@@ -439,6 +439,8 @@ fn pipeline_worker(
         checksum: false,
         hash_or_copy: false,
         precise_mtime: true,
+        two_second_mtimes: Default::default(),
+        symlink_times: std::sync::atomic::AtomicBool::new(true),
         inplace: false,
         same_host: false,
         allow_sequential_nfs_fallback: false,

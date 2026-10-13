@@ -2108,23 +2108,37 @@ impl Planner<'_> {
         ops: &mut LeafOps,
     ) {
         let requested = self.opts.mapping_metadata.get(rel);
-        let flags = self.opts.matching_flags_for(rel);
+        let mut flags = self.opts.matching_flags_for(rel);
+        // Where the destination leaves symlink times alone, as rsync does
+        // when it cannot set them, they are not compared either, so that a
+        // rerun finds nothing to change.
+        let link_times = source.kind != Kind::Symlink || self.opts.symlink_times();
+        if !link_times {
+            flags &= !flags::TIMES;
+        }
         if flags == 0 && source.inode_metadata.is_none() {
             return;
         }
         let meta = self.opts.metadata_for(rel, source);
         // Explicit nanoseconds must be attempted even if preservation's quick
         // comparison would tolerate truncation by the destination filesystem.
-        let time_differs = requested.is_some_and(|r| r.mtime.is_some())
+        let time_differs = link_times
+            && requested.is_some_and(|r| r.mtime.is_some())
             && (meta.mtime, meta.mtime_nsec) != (destination.mtime, destination.mtime_nsec);
         // Comparing a symlink target can change its access time after the
         // destination stat. Even matching captured times need restoration.
         let restore_link_atime = source.kind == Kind::Symlink
+            && link_times
             && self.opts.inode_preservation.atimes
             && !self.opts.dry_run;
         if !time_differs
             && !restore_link_atime
-            && !metadata_differs(&meta, &destination.meta(), flags)
+            && !metadata_differs(
+                &meta,
+                &destination.meta(),
+                flags,
+                self.opts.two_second_mtimes(),
+            )
         {
             return;
         }
@@ -2919,8 +2933,12 @@ impl Planner<'_> {
                 Some(d)
                     if !opts.preserve_existing_directory_metadata
                         && !self.unselected_dirs.contains(p)
-                        && (metadata_differs(&meta, &d.meta(), meta_flags)
-                            || opts.metadata_fix_flags(dst_rel, e, d) != 0)
+                        && (metadata_differs(
+                            &meta,
+                            &d.meta(),
+                            meta_flags,
+                            opts.two_second_mtimes(),
+                        ) || opts.metadata_fix_flags(dst_rel, e, d) != 0)
                         && !self.implicit_dirs.contains(p) =>
                 {
                     self.dry_run_changes.metadata_directories.insert(p.clone());

@@ -1,0 +1,372 @@
+//! Copies onto filesystems that lack atomic rename flags or hard links, set a
+//! symlink's target when asked to set the link's times, or keep two-second
+//! modification times. Debug builds stand in for those filesystems.
+
+use super::*;
+use std::os::unix::ffi::OsStrExt;
+
+fn native_with_env(args: &[&str], env: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command.args(args).arg("--no-progress");
+    for name in env {
+        command.env(name, "1");
+    }
+    command.run().expect("run native syq")
+}
+
+fn set_link_mtime(link: &Path, seconds: i64) {
+    let c = std::ffi::CString::new(link.as_os_str().as_bytes()).unwrap();
+    let time = libc::timespec {
+        tv_sec: seconds,
+        tv_nsec: 0,
+    };
+    let times = [time, time];
+    assert_eq!(
+        unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                c.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        },
+        0
+    );
+}
+
+fn assert_ok(output: &Output) {
+    assert!(
+        output.status.success(),
+        "status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn names(directory: &Path) -> Vec<String> {
+    let mut names: Vec<_> = fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// `--if-exists=error` publishes new files without replacing anything, even
+/// where neither a no-replace rename nor a hard link is available (FAT,
+/// exFAT, rclone mounts), and leaves no staging files behind either way.
+#[test]
+fn no_replace_publication_works_without_rename_flags_or_links() {
+    for env in [
+        &[][..],
+        &["SYQ_TEST_NO_RENAME_NOREPLACE"][..],
+        &["SYQ_TEST_NO_RENAME_NOREPLACE", "SYQ_TEST_NO_HARD_LINKS"][..],
+        &[
+            "SYQ_TEST_NO_RENAME_NOREPLACE",
+            "SYQ_TEST_UNTRUSTED_LINK_COUNTS",
+        ][..],
+    ] {
+        let t = Tmp::new();
+        fs::create_dir(t.path("src")).unwrap();
+        write(&t.path("src/small"), b"small");
+        write(&t.path("src/large"), &vec![7u8; 3 << 20]);
+        fs::create_dir(t.path("dst")).unwrap();
+        let output = native_with_env(
+            &[
+                "cp",
+                "--if-exists=error",
+                "--srcs-in",
+                &t.s("src"),
+                "--into",
+                &t.s("dst"),
+            ],
+            env,
+        );
+        assert_ok(&output);
+        assert_eq!(read(&t.path("dst/small")), b"small", "{env:?}");
+        assert_eq!(read(&t.path("dst/large")), vec![7u8; 3 << 20], "{env:?}");
+        assert_eq!(names(&t.path("dst")), ["large", "small"], "{env:?}");
+
+        // An existing file is refused and kept, and the refused copy leaves
+        // no staging file.
+        write(&t.path("dst/small"), b"kept");
+        write(&t.path("src/small"), b"changed");
+        let output = native_with_env(
+            &[
+                "cp",
+                "--if-exists=error",
+                &t.s("src/small"),
+                "--into",
+                &t.s("dst"),
+            ],
+            env,
+        );
+        assert!(!output.status.success(), "{env:?}: {output:?}");
+        assert_eq!(read(&t.path("dst/small")), b"kept", "{env:?}");
+        assert_eq!(names(&t.path("dst")), ["large", "small"], "{env:?}");
+    }
+}
+
+/// Hard links publish where each name reports its own inode number and one
+/// link (SSHFS), and without exchange or no-replace renames.
+#[test]
+fn hard_links_publish_where_link_counts_are_untrusted() {
+    for env in [
+        &["SYQ_TEST_UNTRUSTED_LINK_COUNTS"][..],
+        &[
+            "SYQ_TEST_UNTRUSTED_LINK_COUNTS",
+            "SYQ_TEST_NO_RENAME_EXCHANGE",
+            "SYQ_TEST_NO_RENAME_NOREPLACE",
+        ][..],
+    ] {
+        let t = Tmp::new();
+        fs::create_dir(t.path("src")).unwrap();
+        write(&t.path("src/a"), b"linked");
+        fs::hard_link(t.path("src/a"), t.path("src/b")).unwrap();
+        fs::create_dir(t.path("dst")).unwrap();
+        // An existing separate file at one name is replaced by the link.
+        write(&t.path("dst/b"), b"old");
+        let output = native_with_env(&["rsync", "-rtH", &t.s("src/"), &t.s("dst/")], env);
+        assert_ok(&output);
+        let a = fs::metadata(t.path("dst/a")).unwrap();
+        let b = fs::metadata(t.path("dst/b")).unwrap();
+        assert_eq!(a.ino(), b.ino(), "{env:?}");
+        assert_eq!(names(&t.path("dst")), ["a", "b"], "{env:?}");
+    }
+}
+
+/// Where setting a symlink's times would set its target's (SSHFS), the
+/// link's times are left alone: the copy succeeds, a dangling link does not
+/// fail it, and the target keeps its own time.
+#[test]
+fn symlink_times_are_left_where_setting_them_follows_the_link() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("src")).unwrap();
+    write(&t.path("src/file"), b"file");
+    set_mtime(&t.path("src/file"), 1_000_000_000);
+    std::os::unix::fs::symlink("file", t.path("src/link")).unwrap();
+    std::os::unix::fs::symlink("missing", t.path("src/dangling")).unwrap();
+    set_link_mtime(&t.path("src/link"), 1_200_000_000);
+    fs::create_dir(t.path("dst")).unwrap();
+    let output = native_with_env(
+        &["cp", "--srcs-in", &t.s("src"), "--into", &t.s("dst")],
+        &["SYQ_TEST_SYMLINK_TIMES_FOLLOW"],
+    );
+    assert_ok(&output);
+    assert_eq!(
+        fs::metadata(t.path("dst/file")).unwrap().mtime(),
+        1_000_000_000
+    );
+    assert_eq!(
+        fs::read_link(t.path("dst/link")).unwrap(),
+        Path::new("file")
+    );
+    assert_ne!(
+        fs::symlink_metadata(t.path("dst/link")).unwrap().mtime(),
+        1_200_000_000
+    );
+    assert_eq!(
+        fs::read_link(t.path("dst/dangling")).unwrap(),
+        Path::new("missing")
+    );
+    assert_eq!(names(&t.path("dst")), ["dangling", "file", "link"]);
+}
+
+/// On a verified local filesystem the link's own times are set.
+#[test]
+fn symlink_times_are_set_on_verified_filesystems() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("src")).unwrap();
+    write(&t.path("src/file"), b"file");
+    std::os::unix::fs::symlink("file", t.path("src/link")).unwrap();
+    set_link_mtime(&t.path("src/link"), 1_100_000_000);
+    fs::create_dir(t.path("dst")).unwrap();
+    let output = native_with_env(
+        &["cp", "--srcs-in", &t.s("src"), "--into", &t.s("dst")],
+        &[],
+    );
+    assert_ok(&output);
+    assert_eq!(
+        fs::symlink_metadata(t.path("dst/link")).unwrap().mtime(),
+        1_100_000_000
+    );
+}
+
+/// A filesystem syq does not know gets the conservative profile: no
+/// exchange, the no-replace fallback chain, untrusted link counts and no
+/// symlink times. Copies there still come out right.
+#[test]
+fn copies_are_complete_with_the_conservative_profile() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("src")).unwrap();
+    write(&t.path("src/a"), b"linked");
+    fs::hard_link(t.path("src/a"), t.path("src/b")).unwrap();
+    write(&t.path("src/large"), &vec![3u8; 3 << 20]);
+    std::os::unix::fs::symlink("a", t.path("src/link")).unwrap();
+    fs::create_dir(t.path("dst")).unwrap();
+    let conservative = ["SYQ_TEST_CONSERVATIVE_FILESYSTEM"];
+    let output = native_with_env(
+        &["rsync", "-rltH", &t.s("src/"), &t.s("dst/")],
+        &conservative,
+    );
+    assert_ok(&output);
+    assert_eq!(
+        fs::metadata(t.path("dst/a")).unwrap().ino(),
+        fs::metadata(t.path("dst/b")).unwrap().ino()
+    );
+    assert_eq!(read(&t.path("dst/large")), vec![3u8; 3 << 20]);
+    assert_eq!(fs::read_link(t.path("dst/link")).unwrap(), Path::new("a"));
+    // Unchanged files stay unchanged on a second run, and an update
+    // replaces exactly the files that changed.
+    write(&t.path("src/large"), &vec![4u8; 3 << 20]);
+    set_mtime(&t.path("src/large"), 1_300_000_000);
+    let output = native_with_env(
+        &["rsync", "-rltH", &t.s("src/"), &t.s("dst/")],
+        &conservative,
+    );
+    assert_ok(&output);
+    assert_eq!(read(&t.path("dst/large")), vec![4u8; 3 << 20]);
+    assert_eq!(names(&t.path("dst")), ["a", "b", "large", "link"]);
+    // New files without replacing anything.
+    fs::create_dir(t.path("new")).unwrap();
+    let output = native_with_env(
+        &[
+            "cp",
+            "--if-exists=error",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("new"),
+        ],
+        &conservative,
+    );
+    assert_ok(&output);
+    assert_eq!(names(&t.path("new")), ["a", "b", "large", "link"]);
+}
+
+/// On FAT, which keeps two-second modification times, a file whose time
+/// was rounded to an even second counts as unchanged; elsewhere it does not.
+#[test]
+fn fat_modification_times_compare_at_two_seconds() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("src")).unwrap();
+    write(&t.path("src/odd"), b"odd");
+    set_mtime(&t.path("src/odd"), 1_000_000_001);
+    fs::create_dir(t.path("dst")).unwrap();
+    write(&t.path("dst/odd"), b"odd");
+    // What FAT keeps after a copy writes the source's time.
+    set_mtime(&t.path("dst/odd"), 1_000_000_000);
+    let transferred = |env: &[&str]| {
+        let output = native_with_env(
+            &["cp", "-v", "--srcs-in", &t.s("src"), "--into", &t.s("dst")],
+            env,
+        );
+        assert_ok(&output);
+        String::from_utf8_lossy(&output.stdout).contains("odd")
+    };
+    assert!(!transferred(&["SYQ_TEST_TWO_SECOND_MTIMES"]));
+    assert_eq!(
+        fs::metadata(t.path("dst/odd")).unwrap().mtime(),
+        1_000_000_000
+    );
+    // Two seconds apart is a change even there.
+    set_mtime(&t.path("dst/odd"), 1_000_000_003);
+    assert!(transferred(&["SYQ_TEST_TWO_SECOND_MTIMES"]));
+    set_mtime(&t.path("dst/odd"), 1_000_000_000);
+    assert!(transferred(&[]));
+}
+
+/// A copy that cannot publish a file because another writer created its
+/// name meanwhile keeps the partial file it wrote, as an interrupted copy
+/// would: a rerun after that name is removed sends nothing again.
+#[test]
+fn a_refused_publication_keeps_a_resumable_partial() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("src")).unwrap();
+    fs::create_dir(t.path("dst")).unwrap();
+    let data = prng(4 << 20, 91);
+    write(&t.path("src/file"), &data);
+    let ready = t.path("ready");
+    let continuation = t.path("continue");
+    let args = [
+        "cp",
+        "--no-progress",
+        "--if-exists=error",
+        "--performance-tuning=copy-path=ranges,workers=1",
+    ];
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(args)
+        .args([&t.s("src/file"), "--into", &t.s("dst")])
+        .env("SYQ_TEST_SOURCE_RECHECK_READY_FILE", &ready)
+        .env("SYQ_TEST_SOURCE_RECHECK_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "the check before publication");
+    write(&t.path("dst/file"), b"another writer");
+    release_confinement_barrier(&continuation);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(read(&t.path("dst/file")), b"another writer", "{output:?}");
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(
+        partial_files(&t.path("dst")).len(),
+        1,
+        "{:?}",
+        names(&t.path("dst"))
+    );
+
+    fs::remove_file(t.path("dst/file")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(args)
+        .args(["--stats", &t.s("src/file"), "--into", &t.s("dst")])
+        .run()
+        .unwrap();
+    assert_ok(&output);
+    assert_eq!(read(&t.path("dst/file")), data);
+    let stats = String::from_utf8_lossy(&output.stdout).into_owned()
+        + &String::from_utf8_lossy(&output.stderr);
+    assert!(stats.contains("bytes transferred: 0\n"), "{stats}");
+}
+
+/// Where symlink times are left alone, they are not compared either, so a
+/// rerun finds nothing to change.
+#[test]
+fn symlink_times_that_are_left_alone_settle() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("src")).unwrap();
+    write(&t.path("src/file"), b"file");
+    for (index, name) in ["one", "two", "three"].iter().enumerate() {
+        std::os::unix::fs::symlink("file", t.path(&format!("src/{name}"))).unwrap();
+        set_link_mtime(
+            &t.path(&format!("src/{name}")),
+            1_200_000_000 + index as i64,
+        );
+    }
+    let follow = ["SYQ_TEST_SYMLINK_TIMES_FOLLOW"];
+    let copy = |extra: &[&str]| {
+        let mut args = vec!["rsync", "-rlt"];
+        args.extend_from_slice(extra);
+        let src = t.s("src/");
+        let dst = t.s("dst/");
+        args.extend_from_slice(&[&src, &dst]);
+        let output = native_with_env(&args, &follow);
+        assert_ok(&output);
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    copy(&[]);
+    for name in ["one", "two", "three"] {
+        assert_ne!(
+            fs::symlink_metadata(t.path(&format!("dst/{name}")))
+                .unwrap()
+                .mtime(),
+            1_200_000_000
+        );
+    }
+    let preview = copy(&["--dry-run"]);
+    assert!(preview.contains("changes: none"), "{preview}");
+    copy(&[]);
+    let preview = copy(&["--dry-run"]);
+    assert!(preview.contains("changes: none"), "{preview}");
+}

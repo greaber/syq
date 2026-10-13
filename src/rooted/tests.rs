@@ -1663,10 +1663,721 @@ fn only_recovery_entry(directory: &Path, error: &str) -> PathBuf {
     directory.join(&kept[0])
 }
 
+/// Stand in for a filesystem without exchange, an atomic no-replace rename
+/// or hard links.
+fn assume_missing(root: &Root, exchange: bool, no_replace_rename: bool, links: bool) {
+    let mut profile = root.profile();
+    profile.exchange &= !exchange;
+    profile.atomic_no_replace_rename &= !no_replace_rename;
+    profile.hard_links &= !links;
+    root.assume_profile_for_test(profile);
+}
+
+fn assume_untrusted_link_counts(root: &Root) {
+    let mut profile = root.profile();
+    profile.link_counts_trusted = false;
+    root.assume_profile_for_test(profile);
+}
+
+/// The names in `directory`, sorted.
+fn sorted_names(directory: &Path) -> Vec<String> {
+    let mut names: Vec<_> = fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Without exchange (HFS+, exFAT, NFS, SMB, SSHFS), a matched replacement
+/// of a file, a symlink, a node or a hard link moves the expected entry
+/// aside, publishes, and removes it; with or without no-replace renames.
+#[test]
+fn matched_replacement_without_exchange_moves_the_expected_entry_aside() {
+    use crate::proto::TargetCondition::Matches;
+    for no_replace_rename in [false, true] {
+        let tree = TestDir::new("matched-without-exchange");
+        let root = Root::open(tree.path()).unwrap();
+        assume_missing(&root, true, no_replace_rename, false);
+
+        let (staged, target) = (relative(b"staged"), relative(b"target"));
+        fs::write(tree.path().join("staged"), b"new").unwrap();
+        fs::write(tree.path().join("target"), b"old").unwrap();
+        let staged_metadata = fs::metadata(tree.path().join("staged")).unwrap();
+        let old = root.metadata(&target).unwrap();
+        root.replace_regular_if_same(
+            &staged,
+            &target,
+            (staged_metadata.dev(), staged_metadata.ino()),
+            old.dev,
+            old.ino,
+            Some((old.ctime, old.ctime_nsec)),
+        )
+        .unwrap();
+        assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"new");
+        assert_eq!(root.metadata(&target).unwrap().ino, staged_metadata.ino());
+
+        let link = relative(b"link");
+        root.create_symlink(&link, b"old").unwrap();
+        let old_link = root.metadata(&link).unwrap();
+        root.replace_symlink_if_same(&link, b"new", old_link.dev, old_link.ino)
+            .unwrap();
+        assert_eq!(
+            fs::read_link(tree.path().join("link")).unwrap(),
+            Path::new("new")
+        );
+
+        let fifo = relative(b"fifo");
+        root.create_node(&fifo, MODE_FIFO | 0o644, 0).unwrap();
+        let old_fifo = root.metadata(&fifo).unwrap();
+        root.replace_node_if_same(&fifo, MODE_FIFO | 0o600, 0, old_fifo.dev, old_fifo.ino)
+            .unwrap();
+        assert_ne!(root.metadata(&fifo).unwrap().ino, old_fifo.ino);
+
+        fs::write(tree.path().join("existing"), b"existing").unwrap();
+        let existing = root.metadata(&relative(b"existing")).unwrap();
+        let representative = root.metadata(&target).unwrap();
+        root.publish_hardlink(
+            &target,
+            &relative(b"existing"),
+            (representative.dev, representative.ino),
+            Matches {
+                dev: existing.dev,
+                ino: existing.ino,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            root.metadata(&relative(b"existing")).unwrap().ino,
+            representative.ino
+        );
+        assert_eq!(
+            sorted_names(tree.path()),
+            ["existing", "fifo", "link", "target"],
+            "{no_replace_rename}"
+        );
+    }
+}
+
+/// Matched replacement of a file and a symlink with whatever this
+/// filesystem supports: exchange where it has one, the fallback elsewhere.
+/// Run with `TMPDIR` on HFS+, FAT32 or exFAT to check those filesystems; a
+/// FAT32 volume completes a swap as a plain rename, so it must not be asked.
+#[test]
+fn matched_file_and_symlink_replacement_work_on_this_filesystem() {
+    let tree = TestDir::new("matched-on-this-filesystem");
+    let root = Root::open(tree.path()).unwrap();
+    for round in 0..2 {
+        let (staged, target) = (relative(b"staged"), relative(b"target"));
+        fs::write(tree.path().join("staged"), format!("new {round}")).unwrap();
+        if round == 0 {
+            fs::write(tree.path().join("target"), b"old").unwrap();
+        }
+        let staged_metadata = fs::metadata(tree.path().join("staged")).unwrap();
+        let old = root.metadata(&target).unwrap();
+        root.replace_regular_if_same(
+            &staged,
+            &target,
+            (staged_metadata.dev(), staged_metadata.ino()),
+            old.dev,
+            old.ino,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(tree.path().join("target")).unwrap(),
+            format!("new {round}").as_bytes()
+        );
+    }
+    let link = relative(b"link");
+    root.create_symlink(&link, b"old").unwrap();
+    let old_link = root.metadata(&link).unwrap();
+    root.replace_symlink_if_same(&link, b"new", old_link.dev, old_link.ino)
+        .unwrap();
+    assert_eq!(
+        fs::read_link(tree.path().join("link")).unwrap(),
+        Path::new("new")
+    );
+    assert_eq!(sorted_names(tree.path()), ["link", "target"]);
+}
+
+/// A profile can be wrong by version: OpenZFS before 2.2 refuses exchange
+/// and no-replace renames with EINVAL. A refused call falls back to the
+/// conservative path, and the refusal is remembered, so later publications
+/// on that filesystem do not try the call again.
+#[test]
+fn refused_rename_flags_fall_back_and_are_remembered() {
+    use super::publication::{REFUSED_RENAME_FLAG_CALLS, REFUSE_RENAME_FLAGS};
+    let tree = TestDir::new("refused-rename-flags");
+    let root = Root::open(tree.path()).unwrap();
+    let mut profile = root.profile();
+    profile.exchange = true;
+    profile.atomic_no_replace_rename = true;
+    profile.hard_links = true;
+    profile.link_counts_trusted = true;
+    root.assume_profile_for_test(profile);
+    REFUSE_RENAME_FLAGS.set(true);
+    REFUSED_RENAME_FLAG_CALLS.set(0);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fs::write(tree.path().join("target"), b"old").unwrap();
+        for round in 0..2 {
+            let staged = format!("staged{round}");
+            fs::write(tree.path().join(&staged), format!("new {round}")).unwrap();
+            let staged_metadata = fs::metadata(tree.path().join(&staged)).unwrap();
+            let old = root.metadata(&relative(b"target")).unwrap();
+            root.replace_regular_if_same(
+                &relative(staged.as_bytes()),
+                &relative(b"target"),
+                (staged_metadata.dev(), staged_metadata.ino()),
+                old.dev,
+                old.ino,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read(tree.path().join("target")).unwrap(),
+                format!("new {round}").as_bytes()
+            );
+
+            let new = format!("new{round}");
+            fs::write(tree.path().join(&staged), b"fresh").unwrap();
+            let staged_metadata = fs::metadata(tree.path().join(&staged)).unwrap();
+            root.publish_new_regular(
+                &relative(staged.as_bytes()),
+                &relative(new.as_bytes()),
+                (staged_metadata.dev(), staged_metadata.ino()),
+            )
+            .unwrap();
+            assert_eq!(fs::read(tree.path().join(&new)).unwrap(), b"fresh");
+        }
+    }));
+    REFUSE_RENAME_FLAGS.set(false);
+    result.unwrap();
+    // Each flag was tried once, refused, and not tried again.
+    assert_eq!(REFUSED_RENAME_FLAG_CALLS.get(), 2);
+    let profile = root.profile();
+    assert!(!profile.exchange && !profile.atomic_no_replace_rename);
+    assert!(profile.hard_links);
+    assert_eq!(sorted_names(tree.path()), ["new0", "new1", "target"]);
+}
+
+/// Where hard links exist, a name is never published by checking that it
+/// is absent and then renaming, which could replace a file another writer
+/// creates in between: publication and putting an entry back link the name
+/// instead. Only where there are neither atomic no-replace renames nor hard
+/// links is the check used.
+#[test]
+fn names_are_linked_rather_than_checked_wherever_links_exist() {
+    use super::publication::CHECKED_RENAMES;
+    for links in [true, false] {
+        let tree = TestDir::new("linked-not-checked");
+        let root = Root::open(tree.path()).unwrap();
+        assume_missing(&root, true, true, !links);
+        CHECKED_RENAMES.set(0);
+
+        let (staged, target) = (relative(b"staged"), relative(b"target"));
+        fs::write(tree.path().join("staged"), b"new").unwrap();
+        fs::write(tree.path().join("target"), b"old").unwrap();
+        let staged_metadata = fs::metadata(tree.path().join("staged")).unwrap();
+        let old = root.metadata(&target).unwrap();
+        root.replace_regular_if_same(
+            &staged,
+            &target,
+            (staged_metadata.dev(), staged_metadata.ino()),
+            old.dev,
+            old.ino,
+            None,
+        )
+        .unwrap();
+        assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"new");
+
+        let link = relative(b"link");
+        root.create_symlink(&link, b"old").unwrap();
+        let old_link = root.metadata(&link).unwrap();
+        root.replace_symlink_if_same(&link, b"new", old_link.dev, old_link.ino)
+            .unwrap();
+        assert_eq!(
+            fs::read_link(tree.path().join("link")).unwrap(),
+            Path::new("new")
+        );
+
+        fs::write(tree.path().join("staged"), b"fresh").unwrap();
+        let staged_metadata = fs::metadata(tree.path().join("staged")).unwrap();
+        root.publish_new_regular(
+            &staged,
+            &relative(b"fresh"),
+            (staged_metadata.dev(), staged_metadata.ino()),
+        )
+        .unwrap();
+
+        // An unexpected entry goes back by the same steps.
+        fs::write(tree.path().join("staged"), b"newer").unwrap();
+        let staged_metadata = fs::metadata(tree.path().join("staged")).unwrap();
+        let old = root.metadata(&target).unwrap();
+        let target_path = tree.path().join("target");
+        let moved_path = tree.path().join("moved");
+        let _hook = install_publication_test_hook(
+            root.identity(),
+            &target,
+            PublicationTestPoint::BeforeMatchedExchange,
+            move || {
+                fs::rename(&target_path, &moved_path).unwrap();
+                fs::write(&target_path, b"other writer").unwrap();
+            },
+        );
+        let error = root
+            .replace_regular_if_same(
+                &staged,
+                &target,
+                (staged_metadata.dev(), staged_metadata.ino()),
+                old.dev,
+                old.ino,
+                None,
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("changed before publication"));
+        assert_eq!(
+            fs::read(tree.path().join("target")).unwrap(),
+            b"other writer"
+        );
+
+        assert_eq!(CHECKED_RENAMES.get() == 0, links, "links {links}");
+        assert_eq!(
+            sorted_names(tree.path()),
+            ["fresh", "link", "moved", "staged", "target"]
+        );
+    }
+}
+
+/// Stand in for a filesystem whose links fail with `error` until the guard
+/// drops.
+fn fail_links_with(error: i32) -> impl Drop {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            super::publication::LINK_ERROR.set(None);
+        }
+    }
+    super::publication::LINK_ERROR.set(Some(error));
+    Reset
+}
+
+/// Write `contents` as `name` in `tree` and publish it as the new name
+/// `target`, as a staged file is published.
+fn publish_staged(root: &Root, tree: &TestDir, name: &str, target: &str) -> Result<()> {
+    fs::write(tree.path().join(name), target).unwrap();
+    let staged = fs::metadata(tree.path().join(name)).unwrap();
+    root.publish_new_regular(
+        &relative(name.as_bytes()),
+        &relative(target.as_bytes()),
+        (staged.dev(), staged.ino()),
+    )
+}
+
+/// Swap the target for another writer's `entry` just before a matched
+/// replacement, and check that the replacement puts it back.
+fn replace_while_another_writer_swaps_in(
+    root: &Root,
+    tree: &TestDir,
+    entry: impl Fn(&Path) + Send + Sync + 'static,
+) {
+    let (staged, target) = (relative(b"staged"), relative(b"target"));
+    fs::write(tree.path().join("staged"), b"new").unwrap();
+    fs::write(tree.path().join("target"), b"old").unwrap();
+    let staged_metadata = fs::metadata(tree.path().join("staged")).unwrap();
+    let old = root.metadata(&target).unwrap();
+    let target_path = tree.path().join("target");
+    let saved_path = tree.path().join("saved");
+    let _hook = install_publication_test_hook(
+        root.identity(),
+        &target,
+        PublicationTestPoint::BeforeMatchedExchange,
+        move || {
+            fs::rename(&target_path, &saved_path).unwrap();
+            entry(&target_path);
+        },
+    );
+    let error = root
+        .replace_regular_if_same(
+            &staged,
+            &target,
+            (staged_metadata.dev(), staged_metadata.ino()),
+            old.dev,
+            old.ino,
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("changed before publication"),
+        "{error:#}"
+    );
+    assert_eq!(fs::read(tree.path().join("saved")).unwrap(), b"old");
+}
+
+/// Putting back an unexpected directory moves it by rename: a directory
+/// cannot be linked, and the refusal must not mark the filesystem as
+/// without hard links.
+#[test]
+fn putting_back_a_directory_keeps_hard_links() {
+    let tree = TestDir::new("put-back-directory");
+    let root = Root::open(tree.path()).unwrap();
+    assume_missing(&root, true, true, false);
+    replace_while_another_writer_swaps_in(&root, &tree, |target| fs::create_dir(target).unwrap());
+    assert!(tree.path().join("target").is_dir());
+    assert!(root.profile().hard_links, "{:?}", root.profile());
+}
+
+/// A filesystem is remembered as without hard links only when it says so
+/// (`EOPNOTSUPP`, `ENOSYS`) for a staged file, which this receiver created.
+/// `EPERM` can be the file's own: Linux refuses to link another user's
+/// file under `fs.protected_hardlinks`. It falls back without being
+/// remembered.
+#[test]
+fn a_link_refused_with_eperm_is_not_remembered() {
+    let tree = TestDir::new("link-eperm");
+    let root = Root::open(tree.path()).unwrap();
+    assume_missing(&root, true, true, false);
+    let refused = fail_links_with(libc::EPERM);
+    publish_staged(&root, &tree, "staged", "refused").unwrap();
+    assert!(root.profile().hard_links, "{:?}", root.profile());
+    drop(refused);
+    let _unsupported = fail_links_with(libc::EOPNOTSUPP);
+    publish_staged(&root, &tree, "staged", "unsupported").unwrap();
+    assert!(!root.profile().hard_links, "{:?}", root.profile());
+    assert_eq!(sorted_names(tree.path()), ["refused", "unsupported"]);
+}
+
+/// An entry being put back is another writer's, and may be refused a link
+/// for reasons of its own, so even an error that says the filesystem has
+/// no hard links is not remembered there.
+#[test]
+fn a_link_refused_while_putting_back_an_entry_is_not_remembered() {
+    let tree = TestDir::new("link-put-back");
+    let root = Root::open(tree.path()).unwrap();
+    assume_missing(&root, true, true, false);
+    let _unsupported = fail_links_with(libc::EOPNOTSUPP);
+    replace_while_another_writer_swaps_in(&root, &tree, |target| {
+        fs::write(target, b"other writer").unwrap()
+    });
+    assert_eq!(
+        fs::read(tree.path().join("target")).unwrap(),
+        b"other writer"
+    );
+    assert!(root.profile().hard_links, "{:?}", root.profile());
+}
+
+/// `EIO` from a link is an I/O error on a filesystem whose type was
+/// audited, and fails the publication. Only where the type was not, as on
+/// FUSE, where an rclone mount answers a link with `EIO`, does it fall back
+/// to check-then-rename. Neither is remembered.
+#[test]
+fn an_io_error_from_a_link_falls_back_only_where_the_filesystem_was_not_audited() {
+    for audited in [true, false] {
+        let tree = TestDir::new("link-eio");
+        let root = Root::open(tree.path()).unwrap();
+        let mut profile = crate::fsops::Profile::LOCAL;
+        profile.exchange = false;
+        profile.atomic_no_replace_rename = false;
+        profile.audited = audited;
+        root.assume_profile_for_test(profile);
+        let _failing = fail_links_with(libc::EIO);
+        let published = publish_staged(&root, &tree, "staged", "new");
+        if audited {
+            let error = published.unwrap_err();
+            assert!(
+                error.chain().any(|cause| cause
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.raw_os_error() == Some(libc::EIO))),
+                "{error:#}"
+            );
+            assert_eq!(sorted_names(tree.path()), ["staged"]);
+        } else {
+            published.unwrap();
+            assert_eq!(sorted_names(tree.path()), ["new"]);
+        }
+        assert!(root.profile().hard_links, "audited {audited}");
+    }
+}
+
+/// On a filesystem that was not audited, a new symlink or node is never
+/// published by a hard link: a server whose `link()` follows symlinks, as
+/// macOS's does behind SSHFS, would link the file a sender's symlink names.
+/// There it takes the check-then-rename step; where the filesystem was
+/// audited, the link.
+#[test]
+fn new_symlinks_and_nodes_are_linked_only_where_the_filesystem_was_audited() {
+    use super::publication::CHECKED_RENAMES;
+    for audited in [true, false] {
+        let tree = TestDir::new("leaf-links");
+        let root = Root::open(tree.path()).unwrap();
+        let mut profile = crate::fsops::Profile::LOCAL;
+        profile.exchange = false;
+        profile.atomic_no_replace_rename = false;
+        profile.audited = audited;
+        root.assume_profile_for_test(profile);
+        CHECKED_RENAMES.set(0);
+
+        let link = relative(b"link");
+        root.create_symlink(&link, b"old").unwrap();
+        let old = root.metadata(&link).unwrap();
+        root.replace_symlink_if_same(&link, b"new", old.dev, old.ino)
+            .unwrap();
+        assert_eq!(
+            fs::read_link(tree.path().join("link")).unwrap(),
+            Path::new("new")
+        );
+        let fifo = relative(b"fifo");
+        root.create_node(&fifo, MODE_FIFO | 0o644, 0).unwrap();
+        let old = root.metadata(&fifo).unwrap();
+        root.replace_node_if_same(&fifo, MODE_FIFO | 0o600, 0, old.dev, old.ino)
+            .unwrap();
+        assert_ne!(root.metadata(&fifo).unwrap().ino, old.ino);
+
+        let checked = if audited { 0 } else { 2 };
+        assert_eq!(CHECKED_RENAMES.get(), checked, "audited {audited}");
+        assert_eq!(sorted_names(tree.path()), ["fifo", "link"]);
+    }
+}
+
+/// A private file created for ACL copying is published by the steps its
+/// volume's profile allows: an exclusive rename only where the profile
+/// trusts one, and a refusal falls back and is remembered. Run with
+/// `TMPDIR` on HFS+ or exFAT to check those volumes.
+#[cfg(target_os = "macos")]
+#[test]
+fn private_files_are_published_by_their_volumes_profile() {
+    use super::publication::{CHECKED_RENAMES, REFUSED_RENAME_FLAG_CALLS, REFUSE_RENAME_FLAGS};
+    let tree = TestDir::new("private-file-profile");
+    let root = Root::open(tree.path()).unwrap();
+    let mut profile = root.profile();
+    let links = profile.hard_links;
+    profile.atomic_no_replace_rename = true;
+    root.assume_profile_for_test(profile);
+    REFUSE_RENAME_FLAGS.set(true);
+    REFUSED_RENAME_FLAG_CALLS.set(0);
+    CHECKED_RENAMES.set(0);
+    let created = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        root.create_private_file(&relative(b"first"))
+    }));
+    REFUSE_RENAME_FLAGS.set(false);
+    let mut file = created.unwrap().unwrap();
+    // The refused flag was tried once; the file was then linked where the
+    // volume has hard links, and checked and renamed where it does not.
+    assert_eq!(REFUSED_RENAME_FLAG_CALLS.get(), 1);
+    assert!(!root.profile().atomic_no_replace_rename);
+    assert_eq!(CHECKED_RENAMES.get(), usize::from(!links), "links {links}");
+    file.write_all(b"private").unwrap();
+    assert_eq!(fs::read(tree.path().join("first")).unwrap(), b"private");
+    assert_eq!(
+        fs::symlink_metadata(tree.path().join("first"))
+            .unwrap()
+            .nlink(),
+        1
+    );
+    // Nothing replaces an existing name.
+    let error = root.create_private_file(&relative(b"first")).unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::AlreadyExists),
+        "{error:#}"
+    );
+    assert_eq!(sorted_names(tree.path()), ["first"]);
+}
+
+/// A hard link names its file on the file's own filesystem, so it is
+/// published by that filesystem's profile. A link from another filesystem
+/// fails with `EXDEV`, which teaches nothing, and must not leave the
+/// destination's profile cached for the source's device.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_link_across_filesystems_keeps_each_filesystems_profile() {
+    use crate::fsops::Profile;
+    let destination = crate::test_support::tempdir().unwrap();
+    let source = tempfile::tempdir_in("/dev/shm").unwrap();
+    let source_path = source.path().join("source");
+    fs::write(&source_path, b"source").unwrap();
+    let source_metadata = fs::metadata(&source_path).unwrap();
+    let (source_dev, destination_dev) = (
+        source_metadata.dev(),
+        fs::metadata(destination.path()).unwrap().dev(),
+    );
+    assert_ne!(
+        source_dev, destination_dev,
+        "the test needs two filesystems"
+    );
+    // The source's filesystem stands in for one trusted with nothing, the
+    // destination's for a local one.
+    let _profiles = crate::fsops::override_profiles_for_test(move |dev, _| {
+        if dev == source_dev {
+            Profile::CONSERVATIVE
+        } else {
+            Profile::LOCAL
+        }
+    });
+    let root = Root::open(Path::new("/")).unwrap();
+    let beneath_root =
+        |path: &Path| relative(path.strip_prefix("/").unwrap().as_os_str().as_bytes());
+    let error = root
+        .publish_hardlink(
+            &beneath_root(&source_path),
+            &beneath_root(&destination.path().join("link")),
+            (source_dev, source_metadata.ino()),
+            crate::proto::TargetCondition::Absent,
+        )
+        .unwrap_err();
+    assert!(
+        error.chain().any(|cause| cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.raw_os_error() == Some(libc::EXDEV))),
+        "{error:#}"
+    );
+    let source_directory = File::open(source.path()).unwrap();
+    assert_eq!(
+        root.profile_on(source_dev, &source_directory),
+        Profile::CONSERVATIVE
+    );
+    let destination_directory = File::open(destination.path()).unwrap();
+    assert_eq!(
+        root.profile_on(destination_dev, &destination_directory),
+        Profile::LOCAL
+    );
+}
+
+/// Without exchange, an entry that is not the expected one when it is
+/// moved aside goes back to its name, untouched.
+#[test]
+fn matched_replacement_without_exchange_puts_an_unexpected_entry_back() {
+    let tree = TestDir::new("matched-without-exchange-unexpected");
+    let root = Root::open(tree.path()).unwrap();
+    assume_missing(&root, true, false, false);
+    let (staged, target) = (relative(b"staged"), relative(b"target"));
+    fs::write(tree.path().join("staged"), b"new").unwrap();
+    fs::write(tree.path().join("target"), b"old").unwrap();
+    let staged_metadata = fs::metadata(tree.path().join("staged")).unwrap();
+    let old = root.metadata(&target).unwrap();
+
+    let target_path = tree.path().join("target");
+    let moved_path = tree.path().join("moved");
+    let _hook = install_publication_test_hook(
+        root.identity(),
+        &target,
+        PublicationTestPoint::BeforeMatchedExchange,
+        move || {
+            fs::rename(&target_path, &moved_path).unwrap();
+            fs::write(&target_path, b"other writer").unwrap();
+        },
+    );
+    let error = root
+        .replace_regular_if_same(
+            &staged,
+            &target,
+            (staged_metadata.dev(), staged_metadata.ino()),
+            old.dev,
+            old.ino,
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("changed before publication"),
+        "{error:#}"
+    );
+    assert_eq!(
+        fs::read(tree.path().join("target")).unwrap(),
+        b"other writer"
+    );
+    assert_eq!(fs::read(tree.path().join("staged")).unwrap(), b"new");
+    assert_eq!(sorted_names(tree.path()), ["moved", "staged", "target"]);
+}
+
+/// Without exchange, a writer that takes the name while the expected entry
+/// is aside keeps it, and the expected entry is kept and reported.
+#[test]
+fn matched_replacement_without_exchange_keeps_what_a_later_writer_displaced() {
+    let tree = TestDir::new("matched-without-exchange-later-writer");
+    let root = Root::open(tree.path()).unwrap();
+    assume_missing(&root, true, false, false);
+    let (staged, target) = (relative(b"staged"), relative(b"target"));
+    fs::write(tree.path().join("staged"), b"new").unwrap();
+    fs::write(tree.path().join("target"), b"old").unwrap();
+    let staged_metadata = fs::metadata(tree.path().join("staged")).unwrap();
+    let old = root.metadata(&target).unwrap();
+
+    let target_path = tree.path().join("target");
+    let _hook = install_publication_test_hook(
+        root.identity(),
+        &target,
+        PublicationTestPoint::AfterMovedAside,
+        move || fs::write(&target_path, b"later").unwrap(),
+    );
+    let error = root
+        .replace_regular_if_same(
+            &staged,
+            &target,
+            (staged_metadata.dev(), staged_metadata.ino()),
+            old.dev,
+            old.ino,
+            None,
+        )
+        .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(error.contains("changed during publication"), "{error}");
+    assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"later");
+    let kept = only_recovery_entry(tree.path(), &error);
+    assert_eq!(fs::read(kept).unwrap(), b"old");
+    assert_eq!(fs::read(tree.path().join("staged")).unwrap(), b"new");
+}
+
+/// A new name is published without replacing anything by a no-replace
+/// rename, else a hard link, else a check and a rename; an existing name is
+/// refused each way, and no staged name remains after success.
+#[test]
+fn absent_publication_falls_back_without_rename_flags_or_links() {
+    for (no_replace_rename, links, untrusted) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (true, false, true),
+    ] {
+        let label = format!("{no_replace_rename} {links} {untrusted}");
+        let tree = TestDir::new("absent-publication-fallback");
+        let root = Root::open(tree.path()).unwrap();
+        assume_missing(&root, false, no_replace_rename, links);
+        if untrusted {
+            assume_untrusted_link_counts(&root);
+        }
+        let (staged, target) = (relative(b"staged"), relative(b"target"));
+        fs::write(tree.path().join("staged"), b"staged").unwrap();
+        let metadata = fs::metadata(tree.path().join("staged")).unwrap();
+        root.publish_new_regular(&staged, &target, (metadata.dev(), metadata.ino()))
+            .unwrap();
+        assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"staged");
+        assert_eq!(root.metadata(&target).unwrap().nlink, 1, "{label}");
+        assert_eq!(sorted_names(tree.path()), ["target"], "{label}");
+
+        fs::write(tree.path().join("staged"), b"again").unwrap();
+        let metadata = fs::metadata(tree.path().join("staged")).unwrap();
+        let error = root
+            .publish_new_regular(&staged, &target, (metadata.dev(), metadata.ino()))
+            .unwrap_err();
+        assert!(
+            error.chain().any(|cause| cause
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::AlreadyExists)),
+            "{label}: {error:#}"
+        );
+        assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"staged");
+        assert!(root.unlink_if_same_regular(&staged, (metadata.dev(), metadata.ino())));
+        assert_eq!(sorted_names(tree.path()), ["target"], "{label}");
+    }
+}
+
 #[test]
 fn absent_publication_never_unlinks_a_later_writer() {
     let tree = TestDir::new("absent-publication-race");
     let root = Root::open(tree.path()).unwrap();
+    // The race is between the link and the removal of the staged name.
+    assume_missing(&root, false, true, false);
     let staged = relative(b"staged");
     let target = relative(b"target");
     fs::write(tree.path().join("staged"), b"staged").unwrap();

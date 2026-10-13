@@ -1017,6 +1017,9 @@ mod directory_privacy;
 mod existing_policy;
 #[path = "local/fifo.rs"]
 mod fifo;
+#[cfg(debug_assertions)]
+#[path = "local/filesystem_support.rs"]
+mod filesystem_support;
 #[path = "local/hardlinks.rs"]
 mod hardlinks;
 #[path = "local/hashing.rs"]

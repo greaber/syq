@@ -447,10 +447,17 @@ fn apply_one_rooted(
         } => {
             // The publication links only the file with this identity, so
             // checking the identity checks the file linked (`OwnedObjects`).
+            // Where inode numbers cannot show that, the link is refused.
             if let Some(owned) = owned {
                 owned.require_link((*dev, *ino), &target.label)?;
             }
-            root.publish_hardlink(&RelativePath::new(source)?, path, (*dev, *ino), *condition)
+            root.publish_hardlink_to(
+                &RelativePath::new(source)?,
+                path,
+                (*dev, *ino),
+                *condition,
+                owned.is_some(),
+            )
         }
         Op::SetMeta {
             meta,
@@ -578,7 +585,13 @@ pub(super) fn set_meta_rooted(
             parent.chown(uid, gid)
         })
         .with_context(|| format!("change owner of confined path {}", target.label.display()))?;
-        if time_differs {
+        // Only where setting them is known to set the link's own: an SFTP
+        // server behind SSHFS sets the target's instead.
+        if time_differs
+            && target
+                .root
+                .sets_symlink_times(parent.directory(), metadata.dev)
+        {
             let times = [
                 timespec(0, libc::UTIME_OMIT as u32),
                 timespec(meta.mtime, meta.mtime_nsec),
@@ -586,6 +599,11 @@ pub(super) fn set_meta_rooted(
             parent.set_times(&times).with_context(|| {
                 format!("set times on confined path {}", target.label.display())
             })?;
+        } else if time_differs && crate::output::debug() {
+            crate::output::diagnostic!(
+                "syq: not setting the times of symlink {}: this filesystem may set its target's",
+                target.label.display()
+            );
         }
         if let Some(handle) = &handle {
             crate::inode_metadata::apply(handle, meta.inode_metadata.as_deref(), meta.mode)?;

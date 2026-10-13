@@ -81,6 +81,7 @@ impl Planner<'_> {
                     &metadata,
                     &self.opts.metadata_for(&leaf.dst_rel, &leaf.e),
                     flags,
+                    false,
                 )
             {
                 self.progress.error(&format!(
