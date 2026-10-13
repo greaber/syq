@@ -23,6 +23,21 @@ pub(crate) fn wait_readable(fd: RawFd, timeout: std::time::Duration) {
     );
 }
 
+/// Whether `fd` becomes readable, or reports hang-up or an error, within
+/// `timeout`. A signal that interrupts the wait ends it early with `false`,
+/// so a caller with a deadline waits again for what remains of it.
+pub(crate) fn readable_within(fd: RawFd, timeout: std::time::Duration) -> bool {
+    let mut ready = [libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    let millis =
+        libc::c_int::try_from(timeout.as_micros().div_ceil(1000)).unwrap_or(libc::c_int::MAX);
+    // SAFETY: ready is a live array of one initialized pollfd entry.
+    unsafe { libc::poll(ready.as_mut_ptr(), 1, millis) > 0 }
+}
+
 /// Wait until any of `fds` is readable or `timeout` passes, as
 /// [`wait_readable`] does for one descriptor.
 pub(crate) fn wait_any_readable(fds: &[RawFd], timeout: std::time::Duration) {

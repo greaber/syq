@@ -136,6 +136,9 @@ pub(crate) struct RestrictedAuthority {
     /// The files this receiver created for the grant, shared with every
     /// connection's operations.
     pub(super) owned: std::sync::Arc<crate::fsops::owned::OwnedObjects>,
+    /// The scope of the files this copy is writing, which the receiver holds
+    /// open until the copy's control connection ends.
+    pub(super) stage_scope: u64,
 }
 
 impl RestrictedAuthority {
@@ -148,6 +151,11 @@ impl RestrictedAuthority {
         (self.copy.policy.existing == ExistingDestinationPolicy::Skip
             && self.extra_options.hardlinks)
             .then(|| self.owned.clone())
+    }
+
+    /// The scope of the files this copy is writing (`FsOps::set_stage_scope`).
+    pub(crate) fn stage_scope(&self) -> u64 {
+        self.stage_scope
     }
 
     pub(crate) fn hash_policy(&self) -> crate::hashing::HashPolicy {
@@ -256,6 +264,7 @@ impl RestrictedAuthority {
             hashing,
             extra_options,
             owned: Default::default(),
+            stage_scope: crate::fsops::new_stage_scope(),
             tcp_congestion,
             mapping: mapping.map(|authorization| {
                 Mutex::new(crate::mapping::Admission::new(

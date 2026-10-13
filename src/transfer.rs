@@ -2424,8 +2424,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             spec.prime_pooled_control(args.compress);
         }
     }
+    // A receiving process serves at most `MAX_WORKER_CONNECTIONS` worker
+    // connections at once, so automatic tuning asks for no more.
     let maximum_workers = if autotune {
         args.automatic_worker_limit()
+            .min(crate::server::MAX_WORKER_CONNECTIONS)
     } else {
         args.connections
     };
@@ -4015,14 +4018,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 (&dst_ep, receiver_roots, true),
             ] {
                 if let Endpoint::Remote(spec) = endpoint {
-                    // TCP workers share the control helper's process. SSH
-                    // workers each have their own process and descriptor limit.
-                    let shared = spec
-                        .tcp
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .is_some_and(|info| !info.failed);
+                    // Every worker of a receiver runs in its process, SSH
+                    // workers too. A sender's TCP workers share its control
+                    // helper's process; its SSH workers each have their own
+                    // process and descriptor limit.
+                    let shared = receiver
+                        || spec
+                            .tcp
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .is_some_and(|info| !info.failed);
                     if shared {
                         if let Some(budget) =
                             spec.diagnostics().peer.and_then(|peer| peer.descriptors)

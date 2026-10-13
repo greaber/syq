@@ -1305,23 +1305,44 @@ impl FsOps {
         let (partial, label, opened) =
             with_rooted_partial(&target, &put.copy_id, |relative, label| {
                 // Nothing reads a small file's sidecar, so it is opened for
-                // writing only, and without exclusive creation, which costs
-                // an NFS client a further request. Whatever the name held is
-                // opened too: a new empty file of ours is used as created,
-                // and anything else, or an open the kernel refused, takes
-                // the checked reuse that ranged writes apply.
-                if creates_foreign_owners(target.root.identity().dev) {
-                    return self.checked_small_stage(&target.root, relative, label, mode);
+                // writing only, and, where the root's filesystem's link
+                // counts can be trusted, without exclusive creation, which
+                // costs an NFS client a further request. Whatever the name
+                // held is opened too: a new empty file of ours, on a
+                // filesystem whose counts are trusted (judged through the
+                // file: another can be mounted below the root), is used as
+                // created, and anything else, or an open the kernel
+                // refused, takes the checked path that ranged writes apply.
+                if !target.root.link_counts_trusted()
+                    || creates_foreign_owners(target.root.identity().dev)
+                {
+                    return self.checked_small_stage(
+                        stages::of(self.stage_scope, &target, &put.copy_id, false),
+                        relative,
+                        label,
+                        mode,
+                    );
                 }
                 self.uncache_rooted(&target.root, relative);
-                match self.open_or_create_write_only_partial(&target.root, relative, mode) {
-                    Ok((file, created)) if is_fresh_partial(&created, mode) => {
+                match self.open_or_create_partial(&target.root, relative, mode, true) {
+                    Ok((file, created))
+                        if is_fresh_partial(&created, mode)
+                            && target.root.link_counts_trusted_on(created.dev(), &file) =>
+                    {
                         Ok(Some((file, created, None)))
                     }
-                    Ok(_) => self.checked_small_stage(&target.root, relative, label, mode),
-                    Err(error) if existing_leaf_refused(&error) => {
-                        self.checked_small_stage(&target.root, relative, label, mode)
-                    }
+                    Ok(_) => self.checked_small_stage(
+                        stages::of(self.stage_scope, &target, &put.copy_id, false),
+                        relative,
+                        label,
+                        mode,
+                    ),
+                    Err(error) if existing_leaf_refused(&error) => self.checked_small_stage(
+                        stages::of(self.stage_scope, &target, &put.copy_id, false),
+                        relative,
+                        label,
+                        mode,
+                    ),
                     Err(error) => Err(error),
                 }
             })?;
@@ -1341,13 +1362,13 @@ impl FsOps {
     /// metadata of the file it settles on.
     fn checked_small_stage(
         &mut self,
-        root: &Root,
+        held: stages::For<'_>,
         relative: &RelativePath,
         label: &Path,
         mode: u32,
     ) -> Result<Option<(File, fs::Metadata, Option<u64>)>> {
         let Some((file, opened)) =
-            self.open_private_partial_rooted(root, relative, label, true, mode, Some(mode))?
+            self.open_private_partial_rooted(held, relative, label, true, mode, Some(mode))?
         else {
             return Ok(None);
         };
@@ -2795,7 +2816,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_sidecar_is_opened_for_writing_only_and_a_leftover_is_reused() {
+    fn a_new_sidecar_is_opened_for_writing_only_and_a_leftover_is_replaced() {
         let temporary = crate::test_support::tempdir().unwrap();
         let mut ops = receiver(temporary.path());
         let access = |stage: &SmallStage| {
@@ -2808,7 +2829,9 @@ mod tests {
         assert!(!stage.reused);
         // An attempt interrupted before it wrote anything leaves an empty
         // sidecar, which is what a new one would be; the copy uses it as
-        // created. One interrupted after writing takes the checked reuse.
+        // created. One interrupted after writing takes the checked path,
+        // which replaces it: only a sidecar the receiver holds is written
+        // again, and a small file's is never held.
         drop(stage);
         let target = ops.small_target(&file).unwrap();
         let stage = ops.create_small_stage(&file, target).unwrap();
@@ -2817,7 +2840,7 @@ mod tests {
         drop(stage);
         let target = ops.small_target(&file).unwrap();
         let stage = ops.create_small_stage(&file, target).unwrap();
-        assert!(stage.reused);
+        assert!(!stage.reused);
         ops.write_small_stage(&file, None, &stage, None).unwrap();
         ops.publish_small_stage(&file, &stage).unwrap();
         assert_eq!(ops.finish_small_stage(&file, stage).unwrap(), None);

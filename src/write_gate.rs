@@ -1,5 +1,7 @@
 //! Serialize Linux range writes while keeping reception and hashing parallel.
-//! The registry is process-local; independent SSH helpers do not share it.
+//! Every worker of a copy runs in its receiver process, so the registry
+//! covers them all. Writes are serialized only on filesystems where that
+//! helps (`Profile::serialized_writes`).
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -44,30 +46,58 @@ impl Registry {
     }
 }
 
+/// Whether writes to one file on the device of `file` are serialized, as
+/// the filesystem's profile says (`Profile::serialized_writes`), cached per
+/// device.
+#[cfg(any(target_os = "linux", test))]
+fn serializes_range_writes(file: &File, dev: u64) -> bool {
+    static DEVICES: OnceLock<Mutex<HashMap<u64, bool>>> = OnceLock::new();
+    let devices = DEVICES.get_or_init(Default::default);
+    if let Some(&serializes) = devices.lock().unwrap().get(&dev) {
+        return serializes;
+    }
+    let serializes = profile_serializes_writes(file);
+    devices.lock().unwrap().insert(dev, serializes);
+    serializes
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn profile_serializes_writes(file: &File) -> bool {
+    crate::fsops::profile(file).serialized_writes
+}
+
+/// Tests serialize on every filesystem, so the gate itself is exercised
+/// wherever they run; the profile's choice is tested with the profiles.
+#[cfg(test)]
+fn profile_serializes_writes(_file: &File) -> bool {
+    true
+}
+
 pub(crate) struct CachedFile {
     file: File,
-    /// Metadata read when this descriptor opened or created its file,
-    /// before any write, kept for publication: an NFS client answers that
-    /// read from the open's reply, where one after the data is written is a
-    /// request.
-    opened: Option<std::fs::Metadata>,
+    /// The file's write gate, or `None` where writes are not serialized.
     #[cfg(any(target_os = "linux", test))]
-    gate: OnceLock<Arc<Mutex<()>>>,
+    gate: OnceLock<Option<Arc<Mutex<()>>>>,
+    /// For a file the receiver holds for a copy, a share of its use count,
+    /// which keeps it held while this descriptor is cached.
+    _in_use: Option<std::sync::Arc<()>>,
 }
 
 impl CachedFile {
     pub(crate) fn new(file: File) -> Self {
         Self {
             file,
-            opened: None,
             #[cfg(any(target_os = "linux", test))]
             gate: OnceLock::new(),
+            _in_use: None,
         }
     }
 
-    pub(crate) fn opened(file: File, metadata: std::fs::Metadata) -> Self {
+    /// A descriptor of a file the receiver holds, with a share of its use
+    /// count.
+    pub(crate) fn held(file: File, in_use: std::sync::Arc<()>) -> Self {
         Self {
-            opened: Some(metadata),
+            _in_use: Some(in_use),
             ..Self::new(file)
         }
     }
@@ -80,26 +110,23 @@ impl CachedFile {
         self.file
     }
 
-    pub(crate) fn into_parts(self) -> (File, Option<std::fs::Metadata>) {
-        (self.file, self.opened)
-    }
-
     #[cfg(any(target_os = "linux", test))]
-    fn write_gate(&self) -> io::Result<&Arc<Mutex<()>>> {
+    fn write_gate(&self) -> io::Result<Option<&Arc<Mutex<()>>>> {
         if let Some(gate) = self.gate.get() {
-            return Ok(gate);
+            return Ok(gate.as_ref());
         }
         static GATES: OnceLock<Mutex<Registry>> = OnceLock::new();
         // The open descriptor pins this inode for the lifetime of the cached gate.
         // Register lazily so reads and native copies do not pay for a write gate.
         let metadata = self.file.metadata()?;
-        let key = (metadata.dev(), metadata.ino());
-        let gate = GATES
-            .get_or_init(|| Mutex::new(Registry::new()))
-            .lock()
-            .unwrap()
-            .gate(key);
-        Ok(self.gate.get_or_init(|| gate))
+        let gate = serializes_range_writes(&self.file, metadata.dev()).then(|| {
+            GATES
+                .get_or_init(|| Mutex::new(Registry::new()))
+                .lock()
+                .unwrap()
+                .gate((metadata.dev(), metadata.ino()))
+        });
+        Ok(self.gate.get_or_init(|| gate).as_ref())
     }
 
     pub(crate) fn write_range_at(&self, data: &[u8], offset: u64, sparse: bool) -> io::Result<()> {
@@ -108,7 +135,7 @@ impl CachedFile {
         #[cfg(any(target_os = "linux", test))]
         let gate = self.write_gate()?;
         #[cfg(any(target_os = "linux", test))]
-        let _writer = gate.lock().unwrap();
+        let _writer = gate.map(|gate| gate.lock().unwrap());
         if sparse {
             crate::sparse::write_at(&self.file, data, offset, true)
         } else {
@@ -157,7 +184,7 @@ mod tests {
                 scope.spawn(move || {
                     let file = CachedFile::new(File::options().write(true).open(path).unwrap());
                     for _ in 0..32 {
-                        let gate = file.write_gate().unwrap();
+                        let gate = file.write_gate().unwrap().unwrap();
                         let _writer = gate.lock().unwrap();
                         assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
                         std::thread::yield_now();
@@ -177,19 +204,19 @@ mod tests {
         let alias = dir.path().join("alias");
         let original = CachedFile::new(File::create(&path).unwrap());
         original.write_range_at(b"old", 0, false).unwrap();
-        let gate = Arc::downgrade(original.write_gate().unwrap());
+        let gate = Arc::downgrade(original.write_gate().unwrap().unwrap());
         std::fs::hard_link(&path, &alias).unwrap();
         let other = CachedFile::new(File::options().write(true).open(&alias).unwrap());
         assert!(Arc::ptr_eq(
-            original.write_gate().unwrap(),
-            other.write_gate().unwrap()
+            original.write_gate().unwrap().unwrap(),
+            other.write_gate().unwrap().unwrap()
         ));
 
         std::fs::remove_file(&path).unwrap();
         let replacement = CachedFile::new(File::create(&path).unwrap());
         assert!(!Arc::ptr_eq(
-            original.write_gate().unwrap(),
-            replacement.write_gate().unwrap()
+            original.write_gate().unwrap().unwrap(),
+            replacement.write_gate().unwrap().unwrap()
         ));
         original.write_range_at(b"OLD", 0, false).unwrap();
         replacement.write_range_at(b"new", 0, false).unwrap();
@@ -200,8 +227,8 @@ mod tests {
         drop(original);
         let reopened = CachedFile::new(File::options().write(true).open(&alias).unwrap());
         assert!(Arc::ptr_eq(
-            other.write_gate().unwrap(),
-            reopened.write_gate().unwrap()
+            other.write_gate().unwrap().unwrap(),
+            reopened.write_gate().unwrap().unwrap()
         ));
         drop(other);
         drop(reopened);
@@ -214,8 +241,8 @@ mod tests {
         let path = dir.path().join("first");
         let first = CachedFile::new(File::create(&path).unwrap());
         let second = CachedFile::new(File::create(dir.path().join("second")).unwrap());
-        let first_gate = first.write_gate().unwrap();
-        let second_gate = second.write_gate().unwrap();
+        let first_gate = first.write_gate().unwrap().unwrap();
+        let second_gate = second.write_gate().unwrap().unwrap();
         assert!(!Arc::ptr_eq(first_gate, second_gate));
         {
             let _held = first_gate.lock().unwrap();

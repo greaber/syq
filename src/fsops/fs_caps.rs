@@ -131,6 +131,11 @@ pub(crate) struct Profile {
     /// rclone mount answers a hard link, so only there does a link that
     /// fails with `EIO` fall back to check-then-rename.
     pub(crate) audited: bool,
+    /// Concurrent range writes to one file are taken one at a time
+    /// (`write_gate`): on most filesystems they contend inside it, and
+    /// serializing them saves CPU at the same speed. ZFS locks only the
+    /// ranges written, so there they run concurrently, which is faster.
+    pub(crate) serialized_writes: bool,
 }
 
 impl Default for Profile {
@@ -149,6 +154,7 @@ impl Profile {
         symlink_times: false,
         two_second_mtimes: false,
         audited: false,
+        serialized_writes: true,
     };
 
     /// Every capability, as on the tested local filesystems.
@@ -161,6 +167,7 @@ impl Profile {
         symlink_times: true,
         two_second_mtimes: false,
         audited: true,
+        serialized_writes: true,
     };
 
     /// Tests stand in for filesystems that lack these capabilities.
@@ -212,6 +219,7 @@ impl Profile {
             | (self.symlink_times as u8) << 4
             | (self.two_second_mtimes as u8) << 5
             | (self.audited as u8) << 6
+            | (self.serialized_writes as u8) << 7
     }
 
     pub(crate) const fn from_bits(bits: u8) -> Self {
@@ -223,6 +231,7 @@ impl Profile {
             symlink_times: bits & 1 << 4 != 0,
             two_second_mtimes: bits & 1 << 5 != 0,
             audited: bits & 1 << 6 != 0,
+            serialized_writes: bits & 1 << 7 != 0,
         }
     }
 
@@ -361,6 +370,7 @@ pub(super) fn linux_profile(file_system_type: u32, file: &File, key: FileSystemK
         symlink_times,
         two_second_mtimes: fat,
         audited: tries_flags,
+        serialized_writes: t != ZFS_SUPER_MAGIC,
     }
 }
 
@@ -566,6 +576,7 @@ pub(crate) fn macos_profile(fd: RawFd) -> Profile {
                 symlink_times: true,
                 two_second_mtimes: false,
                 audited: true,
+                serialized_writes: true,
             },
             &volume.kind,
         ),
@@ -679,7 +690,7 @@ mod tests {
 
     #[test]
     fn profiles_survive_their_bits() {
-        for bits in 0..128 {
+        for bits in 0..=u8::MAX {
             assert_eq!(Profile::from_bits(bits).to_bits(), bits);
         }
         assert_eq!(Profile::from_bits(Profile::LOCAL.to_bits()), Profile::LOCAL);
@@ -764,10 +775,17 @@ mod tests {
             libc::XFS_SUPER_MAGIC as u32,
             libc::BTRFS_SUPER_MAGIC as u32,
             libc::TMPFS_MAGIC as u32,
-            ZFS_SUPER_MAGIC,
         ] {
             assert_eq!(linux_profile(local, &file, key), Profile::LOCAL);
         }
+        // ZFS locks only the ranges written, so its writes run concurrently.
+        assert_eq!(
+            linux_profile(ZFS_SUPER_MAGIC, &file, key),
+            Profile {
+                serialized_writes: false,
+                ..Profile::LOCAL
+            }
+        );
         for evidenced in [
             F2FS_SUPER_MAGIC,
             NTFS3_SUPER_MAGIC,

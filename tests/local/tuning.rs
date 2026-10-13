@@ -2584,15 +2584,17 @@ fn resource_pressure_reports_essential_and_fixed_worker_failures() {
 #[cfg(debug_assertions)]
 #[test]
 fn resource_pressure_accounts_for_transport_and_endpoint_roots() {
-    for (label, limit, tcp, selectors, expected) in [
-        ("tcp-low", 128, true, false, 2..=2),
+    for (label, limit, tcp, selectors, expected, notice) in [
+        ("tcp-low", 128, true, false, 2..=2, true),
         // A ceiling above the SSH start of eight must still report the
         // reduction from the TCP start of sixteen.
-        ("tcp-notice", 512, true, false, 11..=13),
-        ("ssh-processes", 128, false, false, 8..=8),
+        ("tcp-notice", 512, true, false, 11..=13, true),
+        // SSH workers run in the receiver's process too, and share its
+        // limit.
+        ("ssh-low", 128, false, false, 2..=2, true),
         // Only the local source holds these roots. Charging them to this
         // receiver's shared process used to reduce its ceiling to five.
-        ("receiver-roots", 4096, true, true, 16..=16),
+        ("receiver-roots", 4096, true, true, 16..=16, false),
     ] {
         let t = Tmp::new();
         let rsh = fake_rsh(&t);
@@ -2652,10 +2654,9 @@ fn resource_pressure_accounts_for_transport_and_endpoint_roots() {
         let output =
             wait_for_child_output(command.start().unwrap(), std::time::Duration::from_secs(30));
         assert_output_ok(&output);
-        let notice = stderr_of(&output).contains("open-file limits restrict this copy");
         assert_eq!(
+            stderr_of(&output).contains("open-file limits restrict this copy"),
             notice,
-            label.starts_with("tcp-"),
             "{label}: {}",
             stderr_of(&output)
         );

@@ -370,8 +370,8 @@ impl Root {
                 Err(current) => crate::fsops::Profile::from_bits(current as u8),
             };
         }
-        if let Some(profile) = self.other_profiles.lock().unwrap().get(&dev) {
-            return *profile;
+        if let Some(profile) = self.known_profile(dev) {
+            return profile;
         }
         let read = crate::fsops::profile(directory);
         *self
@@ -382,6 +382,27 @@ impl Root {
             .or_insert(read)
     }
 
+    /// The profile of device `dev` when it needs no file on that device to
+    /// read it: the root's own, or one already read.
+    pub(crate) fn known_profile(&self, dev: u64) -> Option<crate::fsops::Profile> {
+        #[cfg(test)]
+        if let Some(profile) = *self.test_profile.lock().unwrap() {
+            return Some(profile);
+        }
+        if dev == self.identity.dev {
+            return Some(self.profile());
+        }
+        self.other_profiles.lock().unwrap().get(&dev).copied()
+    }
+
+    /// Whether the filesystem `file`, on device `dev`, is on reports link
+    /// counts and inode numbers that checks can rely on
+    /// (`link_counts_trusted`), read through `file` itself: below the root
+    /// another filesystem can be mounted.
+    pub(crate) fn link_counts_trusted_on(&self, dev: u64, file: &File) -> bool {
+        self.profile_on(dev, file).link_counts_trusted
+    }
+
     /// The profile of the root's own filesystem.
     pub(crate) fn profile(&self) -> crate::fsops::Profile {
         self.profile_on(self.identity.dev, &self.directory)
@@ -389,10 +410,9 @@ impl Root {
 
     /// Whether the root's filesystem reports link counts and inode numbers
     /// that checks can rely on. Where it does not, a check that needs to
-    /// know a file has no other names must assume it may have some.
-    // Its callers are still to come: the check that lets metadata change in
-    // place, and fast staging.
-    #[allow(dead_code)]
+    /// know a file has no other names must assume it may have some. A file
+    /// below the root is judged by its own filesystem
+    /// (`link_counts_trusted_on`).
     pub(crate) fn link_counts_trusted(&self) -> bool {
         self.profile().link_counts_trusted
     }
@@ -757,6 +777,15 @@ impl Root {
         mode: u32,
     ) -> Result<(File, std::fs::Metadata)> {
         self.open_or_create_file_with_access(path, mode, libc::O_WRONLY)
+    }
+
+    /// `open_or_create_write_only_file`, read-write.
+    pub(crate) fn open_or_create_file(
+        &self,
+        path: &RelativePath,
+        mode: u32,
+    ) -> Result<(File, std::fs::Metadata)> {
+        self.open_or_create_file_with_access(path, mode, libc::O_RDWR)
     }
 
     fn open_or_create_file_with_access(

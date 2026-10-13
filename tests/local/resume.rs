@@ -1220,7 +1220,6 @@ fn unchmodable_interrupted_partial_is_left_alone() {
     let out = compat_command()
         .args(args)
         .arg("--no-progress")
-        .env("SYQ_TEST_FAIL_PARTIAL_CHMOD", "1")
         .run()
         .unwrap();
 

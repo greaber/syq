@@ -5,6 +5,13 @@
 //! directly; independent workers use a private, secret-authenticated Unix
 //! socket and receive the same open file descriptions with `SCM_RIGHTS`. No
 //! worker reopens an operator pathname.
+//!
+//! The same socket takes connections the other way: a process that an SSH
+//! session started for a worker hands the session's pipes (or a local
+//! coordinator hands one end of a socket pair) to the control process, which
+//! serves the connection on a thread of its own, as it serves a TCP worker.
+//! Every worker of a copy then runs in the process that holds the copy's
+//! state.
 
 use crate::private_broker::{PrivateBroker, PrivateBrokerConfig, TrackedStream};
 #[cfg(test)]
@@ -18,6 +25,7 @@ use std::io::{self, Read, Write};
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,6 +38,19 @@ const HANDOFF_REQUEST_LEN: usize = HANDOFF_MAGIC.len() + SECRET_LEN + size_of::<
 const RESPONSE_OK: u8 = 0;
 const RESPONSE_REJECTED: u8 = 1;
 const RESPONSE_INTERNAL: u8 = 2;
+/// The kind byte of a request that hands over a connection to serve rather
+/// than claiming a descriptor.
+const CONNECTION_REQUEST: u8 = 0x80;
+/// The bytes a handing-over process may already have read from its
+/// connection: the peer's preamble and Hello, and what a buffered read took
+/// past them.
+const MAX_HANDED_PREFIX: usize = crate::proto::MAX_HANDSHAKE_FRAME + (64 << 10);
+/// How a served connection ended, sent to the process that handed it over.
+const CONNECTION_ENDED: u8 = 0;
+const CONNECTION_FAILED: u8 = 1;
+/// Longest failure text sent back to the process that handed over a
+/// connection.
+const MAX_ENDING_MESSAGE: usize = 64 << 10;
 const BROKER_IO_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const DEFAULT_MAX_ROOTS: usize = 256;
 const DEFAULT_MAX_CONNECTIONS: usize = 256;
@@ -314,6 +335,61 @@ impl DescriptorTicket {
     }
 }
 
+/// A connection another process handed to this process to serve, with the
+/// bytes it had already read from the connection.
+pub(crate) struct HandedConnection {
+    pub(crate) prefix: Vec<u8>,
+    pub(crate) transport: HandedTransport,
+    /// The handing-over process waits on this socket until the connection
+    /// ends; `report_end` tells it how.
+    pub(crate) control: TrackedStream,
+}
+
+pub(crate) enum HandedTransport {
+    /// An SSH session's input and output.
+    Pipes { input: File, output: File },
+    /// One end of a socket pair a local coordinator made.
+    Socket(UnixStream),
+}
+
+impl HandedConnection {
+    /// Tell the process handing this connection over that this process
+    /// serves it. The handler sends this, or `refuse`, exactly once.
+    pub(crate) fn accept(control: &mut TrackedStream) -> io::Result<()> {
+        control.write_all(&[RESPONSE_OK])
+    }
+
+    /// Tell the process handing this connection over that this process will
+    /// not serve it.
+    pub(crate) fn refuse(self) {
+        let mut control = self.control;
+        let _ = control.write_all(&[RESPONSE_REJECTED]);
+    }
+
+    /// Tell the process that handed this connection over how it ended, so
+    /// that it exits as a process serving the connection itself would have.
+    pub(crate) fn report_end(mut control: TrackedStream, result: &Result<()>) {
+        let mut ending = Vec::new();
+        match result {
+            Ok(()) => ending.push(CONNECTION_ENDED),
+            Err(error) => {
+                let mut message = format!("{error:#}").into_bytes();
+                message.truncate(MAX_ENDING_MESSAGE);
+                ending.push(CONNECTION_FAILED);
+                ending.extend_from_slice(&(message.len() as u32).to_be_bytes());
+                ending.extend_from_slice(&message);
+            }
+        }
+        let _ = control.write_all(&ending);
+    }
+}
+
+/// Serves a connection handed to this process: it accepts the connection
+/// and serves it on a thread of its own, or refuses it.
+pub(crate) type ConnectionHandler = Arc<dyn Fn(HandedConnection) -> Result<()> + Send + Sync>;
+
+type HandlerCell = Arc<Mutex<Option<ConnectionHandler>>>;
+
 /// Owns the endpoint session's roots and its independent-worker handoff
 /// broker. Dropping it closes the broker before releasing the registered roots.
 pub(crate) struct DescriptorSession {
@@ -323,11 +399,17 @@ pub(crate) struct DescriptorSession {
 }
 
 impl DescriptorSession {
+    #[cfg(test)]
     pub(crate) fn start(max_roots: usize, max_connections: usize) -> Result<Self> {
-        Self::start_inner(max_roots, max_connections, false)
+        Self::start_inner(max_roots, max_connections, false, HandlerCell::default())
     }
 
-    fn start_inner(max_roots: usize, max_connections: usize, managed: bool) -> Result<Self> {
+    fn start_inner(
+        max_roots: usize,
+        max_connections: usize,
+        managed: bool,
+        connections: HandlerCell,
+    ) -> Result<Self> {
         let registry = RegisteredRootRegistry::new(max_roots)?;
         let secret: [u8; SECRET_LEN] = crate::tcp_records::random_bytes(SECRET_LEN)
             .try_into()
@@ -343,8 +425,8 @@ impl DescriptorSession {
             max_connections,
             io_timeout: BROKER_IO_TIMEOUT,
         };
-        let handler = move |mut stream: TrackedStream, _connections| {
-            let _ = serve_acquire(&mut stream, &server_registry, &server_secret);
+        let handler = move |stream: TrackedStream, _connections| {
+            let _ = serve_request(stream, &server_registry, &server_secret, &connections);
         };
         let broker = if managed {
             PrivateBroker::start_managed(config, handler)?
@@ -415,6 +497,9 @@ pub(crate) struct DescriptorSessionSlot {
     session: Arc<Mutex<Option<DescriptorSession>>>,
     bandwidth: Arc<Mutex<Option<SendBudget>>>,
     closed: Arc<AtomicBool>,
+    /// Serves connections other processes hand to this one; without it the
+    /// broker refuses them.
+    connections: HandlerCell,
     max_roots: usize,
     max_connections: usize,
 }
@@ -425,6 +510,7 @@ impl Default for DescriptorSessionSlot {
             session: Arc::new(Mutex::new(None)),
             bandwidth: Arc::new(Mutex::new(None)),
             closed: Arc::new(AtomicBool::new(false)),
+            connections: HandlerCell::default(),
             max_roots: DEFAULT_MAX_ROOTS,
             max_connections: DEFAULT_MAX_CONNECTIONS,
         }
@@ -434,14 +520,35 @@ impl Default for DescriptorSessionSlot {
 impl DescriptorSessionSlot {
     /// The caller handles signals and must close this session before exit.
     pub(crate) fn managed() -> Result<Self> {
+        let connections = HandlerCell::default();
         Ok(Self {
             session: Arc::new(Mutex::new(Some(DescriptorSession::start_inner(
                 DEFAULT_MAX_ROOTS,
                 DEFAULT_MAX_CONNECTIONS,
                 true,
+                connections.clone(),
             )?))),
+            connections,
             ..Self::default()
         })
+    }
+
+    /// Serve the worker connections other processes hand to this session
+    /// with `handler`. `close` drops it again.
+    pub(crate) fn serve_handed_connections(&self, handler: ConnectionHandler) {
+        *self
+            .connections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handler);
+    }
+
+    fn start_session(&self) -> Result<DescriptorSession> {
+        DescriptorSession::start_inner(
+            self.max_roots,
+            self.max_connections,
+            false,
+            self.connections.clone(),
+        )
     }
 
     /// All sending helpers in this endpoint session debit the same budget.
@@ -495,10 +602,7 @@ impl DescriptorSessionSlot {
             "descriptor session is closed"
         );
         if session.is_none() {
-            *session = Some(DescriptorSession::start(
-                self.max_roots,
-                self.max_connections,
-            )?);
+            *session = Some(self.start_session()?);
         }
         let session = session.as_ref().unwrap();
         let id = session
@@ -550,10 +654,7 @@ impl DescriptorSessionSlot {
             bail!("descriptor session is closed");
         }
         if session.is_none() {
-            *session = Some(DescriptorSession::start(
-                self.max_roots,
-                self.max_connections,
-            )?);
+            *session = Some(self.start_session()?);
         }
         let session = session.as_ref().expect("descriptor session initialized");
         session
@@ -586,10 +687,7 @@ impl DescriptorSessionSlot {
             bail!("descriptor session is closed");
         }
         if session.is_none() {
-            *session = Some(DescriptorSession::start(
-                self.max_roots,
-                self.max_connections,
-            )?);
+            *session = Some(self.start_session()?);
         }
         let session = session.as_ref().expect("descriptor session initialized");
         let has_leaf: Vec<_> = handles.iter().map(|(_, leaf)| leaf.is_some()).collect();
@@ -629,6 +727,11 @@ impl DescriptorSessionSlot {
     /// its private socket directory.
     pub(crate) fn close(&self) {
         self.closed.store(true, Ordering::Release);
+        // The handler may hold a clone of this slot.
+        self.connections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
         if let Some((budget, _)) = self.bandwidth.lock().unwrap().take() {
             budget.close();
         }
@@ -677,20 +780,274 @@ pub(crate) fn acquire_descriptor(ticket: &DescriptorTicket) -> Result<File> {
     }
 }
 
-fn serve_acquire(
-    stream: &mut TrackedStream,
+/// A connection handed to the process that owns its descriptor session. The
+/// handing-over process waits here until that process has served it.
+pub(crate) struct HandedOff(UnixStream);
+
+impl HandedOff {
+    /// Wait for the connection to end. An error carries the failure the
+    /// serving process reported, or says that it ended without reporting.
+    pub(crate) fn wait(mut self) -> Result<()> {
+        // macOS refuses to change the timeout once the receiver has closed
+        // its end, as when the connection already ended; what it sent is
+        // still there to read.
+        if let Err(error) = self.0.set_read_timeout(None) {
+            if error.raw_os_error() != Some(libc::EINVAL) {
+                return Err(error.into());
+            }
+        }
+        let mut status = [0u8];
+        if self.0.read_exact(&mut status).is_err() {
+            bail!("the receiver ended while serving this connection");
+        }
+        match status[0] {
+            CONNECTION_ENDED => Ok(()),
+            CONNECTION_FAILED => {
+                let mut length = [0u8; 4];
+                self.0.read_exact(&mut length)?;
+                let length = (u32::from_be_bytes(length) as usize).min(MAX_ENDING_MESSAGE);
+                let mut message = vec![0; length];
+                self.0.read_exact(&mut message)?;
+                Err(anyhow!("{}", String::from_utf8_lossy(&message)))
+            }
+            status => bail!("the receiver reported unknown connection status {status}"),
+        }
+    }
+}
+
+/// Hand this process's standard input and output, an SSH session's, over
+/// `socket`, which its listener has already admitted, and wait until the
+/// listening process has served them.
+pub(crate) fn hand_over_standard_streams(socket: UnixStream) -> Result<()> {
+    let handed = hand_over_streams(socket, 0, 1)?;
+    release_standard_streams()?;
+    handed.wait()
+}
+
+/// Hand a connection's `input` and `output` over `socket`, which its
+/// listener has already admitted, once the listening process takes them.
+pub(crate) fn hand_over_streams(
+    socket: UnixStream,
+    input: RawFd,
+    output: RawFd,
+) -> Result<HandedOff> {
+    socket.set_read_timeout(Some(BROKER_IO_TIMEOUT))?;
+    socket.set_write_timeout(Some(BROKER_IO_TIMEOUT))?;
+    send_message(socket.as_raw_fd(), &[CONNECTION_REQUEST], &[input, output])?;
+    let mut handed = HandedOff(socket);
+    let mut response = [0u8];
+    match handed.0.read_exact(&mut response) {
+        Ok(()) if response[0] == RESPONSE_OK => Ok(handed),
+        Ok(()) => bail!("the receiver refused the worker connection"),
+        Err(error) => Err(error).context("the receiver did not take the worker connection"),
+    }
+}
+
+/// Receive the standard input and output a worker's SSH session process
+/// hands over `socket` (`hand_over_standard_streams`).
+pub(crate) fn receive_standard_streams(socket: &UnixStream) -> Result<(File, File)> {
+    let (payload, mut descriptors) = receive_message(socket, 1)?;
+    anyhow::ensure!(
+        payload == [CONNECTION_REQUEST] && descriptors.len() == 2,
+        "malformed worker connection handoff"
+    );
+    let output = descriptors.pop().unwrap();
+    let input = descriptors.pop().unwrap();
+    Ok((input, output))
+}
+
+/// Point standard input and output at /dev/null once another process serves
+/// the connection they carried: only that process then holds the session's
+/// input and output, so it alone reads and answers them, and they close when
+/// it is done.
+pub(crate) fn release_standard_streams() -> Result<()> {
+    let null = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+        .context("open /dev/null")?;
+    for descriptor in [0, 1] {
+        if unsafe { libc::dup2(null.as_raw_fd(), descriptor) } < 0 {
+            return Err(io::Error::last_os_error()).context("release the worker connection");
+        }
+    }
+    Ok(())
+}
+
+/// Hand the connection whose input is `input` and output `output` to the
+/// process that owns `ticket`'s session, with the bytes already read from it.
+pub(crate) fn hand_off_pipes(
+    ticket: &DescriptorTicket,
+    prefix: &[u8],
+    input: RawFd,
+    output: RawFd,
+) -> Result<HandedOff> {
+    hand_off(ticket, prefix, &[input, output])
+}
+
+/// Hand `socket`, a connection nothing has read from yet, to the process that
+/// owns `ticket`'s session.
+pub(crate) fn hand_off_socket(ticket: &DescriptorTicket, socket: RawFd) -> Result<HandedOff> {
+    hand_off(ticket, &[], &[socket])
+}
+
+fn hand_off(ticket: &DescriptorTicket, prefix: &[u8], descriptors: &[RawFd]) -> Result<HandedOff> {
+    anyhow::ensure!(
+        prefix.len() <= MAX_HANDED_PREFIX,
+        "connection prefix is too long to hand over"
+    );
+    let socket_path = ticket.socket_path();
+    let mut stream = UnixStream::connect(&socket_path)
+        .with_context(|| format!("connect to descriptor broker {}", socket_path.display()))?;
+    stream.set_read_timeout(Some(BROKER_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(BROKER_IO_TIMEOUT))?;
+    let mut request = [0u8; HANDOFF_REQUEST_LEN];
+    request[..HANDOFF_MAGIC.len()].copy_from_slice(HANDOFF_MAGIC);
+    let secret_start = HANDOFF_MAGIC.len();
+    request[secret_start..secret_start + SECRET_LEN].copy_from_slice(&ticket.secret);
+    request[HANDOFF_REQUEST_LEN - 1] = CONNECTION_REQUEST;
+    stream.write_all(&request)?;
+    send_message(
+        stream.as_raw_fd(),
+        &(prefix.len() as u32).to_be_bytes(),
+        descriptors,
+    )?;
+    stream.write_all(prefix)?;
+    let mut response = [0u8];
+    match stream.read_exact(&mut response) {
+        Ok(()) if response[0] == RESPONSE_OK => Ok(HandedOff(stream)),
+        Ok(()) => bail!("the receiver refused the worker connection"),
+        Err(error) => Err(error).context("the receiver did not take the worker connection"),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::HandedOff;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+
+    /// The input of a handed-over SSH session, closed as sshd closes it
+    /// once the session's process has exited: when that process is told the
+    /// connection is over, or its socket closes.
+    pub(crate) struct SessionInput(Arc<Mutex<Option<std::io::PipeWriter>>>);
+
+    impl SessionInput {
+        pub(crate) fn closed_after(input: std::io::PipeWriter, handed: HandedOff) -> Self {
+            let input = Arc::new(Mutex::new(Some(input)));
+            let closing = input.clone();
+            std::thread::spawn(move || {
+                let _ = handed.wait();
+                closing.lock().unwrap().take();
+            });
+            Self(input)
+        }
+    }
+
+    impl Drop for SessionInput {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().take();
+        }
+    }
+
+    impl Write for SessionInput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            match self.0.lock().unwrap().as_mut() {
+                Some(input) => input.write(bytes),
+                None => Err(io::ErrorKind::BrokenPipe.into()),
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            match self.0.lock().unwrap().as_mut() {
+                Some(input) => input.flush(),
+                None => Ok(()),
+            }
+        }
+    }
+}
+
+fn serve_request(
+    mut stream: TrackedStream,
     registry: &RegisteredRootRegistry,
     secret: &[u8; SECRET_LEN],
+    connections: &HandlerCell,
 ) -> Result<()> {
     let mut request = [0u8; HANDOFF_REQUEST_LEN];
     stream.read_exact(&mut request)?;
     let secret_start = HANDOFF_MAGIC.len();
     let authenticated = request[..secret_start] == *HANDOFF_MAGIC
-        && request[secret_start..secret_start + SECRET_LEN] == *secret;
+        && bool::from(subtle::ConstantTimeEq::ct_eq(
+            &request[secret_start..secret_start + SECRET_LEN],
+            secret.as_slice(),
+        ));
     if !authenticated {
         stream.write_all(&[RESPONSE_REJECTED])?;
         return Ok(());
     }
+    if request[HANDOFF_REQUEST_LEN - 1] == CONNECTION_REQUEST {
+        return accept_connection(stream, connections);
+    }
+    serve_acquire(&mut stream, &request, registry)
+}
+
+/// Take a connection another process hands over: its descriptors, then the
+/// bytes it already read from it. The handler serves it from here on.
+fn accept_connection(stream: TrackedStream, connections: &HandlerCell) -> Result<()> {
+    let handler = connections
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let socket = stream.try_clone()?;
+    let (header, mut descriptors) = receive_message(&socket, size_of::<u32>())?;
+    let mut stream = stream;
+    let Some(handler) = handler else {
+        stream.write_all(&[RESPONSE_REJECTED])?;
+        return Ok(());
+    };
+    let length = header
+        .as_slice()
+        .try_into()
+        .map(u32::from_be_bytes)
+        .context("malformed connection handoff")? as usize;
+    anyhow::ensure!(
+        length <= MAX_HANDED_PREFIX,
+        "handed connection prefix is too long"
+    );
+    let mut prefix = vec![0; length];
+    stream.read_exact(&mut prefix)?;
+    let transport = match descriptors.len() {
+        2 => {
+            let output = descriptors.pop().unwrap();
+            let input = descriptors.pop().unwrap();
+            HandedTransport::Pipes { input, output }
+        }
+        1 if prefix.is_empty() => {
+            let socket = descriptors.pop().unwrap();
+            anyhow::ensure!(
+                socket.metadata()?.file_type().is_socket(),
+                "a handed socket must be a socket"
+            );
+            HandedTransport::Socket(UnixStream::from(std::os::fd::OwnedFd::from(socket)))
+        }
+        _ => {
+            stream.write_all(&[RESPONSE_REJECTED])?;
+            return Ok(());
+        }
+    };
+    handler(HandedConnection {
+        prefix,
+        transport,
+        control: stream,
+    })
+}
+
+fn serve_acquire(
+    stream: &mut TrackedStream,
+    request: &[u8; HANDOFF_REQUEST_LEN],
+    registry: &RegisteredRootRegistry,
+) -> Result<()> {
+    let secret_start = HANDOFF_MAGIC.len();
     let root_start = secret_start + SECRET_LEN;
     let root_end = root_start + size_of::<u64>();
     let root_id = RegisteredRootId(u64::from_be_bytes(
@@ -1332,6 +1689,59 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("rejected"));
+    }
+
+    #[test]
+    fn handed_connections_need_the_secret_and_their_descriptors() {
+        // The broker takes a connection only with the session's secret, as
+        // two pipes with the bytes already read or one socket without any,
+        // and only while the session serves handed connections.
+        let temp = crate::test_support::tempdir().unwrap();
+        let slot = DescriptorSessionSlot::default();
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = served.clone();
+        slot.serve_handed_connections(Arc::new(move |connection: HandedConnection| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut control = connection.control;
+            HandedConnection::accept(&mut control)?;
+            HandedConnection::report_end(control, &Ok(()));
+            Ok(())
+        }));
+        let ticket = slot.register(File::open(temp.path()).unwrap()).unwrap();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let socket = socket.as_raw_fd();
+        let (input, _input) = std::io::pipe().unwrap();
+        let (_output, output) = std::io::pipe().unwrap();
+        let pipes = [input.as_raw_fd(), output.as_raw_fd()];
+
+        let mut wrong = ticket.clone();
+        wrong.secret[0] ^= 1;
+        assert!(hand_off_socket(&wrong, socket).is_err());
+        for (prefix, descriptors) in [
+            (&b""[..], &[socket, socket, socket][..]),
+            (b"hello", &[socket]),
+            (b"", &[]),
+        ] {
+            assert!(
+                hand_off(&ticket, prefix, descriptors).is_err(),
+                "{} descriptors, {} bytes",
+                descriptors.len(),
+                prefix.len()
+            );
+        }
+        assert_eq!(served.load(Ordering::SeqCst), 0);
+
+        hand_off_socket(&ticket, socket).unwrap().wait().unwrap();
+        hand_off_pipes(&ticket, b"hello", pipes[0], pipes[1])
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+
+        // A session that no longer serves them refuses them.
+        slot.connections.lock().unwrap().take();
+        assert!(hand_off_socket(&ticket, socket).is_err());
+        assert_eq!(served.load(Ordering::SeqCst), 2);
     }
 
     #[cfg(debug_assertions)]

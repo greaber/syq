@@ -225,11 +225,24 @@ struct ServeSession {
     descriptor_session: DescriptorSessionSlot,
 }
 
+/// Lets go of the files a copy is writing when its control connection ends.
+struct ReleaseStages(u64);
+
+impl Drop for ReleaseStages {
+    fn drop(&mut self) {
+        crate::fsops::release_stages(self.0);
+    }
+}
+
+/// Most worker connections one receiving process serves at once, over TCP
+/// or handed over from SSH sessions, each counted separately.
+pub(crate) const MAX_WORKER_CONNECTIONS: usize = 256;
+
 /// Ceiling on accepted TCP sockets being served at once, authenticated or
 /// not. It bounds thread use against scanners and stray connections; the
 /// signed grant's `max_connections` is charged separately, after a worker
 /// authenticates.
-const MAX_LIVE_TCP_CONNECTIONS: u32 = 256;
+const MAX_LIVE_TCP_CONNECTIONS: u32 = MAX_WORKER_CONNECTIONS as u32;
 
 /// One authenticated worker's share of a signed grant's connection allowance,
 /// returned when the connection ends.
@@ -274,9 +287,15 @@ impl Drop for ConnectionPermit {
 /// `local_receiver` marks the child process that receives a local copy.
 pub fn run(local_receiver: bool) -> Result<()> {
     let _termination = clean_up_on_termination();
+    let (prefix, hello) = peek_hello();
+    if let Some(ticket) = hello.as_ref().and_then(handed_worker_ticket) {
+        return hand_off_worker(&ticket, &prefix);
+    }
     let descriptor_session = DescriptorSessionSlot::default();
+    descriptor_session
+        .serve_handed_connections(handed_connection_handler(descriptor_session.clone()));
     let result = serve(
-        io::stdin(),
+        io::Cursor::new(prefix).chain(io::stdin()),
         io::stdout().lock(),
         true,
         None,
@@ -298,6 +317,260 @@ pub fn run(local_receiver: bool) -> Result<()> {
     descriptor_session.close();
     crate::process::termination::wait_if_terminating();
     result
+}
+
+/// Records every byte read through it.
+struct Recording<'a, R> {
+    inner: R,
+    recorded: &'a mut Vec<u8>,
+}
+
+impl<R: Read> Read for Recording<'_, R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let count = self.inner.read(bytes)?;
+        self.recorded.extend_from_slice(&bytes[..count]);
+        Ok(count)
+    }
+}
+
+/// Read the client's Hello from standard input, unbuffered by `io::stdin`,
+/// with every byte read for it. A Hello that cannot be read is left to
+/// `serve`, which reads the same bytes again and reports what is wrong.
+fn peek_hello() -> (Vec<u8>, Option<Request>) {
+    // SAFETY: borrows descriptor 0 without closing it.
+    let input = std::mem::ManuallyDrop::new(unsafe {
+        <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(0)
+    });
+    let mut recorded = Vec::new();
+    let hello = {
+        let mut reader = FrameReader::new(Recording {
+            inner: &*input,
+            recorded: &mut recorded,
+        });
+        reader.set_limit(MAX_HANDSHAKE_FRAME);
+        reader
+            .read_budgeted::<Request>()
+            .ok()
+            .map(|hello| hello.into_parts().0)
+    };
+    (recorded, hello)
+}
+
+/// The descriptor session whose process serves this destination worker:
+/// the copy's receiver, which registered the destination root.
+fn handed_worker_ticket(hello: &Request) -> Option<crate::descriptor_broker::DescriptorTicket> {
+    match hello {
+        Request::Hello {
+            identity,
+            role:
+                ConnectionRole::DestinationWorker {
+                    destination: Some(destination),
+                    ..
+                },
+            ..
+        } if identity == crate::identity::build() => Some(destination.ticket.clone()),
+        _ => None,
+    }
+}
+
+/// Give an SSH session's worker connection to the copy's receiver, which
+/// serves it on a thread as it serves a TCP worker, and wait until it has.
+/// The bytes already read (`prefix`) go with it.
+fn hand_off_worker(
+    ticket: &crate::descriptor_broker::DescriptorTicket,
+    prefix: &[u8],
+) -> Result<()> {
+    let handed = match crate::descriptor_broker::hand_off_pipes(ticket, prefix, 0, 1) {
+        Ok(handed) => handed,
+        Err(error) => {
+            // The coordinator learns of it as of any worker that cannot start.
+            let mut writer = FrameWriter::new(io::stdout().lock(), false);
+            let _ = writer.write_msg(&Response::Err(format!(
+                "hand the worker connection to the receiver: {error:#}"
+            )));
+            return Err(error);
+        }
+    };
+    crate::descriptor_broker::release_standard_streams()?;
+    handed.wait()
+}
+
+/// Serve a restricted worker's SSH session, whose input and output its
+/// process handed over `control` after the receiver admitted it, and tell
+/// that process how it ended. Hello must arrive within the handshake time.
+pub(crate) fn serve_handed_restricted(
+    input: std::fs::File,
+    output: std::fs::File,
+    mut control: crate::private_broker::TrackedStream,
+    authority: Arc<crate::restricted::RestrictedAuthority>,
+    handshake: Duration,
+) -> Result<()> {
+    use crate::descriptor_broker::HandedConnection;
+    HandedConnection::accept(&mut control)?;
+    #[cfg(debug_assertions)]
+    record_handed_connection_for_test();
+    let pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let reader = PipeHandshakeReader {
+        input,
+        pending: pending.clone(),
+        deadline: std::time::Instant::now() + handshake,
+    };
+    let descriptor_session = DescriptorSessionSlot::default();
+    let result = serve(
+        reader,
+        output,
+        false,
+        None,
+        None,
+        None,
+        ServeSession {
+            owns_process: false,
+            handshake_pending: Some(pending),
+            ssh_worker_ticket: None,
+            allow_tcp: false,
+            metadata_control: false,
+            loopback_only: false,
+            named_socket: None,
+            authority: Some(authority),
+            source_authority: None,
+            descriptor_session: descriptor_session.clone(),
+        },
+    );
+    descriptor_session.close();
+    HandedConnection::report_end(control, &result);
+    result
+}
+
+/// Bound every read of a handed-over SSH session by the Hello deadline until
+/// `serve` clears `pending`, as `TcpHandshakeReader` bounds a socket's.
+struct PipeHandshakeReader {
+    input: std::fs::File,
+    pending: Arc<std::sync::atomic::AtomicBool>,
+    deadline: std::time::Instant,
+}
+
+impl Read for PipeHandshakeReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pending.load(std::sync::atomic::Ordering::Acquire) {
+            // A signal can end a wait early; the next one waits for what
+            // remains of the deadline.
+            let input = std::os::fd::AsRawFd::as_raw_fd(&self.input);
+            loop {
+                let remaining = self
+                    .deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .filter(|time| !time.is_zero())
+                    .ok_or_else(|| {
+                        io::Error::new(ErrorKind::TimedOut, "SSH worker Hello timed out")
+                    })?;
+                if crate::sys::readable_within(input, remaining) {
+                    break;
+                }
+            }
+        }
+        self.input.read(buf)
+    }
+}
+
+/// Most connections handed to one receiver that it serves at once, as for
+/// TCP connections.
+const MAX_LIVE_HANDED_CONNECTIONS: u32 = MAX_LIVE_TCP_CONNECTIONS;
+
+/// Serve the worker connections other processes hand to this receiver,
+/// each on a thread of its own.
+fn handed_connection_handler(
+    descriptor_session: DescriptorSessionSlot,
+) -> crate::descriptor_broker::ConnectionHandler {
+    handed_connection_handler_within(descriptor_session, MAX_LIVE_HANDED_CONNECTIONS)
+}
+
+/// `handed_connection_handler`, refusing connections beyond `limit` live.
+fn handed_connection_handler_within(
+    descriptor_session: DescriptorSessionSlot,
+    limit: u32,
+) -> crate::descriptor_broker::ConnectionHandler {
+    let live = Arc::new(AtomicU32::new(0));
+    Arc::new(move |connection| {
+        use crate::descriptor_broker::HandedConnection;
+        if live.fetch_add(1, Relaxed) >= limit {
+            live.fetch_sub(1, Relaxed);
+            connection.refuse();
+            return Ok(());
+        }
+        let session = descriptor_session.clone();
+        let served = live.clone();
+        let spawned = std::thread::Builder::new()
+            .name("syq-handed-worker".into())
+            .spawn(move || {
+                let HandedConnection {
+                    prefix,
+                    transport,
+                    mut control,
+                } = connection;
+                if HandedConnection::accept(&mut control).is_ok() {
+                    let result = serve_handed(prefix, transport, session);
+                    HandedConnection::report_end(control, &result);
+                }
+                served.fetch_sub(1, Relaxed);
+            });
+        if spawned.is_err() {
+            // The connection went with the closure: its process sees no answer.
+            live.fetch_sub(1, Relaxed);
+        }
+        Ok(())
+    })
+}
+
+/// Serve one handed-over worker connection. It is a data connection: it may
+/// not become a control.
+fn serve_handed(
+    prefix: Vec<u8>,
+    transport: crate::descriptor_broker::HandedTransport,
+    descriptor_session: DescriptorSessionSlot,
+) -> Result<()> {
+    #[cfg(debug_assertions)]
+    record_handed_connection_for_test();
+    let session = |named_socket| ServeSession {
+        owns_process: false,
+        handshake_pending: None,
+        ssh_worker_ticket: None,
+        allow_tcp: false,
+        metadata_control: false,
+        loopback_only: false,
+        named_socket,
+        authority: None,
+        source_authority: None,
+        descriptor_session: descriptor_session.clone(),
+    };
+    match transport {
+        crate::descriptor_broker::HandedTransport::Pipes { input, output } => serve(
+            io::Cursor::new(prefix).chain(input),
+            output,
+            false,
+            None,
+            None,
+            None,
+            session(None),
+        ),
+        crate::descriptor_broker::HandedTransport::Socket(socket) => serve(
+            socket.try_clone()?,
+            socket.try_clone()?,
+            false,
+            None,
+            None,
+            None,
+            session(Some(socket)),
+        ),
+    }
+}
+
+/// Record, for tests, that this process served a handed-over worker.
+#[cfg(debug_assertions)]
+fn record_handed_connection_for_test() {
+    let _ = crate::fsops::record_test_event(
+        "SYQ_TEST_HANDED_WORKER_EVENTS",
+        format_args!("served {}", std::process::id()),
+    );
 }
 
 pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Result<()> {
@@ -645,6 +918,9 @@ fn serve<R: Read + Send + 'static, W: Write>(
         authority.is_none() || source_authority.is_none(),
         "a server session cannot combine source and destination authority"
     );
+    // Worker connections handed over from SSH sessions are served as data
+    // connections too, but do not arrive over TCP.
+    let over_tcp = tcp_socket.is_some();
     let mut r = FrameReader::new(r);
     r.set_limit(MAX_HANDSHAKE_FRAME);
     let sending_budget = Arc::new(std::sync::OnceLock::new());
@@ -745,6 +1021,15 @@ fn serve<R: Read + Send + 'static, W: Write>(
     }
     let is_control = matches!(&role, ConnectionRole::Control);
     let is_source_worker = matches!(&role, ConnectionRole::SourceWorker { .. });
+    // Tests check that every destination worker is served in the copy's
+    // receiver, handed over to it (`record_handed_connection_for_test`).
+    #[cfg(debug_assertions)]
+    if matches!(&role, ConnectionRole::DestinationWorker { .. }) {
+        let _ = crate::fsops::record_test_event(
+            "SYQ_TEST_HANDED_WORKER_EVENTS",
+            format_args!("worker {}", std::process::id()),
+        );
+    }
     // The copy's sidecars are registered from here so that they can be
     // removed; the guard is dropped on every return, after the reader.
     if owns_process {
@@ -756,7 +1041,13 @@ fn serve<R: Read + Send + 'static, W: Write>(
     if let Some(authority) = &authority {
         ops.set_hash_policy(authority.hash_policy());
         ops.set_owned_objects(authority.owned_objects());
+        ops.set_stage_scope(authority.stage_scope());
     }
+    // The files a copy is writing are let go when its control ends; a
+    // receiver that serves many copies would otherwise keep those that never
+    // reached Finalize.
+    let _release_stages =
+        (is_control && source_authority.is_none()).then(|| ReleaseStages(ops.stage_scope()));
     if let Some(source) = &source_permit {
         source.initialize(&mut ops)?;
     }
@@ -1518,7 +1809,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
     if debug {
         crate::output::diagnostic!(
             "syq server{}: {blocks} blocks, {} MiB",
-            if over_ssh { "" } else { " (tcp)" },
+            if over_tcp { " (tcp)" } else { "" },
             bytes >> 20,
         );
     }

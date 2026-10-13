@@ -1,5 +1,7 @@
 //! SSH workers join an already redeemed copy through a private local socket.
 //! The enrollment key never gains arbitrary commands or socket forwarding.
+//! A worker's SSH session process hands its input and output to the
+//! receiver over that socket, and the receiver serves them on a thread.
 
 use super::RestrictedAuthority;
 use crate::private_broker::{PrivateBroker, PrivateBrokerConfig};
@@ -7,8 +9,7 @@ use crate::private_broker::{PrivateBroker, PrivateBrokerConfig};
 use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
 use std::io::{self, Read, Write};
-use std::net::Shutdown;
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Arc;
@@ -64,14 +65,18 @@ pub(crate) fn start(authority: Arc<RestrictedAuthority>) -> Result<(PrivateBroke
                 if !bool::from(offered.ct_eq(&secret)) {
                     bail!("invalid SSH worker admission");
                 }
-                let _permit = crate::server::ConnectionPermit::acquire(authority.clone())?;
-                let writer = stream.try_clone()?;
-                writer.set_read_timeout(Some(
-                    deadline
-                        .checked_duration_since(Instant::now())
-                        .context("SSH worker admission timed out")?,
-                ))?;
-                crate::server::run_named(stream, writer, authority.clone(), false)
+                let (input, output) =
+                    crate::descriptor_broker::receive_standard_streams(&stream.try_clone()?)?;
+                let handshake = deadline
+                    .checked_duration_since(Instant::now())
+                    .context("SSH worker admission timed out")?;
+                crate::server::serve_handed_restricted(
+                    input,
+                    output,
+                    stream,
+                    authority.clone(),
+                    handshake,
+                )
             })();
             // The SSH client observes a closed stream on refused admission.
             // Do not let unauthenticated clients block on diagnostic output.
@@ -142,38 +147,11 @@ fn join(ticket: &str) -> Result<UnixStream> {
     Ok(socket)
 }
 
+/// Hand this SSH session's input and output to the live receiver, which
+/// serves them, and wait until it has.
 pub(super) fn connect(ticket: &str) -> Result<()> {
-    let mut socket = join(ticket)?;
-    let mut input_socket = socket.try_clone()?;
-    std::thread::Builder::new()
-        .name("receiver-ssh-input".into())
-        .spawn(move || {
-            let _ = pump(&mut io::stdin().lock(), &mut input_socket);
-            let _ = input_socket.shutdown(Shutdown::Write);
-        })?;
-    // StdoutLock is line buffered. A short binary Hello reply may contain no
-    // newline, so buffering it would deadlock both ends of the handshake.
-    let mut output = std::fs::File::from(io::stdout().as_fd().try_clone_to_owned()?);
-    let result = pump(&mut socket, &mut output);
-    let _ = socket.shutdown(Shutdown::Both);
-    result.context("relay restricted SSH worker")?;
-    Ok(())
-}
-
-// Forward each available chunk immediately, including short binary handshakes.
-fn pump(input: &mut impl Read, output: &mut impl Write) -> io::Result<()> {
-    let mut bytes = [0; 64 * 1024];
-    loop {
-        let count = match input.read(&mut bytes) {
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            result => result?,
-        };
-        if count == 0 {
-            return Ok(());
-        }
-        output.write_all(&bytes[..count])?;
-        output.flush()?;
-    }
+    crate::descriptor_broker::hand_over_standard_streams(join(ticket)?)
+        .context("hand the restricted SSH worker to the receiver")
 }
 
 #[cfg(test)]
@@ -183,14 +161,28 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 
+    /// A worker as its SSH session process would start it: the session's
+    /// input and output are handed to the receiver, and closed, as sshd
+    /// closes them, once that process is told the connection is over.
     fn worker(
         ticket: &str,
         role: ConnectionRole,
-    ) -> Result<(FrameReader<UnixStream>, FrameWriter<UnixStream>)> {
+    ) -> Result<(
+        FrameReader<std::io::PipeReader>,
+        FrameWriter<crate::descriptor_broker::test_support::SessionInput>,
+    )> {
         let socket = join(ticket)?;
-        socket.set_read_timeout(Some(Duration::from_secs(2)))?;
-        socket.set_write_timeout(Some(Duration::from_secs(2)))?;
-        let mut writer = FrameWriter::new(socket.try_clone()?, false);
+        let (receiver_input, input) = std::io::pipe()?;
+        let (output, receiver_output) = std::io::pipe()?;
+        let handed = crate::descriptor_broker::hand_over_streams(
+            socket,
+            receiver_input.as_raw_fd(),
+            receiver_output.as_raw_fd(),
+        )?;
+        drop((receiver_input, receiver_output));
+        let input =
+            crate::descriptor_broker::test_support::SessionInput::closed_after(input, handed);
+        let mut writer = FrameWriter::new(input, false);
         writer.write_msg(&Request::Hello {
             identity: crate::identity::build().into(),
             compress: false,
@@ -198,7 +190,7 @@ mod tests {
             token: Vec::new(),
             role,
         })?;
-        let mut reader = FrameReader::new(socket);
+        let mut reader = FrameReader::new(output);
         match reader.read_msg::<Response>()? {
             Response::HelloOk {
                 ssh_worker_ticket: None,

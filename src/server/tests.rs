@@ -1351,3 +1351,79 @@ fn stream_worker_rebinds_only_live_files_from_its_original_session() {
     slot.close();
     foreign.close();
 }
+
+#[test]
+fn a_signal_does_not_lift_the_ssh_worker_hello_deadline() {
+    // A handed-over SSH worker that sends nothing is cut off at the Hello
+    // deadline, however often signals interrupt the wait for it.
+    extern "C" fn ignore(_: libc::c_int) {}
+    // SAFETY: installs a handler that does nothing, without SA_RESTART, for
+    // a signal syq does not use.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = ignore as *const () as usize;
+        assert_eq!(
+            libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut()),
+            0
+        );
+    }
+    let (input, _writer) = std::io::pipe().unwrap();
+    let (sender, received) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut reader = PipeHandshakeReader {
+            input: std::fs::File::from(std::os::fd::OwnedFd::from(input)),
+            pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            deadline: Instant::now() + Duration::from_millis(500),
+        };
+        let mut byte = [0];
+        sender
+            .send(reader.read(&mut byte).map_err(|error| error.kind()))
+            .unwrap();
+    });
+    let thread = std::os::unix::thread::JoinHandleExt::as_pthread_t(&reader);
+    let started = Instant::now();
+    let result = loop {
+        // SAFETY: the reader thread has not been joined, so its id is live.
+        unsafe { libc::pthread_kill(thread, libc::SIGUSR2) };
+        match received.recv_timeout(Duration::from_millis(20)) {
+            Ok(result) => break result,
+            Err(_) if started.elapsed() < Duration::from_secs(5) => {}
+            Err(_) => panic!("the Hello wait outlived its deadline"),
+        }
+    };
+    reader.join().unwrap();
+    assert_eq!(result, Err(ErrorKind::TimedOut));
+}
+
+#[test]
+fn a_receiver_refuses_handed_connections_beyond_its_limit() {
+    use crate::descriptor_broker::hand_off_socket;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    let temp = crate::test_support::tempdir().unwrap();
+    let slot = DescriptorSessionSlot::default();
+    slot.serve_handed_connections(handed_connection_handler_within(slot.clone(), 1));
+    let ticket = slot
+        .register(std::fs::File::open(temp.path()).unwrap())
+        .unwrap();
+    // The first is served until its worker closes it.
+    let (first, worker) = UnixStream::pair().unwrap();
+    let first = hand_off_socket(&ticket, first.as_raw_fd()).unwrap();
+    let (second, _second_worker) = UnixStream::pair().unwrap();
+    assert!(hand_off_socket(&ticket, second.as_raw_fd()).is_err());
+    drop(worker);
+    // It ends without a Hello, as a failed connection.
+    assert!(first.wait().is_err());
+    let started = Instant::now();
+    loop {
+        let (third, _third_worker) = UnixStream::pair().unwrap();
+        match hand_off_socket(&ticket, third.as_raw_fd()) {
+            Ok(_) => break,
+            Err(_) if started.elapsed() < Duration::from_secs(5) => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            Err(error) => panic!("no room after the first ended: {error:#}"),
+        }
+    }
+    slot.close();
+}

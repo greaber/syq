@@ -424,6 +424,9 @@ fi
 if [ -n "${FAKE_REMOTE_UMASK:-}" ]; then
     umask "$FAKE_REMOTE_UMASK"
 fi
+if [ -n "${FAKE_REMOTE_NOFILE:-}" ]; then
+    ulimit -n "$FAKE_REMOTE_NOFILE"
+fi
 printf '%s\n' "$1" >> "$FAKE_RSH_LOG"
 exec /bin/sh -c "$1"
 "#,
@@ -1037,6 +1040,8 @@ mod metadata;
 mod persistence;
 #[path = "local/progress.rs"]
 mod progress;
+#[path = "local/receiver_process.rs"]
+mod receiver_process;
 #[path = "local/receiving.rs"]
 mod receiving;
 #[path = "local/remote.rs"]

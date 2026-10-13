@@ -99,6 +99,13 @@ bytes from old partials that are regular files owned by its user with no extra
 hard links, checks those bytes against the source, and leaves the old files
 unchanged. It does not resume by writing through the planted link.
 
+**Files swapped in during a copy.** While a copy runs, the receiving side
+writes each partial file, and each file `--inplace` creates, only through the
+file it created or opened itself, never by opening the name again. A file
+someone renames into its place gets none of the copy's data or metadata. When
+that happens to a partial file, syq does not publish what is at its name, and
+the copy reports the file as failed.
+
 **Concurrent replacement of directory entries.** Checking an entry and
 removing it are separate operations. Someone able to rename files in that
 directory can replace the entry in between, causing syq to remove the new

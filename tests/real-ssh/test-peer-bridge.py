@@ -99,14 +99,15 @@ key = Path(args[args.index("-i") + 1])
 assert key.parent.name.startswith("syq-copy-key-")
 assert key.stat().st_mode & 0o777 == 0o600
 # The server must ignore this requested command, even though the key can enter
-# the live transfer's worker. EOF finishes that worker without a valid Hello.
+# the live transfer's worker. EOF finishes that worker without a valid Hello,
+# which the receiver reports as a failed connection; ssh itself fails with 255.
 import shlex
 args[-1] = "printf escaped > " + shlex.quote(v["outside"]) + "; printf SHELL_ESCAPE"
 try:
     result = subprocess.run(args, input=b"", capture_output=True, timeout=15)
 except subprocess.TimeoutExpired:
     raise AssertionError("forced-command probe timed out") from None
-assert result.returncode == 0, "live copy key could not enter its forced worker"
+assert result.returncode != 255, ("live copy key could not enter its forced worker", result)
 assert b"SHELL_ESCAPE" not in result.stdout, "copy key executed a shell command"
 print("true")
 ''',

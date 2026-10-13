@@ -5,6 +5,8 @@ use std::path::Path;
 use std::sync::mpsc;
 
 struct Session {
+    /// The scope of the files the copy is writing.
+    scope: u64,
     socket: UnixStream,
     reader: FrameReader<UnixStream>,
     writer: FrameWriter<UnixStream>,
@@ -14,6 +16,7 @@ struct Session {
 impl Session {
     fn start(root: &Path, metadata_control: bool) -> Self {
         let authority = Arc::new(crate::restricted::tests::tcp_test_authority(root));
+        let scope = authority.stage_scope();
         let (server, socket) = crate::process::with_inheritance_guard(UnixStream::pair).unwrap();
         for stream in [&server, &socket] {
             stream
@@ -57,6 +60,7 @@ impl Session {
             )
         });
         Self {
+            scope,
             reader: FrameReader::new(socket.try_clone().unwrap()),
             writer: FrameWriter::new(socket.try_clone().unwrap(), true),
             socket,
@@ -311,4 +315,37 @@ fn control_watcher_drop_wakes_while_upstream_is_still_open() {
         authority.control_is_open(),
         "normal watcher teardown must not revoke control"
     );
+}
+
+#[test]
+fn a_copys_files_are_let_go_when_its_control_ends() {
+    // A receiver that serves many copies holds the files each one writes
+    // only until its control connection ends.
+    let root = crate::test_support::tempdir().unwrap();
+    let target = root.path().join("target");
+    let mut session = Session::start(root.path(), false);
+    assert!(matches!(
+        session.hello(ConnectionRole::Control),
+        Response::HelloOk { .. }
+    ));
+    assert!(matches!(
+        session.request(Request::Prepare {
+            path: target.as_os_str().as_bytes().to_vec(),
+            size: 4,
+            inplace: false,
+            copy_id: CopyId::default(),
+            mode: 0o600,
+            flags: 0,
+            acl: false,
+            scanned: crate::proto::ScannedDestination::Unknown,
+            attempt: 0,
+            create_if_missing: true,
+            guard: None,
+            group: None,
+        }),
+        Response::Prepared(_)
+    ));
+    assert_eq!(fsops::held_stage_count(session.scope), 1);
+    session.finish().unwrap();
+    assert_eq!(fsops::held_stage_count(session.scope), 0);
 }

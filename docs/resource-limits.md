@@ -50,11 +50,12 @@ even when the values match. Controls for different quantities can combine:
 for example, a fixed request size with a worker ceiling. Unknown keys,
 duplicate keys, zero counts, and out-of-range values are rejected.
 
-A ceiling does not force syq to use that many slots. Filesystem copies have no
-fixed default tuning ceiling; syq adjusts the count from measured throughput.
-Automatic filesystem copies also limit workers using the endpoints' available
-open-file budgets and reduce concurrency when worker setup exhausts local
-resources. Syq reports these reductions; raising an endpoint's operating-system
+A ceiling does not force syq to use that many slots. Syq adjusts the count of
+filesystem copy workers from measured throughput, up to 256: the receiving
+side serves all of a copy's workers in one process, which takes at most 256
+worker connections at once. Automatic filesystem copies also limit workers
+using the endpoints' available open-file budgets and reduce concurrency when
+worker setup exhausts local resources. Syq reports these reductions; raising an endpoint's operating-system
 limit can allow more concurrency. Fixed worker settings still report failures
 when their requested resources are unavailable.
 
