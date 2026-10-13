@@ -465,6 +465,7 @@ fn apply_one_rooted(
 }
 
 /// The type bits of a symlink.
+#[allow(clippy::unnecessary_cast)] // `mode_t` is narrower on macOS.
 const MODE_SYMLINK: u32 = libc::S_IFLNK as u32;
 
 /// What a new symlink or node of type `file_type` at `target` may replace

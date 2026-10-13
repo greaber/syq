@@ -3372,6 +3372,28 @@ impl Drop for PartialCleanup<'_> {
     }
 }
 
+/// Whether giving the existing symlink `current` the metadata `meta` under
+/// `flags` would change it: its owner, group or, where the filesystem sets
+/// a link's own times, its modification time.
+fn symlink_metadata_differs(
+    root: &Root,
+    current: crate::rooted::RootMetadata,
+    meta: &crate::proto::Meta,
+    flags: u8,
+) -> bool {
+    use crate::proto::flags;
+    let superuser = unsafe { libc::geteuid() } == 0;
+    (flags & flags::OWNER != 0
+        && (superuser || flags & flags::REQUIRE_OWNER != 0)
+        && current.uid != meta.uid)
+        || (flags & flags::GROUP != 0 && current.gid != meta.gid)
+        || (flags & flags::TIMES != 0
+            && root
+                .known_profile(current.dev)
+                .is_none_or(|profile| profile.symlink_times)
+            && (current.mtime, current.mtime_nsec) != (meta.mtime, meta.mtime_nsec))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3458,26 +3480,4 @@ mod tests {
             assert!(!record.acknowledged_part(1, "opaque-etag", checksum, 41));
         }
     }
-}
-
-/// Whether giving the existing symlink `current` the metadata `meta` under
-/// `flags` would change it: its owner, group or, where the filesystem sets
-/// a link's own times, its modification time.
-fn symlink_metadata_differs(
-    root: &Root,
-    current: crate::rooted::RootMetadata,
-    meta: &crate::proto::Meta,
-    flags: u8,
-) -> bool {
-    use crate::proto::flags;
-    let superuser = unsafe { libc::geteuid() } == 0;
-    (flags & flags::OWNER != 0
-        && (superuser || flags & flags::REQUIRE_OWNER != 0)
-        && current.uid != meta.uid)
-        || (flags & flags::GROUP != 0 && current.gid != meta.gid)
-        || (flags & flags::TIMES != 0
-            && !root
-                .known_profile(current.dev)
-                .is_some_and(|profile| !profile.symlink_times)
-            && (current.mtime, current.mtime_nsec) != (meta.mtime, meta.mtime_nsec))
 }
