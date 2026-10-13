@@ -2496,6 +2496,73 @@ fn s3_multipart_download_reuses_completed_ranges_before_getting_more() {
     }
 }
 
+/// A download writes only files it created: the partial an earlier run
+/// recorded is only read, for the parts its record vouches for, into a new
+/// partial. A reader that holds the old one open sees nothing written to it.
+#[test]
+fn s3_multipart_download_reads_a_recorded_partial_only_as_a_donor() {
+    use std::os::unix::fs::FileExt;
+    let server = Server::start("prefix-recovery-first");
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("download")).unwrap();
+    let args = [
+        "--from",
+        "s3://bucket",
+        "--srcs-in",
+        "data",
+        "--into",
+        "download",
+    ];
+    let first = server.cp(temp.path(), &args);
+    assert!(!first.status.success(), "{}", output_text(&first));
+    let record = std::fs::read_dir(temp.path().join("cache/syq/s3"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .expect("failed publication keeps its completed ranges");
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    // The retry downloads this part again; the others come from the donor.
+    saved["parts"].as_object_mut().unwrap().remove("1").unwrap();
+    std::fs::write(&record, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let partial = temp.path().join("download").join(
+        saved["partial"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap(),
+    );
+    // The part the record no longer vouches for holds other bytes, which
+    // the retry would have to overwrite to use this file.
+    let part_size = saved["part_size"].as_u64().unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&partial)
+        .unwrap()
+        .write_all_at(
+            &vec![b'z'; part_size.min(SIZE as u64 - part_size) as usize],
+            part_size,
+        )
+        .unwrap();
+    let held = std::fs::File::open(&partial).unwrap();
+    let mut before = vec![0; held.metadata().unwrap().len() as usize];
+    held.read_exact_at(&mut before, 0).unwrap();
+    let retry = server.cp(temp.path(), &args);
+    assert!(retry.status.success(), "{}", output_text(&retry));
+    assert_eq!(
+        std::fs::read(temp.path().join("download/file")).unwrap(),
+        vec![b'x'; SIZE]
+    );
+    let mut after = vec![0; before.len()];
+    held.read_exact_at(&mut after, 0).unwrap();
+    assert!(after == before, "the recorded partial was written");
+    assert!(!partial.exists(), "the donor is removed once it is read");
+}
+
 #[test]
 fn s3_invalid_initial_ranges_never_publish_a_fresh_download() {
     for fault in ["ignore-range", "etag", "corrupt", "truncated"] {

@@ -68,6 +68,80 @@ def ownership_only_directories(root):
     print("Ownership-only root copies end with the source's directory modes", flush=True)
 
 
+def planted_files_are_replaced(root):
+    """Root never adopts a file another user planted in the destination: a
+    file whose size and time match the source's, which the copy would
+    otherwise keep, gets neither the source's owner nor its mode; syq
+    replaces it, and the planted inode keeps its owner, mode and contents
+    (seen here through a second name outside the destination). The same
+    holds for --in-place=new, which writes only files it creates, and for a
+    hard-link representative, to which syq links no new name."""
+    payload = b"source contents\n" * 4096
+    planted = b"planted payload\n" * 4096
+    for name, args in [
+        ("rsync", ["rsync", "-a"]),
+        ("native", ["cp", "--copy-metadata=ownership,permissions,mtime"]),
+        ("native-mode", ["cp", "--copy-metadata=permissions,mtime"]),
+        ("in-place", ["cp", "--in-place=new", "--copy-metadata=permissions"]),
+    ]:
+        source = root / f"planted-{name}-source"
+        destination = root / f"planted-{name}-destination"
+        outside = root / f"planted-{name}-outside"
+        source.mkdir()
+        destination.mkdir()
+        (source / "file").write_bytes(payload)
+        os.chown(source / "file", 1000, 1000)
+        (source / "file").chmod(0o4755)
+        os.utime(source / "file", (1_700_000_000, 1_700_000_000))
+        target = destination / "file"
+        # In place, the planted file's contents differ, so the copy writes
+        # them, into a file of its own.
+        contents = planted[:1000] if name == "in-place" else planted
+        target.write_bytes(contents)
+        os.chown(target, 1001, 1001)
+        target.chmod(0o644)
+        os.utime(target, (1_700_000_000, 1_700_000_000))
+        os.link(target, outside)
+        before = outside.stat()
+        if args[0] == "rsync":
+            run(["syq", *args, str(source) + "/", str(destination) + "/", "--no-progress"])
+        else:
+            run(["syq", *args, "--srcs-in", str(source), "--into", str(destination), "--no-progress"])
+        after = outside.stat()
+        assert (after.st_ino, after.st_uid, after.st_gid, after.st_mode & 0o7777) == (
+            before.st_ino, 1001, 1001, 0o644), (name, after)
+        assert outside.read_bytes() == contents, name
+        copied = target.stat()
+        assert copied.st_ino != before.st_ino, name
+        assert target.read_bytes() == payload, name
+        owner = 1000 if "ownership" in " ".join(args) or name == "rsync" else 0
+        assert copied.st_uid == owner, (name, copied.st_uid)
+        assert copied.st_mode & 0o7777 == 0o4755, (name, oct(copied.st_mode))
+    print("Planted files are replaced, never adopted, by root copies", flush=True)
+
+    # A planted representative: a group's new name is linked only to the
+    # file that replaces it.
+    source = root / "planted-group-source"
+    destination = root / "planted-group-destination"
+    source.mkdir()
+    destination.mkdir()
+    (source / "a").write_bytes(payload)
+    os.link(source / "a", source / "b")
+    os.chown(source / "a", 1000, 1000)
+    os.utime(source / "a", (1_700_000_000, 1_700_000_000))
+    (destination / "a").write_bytes(payload)
+    os.chown(destination / "a", 1001, 1001)
+    os.utime(destination / "a", (1_700_000_000, 1_700_000_000))
+    planted_inode = (destination / "a").stat().st_ino
+    run(["syq", "rsync", "-aH", str(source) + "/", str(destination) + "/", "--no-progress"])
+    for name in ["a", "b"]:
+        status = (destination / name).stat()
+        assert status.st_ino != planted_inode, name
+        assert status.st_uid == 1000, (name, status.st_uid)
+    assert (destination / "a").stat().st_ino == (destination / "b").stat().st_ino
+    print("A planted hard-link representative gets no new name", flush=True)
+
+
 def main():
     assert os.geteuid() == 0, "run this check as root only inside the disposable lab"
     libc = ctypes.CDLL(None, use_errno=True)
@@ -77,6 +151,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="syq-root-security-") as temporary:
         root = Path(temporary)
         ownership_only_directories(root)
+        planted_files_are_replaced(root)
         for interface in ["native", "native-owner", "rsync"]:
             source = root / f"source-{interface}"
             destination = root / f"destination-{interface}"

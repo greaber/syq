@@ -6903,6 +6903,146 @@ fn only_an_ordinary_receiver_takes_a_senders_word_for_what_a_file_replaces() {
     }
 }
 
+/// Ordinary and command-restricted receivers write only files they created,
+/// alike: neither changes a linked file's metadata in place, both answer
+/// that it must be replaced; an in-place request for an existing file
+/// writes a stage that replaces it; and a symlink whose metadata changes is
+/// created again.
+#[test]
+fn both_receivers_write_only_files_they_created() {
+    use proto::TargetCondition::{Any, Matches};
+    for restricted in [false, true] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("linked"), b"same").unwrap();
+        fs::hard_link(target.join("linked"), root.join("outside")).unwrap();
+        fs::set_permissions(target.join("linked"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(target.join("existing"), b"old contents").unwrap();
+        fs::hard_link(target.join("existing"), root.join("existing-outside")).unwrap();
+        std::os::unix::fs::symlink("elsewhere", target.join("link")).unwrap();
+        let mut receiver =
+            ParityReceiver::new(&root, restricted, true, PublicationPolicy::InPlaceNew);
+        if let Some(authority) = receiver.authority.as_mut() {
+            authority.copy.options.preserve_times = true;
+        }
+        let case = format!("restricted={restricted}");
+
+        // A metadata-only change to a file with another name.
+        let linked = fs::metadata(target.join("linked")).unwrap();
+        let mut request = Request::Apply {
+            ops: vec![Op::SetFileMetaIfSame {
+                path: path_bytes(&target.join("linked")),
+                condition: Matches {
+                    dev: linked.dev(),
+                    ino: linked.ino(),
+                },
+                meta: proto::Meta {
+                    mode: 0o600,
+                    ..plain_meta()
+                },
+                flags: proto::flags::MODE,
+            }],
+            guard: None,
+        };
+        let response = match &receiver.authority {
+            Some(authority) => {
+                let settlement = authority.authorize(&mut request, false).unwrap();
+                let response = receiver.ops.handle(&request);
+                authority.settle(settlement, &response);
+                response
+            }
+            None => receiver.ops.handle(&request),
+        };
+        assert!(
+            matches!(
+                &response,
+                proto::Response::Applied(errors)
+                    if matches!(errors.as_slice(), [Some(error)]
+                        if crate::fsops::vouch::is_replace_required_wire(error))
+            ),
+            "{case}: {response:?}"
+        );
+        assert_eq!(
+            fs::metadata(root.join("outside")).unwrap().mode() & 0o7777,
+            0o644,
+            "{case}"
+        );
+
+        // An in-place request for an existing file.
+        let path = path_bytes(&target.join("existing"));
+        let data = b"new contents".to_vec();
+        receiver.send(Request::Prepare {
+            path: path.clone(),
+            size: data.len() as u64,
+            inplace: true,
+            copy_id: [5; 16],
+            mode: 0o644,
+            flags: proto::flags::MODE,
+            acl: false,
+            scanned: proto::ScannedDestination::Unknown,
+            attempt: 0,
+            create_if_missing: true,
+            guard: None,
+            group: None,
+        });
+        receiver.send(Request::WriteRange {
+            path: path.clone(),
+            inplace: true,
+            copy_id: [5; 16],
+            attempt: 0,
+            off: 0,
+            hash: crate::fsops::content_digest(&data),
+            data: data.clone().into(),
+            guard: None,
+        });
+        assert_eq!(fs::read(target.join("existing")).unwrap(), b"old contents");
+        receiver.send(Request::Finalize {
+            expected_hash: None,
+            path,
+            inplace: true,
+            copy_id: [5; 16],
+            meta: proto::Meta {
+                mode: 0o644,
+                ..plain_meta()
+            },
+            flags: proto::flags::MODE,
+            scanned: proto::ScannedDestination::Unknown,
+            condition: Any,
+            guard: None,
+        });
+        assert_eq!(fs::read(target.join("existing")).unwrap(), data, "{case}");
+        assert_eq!(
+            fs::read(root.join("existing-outside")).unwrap(),
+            b"old contents",
+            "{case}"
+        );
+
+        // A symlink whose time changes is created again with it.
+        let before = fs::symlink_metadata(target.join("link")).unwrap();
+        receiver.send(Request::Apply {
+            ops: vec![Op::Symlink {
+                path: path_bytes(&target.join("link")),
+                target: b"elsewhere".to_vec(),
+                condition: Matches {
+                    dev: before.dev(),
+                    ino: before.ino(),
+                },
+                meta: proto::Meta {
+                    mtime: 1_600_000_000,
+                    ..plain_meta()
+                },
+                flags: proto::flags::TIMES,
+            }],
+            guard: None,
+        });
+        let after = fs::symlink_metadata(target.join("link")).unwrap();
+        assert_ne!(after.ino(), before.ino(), "{case}");
+        assert_eq!(after.mtime(), 1_600_000_000, "{case}");
+    }
+}
+
 #[test]
 fn both_receivers_restore_set_id_bits_after_writing_in_place() {
     // Writes clear an existing file's set-ID bits. Without word from the
