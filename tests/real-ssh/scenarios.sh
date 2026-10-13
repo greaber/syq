@@ -286,6 +286,9 @@ cmp /tmp/syq-ordinary-source/sub/file /tmp/syq-ordinary-pull/sub/file
 printf 'case: separate receiver keys, migration, and OpenSSH 8.8\n'
 python3 /usr/local/libexec/syq-test-receiver-separate-keys.py
 
+printf 'case: separate receiver keys on an RSA-only destination\n'
+python3 /usr/local/libexec/syq-test-receiver-separate-keys.py --rsa-only
+
 printf 'case: restricted SSH worker handshake, revocation, and resume\n'
 python3 /usr/local/libexec/syq-test-receiver-revoke.py --no-tcp
 

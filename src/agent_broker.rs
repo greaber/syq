@@ -1558,19 +1558,12 @@ enum SigningBackend {
     Ambient(PathBuf),
     #[cfg(test)]
     Private(Arc<PrivateKey>),
-    #[cfg(test)]
-    SelectedAgent {
-        socket: PathBuf,
-        key: KeyData,
-    },
 }
 
 impl SigningBackend {
     fn uses_agent(&self) -> bool {
         match self {
             Self::Ambient(_) => true,
-            #[cfg(test)]
-            Self::SelectedAgent { .. } => true,
             #[cfg(test)]
             Self::Private(_) => false,
         }
@@ -1589,11 +1582,6 @@ impl SigningBackend {
                 decode_identities_response(&response)
             }
             #[cfg(test)]
-            Self::SelectedAgent { key, .. } => Ok(vec![Identity {
-                credential: key.clone().into(),
-                comment: String::new(),
-            }]),
-            #[cfg(test)]
             Self::Private(private) => Ok(vec![Identity {
                 credential: private.public_key().key_data().clone().into(),
                 comment: String::new(),
@@ -1611,13 +1599,6 @@ impl SigningBackend {
     ) -> Result<Vec<u8>> {
         match self {
             Self::Ambient(socket) => {
-                upstream_request(upstream, socket, connections, bindings, frame)
-            }
-            #[cfg(test)]
-            Self::SelectedAgent { socket, key } => {
-                if _request.credential != PublicCredential::Key(key.clone()) {
-                    bail!("sign request did not select the enrollment key");
-                }
                 upstream_request(upstream, socket, connections, bindings, frame)
             }
             #[cfg(test)]

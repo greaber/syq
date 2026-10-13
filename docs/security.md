@@ -191,8 +191,9 @@ The protection has several parts:
    refuses to run as root.
 2. **Keep the grant-signing key on your laptop.** A dedicated agent exposes only
    the receiver's SSH key to hostA. That key can authenticate to the receiver,
-   but cannot sign valid copy grants. It is a software key stored on your laptop;
-   your ordinary SSH agent and the grant-signing key are not forwarded. Ordinary
+   but cannot sign valid copy grants. It is stored unencrypted on your laptop: anyone
+   holding it can enter that receiver, but still needs a valid signed grant to
+   copy files. Your ordinary SSH agent and the grant-signing key are not forwarded. Ordinary
    SSH host-key checking on hostA uses the destination keys trusted by your laptop.
    Keep this SSH key dedicated to the receiver: authorizing it elsewhere would
    give hostA that access too.

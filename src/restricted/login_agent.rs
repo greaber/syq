@@ -15,9 +15,10 @@ pub(crate) struct ReceiverAgent(PrivateBroker);
 impl ReceiverAgent {
     pub(crate) fn start(key: PrivateKey, max_connections: usize) -> Result<Self> {
         anyhow::ensure!(
-            !key.is_encrypted() && key.algorithm() == ssh_key::Algorithm::Ed25519,
-            "receiver SSH agent requires an unlocked Ed25519 key"
+            !key.is_encrypted(),
+            "receiver SSH agent requires an unlocked key"
         );
+        super::keys::validate_ssh_public_key(key.public_key())?;
         let key = Arc::new(key);
         let broker = PrivateBroker::start(
             PrivateBrokerConfig {
@@ -50,8 +51,11 @@ fn serve(mut stream: TrackedStream, key: &PrivateKey) -> Result<()> {
                 comment: String::new(),
             }]),
             Some(13) => match parse_sign_request(&frame) {
-                Ok(request) if request.credential == credential && request.flags == 0 => {
-                    Response::SignResponse(sign_private_key(key, &request.data, 0)?)
+                Ok(request) if request.credential == credential => {
+                    match sign_private_key(key, &request.data, request.flags) {
+                        Ok(signature) => Response::SignResponse(signature),
+                        Err(_) => Response::Failure,
+                    }
                 }
                 _ => Response::Failure,
             },
@@ -147,5 +151,36 @@ mod tests {
             exchange(&mut stream, Request::RequestIdentities),
             Response::IdentitiesAnswer(_)
         ));
+    }
+    #[test]
+    fn rsa_agent_accepts_sha2_requests_and_refuses_sha1() {
+        let key: PrivateKey =
+            ssh_key::private::RsaKeypair::random(&mut ssh_key::rand_core::OsRng, 3072)
+                .unwrap()
+                .into();
+        let public = key.public_key().clone();
+        let agent = ReceiverAgent::start(key, 2).unwrap();
+        let mut stream = UnixStream::connect(agent.socket_path()).unwrap();
+        for flags in [0, 2, 6, 4] {
+            let request = Request::SignRequest(SignRequest {
+                credential: public.key_data().clone().into(),
+                data: b"SSH authentication".to_vec(),
+                flags,
+            });
+            let mut frame = Vec::new();
+            request.encode(&mut frame).unwrap();
+            write_frame(&mut stream, &frame).unwrap();
+            let response =
+                Response::decode(&mut read_frame(&mut stream).unwrap().unwrap().as_slice())
+                    .unwrap();
+            match (flags, response) {
+                (2 | 4, Response::SignResponse(signature)) => public
+                    .key_data()
+                    .verify(b"SSH authentication", &signature)
+                    .unwrap(),
+                (0 | 6, Response::Failure) => {}
+                (_, response) => panic!("unexpected RSA agent response: {response:?}"),
+            }
+        }
     }
 }

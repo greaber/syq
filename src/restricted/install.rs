@@ -269,23 +269,12 @@ pub(crate) fn remote_install() -> Result<()> {
     let root = crate::rooted::Root::open(&canonical_root)?;
     let root_identity = root.identity();
     let enrollment_key = EnrollmentPublicKey::parse(&request.public_key)?;
-    let ssh_key = request
-        .ssh_public_key
-        .as_deref()
-        .map(EnrollmentPublicKey::parse)
-        .transpose()?;
-    if request.version >= 6 && ssh_key.is_none() {
-        bail!("separate-key enrollment requires an SSH public key");
-    }
-    if let Some(ssh_key) = &ssh_key {
-        anyhow::ensure!(
-            ssh_key != &enrollment_key
-                && ssh_key::PublicKey::from_openssh(request.ssh_public_key.as_deref().unwrap())?
-                    .algorithm()
-                    == ssh_key::Algorithm::Ed25519,
-            "receiver SSH key must be a distinct Ed25519 key"
-        );
-    }
+    let ssh_key = EnrollmentPublicKey::parse(&request.ssh_public_key)?;
+    validate_ssh_public_key(&ssh_key::PublicKey::from_openssh(&request.ssh_public_key)?)?;
+    anyhow::ensure!(
+        ssh_key != enrollment_key,
+        "receiver SSH key must differ from its grant-signing key"
+    );
     let signer = signer_name(request.id);
     let public_words: Vec<&str> = request.public_key.split_ascii_whitespace().collect();
     if public_words.len() < 2 {
@@ -303,33 +292,20 @@ pub(crate) fn remote_install() -> Result<()> {
     // installer that already started has its bytes and recreates it before
     // publishing the new forced authorization.
     let receiver_path = materialize_receiver(&home, &receiver_contents)?;
-    let entry = AuthorizedKeyEntry::with_security_key_flags(
-        request.id,
-        &receiver_path,
-        ssh_key.as_ref().unwrap_or(&enrollment_key),
-        if ssh_key.is_some() {
-            None
-        } else {
-            request.security_key_flags
-        },
-    )?;
+    let entry = AuthorizedKeyEntry::new(request.id, &receiver_path, &ssh_key)?;
     let original =
         read_leaf(&directory, "authorized_keys", MAX_AUTHORIZED_KEYS, false)?.unwrap_or_default();
     let normalized = normalize_managed_authorized_keys(&original, &entry.marker());
-    let normalized = if ssh_key.is_some() {
-        replace_legacy_ssh_authorization(
-            &normalized,
-            &entry,
-            &AuthorizedKeyEntry::with_security_key_flags(
-                request.id,
-                &receiver_path,
-                &enrollment_key,
-                request.security_key_flags,
-            )?,
-        )?
-    } else {
-        normalized
-    };
+    let normalized = replace_legacy_ssh_authorization(
+        &normalized,
+        &entry,
+        &AuthorizedKeyEntry::with_security_key_flags(
+            request.id,
+            &receiver_path,
+            &enrollment_key,
+            request.security_key_flags,
+        )?,
+    )?;
     let (updated, change) = enrollment::install_authorized_key(&normalized, &entry)?;
 
     // Publish the forced authorization last. A failed preflight therefore
@@ -345,11 +321,7 @@ pub(crate) fn remote_install() -> Result<()> {
     )?;
     let config = ReceiverEnrollment {
         security_key_flags: request.security_key_flags,
-        version: if ssh_key.is_some() {
-            CONFIG_VERSION
-        } else {
-            request.version
-        },
+        version: CONFIG_VERSION,
         id: request.id,
         target_login: request.target_login.clone(),
         signer,

@@ -580,8 +580,22 @@ fn destination_rsh(
     }
 }
 
-fn constrained_destination_rsh(port: u16, host_key_algorithms: &str) -> String {
-    shell_words::join([
+#[derive(Clone, Copy)]
+enum DestinationAuthentication {
+    Broker,
+    Receiver,
+}
+
+fn constrained_destination_rsh(
+    port: u16,
+    host_key_algorithms: &str,
+    authentication: DestinationAuthentication,
+) -> String {
+    let (publickey, checking) = match authentication {
+        DestinationAuthentication::Broker => ("host-bound", "no"),
+        DestinationAuthentication::Receiver => ("yes", "yes"),
+    };
+    let mut command = vec![
         "ssh".to_owned(),
         "-F".to_owned(),
         "/dev/null".to_owned(),
@@ -600,7 +614,7 @@ fn constrained_destination_rsh(port: u16, host_key_algorithms: &str) -> String {
         "-o".to_owned(),
         "PKCS11Provider=none".to_owned(),
         "-o".to_owned(),
-        "PubkeyAuthentication=host-bound".to_owned(),
+        format!("PubkeyAuthentication={publickey}"),
         "-o".to_owned(),
         "PreferredAuthentications=publickey".to_owned(),
         "-o".to_owned(),
@@ -618,7 +632,7 @@ fn constrained_destination_rsh(port: u16, host_key_algorithms: &str) -> String {
         "-o".to_owned(),
         "ProxyCommand=none".to_owned(),
         "-o".to_owned(),
-        "StrictHostKeyChecking=no".to_owned(),
+        format!("StrictHostKeyChecking={checking}"),
         "-o".to_owned(),
         "LogLevel=ERROR".to_owned(),
         "-o".to_owned(),
@@ -635,38 +649,25 @@ fn constrained_destination_rsh(port: u16, host_key_algorithms: &str) -> String {
         format!("HostKeyAlgorithms={host_key_algorithms}"),
         "-p".to_owned(),
         port.to_string(),
-    ])
-}
-
-const RECEIVER_KNOWN_HOSTS: &str = "SYQ_INTERNAL_NATIVE_RECEIVER_KNOWN_HOSTS";
-const RECEIVER_HOST_ALIAS: &str = "syq-enrolled-receiver";
-
-fn receiver_destination_rsh(port: u16, algorithms: &str) -> String {
-    let mut command = shell_words::split(&constrained_destination_rsh(port, algorithms))
-        .expect("generated SSH command");
-    for argument in &mut command {
-        if argument == "PubkeyAuthentication=host-bound" {
-            *argument = "PubkeyAuthentication=yes".into();
-        } else if argument == "StrictHostKeyChecking=no" {
-            *argument = "StrictHostKeyChecking=yes".into();
-        }
+    ];
+    if matches!(authentication, DestinationAuthentication::Receiver) {
+        command.extend(["-o".into(), format!("HostKeyAlias={RECEIVER_HOST_ALIAS}")]);
     }
-    command.extend(["-o".into(), format!("HostKeyAlias={RECEIVER_HOST_ALIAS}")]);
-    // /dev/null contains no trusted keys. An older coordinator which ignores
-    // the internal environment therefore fails host verification safely.
+    // An older helper that ignores the supplied host keys has only /dev/null
+    // and strict checking, so the restricted copy fails verification.
     shell_words::join(command)
 }
+
+pub(crate) const RECEIVER_KNOWN_HOSTS: &str = "SYQ_INTERNAL_NATIVE_RECEIVER_KNOWN_HOSTS";
+const RECEIVER_HOST_ALIAS: &str = "syq-enrolled-receiver";
 
 /// Materialize the laptop's trusted destination keys on the source. The guard
 /// lives through all workers; ordinary OpenSSH verifies every connection.
 pub(crate) fn prepare_receiver_ssh(args: &mut Args) -> Result<Option<tempfile::TempDir>> {
-    let Some(encoded) = std::env::var_os(RECEIVER_KNOWN_HOSTS) else {
+    let Some(known_hosts) = args.receiver_known_hosts.take() else {
         return Ok(None);
     };
-    let known_hosts = encoded
-        .to_str()
-        .context("receiver host keys must be UTF-8")?;
-    prepare_receiver_ssh_with(args, known_hosts).map(Some)
+    prepare_receiver_ssh_with(args, &known_hosts).map(Some)
 }
 
 fn prepare_receiver_ssh_with(args: &mut Args, known_hosts: &str) -> Result<tempfile::TempDir> {
@@ -910,6 +911,7 @@ fn run_remote(
         constrained_rsh = Some(constrained_destination_rsh(
             peer_policy.port(),
             &peer_policy.host_key_algorithms(),
+            DestinationAuthentication::Broker,
         ));
         // Native new/existing placement forms travel in the signed grant as the
         // root-existence precondition, so they use the receiver like any other
@@ -947,9 +949,10 @@ fn run_remote(
                 "source SSH agent",
             )?;
             receiver_known_hosts = Some(peer_policy.known_hosts(RECEIVER_HOST_ALIAS)?);
-            constrained_rsh = Some(receiver_destination_rsh(
+            constrained_rsh = Some(constrained_destination_rsh(
                 peer_policy.port(),
                 &peer_policy.host_key_algorithms(),
+                DestinationAuthentication::Receiver,
             ));
             restricted_destination_path = Some(prepared.canonical_destination);
             restricted_grant = Some(prepared.grant);

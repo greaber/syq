@@ -317,6 +317,13 @@ pub(crate) fn prepare_transfer(
             }
         }
     }
+    if !allow_enrollment
+        && selected
+            .as_ref()
+            .is_some_and(|(metadata, _, _)| metadata.version != CONFIG_VERSION)
+    {
+        bail!("existing receiver enrollment needs updating; run `syq receiver enroll host:/path` for this destination before retrying the read-only operation");
+    }
     let (metadata, directory, canonical_destination) = match selected {
         Some(selected) if selected.0.version == CONFIG_VERSION => selected,
         _ => {

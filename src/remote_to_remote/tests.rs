@@ -120,7 +120,8 @@ fn setup_and_destination_connections_apply_only_the_selected_agent_policy() {
         ambient: "/tmp/ambient-agent".into(),
         broker: "/tmp/syq-agent".into(),
     };
-    let hardened = constrained_destination_rsh(2222, "ssh-ed25519");
+    let hardened =
+        constrained_destination_rsh(2222, "ssh-ed25519", DestinationAuthentication::Broker);
     assert_eq!(
         destination_rsh(None, false, Some(&constrained), Some(&hardened)),
         Some(hardened.clone())
@@ -486,7 +487,11 @@ fn receiver_ssh_uses_ordinary_auth_and_pinned_host_keys() {
     use clap::Parser;
     let mut args = Args::parse_from(["syq", "src", "dst"]);
     args.restricted_grant = Some("signed-grant".into());
-    args.rsh = Some(receiver_destination_rsh(2222, "ssh-ed25519"));
+    args.rsh = Some(constrained_destination_rsh(
+        2222,
+        "ssh-ed25519",
+        DestinationAuthentication::Receiver,
+    ));
     let key =
         ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ed25519)
             .unwrap();

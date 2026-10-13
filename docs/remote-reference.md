@@ -26,8 +26,8 @@ Use a real directory, not a symlink. Transfers cannot overwrite the receiver's
 SSH configuration, programs, or enrollment state. Manage that state with
 `syq receiver` commands; it is not a disposable cache.
 
-Each enrollment has a grant-signing key and a separate Ed25519 SSH key that can
-only enter the receiver. The grant-signing key matches the SSH key that
+Each enrollment has a grant-signing key and a separate SSH key that can
+only enter the receiver. The grant-signing key matches the login key that
 authenticated setup. Ed25519 stays Ed25519; RSA uses at least 3,072 bits and at least the login key's size.
 Unencrypted ECDSA keeps its curve. FIDO (`*-sk`) logins create a separate
 hardware-backed key with the same effective touch and PIN requirements;
@@ -42,7 +42,13 @@ using a secret derived through the login key's SSH agent. There is no new
 passphrase. If the login key is not loaded, `ssh-add` asks for its usual
 passphrase. Syq uses the agent selected by the destination's `IdentityAgent`
 setting, or `SSH_AUTH_SOCK` when that setting is absent. Losing that login key requires revoking and enrolling again through
-another login. Revocation itself does not need the receiver key unlocked.
+another login. Revocation itself does not need the grant-signing key unlocked.
+
+The SSH admission key is a separate, unencrypted software key: it keeps the
+signer's RSA size or ECDSA curve, or uses Ed25519 for an Ed25519 signer.
+A FIDO signer uses the corresponding software key type for SSH admission,
+so the destination must accept that software type as well. Grant signing still
+requires the hardware device.
 
 Automatic matching needs the login's local OpenSSH private-key file or FIDO
 handle, readable only by its owner (mode 0400 or 0600). Passphrase-protected ECDSA, encrypted FIDO handles, SSH certificates,

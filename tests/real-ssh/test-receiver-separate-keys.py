@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Separate admission/signing keys with pre-8.9 clients, agent, and sshd."""
+import argparse
 import json
 import os
 from pathlib import Path
@@ -41,6 +42,9 @@ def wait_for(label, probe):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--rsa-only', action='store_true')
+    options = parser.parse_args()
     config = Path.home() / '.ssh/config'
     saved_config = config.read_bytes()
     root = '/tmp/syq-real-ssh/separate-keys-' + uuid.uuid4().hex
@@ -51,6 +55,11 @@ def main():
         try:
             remote('destination', f'mkdir -p {root}; ssh-keygen -q -t ed25519 -N "" -f {root}/host')
             public = remote('destination', f'cat {root}/host.pub', stdout=subprocess.PIPE).stdout.decode().strip()
+            login = Path.home() / '.ssh/id_ed25519'
+            if options.rsa_only:
+                login = local / 'rsa-login'
+                run('ssh-keygen', '-q', '-t', 'rsa', '-b', '3072', '-N', '', '-f', str(login))
+                remote('destination', 'cat >> ~/.ssh/authorized_keys', input=login.with_suffix('.pub').read_bytes())
             server_config = f'''Port 22222
 ListenAddress 0.0.0.0
 HostKey {root}/host
@@ -64,6 +73,8 @@ AllowAgentForwarding yes
 StrictModes yes
 LogLevel VERBOSE
 '''
+            if options.rsa_only:
+                server_config += 'PubkeyAcceptedAlgorithms rsa-sha2-512,rsa-sha2-256\n'
             remote('destination', f'cat > {root}/sshd_config', input=server_config.encode())
             remote('destination', f'setsid {OLD}/sbin/sshd -D -e -f {root}/sshd_config '
                    f'< /dev/null > {root}/server.log 2>&1 & echo $! > {root}/process.pid')
@@ -73,7 +84,8 @@ LogLevel VERBOSE
     HostName destination
     Port 22222
     User syq
-    IdentityFile /home/syq/.ssh/id_ed25519
+    IdentityFile {login}
+    IdentitiesOnly yes
     UserKnownHostsFile {known_hosts}
     GlobalKnownHostsFile /dev/null
     StrictHostKeyChecking yes
@@ -91,6 +103,17 @@ LogLevel VERBOSE
                                      stdout=subprocess.DEVNULL, start_new_session=True)
             wait_for('OpenSSH 8.8 agent', lambda: (Path(environment['SSH_AUTH_SOCK']).exists(), agent.poll()))
             run(f'{OLD}/bin/ssh-add', str(Path.home() / '.ssh/id_ed25519'), env=environment)
+            if options.rsa_only:
+                run(f'{OLD}/bin/ssh-add', str(login), env=environment)
+                # Verify the fixture really refuses the normal Ed25519 login.
+                refused = subprocess.run([f'{OLD}/bin/ssh', '-F', '/dev/null', '-p', '22222',
+                                          '-o', 'IdentityAgent=none', '-o', 'IdentitiesOnly=yes',
+                                          '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
+                                          '-o', f'UserKnownHostsFile={known_hosts}',
+                                          '-i', str(Path.home() / '.ssh/id_ed25519'),
+                                          'syq@destination', 'true'],
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+                assert refused.returncode and b'Permission denied (publickey)' in refused.stderr, refused.stderr
             remote('source', f'touch {marker}; printf separate-keys > /tmp/syq-separate-key-source')
             version = remote('source', 'ssh -V', stderr=subprocess.PIPE).stderr
             assert b'OpenSSH_8.8' in version, version
@@ -111,6 +134,8 @@ LogLevel VERBOSE
             ssh_public = run('ssh-keygen', '-y', '-f', str(ssh_key), stdout=subprocess.PIPE).stdout.decode().strip()
             ssh_public = ' '.join(ssh_public.split()[:2])
             assert signer_public != ssh_public
+            if options.rsa_only:
+                assert ssh_public.startswith('ssh-rsa '), ssh_public
             protected = remote_python('destination', f'''
 import hashlib, json
 from pathlib import Path
@@ -127,6 +152,7 @@ print(json.dumps({{str(p.relative_to(s)): hashlib.sha256(p.read_bytes()).hexdige
             # Restore the exact old single-key arrangement and generation. The
             # protected key and all recorded grants remain unchanged.
             remote_python('destination', f'''
+import argparse
 import json
 from pathlib import Path
 s = Path({state!r})
@@ -138,6 +164,11 @@ p.write_text(p.read_text().replace({ssh_public!r}, {signer_public!r}))
             metadata['version'] = 5
             metadata_path.write_text(json.dumps(metadata))
             ssh_key.unlink()
+            preview = subprocess.run(copy + ['--as', root + '/migrated', '--dry-run'], env=environment,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            assert preview.returncode and b'existing receiver enrollment needs updating' in preview.stderr, preview.stderr
+            assert b'syq receiver enroll host:/path' in preview.stderr, preview.stderr
+            assert not ssh_key.exists() and json.loads(metadata_path.read_bytes())['version'] == 5
             run(*copy, '--as', root + '/migrated', env=environment)
             updated = json.loads(metadata_path.read_bytes())
             assert updated['version'] == 6 and updated['id'] == metadata['id']
@@ -166,7 +197,7 @@ for name, digest in {snapshots!r}.items():
             known_hosts.write_text(f'[destination]:22222 {public}\n')
             run('syq', 'receiver', 'revoke', identifier, env=environment)
             remote('destination', f'test ! -e {state}')
-            print('Separate receiver keys, migration, and OpenSSH 8.8 passed', flush=True)
+            print('Separate receiver keys, migration, and OpenSSH 8.8 passed' + (' (RSA-only)' if options.rsa_only else ''), flush=True)
         finally:
             config.write_bytes(saved_config)
             remote('source', f'rm -f {marker}')

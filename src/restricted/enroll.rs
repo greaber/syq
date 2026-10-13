@@ -411,7 +411,7 @@ pub(super) fn enroll(
     let public_key = private_key.to_openssh()?;
     let ssh_key = ensure_ssh_key(&directory)?;
     let request = InstallRequest {
-        ssh_public_key: Some(ssh_key.public_key().to_openssh()?),
+        ssh_public_key: ssh_key.public_key().to_openssh()?,
         security_key_flags: pending.security_key_flags,
         version: CONFIG_VERSION,
         id: pending.id,
@@ -610,7 +610,7 @@ fn create_over_route(
     )?;
     let ssh_key = ensure_ssh_key(&directory)?;
     let request = InstallRequest {
-        ssh_public_key: Some(ssh_key.public_key().to_openssh()?),
+        ssh_public_key: ssh_key.public_key().to_openssh()?,
         version: CONFIG_VERSION,
         id,
         target_login: login.to_owned(),

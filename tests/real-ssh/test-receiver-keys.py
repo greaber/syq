@@ -115,7 +115,7 @@ def main():
             for index, (kind, bits, protected, flags) in enumerate([
                 ('ed25519', None, False, None), ('ed25519', None, True, None),
                 ('rsa', 2048, True, None), ('rsa', 4096, False, None),
-                ('ecdsa', 256, True, None), ('ed25519-sk', None, False, 0),
+                ('ecdsa', 256, True, None), ('ecdsa', 384, False, None), ('ed25519-sk', None, False, 0),
                 ('ed25519-sk', None, False, 1), ('ecdsa-sk', None, False, 0),
                 ('ed25519-sk', None, False, 5),
             ]):
@@ -222,7 +222,9 @@ Host source
                 installed = next(line for line in auth.splitlines() if f'syq-enrollment:{identifier}' in line)
                 ssh_public = run('ssh-keygen', '-y', '-f', str(metadata_path.parent / 'ssh-key'),
                                  stdout=subprocess.PIPE).stdout.decode().strip()
-                assert ssh_public in installed and ssh_public.startswith('ssh-ed25519 '), installed
+                expected_algorithm = ('ssh-rsa' if kind == 'rsa' else
+                                      f'ecdsa-sha2-nistp{bits or 256}' if kind.startswith('ecdsa') else 'ssh-ed25519')
+                assert ssh_public in installed and ssh_public.split()[0] == expected_algorithm, installed
                 assert 'no-touch-required' not in installed and 'verify-required' not in installed
                 signers = remote(f'cat ~/.local/share/syq/restricted/{identifier}/allowed-signers',
                                  stdout=subprocess.PIPE).stdout.decode()

@@ -100,8 +100,7 @@ struct InstallRequest {
     target_login: String,
     requested_destination: String,
     public_key: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    ssh_public_key: Option<String>,
+    ssh_public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     security_key_flags: Option<u8>,
 }
