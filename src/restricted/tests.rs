@@ -7020,6 +7020,54 @@ fn keeping_existing_files_links_only_to_files_the_copy_created() {
     );
 }
 
+/// Where inode numbers cannot tie a name to a file (SSHFS, rclone, unknown
+/// filesystems), a grant that keeps existing files cannot check which file
+/// a hard link names, so it refuses the link: a sender could supply a
+/// created file's identity while naming an existing file.
+#[test]
+fn keeping_existing_files_refuses_links_it_cannot_tie_to_a_created_file() {
+    use std::os::unix::fs::MetadataExt;
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            std::env::remove_var("SYQ_TEST_UNTRUSTED_LINK_COUNTS");
+        }
+    }
+    let _restore = Restore;
+    std::env::set_var("SYQ_TEST_UNTRUSTED_LINK_COUNTS", "1");
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let authority = keeping_link_authority(&root);
+    let mine = root.join("target/mine");
+    let mut ops = crate::fsops::FsOps::new();
+    ops.set_owned_objects(authority.owned_objects());
+    let mut put = small_put(&mine);
+    let settlement = authority.authorize(&mut put, false).unwrap();
+    let response = ops.handle(&put);
+    authority.settle(settlement, &response);
+    assert_eq!(fs::read(&mine).unwrap(), b"new", "{response:?}");
+
+    // The created file's identity, but the existing file's name.
+    let created = fs::metadata(&mine).unwrap();
+    let Op::Hardlink { path, source, .. } = link_to_kept(&root, "stolen") else {
+        unreachable!()
+    };
+    let response = execute(
+        &authority,
+        apply(Op::Hardlink {
+            path,
+            source,
+            dev: created.dev(),
+            ino: created.ino(),
+            condition: proto::TargetCondition::Any,
+        }),
+    )
+    .unwrap();
+    assert!(applied(&response)[0].is_some(), "{response:?}");
+    assert!(fs::symlink_metadata(root.join("target/stolen")).is_err());
+    assert_eq!(kept_state(&root), (0o600, 1));
+}
+
 /// Only a grant that keeps existing files and copies hard links records the
 /// files it creates: the record serves only to check links.
 #[test]

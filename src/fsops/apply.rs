@@ -447,10 +447,17 @@ fn apply_one_rooted(
         } => {
             // The publication links only the file with this identity, so
             // checking the identity checks the file linked (`OwnedObjects`).
+            // Where inode numbers cannot show that, the link is refused.
             if let Some(owned) = owned {
                 owned.require_link((*dev, *ino), &target.label)?;
             }
-            root.publish_hardlink(&RelativePath::new(source)?, path, (*dev, *ino), *condition)
+            root.publish_hardlink_to(
+                &RelativePath::new(source)?,
+                path,
+                (*dev, *ino),
+                *condition,
+                owned.is_some(),
+            )
         }
         Op::SetMeta {
             meta,

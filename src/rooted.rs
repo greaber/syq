@@ -1839,12 +1839,34 @@ impl Root {
         identity: (u64, u64),
         condition: crate::proto::TargetCondition,
     ) -> Result<()> {
+        self.publish_hardlink_to(source, target, identity, condition, false)
+    }
+
+    /// Like `publish_hardlink`. With `identity_relied_on`, a caller has
+    /// checked `identity` itself, as a grant that keeps existing files
+    /// checks that a link names a file the copy created, so the link is
+    /// made only where inode numbers show that `source` is that file.
+    pub(crate) fn publish_hardlink_to(
+        &self,
+        source: &RelativePath,
+        target: &RelativePath,
+        identity: (u64, u64),
+        condition: crate::proto::TargetCondition,
+        identity_relied_on: bool,
+    ) -> Result<()> {
         use crate::proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
         let file = self.open_metadata(source)?;
         let opened = root_metadata_from_std(&file.metadata()?)?;
         let parent = self.resolve_parent(target)?;
         // A hard link names its file on the file's own device.
         let mut profile = self.profile_on(opened.dev, &parent.directory);
+        if identity_relied_on && !profile.link_counts_trusted {
+            bail!(
+                "hard link {} cannot be tied to the file it would name on this filesystem, \
+                 and the copy keeps existing files",
+                target.label()
+            );
+        }
         // Where names report their own inode numbers (SSHFS, rclone), the
         // representative's name need not show the number its file was
         // published with, so only its type can be checked.

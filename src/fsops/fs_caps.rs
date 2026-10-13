@@ -700,3 +700,77 @@ mod tests {
         assert_eq!(linux_kind(libc::EXT4_SUPER_MAGIC as u32), None);
     }
 }
+
+/// macOS: a profile belongs to a volume, not to the path it is mounted at.
+#[cfg(all(test, target_os = "macos"))]
+mod volume_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    use std::process::Command;
+
+    fn hdiutil(arguments: &[&std::ffi::OsStr]) {
+        let output = Command::new("hdiutil").args(arguments).output().unwrap();
+        assert!(
+            output.status.success(),
+            "hdiutil {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    struct Attached(std::path::PathBuf);
+
+    impl Drop for Attached {
+        fn drop(&mut self) {
+            let _ = Command::new("hdiutil")
+                .args(["detach", "-force"])
+                .arg(&self.0)
+                .output();
+        }
+    }
+
+    fn attach(image: &std::path::Path, point: &std::path::Path) -> Attached {
+        hdiutil(&[
+            "attach".as_ref(),
+            "-nobrowse".as_ref(),
+            "-mountpoint".as_ref(),
+            point.as_os_str(),
+            image.as_os_str(),
+        ]);
+        Attached(point.to_path_buf())
+    }
+
+    /// A FAT32 volume mounted where an APFS volume was gets FAT32's own
+    /// profile: no swap, which it would complete as a plain rename over
+    /// the target, and untrusted inode numbers.
+    #[test]
+    fn a_reused_mount_point_gets_its_own_volumes_profile() {
+        let tree = crate::test_support::tempdir().unwrap();
+        let point = tree.path().join("mounted");
+        std::fs::create_dir(&point).unwrap();
+        for (name, filesystem) in [("apfs", "APFS"), ("fat", "MS-DOS FAT32")] {
+            let image = tree.path().join(format!("{name}.dmg"));
+            hdiutil(&[
+                "create".as_ref(),
+                "-quiet".as_ref(),
+                "-size".as_ref(),
+                "64m".as_ref(),
+                "-fs".as_ref(),
+                filesystem.as_ref(),
+                "-volname".as_ref(),
+                format!("syqprofile{name}").as_ref(),
+                image.as_os_str(),
+            ]);
+        }
+        {
+            let _attached = attach(&tree.path().join("apfs.dmg"), &point);
+            let volume = File::open(&point).unwrap();
+            let apfs = macos_profile(volume.as_raw_fd());
+            assert!(apfs.exchange && apfs.link_counts_trusted, "{apfs:?}");
+        }
+        let _attached = attach(&tree.path().join("fat.dmg"), &point);
+        let volume = File::open(&point).unwrap();
+        let fat = macos_profile(volume.as_raw_fd());
+        assert!(!fat.exchange && !fat.link_counts_trusted, "{fat:?}");
+        assert!(fat.two_second_mtimes, "{fat:?}");
+    }
+}
