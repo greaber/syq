@@ -115,7 +115,7 @@ def main():
             for index, (kind, bits, protected, flags) in enumerate([
                 ('ed25519', None, False, None), ('ed25519', None, True, None),
                 ('rsa', 2048, True, None), ('rsa', 4096, False, None),
-                ('ecdsa', 256, True, None), ('ed25519-sk', None, False, 0),
+                ('ecdsa', 256, True, None), ('ecdsa', 384, False, None), ('ed25519-sk', None, False, 0),
                 ('ed25519-sk', None, False, 1), ('ecdsa-sk', None, False, 0),
                 ('ed25519-sk', None, False, 5),
             ]):
@@ -220,10 +220,16 @@ Host source
                 assert metadata.get('security_key_flags') == flags
                 auth = remote('cat ~/.ssh/authorized_keys', stdout=subprocess.PIPE).stdout.decode()
                 installed = next(line for line in auth.splitlines() if f'syq-enrollment:{identifier}' in line)
-                if flags is not None:
-                    assert ('no-touch-required' in installed) == (not flags & 1), installed
-                    assert ('verify-required' in installed) == bool(flags & 4), installed
-                elif kind == 'rsa':
+                ssh_public = run('ssh-keygen', '-y', '-f', str(metadata_path.parent / 'ssh-key'),
+                                 stdout=subprocess.PIPE).stdout.decode().strip()
+                expected_algorithm = ('ssh-rsa' if kind == 'rsa' else
+                                      f'ecdsa-sha2-nistp{bits or 256}' if kind.startswith('ecdsa') else 'ssh-ed25519')
+                assert ssh_public in installed and ssh_public.split()[0] == expected_algorithm, installed
+                assert 'no-touch-required' not in installed and 'verify-required' not in installed
+                signers = remote(f'cat ~/.local/share/syq/restricted/{identifier}/allowed-signers',
+                                 stdout=subprocess.PIPE).stdout.decode()
+                assert ssh_public.split()[1] not in signers, 'SSH key can sign grants'
+                if kind == 'rsa':
                     if protected:
                         encoded = json.loads(stored.split(b'\n', 1)[1])['header']['public_key']
                     else:
@@ -231,6 +237,8 @@ Host source
                                       stdout=subprocess.PIPE).stdout.decode()
                     size = int(run('ssh-keygen', '-lf', '-', input=encoded.encode(), stdout=subprocess.PIPE).stdout.split()[0])
                     assert size == max(3072, bits), size
+                    admission_size = int(run('ssh-keygen', '-lf', '-', input=ssh_public.encode(), stdout=subprocess.PIPE).stdout.split()[0])
+                    assert admission_size == size, (admission_size, size)
                 copy = ['syq', 'cp', '--from', 'source', '/tmp/syq-real-ssh-key-source',
                         '--to', 'destination', '--as', parent + '/copy', '--no-tcp', '--no-progress']
                 run(*copy, env=environment)

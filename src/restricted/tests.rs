@@ -323,6 +323,7 @@ fn revoke_validates_all_state_before_rewriting_authorized_keys() {
         fs::set_permissions(&authorized_keys, fs::Permissions::from_mode(0o600)).unwrap();
 
         let request = RevokeRequest {
+            ssh_public_key: None,
             security_key_flags: None,
             version: CONFIG_VERSION,
             id,
@@ -7773,4 +7774,29 @@ fn an_in_place_as_new_root_that_exists_is_refused_and_unchanged() {
         );
     }
     assert_eq!(fs::read(&target).unwrap(), b"theirs");
+}
+
+#[test]
+fn separate_ssh_key_preserves_grant_key_and_survives_retry() {
+    let directory = crate::test_support::tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let grant = generate_enrollment_key(EnrollmentId::random()).unwrap();
+    let encoded = grant.to_openssh(LineEnding::LF).unwrap();
+    atomic_write(
+        directory.path(),
+        "enrollment-key",
+        encoded.as_bytes(),
+        0o600,
+    )
+    .unwrap();
+    let login = ensure_ssh_key(directory.path()).unwrap();
+    assert_ne!(login.public_key().key_data(), grant.public_key().key_data());
+    assert_eq!(ensure_ssh_key(directory.path()).unwrap(), login);
+    assert_eq!(
+        fs::read(directory.path().join("enrollment-key")).unwrap(),
+        encoded.as_bytes()
+    );
+    // A damaged or accidentally reused grant key must never be exposed.
+    atomic_write(directory.path(), "ssh-key", encoded.as_bytes(), 0o600).unwrap();
+    assert!(ensure_ssh_key(directory.path()).is_err());
 }
