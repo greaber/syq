@@ -16,6 +16,7 @@
 //! was not retried.
 
 use super::*;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Condvar, MutexGuard};
 

@@ -7189,8 +7189,15 @@ fn acl_resume_replaces_previously_readable_staging_inodes() {
         let relative = RelativePath::new(b"partial").unwrap();
         let mut ops = FsOps::new();
         ops.inode_preservation.acls = true;
+        let held = stages::For {
+            scope: 0,
+            root: &root,
+            target: &relative,
+            copy_id: &[0; 16],
+            inplace: false,
+        };
         let (mut file, basis) = ops
-            .open_private_partial_rooted(&root, &relative, &path, true, 0o644, None)
+            .open_private_partial_rooted(held, &relative, &path, true, 0o644, None)
             .unwrap()
             .unwrap();
         assert!(basis.basis_size().is_none());
