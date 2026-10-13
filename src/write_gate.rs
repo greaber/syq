@@ -4,11 +4,12 @@ use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
 
+use std::sync::OnceLock;
 #[cfg(any(target_os = "linux", test))]
 use {
     std::collections::HashMap,
     std::os::unix::fs::MetadataExt,
-    std::sync::{Arc, Mutex, OnceLock, Weak},
+    std::sync::{Arc, Mutex, Weak},
 };
 
 #[cfg(any(target_os = "linux", test))]
@@ -103,6 +104,15 @@ impl CachedFile {
     }
 
     pub(crate) fn write_range_at(&self, data: &[u8], offset: u64, sparse: bool) -> io::Result<()> {
+        // Measurement only: SYQ_BENCH_NO_WRITE_GATE turns the gate off.
+        static NO_GATE: OnceLock<bool> = OnceLock::new();
+        if *NO_GATE.get_or_init(|| std::env::var_os("SYQ_BENCH_NO_WRITE_GATE").is_some()) {
+            return if sparse {
+                crate::sparse::write_at(&self.file, data, offset, true)
+            } else {
+                self.file.write_all_at(data, offset)
+            };
+        }
         // Tests exercise serialization on every Unix host; production enables it
         // only on Linux, where its performance has been measured.
         #[cfg(any(target_os = "linux", test))]
