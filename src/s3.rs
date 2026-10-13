@@ -238,7 +238,7 @@ impl Options {
             bail!("S3 authorization requires --auth-from @NAME; omit it to use local storage credentials");
         }
         for id in [
-            "inplace",
+            "in_place",
             "transfer_strategy",
             "via",
             "coordinate_at",
