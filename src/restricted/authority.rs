@@ -2072,6 +2072,7 @@ impl RestrictedAuthority {
                 meta,
                 flags,
                 condition,
+                ..
             } => {
                 let implicit = self.mapping_parent(path)?;
                 if implicit {

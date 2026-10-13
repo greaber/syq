@@ -456,8 +456,9 @@ fn apply_one_rooted(
             meta,
             flags,
             condition,
+            directory,
             ..
-        } => set_meta_rooted(target, meta, *flags, *condition),
+        } => set_meta_rooted(target, meta, *flags, *condition, *directory),
         Op::SetFileMetaIfSame {
             condition,
             meta,
@@ -493,18 +494,34 @@ fn apply_one_rooted(
     }
 }
 
+/// Apply `meta` to the object at `target`. A `directory`'s metadata goes
+/// only to a directory: anything else found at its name, such as a file
+/// someone put there in its place, is refused before any change, so that it
+/// never takes the directory's owner, group or mode.
 pub(super) fn set_meta_rooted(
     target: &RootedTarget,
     meta: &Meta,
     flags: u8,
     condition: TargetCondition,
+    directory: bool,
 ) -> Result<()> {
+    let require_directory = |is_dir: bool| {
+        if directory && !is_dir {
+            bail!(
+                "destination {} is no longer a directory",
+                target.label.display()
+            );
+        }
+        Ok(())
+    };
     if target.relative.is_empty() {
         let metadata = target.root.metadata(&target.relative)?;
         require_rooted_condition(metadata, condition, &target.label)?;
+        require_directory(metadata.is_dir())?;
         let handle = target.root.open_metadata(&target.relative)?;
         require_rooted_metadata(&handle, metadata, &target.label)?;
         let opened = handle.metadata()?;
+        require_directory(opened.is_dir())?;
         require_open_target_known(&opened, &target.label, condition)?;
         if flags & flags::TIMES != 0
             && (metadata.mtime != meta.mtime || metadata.mtime_nsec != meta.mtime_nsec)
@@ -531,6 +548,7 @@ pub(super) fn set_meta_rooted(
         .metadata()
         .with_context(|| format!("stat confined path {}", target.label.display()))?;
     require_rooted_condition(metadata, condition, &target.label)?;
+    require_directory(metadata.is_dir())?;
     let is_link = metadata.is_symlink();
     let owner_differs = (flags & flags::OWNER != 0
         && (is_superuser() || flags & flags::REQUIRE_OWNER != 0)
@@ -583,6 +601,7 @@ pub(super) fn set_meta_rooted(
                 target.label.display()
             );
         }
+        require_directory(opened.is_dir())?;
         require_open_target_known(&opened, &target.label, condition)?;
         // Timestamp mutation is performed separately with no-follow
         // descriptor-relative semantics. All other metadata is applied to

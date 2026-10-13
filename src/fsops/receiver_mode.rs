@@ -84,6 +84,7 @@ impl ReceiverDirectories {
                 meta,
                 flags,
                 condition,
+                directory,
             } if flags & flags::RECEIVER_MODE != 0 => {
                 let mut meta = meta.clone();
                 let mut flags = flags & !flags::RECEIVER_MODE;
@@ -119,6 +120,7 @@ impl ReceiverDirectories {
                     meta,
                     flags,
                     condition,
+                    directory: *directory,
                 })
             }
             _ => Cow::Borrowed(op),

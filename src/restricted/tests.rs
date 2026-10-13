@@ -1334,6 +1334,7 @@ fn restricted_widening_follows_the_approved_mode() {
                 },
                 flags: proto::flags::MODE,
                 condition: identity(&root),
+                directory: false,
             }],
             guard: None,
         };
@@ -1536,6 +1537,7 @@ fn set_meta(path: &Path) -> Op {
         meta: plain_meta(),
         flags: 0,
         condition: proto::TargetCondition::Any,
+        directory: false,
     }
 }
 
@@ -1840,6 +1842,7 @@ fn mapping_parents_reopen_and_restore_receiver_permissions() {
                         proto::flags::RECEIVER_MODE
                     },
                     condition: proto::TargetCondition::Any,
+                    directory: false,
                 });
                 let settlement = authority.authorize(&mut restore, false).unwrap();
                 let response = ops.handle(&restore);
@@ -1922,6 +1925,7 @@ fn mapping_pending_parent_creation_cannot_authorize_foreign_metadata() {
                 meta: plain_meta(),
                 flags: proto::flags::RECEIVER_MODE,
                 condition: proto::TargetCondition::Any,
+                directory: false,
             },
         ],
         guard: None,
@@ -1963,6 +1967,7 @@ fn mapping_failed_parent_creation_cannot_authorize_foreign_metadata() {
         meta: plain_meta(),
         flags: proto::flags::RECEIVER_MODE,
         condition: proto::TargetCondition::Any,
+        directory: false,
     });
     let settlement = authority.authorize(&mut restore, false).unwrap();
     let response = crate::fsops::FsOps::new().handle(&restore);
@@ -2025,6 +2030,7 @@ fn mapping_receiver_confines_entries_and_protects_existing_parents() {
                 meta: plain_meta(),
                 flags: proto::flags::TIMES,
                 condition: proto::TargetCondition::Any,
+                directory: false,
             }),
             false
         )
@@ -2584,6 +2590,7 @@ fn must_exist_pins_update_only_operations() {
         meta: plain_meta(),
         flags: 0,
         condition: Matches { dev: 1, ino: 1 },
+        directory: false,
     });
     assert!(authority.authorize(&mut bogus, false).is_err());
     let mut absent = apply(set_meta(&missing));
@@ -3683,6 +3690,7 @@ fn grant_distinguishes_receiver_modes_from_source_permission_preservation() {
             },
             flags,
             condition: proto::TargetCondition::Any,
+            directory: false,
         }],
         guard: None,
     };
@@ -3849,6 +3857,7 @@ fn receiver_chosen_modes_keep_existing_objects_and_limit_new_ones() {
         },
         flags: proto::flags::RECEIVER_MODE,
         condition: proto::TargetCondition::Any,
+        directory: false,
     };
     assert!(applied(execute_authorized(
         &authority,
@@ -3974,6 +3983,7 @@ fn receiver_chosen_mode_opens_a_private_directory_with_its_inherited_setgid() {
             },
             flags: proto::flags::RECEIVER_MODE,
             condition: proto::TargetCondition::Any,
+            directory: false,
         })
     };
     // Another connection did not create it, so its mode stays.
@@ -4168,6 +4178,7 @@ fn authority_binds_one_encrypted_listener_and_known_metadata_flags() {
             },
             flags: 0x80,
             condition: proto::TargetCondition::Any,
+            directory: false,
         }],
         guard: None,
     };
@@ -6611,12 +6622,14 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
                         dev: observed.dev(),
                         ino: observed.ino(),
                     },
+                    directory: false,
                 },
                 Op::SetMeta {
                     path: path("private-dir"),
                     meta: meta(0o755),
                     flags: mode_flag,
                     condition: proto::TargetCondition::Any,
+                    directory: false,
                 },
                 // A native receiver does not narrow a new directory to a
                 // source without owner access; only `syq rsync` does.
@@ -6625,6 +6638,7 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
                     meta: meta(0o555),
                     flags: mode_flag,
                     condition: proto::TargetCondition::Any,
+                    directory: false,
                 },
             ],
             guard: None,
@@ -7049,6 +7063,7 @@ fn ordinary_and_restricted_receivers_give_directories_their_groups_first() {
                     dev: existing.dev(),
                     ino: existing.ino(),
                 },
+                directory: false,
             }],
             guard: None,
         });
@@ -7064,6 +7079,7 @@ fn ordinary_and_restricted_receivers_give_directories_their_groups_first() {
                     meta: grouped.clone(),
                     flags,
                     condition: proto::TargetCondition::Any,
+                    directory: false,
                 },
             ],
             guard: None,
@@ -7166,6 +7182,7 @@ fn make_world_writable(root: &Path, name: &str) -> Op {
         },
         flags: proto::flags::MODE,
         condition: proto::TargetCondition::Any,
+        directory: false,
     }
 }
 

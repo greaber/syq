@@ -2152,6 +2152,7 @@ impl Planner<'_> {
                     meta,
                     flags,
                     condition: target_identity(destination),
+                    directory: false,
                 },
                 rel.to_vec(),
                 if source.kind == Kind::Symlink {
@@ -2276,6 +2277,7 @@ impl Planner<'_> {
             path: dst_path,
             meta: opts.metadata_for(&dst_rel, &e),
             flags: opts.flags_for(&dst_rel) & !flags::MODE,
+            directory: false,
         });
     }
 
@@ -2396,6 +2398,7 @@ impl Planner<'_> {
             path: dst_path,
             meta,
             flags,
+            directory: false,
         });
     }
 
@@ -2638,6 +2641,7 @@ impl Planner<'_> {
                         ino: d.ino,
                     },
                 ),
+                directory: true,
             };
             // A private root changes group only after this batch's
             // subdirectories have inherited its starting group, as they would
@@ -2686,6 +2690,7 @@ impl Planner<'_> {
             },
             flags: flags::RECEIVER_MODE,
             condition,
+            directory: true,
         }])?;
         Ok(())
     }
@@ -3009,13 +3014,22 @@ impl Planner<'_> {
                     None => {}
                 }
             }
-            self.deferred.push((
-                p.clone(),
-                meta,
-                flags,
-                depth,
-                self.metadata_condition_for(p),
-            ));
+            // An existing directory's final metadata goes only to the
+            // directory the scan found there. One this copy created is held
+            // only to being a directory (`Op::SetMeta::directory`).
+            let condition = match (self.metadata_condition_for(p), s) {
+                (TargetCondition::Any, Some(found))
+                    if found.kind == Kind::Dir && !self.created_dirs.contains(p) =>
+                {
+                    TargetCondition::Matches {
+                        dev: found.dev,
+                        ino: found.ino,
+                    }
+                }
+                (condition, _) => condition,
+            };
+            self.deferred
+                .push((p.clone(), meta, flags, depth, condition));
         }
         Ok(())
     }
@@ -4628,6 +4642,14 @@ impl Planner<'_> {
         }
         d.retain(|(_, _, flags, _, _)| *flags != 0);
         d.sort_by(|a, b| b.3.cmp(&a.3));
+        #[cfg(debug_assertions)]
+        if !d.is_empty() {
+            crate::fsops::test_race_barrier(
+                "SYQ_TEST_DIRECTORY_METADATA_READY_FILE",
+                "SYQ_TEST_DIRECTORY_METADATA_CONTINUE_FILE",
+                "final directory metadata",
+            )?;
+        }
         let mut pending = d.as_slice();
         while !pending.is_empty() {
             let (chunk, rest) = pending.split_at(directory_metadata_batch_len(pending));
@@ -4639,6 +4661,7 @@ impl Planner<'_> {
                     meta: m.clone(),
                     flags: *f,
                     condition: *condition,
+                    directory: true,
                 })
                 .collect();
             let errors = self.apply(ops)?;
