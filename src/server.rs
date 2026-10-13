@@ -378,19 +378,82 @@ fn hand_off_worker(
             return Err(error);
         }
     };
-    // Only the receiver holds the session's input and output now, so it
-    // alone reads and answers them, and they close when it is done.
-    let null = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/null")
-        .context("open /dev/null")?;
-    for descriptor in [0, 1] {
-        if unsafe { libc::dup2(std::os::fd::AsRawFd::as_raw_fd(&null), descriptor) } < 0 {
-            return Err(io::Error::last_os_error()).context("release the worker connection");
-        }
-    }
+    crate::descriptor_broker::release_standard_streams()?;
     handed.wait()
+}
+
+/// Serve a restricted worker's SSH session, whose input and output its
+/// process handed over `control` after the receiver admitted it, and tell
+/// that process how it ended. Hello must arrive within the handshake time.
+pub(crate) fn serve_handed_restricted(
+    input: std::fs::File,
+    output: std::fs::File,
+    mut control: crate::private_broker::TrackedStream,
+    authority: Arc<crate::restricted::RestrictedAuthority>,
+    handshake: Duration,
+) -> Result<()> {
+    use crate::descriptor_broker::HandedConnection;
+    HandedConnection::accept(&mut control)?;
+    #[cfg(debug_assertions)]
+    record_handed_connection_for_test();
+    let pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let reader = PipeHandshakeReader {
+        input,
+        pending: pending.clone(),
+        deadline: std::time::Instant::now() + handshake,
+    };
+    let descriptor_session = DescriptorSessionSlot::default();
+    let result = serve(
+        reader,
+        output,
+        false,
+        None,
+        None,
+        None,
+        ServeSession {
+            owns_process: false,
+            handshake_pending: Some(pending),
+            ssh_worker_ticket: None,
+            allow_tcp: false,
+            metadata_control: false,
+            loopback_only: false,
+            named_socket: None,
+            authority: Some(authority),
+            source_authority: None,
+            descriptor_session: descriptor_session.clone(),
+        },
+    );
+    descriptor_session.close();
+    HandedConnection::report_end(control, &result);
+    result
+}
+
+/// Bound every read of a handed-over SSH session by the Hello deadline until
+/// `serve` clears `pending`, as `TcpHandshakeReader` bounds a socket's.
+struct PipeHandshakeReader {
+    input: std::fs::File,
+    pending: Arc<std::sync::atomic::AtomicBool>,
+    deadline: std::time::Instant,
+}
+
+impl Read for PipeHandshakeReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pending.load(std::sync::atomic::Ordering::Acquire) {
+            let remaining = self
+                .deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|time| !time.is_zero())
+                .ok_or_else(|| io::Error::new(ErrorKind::TimedOut, "SSH worker Hello timed out"))?;
+            crate::sys::wait_readable(std::os::fd::AsRawFd::as_raw_fd(&self.input), remaining);
+            if std::time::Instant::now() >= self.deadline {
+                return Err(io::Error::new(
+                    ErrorKind::TimedOut,
+                    "SSH worker Hello timed out",
+                ));
+            }
+        }
+        self.input.read(buf)
+    }
 }
 
 /// Most connections handed to one receiver that it serves at once, as for

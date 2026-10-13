@@ -428,12 +428,12 @@ fn an_inplace_ranged_copy_opens_its_destination_directly() {
 
 #[test]
 fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read() {
-    // A new sidecar is opened for writing only, without exclusive creation,
-    // in the staged mode the sender chose; the metadata read then decides
-    // the publication's chmod, the times are set regardless, set-id bits are
+    // A new sidecar is created exclusively, for writing only, in the staged
+    // mode the sender chose; the metadata read then decides the
+    // publication's chmod, the times are set regardless, set-id bits are
     // applied, and the identity reported is the inode created. A leftover
-    // holding data still takes the checked reuse, and a directory at the
-    // target is refused as before.
+    // this receiver does not hold is replaced, never resumed, and a
+    // directory at the target is refused as before.
     use std::os::unix::io::AsRawFd;
     let directory = crate::test_support::tempdir().unwrap();
     let copy_id = [5; 16];
@@ -544,8 +544,8 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
     );
     assert!(!sidecar.exists());
 
-    // A leftover holding data is reused through the checked path and still
-    // published correctly.
+    // A leftover this receiver does not hold is replaced, and the file it
+    // was is left as it is.
     let (leftover, _) = rooted_partial_target(
         &operations
             .destination_mutation_target(b"left", None)
@@ -555,20 +555,20 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
     .unwrap();
     let leftover = directory.path().join(leftover.to_path_buf());
     fs::write(&leftover, b"earlier attempt wrote this").unwrap();
-    assert_eq!(
-        prepare(&mut operations, b"left", 0o644).partial_size,
-        Some(26)
-    );
+    let kept = File::open(&leftover).unwrap();
+    assert_eq!(prepare(&mut operations, b"left", 0o644).partial_size, None);
     write(&mut operations, b"left");
     publish(&mut operations, b"left", 0o644).unwrap();
     assert_eq!(
         fs::read(directory.path().join("left")).unwrap(),
         b"contents"
     );
+    let mut earlier = Vec::new();
+    (&kept).read_to_end(&mut earlier).unwrap();
+    assert_eq!(earlier, b"earlier attempt wrote this");
 
-    // A read-only final mode: the sidecar keeps owner access, so another
-    // worker, which reopens it by name, can still write it and publish it,
-    // and publication sets the final mode. Root is never refused, so the
+    // A read-only final mode: the sidecar keeps owner access, so it can
+    // still be written and verified, and publication sets the final mode. Root is never refused, so the
     // case proves nothing there.
     if unsafe { libc::geteuid() } != 0 {
         assert_eq!(
@@ -3429,21 +3429,36 @@ fn rooted_descriptor_cache_distinguishes_roots_with_the_same_relative_name() {
     let second_root = Root::open(&second).unwrap();
     let relative = RelativePath::new(b"same").unwrap();
     let mut operations = FsOps::new();
+    let copy_id = [61; 16];
+    let held = |root| stages::For {
+        root,
+        target: &relative,
+        copy_id: &copy_id,
+        inplace: true,
+    };
+    for (root, path) in [(&first_root, &first), (&second_root, &second)] {
+        let file = File::options().write(true).open(path.join("same")).unwrap();
+        stages::hold(held(root), &relative, &file, None).unwrap();
+    }
 
     let first_inode = operations
-        .cached_rooted(Path::new("same"), &first_root, &relative, 0, false)
+        .cached_held(Path::new("same"), held(&first_root), &relative, 0)
         .unwrap()
+        .0
         .file()
         .metadata()
         .unwrap()
         .ino();
     let second_inode = operations
-        .cached_rooted(Path::new("same"), &second_root, &relative, 0, false)
+        .cached_held(Path::new("same"), held(&second_root), &relative, 0)
         .unwrap()
+        .0
         .file()
         .metadata()
         .unwrap()
         .ino();
+    stages::take(held(&first_root));
+    stages::take(held(&second_root));
 
     assert_ne!(first_inode, second_inode);
     assert_eq!(operations.fds.len(), 2);
@@ -3994,6 +4009,23 @@ fn seed_basis_hashes_retry_bytes_without_rewriting_them() {
         .unwrap();
     let before = fs::metadata(&partial).unwrap();
     let mut ops = destination_ops(temporary.path());
+    // The sidecar an earlier attempt of this copy created in this receiver,
+    // which holds it.
+    let target_relative = RelativePath::new(b"file").unwrap();
+    let relative = RelativePath::new(partial.file_name().unwrap().as_bytes()).unwrap();
+    let root = ops.destination_root.clone().unwrap();
+    let held = stages::For {
+        root: &root,
+        target: &target_relative,
+        copy_id: &id,
+        inplace: false,
+    };
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .open(&partial)
+        .unwrap();
+    stages::hold(held, &relative, &file, None).unwrap();
     // Retried bytes are compared with source block hashes, independently
     // of the hash used to check transported payloads.
     ops.set_hash_policy(crate::hashing::HashPolicy {
@@ -4019,6 +4051,50 @@ fn seed_basis_hashes_retry_bytes_without_rewriting_them() {
     assert_eq!(after.modified().unwrap(), before.modified().unwrap());
     assert_eq!(after.ino(), before.ino());
     assert_eq!(fs::read(partial).unwrap(), b"retry bytes");
+    stages::take(held);
+}
+
+#[test]
+fn a_sidecar_this_receiver_does_not_hold_is_only_a_donor() {
+    // The copy's sidecar left by a receiver that has since ended, or a file
+    // someone renamed to its name: a retry creates a new sidecar, copies only
+    // the old one's bytes into it, and never writes the old file.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let target = temporary.path().join("file");
+    let id = [19; 16];
+    let partial = partial_path(&target, &id).unwrap();
+    fs::write(&partial, b"retry bytes").unwrap();
+    fs::set_permissions(&partial, fs::Permissions::from_mode(0o600)).unwrap();
+    let old = File::open(&partial).unwrap();
+    let before = old.metadata().unwrap();
+    let mut ops = destination_ops(temporary.path());
+    let target_of = || PartialTarget {
+        path: b"file",
+        id: &id,
+        guard: None,
+    };
+    let seeded = ops
+        .seed_basis(target_of(), 11, MIN_HASH_BLOCK_BYTES, None, 1)
+        .unwrap();
+    // Its bytes were offered to the new sidecar as a donor's.
+    assert_eq!(seeded.hashes, vec![content_digest(b"retry bytes")]);
+    let created = fs::metadata(&partial).unwrap();
+    assert_ne!(created.ino(), before.ino());
+    // Writes go to the new sidecar, never to the old file.
+    ops.write_range(
+        target_of(),
+        false,
+        1,
+        0,
+        content_digest(b"fresh bytes"),
+        b"fresh bytes",
+    )
+    .unwrap();
+    assert_eq!(fs::read(&partial).unwrap(), b"fresh bytes");
+    let mut old_bytes = Vec::new();
+    (&old).read_to_end(&mut old_bytes).unwrap();
+    assert_eq!(old_bytes, b"retry bytes");
+    assert_eq!(old.metadata().unwrap().mtime(), before.mtime());
 }
 
 #[cfg(target_os = "linux")]
@@ -4464,9 +4540,15 @@ fn a_refused_mode_probe_leaves_the_device_checked() {
     let root = Root::open(temporary.path()).unwrap();
     FORCED_MODE.set(Some(0o644));
     REFUSE_MODE_PROBE.set(true);
+    let probe = RelativePath::new(b"probe").unwrap();
     let probed = ops.open_private_partial_rooted(
-        &root,
-        &RelativePath::new(b"probe").unwrap(),
+        stages::For {
+            root: &root,
+            target: &probe,
+            copy_id: &[43; 16],
+            inplace: false,
+        },
+        &probe,
         &temporary.path().join("probe"),
         true,
         0o600,
@@ -4546,11 +4628,18 @@ fn one_connections_probe_does_not_decide_for_another() {
     // finds out for itself.
     let temporary = crate::test_support::tempdir().unwrap();
     let root = Root::open(temporary.path()).unwrap();
+    let copy_id = [62; 16];
     let open = |ops: &mut FsOps, name: &str| {
+        let relative = RelativePath::new(name.as_bytes()).unwrap();
         let (file, basis) = ops
             .open_private_partial_rooted(
-                &root,
-                &RelativePath::new(name.as_bytes()).unwrap(),
+                stages::For {
+                    root: &root,
+                    target: &relative,
+                    copy_id: &copy_id,
+                    inplace: false,
+                },
+                &relative,
                 &temporary.path().join(name),
                 true,
                 0o600,
@@ -4560,11 +4649,21 @@ fn one_connections_probe_does_not_decide_for_another() {
             .unwrap();
         (file.metadata().unwrap().ino(), basis.basis_size().is_some())
     };
+    // A sidecar an earlier attempt in this receiver created, and holds.
     let leftover = |name: &str| {
         let path = temporary.path().join(name);
         fs::write(&path, b"an earlier attempt").unwrap();
+        let relative = RelativePath::new(name.as_bytes()).unwrap();
+        let file = File::options().read(true).write(true).open(&path).unwrap();
+        let held = stages::For {
+            root: &root,
+            target: &relative,
+            copy_id: &copy_id,
+            inplace: false,
+        };
+        stages::hold(held, &relative, &file, None).unwrap();
         // Held open, its inode number cannot be given to a replacement.
-        File::open(&path).unwrap()
+        file
     };
     FORCED_MODE.set(Some(0o755));
     let mut first = destination_ops(temporary.path());

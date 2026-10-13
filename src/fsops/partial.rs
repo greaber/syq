@@ -45,6 +45,20 @@ impl FsOps {
         root.create_file(relative, mode)
     }
 
+    /// Create a sidecar exclusively, for writing only.
+    fn create_write_only_partial(
+        &self,
+        root: &Root,
+        relative: &RelativePath,
+        mode: u32,
+    ) -> Result<File> {
+        #[cfg(target_os = "macos")]
+        if self.inode_preservation.acls {
+            return root.create_private_file(relative);
+        }
+        root.create_write_only_file(relative, mode)
+    }
+
     /// Open or create a small file's sidecar for writing only, with the
     /// metadata read when it was opened. The caller checks that metadata:
     /// the name may have held something other than a new file.
@@ -168,202 +182,59 @@ impl FsOps {
         Ok(true)
     }
 
-    /// Open the sidecar at `relative` to resume from or overwrite, creating
-    /// it exclusively in `create_mode` when absent and `create_if_missing`.
-    /// A sidecar found there keeps its group and other bits: whoever they
-    /// let open it may still hold it open, and a chmod does not stop them
-    /// reading. One whose group or other bits exceed `widest`, the mode this
-    /// attempt would create it in, is replaced instead. `None` leaves that
-    /// check to the Prepare that came first in the attempt.
+    /// The sidecar at `relative` for `copy_id`: the one this receiver holds
+    /// there, to resume, or else, when `create_if_missing`, a new one created
+    /// exclusively in `create_mode` after removing whatever the name holds.
+    /// A sidecar this receiver does not hold is never written: whoever could
+    /// rename a file into its place could have chosen it, and a chmod does
+    /// not stop someone who opened it while its mode was wider. A held one
+    /// whose group or other bits exceed `widest`, the mode this attempt would
+    /// create it in, is replaced instead. `None` leaves that check to the
+    /// Prepare that came first in the attempt.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn open_private_partial_rooted(
         &mut self,
-        root: &Root,
+        held: stages::For<'_>,
         relative: &RelativePath,
         label: &Path,
         create_if_missing: bool,
         create_mode: u32,
         widest: Option<u32>,
     ) -> Result<Option<(File, OpenedPartial)>> {
+        let root = held.root;
         self.uncache_rooted(root, relative);
-        let mut repaired_permissions = false;
-        if create_if_missing {
-            match self.create_partial_rooted(root, relative, create_mode) {
-                Ok(file) => {
-                    let created = file.metadata()?;
-                    note_created_owner(&created);
-                    self.note_created_mode(&file, &created, create_mode);
-                    return Ok(Some((file, OpenedPartial::Created(created))));
-                }
-                Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {}
-                Err(error) => return Err(error),
+        if let Some((file, _, _)) = stages::get(held)?.filter(|(_, _, held)| held == relative) {
+            let opened = file.metadata()?;
+            // A held sidecar someone has renamed away is let go: what its
+            // name holds now is replaced below, and the held one is never
+            // published.
+            let named = root.metadata_optional(relative)?;
+            if named.is_none_or(|named| (named.dev, named.ino) != (opened.dev(), opened.ino())) {
+                stages::take(held);
+            } else if !self.reusable_partial_permissions(&file)?
+                || self.wider_than(opened.mode(), opened.dev(), widest)
+            {
+                stages::take(held);
+                drop(file);
+                discard_safe_rooted_partial_if_same(
+                    root,
+                    relative,
+                    opened.dev(),
+                    opened.ino(),
+                    label,
+                )?;
+            } else {
+                return Ok(Some((file, OpenedPartial::Reused(opened.len()))));
             }
         }
-        for _ in 0..8 {
-            match root.metadata_optional(relative)? {
-                Some(metadata) if is_owned_rooted_partial(metadata) => {
-                    match root.open_regular_read_write(relative) {
-                        Ok(file) => {
-                            let opened = file.metadata()?;
-                            let named = root.metadata(relative)?;
-                            if !is_owned_partial(&opened)
-                                || !is_owned_rooted_partial(named)
-                                || opened.dev() != named.dev
-                                || opened.ino() != named.ino
-                            {
-                                continue;
-                            }
-                            if !self.reusable_partial_permissions(&file)?
-                                || self.wider_than(opened.mode(), opened.dev(), widest)
-                            {
-                                drop(file);
-                                discard_safe_rooted_partial_if_same(
-                                    root,
-                                    relative,
-                                    opened.dev(),
-                                    opened.ino(),
-                                    label,
-                                )?;
-                                continue;
-                            }
-                            let reported = reported_mode(opened.mode());
-                            let repaired = reported & 0o777 | 0o600;
-                            if reported & 0o7777 != repaired {
-                                let repair = (|| -> Result<()> {
-                                    fail_partial_chmod_for_test()?;
-                                    file.set_permissions(fs::Permissions::from_mode(repaired))?;
-                                    Ok(())
-                                })();
-                                if let Err(error) = repair {
-                                    drop(file);
-                                    discard_safe_rooted_partial_if_same(
-                                        root,
-                                        relative,
-                                        opened.dev(),
-                                        opened.ino(),
-                                        label,
-                                    )
-                                    .with_context(|| {
-                                        format!(
-                                            "replace partial {} after chmod failed: {error:#}",
-                                            label.display()
-                                        )
-                                    })?;
-                                    continue;
-                                }
-                            }
-                            return Ok(Some((file, OpenedPartial::Reused(opened.len()))));
-                        }
-                        Err(error)
-                            if error.downcast_ref::<io::Error>().is_some_and(|error| {
-                                error.kind() == io::ErrorKind::PermissionDenied
-                            }) =>
-                        {
-                            if repaired_permissions {
-                                discard_safe_rooted_partial_if_same(
-                                    root,
-                                    relative,
-                                    metadata.dev,
-                                    metadata.ino,
-                                    label,
-                                )
-                                .with_context(|| {
-                                    format!(
-                                        "replace partial {} after it remained unreadable",
-                                        label.display()
-                                    )
-                                })?;
-                                repaired_permissions = false;
-                                continue;
-                            }
-                            let handle = match root.open_metadata(relative) {
-                                Ok(handle) => handle,
-                                Err(repair_error) => {
-                                    discard_safe_rooted_partial_if_same(
-                                        root,
-                                        relative,
-                                        metadata.dev,
-                                        metadata.ino,
-                                        label,
-                                    )
-                                    .with_context(|| {
-                                        format!(
-                                            "replace partial {} after permission repair failed: {repair_error:#}",
-                                            label.display()
-                                        )
-                                    })?;
-                                    continue;
-                                }
-                            };
-                            if !is_owned_partial(&handle.metadata()?) {
-                                continue;
-                            }
-                            require_rooted_metadata(&handle, metadata, label)?;
-                            if !self.reusable_partial_permissions(&handle)?
-                                || self.wider_than(metadata.mode, metadata.dev, widest)
-                            {
-                                drop(handle);
-                                discard_safe_rooted_partial_if_same(
-                                    root,
-                                    relative,
-                                    metadata.dev,
-                                    metadata.ino,
-                                    label,
-                                )?;
-                                continue;
-                            }
-                            let repair = (|| -> Result<()> {
-                                fail_partial_chmod_for_test()?;
-                                set_mode_handle(&handle, metadata.mode & 0o777 | 0o600)?;
-                                Ok(())
-                            })();
-                            if let Err(error) = repair {
-                                drop(handle);
-                                discard_safe_rooted_partial_if_same(
-                                    root,
-                                    relative,
-                                    metadata.dev,
-                                    metadata.ino,
-                                    label,
-                                )
-                                .with_context(|| {
-                                    format!(
-                                        "replace partial {} after chmod failed: {error:#}",
-                                        label.display()
-                                    )
-                                })?;
-                                continue;
-                            }
-                            repaired_permissions = true;
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                Some(_) if !create_if_missing => return Ok(None),
-                Some(_) => root.unlink(relative)?,
-                None if !create_if_missing => return Ok(None),
-                None => match self.create_partial_rooted(root, relative, create_mode) {
-                    Ok(file) => {
-                        let created = file.metadata()?;
-                        note_created_owner(&created);
-                        self.note_created_mode(&file, &created, create_mode);
-                        return Ok(Some((file, OpenedPartial::Created(created))));
-                    }
-                    Err(error)
-                        if error
-                            .downcast_ref::<io::Error>()
-                            .is_some_and(|error| error.kind() == io::ErrorKind::AlreadyExists) =>
-                    {
-                        continue
-                    }
-                    Err(error) => return Err(error),
-                },
-            }
+        if !create_if_missing {
+            return Ok(None);
         }
-        bail!(
-            "partial {} changed repeatedly while opening it",
-            label.display()
-        )
+        let (file, created) = create_fresh_rooted_partial(root, relative, label, || {
+            self.create_partial_rooted(root, relative, create_mode)
+        })?;
+        self.note_created_mode(&file, &created, create_mode);
+        Ok(Some((file, OpenedPartial::Created(created))))
     }
 
     /// Remove this copy's sidecar when its group or other bits exceed
@@ -381,6 +252,7 @@ impl FsOps {
                     if is_owned_rooted_partial(metadata)
                         && self.wider_than(metadata.mode, metadata.dev, Some(widest)) =>
                 {
+                    stages::take(stages::of(target, copy_id, false));
                     discard_safe_rooted_partial_if_same(
                         &target.root,
                         relative,
@@ -524,6 +396,12 @@ impl FsOps {
                 )?;
                 receiver_mode::note_inplace_open(copy_id, &metadata, false);
                 self.set_copy_length(&file, size)?;
+                stages::hold(
+                    stages::of(&target, copy_id, true),
+                    &target.relative,
+                    &file,
+                    None,
+                )?;
                 self.cache_file(target.location(), attempt, false, file);
                 return Ok(Preparation::default());
             }
@@ -542,7 +420,13 @@ impl FsOps {
                         self.set_copy_length(&file, size).with_context(|| {
                             format!("resize confined file {}", target.label.display())
                         })?;
-                        self.cache_opened_file(target.location(), attempt, false, file, opened);
+                        stages::hold(
+                            stages::of(&target, copy_id, true),
+                            &target.relative,
+                            &file,
+                            Some(opened.clone()),
+                        )?;
+                        self.cache_file(target.location(), attempt, false, file);
                         return Ok(Preparation::default());
                     }
                     Err(error) if error_is_kind(&error, io::ErrorKind::NotFound) => {
@@ -571,7 +455,13 @@ impl FsOps {
                         self.set_copy_length(&file, size).with_context(|| {
                             format!("resize confined file {}", target.label.display())
                         })?;
-                        self.cache_opened_file(target.location(), attempt, false, file, opened);
+                        stages::hold(
+                            stages::of(&target, copy_id, true),
+                            &target.relative,
+                            &file,
+                            Some(opened.clone()),
+                        )?;
+                        self.cache_file(target.location(), attempt, false, file);
                         return Ok(Preparation::default());
                     }
                     Some(metadata) if metadata.is_dir() => {
@@ -589,7 +479,19 @@ impl FsOps {
                             self.set_copy_length(&file, size).with_context(|| {
                                 format!("resize confined file {}", target.label.display())
                             })?;
-                            self.cache_opened_file(target.location(), attempt, false, file, opened);
+                            stages::hold(
+                                stages::of(&target, copy_id, true),
+                                &target.relative,
+                                &file,
+                                Some(opened.clone()),
+                            )?;
+                            #[cfg(debug_assertions)]
+                            test_race_barrier(
+                                "SYQ_TEST_INPLACE_CREATED_READY_FILE",
+                                "SYQ_TEST_INPLACE_CREATED_CONTINUE_FILE",
+                                "in-place file created",
+                            )?;
+                            self.cache_file(target.location(), attempt, false, file);
                             return Ok(Preparation::default());
                         }
                         Err(error)
@@ -613,37 +515,38 @@ impl FsOps {
         let creation = create_if_missing.then(sidecars::begin).transpose()?;
         let (relative, _label, opened) =
             with_rooted_partial(&target, copy_id, |relative, label| {
-                if create_if_missing {
-                    // A new sidecar is created as the small-file batch
-                    // creates its own: for writing only, in its staged mode,
-                    // without exclusive creation, and used as created only
-                    // when the open landed on a new empty file of ours. Its
-                    // metadata, read at once, serves publication. Anything
-                    // else at the name takes the checked reuse below. Other
-                    // range workers reopen the sidecar by name for writing,
-                    // and verification reopens it for reading, so it keeps
-                    // owner access until publication sets the final mode, as
-                    // an in-place file does; that chmod is paid only by files
-                    // whose final mode lacks it.
+                if create_if_missing
+                    && !stages::holds(stages::of(&target, copy_id, false), relative)
+                {
+                    // A new sidecar is created for writing only, in its
+                    // staged mode, and exclusively, after removing whatever
+                    // the name held: only a file this receiver created is
+                    // written. Its metadata, read at once, serves
+                    // publication. Range workers write it through this
+                    // descriptor, and verification reopens it for reading,
+                    // so it keeps owner access until publication sets the
+                    // final mode, as an in-place file does; that chmod is
+                    // paid only by files whose final mode lacks it.
+                    // Exclusive creation costs an NFS client a SETATTR; where
+                    // link counts can be trusted (#792's filesystem
+                    // profile), opening without it and checking that the
+                    // file is a new empty one of ours would do.
                     let staged = mode | 0o600;
                     self.uncache_rooted(&target.root, relative);
-                    if !creates_foreign_owners(target.root.identity().dev) {
-                        match self.open_or_create_write_only_partial(&target.root, relative, staged)
-                        {
-                            Ok((file, created))
-                                if is_fresh_partial(&created, staged)
-                                    && created.mode() & 0o600 == 0o600 =>
-                            {
-                                return Ok(Some((file, None, Some(created), None)));
-                            }
-                            Ok(_) => {}
-                            Err(error) if existing_leaf_refused(&error) => {}
-                            Err(error) => return Err(error),
-                        }
+                    let (file, created) =
+                        create_fresh_rooted_partial(&target.root, relative, label, || {
+                            self.create_write_only_partial(&target.root, relative, staged)
+                        })?;
+                    if is_fresh_partial(&created, staged) && created.mode() & 0o600 == 0o600 {
+                        return Ok(Some((file, None, Some(created), None)));
                     }
+                    // A umask or default ACL took owner access away, or the
+                    // filesystem made it wider than asked or another owner's:
+                    // create it owner-only instead, below, which checks the
+                    // device's modes.
                 }
                 self.open_private_partial_rooted(
-                    &target.root,
+                    stages::of(&target, copy_id, false),
                     relative,
                     label,
                     create_if_missing,
@@ -679,14 +582,17 @@ impl FsOps {
             "SYQ_TEST_PARTIAL_CONTINUE_FILE",
             "partial-ready",
         )?;
+        stages::hold(
+            stages::of(&target, copy_id, false),
+            &relative,
+            &file,
+            created.clone(),
+        )?;
         let location = FileLocation::Rooted {
             root: target.root.identity(),
             relative,
         };
-        match created {
-            Some(created) => self.cache_opened_file(location, attempt, true, file, created),
-            None => self.cache_file(location, attempt, true, file),
-        }
+        self.cache_file(location, attempt, true, file);
         Ok(Preparation {
             partial_size: basis_size,
             has_candidates: false,
@@ -909,19 +815,31 @@ impl FsOps {
             )?;
         }
         let creation = sidecars::begin()?;
-        let (relative, label, opened) =
+        let (relative, label, (opened, own_donor)) =
             with_rooted_partial(&target, copy_id, |relative, label| {
+                // A sidecar of this copy that this receiver does not hold,
+                // as one a receiver that has since ended left, is only a
+                // donor: it is opened for reading before the new sidecar
+                // replaces it at the name.
+                let own_donor = (!stages::holds(stages::of(&target, copy_id, false), relative))
+                    .then(|| target.root.open_regular_read(relative).ok())
+                    .flatten()
+                    .filter(|file| {
+                        file.metadata()
+                            .is_ok_and(|m| is_owned_partial(&m) && m.len() > 0)
+                    });
                 // Prepare has replaced an earlier attempt's sidecar that is
                 // wider than this attempt's staged mode, which is not sent
                 // here. One that is not is resumed as it is.
                 self.open_private_partial_rooted(
-                    &target.root,
+                    stages::of(&target, copy_id, false),
                     relative,
                     label,
                     true,
                     PRIVATE_PARTIAL_MODE,
                     None,
                 )
+                .map(|opened| (opened, own_donor))
             })?;
         let (output, opened) = opened.context("sidecar creation was requested")?;
         let (basis_size, created) = (opened.basis_size(), opened.identity());
@@ -934,6 +852,9 @@ impl FsOps {
         let mut input = None;
         let access = SeedAccess::new(&output);
         if basis_size.unwrap_or(0) == 0 && len > 0 {
+            input = own_donor.filter(|donor| access.admits(donor));
+        }
+        if input.is_none() && basis_size.unwrap_or(0) == 0 && len > 0 {
             for candidate in self.candidate_partials(&target) {
                 let Ok(relative) = RelativePath::new(&candidate) else {
                     continue;
@@ -1062,6 +983,12 @@ impl FsOps {
             )?;
             // Never replace an existing partial with an older final-file donor.
             self.set_copy_length(&output, len)?;
+            stages::hold(
+                stages::of(&target, copy_id, false),
+                &relative,
+                &output,
+                None,
+            )?;
             self.cache_file(location, attempt, true, output);
             return Ok((
                 SeededBasis {
@@ -1076,9 +1003,12 @@ impl FsOps {
         }
         // A cached donor can disappear or become unsuitable before opening.
         // Freshly allocated zeros are not old copy data worth scanning.
-        let reader = input
-            .as_ref()
-            .or_else(|| (basis_size.unwrap_or(0) > 0).then_some(&output));
+        // A held sidecar created for writing only is read through a
+        // descriptor of its own.
+        let own = (input.is_none() && basis_size.unwrap_or(0) > 0)
+            .then(|| stages::reader(&target.root, &relative, &label, &output))
+            .transpose()?;
+        let reader = input.as_ref().or(own.as_ref());
         let mut hashes = Vec::new();
         if let Some(reader) = reader {
             let whole = [(0, len)];
@@ -1119,6 +1049,12 @@ impl FsOps {
         if output.metadata()?.len() != len {
             self.set_copy_length(&output, len)?;
         }
+        stages::hold(
+            stages::of(&target, copy_id, false),
+            &relative,
+            &output,
+            None,
+        )?;
         self.cache_file(location, attempt, true, output);
         Ok((
             SeededBasis {
@@ -1178,6 +1114,7 @@ impl FsOps {
             creation.register_with(&target.root, &relative, Sidecar::Partial, || {
                 clone.metadata().map(|metadata| identity_of(&metadata))
             })?;
+            stages::hold(stages::of(target, copy_id, false), &relative, &clone, None)?;
         }
         Ok(())
     }
@@ -1438,7 +1375,7 @@ impl FsOps {
             let (relative, label, opened) =
                 with_rooted_partial(&target, copy_id, |relative, label| {
                     self.open_private_partial_rooted(
-                        &destination_root,
+                        stages::of(&target, copy_id, false),
                         relative,
                         label,
                         true,
@@ -1666,10 +1603,23 @@ impl FsOps {
             // Keep it for the immediately following Finalize: reopening the
             // completed file for writing would fail. Finalize removes every
             // attempt for this path, so CopyLocal needs no wire attempt field.
+            stages::hold(
+                stages::of(&target, copy_id, true),
+                &target.relative,
+                &d,
+                None,
+            )?;
             self.cache_file(target.location(), 0, false, d);
         } else {
-            // Finalize reopens the partial. Collect errors on this original
-            // writer now: a later open may not observe an already reported error.
+            // Finalize takes the held duplicate. Collect errors on this
+            // descriptor now: closing it flushes, as an NFS client does at
+            // every close, and reports what the writes left.
+            stages::hold(
+                stages::of(&target, copy_id, false),
+                &target_relative,
+                &d,
+                None,
+            )?;
             close_writer(d, &target_label)?;
         }
         _copy.bytes(size);
@@ -2247,27 +2197,34 @@ impl FsOps {
             // this legacy branch after source roots have been initialized.
         }
         if let Some(target) = self.rooted_destination_target(target.path, target.guard)? {
-            let open = |relative: &RelativePath, _: &Path| {
-                let location = FileLocation::Rooted {
-                    root: target.root.identity(),
-                    relative: relative.clone(),
-                };
-                self.cached_clone(location, attempt, which == Which::Partial)?
-                    .map(Ok)
-                    .unwrap_or_else(|| target.root.open_regular_read(relative))
-            };
-            let (relative, label, mut file) = if which == Which::Partial {
-                with_rooted_partial(&target, copy_id, open)?
+            let file = if which == Which::Partial {
+                // The sidecar this receiver holds, read with positioned
+                // reads: its duplicates on other connections share one
+                // offset.
+                with_rooted_partial(&target, copy_id, |relative, label| {
+                    let held = stages::of(&target, copy_id, false);
+                    let (writer, held_relative) =
+                        self.cached_held(label, held, relative, attempt)?;
+                    let writer = writer.file().try_clone()?;
+                    stages::reader(
+                        &target.root,
+                        &held_relative,
+                        &stages::label(&target, &held_relative),
+                        &writer,
+                    )
+                })?
+                .2
             } else {
-                let file = open(&target.relative, &target.label)?;
-                (target.relative.clone(), target.label.clone(), file)
+                let location = target.location();
+                self.cached_clone(location, attempt, false)?
+                    .map(Ok)
+                    .unwrap_or_else(|| target.root.open_regular_read(&target.relative))?
             };
-            file.seek(SeekFrom::Start(off))?;
-            if which == Which::Partial {
-                require_safe_rooted_named_partial(&target.root, &relative, &label, &file)?;
-            }
             return hash_reader_observed(
-                &mut file,
+                &mut ReadAt {
+                    file: &file,
+                    pos: off,
+                },
                 block,
                 len,
                 Some(&self.operation),
@@ -2400,25 +2357,20 @@ impl FsOps {
             return Ok(hashes);
         }
 
-        let (relative, label, file) =
-            with_rooted_partial(&target, partial.id, |relative, label| {
-                let location = FileLocation::Rooted {
-                    root: target.root.identity(),
-                    relative: relative.clone(),
-                };
-                if let Some(file) = self.cached_clone(location.clone(), attempt, true)? {
-                    return Ok(file);
-                }
-                // A range worker alternates reads and writes on this private inode.
-                // Cache a read/write descriptor on its first comparison; caching a
-                // read-only descriptor would break writes, and a later write-only
-                // cache entry would break the next comparison window.
-                let file = target.root.open_regular_read_write(relative)?;
-                require_safe_rooted_named_partial(&target.root, relative, label, &file)?;
-                self.cache_file(location, attempt, true, file.try_clone()?);
-                Ok(file)
-            })?;
-        require_safe_rooted_named_partial(&target.root, &relative, &label, &file)?;
+        // The comparison reads the sidecar this receiver holds, which the
+        // range writes that follow write through.
+        let copy_id = *partial.id;
+        let (_, _, file) = with_rooted_partial(&target, partial.id, |relative, label| {
+            let held = stages::of(&target, &copy_id, false);
+            let (writer, held_relative) = self.cached_held(label, held, relative, attempt)?;
+            let writer = writer.file().try_clone()?;
+            stages::reader(
+                &target.root,
+                &held_relative,
+                &stages::label(&target, &held_relative),
+                &writer,
+            )
+        })?;
         let mut buffer = vec![0; block.min(u64::from(len)) as usize];
         let mut hashes = Vec::with_capacity(u64::from(len).div_ceil(block) as usize);
         let end = off + u64::from(len);
@@ -2626,8 +2578,10 @@ impl FsOps {
         {
             self.comparison_window = None;
         }
+        let copy_id = *target.id;
         let mut write = |relative: &RelativePath, label: &Path| {
-            let file = self.cached_rooted(label, &rooted.root, relative, attempt, !inplace)?;
+            let held = stages::of(&rooted, &copy_id, inplace);
+            let (file, _) = self.cached_held(label, held, relative, attempt)?;
             let writing = operation.span(crate::transfer_observations::Stage::DestinationWrite);
             let result = file.write_range_at(data, off, sparse);
             if result.is_ok() {
@@ -2743,9 +2697,43 @@ impl FsOps {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Finalize the file this receiver holds for `target` (`stages`), never
+    /// whatever the name holds now. A finalize that fails leaves it held, so
+    /// that it can be finalized again.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn finalize_rooted(
         &mut self,
         target: &RootedTarget,
+        inplace: bool,
+        copy_id: &CopyId,
+        meta: &Meta,
+        flags: u8,
+        scanned: ScannedDestination,
+        mutation: TargetMutation<'_>,
+        expected: Option<&crate::hashing::ExpectedHashes>,
+    ) -> Result<Option<(u64, u64)>> {
+        let held_for = stages::of(target, copy_id, inplace);
+        let held = stages::take(held_for).ok_or_else(|| stages::not_held(&target.label))?;
+        let kept = (
+            held.file.try_clone()?,
+            held.opened.clone(),
+            held.relative.clone(),
+        );
+        let result = self.finalize_held(
+            target, held, inplace, copy_id, meta, flags, scanned, mutation, expected,
+        );
+        if result.is_err() {
+            let (file, opened, relative) = kept;
+            stages::hold(held_for, &relative, &file, opened)?;
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_held(
+        &mut self,
+        target: &RootedTarget,
+        held: stages::Held,
         inplace: bool,
         copy_id: &CopyId,
         meta: &Meta,
@@ -2760,15 +2748,10 @@ impl FsOps {
             // The descriptor Prepare opened carries the metadata read then,
             // before the writes; the condition check, the metadata step and
             // the identity use it instead of a read after the data, which an
-            // NFS client answers with a request. A reopened file is read as
-            // before.
-            let (file, opened) = match self.uncache_rooted_opened(&target.root, &target.relative) {
-                Some(opened) => opened,
-                None => (
-                    target.root.open_regular_write(&target.relative, false)?,
-                    None,
-                ),
-            };
+            // NFS client answers with a request. A file opened without that
+            // read is read as before.
+            self.uncache_rooted(&target.root, &target.relative);
+            let (file, opened) = (held.file, held.opened);
             // The file is read at most once here. A fingerprint condition
             // holds the file's ctime as it is now, after the writes, so that
             // condition needs fresh metadata; every other condition, the
@@ -2808,28 +2791,21 @@ impl FsOps {
             }
             return Ok(known_identity(&current, flags));
         }
-        // The descriptor that created the sidecar carries the metadata read
-        // then, which the metadata step and the identity use instead of a
-        // read after the data: on NFS that read is a request. A reopened
-        // sidecar has no such read and takes the reads it always did.
-        let (src_relative, src, (file, created)) =
-            with_rooted_partial(target, copy_id, |relative, _| {
-                match self.uncache_rooted_opened(&target.root, relative) {
-                    Some(opened) => Ok(opened),
-                    None => target
-                        .root
-                        .open_regular_write(relative, false)
-                        .map(|file| (file, None)),
-                }
-            })?;
+        // The sidecar this receiver holds, never whatever its name holds
+        // now. The descriptor that created it carries the metadata read then,
+        // which the metadata step and the identity use instead of a read
+        // after the data: on NFS that read is a request. A sidecar resumed
+        // from an earlier attempt has no such read and takes the reads it
+        // always did.
+        self.uncache_rooted(&target.root, &held.relative);
+        let src = stages::label(target, &held.relative);
+        let (src_relative, file, created) = (held.relative, held.file, held.opened);
         // The name is checked against the held inode before anything reads
         // the sidecar or changes its metadata, and again before publication.
-        // A reopened descriptor may be whatever the name now holds, so it is
-        // checked at once. The descriptor that created the sidecar is that
-        // inode by construction, so its check waits for the metadata step,
-        // whose SETATTR lets an NFS client answer the check's reads of the
-        // written file from its cache, where before the step they are a
-        // request.
+        // For a sidecar created by this attempt that check waits for the
+        // metadata step, whose SETATTR lets an NFS client answer the check's
+        // reads of the written file from its cache, where before the step
+        // they are a request.
         let checked_early = created.is_none();
         if checked_early {
             require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
@@ -3804,6 +3780,21 @@ impl FsOps {
 /// Publish the private partial `staged` at `source` as `target`. With
 /// `owned`, the published file, which this receiver wrote, is recorded as
 /// its own.
+/// Reads `file` from `pos` with positioned reads, leaving the descriptor's
+/// offset alone: duplicates of a held file on other connections share it.
+pub(super) struct ReadAt<'a> {
+    pub(super) file: &'a File,
+    pub(super) pos: u64,
+}
+
+impl Read for ReadAt<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let count = self.file.read_at(bytes, self.pos)?;
+        self.pos += count as u64;
+        Ok(count)
+    }
+}
+
 pub(super) fn publish_partial_rooted(
     root: &Root,
     source: &RelativePath,
@@ -4242,19 +4233,6 @@ impl<'a> SeedAccess<'a> {
             true
         }
     }
-}
-
-#[cfg(debug_assertions)]
-pub(super) fn fail_partial_chmod_for_test() -> Result<()> {
-    if std::env::var_os("SYQ_TEST_FAIL_PARTIAL_CHMOD").is_some() {
-        bail!("injected partial chmod failure");
-    }
-    Ok(())
-}
-
-#[cfg(not(debug_assertions))]
-pub(super) fn fail_partial_chmod_for_test() -> Result<()> {
-    Ok(())
 }
 
 /// Preallocate a new file on device `dev`, as `preallocate_new_file` does

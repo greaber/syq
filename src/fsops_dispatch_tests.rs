@@ -262,7 +262,10 @@ fn ordinary_partial_planning_and_copy_do_not_query_name_limits() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn optimistic_partial_reopens_legacy_short_name_across_workers() {
+fn a_sidecar_with_a_short_name_serves_every_worker() {
+    // The sidecar's full name exceeds NAME_MAX, so it has the short form. A
+    // file left at that name is not resumed: Prepare replaces it with one it
+    // creates, and the other workers find that one, not the name.
     let dir = crate::test_support::tempdir().unwrap();
     let name = "x".repeat(120);
     // Exact name produced at d695902d with NAME_MAX=143, logical/<120 x's>,
@@ -298,7 +301,7 @@ fn optimistic_partial_reopens_legacy_short_name_across_workers() {
         acl: false,
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
-        create_if_missing: false,
+        create_if_missing: true,
         guard: None,
         group: None,
     });
@@ -344,14 +347,22 @@ fn optimistic_partial_reopens_legacy_short_name_across_workers() {
     assert!(matches!(reply, Response::Ok), "{reply:?}");
     assert_eq!(fs::read(dir.path().join(&name)).unwrap(), b"new data");
     assert!(!dir.path().join(&legacy).exists());
-    for ops in [&first, &prepared, &reader, &writer, &publisher] {
+    // Only the workers that looked at the name learned its limit; the others
+    // found the held sidecar without it.
+    for (ops, queries) in [
+        (&first, 1),
+        (&prepared, 1),
+        (&reader, 0),
+        (&writer, 0),
+        (&publisher, 0),
+    ] {
         assert_eq!(
             ops.destination_root
                 .as_ref()
                 .unwrap()
                 .test_name_queries
                 .load(std::sync::atomic::Ordering::Relaxed),
-            1
+            queries
         );
     }
 }

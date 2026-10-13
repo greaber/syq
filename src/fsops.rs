@@ -44,6 +44,7 @@ mod paths;
 mod receiver_mode;
 mod sidecars;
 mod small_batch;
+mod stages;
 
 pub(crate) use apply::*;
 pub(crate) use entry::*;
@@ -1621,7 +1622,7 @@ impl FsOps {
         let staged = staged_file_mode(meta, flags);
         let (partial, label, opened) = with_rooted_partial(&rooted, copy_id, |partial, label| {
             self.open_private_partial_rooted(
-                &rooted.root,
+                stages::of(&rooted, copy_id, false),
                 partial,
                 label,
                 true,
@@ -2689,24 +2690,6 @@ impl FsOps {
         self.cache_entry(location, attempt, private, CachedFile::new(file));
     }
 
-    /// Cache a descriptor with the metadata read when it opened or created
-    /// its file, before any write.
-    fn cache_opened_file(
-        &mut self,
-        location: FileLocation,
-        attempt: u32,
-        private: bool,
-        file: File,
-        metadata: fs::Metadata,
-    ) {
-        self.cache_entry(
-            location,
-            attempt,
-            private,
-            CachedFile::opened(file, metadata),
-        );
-    }
-
     fn cache_entry(
         &mut self,
         location: FileLocation,
@@ -2750,17 +2733,6 @@ impl FsOps {
             .map(CachedFile::into_file)
     }
 
-    /// The cached descriptor with the metadata read when it opened its
-    /// file, if that was kept.
-    fn uncache_rooted_opened(
-        &mut self,
-        root: &Root,
-        relative: &RelativePath,
-    ) -> Option<(File, Option<fs::Metadata>)> {
-        self.uncache_rooted_entry(root, relative)
-            .map(CachedFile::into_parts)
-    }
-
     fn uncache_rooted_entry(&mut self, root: &Root, relative: &RelativePath) -> Option<CachedFile> {
         self.uncache_entry(&FileLocation::Rooted {
             root: root.identity(),
@@ -2785,40 +2757,40 @@ impl FsOps {
         removed
     }
 
-    fn cached_rooted(
+    /// The descriptor this connection writes the file held for `held`
+    /// through (`stages`), and that file's name: one this connection opened
+    /// at `relative`, or a duplicate of the held one. A file the receiver
+    /// does not hold is refused, whatever the name now holds.
+    fn cached_held(
         &mut self,
         label: &Path,
-        root: &Root,
+        held: stages::For<'_>,
         relative: &RelativePath,
         attempt: u32,
-        private: bool,
-    ) -> Result<&CachedFile> {
-        let key = FdKey {
+    ) -> Result<(&CachedFile, RelativePath)> {
+        let key = |relative: &RelativePath| FdKey {
             location: FileLocation::Rooted {
-                root: root.identity(),
+                root: held.root.identity(),
                 relative: relative.clone(),
             },
             attempt,
-            private,
+            private: !held.inplace,
         };
-        if !self.fds.contains_key(&key) {
-            if self.fds.len() >= FD_CACHE_MAX {
-                let victim = self.fd_order.remove(0);
-                self.fds.remove(&victim);
-            }
-            let file = root.open_regular_write(relative, false)?;
-            if private {
-                require_safe_partial(&file, label)?;
-                let named = root.metadata(relative)?;
-                let opened = file.metadata()?;
-                if opened.dev() != named.dev || opened.ino() != named.ino {
-                    bail!("partial {} changed while opening it", label.display());
+        let mut found = relative.clone();
+        if !self.fds.contains_key(&key(relative)) {
+            let (file, _, held_relative) =
+                stages::get(held)?.ok_or_else(|| stages::not_held(label))?;
+            if !self.fds.contains_key(&key(&held_relative)) {
+                if self.fds.len() >= FD_CACHE_MAX {
+                    let victim = self.fd_order.remove(0);
+                    self.fds.remove(&victim);
                 }
+                self.fds.insert(key(&held_relative), CachedFile::new(file));
+                self.fd_order.push(key(&held_relative));
             }
-            self.fds.insert(key.clone(), CachedFile::new(file));
-            self.fd_order.push(key.clone());
+            found = held_relative;
         }
-        Ok(self.fds.get(&key).unwrap())
+        Ok((self.fds.get(&key(&found)).unwrap(), found))
     }
 
     fn cached_source_read(

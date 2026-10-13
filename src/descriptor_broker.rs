@@ -808,6 +808,65 @@ impl HandedOff {
     }
 }
 
+/// Hand this process's standard input and output, an SSH session's, over
+/// `socket`, which its listener has already admitted, and wait until the
+/// listening process has served them.
+pub(crate) fn hand_over_standard_streams(socket: UnixStream) -> Result<()> {
+    let handed = hand_over_streams(socket, 0, 1)?;
+    release_standard_streams()?;
+    handed.wait()
+}
+
+/// Hand a connection's `input` and `output` over `socket`, which its
+/// listener has already admitted, once the listening process takes them.
+pub(crate) fn hand_over_streams(
+    socket: UnixStream,
+    input: RawFd,
+    output: RawFd,
+) -> Result<HandedOff> {
+    socket.set_read_timeout(Some(BROKER_IO_TIMEOUT))?;
+    socket.set_write_timeout(Some(BROKER_IO_TIMEOUT))?;
+    send_message(socket.as_raw_fd(), &[CONNECTION_REQUEST], &[input, output])?;
+    let mut handed = HandedOff(socket);
+    let mut response = [0u8];
+    match handed.0.read_exact(&mut response) {
+        Ok(()) if response[0] == RESPONSE_OK => Ok(handed),
+        Ok(()) => bail!("the receiver refused the worker connection"),
+        Err(error) => Err(error).context("the receiver did not take the worker connection"),
+    }
+}
+
+/// Receive the standard input and output a worker's SSH session process
+/// hands over `socket` (`hand_over_standard_streams`).
+pub(crate) fn receive_standard_streams(socket: &UnixStream) -> Result<(File, File)> {
+    let (payload, mut descriptors) = receive_message(socket, 1)?;
+    anyhow::ensure!(
+        payload == [CONNECTION_REQUEST] && descriptors.len() == 2,
+        "malformed worker connection handoff"
+    );
+    let output = descriptors.pop().unwrap();
+    let input = descriptors.pop().unwrap();
+    Ok((input, output))
+}
+
+/// Point standard input and output at /dev/null once another process serves
+/// the connection they carried: only that process then holds the session's
+/// input and output, so it alone reads and answers them, and they close when
+/// it is done.
+pub(crate) fn release_standard_streams() -> Result<()> {
+    let null = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+        .context("open /dev/null")?;
+    for descriptor in [0, 1] {
+        if unsafe { libc::dup2(null.as_raw_fd(), descriptor) } < 0 {
+            return Err(io::Error::last_os_error()).context("release the worker connection");
+        }
+    }
+    Ok(())
+}
+
 /// Hand the connection whose input is `input` and output `output` to the
 /// process that owns `ticket`'s session, with the bytes already read from it.
 pub(crate) fn hand_off_pipes(
@@ -852,6 +911,52 @@ fn hand_off(ticket: &DescriptorTicket, prefix: &[u8], descriptors: &[RawFd]) -> 
         Ok(()) if response[0] == RESPONSE_OK => Ok(HandedOff(stream)),
         Ok(()) => bail!("the receiver refused the worker connection"),
         Err(error) => Err(error).context("the receiver did not take the worker connection"),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::HandedOff;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+
+    /// The input of a handed-over SSH session, closed as sshd closes it
+    /// once the session's process has exited: when that process is told the
+    /// connection is over, or its socket closes.
+    pub(crate) struct SessionInput(Arc<Mutex<Option<std::io::PipeWriter>>>);
+
+    impl SessionInput {
+        pub(crate) fn closed_after(input: std::io::PipeWriter, handed: HandedOff) -> Self {
+            let input = Arc::new(Mutex::new(Some(input)));
+            let closing = input.clone();
+            std::thread::spawn(move || {
+                let _ = handed.wait();
+                closing.lock().unwrap().take();
+            });
+            Self(input)
+        }
+    }
+
+    impl Drop for SessionInput {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().take();
+        }
+    }
+
+    impl Write for SessionInput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            match self.0.lock().unwrap().as_mut() {
+                Some(input) => input.write(bytes),
+                None => Err(io::ErrorKind::BrokenPipe.into()),
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            match self.0.lock().unwrap().as_mut() {
+                Some(input) => input.flush(),
+                None => Ok(()),
+            }
+        }
     }
 }
 

@@ -144,9 +144,15 @@ impl Admission {
             PrivateBroker::start_managed(config("syq-copy-worker-", 128), move |mut stream, _| {
                 let result = (|| -> Result<()> {
                     authenticate(&mut stream, &expected)?;
-                    let _permit = crate::server::ConnectionPermit::acquire(authority.clone())?;
-                    let writer = stream.try_clone()?;
-                    crate::server::run_named(stream, writer, authority.clone(), false)
+                    let (input, output) =
+                        crate::descriptor_broker::receive_standard_streams(&stream.try_clone()?)?;
+                    crate::server::serve_handed_restricted(
+                        input,
+                        output,
+                        stream,
+                        authority.clone(),
+                        TIMEOUT,
+                    )
                 })();
                 // Refused workers observe EOF; unauthenticated clients cannot fill
                 // a diagnostic pipe or obtain a useful error oracle.
@@ -273,19 +279,12 @@ pub(in crate::destination) fn setup_over_spec(
 }
 
 /// sshd ignores the caller's requested command and runs exactly this worker.
+/// It hands the session's input and output to the copy's receiver, which
+/// serves them, and waits until it has.
 pub(super) fn worker(encoded: &str) -> Result<i32> {
-    let mut socket = Ticket::decode(encoded)?.connect()?;
-    socket.set_write_timeout(None)?;
-    socket.set_read_timeout(None)?;
-    let mut input = socket.try_clone()?;
-    std::thread::spawn(move || {
-        let _ = pump(&mut std::io::stdin().lock(), &mut input);
-        let _ = input.shutdown(std::net::Shutdown::Write);
-    });
-    let mut output = File::from(std::io::stdout().as_fd().try_clone_to_owned()?);
-    let result = pump(&mut socket, &mut output);
-    let _ = socket.shutdown(std::net::Shutdown::Both);
-    result?;
+    let socket = Ticket::decode(encoded)?.connect()?;
+    crate::descriptor_broker::hand_over_standard_streams(socket)
+        .context("hand the copy's SSH worker to the receiver")?;
     Ok(0)
 }
 
@@ -716,12 +715,28 @@ mod tests {
         write_message(&mut socket, &public).unwrap();
         read_socket_message(&mut socket, TIMEOUT).unwrap()
     }
+    /// A worker as its SSH session process would start it: the session's
+    /// input and output are handed to the receiver, and closed, as sshd
+    /// closes them, once that process is told the connection is over.
     fn worker_connection(
         ticket: &Ticket,
         role: ConnectionRole,
-    ) -> Result<(FrameReader<UnixStream>, FrameWriter<UnixStream>)> {
+    ) -> Result<(
+        FrameReader<std::io::PipeReader>,
+        FrameWriter<crate::descriptor_broker::test_support::SessionInput>,
+    )> {
         let socket = ticket.connect()?;
-        let mut writer = FrameWriter::new(socket.try_clone()?, false);
+        let (receiver_input, input) = std::io::pipe()?;
+        let (output, receiver_output) = std::io::pipe()?;
+        let handed = crate::descriptor_broker::hand_over_streams(
+            socket,
+            receiver_input.as_raw_fd(),
+            receiver_output.as_raw_fd(),
+        )?;
+        drop((receiver_input, receiver_output));
+        let input =
+            crate::descriptor_broker::test_support::SessionInput::closed_after(input, handed);
+        let mut writer = FrameWriter::new(input, false);
         writer.write_msg(&Request::Hello {
             identity: crate::identity::build().into(),
             compress: false,
@@ -729,7 +744,7 @@ mod tests {
             token: Vec::new(),
             role,
         })?;
-        let mut reader = FrameReader::new(socket);
+        let mut reader = FrameReader::new(output);
         anyhow::ensure!(
             matches!(reader.read_msg::<Response>()?, Response::HelloOk { .. }),
             "worker rejected"

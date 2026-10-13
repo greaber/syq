@@ -1034,6 +1034,8 @@ mod metadata;
 mod persistence;
 #[path = "local/progress.rs"]
 mod progress;
+#[path = "local/receiver_process.rs"]
+mod receiver_process;
 #[path = "local/receiving.rs"]
 mod receiving;
 #[path = "local/remote.rs"]
