@@ -95,10 +95,10 @@ pub(super) enum Link {
     /// such as a directory, which cannot be linked.
     Never,
     /// Yes, for a name only this publication uses that is not a staged
-    /// file: an entry moved aside, a new symlink or node, or a new name of
-    /// an existing file. Its link may be refused for reasons of its own, as
-    /// Linux refuses another user's file under `fs.protected_hardlinks`, so
-    /// a refusal is not remembered.
+    /// file: a regular file moved aside, a new name of an existing file, or
+    /// a new symlink or node where the filesystem was audited. Its link may
+    /// be refused for reasons of its own, as Linux refuses another user's
+    /// file under `fs.protected_hardlinks`, so a refusal is not remembered.
     Entry,
     /// Yes, for a staged file this receiver created, and a refusal that
     /// says the filesystem has no hard links is remembered: nothing about
@@ -107,6 +107,19 @@ pub(super) enum Link {
 }
 
 impl Link {
+    /// How a new symlink, device node or FIFO may be published: by linking
+    /// only where the filesystem was audited, where a link names the entry
+    /// itself. Elsewhere the link may be made by a server whose `link()`
+    /// follows symlinks, as macOS's does behind SSHFS, which would publish
+    /// a hard link to the file a sender's symlink names.
+    pub(super) fn new_entry(profile: Profile) -> Self {
+        if profile.audited {
+            Self::Entry
+        } else {
+            Self::Never
+        }
+    }
+
     /// How an entry being put back may move: by linking a regular file,
     /// and renaming anything else.
     pub(super) fn putting_back(entry: RootMetadata) -> Self {

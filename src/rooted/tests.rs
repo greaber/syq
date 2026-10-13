@@ -2099,6 +2099,87 @@ fn an_io_error_from_a_link_falls_back_only_where_the_filesystem_was_not_audited(
     }
 }
 
+/// On a filesystem that was not audited, a new symlink or node is never
+/// published by a hard link: a server whose `link()` follows symlinks, as
+/// macOS's does behind SSHFS, would link the file a sender's symlink names.
+/// There it takes the check-then-rename step; where the filesystem was
+/// audited, the link.
+#[test]
+fn new_symlinks_and_nodes_are_linked_only_where_the_filesystem_was_audited() {
+    use super::publication::CHECKED_RENAMES;
+    for audited in [true, false] {
+        let tree = TestDir::new("leaf-links");
+        let root = Root::open(tree.path()).unwrap();
+        let mut profile = crate::fsops::Profile::LOCAL;
+        profile.exchange = false;
+        profile.atomic_no_replace_rename = false;
+        profile.audited = audited;
+        root.assume_profile_for_test(profile);
+        CHECKED_RENAMES.set(0);
+
+        let link = relative(b"link");
+        root.create_symlink(&link, b"old").unwrap();
+        let old = root.metadata(&link).unwrap();
+        root.replace_symlink_if_same(&link, b"new", old.dev, old.ino)
+            .unwrap();
+        assert_eq!(
+            fs::read_link(tree.path().join("link")).unwrap(),
+            Path::new("new")
+        );
+        let fifo = relative(b"fifo");
+        root.create_node(&fifo, MODE_FIFO | 0o644, 0).unwrap();
+        let old = root.metadata(&fifo).unwrap();
+        root.replace_node_if_same(&fifo, MODE_FIFO | 0o600, 0, old.dev, old.ino)
+            .unwrap();
+        assert_ne!(root.metadata(&fifo).unwrap().ino, old.ino);
+
+        let checked = if audited { 0 } else { 2 };
+        assert_eq!(CHECKED_RENAMES.get(), checked, "audited {audited}");
+        assert_eq!(sorted_names(tree.path()), ["fifo", "link"]);
+    }
+}
+
+/// A private file created for ACL copying is published by the steps its
+/// volume's profile allows: an exclusive rename only where the profile
+/// trusts one, and a refusal falls back and is remembered.
+#[cfg(target_os = "macos")]
+#[test]
+fn private_files_are_published_by_their_volumes_profile() {
+    use super::publication::{CHECKED_RENAMES, REFUSED_RENAME_FLAG_CALLS, REFUSE_RENAME_FLAGS};
+    let tree = TestDir::new("private-file-profile");
+    let root = Root::open(tree.path()).unwrap();
+    let mut profile = root.profile();
+    profile.atomic_no_replace_rename = true;
+    profile.hard_links = true;
+    root.assume_profile_for_test(profile);
+    REFUSE_RENAME_FLAGS.set(true);
+    REFUSED_RENAME_FLAG_CALLS.set(0);
+    CHECKED_RENAMES.set(0);
+    let created = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        root.create_private_file(&relative(b"first"))
+    }));
+    REFUSE_RENAME_FLAGS.set(false);
+    let file = created.unwrap().unwrap();
+    // The refused flag was tried once, and the file was linked instead.
+    assert_eq!(REFUSED_RENAME_FLAG_CALLS.get(), 1);
+    assert!(!root.profile().atomic_no_replace_rename);
+    assert_eq!(CHECKED_RENAMES.get(), 0);
+    let published = fs::symlink_metadata(tree.path().join("first")).unwrap();
+    assert_eq!(
+        (published.ino(), published.nlink(), published.mode() & 0o777),
+        (file.metadata().unwrap().ino(), 1, 0o600)
+    );
+    // Nothing replaces an existing name.
+    let error = root.create_private_file(&relative(b"first")).unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::AlreadyExists),
+        "{error:#}"
+    );
+    assert_eq!(sorted_names(tree.path()), ["first"]);
+}
+
 /// A hard link names its file on the file's own filesystem, so it is
 /// published by that filesystem's profile. A link from another filesystem
 /// fails with `EXDEV`, which teaches nothing, and must not leave the

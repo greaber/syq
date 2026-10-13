@@ -865,15 +865,21 @@ impl Root {
                 0o600,
             )?;
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            retry_zero(|| unsafe {
-                libc::renameatx_np(
-                    directory.as_raw_fd(),
-                    leaf.as_ptr(),
-                    parent.directory.as_raw_fd(),
-                    parent.leaf.as_ptr(),
-                    libc::RENAME_EXCL,
-                )
-            })?;
+            // Published without replacing, by the steps the filesystem's
+            // profile allows: RENAME_EXCL only on volume types where tests
+            // show it working.
+            let mut profile = self.profile_on(metadata.dev(), directory);
+            self.move_own_name_without_replacing(
+                &mut profile,
+                &parent.directory,
+                &publication::Placement {
+                    from_directory: directory.as_raw_fd(),
+                    from: leaf,
+                    to_directory: parent.directory.as_raw_fd(),
+                    to: &parent.leaf,
+                    link: publication::Link::Staged,
+                },
+            )?;
             Ok(file)
         })();
         let cleanup = (|| -> Result<()> {
@@ -1061,6 +1067,9 @@ impl Root {
             retry_zero(|| unsafe { libc::futimens(file.as_raw_fd(), std::ptr::null()) })?;
             // Do not replace an existing resumable partial, including one that
             // appeared after the caller checked. Both directory fds stay pinned.
+            // RENAME_EXCL is called directly, not through the filesystem's
+            // profile: clones are staged only on APFS (checked above), where
+            // tests show it working.
             let published = unsafe {
                 libc::renameatx_np(
                     directory.as_raw_fd(),
@@ -1733,12 +1742,13 @@ impl Root {
             })
             .with_context(|| format!("atomically replace confined path {}", path.label()))?
         {
+            let link = publication::Link::new_entry(profile);
             let aside = self
                 .publish_over_moved_aside(
                     &mut profile,
                     path,
                     &parent,
-                    (directory, &temporary, publication::Link::Entry),
+                    (directory, &temporary, link),
                     |entry| {
                         publication::is_expected(entry, expected_dev, expected_ino, expected_type)
                     },
