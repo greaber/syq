@@ -1,7 +1,6 @@
-//! Enrollment key protection and local signing. Only the dedicated key is
-//! exposed to a coordinating server; the login identity is never forwarded.
+//! Protected grant signing stays local; a separate software key admits SSH
+//! connections to the restricted receiver.
 use super::*;
-use crate::agent_broker::{BrokerPolicy, ConstrainedAgentBroker};
 use crate::process::CommandExt as _;
 use ssh_key::{Algorithm, PublicKey};
 use zeroize::Zeroizing;
@@ -52,24 +51,88 @@ impl EnrollmentSigningKey {
             }
         }
     }
+}
 
-    pub(crate) fn start_broker(
-        self,
-        policy: BrokerPolicy,
-        limit: usize,
-    ) -> Result<ConstrainedAgentBroker> {
-        match self {
-            Self::Private(key) => {
-                ConstrainedAgentBroker::start_with_private_key(policy, limit, key)
-            }
-            Self::Agent { key, socket, .. } => ConstrainedAgentBroker::start_with_agent_key(
-                policy,
-                limit,
-                socket,
-                key.key_data().clone(),
-            ),
-        }
+/// A software SSH admission key has no grant-signing authority. It is never
+/// reused as the protected enrollment key, including while upgrading old state.
+const SSH_KEY_FILE: &str = "ssh-key";
+
+pub(super) fn validate_ssh_public_key(key: &PublicKey) -> Result<()> {
+    anyhow::ensure!(
+        matches!(
+            key.algorithm(),
+            Algorithm::Ed25519 | Algorithm::Rsa { .. } | Algorithm::Ecdsa { .. }
+        ),
+        "receiver SSH key must be a software Ed25519, RSA, or ECDSA key"
+    );
+    Ok(())
+}
+
+pub(super) fn load_ssh_key(directory: &Path) -> Result<PrivateKey> {
+    let encoded = delegation::read_private_regular(
+        &directory.join(SSH_KEY_FILE),
+        "receiver SSH key",
+        MAX_STATE_FILE,
+    )?;
+    let key = PrivateKey::from_openssh(&encoded).context("parse receiver SSH key")?;
+    anyhow::ensure!(!key.is_encrypted(), "receiver SSH key must be unencrypted");
+    validate_ssh_public_key(key.public_key())?;
+    anyhow::ensure!(
+        key.public_key().key_data() != load_enrollment_public_key(directory)?.key_data(),
+        "receiver SSH key must differ from its grant-signing key"
+    );
+    Ok(key)
+}
+
+pub(super) fn optional_ssh_public_key(directory: &Path) -> Result<Option<String>> {
+    match fs::symlink_metadata(directory.join(SSH_KEY_FILE)) {
+        Ok(_) => Ok(Some(load_ssh_key(directory)?.public_key().to_openssh()?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("inspect receiver SSH key"),
     }
+}
+
+pub(super) fn ensure_ssh_key(directory: &Path) -> Result<PrivateKey> {
+    match fs::symlink_metadata(directory.join(SSH_KEY_FILE)) {
+        Ok(_) => return load_ssh_key(directory),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect receiver SSH key"),
+    }
+    let public = load_enrollment_public_key(directory)?;
+    let mut rng = ssh_key::rand_core::OsRng;
+    let key = match public.algorithm() {
+        Algorithm::Rsa { .. } => {
+            let modulus = public
+                .key_data()
+                .rsa()
+                .context("RSA grant key")?
+                .n
+                .as_positive_bytes()
+                .context("RSA modulus")?;
+            let bits = modulus.first().map_or(0, |first| {
+                modulus.len() * 8 - first.leading_zeros() as usize
+            });
+            ssh_key::private::RsaKeypair::random(&mut rng, bits.max(3072))?.into()
+        }
+        Algorithm::Ecdsa { curve } => PrivateKey::random(&mut rng, Algorithm::Ecdsa { curve })?,
+        Algorithm::SkEcdsaSha2NistP256 => PrivateKey::random(
+            &mut rng,
+            Algorithm::Ecdsa {
+                curve: ssh_key::EcdsaCurve::NistP256,
+            },
+        )?,
+        Algorithm::Ed25519 | Algorithm::SkEd25519 => {
+            PrivateKey::random(&mut rng, Algorithm::Ed25519)?
+        }
+        _ => bail!("unsupported receiver SSH key algorithm"),
+    };
+    atomic_write(
+        directory,
+        SSH_KEY_FILE,
+        key.to_openssh(LineEnding::LF)?.as_bytes(),
+        0o600,
+    )?;
+    load_ssh_key(directory)
 }
 
 pub(super) fn load_signing_key(

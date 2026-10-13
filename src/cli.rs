@@ -517,6 +517,9 @@ pub struct Args {
     /// Signed receiver grant forwarded to a native source-host coordinator
     #[arg(skip)]
     pub restricted_grant: Option<String>,
+    /// Laptop-trusted destination keys for the restricted coordinator's SSH connections
+    #[arg(skip)]
+    pub(crate) receiver_known_hosts: Option<String>,
     /// Terminal width for a native remote coordinator's progress display
     #[arg(skip)]
     pub width: Option<usize>,
@@ -3193,6 +3196,7 @@ fn apply_internal_native_direct(args: &mut Args) -> Result<()> {
             .transpose()
     };
     args.restricted_grant = utf8("SYQ_INTERNAL_NATIVE_RESTRICTED_GRANT")?;
+    args.receiver_known_hosts = utf8(crate::remote_to_remote::RECEIVER_KNOWN_HOSTS)?;
     args.plan_source_host = utf8("SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST")?;
     args.requester_stdin = utf8(crate::remote_to_remote::REQUESTER_STDIN)?
         .map(|bytes| {

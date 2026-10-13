@@ -567,7 +567,7 @@ fn destination_rsh(
     match agent_forwarding {
         // A uses the broker to authenticate to B, but B must never receive it.
         // The generated command ignores A's SSH configuration and identity
-        // files, then uses only the forwarded socket with host-bound auth.
+        // files, then uses only the selected forwarded socket.
         Some(AgentForwarding::Constrained { .. }) => constrained_rsh.map(str::to_owned),
         // The explicitly selected unrestricted policy forwards the ambient
         // agent, while preventing it from being forwarded another hop.
@@ -580,8 +580,22 @@ fn destination_rsh(
     }
 }
 
-fn constrained_destination_rsh(port: u16, host_key_algorithms: &str) -> String {
-    shell_words::join([
+#[derive(Clone, Copy)]
+enum DestinationAuthentication {
+    Broker,
+    Receiver,
+}
+
+fn constrained_destination_rsh(
+    port: u16,
+    host_key_algorithms: &str,
+    authentication: DestinationAuthentication,
+) -> String {
+    let (publickey, checking) = match authentication {
+        DestinationAuthentication::Broker => ("host-bound", "no"),
+        DestinationAuthentication::Receiver => ("yes", "yes"),
+    };
+    let mut command = vec![
         "ssh".to_owned(),
         "-F".to_owned(),
         "/dev/null".to_owned(),
@@ -600,7 +614,7 @@ fn constrained_destination_rsh(port: u16, host_key_algorithms: &str) -> String {
         "-o".to_owned(),
         "PKCS11Provider=none".to_owned(),
         "-o".to_owned(),
-        "PubkeyAuthentication=host-bound".to_owned(),
+        format!("PubkeyAuthentication={publickey}"),
         "-o".to_owned(),
         "PreferredAuthentications=publickey".to_owned(),
         "-o".to_owned(),
@@ -618,7 +632,7 @@ fn constrained_destination_rsh(port: u16, host_key_algorithms: &str) -> String {
         "-o".to_owned(),
         "ProxyCommand=none".to_owned(),
         "-o".to_owned(),
-        "StrictHostKeyChecking=no".to_owned(),
+        format!("StrictHostKeyChecking={checking}"),
         "-o".to_owned(),
         "LogLevel=ERROR".to_owned(),
         "-o".to_owned(),
@@ -635,7 +649,56 @@ fn constrained_destination_rsh(port: u16, host_key_algorithms: &str) -> String {
         format!("HostKeyAlgorithms={host_key_algorithms}"),
         "-p".to_owned(),
         port.to_string(),
-    ])
+    ];
+    if matches!(authentication, DestinationAuthentication::Receiver) {
+        command.extend(["-o".into(), format!("HostKeyAlias={RECEIVER_HOST_ALIAS}")]);
+    }
+    // An older helper that ignores the supplied host keys has only /dev/null
+    // and strict checking, so the restricted copy fails verification.
+    shell_words::join(command)
+}
+
+pub(crate) const RECEIVER_KNOWN_HOSTS: &str = "SYQ_INTERNAL_NATIVE_RECEIVER_KNOWN_HOSTS";
+const RECEIVER_HOST_ALIAS: &str = "syq-enrolled-receiver";
+
+/// Materialize the laptop's trusted destination keys on the source. The guard
+/// lives through all workers; ordinary OpenSSH verifies every connection.
+pub(crate) fn prepare_receiver_ssh(args: &mut Args) -> Result<Option<tempfile::TempDir>> {
+    let Some(known_hosts) = args.receiver_known_hosts.take() else {
+        return Ok(None);
+    };
+    prepare_receiver_ssh_with(args, &known_hosts).map(Some)
+}
+
+fn prepare_receiver_ssh_with(args: &mut Args, known_hosts: &str) -> Result<tempfile::TempDir> {
+    anyhow::ensure!(
+        args.restricted_grant
+            .as_deref()
+            .is_some_and(crate::restricted::enrolled_grant),
+        "receiver host keys require an enrolled copy grant"
+    );
+    anyhow::ensure!(
+        !known_hosts.is_empty() && known_hosts.len() <= 64 * 1024,
+        "invalid receiver known-hosts length"
+    );
+    for line in known_hosts.lines() {
+        let key = line
+            .strip_prefix(&format!("{RECEIVER_HOST_ALIAS} "))
+            .context("invalid receiver known-hosts alias")?;
+        ssh_key::PublicKey::from_openssh(key).context("invalid receiver host key")?;
+    }
+    let mut command = parse_rsh(&args.rsh)?;
+    let entry = command
+        .iter_mut()
+        .find(|argument| *argument == "UserKnownHostsFile=/dev/null")
+        .context("receiver SSH command is missing its known-hosts placeholder")?;
+    let directory = crate::private_broker::private_temp_dir("syq-receiver-hosts-")?;
+    let path = directory.path().join("known_hosts");
+    std::fs::write(&path, known_hosts)?;
+    crate::agent_broker::validate_openssh_option_path(&path, "receiver known-hosts file")?;
+    *entry = format!("UserKnownHostsFile={}", path.display());
+    args.rsh = Some(shell_words::join(command));
+    Ok(directory)
 }
 
 // This bounds unauthenticated clients on the invoking machine independently of
@@ -801,6 +864,8 @@ fn run_remote(
     }
 
     let mut broker_guard = None;
+    let mut _receiver_agent_guard = None;
+    let mut receiver_known_hosts = None;
     let mut peer_login_user = None;
     let mut peer_connection_host = None;
     let mut constrained_rsh = None;
@@ -826,7 +891,9 @@ fn run_remote(
     } else if args.peer_auth == PeerAuth::FullAgent {
         Some(AgentForwarding::Unrestricted)
     } else {
-        crate::conn::require_constrained_openssh(&rsh[0], "on this machine")?;
+        if args.peer_auth == PeerAuth::Broker || coordinator_at_dst {
+            crate::conn::require_constrained_openssh(&rsh[0], "on this machine")?;
+        }
         let coordinator_policy = crate::agent_broker::resolve_host_policy_at(
             &rsh[0],
             coordinator.user.as_deref(),
@@ -844,6 +911,7 @@ fn run_remote(
         constrained_rsh = Some(constrained_destination_rsh(
             peer_policy.port(),
             &peer_policy.host_key_algorithms(),
+            DestinationAuthentication::Broker,
         ));
         // Native new/existing placement forms travel in the signed grant as the
         // root-existence precondition, so they use the receiver like any other
@@ -864,7 +932,6 @@ fn run_remote(
             .context(
                 "prepare command-restricted destination enrollment; use --peer-auth broker to explicitly request authentication-only confinement",
             )?;
-        let policy = crate::agent_broker::BrokerPolicy::new(coordinator_policy, peer_policy);
         let limit = broker_connection_limit(
             args.connections_opt.or_else(|| {
                 args.resource_limits
@@ -873,7 +940,20 @@ fn run_remote(
             }),
             prepared.is_some(),
         )?;
-        let broker = if let Some(prepared) = prepared {
+        let (ambient, socket) = if let Some(prepared) = prepared {
+            let ambient = coordinator_policy.agent_socket()
+                .context("authenticating to the source host needs its configured SSH agent; configure IdentityAgent or SSH_AUTH_SOCK")?
+                .to_string_lossy().into_owned();
+            crate::agent_broker::validate_openssh_option_path(
+                std::path::Path::new(&ambient),
+                "source SSH agent",
+            )?;
+            receiver_known_hosts = Some(peer_policy.known_hosts(RECEIVER_HOST_ALIAS)?);
+            constrained_rsh = Some(constrained_destination_rsh(
+                peer_policy.port(),
+                &peer_policy.host_key_algorithms(),
+                DestinationAuthentication::Receiver,
+            ));
             restricted_destination_path = Some(prepared.canonical_destination);
             restricted_grant = Some(prepared.grant);
             receipt_expectation = Some(ReceiptExpectation {
@@ -890,13 +970,22 @@ fn run_remote(
                     prepared.enrollment_id
                 );
             }
-            prepared.private_key.start_broker(policy, limit)?
+            let agent = crate::restricted::ReceiverAgent::start(prepared.ssh_key, limit)?;
+            crate::agent_broker::validate_openssh_option_path(
+                agent.socket_path(),
+                "receiver agent",
+            )?;
+            let socket = agent.socket_path().to_string_lossy().into_owned();
+            _receiver_agent_guard = Some(agent);
+            (ambient, socket)
         } else {
-            crate::agent_broker::ConstrainedAgentBroker::start(policy, limit)?
+            let policy = crate::agent_broker::BrokerPolicy::new(coordinator_policy, peer_policy);
+            let broker = crate::agent_broker::ConstrainedAgentBroker::start(policy, limit)?;
+            let ambient = broker.ambient_socket().to_string_lossy().into_owned();
+            let socket = broker.socket_path().to_string_lossy().into_owned();
+            broker_guard = Some(broker);
+            (ambient, socket)
         };
-        let ambient = broker.ambient_socket().to_string_lossy().into_owned();
-        let socket = broker.socket_path().to_string_lossy().into_owned();
-        broker_guard = Some(broker);
         Some(AgentForwarding::Constrained {
             ambient,
             broker: socket,
@@ -1214,6 +1303,9 @@ fn run_remote(
     if let Some(grant) = &restricted_grant {
         internal_environment.push(("SYQ_INTERNAL_NATIVE_RESTRICTED_GRANT", grant.clone()));
     }
+    if let Some(known_hosts) = receiver_known_hosts {
+        internal_environment.push((RECEIVER_KNOWN_HOSTS, known_hosts));
+    }
     if args.dry_run {
         internal_environment.push((
             "SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST",
@@ -1405,7 +1497,7 @@ fn run_remote(
         Some(c) => {
             if peer_bridge.is_none()
                 && args.rsh.is_none()
-                && matches!(args.peer_auth, PeerAuth::Restricted | PeerAuth::Broker)
+                && args.peer_auth == PeerAuth::Broker
                 && !same_host
             {
                 bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Use --peer-auth own-credentials with coordinator-host credentials, or explicitly accept full agent exposure with --peer-auth full-agent", peer_login_user.as_deref().unwrap_or("the peer user"), peer.host.as_deref().unwrap_or("the peer"))
