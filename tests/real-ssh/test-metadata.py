@@ -251,7 +251,7 @@ def failed_copies():
                         '--srcs-in', str(source), '--to', 'destination', '--into', destination,
                         '--syq-path', wrapper, '--performance-tuning=workers=1', '--no-progress', *transport]
                     if inplace:
-                        command.extend(['--if-exists=update', '--inplace'])
+                        command.extend(['--if-exists=update', '--in-place=new'])
                     result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, env=env)
                     assert result.returncode != 0, result.stdout
                     assert 'injected attribute reconciliation failure' in result.stdout, result.stdout

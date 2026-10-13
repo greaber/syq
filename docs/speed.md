@@ -140,8 +140,8 @@ details, units, and supported routes.
 ## Compression and in-place writes
 
 `--no-compress` can help when compression costs more CPU time than it saves
-in network traffic; see [Transport compression](reference.md#transport-compression). `--inplace` saves temporary
-disk space, but exposes incomplete updates to readers. Read
+in network traffic; see [Transport compression](reference.md#transport-compression). `--in-place=new` writes new
+files at their final names, but shows readers incomplete files. Read
 [in-place writes](reference.md#in-place-writes) before using it.
 
 <a id="how-many-connections"></a>

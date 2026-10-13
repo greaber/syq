@@ -77,12 +77,25 @@ redirecting an operation; they do not make all changes within the selected
 directory safe. The following risks require separate attention, especially
 when syq has more permissions than the people who can modify that directory.
 
-**Hard links and `--inplace`.** Suppose `backup/report` and a file outside
-`backup` are hard links to the same file. Copying over `backup/report` with
-`--inplace` changes the contents visible through both names. Avoid `--inplace`
-when you cannot trust the destination's existing files. Metadata changes,
-such as permissions or timestamps, also affect every hard link to that file,
-even without `--inplace`.
+**Existing files and their other names.** Syq writes new contents only into
+files the copy creates. It updates an existing file by building a new one
+beside it and renaming that over the name, so a hard link to the old file
+elsewhere, or someone who already has it open, keeps the old contents. This
+holds with `--in-place=new` too, which writes only new files at their final
+names.
+
+Syq changes an existing file's permissions, owner, group, times, ACLs or
+extended attributes in place only when the file has no other names, the
+filesystem's link counts can be trusted, the file belongs to the account syq
+runs as (as root: already to the owner and group it ends with), and the change
+adds no set-user-ID or set-group-ID bit or file capability. Otherwise syq
+replaces the file as if its contents had changed. So a hard link planted in the
+destination never takes the copy's metadata, and root never gives a file
+another user planted there the source's owner or permissions, even when its
+size and time match the source's. A symlink, device or named pipe whose
+metadata changes is created again with it. Narrowing a file's permissions in
+place does not cut off someone who already has it open, though they can read
+only the contents they could read before.
 
 **Permissions supplied by the source.** Path protection does not decide
 whether copied permissions are appropriate. For example,
@@ -100,7 +113,7 @@ hard links, checks those bytes against the source, and leaves the old files
 unchanged. It does not resume by writing through the planted link.
 
 **Files swapped in during a copy.** While a copy runs, the receiving side
-writes each partial file, and each file `--inplace` creates, only through the
+writes each partial file, and each file `--in-place=new` creates, only through the
 file it created or opened itself, never by opening the name again. A file
 someone renames into its place gets none of the copy's data or metadata. When
 that happens to a partial file, syq does not publish what is at its name, and
@@ -266,8 +279,8 @@ such as FAT and exFAT on macOS and rclone mounts, it still refuses files that
 already exist, but a file another program creates at a name in the instant
 between syq's check and its rename can be replaced.
 
-The filesystem limitations above still apply, including effects through
-hard links. HostB's account and receiver remain trusted to
+The filesystem limitations above still apply. HostB's account and receiver
+remain trusted to
 enforce the grant and report accurately. A verified receipt describes their
 work; it cannot prove that hostA supplied the right files. For example, a
 successful receipt can accurately report that hostB wrote false contents

@@ -74,7 +74,7 @@ objects.
   to S3 Last-Modified when an object has no stored timestamp. S3 Last-Modified
   reflects uploads and metadata rewrites, rather than the original file's age.
   Equal timestamps use the normal content comparison.
-  `--inplace` and SSH/S3 combinations are unsupported.
+  `--in-place=new` and SSH/S3 combinations are unsupported.
 - **Recovery:** Retrying a copy can reuse multipart work. Recovery records are
   stored in the local user cache and removed on success. If that cache cannot be used, for example
   because it is read-only or belongs to another user, the copy continues with a

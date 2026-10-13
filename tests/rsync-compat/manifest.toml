@@ -218,12 +218,12 @@ classification = "adapted"
 adaptation = "inplace-syq-cli"
 adaptation_kind = "invocation"
 area = "publication"
-position = "compatible"
+position = "intentional-divergence"
 baseline = "pass"
 platforms = ["linux", "macos"]
 tags = ["local", "inplace", "inode"]
 requirements = ["stable inode numbers"]
-note = "--inplace retains the destination inode while the default atomic path replaces it."
+note = "--inplace writes only new files in place; an existing destination is replaced, getting a new inode as on the default path."
 
 [[tests]]
 name = "longdir"

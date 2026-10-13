@@ -213,7 +213,7 @@ SSH destination, while `--to @NAME` sends files to a receiving machine.
 Per-copy SSH authorization through a receiving machine does not support a root
 login on the destination, `--detach`, custom
 `--rsh` or `--syq-path`, `--no-bootstrap`, alternative `--peer-auth`
-or `--coordinate-at`, `--no-tcp-encryption`, or `--inplace`. The authorizing
+or `--coordinate-at`, or `--no-tcp-encryption`. The authorizing
 machine's copy limits apply, including its `--max-delete` and `--max-entries`
 for pruning. Uploads send file data directly from
 source to destination over encrypted TCP, falling back to SSH between those same
