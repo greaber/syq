@@ -388,11 +388,10 @@ impl Root {
     }
 
     /// Whether the root's filesystem reports link counts and inode numbers
-    /// that checks can rely on. Where it does not, a rule that looks for a
-    /// file's other names must assume it may have some: the outside-names
-    /// rule of restricted receivers is to stage content changes and refuse
-    /// metadata-only changes in approved directories on such filesystems.
-    // The outside-names rule of #778 is its first caller.
+    /// that checks can rely on. Where it does not, a check that needs to
+    /// know a file has no other names must assume it may have some.
+    // Its callers are still to come: the check that lets metadata change in
+    // place, and fast staging.
     #[allow(dead_code)]
     pub(crate) fn link_counts_trusted(&self) -> bool {
         self.profile().link_counts_trusted
@@ -1832,6 +1831,7 @@ impl Root {
     /// `condition` says what the new name may replace: anything but a
     /// directory (`Any`), nothing (`Absent`), or exactly one object
     /// (`Matches`).
+    #[cfg(test)]
     pub(crate) fn publish_hardlink(
         &self,
         source: &RelativePath,

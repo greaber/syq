@@ -112,10 +112,10 @@ pub(crate) struct Profile {
     /// Where this is false, checks that compare counts or numbers are not
     /// made, and nothing is skipped because two names seem to be one file.
     /// Leftover partial files are still used: they are only read into a new
-    /// partial, block by block against the source. A rule that relies on a
-    /// count to find a file's other names (a restricted receiver's limit on
-    /// files that may have names outside its approved directories) must
-    /// assume any file may have them.
+    /// partial, block by block against the source. A check that relies on a
+    /// count to know a file has no other names must assume it may have
+    /// some, and one that relies on a number to know which file a name
+    /// leads to cannot be made.
     pub(crate) link_counts_trusted: bool,
     /// Setting a symlink's times with `AT_SYMLINK_NOFOLLOW` sets the link's
     /// own. An SFTP server behind SSHFS follows the link and sets the
@@ -413,11 +413,9 @@ fn super_options(mounts: &[u8], mount: u64) -> Option<&[u8]> {
     None
 }
 
-/// macOS: the profile of the volume holding `fd`, from the capabilities it
-/// advertises, cached per mount point. A capability a volume was seen to
-/// violate does not count: FAT32 (`msdos`) completes `RENAME_SWAP` as a
-/// plain rename over the target and reports success. It does not
-/// advertise the capability, but it is excluded by name as well.
+/// macOS: the volumes whose profiles are known, by volume identity: the
+/// filesystem ID, mount point and type together, so that a volume mounted
+/// where another was is read again.
 #[cfg(target_os = "macos")]
 fn volumes() -> &'static std::sync::Mutex<std::collections::HashMap<Vec<u8>, Profile>> {
     use std::collections::HashMap;
@@ -426,9 +424,17 @@ fn volumes() -> &'static std::sync::Mutex<std::collections::HashMap<Vec<u8>, Pro
     VOLUMES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The mount point and filesystem type name of the volume holding `fd`.
+/// The volume holding `fd`: its identity (filesystem ID, mount point and
+/// type name), mount point, and type name.
 #[cfg(target_os = "macos")]
-fn volume_of(fd: RawFd) -> Option<(Vec<u8>, Vec<u8>)> {
+struct Volume {
+    identity: Vec<u8>,
+    mount: std::ffi::CString,
+    kind: Vec<u8>,
+}
+
+#[cfg(target_os = "macos")]
+fn volume_of(fd: RawFd) -> Option<Volume> {
     let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
     // SAFETY: fstatfs writes only into the local structure.
     if unsafe { libc::fstatfs(fd, stats.as_mut_ptr()) } != 0 {
@@ -438,48 +444,81 @@ fn volume_of(fd: RawFd) -> Option<(Vec<u8>, Vec<u8>)> {
     // SAFETY: fstatfs NUL-terminates both names.
     let mount = unsafe { std::ffi::CStr::from_ptr(stats.f_mntonname.as_ptr()) };
     let kind = unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) };
-    Some((mount.to_bytes().to_vec(), kind.to_bytes().to_vec()))
+    // SAFETY: fsid_t is plain data; its fields are not public in libc.
+    let fsid = unsafe {
+        std::slice::from_raw_parts(
+            (&stats.f_fsid as *const libc::fsid_t).cast::<u8>(),
+            std::mem::size_of::<libc::fsid_t>(),
+        )
+    };
+    let mut identity = fsid.to_vec();
+    identity.extend_from_slice(mount.to_bytes_with_nul());
+    identity.extend_from_slice(kind.to_bytes());
+    Some(Volume {
+        identity,
+        mount: mount.to_owned(),
+        kind: kind.to_bytes().to_vec(),
+    })
+}
+
+/// What a volume of this type may be trusted with, whatever it advertises
+/// or a cached profile says. FAT32 (`msdos`) completes `RENAME_SWAP` as a
+/// plain rename over the target and reports success, so it never swaps;
+/// inode numbers were tested on APFS and HFS+ only; symlink times on APFS,
+/// HFS+, FAT and exFAT (where links are small files), and on NFS, SETATTR
+/// acts on the object a file handle names, the link itself.
+#[cfg(target_os = "macos")]
+fn within_kind(mut profile: Profile, kind: &[u8]) -> Profile {
+    profile.exchange &= kind != b"msdos";
+    profile.link_counts_trusted &= matches!(kind, b"apfs" | b"hfs");
+    profile.symlink_times &= matches!(kind, b"apfs" | b"hfs" | b"msdos" | b"exfat" | b"nfs");
+    profile.two_second_mtimes = kind == b"msdos";
+    profile
 }
 
 #[cfg(target_os = "macos")]
 fn update_macos_profile(fd: RawFd, update: impl FnOnce(&mut Profile)) {
     let profile = macos_profile(fd);
-    if let Some((mount, _)) = volume_of(fd) {
-        update(volumes().lock().unwrap().entry(mount).or_insert(profile));
+    if let Some(volume) = volume_of(fd) {
+        update(
+            volumes()
+                .lock()
+                .unwrap()
+                .entry(volume.identity)
+                .or_insert(profile),
+        );
     }
 }
 
+/// macOS: the profile of the volume holding `fd`, from the capabilities it
+/// advertises and its type, cached per volume.
 #[cfg(target_os = "macos")]
 pub(crate) fn macos_profile(fd: RawFd) -> Profile {
-    let Some((mount, kind)) = volume_of(fd) else {
+    let Some(volume) = volume_of(fd) else {
         return Profile::CONSERVATIVE;
     };
-    let kind = kind.as_slice();
-    if let Some(known) = volumes().lock().unwrap().get(&mount) {
-        return *known;
+    if let Some(known) = volumes().lock().unwrap().get(&volume.identity) {
+        return within_kind(*known, &volume.kind);
     }
-    let Ok(mount_name) = std::ffi::CString::new(mount.clone()) else {
-        return Profile::CONSERVATIVE;
-    };
-    let profile = match read_volume_capabilities(&mount_name) {
+    let profile = match read_volume_capabilities(&volume.mount) {
         None => Profile::CONSERVATIVE,
-        Some(volume) => Profile {
-            exchange: volume.rename_swap && kind != b"msdos",
-            atomic_no_replace_rename: volume.rename_exclusive,
-            hard_links: volume.hard_links,
-            // Tested on APFS and HFS+ only; other volumes may report
-            // capabilities they were not tested for.
-            link_counts_trusted: matches!(kind, b"apfs" | b"hfs")
-                && volume.hard_links
-                && volume.persistent_ids,
-            // Tested on APFS, HFS+, FAT and exFAT (where links are small
-            // files); on NFS, SETATTR acts on the object a file handle
-            // names, the link itself.
-            symlink_times: matches!(kind, b"apfs" | b"hfs" | b"msdos" | b"exfat" | b"nfs"),
-            two_second_mtimes: kind == b"msdos",
-        },
+        Some(capabilities) => within_kind(
+            Profile {
+                exchange: capabilities.rename_swap,
+                atomic_no_replace_rename: capabilities.rename_exclusive,
+                hard_links: capabilities.hard_links,
+                link_counts_trusted: capabilities.hard_links && capabilities.persistent_ids,
+                symlink_times: true,
+                two_second_mtimes: false,
+            },
+            &volume.kind,
+        ),
     };
-    *volumes().lock().unwrap().entry(mount).or_insert(profile)
+    *volumes()
+        .lock()
+        .unwrap()
+        .entry(volume.identity)
+        .or_insert(profile)
 }
 
 /// The atomic renames and identity reports a macOS volume advertises.
