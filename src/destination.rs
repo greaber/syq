@@ -839,14 +839,11 @@ fn constrain(
     request.copy.limits.max_total_bytes = request.copy.limits.max_total_bytes.min(max_bytes);
     request.copy.limits.max_file_bytes = request.copy.limits.max_file_bytes.min(max_bytes);
     request.copy.limits.max_entries = request.copy.limits.max_entries.min(max_entries);
-    // This machine's own --max-delete bounds pruning. The sender learns it
-    // from the approval and refuses every deletion when it plans more.
     request.copy.limits.max_deletions = request
         .copy
         .limits
         .max_deletions
-        .min(max_delete)
-        .min(request.copy.limits.max_entries);
+        .min(deletion_ceiling(&request, max_delete));
     if request.copy.policy.deletion == crate::delegation::DeletionPolicy::DeleteDestinationOnly
         && request.copy.limits.max_deletions == 0
     {
@@ -858,6 +855,16 @@ fn constrain(
         .max_connections
         .min(crate::delegation::MAX_CONNECTIONS);
     Ok(request)
+}
+
+/// The most deletions a copy constrained by [`constrain`] may make here:
+/// this machine's own --max-delete, within the copy's entry limit. A pruning
+/// grant enforces it, or the sender's own --max-delete if lower. The
+/// approval carries it to the sender, which refuses every deletion when it
+/// plans more. A dry run's read-only grant deletes nothing, but its reply
+/// carries this too, so the dry run plans against what a real run would get.
+fn deletion_ceiling(request: &CopyRequest, max_delete: u64) -> u64 {
+    max_delete.min(request.copy.limits.max_entries)
 }
 
 /// The SSH destination a copy through the receiving machine's access would use.
@@ -1334,6 +1341,7 @@ impl Receiver {
                     self.max_entries,
                     self.max_delete,
                 )?;
+                let max_delete = deletion_ceiling(&request, self.max_delete);
                 {
                     let mut sessions = self.sessions.lock().unwrap();
                     sessions.retain(|_, s| s.opened || s.issued.elapsed() < START_TIMEOUT);
@@ -1392,6 +1400,7 @@ impl Receiver {
                     bail!("copy disconnected before approval could be used");
                 }
                 approved.token = random_token()?;
+                approved.max_delete = Some(max_delete);
                 sessions.insert(
                     approved.token.clone(),
                     Session {

@@ -159,11 +159,16 @@ finally:
         "printf kept > /tmp/syq-real-ssh/handoff-source/limit-source/kept")
     prune = shlex.join(["syq", "cp", "--srcs-in", "/tmp/syq-real-ssh/handoff-source/limit-source",
                         "--to", "@laptop", "--into", "laptop-limit", "--prune", "--no-progress"])
-    # Two planned deletions exceed the laptop's limit of one: none happen.
-    exceeded = subprocess.run(["ssh", "source", prune], capture_output=True, timeout=40)
-    assert exceeded.returncode == 25, exceeded
-    assert (destination / "extra-1").exists() and (destination / "extra-2").exists()
+    preview = prune + " --dry-run"
+    # Two planned deletions exceed the laptop's limit of one: none happen,
+    # and a dry run, whose grant deletes nothing, predicts that.
+    for command in [preview, prune]:
+        exceeded = subprocess.run(["ssh", "source", command], capture_output=True, timeout=40)
+        assert exceeded.returncode == 25, exceeded
+        assert (destination / "extra-1").exists() and (destination / "extra-2").exists()
     (destination / "extra-2").unlink()
+    run("ssh", "source", preview)
+    assert (destination / "extra-1").exists()
     run("ssh", "source", prune)
     assert not (destination / "extra-1").exists()
     assert (destination / "kept").read_bytes() == b"kept"

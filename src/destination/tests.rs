@@ -984,19 +984,20 @@ fn named_requests_keep_inplace_refused_and_prune_within_the_machines_limit() {
     assert_eq!(constrained.copy.limits.max_deletions, 5);
     let constrained = constrain(prune.clone(), temporary.path(), 1000, 3, 5).unwrap();
     assert_eq!(constrained.copy.limits.max_deletions, 3);
-    // The approval reports the limit the grant enforces: here the sender's
-    // own --max-delete 2, below the machine's 5.
+    // The approval carries the ceiling that bounds the grant, for a dry
+    // run's read-only grant too, whose own limit is zero.
     let mut stated = pruning.clone();
     stated.max_delete = Some(2);
     let (lower, _) = request(&stated);
-    let destination = temporary.path().join("output");
-    fs::create_dir_all(&destination).unwrap();
-    let constrained = constrain(lower, &destination, 1000, 1000, 5).unwrap();
+    let constrained = constrain(lower, temporary.path(), 1000, 1000, 5).unwrap();
     assert_eq!(constrained.copy.limits.max_deletions, 2);
-    let (authority, approved) =
-        crate::restricted::named_authority(temporary.path(), constrained).unwrap();
-    assert_eq!(approved.max_delete, Some(2));
-    drop(authority);
+    assert_eq!(deletion_ceiling(&constrained, 5), 5);
+    let mut preview = pruning.clone();
+    preview.dry_run = true;
+    let (preview, _) = request(&preview);
+    let constrained = constrain(preview, temporary.path(), 1000, 3, 5).unwrap();
+    assert_eq!(constrained.copy.limits.max_deletions, 0);
+    assert_eq!(deletion_ceiling(&constrained, 5), 3);
 
     // The sender plans against the machine's limit, or its own if lower.
     let approved = Approved {
@@ -1053,6 +1054,38 @@ fn named_pruning_plans_against_the_receiving_machines_limit() {
     assert!(!root.join("source/extra-1").exists());
     assert!(!root.join("source/extra-2").exists());
     assert_eq!(fs::read(root.join("source/kept")).unwrap(), b"kept");
+}
+
+/// A dry run asks for a read-only grant, which deletes nothing, yet it
+/// plans against the limit a real run would get: the machine's own.
+#[test]
+fn a_named_pruning_dry_run_plans_against_the_machines_limit() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    fs::create_dir_all(root.join("source")).unwrap();
+    let source = fs::canonicalize(temp.path()).unwrap().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("kept"), b"kept").unwrap();
+    for name in ["kept", "extra-1", "extra-2"] {
+        fs::write(root.join("source").join(name), b"old").unwrap();
+    }
+    {
+        let (_broker, _receiver, registration, _) =
+            broker_with_max_delete(&root, Approval::Always, 100);
+        assert_eq!(
+            named_copy(&registration, &source, &["--prune", "--dry-run"]),
+            0
+        );
+    }
+    let (_broker, _receiver, registration, _) = broker_with_max_delete(&root, Approval::Always, 1);
+    assert_eq!(
+        named_copy(&registration, &source, &["--prune", "--dry-run"]),
+        25
+    );
+    for name in ["extra-1", "extra-2"] {
+        assert!(root.join("source").join(name).exists());
+    }
+    assert_eq!(fs::read(root.join("source/kept")).unwrap(), b"old");
 }
 
 #[test]

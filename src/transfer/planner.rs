@@ -4017,7 +4017,7 @@ impl Planner<'_> {
             if planned > max {
                 self.progress.eprintln(&if opts.max_delete_from_approver {
                     format!(
-                        "syq: {planned} deletions planned, more than the {max} the approving machine allows; deleting nothing (raise its limit there with `syq persist receive on --max-delete N`)"
+                        "syq: {planned} deletions planned, more than the {max} the approving machine allows; deleting nothing (its --max-delete and --max-entries both limit pruning; raise them there with `syq persist receive on`)"
                     )
                 } else {
                     format!(

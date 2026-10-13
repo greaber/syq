@@ -257,6 +257,7 @@ impl Receiver {
             self.max_entries,
             self.max_delete,
         )?;
+        let max_delete = super::deletion_ceiling(&request, self.max_delete);
         crate::delegation::validate_return_request(&request)?;
         if !request.constraints.receipt_policy.required
             || !matches!(
@@ -319,6 +320,7 @@ impl Receiver {
         let session =
             ssh::SessionGuard::insert(self, target.clone(), approved.token.clone(), generation)?;
         approved.token = session.token();
+        approved.max_delete = Some(max_delete);
         let result = (|| {
             let input = child.child.stdin.take().unwrap();
             let output = child.child.stdout.take().unwrap();

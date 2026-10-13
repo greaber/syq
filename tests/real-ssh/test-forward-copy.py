@@ -324,11 +324,16 @@ remote("mkdir -p /tmp/syq-real-ssh/forward/pruned && cd /tmp/syq-real-ssh/forwar
 run("syq", "persist", "receive", "on", "--max-delete", "1", "--notify", "off")
 run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
 try:
-    # Two planned deletions exceed the laptop's limit of one: none happen.
-    copy("/tmp/syq-real-ssh/forward/pruned", source="/tmp/syq-real-ssh/forward-prune-source",
-         extra=("--prune",), success=False)
-    remote("test -e /tmp/syq-real-ssh/forward/pruned/extra-1 && test -e /tmp/syq-real-ssh/forward/pruned/extra-2")
+    # Two planned deletions exceed the laptop's limit of one: none happen,
+    # and a dry run, whose grant deletes nothing, predicts that.
+    for extra in [("--prune", "--dry-run"), ("--prune",)]:
+        copy("/tmp/syq-real-ssh/forward/pruned", source="/tmp/syq-real-ssh/forward-prune-source",
+             extra=extra, success=False)
+        remote("test -e /tmp/syq-real-ssh/forward/pruned/extra-1 && test -e /tmp/syq-real-ssh/forward/pruned/extra-2")
     remote("rm /tmp/syq-real-ssh/forward/pruned/extra-2")
+    copy("/tmp/syq-real-ssh/forward/pruned", source="/tmp/syq-real-ssh/forward-prune-source",
+         extra=("--prune", "--dry-run"))
+    remote("test -e /tmp/syq-real-ssh/forward/pruned/extra-1")
     copy("/tmp/syq-real-ssh/forward/pruned", source="/tmp/syq-real-ssh/forward-prune-source",
          extra=("--prune",))
     remote("test ! -e /tmp/syq-real-ssh/forward/pruned/extra-1 && test -e /tmp/syq-real-ssh/forward/pruned/kept")
