@@ -1358,6 +1358,29 @@ pub(super) fn set_meta_handle_known_portable(
     set_meta_file_known(file, meta, flags, current)
 }
 
+/// Give the file `file` refers to the owner `uid` and group `gid`, where
+/// given. `file` may be an `O_PATH` handle, which `fchown` refuses.
+pub(crate) fn chown_handle(file: &File, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let r = unsafe {
+            libc::fchownat(
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                uid.unwrap_or(u32::MAX),
+                gid.unwrap_or(u32::MAX),
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if r != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    std::os::unix::fs::fchown(file, uid, gid)?;
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
     let fd = file.as_raw_fd();

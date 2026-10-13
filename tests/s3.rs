@@ -442,16 +442,37 @@ fn serve(
         }
         return;
     }
-    if fault == "copy-root-marker" {
+    if fault == "copy-root-marker" || fault == "copy-root-marker-owned" {
         let path = first.split_whitespace().nth(1).unwrap();
         match (method, path.split('?').next().unwrap()) {
             ("HEAD", "/source/data" | "/destination/child") =>
                 reply(&mut socket, 404, &[], b"", true),
             ("GET", "/source/") if path.contains("list-type=2") => reply(&mut socket, 200, &[],
                 b"<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>data/</Key><Size>0</Size></Contents><Contents><Key>data/child</Key><Size>4</Size></Contents></ListBucketResult>", false),
-            ("HEAD", "/source/data/") => reply(&mut socket, 200,
-                &[("Content-Length".into(), "0".into()), ("ETag".into(), "\"marker\"".into()),
-                  ("Last-Modified".into(), "Wed, 01 Jan 2020 00:00:00 GMT".into())], b"", true),
+            ("HEAD", "/source/data/") => {
+                let mut fields: Vec<(String, String)> = vec![
+                    ("Content-Length".into(), "0".into()),
+                    ("ETag".into(), "\"marker\"".into()),
+                    ("Last-Modified".into(), "Wed, 01 Jan 2020 00:00:00 GMT".into()),
+                ];
+                if fault == "copy-root-marker-owned" {
+                    // The marker records the test's own account, which a
+                    // download may give the directory without privilege.
+                    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+                    for (name, value) in [
+                        ("format", "1".to_owned()),
+                        ("kind", "dir".to_owned()),
+                        ("mode", "493".to_owned()),
+                        ("uid", uid.to_string()),
+                        ("gid", gid.to_string()),
+                        ("mtime", "1577836800".to_owned()),
+                        ("mtime-nsec", "0".to_owned()),
+                    ] {
+                        fields.push((format!("x-amz-meta-syq-{name}"), value));
+                    }
+                }
+                reply(&mut socket, 200, &fields, b"", true)
+            }
             ("GET", "/source/data/child") => reply(&mut socket, 200,
                 &[("ETag".into(), "\"source\"".into())], b"data", false),
             ("HEAD", "/source/data/child") => reply(&mut socket, 200,
@@ -5757,6 +5778,38 @@ fn server_copy_directory_to_bucket_root_skips_root_marker() {
         .iter()
         .any(|r| r["type"] == "progress" && r["scan_done"] == true && r["files_total"] == 1));
     assert_eq!(records.last().unwrap()["files_transferred"], 1);
+}
+
+/// A download gives an existing directory its marker's owner and group
+/// through a handle of the directory.
+#[test]
+fn download_directory_to_root_sets_its_owner_through_a_handle() {
+    use std::os::unix::fs::MetadataExt;
+    let server = Server::start("copy-root-marker-owned");
+    let temp = crate::test_support::tempdir().unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--copy-metadata=ownership,mtime",
+            "--from",
+            "s3://source",
+            "--src-dir",
+            "data",
+            "--as",
+            ".",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(std::fs::read(temp.path().join("child")).unwrap(), b"data");
+    let metadata = std::fs::metadata(temp.path()).unwrap();
+    assert_eq!(
+        (metadata.uid(), metadata.gid(), metadata.mtime()),
+        (
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+            1577836800
+        )
+    );
 }
 
 #[test]

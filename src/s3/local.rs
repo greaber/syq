@@ -695,7 +695,7 @@ pub(super) fn apply_metadata(
     // Every change goes through a handle of the directory, never its name.
     let file = root.open_directory(path)?;
     if args.owner || args.group || explicit.uid.is_some() || explicit.gid.is_some() {
-        std::os::unix::fs::fchown(
+        crate::fsops::chown_handle(
             &file,
             (args.owner || explicit.uid.is_some()).then_some(metadata.uid),
             (args.group || explicit.gid.is_some()).then_some(metadata.gid),
