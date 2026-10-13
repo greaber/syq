@@ -2141,7 +2141,8 @@ fn new_symlinks_and_nodes_are_linked_only_where_the_filesystem_was_audited() {
 
 /// A private file created for ACL copying is published by the steps its
 /// volume's profile allows: an exclusive rename only where the profile
-/// trusts one, and a refusal falls back and is remembered.
+/// trusts one, and a refusal falls back and is remembered. Run with
+/// `TMPDIR` on HFS+ or exFAT to check those volumes.
 #[cfg(target_os = "macos")]
 #[test]
 fn private_files_are_published_by_their_volumes_profile() {
@@ -2149,8 +2150,8 @@ fn private_files_are_published_by_their_volumes_profile() {
     let tree = TestDir::new("private-file-profile");
     let root = Root::open(tree.path()).unwrap();
     let mut profile = root.profile();
+    let links = profile.hard_links;
     profile.atomic_no_replace_rename = true;
-    profile.hard_links = true;
     root.assume_profile_for_test(profile);
     REFUSE_RENAME_FLAGS.set(true);
     REFUSED_RENAME_FLAG_CALLS.set(0);
@@ -2159,15 +2160,19 @@ fn private_files_are_published_by_their_volumes_profile() {
         root.create_private_file(&relative(b"first"))
     }));
     REFUSE_RENAME_FLAGS.set(false);
-    let file = created.unwrap().unwrap();
-    // The refused flag was tried once, and the file was linked instead.
+    let mut file = created.unwrap().unwrap();
+    // The refused flag was tried once; the file was then linked where the
+    // volume has hard links, and checked and renamed where it does not.
     assert_eq!(REFUSED_RENAME_FLAG_CALLS.get(), 1);
     assert!(!root.profile().atomic_no_replace_rename);
-    assert_eq!(CHECKED_RENAMES.get(), 0);
-    let published = fs::symlink_metadata(tree.path().join("first")).unwrap();
+    assert_eq!(CHECKED_RENAMES.get(), usize::from(!links), "links {links}");
+    file.write_all(b"private").unwrap();
+    assert_eq!(fs::read(tree.path().join("first")).unwrap(), b"private");
     assert_eq!(
-        (published.ino(), published.nlink(), published.mode() & 0o777),
-        (file.metadata().unwrap().ino(), 1, 0o600)
+        fs::symlink_metadata(tree.path().join("first"))
+            .unwrap()
+            .nlink(),
+        1
     );
     // Nothing replaces an existing name.
     let error = root.create_private_file(&relative(b"first")).unwrap_err();
