@@ -237,6 +237,8 @@ Host source
                                       stdout=subprocess.PIPE).stdout.decode()
                     size = int(run('ssh-keygen', '-lf', '-', input=encoded.encode(), stdout=subprocess.PIPE).stdout.split()[0])
                     assert size == max(3072, bits), size
+                    admission_size = int(run('ssh-keygen', '-lf', '-', input=ssh_public.encode(), stdout=subprocess.PIPE).stdout.split()[0])
+                    assert admission_size == size, (admission_size, size)
                 copy = ['syq', 'cp', '--from', 'source', '/tmp/syq-real-ssh-key-source',
                         '--to', 'destination', '--as', parent + '/copy', '--no-tcp', '--no-progress']
                 run(*copy, env=environment)
