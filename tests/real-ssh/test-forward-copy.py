@@ -310,6 +310,53 @@ authorized = remote("sha256sum ~/.ssh/authorized_keys")
 copy(".ssh/authorized_keys", success=False)
 assert remote("sha256sum ~/.ssh/authorized_keys") == authorized
 
+print("case: approved copies keep ownership and special files as an ordinary account", flush=True)
+# Outside the shared return-source tree, which later cases copy whole.
+run("ssh", "source", "mkdir -p /tmp/syq-real-ssh/forward-specials && mkfifo /tmp/syq-real-ssh/forward-specials/pipe")
+copy("/tmp/syq-real-ssh/forward/pipe", source="/tmp/syq-real-ssh/forward-specials/pipe",
+     extra=("--copy-metadata=mtime,ownership,specials",))
+remote("test -p /tmp/syq-real-ssh/forward/pipe")
+
+print("case: approved copies prune within the laptop's own limit", flush=True)
+run("ssh", "source", "mkdir -p /tmp/syq-real-ssh/forward-prune-source && printf kept > /tmp/syq-real-ssh/forward-prune-source/kept")
+remote("mkdir -p /tmp/syq-real-ssh/forward/pruned && cd /tmp/syq-real-ssh/forward/pruned && "
+       "printf kept > kept && printf extra > extra-1 && printf extra > extra-2")
+run("syq", "persist", "receive", "on", "--max-delete", "1", "--notify", "off")
+run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
+try:
+    # Two planned deletions exceed the laptop's limit of one: none happen,
+    # and a dry run, whose grant deletes nothing, predicts that.
+    for extra in [("--prune", "--dry-run"), ("--prune",)]:
+        copy("/tmp/syq-real-ssh/forward/pruned", source="/tmp/syq-real-ssh/forward-prune-source",
+             extra=extra, success=False)
+        remote("test -e /tmp/syq-real-ssh/forward/pruned/extra-1 && test -e /tmp/syq-real-ssh/forward/pruned/extra-2")
+    remote("rm /tmp/syq-real-ssh/forward/pruned/extra-2")
+    copy("/tmp/syq-real-ssh/forward/pruned", source="/tmp/syq-real-ssh/forward-prune-source",
+         extra=("--prune", "--dry-run"))
+    remote("test -e /tmp/syq-real-ssh/forward/pruned/extra-1")
+    copy("/tmp/syq-real-ssh/forward/pruned", source="/tmp/syq-real-ssh/forward-prune-source",
+         extra=("--prune",))
+    remote("test ! -e /tmp/syq-real-ssh/forward/pruned/extra-1 && test -e /tmp/syq-real-ssh/forward/pruned/kept")
+    # With pruning off on the laptop, the copy is refused before it asks for
+    # approval, and so is its dry run, the same way, with nothing to delete.
+    run("syq", "persist", "receive", "on", "--max-delete", "0", "--notify", "off")
+    run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
+
+    def refused(*extra):
+        argv = ["syq", "cp", "/tmp/syq-real-ssh/forward-prune-source", "--to", "destination",
+                "--as", "/tmp/syq-real-ssh/forward/pruned", "--no-progress", *extra]
+        command = "test -z \"${SSH_AUTH_SOCK:-}\" && test ! -e ~/.ssh/id_ed25519 && exec timeout 75 " + shlex.join(argv)
+        result = subprocess.run(["ssh", "source", command], capture_output=True, text=True, timeout=90)
+        assert result.returncode not in (0, 124), result
+        reasons = [line for line in result.stderr.splitlines() if "pruning needs a positive --max-delete" in line]
+        assert reasons, result
+        assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == [], result
+        return result.returncode, reasons
+    assert refused("--prune", "--dry-run") == refused("--prune")
+finally:
+    run("syq", "persist", "receive", "on", "--max-delete", "0", "--notify", "off")
+    run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
+
 print("case: unreachable TCP falls back to direct restricted SSH data", flush=True)
 port = os.environ["SYQ_REAL_SSH_BLOCKED_TCP_PORT"]
 started = time.monotonic()

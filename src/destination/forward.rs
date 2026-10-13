@@ -86,11 +86,10 @@ pub(super) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
     {
         bail!("return authorization owns its SSH connection and requires encrypted direct data transport; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --no-tcp-encryption, --peer-auth, or --coordinate-at");
     }
-    if args.owner || args.group || args.devices || args.inplace {
-        bail!("return authorization does not accept ownership, special-file preservation, or --inplace");
+    if args.inplace {
+        bail!("return authorization does not accept --inplace");
     }
     crate::restricted::validate_restricted_args(args)?;
-    super::require_deletion_ceiling(args)?;
     let target = crate::remote_to_remote::endpoint_arg(destination, None, None);
     target_endpoint(&target)?;
     Ok(target)
@@ -207,6 +206,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
     let Reply::Approved(approved) = reply else {
         bail!("unexpected remote copy approval response");
     };
+    super::apply_deletion_limit(args, &approved);
     args.locations.last_mut().unwrap().path = approved.destination.clone();
     args.auth_from = crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name));
     // The actual authority never leaves the destination helper. This internal
@@ -256,7 +256,9 @@ impl Receiver {
             self.max_bytes,
             self.max_entries,
             self.max_delete,
+            crate::approval_command::dry_run_prunes(&command)?,
         )?;
+        let max_delete = super::deletion_ceiling(&request, self.max_delete);
         crate::delegation::validate_return_request(&request)?;
         if !request.constraints.receipt_policy.required
             || !matches!(
@@ -319,6 +321,7 @@ impl Receiver {
         let session =
             ssh::SessionGuard::insert(self, target.clone(), approved.token.clone(), generation)?;
         approved.token = session.token();
+        approved.max_delete = Some(max_delete);
         let result = (|| {
             let input = child.child.stdin.take().unwrap();
             let output = child.child.stdout.take().unwrap();
@@ -842,7 +845,10 @@ fn receive() -> Result<i32> {
             &destination,
             crate::delegation::MAX_COPY_BYTES,
             crate::delegation::MAX_ENTRIES,
+            // The laptop applied its own deletion limit, and refused a
+            // pruning dry run where pruning is off, before forwarding.
             u64::MAX,
+            false,
         )?;
         crate::restricted::named_authority(&container, request)
     })();
@@ -1319,6 +1325,23 @@ mod tests {
         }
         args.connections_opt = Some(129);
         args.connections = 129;
+        assert!(eligible_target(&args).is_err());
+    }
+
+    /// As on other routes to an ordinary account, ownership and special
+    /// files are accepted; in-place writes are not.
+    #[test]
+    fn return_authorization_accepts_ownership_and_special_files() {
+        let root = crate::test_support::tempdir().unwrap();
+        let mut args = args(root.path(), "output");
+        args.owner = true;
+        args.group = true;
+        args.devices = true;
+        assert_eq!(eligible_target(&args).unwrap(), "server");
+        // Pruning states no limit of its own; the approving machine's applies.
+        args.delete = true;
+        assert_eq!(eligible_target(&args).unwrap(), "server");
+        args.inplace = true;
         assert!(eligible_target(&args).is_err());
     }
 

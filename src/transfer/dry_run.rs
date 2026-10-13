@@ -69,14 +69,30 @@ pub(super) fn count_label(n: u64, singular: &str, plural: &str) -> String {
     format!("{} {}", commas(n), if n == 1 { singular } else { plural })
 }
 
-pub(super) fn deletion_summary(plan: DeletePlan, deleted: u64, max: Option<u64>) -> String {
+/// A deletion limit as the user knows it: their own --max-delete, or the
+/// approving machine's (`from_approver`).
+pub(super) fn deletion_limit_label(limit: u64, from_approver: bool) -> String {
+    if from_approver {
+        format!("the approving machine's limit of {limit}")
+    } else {
+        format!("--max-delete {limit}")
+    }
+}
+
+pub(super) fn deletion_summary(
+    plan: DeletePlan,
+    deleted: u64,
+    max: Option<u64>,
+    from_approver: bool,
+) -> String {
     match plan {
         DeletePlan::Disabled => String::new(),
         DeletePlan::Planned(n) => {
             if let Some(limit) = max.filter(|limit| n > *limit) {
                 format!(
-                    ", {} planned for deletion (blocked by --max-delete {limit})",
-                    commas(n)
+                    ", {} planned for deletion (blocked by {})",
+                    commas(n),
+                    deletion_limit_label(limit, from_approver)
                 )
             } else {
                 format!(", {} deleted", commas(deleted))
@@ -116,8 +132,9 @@ pub(super) fn print_dry_run_summary(
         DeletePlan::Planned(n) => {
             if let Some(limit) = opts.max_delete.filter(|limit| n > *limit) {
                 crate::output::human_stdout!(
-                    "  deletions: {} planned; blocked by --max-delete {limit}",
-                    count_label(n, "entry", "entries")
+                    "  deletions: {} planned; blocked by {}",
+                    count_label(n, "entry", "entries"),
+                    deletion_limit_label(limit, opts.max_delete_from_approver)
                 );
             } else {
                 crate::output::human_stdout!(
@@ -200,4 +217,26 @@ pub(super) fn print_dry_run_summary(
     );
 
     crate::output::human_stdout!("  route: {}", selected_route(src_ep, dst_ep, args));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A blocked deletion names the limit that blocked it: the user's own
+    /// --max-delete, or the approving machine's when that is the one in
+    /// effect.
+    #[test]
+    fn blocked_deletions_name_the_limit_in_effect() {
+        let plan = DeletePlan::Planned(5);
+        assert_eq!(
+            deletion_summary(plan, 0, Some(3), false),
+            ", 5 planned for deletion (blocked by --max-delete 3)"
+        );
+        assert_eq!(
+            deletion_summary(plan, 0, Some(3), true),
+            ", 5 planned for deletion (blocked by the approving machine's limit of 3)"
+        );
+        assert_eq!(deletion_summary(plan, 5, Some(9), true), ", 5 deleted");
+    }
 }
