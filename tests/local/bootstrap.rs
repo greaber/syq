@@ -24,11 +24,13 @@ fn native_as_existing_updates_a_same_type_symlink() {
 }
 
 #[test]
-fn native_inplace_updates_the_existing_inode_without_a_sidecar() {
+fn native_in_place_new_replaces_an_existing_file_and_writes_a_new_one_at_its_name() {
     let t = Tmp::new();
     let expected = vec![b'n'; 5 * 1024 * 1024];
     write(&t.path("src/file"), &expected);
+    write(&t.path("src/new"), &expected);
     write(&t.path("dst/file"), &vec![b'o'; expected.len()]);
+    fs::hard_link(t.path("dst/file"), t.path("outside")).unwrap();
     set_mtime(&t.path("src/file"), 1_700_000_000);
     set_mtime(&t.path("dst/file"), 1_600_000_000);
     let inode = fs::metadata(t.path("dst/file")).unwrap().ino();
@@ -36,15 +38,19 @@ fn native_inplace_updates_the_existing_inode_without_a_sidecar() {
     run_native_ok(&[
         "cp",
         "--if-exists=update",
-        "--inplace",
+        "--in-place=new",
         "--srcs-in",
         &t.s("src"),
         "--into-existing",
         &t.s("dst"),
     ]);
 
+    // Only a file the copy creates is written in place: the existing one is
+    // replaced, and its other name keeps the old contents.
     assert_eq!(read(&t.path("dst/file")), expected);
-    assert_eq!(fs::metadata(t.path("dst/file")).unwrap().ino(), inode);
+    assert_eq!(read(&t.path("dst/new")), expected);
+    assert_ne!(fs::metadata(t.path("dst/file")).unwrap().ino(), inode);
+    assert_eq!(read(&t.path("outside")), vec![b'o'; expected.len()]);
     assert!(partial_files(&t.path("dst")).is_empty());
 }
 

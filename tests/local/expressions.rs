@@ -309,7 +309,7 @@ fn expressions_reject_streams_and_copy_if_rejects_inplace() {
     for options in [
         vec!["--src-fd", "0", "--where", "true"],
         vec!["--src-fd", "0", "--copy-if", "true"],
-        vec!["--src", &t.s("src"), "--copy-if", "true", "--inplace"],
+        vec!["--src", &t.s("src"), "--copy-if", "true", "--in-place=new"],
     ] {
         let mut args = vec!["cp"];
         args.extend(options);

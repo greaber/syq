@@ -543,12 +543,9 @@ fn archival_reruns_repair_hardlinks_inside_readonly_directories() {
                     fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
                     fs::write(&destination, b"damaged contents").unwrap();
                     set_attr(&destination, "user.stale", b"remove me");
-                    // Like rsync, --inplace needs permission to write an
-                    // existing inode; ordinary staged replacement does not.
-                    if !args.contains(&"--inplace") {
-                        fs::set_permissions(&destination, fs::Permissions::from_mode(0o400))
-                            .unwrap();
-                    }
+                    // An existing file is replaced, with --inplace too, which
+                    // needs no permission to write it.
+                    fs::set_permissions(&destination, fs::Permissions::from_mode(0o400)).unwrap();
                     fs::set_permissions(t.path("dst/right"), fs::Permissions::from_mode(0o700))
                         .unwrap();
                     fs::remove_file(t.path("dst/right/b")).unwrap();
@@ -973,7 +970,7 @@ fn inplace_files_are_created_within_their_final_mode() {
         }
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         command
-            .args(["cp", "--inplace", "--no-progress", "--srcs-in"])
+            .args(["cp", "--in-place=new", "--no-progress", "--srcs-in"])
             .args([t.s("src"), "--into".into(), t.s("dst")])
             .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
             .env("SYQ_TEST_COPY_LOCAL_FS", "local");

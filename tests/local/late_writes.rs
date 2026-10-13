@@ -125,14 +125,13 @@ fn late_close_does_not_report_inplace_writes_as_success() {
             let t = Tmp::new();
             write(&t.path("src/late-error"), &vec![b'x'; size]);
             set_mtime(&t.path("src/late-error"), 1_600_000_000);
-            write(&t.path("dst/late-error"), b"previous good copy");
-            set_mtime(&t.path("dst/late-error"), 1_500_000_000);
-            let before = fs::metadata(t.path("dst/late-error")).unwrap();
+            fs::create_dir_all(t.path("dst")).unwrap();
             let mut command = copy_command(&t, "local", tuning);
-            command.args(["--as-existing", &t.s("dst/late-error")]);
-            command.arg("--inplace");
-            // In-place copies have already changed the final inode, but must
-            // still report a close error rather than claim completion.
+            command.args(["--as", &t.s("dst/late-error")]);
+            command.arg("--in-place=new");
+            // A new file written in place is already at its final name, but
+            // the copy must still report a close error rather than claim
+            // completion.
             let output = command
                 .env("SYQ_TEST_FAIL_WRITER_CLOSE", "/dst/late-error")
                 .run()
@@ -141,7 +140,6 @@ fn late_close_does_not_report_inplace_writes_as_success() {
             let error = stderr_of(&output);
             assert!(error.contains("check destination writes"), "{error}");
             let after = fs::metadata(t.path("dst/late-error")).unwrap();
-            assert_eq!(after.ino(), before.ino());
             assert_ne!(
                 after.mtime(),
                 1_600_000_000,

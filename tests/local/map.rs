@@ -617,6 +617,7 @@ fn native_map_exposes_source_and_manifest_options() {
         "--ignore-from",
         "--copy-metadata",
         "--inplace",
+        "--in-place",
         "--receiver-max-entries",
         "--receiver-max-bytes",
         "--receiver-receipt",

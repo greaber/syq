@@ -187,7 +187,7 @@ fn hardlink_followers_reject_different_contents_in_preview_and_copy() {
             args.push("--dry-run");
         }
         if inplace {
-            args.push("--inplace");
+            args.push("--in-place=new");
         }
         let output = native_syq(&args);
         assert!(!output.status.success(), "{output:?}");
@@ -253,7 +253,7 @@ fn default_updates_selected_files_and_prunes_independently() {
         vec![],
         vec!["--prune"],
         vec!["--copy-if", "src.size > 0B"],
-        vec!["--inplace"],
+        vec!["--in-place=new"],
     ] {
         let t = Tmp::new();
         write(&t.path("src/file"), b"replacement");
@@ -299,7 +299,7 @@ fn an_inplace_as_new_copy_onto_an_existing_name_is_refused() {
     let inode = fs::metadata(t.path("dst/existing")).unwrap().ino();
     let refused = native_syq(&[
         "cp",
-        "--inplace",
+        "--in-place=new",
         &t.s("src/file"),
         "--as-new",
         &t.s("dst/existing"),
@@ -327,7 +327,7 @@ fn a_file_that_must_be_new_is_staged_under_inplace() {
         .args([
             "cp",
             "-q",
-            "--inplace",
+            "--in-place=new",
             "--performance-tuning",
             "copy-path=ranges",
         ])
@@ -369,7 +369,7 @@ fn an_as_new_inplace_file_is_finished_by_another_receiver_process() {
             .args([
                 "--no-tcp",
                 "--no-progress",
-                "--inplace",
+                "--in-place=new",
                 "--performance-tuning",
                 "workers=1,copy-path=ranges,request-size=1M",
             ])
@@ -433,7 +433,7 @@ fn a_protected_new_inplace_file_survives_a_lost_worker_connection() {
             .args([
                 "--no-tcp",
                 "--no-progress",
-                "--inplace",
+                "--in-place=new",
                 &format!("--if-exists={policy}"),
                 "--performance-tuning",
                 "workers=1,copy-path=ranges,request-size=1M",

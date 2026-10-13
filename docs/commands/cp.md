@@ -64,7 +64,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 |---|---|
 | `--if-exists <POLICY>` | How to handle existing destination files; directories remain containers<br><br>Possible values:<br>- error-if-different: Reject detected content differences; trusts matching size and mtime unless --hash is set<br>- error: Report an error for every existing destination leaf<br>- keep: Leave existing entries and their metadata alone<br>- update: Update contents when they differ and apply requested metadata<br>- update-if-older: Keep newer destinations; otherwise update differing contents<br><br>[default: update] |
 | `--copy-if <EXPR>` | Update only entries satisfying a source/destination expression |
-| `--inplace` | Update destination files directly, using no full-sized staging file; interruption can leave them incomplete |
+| `--in-place <MODE>` | Write the files the copy creates directly at their final names, with no staging file; interruption can leave them incomplete<br><br>Possible values:<br>- new: Only files the copy creates; an existing file is still replaced through a staging file |
 | `--prune` | After copying, remove target-only objects in mapped directory scopes; ignored source paths remain protected |
 | `--prune-before` | Remove target-only objects before copying to free space. Implies --prune; later copy failures do not restore removed objects |
 | `--max-delete <N>` | With --prune or --prune-before, refuse all removals if more than N are planned |

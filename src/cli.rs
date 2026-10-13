@@ -107,7 +107,7 @@ pub enum IfExists {
 /// Which files `--in-place` writes directly at their final names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum InPlace {
-    /// Files the copy creates; an existing file is still replaced through a staging file.
+    /// Only files the copy creates; an existing file is still replaced through a staging file
     New,
 }
 
@@ -1380,7 +1380,7 @@ struct NativeCopyOperationalArgs {
     /// Turn written zero ranges into sparse holes
     #[arg(long)]
     sparse: bool,
-    /// new: write new files directly at their final names, with no staging file; interruption can leave them incomplete. Existing files are still replaced
+    /// Write the files the copy creates directly at their final names, with no staging file; interruption can leave them incomplete
     #[arg(long = "in-place", value_enum, value_name = "MODE")]
     in_place: Option<InPlace>,
     /// Replaced by --in-place=new

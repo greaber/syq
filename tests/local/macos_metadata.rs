@@ -583,7 +583,7 @@ fn new_in_place_files_are_private_before_their_acl_is_set() {
             let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
             command.args([
                 "cp",
-                "--inplace",
+                "--in-place=new",
                 "--copy-metadata=acls",
                 "--no-progress",
                 &t.s("source"),

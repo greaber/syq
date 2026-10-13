@@ -744,9 +744,14 @@ impl FsOps {
             || meta.inode_metadata.is_some()
         {
             let current = held.file.metadata()?;
-            vouch::require(&target, &held.file, &current, meta, flags)?;
-            set_meta_file_known(&held.file, meta, flags, &current)
-                .with_context(|| format!("set metadata on basis {}", held.label.display()))?;
+            // A basis another job replaced at its name meanwhile has no name
+            // left: the complete file there remains the winner, and the old
+            // one needs nothing.
+            if current.nlink() > 0 {
+                vouch::require(&target, &held.file, &current, meta, flags)?;
+                set_meta_file_known(&held.file, meta, flags, &current)
+                    .with_context(|| format!("set metadata on basis {}", held.label.display()))?;
+            }
         }
         if guard.is_some() {
             // A signed receiver keeps the pre-existing guarded behavior:
@@ -2000,13 +2005,15 @@ impl FsOps {
             *flags = (*flags & !flags::RECEIVER_MODE) | flags::MODE;
         }
         let data = &put.data;
-        observed_overwrite(&self.operation, &file, data, 0, self.sparse)
-            .with_context(|| format!("write {}", rooted.label.display()))?;
-        // A sparse write may end in a hole that only the length makes.
-        if self.sparse {
-            file.set_len(data.len() as u64)
-                .with_context(|| format!("set length of {}", rooted.label.display()))?;
+        // Tests stop a small in-place copy after it created its file, as a
+        // destination that refuses the write does.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_FAIL_INPLACE_PUT").is_some() {
+            return Err(io::Error::from_raw_os_error(libc::EPERM))
+                .with_context(|| format!("write {}", rooted.label.display()));
         }
+        observed_write(&self.operation, &file, data, 0, self.sparse)
+            .with_context(|| format!("write {}", rooted.label.display()))?;
         check_destination_writes(&file, &rooted.label)?;
         set_meta_written_file(&file, meta, *flags, &created)
             .with_context(|| format!("set metadata {}", rooted.label.display()))?;

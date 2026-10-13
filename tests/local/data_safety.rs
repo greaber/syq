@@ -1005,24 +1005,29 @@ fn file_destination_containers_widen_only_for_all() {
     }
 }
 
+/// `--in-place=new` writes an existing file no more than any copy does: in
+/// a container whose write permission it lacks, the file is left as it is.
 #[test]
-fn readonly_container_allows_inplace_updates_without_widening() {
+fn in_place_updates_need_the_containers_write_permission() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
     let t = Tmp::new();
     write(&t.path("src/file"), b"updated contents");
     write(&t.path("dst/file"), b"old");
     fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o100)).unwrap();
     let out = native_syq(&[
         "cp",
-        "--inplace",
+        "--in-place=new",
         &t.s("src/file"),
         "--as",
         &t.s("dst/file"),
     ]);
     let mode = fs::metadata(t.path("dst")).unwrap().mode() & 0o777;
     fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(out.status.success(), "{out:?}");
+    assert!(!out.status.success(), "{out:?}");
     assert_eq!(mode, 0o100);
-    assert_eq!(read(&t.path("dst/file")), b"updated contents");
+    assert_eq!(read(&t.path("dst/file")), b"old");
 }
 
 /// `syq rsync` widens what rsync does by default, so a failure in the
@@ -1057,7 +1062,7 @@ const INPLACE_OLD_LENS: [usize; 3] = [5 << 20, INPLACE_NEW_LEN, 1 << 20];
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
-fn inplace_local_copy_failure_keeps_old_data_within_the_new_length() {
+fn a_failed_inplace_local_copy_leaves_an_existing_file_whole() {
     for old_len in INPLACE_OLD_LENS {
         // The kernel copy is refused, and then whatever replaces it fails:
         // the range writes, or the userspace copy after its first write.
@@ -1090,28 +1095,20 @@ fn inplace_local_copy_failure_keeps_old_data_within_the_new_length() {
             let out = command.run().unwrap();
             let context = format!("old {old_len}, userspace {userspace}");
             assert!(!out.status.success(), "{context}: {}", stderr_of(&out));
+            // Only a new file is written in place: the existing one is
+            // never touched, and a failed copy leaves it whole.
             assert_eq!(fs::metadata(t.path("dst/file")).unwrap().ino(), inode);
-            // Old bytes within the new length survive until new data
-            // replaces them; only bytes past the new end may go early.
-            let after = read(&t.path("dst/file"));
-            let kept = old_len.min(INPLACE_NEW_LEN);
-            let written = if userspace { (1 << 20).min(kept) } else { 0 };
-            assert!(after.len() >= kept, "{context}: {} bytes left", after.len());
-            assert!(after[..written] == new[..written], "{context}");
-            assert!(
-                after[written..kept] == old[written..kept],
-                "{context}: old data within the new length was lost"
-            );
-            assert!(partial_files(&t.0).is_empty(), "{context}");
+            assert!(read(&t.path("dst/file")) == old, "{context}");
+            let _ = &new;
         }
     }
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
-fn inplace_local_copies_end_at_the_new_length() {
+fn inplace_local_copies_replace_an_existing_file_whole() {
     // The kernel copy, a clone where this filesystem has one, the userspace
-    // copy and the range copy each write over the old file.
+    // copy and the range copy each write a new file that replaces the old.
     let paths: [(&str, &[(&str, &str)]); 4] = [
         ("kernel", &[]),
         ("clone", &[("SYQ_TEST_COPY_LOCAL_FS", "local")]),
@@ -1149,7 +1146,7 @@ fn inplace_local_copies_end_at_the_new_length() {
             let context = format!("{path}, old {old_len}");
             assert!(read(&t.path("dst/file")) == new, "{context}");
             let metadata = fs::metadata(t.path("dst/file")).unwrap();
-            assert_eq!(metadata.ino(), inode, "{context}");
+            assert_ne!(metadata.ino(), inode, "{context}");
             assert_eq!(metadata.mtime(), 1_700_000_000, "{context}");
             assert!(partial_files(&t.0).is_empty(), "{context}");
         }
@@ -1183,14 +1180,14 @@ fn clones_unaligned_files(directory: &Path) -> bool {
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
-fn inplace_clone_of_a_shrinking_unaligned_file_still_clones() {
+fn inplace_copy_of_a_shrinking_unaligned_file_clones_it_into_a_new_file() {
     let t = Tmp::new();
     fs::create_dir_all(t.path("dst")).unwrap();
     if !clones_unaligned_files(&t.path("dst")) {
         return;
     }
-    // A clone of an unaligned length cannot end inside a longer file, so
-    // the file is cut to its new length before the clone.
+    // The existing longer file is replaced, by a new one the source is
+    // cloned into.
     let new = prng(1_000_000, 75);
     write(&t.path("src/file"), &new);
     write(&t.path("dst/file"), &prng(2_000_000, 76));
@@ -1204,7 +1201,7 @@ fn inplace_clone_of_a_shrinking_unaligned_file_still_clones() {
         .unwrap();
     assert_output_ok(&out);
     assert!(read(&t.path("dst/file")) == new);
-    assert_eq!(fs::metadata(t.path("dst/file")).unwrap().ino(), inode);
+    assert_ne!(fs::metadata(t.path("dst/file")).unwrap().ino(), inode);
     assert_eq!(
         fs::read_to_string(t.path("clones")).unwrap(),
         "clone 1000000\n"
@@ -1213,7 +1210,7 @@ fn inplace_clone_of_a_shrinking_unaligned_file_still_clones() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn inplace_small_files_write_before_cutting_and_keep_old_data_on_failure() {
+fn inplace_small_updates_replace_an_existing_file_and_leave_it_whole_on_failure() {
     for fail in [false, true] {
         for old_len in [60_000, 20_000, 0] {
             let t = Tmp::new();
@@ -1228,7 +1225,7 @@ fn inplace_small_files_write_before_cutting_and_keep_old_data_on_failure() {
                 .args(["-a", "--inplace", "--no-progress"])
                 .args([t.s("src/"), t.s("dst/")]);
             if fail {
-                command.env("SYQ_TEST_FAIL_INPLACE_PUT", "1");
+                command.env("SYQ_TEST_FAIL_PUT_SMALL_BEFORE_RENAME", "file");
             }
             let out = command.run().unwrap();
             let context = format!("old {old_len}, fail {fail}");
@@ -1240,8 +1237,11 @@ fn inplace_small_files_write_before_cutting_and_keep_old_data_on_failure() {
             );
             let expected = if fail { &old } else { &new };
             assert!(read(&t.path("dst/file")) == *expected, "{context}");
-            assert_eq!(fs::metadata(t.path("dst/file")).unwrap().ino(), inode);
-            assert!(partial_files(&t.0).is_empty(), "{context}");
+            assert_eq!(
+                fs::metadata(t.path("dst/file")).unwrap().ino() == inode,
+                fail,
+                "{context}"
+            );
         }
     }
 }
@@ -1992,10 +1992,10 @@ fn container_failures_suggest_the_option() {
 }
 
 /// Several sources can reach the same directories in different batches:
-/// each directory is still named once, and an in-place update needs no
-/// directory write.
+/// each directory is still named once. `--in-place=new` replaces an
+/// existing file as any copy does, so it needs the directory write too.
 #[test]
-fn directory_access_notes_stay_once_across_sources_and_skip_inplace_updates() {
+fn directory_access_notes_stay_once_across_sources_and_cover_in_place_updates() {
     if unsafe { libc::geteuid() } == 0 {
         return;
     }
@@ -2038,14 +2038,31 @@ fn directory_access_notes_stay_once_across_sources_and_skip_inplace_updates() {
     fs::set_permissions(t.path("dst/ro"), fs::Permissions::from_mode(0o555)).unwrap();
     for dry_run in [true, false] {
         let (src, dst) = (t.s("src"), t.s("dst"));
-        let mut args = vec!["cp", "--inplace", "--srcs-in", &src, "--into", &dst];
+        let mut args = vec!["cp", "--in-place=new", "--srcs-in", &src, "--into", &dst];
         if dry_run {
             args.push("--dry-run");
         }
         let out = native_syq(&args);
-        assert_output_ok(&out);
-        assert!(!stderr_of(&out).contains("dst/ro:"), "{out:?}");
+        assert_eq!(out.status.success(), dry_run, "{out:?}");
+        assert_eq!(
+            stderr_of(&out)
+                .matches("dst/ro: you own this directory")
+                .count(),
+            1,
+            "{out:?}"
+        );
     }
+    assert_eq!(read(&t.path("dst/ro/file")), b"old");
+    let (src, dst) = (t.s("src"), t.s("dst"));
+    run_native_ok(&[
+        "cp",
+        "--in-place=new",
+        "--widen-dirs=rsync",
+        "--srcs-in",
+        &src,
+        "--into",
+        &dst,
+    ]);
     fs::set_permissions(t.path("dst/ro"), fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(read(&t.path("dst/ro/file")), b"newer");
 }
