@@ -1622,3 +1622,22 @@ fn rejects_certificate_when_ca_is_not_marked_as_an_authority() {
         .expect_err("a certificate signed by a non-authority entry must fail");
     assert!(error.to_string().starts_with("SSHSIG verification failed"));
 }
+
+#[test]
+fn publication_policies_keep_their_encodings() {
+    // Released receivers know only the first two. `InPlaceNew` must not take
+    // the earlier `InPlace` encoding, which such a receiver would read as
+    // permission to write existing files in place: one from v0.7.1 or before
+    // fails to decode it and refuses the grant.
+    for (policy, byte) in [
+        (PublicationPolicy::AtomicStaged, 0u8),
+        (PublicationPolicy::InPlace, 1),
+        (PublicationPolicy::InPlaceNew, 2),
+    ] {
+        assert_eq!(postcard::to_allocvec(&policy).unwrap(), [byte]);
+        assert_eq!(
+            postcard::from_bytes::<PublicationPolicy>(&[byte]).unwrap(),
+            policy
+        );
+    }
+}

@@ -2761,8 +2761,22 @@ fn s3_usage_errors_do_not_contact_storage() {
     let temp = crate::test_support::tempdir().unwrap();
     for args in [
         vec!["--from", "s3://bucket", "data", "--as", "out", "--inplace"],
-        vec!["--from", "s3://bucket", "data", "--as", "out", "--in-place=new"],
-        vec!["out", "--to", "s3://bucket", "--as", "data", "--in-place=new"],
+        vec![
+            "--from",
+            "s3://bucket",
+            "data",
+            "--as",
+            "out",
+            "--in-place=new",
+        ],
+        vec![
+            "out",
+            "--to",
+            "s3://bucket",
+            "--as",
+            "data",
+            "--in-place=new",
+        ],
         vec![
             "--from",
             "s3://bucket",

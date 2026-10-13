@@ -836,7 +836,13 @@ fn constrain(
         *filter_root = rebase(filter_root, destination)?;
     }
     // Ownership, special files and `--in-place=new` act as for any copy by
-    // an ordinary account: the receiver never runs as root.
+    // an ordinary account: the receiver never runs as root. A client from
+    // before `--in-place=new` asks with the earlier in-place policy, which
+    // this machine carries out as `--in-place=new`; approving and signing
+    // that makes it so for a receiver from before it too, which refuses it.
+    if request.copy.policy.publication == crate::delegation::PublicationPolicy::InPlace {
+        request.copy.policy.publication = crate::delegation::PublicationPolicy::InPlaceNew;
+    }
     request.copy.limits.max_total_bytes = request.copy.limits.max_total_bytes.min(max_bytes);
     request.copy.limits.max_file_bytes = request.copy.limits.max_file_bytes.min(max_bytes);
     request.copy.limits.max_entries = request.copy.limits.max_entries.min(max_entries);
