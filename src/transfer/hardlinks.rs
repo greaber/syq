@@ -125,11 +125,18 @@ impl Planner<'_> {
                     .is_none_or(|d| d.kind != Kind::File || d.size != leaf.e.size))
         {
             // A copy that would not compare the file rewrites it unless its
-            // size and time are trusted.
-            let matched = self.opts.trusts_size_and_time()
+            // size and time are trusted, or replaces it when its metadata
+            // cannot be changed in place (`must_replace`); either way, the
+            // group's other names are linked to the new file.
+            let mut matched = self.opts.trusts_size_and_time()
                 && destination
                     .as_ref()
                     .is_some_and(|d| self.opts.metadata_matches(&leaf.dst_rel, &leaf.e, d));
+            let replaced = matched
+                && destination
+                    .clone()
+                    .is_some_and(|d| self.must_replace(&leaf.dst_rel, &leaf.e, &d));
+            matched &= !replaced;
             if matched {
                 self.progress.files_unchanged.fetch_add(1, Relaxed);
                 self.progress
@@ -168,10 +175,18 @@ impl Planner<'_> {
                     Some(leaf.e.size),
                     if destination.is_none() {
                         "destination_missing"
+                    } else if replaced {
+                        "metadata_differs"
                     } else {
                         "content_differs"
                     },
                 );
+                if replaced && self.opts.verbose > 0 {
+                    self.progress.println(&format!(
+                        "replace file {} (requested file metadata differs, and it cannot be changed in place)",
+                        display(&leaf.dst)
+                    ));
+                }
             }
             self.hardlinks
                 .by_inode

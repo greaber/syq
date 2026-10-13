@@ -302,37 +302,55 @@ fn a_hard_link_group_is_linked_again_after_a_metadata_change() {
 }
 
 /// A preview counts a file whose metadata the receiver cannot change in
-/// place as one it rewrites, with its bytes, not as a metadata-only entry.
+/// place as one it rewrites, with its bytes, not as a metadata-only entry,
+/// whether or not it is copied as a hard-link group.
 #[test]
 fn a_preview_counts_a_replaced_file_as_rewritten() {
-    let t = Tmp::new();
-    write(&t.path("src/file"), b"same contents");
-    write(&t.path("dst/file"), b"same contents");
-    fs::hard_link(t.path("dst/file"), t.path("outside")).unwrap();
-    fs::set_permissions(t.path("src/file"), fs::Permissions::from_mode(0o600)).unwrap();
-    fs::set_permissions(t.path("dst/file"), fs::Permissions::from_mode(0o644)).unwrap();
-    set_mtime(&t.path("src/file"), 1_700_000_000);
-    set_mtime(&t.path("dst/file"), 1_700_000_000);
-    let results = t.path("results.jsonl");
-    let out = native_syq(&[
-        "cp",
-        "--dry-run",
-        "--copy-metadata=permissions,mtime",
-        "--results",
-        &results.to_string_lossy(),
-        "--srcs-in",
-        &t.s("src"),
-        "--into",
-        &t.s("dst"),
-    ]);
-    assert_output_ok(&out);
-    let records = fs::read_to_string(&results).unwrap();
-    let trace = records
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-        .find(|record| record["action"] == "transfer_file")
-        .unwrap_or_else(|| panic!("no file trace: {records}"));
-    assert_eq!(trace["reason"], "metadata_differs", "{trace}");
-    assert_eq!(trace["bytes"], 13, "{trace}");
-    assert_eq!(mode(&t.path("outside")), 0o644);
+    for hardlinks in [false, true] {
+        let t = Tmp::new();
+        write(&t.path("src/file"), b"same contents");
+        write(&t.path("dst/file"), b"same contents");
+        if hardlinks {
+            fs::hard_link(t.path("src/file"), t.path("src/alias")).unwrap();
+            fs::hard_link(t.path("dst/file"), t.path("dst/alias")).unwrap();
+        }
+        fs::hard_link(t.path("dst/file"), t.path("outside")).unwrap();
+        fs::set_permissions(t.path("src/file"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(t.path("dst/file"), fs::Permissions::from_mode(0o644)).unwrap();
+        set_mtime(&t.path("src/file"), 1_700_000_000);
+        set_mtime(&t.path("dst/file"), 1_700_000_000);
+        let results = t.path("results.jsonl");
+        let metadata = if hardlinks {
+            "--copy-metadata=permissions,mtime,hardlinks"
+        } else {
+            "--copy-metadata=permissions,mtime"
+        };
+        let out = native_syq(&[
+            "cp",
+            "--dry-run",
+            metadata,
+            "--results",
+            &results.to_string_lossy(),
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("dst"),
+        ]);
+        assert_output_ok(&out);
+        let records = fs::read_to_string(&results).unwrap();
+        let traces: Vec<serde_json::Value> = records
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|record| record["action"] == "transfer_file")
+            .collect();
+        let trace = traces
+            .iter()
+            .find(|record| record["bytes"] != 0)
+            .unwrap_or_else(|| panic!("no rewritten file: {records}"));
+        assert_eq!(trace["reason"], "metadata_differs", "{trace}");
+        assert_eq!(trace["bytes"], 13, "{trace}");
+        // The group's other name is linked to the new file.
+        assert_eq!(traces.len(), if hardlinks { 2 } else { 1 }, "{records}");
+        assert_eq!(mode(&t.path("outside")), 0o644);
+    }
 }
