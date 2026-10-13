@@ -390,9 +390,6 @@ impl Root {
     /// Whether the root's filesystem reports link counts and inode numbers
     /// that checks can rely on. Where it does not, a check that needs to
     /// know a file has no other names must assume it may have some.
-    // Its callers are still to come: the check that lets metadata change in
-    // place, and fast staging.
-    #[allow(dead_code)]
     pub(crate) fn link_counts_trusted(&self) -> bool {
         self.profile().link_counts_trusted
     }
@@ -757,6 +754,15 @@ impl Root {
         mode: u32,
     ) -> Result<(File, std::fs::Metadata)> {
         self.open_or_create_file_with_access(path, mode, libc::O_WRONLY)
+    }
+
+    /// `open_or_create_write_only_file`, read-write.
+    pub(crate) fn open_or_create_file(
+        &self,
+        path: &RelativePath,
+        mode: u32,
+    ) -> Result<(File, std::fs::Metadata)> {
+        self.open_or_create_file_with_access(path, mode, libc::O_RDWR)
     }
 
     fn open_or_create_file_with_access(

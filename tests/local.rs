@@ -424,6 +424,9 @@ fi
 if [ -n "${FAKE_REMOTE_UMASK:-}" ]; then
     umask "$FAKE_REMOTE_UMASK"
 fi
+if [ -n "${FAKE_REMOTE_NOFILE:-}" ]; then
+    ulimit -n "$FAKE_REMOTE_NOFILE"
+fi
 printf '%s\n' "$1" >> "$FAKE_RSH_LOG"
 exec /bin/sh -c "$1"
 "#,

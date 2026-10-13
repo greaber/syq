@@ -62,6 +62,9 @@ pub(crate) use partial::*;
 pub(crate) use paths::*;
 use sidecars::Sidecar;
 pub(crate) use sidecars::{sweep as sweep_sidecars, track as track_sidecars, Swept};
+#[cfg(test)]
+pub(crate) use stages::count as held_stage_count;
+pub(crate) use stages::{new_scope as new_stage_scope, release as release_stages};
 
 /// Compare at the decimal precision suggested by the destination timestamp.
 /// Trailing zeros may reflect either filesystem truncation or a round timestamp;
@@ -780,6 +783,9 @@ pub struct FsOps {
     /// One final-file descriptor retained between the hash response and the
     /// controller's decision to repair or accept that exact inode.
     held_basis: Option<HeldBasis>,
+    /// The copy whose stages and in-place files this connection's requests
+    /// write (`stages`): its own in a process that serves several copies.
+    stage_scope: u64,
     comparison_window: Option<ComparisonWindow>,
     partial_candidates: HashMap<FileLocation, HashMap<PathBytes, Vec<PathBytes>>>,
     partial_directory_order: VecDeque<FileLocation>,
@@ -971,6 +977,16 @@ impl FsOps {
         self.hash_policy = policy;
     }
 
+    /// Serve the copy `scope` (`new_stage_scope`), in a process that serves
+    /// several copies.
+    pub(crate) fn set_stage_scope(&mut self, scope: u64) {
+        self.stage_scope = scope;
+    }
+
+    pub(crate) fn stage_scope(&self) -> u64 {
+        self.stage_scope
+    }
+
     fn observed_payload_hash(&self, bytes: &[u8]) -> ContentDigest {
         let _hash = self
             .operation
@@ -1012,6 +1028,7 @@ impl FsOps {
             fds: HashMap::new(),
             fd_order: Vec::new(),
             held_basis: None,
+            stage_scope: 0,
             comparison_window: None,
             partial_candidates: HashMap::new(),
             partial_directory_order: VecDeque::new(),
@@ -1684,7 +1701,7 @@ impl FsOps {
         let staged = staged_file_mode(meta, flags);
         let (partial, label, opened) = with_rooted_partial(&rooted, copy_id, |partial, label| {
             self.open_private_partial_rooted(
-                stages::of(&rooted, copy_id, false),
+                stages::of(self.stage_scope, &rooted, copy_id, false),
                 partial,
                 label,
                 true,
@@ -2748,10 +2765,6 @@ impl FsOps {
         Ok(self.fds.get(&key).unwrap())
     }
 
-    fn cache_file(&mut self, location: FileLocation, attempt: u32, private: bool, file: File) {
-        self.cache_entry(location, attempt, private, CachedFile::new(file));
-    }
-
     fn cache_entry(
         &mut self,
         location: FileLocation,
@@ -2840,17 +2853,17 @@ impl FsOps {
         };
         let mut found = relative.clone();
         if !self.fds.contains_key(&key(relative)) {
-            let (file, _, held_relative) =
-                stages::get(held)?.ok_or_else(|| stages::not_held(label))?;
-            if !self.fds.contains_key(&key(&held_relative)) {
+            let got = stages::get(held)?.ok_or_else(|| stages::not_held(label))?;
+            if !self.fds.contains_key(&key(&got.relative)) {
                 if self.fds.len() >= FD_CACHE_MAX {
                     let victim = self.fd_order.remove(0);
                     self.fds.remove(&victim);
                 }
-                self.fds.insert(key(&held_relative), CachedFile::new(file));
-                self.fd_order.push(key(&held_relative));
+                self.fds
+                    .insert(key(&got.relative), CachedFile::held(got.file, got.in_use));
+                self.fd_order.push(key(&got.relative));
             }
-            found = held_relative;
+            found = got.relative;
         }
         Ok((self.fds.get(&key(&found)).unwrap(), found))
     }

@@ -1305,32 +1305,35 @@ impl FsOps {
         let (partial, label, opened) =
             with_rooted_partial(&target, &put.copy_id, |relative, label| {
                 // Nothing reads a small file's sidecar, so it is opened for
-                // writing only, and without exclusive creation, which costs
-                // an NFS client a further request. Whatever the name held is
-                // opened too: a new empty file of ours is used as created,
-                // and anything else, or an open the kernel refused, takes
-                // the checked reuse that ranged writes apply.
-                if creates_foreign_owners(target.root.identity().dev) {
+                // writing only, and, where the filesystem's link counts can
+                // be trusted, without exclusive creation, which costs an NFS
+                // client a further request. Whatever the name held is opened
+                // too: a new empty file of ours is used as created, and
+                // anything else, or an open the kernel refused, takes the
+                // checked path that ranged writes apply.
+                if !target.root.link_counts_trusted()
+                    || creates_foreign_owners(target.root.identity().dev)
+                {
                     return self.checked_small_stage(
-                        stages::of(&target, &put.copy_id, false),
+                        stages::of(self.stage_scope, &target, &put.copy_id, false),
                         relative,
                         label,
                         mode,
                     );
                 }
                 self.uncache_rooted(&target.root, relative);
-                match self.open_or_create_write_only_partial(&target.root, relative, mode) {
+                match self.open_or_create_partial(&target.root, relative, mode, true) {
                     Ok((file, created)) if is_fresh_partial(&created, mode) => {
                         Ok(Some((file, created, None)))
                     }
                     Ok(_) => self.checked_small_stage(
-                        stages::of(&target, &put.copy_id, false),
+                        stages::of(self.stage_scope, &target, &put.copy_id, false),
                         relative,
                         label,
                         mode,
                     ),
                     Err(error) if existing_leaf_refused(&error) => self.checked_small_stage(
-                        stages::of(&target, &put.copy_id, false),
+                        stages::of(self.stage_scope, &target, &put.copy_id, false),
                         relative,
                         label,
                         mode,

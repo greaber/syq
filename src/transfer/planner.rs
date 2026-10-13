@@ -3033,8 +3033,10 @@ impl Planner<'_> {
                 }
             }
             // An existing directory's final metadata goes only to the
-            // directory the scan found there. One this copy created is held
-            // only to being a directory (`Op::SetMeta::directory`).
+            // directory the scan found there, where the receiving filesystem
+            // keeps inode numbers (`fsops::set_meta_rooted`). One this copy
+            // created is held only to being a directory
+            // (`Op::SetMeta::directory`).
             let condition = match (self.metadata_condition_for(p), s) {
                 (TargetCondition::Any, Some(found))
                     if found.kind == Kind::Dir && !self.created_dirs.contains(p) =>

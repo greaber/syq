@@ -428,12 +428,12 @@ fn an_inplace_ranged_copy_opens_its_destination_directly() {
 
 #[test]
 fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read() {
-    // A new sidecar is created exclusively, for writing only, in the staged
-    // mode the sender chose; the metadata read then decides the
-    // publication's chmod, the times are set regardless, set-id bits are
-    // applied, and the identity reported is the inode created. A leftover
-    // this receiver does not hold is replaced, never resumed, and a
-    // directory at the target is refused as before.
+    // A new sidecar is created read-write, so that it is read through its
+    // own descriptor too, in the staged mode the sender chose; the metadata
+    // read then decides the publication's chmod, the times are set
+    // regardless, set-id bits are applied, and the identity reported is the
+    // inode created. A leftover this receiver does not hold is replaced,
+    // never resumed, and a directory at the target is refused as before.
     use std::os::unix::io::AsRawFd;
     let directory = crate::test_support::tempdir().unwrap();
     let copy_id = [5; 16];
@@ -494,7 +494,7 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
     };
 
     // Staged mode 0644: no chmod is needed, and the staged file was opened
-    // write-only. Set-id bits are applied at publication.
+    // read-write. Set-id bits are applied at publication.
     assert_eq!(prepare(&mut operations, b"plain", 0o644).partial_size, None);
     let (sidecar, _) = rooted_partial_target(
         &operations
@@ -527,7 +527,7 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
             .unwrap()
             .expect("prepared descriptor is cached");
         let access = unsafe { libc::fcntl(cached.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE;
-        assert_eq!(access, libc::O_WRONLY);
+        assert_eq!(access, libc::O_RDWR);
     }
     write(&mut operations, b"plain");
     let identity = publish(&mut operations, b"plain", 0o4755).unwrap();
@@ -3431,6 +3431,7 @@ fn rooted_descriptor_cache_distinguishes_roots_with_the_same_relative_name() {
     let mut operations = FsOps::new();
     let copy_id = [61; 16];
     let held = |root| stages::For {
+        scope: 0,
         root,
         target: &relative,
         copy_id: &copy_id,
@@ -3438,7 +3439,7 @@ fn rooted_descriptor_cache_distinguishes_roots_with_the_same_relative_name() {
     };
     for (root, path) in [(&first_root, &first), (&second_root, &second)] {
         let file = File::options().write(true).open(path.join("same")).unwrap();
-        stages::hold(held(root), &relative, &file, None).unwrap();
+        stages::hold(held(root), &relative, &file, None, false).unwrap();
     }
 
     let first_inode = operations
@@ -4017,6 +4018,7 @@ fn seed_basis_hashes_retry_bytes_without_rewriting_them() {
     let relative = RelativePath::new(partial.file_name().unwrap().as_bytes()).unwrap();
     let root = ops.destination_root.clone().unwrap();
     let held = stages::For {
+        scope: 0,
         root: &root,
         target: &target_relative,
         copy_id: &id,
@@ -4027,7 +4029,7 @@ fn seed_basis_hashes_retry_bytes_without_rewriting_them() {
         .write(true)
         .open(&partial)
         .unwrap();
-    stages::hold(held, &relative, &file, None).unwrap();
+    stages::hold(held, &relative, &file, None, true).unwrap();
     // Retried bytes are compared with source block hashes, independently
     // of the hash used to check transported payloads.
     ops.set_hash_policy(crate::hashing::HashPolicy {
@@ -4545,6 +4547,7 @@ fn a_refused_mode_probe_leaves_the_device_checked() {
     let probe = RelativePath::new(b"probe").unwrap();
     let probed = ops.open_private_partial_rooted(
         stages::For {
+            scope: 0,
             root: &root,
             target: &probe,
             copy_id: &[43; 16],
@@ -4636,6 +4639,7 @@ fn one_connections_probe_does_not_decide_for_another() {
         let (file, basis) = ops
             .open_private_partial_rooted(
                 stages::For {
+                    scope: 0,
                     root: &root,
                     target: &relative,
                     copy_id: &copy_id,
@@ -4658,12 +4662,13 @@ fn one_connections_probe_does_not_decide_for_another() {
         let relative = RelativePath::new(name.as_bytes()).unwrap();
         let file = File::options().read(true).write(true).open(&path).unwrap();
         let held = stages::For {
+            scope: 0,
             root: &root,
             target: &relative,
             copy_id: &copy_id,
             inplace: false,
         };
-        stages::hold(held, &relative, &file, None).unwrap();
+        stages::hold(held, &relative, &file, None, true).unwrap();
         // Held open, its inode number cannot be given to a replacement.
         file
     };
@@ -5111,6 +5116,56 @@ fn directory_metadata_reaches_only_a_directory() {
     let directory = fs::symlink_metadata(dir.join("directory")).unwrap();
     assert_eq!(directory.mode() & 0o7777, 0o750);
     assert_eq!(directory.mtime(), 1_500_000_000);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn directory_identity_is_checked_only_where_inode_numbers_are_kept() {
+    // The identity the scan found binds a directory's metadata where the
+    // filesystem keeps inode numbers. Elsewhere a number can change while
+    // the directory stays, so only its type is checked.
+    let dir = test_dir();
+    fs::create_dir(&dir).unwrap();
+    let root = Arc::new(Root::open(&dir).unwrap());
+    fs::create_dir(dir.join("directory")).unwrap();
+    fs::write(dir.join("planted"), b"planted").unwrap();
+    let found = fs::symlink_metadata(dir.join("directory")).unwrap();
+    let target = |name: &str| RootedTarget {
+        root: root.clone(),
+        relative: RelativePath::new(name.as_bytes()).unwrap(),
+        label: dir.join(name),
+        create_missing_parents: false,
+        query_partial_name_limit: false,
+    };
+    let meta = Meta {
+        inode_metadata: None,
+        mode: 0o750,
+        uid: found.uid(),
+        gid: found.gid(),
+        mtime: 1_500_000_000,
+        mtime_nsec: 0,
+    };
+    // A number other than the directory's, as a filesystem that renumbers
+    // reports it.
+    let renumbered = TargetCondition::Matches {
+        dev: found.dev(),
+        ino: found.ino() + 1,
+    };
+    let apply = |name| set_meta_rooted(&target(name), &meta, flags::MODE, renumbered, true);
+    root.assume_profile_for_test(Profile::LOCAL);
+    assert!(apply("directory").is_err());
+    root.assume_profile_for_test(Profile {
+        link_counts_trusted: false,
+        ..Profile::LOCAL
+    });
+    apply("directory").unwrap();
+    let directory = fs::symlink_metadata(dir.join("directory")).unwrap();
+    assert_eq!(directory.mode() & 0o7777, 0o750);
+    let error = apply("planted").unwrap_err();
+    assert!(
+        format!("{error:#}").contains("no longer a directory"),
+        "{error:#}"
+    );
     fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -8557,4 +8612,233 @@ fn removed_widened_directories_are_forgotten() {
     );
     assert!(!dir.exists());
     assert!(!operations.receiver_directories.has_widened());
+}
+
+#[test]
+fn a_retry_reads_a_held_stage_whose_finalize_removed_read_permission() {
+    // A publication that fails after Finalize gave the stage its final mode,
+    // here write-only, leaves a partial worth resuming. The retry reads it
+    // through the descriptor the receiver holds, which still reads it.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let id = [219; 16];
+    let data: Vec<u8> = (0..2 << 20).map(|i: u32| (i % 251) as u8).collect();
+    let mut ops = destination_ops(temporary.path());
+    let target = || PartialTarget {
+        path: b"file",
+        id: &id,
+        guard: None,
+    };
+    ops.prepare(
+        target(),
+        PrepareOptions {
+            size: data.len() as u64,
+            inplace: false,
+            mode: 0o200,
+            attempt: 0,
+            create_if_missing: true,
+            scanned: ScannedDestination::Absent,
+            group: None,
+        },
+    )
+    .unwrap();
+    ops.write_range(target(), false, 0, 0, content_digest(&data), &data)
+        .unwrap();
+    // A directory at the target makes publication fail after the metadata
+    // step.
+    fs::create_dir(temporary.path().join("file")).unwrap();
+    let meta = Meta {
+        inode_metadata: None,
+        mode: 0o200,
+        uid: 0,
+        gid: 0,
+        mtime: 0,
+        mtime_nsec: 0,
+    };
+    assert!(ops
+        .finalize(
+            b"file",
+            false,
+            &id,
+            &meta,
+            flags::MODE,
+            TargetMutation {
+                condition: TargetCondition::Any,
+                guard: None
+            }
+        )
+        .is_err());
+    fs::remove_dir(temporary.path().join("file")).unwrap();
+    let seeded = ops.seed_basis(target(), data.len() as u64, MIN_HASH_BLOCK_BYTES, None, 1);
+    // Restore the fixture's permissions even if resuming failed.
+    let partial = partial_path(&temporary.path().join("file"), &id).unwrap();
+    fs::set_permissions(partial, fs::Permissions::from_mode(0o600)).unwrap();
+    let expected: Vec<_> = data
+        .chunks(MIN_HASH_BLOCK_BYTES as usize)
+        .map(content_digest)
+        .collect();
+    assert!(seeded.unwrap().hashes == expected);
+}
+
+#[test]
+fn finalizing_again_after_a_failed_finalize_publishes_the_held_stage() {
+    // A Finalize that fails keeps the stage held, so the next one, once
+    // what stood in the way is gone, publishes it.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let id = [221; 16];
+    let data: Vec<u8> = (0..2 << 20).map(|i: u32| (i % 241) as u8).collect();
+    let mut ops = destination_ops(temporary.path());
+    let target = || PartialTarget {
+        path: b"file",
+        id: &id,
+        guard: None,
+    };
+    ops.prepare(
+        target(),
+        PrepareOptions {
+            size: data.len() as u64,
+            inplace: false,
+            mode: 0o644,
+            attempt: 0,
+            create_if_missing: true,
+            scanned: ScannedDestination::Absent,
+            group: None,
+        },
+    )
+    .unwrap();
+    ops.write_range(target(), false, 0, 0, content_digest(&data), &data)
+        .unwrap();
+    let meta = Meta {
+        inode_metadata: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        mtime: 0,
+        mtime_nsec: 0,
+    };
+    let finalize = |ops: &mut FsOps| {
+        ops.finalize(
+            b"file",
+            false,
+            &id,
+            &meta,
+            flags::MODE,
+            TargetMutation {
+                condition: TargetCondition::Any,
+                guard: None,
+            },
+        )
+    };
+    fs::create_dir(temporary.path().join("file")).unwrap();
+    assert!(finalize(&mut ops).is_err());
+    fs::remove_dir(temporary.path().join("file")).unwrap();
+    // Another connection of the copy finalizes it.
+    let mut other = destination_ops(temporary.path());
+    finalize(&mut other).unwrap();
+    assert!(fs::read(temporary.path().join("file")).unwrap() == data);
+    assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 1);
+}
+
+/// Prepare `file` in place in `ops` for attempt `attempt`, `size` bytes.
+fn prepare_inplace(
+    ops: &mut FsOps,
+    id: &CopyId,
+    attempt: u32,
+    size: u64,
+    scanned: ScannedDestination,
+) -> Result<Preparation> {
+    ops.prepare(
+        PartialTarget {
+            path: b"file",
+            id,
+            guard: None,
+        },
+        PrepareOptions {
+            size,
+            inplace: true,
+            mode: 0o644,
+            attempt,
+            create_if_missing: true,
+            scanned,
+            group: None,
+        },
+    )
+}
+
+#[test]
+fn an_inplace_retry_writes_the_file_it_holds_without_opening_the_name() {
+    // Root may open any file for writing, so the case proves nothing there.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temporary = crate::test_support::tempdir().unwrap();
+    let id = [222; 16];
+    let path = temporary.path().join("file");
+    let mut ops = destination_ops(temporary.path());
+    prepare_inplace(&mut ops, &id, 0, 3, ScannedDestination::Absent).unwrap();
+    // Opening the name for writing now fails, so the retry can write only
+    // through the descriptor it holds.
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+    let mut other = destination_ops(temporary.path());
+    prepare_inplace(&mut other, &id, 1, 3, ScannedDestination::Absent).unwrap();
+    let target = PartialTarget {
+        path: b"file",
+        id: &id,
+        guard: None,
+    };
+    other
+        .write_range(target, true, 1, 0, content_digest(b"new"), b"new")
+        .unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"new");
+}
+
+#[test]
+fn a_new_inplace_file_swapped_out_between_attempts_fails_the_file() {
+    // The retry finds another file at the name of the one the copy created:
+    // it writes nothing there, however often it is tried.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let id = [223; 16];
+    let path = temporary.path().join("file");
+    let mut ops = destination_ops(temporary.path());
+    prepare_inplace(&mut ops, &id, 0, 3, ScannedDestination::Absent).unwrap();
+    fs::rename(&path, temporary.path().join("aside")).unwrap();
+    fs::write(&path, b"planted").unwrap();
+    for attempt in [1, 2] {
+        let error =
+            prepare_inplace(&mut ops, &id, attempt, 3, ScannedDestination::Unknown).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("was replaced while this copy wrote it in place"),
+            "{error:#}"
+        );
+    }
+    assert_eq!(fs::read(&path).unwrap(), b"planted");
+}
+
+#[test]
+fn an_existing_inplace_file_swapped_out_between_attempts_is_opened_again() {
+    // An existing file is written in place as before: the retry lets go of
+    // the file it held and opens whatever is at the name.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let id = [224; 16];
+    let path = temporary.path().join("file");
+    fs::write(&path, b"old").unwrap();
+    let mut ops = destination_ops(temporary.path());
+    prepare_inplace(&mut ops, &id, 0, 3, ScannedDestination::Unknown).unwrap();
+    fs::rename(&path, temporary.path().join("aside")).unwrap();
+    fs::write(&path, b"another").unwrap();
+    prepare_inplace(&mut ops, &id, 1, 3, ScannedDestination::Unknown).unwrap();
+    ops.write_range(
+        PartialTarget {
+            path: b"file",
+            id: &id,
+            guard: None,
+        },
+        true,
+        1,
+        0,
+        content_digest(b"new"),
+        b"new",
+    )
+    .unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"new");
+    assert_eq!(fs::read(temporary.path().join("aside")).unwrap(), b"old");
 }

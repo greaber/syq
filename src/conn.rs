@@ -2212,7 +2212,8 @@ impl RemoteSpec {
                 ..
             } = &role
             {
-                let (stream, receiver) = std::os::unix::net::UnixStream::pair()?;
+                let (stream, receiver) =
+                    crate::process::with_inheritance_guard(std::os::unix::net::UnixStream::pair)?;
                 crate::descriptor_broker::hand_off_socket(
                     &destination.ticket,
                     std::os::fd::AsRawFd::as_raw_fd(&receiver),

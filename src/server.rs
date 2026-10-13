@@ -225,11 +225,24 @@ struct ServeSession {
     descriptor_session: DescriptorSessionSlot,
 }
 
+/// Lets go of the files a copy is writing when its control connection ends.
+struct ReleaseStages(u64);
+
+impl Drop for ReleaseStages {
+    fn drop(&mut self) {
+        crate::fsops::release_stages(self.0);
+    }
+}
+
+/// Most worker connections one receiving process serves at once, over TCP
+/// or handed over from SSH sessions, each counted separately.
+pub(crate) const MAX_WORKER_CONNECTIONS: usize = 256;
+
 /// Ceiling on accepted TCP sockets being served at once, authenticated or
 /// not. It bounds thread use against scanners and stray connections; the
 /// signed grant's `max_connections` is charged separately, after a worker
 /// authenticates.
-const MAX_LIVE_TCP_CONNECTIONS: u32 = 256;
+const MAX_LIVE_TCP_CONNECTIONS: u32 = MAX_WORKER_CONNECTIONS as u32;
 
 /// One authenticated worker's share of a signed grant's connection allowance,
 /// returned when the connection ends.
@@ -439,17 +452,20 @@ struct PipeHandshakeReader {
 impl Read for PipeHandshakeReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.pending.load(std::sync::atomic::Ordering::Acquire) {
-            let remaining = self
-                .deadline
-                .checked_duration_since(std::time::Instant::now())
-                .filter(|time| !time.is_zero())
-                .ok_or_else(|| io::Error::new(ErrorKind::TimedOut, "SSH worker Hello timed out"))?;
-            crate::sys::wait_readable(std::os::fd::AsRawFd::as_raw_fd(&self.input), remaining);
-            if std::time::Instant::now() >= self.deadline {
-                return Err(io::Error::new(
-                    ErrorKind::TimedOut,
-                    "SSH worker Hello timed out",
-                ));
+            // A signal can end a wait early; the next one waits for what
+            // remains of the deadline.
+            let input = std::os::fd::AsRawFd::as_raw_fd(&self.input);
+            loop {
+                let remaining = self
+                    .deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .filter(|time| !time.is_zero())
+                    .ok_or_else(|| {
+                        io::Error::new(ErrorKind::TimedOut, "SSH worker Hello timed out")
+                    })?;
+                if crate::sys::readable_within(input, remaining) {
+                    break;
+                }
             }
         }
         self.input.read(buf)
@@ -465,10 +481,18 @@ const MAX_LIVE_HANDED_CONNECTIONS: u32 = MAX_LIVE_TCP_CONNECTIONS;
 fn handed_connection_handler(
     descriptor_session: DescriptorSessionSlot,
 ) -> crate::descriptor_broker::ConnectionHandler {
+    handed_connection_handler_within(descriptor_session, MAX_LIVE_HANDED_CONNECTIONS)
+}
+
+/// `handed_connection_handler`, refusing connections beyond `limit` live.
+fn handed_connection_handler_within(
+    descriptor_session: DescriptorSessionSlot,
+    limit: u32,
+) -> crate::descriptor_broker::ConnectionHandler {
     let live = Arc::new(AtomicU32::new(0));
     Arc::new(move |connection| {
         use crate::descriptor_broker::HandedConnection;
-        if live.fetch_add(1, Relaxed) >= MAX_LIVE_HANDED_CONNECTIONS {
+        if live.fetch_add(1, Relaxed) >= limit {
             live.fetch_sub(1, Relaxed);
             connection.refuse();
             return Ok(());
@@ -894,6 +918,9 @@ fn serve<R: Read + Send + 'static, W: Write>(
         authority.is_none() || source_authority.is_none(),
         "a server session cannot combine source and destination authority"
     );
+    // Worker connections handed over from SSH sessions are served as data
+    // connections too, but do not arrive over TCP.
+    let over_tcp = tcp_socket.is_some();
     let mut r = FrameReader::new(r);
     r.set_limit(MAX_HANDSHAKE_FRAME);
     let sending_budget = Arc::new(std::sync::OnceLock::new());
@@ -994,6 +1021,15 @@ fn serve<R: Read + Send + 'static, W: Write>(
     }
     let is_control = matches!(&role, ConnectionRole::Control);
     let is_source_worker = matches!(&role, ConnectionRole::SourceWorker { .. });
+    // Tests check that every destination worker is served in the copy's
+    // receiver, handed over to it (`record_handed_connection_for_test`).
+    #[cfg(debug_assertions)]
+    if matches!(&role, ConnectionRole::DestinationWorker { .. }) {
+        let _ = crate::fsops::record_test_event(
+            "SYQ_TEST_HANDED_WORKER_EVENTS",
+            format_args!("worker {}", std::process::id()),
+        );
+    }
     // The copy's sidecars are registered from here so that they can be
     // removed; the guard is dropped on every return, after the reader.
     if owns_process {
@@ -1005,7 +1041,13 @@ fn serve<R: Read + Send + 'static, W: Write>(
     if let Some(authority) = &authority {
         ops.set_hash_policy(authority.hash_policy());
         ops.set_owned_objects(authority.owned_objects());
+        ops.set_stage_scope(authority.stage_scope());
     }
+    // The files a copy is writing are let go when its control ends; a
+    // receiver that serves many copies would otherwise keep those that never
+    // reached Finalize.
+    let _release_stages =
+        (is_control && source_authority.is_none()).then(|| ReleaseStages(ops.stage_scope()));
     if let Some(source) = &source_permit {
         source.initialize(&mut ops)?;
     }
@@ -1767,7 +1809,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
     if debug {
         crate::output::diagnostic!(
             "syq server{}: {blocks} blocks, {} MiB",
-            if over_ssh { "" } else { " (tcp)" },
+            if over_tcp { " (tcp)" } else { "" },
             bytes >> 20,
         );
     }

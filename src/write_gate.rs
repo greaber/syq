@@ -1,7 +1,7 @@
 //! Serialize Linux range writes while keeping reception and hashing parallel.
 //! Every worker of a copy runs in its receiver process, so the registry
 //! covers them all. Writes are serialized only on filesystems where that
-//! helps (`serializes_range_writes`).
+//! helps (`Profile::serialized_writes`).
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -46,12 +46,9 @@ impl Registry {
     }
 }
 
-/// Whether writes to one file on the device of `file` are serialized. On
-/// most filesystems concurrent writes to one file contend inside it, and
-/// taking them one at a time saves CPU at the same speed (#336). ZFS locks
-/// only the ranges written, so there serializing costs throughput. The
-/// answer comes from the filesystem's type, read once per device; it would
-/// belong to a per-filesystem capability profile, were there one.
+/// Whether writes to one file on the device of `file` are serialized, as
+/// the filesystem's profile says (`Profile::serialized_writes`), cached per
+/// device.
 #[cfg(any(target_os = "linux", test))]
 fn serializes_range_writes(file: &File, dev: u64) -> bool {
     static DEVICES: OnceLock<Mutex<HashMap<u64, bool>>> = OnceLock::new();
@@ -59,34 +56,21 @@ fn serializes_range_writes(file: &File, dev: u64) -> bool {
     if let Some(&serializes) = devices.lock().unwrap().get(&dev) {
         return serializes;
     }
-    let serializes = !filesystem_locks_ranges(file);
+    let serializes = profile_serializes_writes(file);
     devices.lock().unwrap().insert(dev, serializes);
     serializes
 }
 
-/// Whether `file` is on a filesystem that locks only the ranges written.
 #[cfg(all(target_os = "linux", not(test)))]
-fn filesystem_locks_ranges(file: &File) -> bool {
-    use std::os::fd::AsRawFd;
-    let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
-    // SAFETY: fstatfs writes the struct on success and reads nothing else.
-    let read = unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) } == 0;
-    read && locks_ranges(unsafe { stats.assume_init() }.f_type as u32)
+fn profile_serializes_writes(file: &File) -> bool {
+    crate::fsops::profile(file).serialized_writes
 }
 
 /// Tests serialize on every filesystem, so the gate itself is exercised
-/// wherever they run; `locks_ranges` is tested on its own.
+/// wherever they run; the profile's choice is tested with the profiles.
 #[cfg(test)]
-fn filesystem_locks_ranges(_file: &File) -> bool {
-    false
-}
-
-/// Whether the Linux filesystem type `f_type` locks only the ranges written.
-#[cfg(any(target_os = "linux", test))]
-fn locks_ranges(f_type: u32) -> bool {
-    /// `ZFS_SUPER_MAGIC`, which libc does not name.
-    const ZFS: u32 = 0x2fc1_2fc1;
-    f_type == ZFS
+fn profile_serializes_writes(_file: &File) -> bool {
+    true
 }
 
 pub(crate) struct CachedFile {
@@ -94,6 +78,9 @@ pub(crate) struct CachedFile {
     /// The file's write gate, or `None` where writes are not serialized.
     #[cfg(any(target_os = "linux", test))]
     gate: OnceLock<Option<Arc<Mutex<()>>>>,
+    /// For a file the receiver holds for a copy, a share of its use count,
+    /// which keeps it held while this descriptor is cached.
+    _in_use: Option<std::sync::Arc<()>>,
 }
 
 impl CachedFile {
@@ -102,6 +89,16 @@ impl CachedFile {
             file,
             #[cfg(any(target_os = "linux", test))]
             gate: OnceLock::new(),
+            _in_use: None,
+        }
+    }
+
+    /// A descriptor of a file the receiver holds, with a share of its use
+    /// count.
+    pub(crate) fn held(file: File, in_use: std::sync::Arc<()>) -> Self {
+        Self {
+            _in_use: Some(in_use),
+            ..Self::new(file)
         }
     }
 
@@ -151,14 +148,6 @@ impl CachedFile {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[test]
-    fn only_zfs_skips_the_write_gate() {
-        assert!(locks_ranges(0x2fc1_2fc1));
-        for f_type in [0xef53, 0x5846_5342, 0x6969, 0x0102_1994, 0x9123_683e] {
-            assert!(!locks_ranges(f_type), "{f_type:#x}");
-        }
-    }
 
     #[test]
     fn registry_sweeps_leave_room_for_live_gates_and_reclaim_idle_entries() {

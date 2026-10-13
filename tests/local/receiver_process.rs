@@ -6,11 +6,38 @@ use super::*;
 /// The process IDs that served handed-over worker connections.
 #[cfg(debug_assertions)]
 fn serving_processes(events: &Path) -> Vec<String> {
+    events_of(events, "served ")
+}
+
+#[cfg(debug_assertions)]
+fn events_of(events: &Path, kind: &str) -> Vec<String> {
     fs::read_to_string(events)
         .unwrap_or_default()
         .lines()
-        .filter_map(|line| line.strip_prefix("served ").map(str::to_owned))
+        .filter_map(|line| line.strip_prefix(kind).map(str::to_owned))
         .collect()
+}
+
+/// That every destination worker of a copy was handed over to one
+/// receiver process, which served it: none served itself.
+#[cfg(debug_assertions)]
+fn assert_one_receiver(events: &Path, context: &str) -> usize {
+    let served = serving_processes(events);
+    let workers = events_of(events, "worker ");
+    assert!(!served.is_empty(), "{context}: no handed-over worker");
+    assert!(
+        served
+            .iter()
+            .chain(&workers)
+            .all(|process| process == &served[0]),
+        "{context}: workers served by {workers:?}, handed to {served:?}"
+    );
+    assert_eq!(
+        workers.len(),
+        served.len(),
+        "{context}: a worker served itself"
+    );
+    served.len()
 }
 
 /// A native copy of `src` into `dst` over the fake SSH transport, with no
@@ -75,12 +102,8 @@ fn workers_without_tcp_are_served_by_one_receiver_process() {
                 prng(4096, index)
             );
         }
-        let served = serving_processes(&t.path("served"));
-        assert!(served.len() >= 2, "remote {remote}: {served:?}");
-        assert!(
-            served.iter().all(|process| process == &served[0]),
-            "remote {remote}: {served:?}"
-        );
+        let served = assert_one_receiver(&t.path("served"), &format!("remote {remote}"));
+        assert!(served >= 2, "remote {remote}: {served} handed-over workers");
     }
 }
 
@@ -106,13 +129,31 @@ fn a_dropped_ssh_worker_reconnects_to_the_same_receiver() {
     assert_output_ok(&out);
     assert!(marker.exists());
     assert!(read(&t.path("dst/big")) == data);
-    let served = serving_processes(&t.path("served"));
-    assert!(served.len() >= 3, "{served:?}");
-    assert!(
-        served.iter().all(|process| process == &served[0]),
-        "{served:?}"
-    );
+    let served = assert_one_receiver(&t.path("served"), "dropped worker");
+    assert!(served >= 3, "{served} handed-over workers");
     assert!(partial_files(&t.path("dst")).is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn automatic_ssh_workers_stay_within_the_receivers_open_file_limit() {
+    // Every SSH worker runs in the copy's receiver process and shares its
+    // open-file limit, so automatic tuning starts only as many as it allows.
+    let t = Tmp::new();
+    for index in 0..100 {
+        write(&t.path(&format!("src/{index}")), &prng(2 << 20, index));
+    }
+    let out = ssh_copy(&t, "copy-path=ranges")
+        .env("FAKE_REMOTE_NOFILE", "64")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    for index in 0..100 {
+        assert!(
+            read(&t.path(&format!("dst/{index}"))) == prng(2 << 20, index),
+            "file {index}"
+        );
+    }
 }
 
 /// Put a file of our own, `planted`, at `name` in place of what is there,

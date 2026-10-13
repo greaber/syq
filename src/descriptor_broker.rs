@@ -1684,6 +1684,59 @@ mod tests {
             .contains("rejected"));
     }
 
+    #[test]
+    fn handed_connections_need_the_secret_and_their_descriptors() {
+        // The broker takes a connection only with the session's secret, as
+        // two pipes with the bytes already read or one socket without any,
+        // and only while the session serves handed connections.
+        let temp = crate::test_support::tempdir().unwrap();
+        let slot = DescriptorSessionSlot::default();
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = served.clone();
+        slot.serve_handed_connections(Arc::new(move |connection: HandedConnection| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut control = connection.control;
+            HandedConnection::accept(&mut control)?;
+            HandedConnection::report_end(control, &Ok(()));
+            Ok(())
+        }));
+        let ticket = slot.register(File::open(temp.path()).unwrap()).unwrap();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let socket = socket.as_raw_fd();
+        let (input, _input) = std::io::pipe().unwrap();
+        let (_output, output) = std::io::pipe().unwrap();
+        let pipes = [input.as_raw_fd(), output.as_raw_fd()];
+
+        let mut wrong = ticket.clone();
+        wrong.secret[0] ^= 1;
+        assert!(hand_off_socket(&wrong, socket).is_err());
+        for (prefix, descriptors) in [
+            (&b""[..], &[socket, socket, socket][..]),
+            (b"hello", &[socket]),
+            (b"", &[]),
+        ] {
+            assert!(
+                hand_off(&ticket, prefix, descriptors).is_err(),
+                "{} descriptors, {} bytes",
+                descriptors.len(),
+                prefix.len()
+            );
+        }
+        assert_eq!(served.load(Ordering::SeqCst), 0);
+
+        hand_off_socket(&ticket, socket).unwrap().wait().unwrap();
+        hand_off_pipes(&ticket, b"hello", pipes[0], pipes[1])
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+
+        // A session that no longer serves them refuses them.
+        slot.connections.lock().unwrap().take();
+        assert!(hand_off_socket(&ticket, socket).is_err());
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     fn descriptor_handoffs_survive_client_thread_refusal() {

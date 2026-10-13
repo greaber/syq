@@ -504,7 +504,10 @@ fn apply_one_rooted(
 /// Apply `meta` to the object at `target`. A `directory`'s metadata goes
 /// only to a directory: anything else found at its name, such as a file
 /// someone put there in its place, is refused before any change, so that it
-/// never takes the directory's owner, group or mode.
+/// never takes the directory's owner, group or mode. Its identity is checked
+/// only where the filesystem keeps inode numbers
+/// (`Profile::link_counts_trusted`): elsewhere a directory's number can
+/// change while it stays, and the type check stands alone.
 pub(super) fn set_meta_rooted(
     target: &RootedTarget,
     meta: &Meta,
@@ -512,6 +515,14 @@ pub(super) fn set_meta_rooted(
     condition: TargetCondition,
     directory: bool,
 ) -> Result<()> {
+    let condition = match condition {
+        TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }
+            if directory && !target.root.link_counts_trusted() =>
+        {
+            TargetCondition::Any
+        }
+        condition => condition,
+    };
     let require_directory = |is_dir: bool| {
         if directory && !is_dir {
             bail!(
