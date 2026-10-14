@@ -354,3 +354,73 @@ fn a_preview_counts_a_replaced_file_as_rewritten() {
         assert_eq!(mode(&t.path("outside")), 0o644);
     }
 }
+
+/// Access times are restored in place on any file: a `-aHU` rerun neither
+/// replaces nor relinks a hard-link group that was only read since the last
+/// copy, and a preview counts it as a metadata-only change.
+#[test]
+fn an_access_time_rerun_keeps_a_hard_link_group_that_was_only_read() {
+    let set_atime = |path: &Path, seconds: i64| {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: seconds as _,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+        ];
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) },
+            0
+        );
+    };
+    let atime = |path: &Path| fs::metadata(path).unwrap().atime();
+    for route in ROUTES {
+        let t = Tmp::new();
+        write(&t.path("src/a"), &prng(1 << 20, 508));
+        fs::hard_link(t.path("src/a"), t.path("src/b")).unwrap();
+        set_mtime(&t.path("src/a"), 1_700_000_000);
+        set_atime(&t.path("src/a"), 1_500_000_000);
+        assert_output_ok(&rsync(&t, route, &["-aHU"]));
+        let group = inode(&t.path("dst/a"));
+        assert_eq!(inode(&t.path("dst/b")), group, "{route}");
+        assert_eq!(atime(&t.path("dst/a")), 1_500_000_000, "{route}");
+        // Someone reads the copy.
+        set_atime(&t.path("dst/a"), 1_650_000_000);
+
+        if route == "local" {
+            let results = t.path("results.jsonl");
+            let out = native_syq(&[
+                "cp",
+                "--dry-run",
+                "--copy-metadata=mtime,permissions,hardlinks,atimes",
+                "--results",
+                &results.to_string_lossy(),
+                "--srcs-in",
+                &t.s("src"),
+                "--into",
+                &t.s("dst"),
+            ]);
+            assert_output_ok(&out);
+            let records = fs::read_to_string(&results).unwrap();
+            let traces: Vec<serde_json::Value> = records
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|record| record["action"] == "transfer_file")
+                .collect();
+            assert_eq!(traces.len(), 1, "{records}");
+            assert_eq!(traces[0]["reason"], "metadata_differs", "{records}");
+            assert!(traces[0]["bytes"].is_null(), "{records}");
+        }
+
+        assert_output_ok(&rsync(&t, route, &["-aHU"]));
+        for name in ["dst/a", "dst/b"] {
+            assert_eq!(inode(&t.path(name)), group, "{route} {name}");
+        }
+        assert_eq!(atime(&t.path("dst/a")), 1_500_000_000, "{route}");
+    }
+}

@@ -450,7 +450,8 @@ When only an existing file's metadata differs, syq changes it in place if the
 file has no other names, belongs to the account syq runs as (as root: already
 to the owner and group it ends with), the filesystem's link counts can be
 trusted, and the change adds no set-user-ID or set-group-ID bit or file
-capability. Otherwise it replaces the file as if its contents had changed. A
+capability. Otherwise it replaces the file as if its contents had changed.
+Access times, which `atimes` restores, are set in place on any file. A
 replaced file gets a new inode number, needs write permission on its directory
 and room for a second copy, and does not keep attributes the copy does not
 select, such as ACLs or extended attributes without `acls` or `xattrs`. Syq

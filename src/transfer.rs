@@ -388,6 +388,21 @@ impl Opts {
             && self.metadata_for(path, source).inode_metadata != destination.inode_metadata
     }
 
+    /// The same, leaving out the access time, which the receiver restores
+    /// in place on any file (`fsops::vouch`).
+    fn inode_metadata_differs_besides_atime(
+        &self,
+        path: &[u8],
+        source: &Entry,
+        destination: &Entry,
+    ) -> bool {
+        self.metadata_for(path, source)
+            .inode_metadata
+            .is_some_and(|metadata| {
+                metadata.differs_besides_atime(destination.inode_metadata.as_deref())
+            })
+    }
+
     fn metadata_fix_flags(&self, path: &[u8], source: &Entry, destination: &Entry) -> u8 {
         let source = self.metadata_for(path, source);
         let flags = self.matching_flags_for(path);

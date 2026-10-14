@@ -53,6 +53,23 @@ pub(crate) struct InodeMetadata {
     pub crtime: Option<Timestamp>,
 }
 
+impl InodeMetadata {
+    /// Whether giving a file with `current` (none read: nothing) this
+    /// metadata would change anything but its access time, which syq
+    /// restores in place on any file (`fsops::vouch`).
+    pub(crate) fn differs_besides_atime(&self, current: Option<&Self>) -> bool {
+        let empty = Self::default();
+        let current = current.unwrap_or(&empty);
+        (&self.acls, &self.macos_acl, &self.xattrs, self.crtime)
+            != (
+                &current.acls,
+                &current.macos_acl,
+                &current.xattrs,
+                current.crtime,
+            )
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct MacAcl {
     pub flags: u32,
@@ -663,12 +680,13 @@ pub(crate) fn apply_after_acls_before_publication(
 /// Whether applying `metadata` with the final `mode` would change `file`:
 /// its ACLs, extended attributes, access time or birth time. Where a part
 /// cannot be compared it counts as a change.
-pub(crate) fn would_change(
+/// Whether applying `metadata` through `file` would change anything but its
+/// access time, which syq restores in place on any file (`fsops::vouch`).
+pub(crate) fn would_change_besides_atime(
     file: &File,
     metadata: Option<&InodeMetadata>,
     mode: u32,
 ) -> Result<bool> {
-    use std::os::unix::fs::MetadataExt;
     let Some(metadata) = metadata else {
         return Ok(false);
     };
@@ -694,11 +712,6 @@ pub(crate) fn would_change(
         return Ok(true);
     }
     let current = file.metadata()?;
-    if let Some(atime) = metadata.atime {
-        if (current.atime(), current.atime_nsec() as u32) != (atime.seconds, atime.nanoseconds) {
-            return Ok(true);
-        }
-    }
     if let Some(crtime) = metadata.crtime {
         let created = current
             .created()

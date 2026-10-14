@@ -84,8 +84,8 @@ elsewhere, or someone who already has it open, keeps the old contents. This
 holds with `--in-place=new` too, which writes only new files at their final
 names.
 
-Syq changes an existing file's permissions, owner, group, times, ACLs or
-extended attributes in place only when the file has no other names, the
+Syq changes an existing file's permissions, owner, group, modification time,
+ACLs or extended attributes in place only when the file has no other names, the
 filesystem's link counts can be trusted, the file belongs to the account syq
 runs as (as root: already to the owner and group it ends with), and the change
 adds no set-user-ID or set-group-ID bit or file capability. Otherwise syq

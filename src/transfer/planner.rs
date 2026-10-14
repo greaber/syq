@@ -4575,8 +4575,12 @@ impl Planner<'_> {
             return false;
         }
         let representative = self.opts.hardlinks && source.nlink > 1;
+        // Access times are restored in place on any file: a file that was
+        // only read is not replaced for them.
         let changes = self.opts.metadata_fix_flags(rel, source, destination) != 0
-            || self.opts.inode_metadata_differs(rel, source, destination);
+            || self
+                .opts
+                .inode_metadata_differs_besides_atime(rel, source, destination);
         if !changes && !representative {
             return false;
         }

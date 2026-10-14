@@ -14,6 +14,11 @@
 //! - the change gives it no set-user-ID or set-group-ID bit and no file
 //!   capability it lacks.
 //!
+//! Access times are the exception: they are restored in place on any file,
+//! through the descriptor the receiver holds, so a rerun with `-U` does not
+//! replace a file (or relink a hard-link group) that was only read. Setting
+//! one reveals and changes nothing else about the file.
+//!
 //! Every check reads the descriptor the change then goes through, never a
 //! name. A file that fails is replaced as a changed file is, and the
 //! receiver says so (`WireIoKind::ReplaceRequired`): a new file built from
@@ -84,8 +89,9 @@ pub(crate) fn is_replace_required_wire(error: &WireError) -> bool {
 }
 
 /// Whether applying `meta` under `flags` through `file`, whose metadata
-/// `current` was read through it, would change anything, as the metadata
-/// step judges it (`set_meta_file_inner`).
+/// `current` was read through it, would change anything that needs the
+/// receiver to vouch for the file: anything, as the metadata step judges it
+/// (`set_meta_file_inner`), but the access time.
 pub(super) fn changes(file: &File, current: &fs::Metadata, meta: &Meta, flags: u8) -> Result<bool> {
     let owner = flags & flags::OWNER != 0
         && (is_superuser() || flags & flags::REQUIRE_OWNER != 0)
@@ -97,7 +103,11 @@ pub(super) fn changes(file: &File, current: &fs::Metadata, meta: &Meta, flags: u
     if owner || group || mode || times {
         return Ok(true);
     }
-    crate::inode_metadata::would_change(file, meta.inode_metadata.as_deref(), meta.mode)
+    crate::inode_metadata::would_change_besides_atime(
+        file,
+        meta.inode_metadata.as_deref(),
+        meta.mode,
+    )
 }
 
 /// Whether `current` is owned as a file syq may change in place must be:
@@ -162,7 +172,8 @@ pub(super) fn refusal(
 }
 
 /// Refuse, with `replace_required`, to change `file`'s metadata in place
-/// unless the receiver can vouch for it or the change would change nothing.
+/// unless the receiver can vouch for it or the change would change nothing
+/// but the access time.
 /// A hard-link representative must pass the owner check either way.
 /// `current` was read through `file`.
 pub(crate) fn require<'a>(
