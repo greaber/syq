@@ -7043,6 +7043,36 @@ fn both_receivers_write_only_files_they_created() {
     }
 }
 
+/// Both receivers put a new small file in place at its name, the restricted
+/// one under its guard, and replace an existing one through a stage.
+#[test]
+fn both_receivers_put_small_files_in_place_only_when_new() {
+    for restricted in [false, true] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("existing"), b"old").unwrap();
+        fs::hard_link(target.join("existing"), root.join("outside")).unwrap();
+        let mut receiver =
+            ParityReceiver::new(&root, restricted, true, PublicationPolicy::InPlaceNew);
+        let put = |name: &str| {
+            let Request::PutSmallBatch(mut puts) = small_put(&target.join(name)) else {
+                unreachable!()
+            };
+            puts[0].inplace = true;
+            puts[0].meta.mode = 0o644;
+            puts[0].flags = proto::flags::MODE;
+            puts.remove(0)
+        };
+        receiver.send(Request::PutSmallBatch(vec![put("new"), put("existing")]));
+        let case = format!("restricted={restricted}");
+        assert_eq!(fs::read(target.join("new")).unwrap(), b"new", "{case}");
+        assert_eq!(fs::read(target.join("existing")).unwrap(), b"new", "{case}");
+        assert_eq!(fs::read(root.join("outside")).unwrap(), b"old", "{case}");
+    }
+}
+
 #[test]
 fn both_receivers_restore_set_id_bits_after_writing_in_place() {
     // Writes clear an existing file's set-ID bits. Without word from the

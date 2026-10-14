@@ -1973,6 +1973,7 @@ impl FsOps {
         &mut self,
         put: &SmallPut,
         rooted: &RootedTarget,
+        guarded: bool,
         meta: &mut Cow<'_, Meta>,
         flags: &mut u8,
     ) -> Result<Option<Option<(u64, u64)>>> {
@@ -2017,6 +2018,17 @@ impl FsOps {
         check_destination_writes(&file, &rooted.label)?;
         set_meta_written_file(&file, meta, *flags, &created)
             .with_context(|| format!("set metadata {}", rooted.label.display()))?;
+        // As when an in-place file is finalized (`finalize_held`): the file
+        // is finished only while its name still leads to it.
+        if guarded || rooted.root.link_counts_trusted_on(created.dev(), &file) {
+            require_rooted_named_identity_known(
+                &rooted.root,
+                &rooted.relative,
+                &rooted.label,
+                &created,
+                TargetCondition::Any,
+            )?;
+        }
         Ok(Some(known_identity(&created, *flags)))
     }
 
@@ -2040,15 +2052,16 @@ impl FsOps {
         let rooted = self.destination_mutation_target(target.path, target.guard)?;
         self.uncache_rooted(&rooted.root, &rooted.relative);
         if inplace {
-            if target.guard.is_some() {
-                bail!("guarded small-file updates require atomic publication");
-            }
             // Only a file this creates is written at its name. Whatever else
             // the name holds is replaced through a stage, below, as any
             // changed file is.
-            if let Some(identity) =
-                self.create_small_inplace(put, &rooted, &mut meta, &mut flags)?
-            {
+            if let Some(identity) = self.create_small_inplace(
+                put,
+                &rooted,
+                target.guard.is_some(),
+                &mut meta,
+                &mut flags,
+            )? {
                 return Ok(identity);
             }
             let mut put = put.clone();

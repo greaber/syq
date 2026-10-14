@@ -1101,10 +1101,12 @@ if taken_output=$(syq cp --in-place=new --no-progress --from source --src /tmp/s
 fi
 ssh destination 'test "$(cat /tmp/syq-real-ssh/inplace-policy/taken)" = theirs'
 
-printf 'case: restricted receiver keeps or replaces each name of a linked destination\n'
+printf 'case: restricted receiver replaces each name of a linked destination\n'
 # Eight names of one destination file. The odd names' sources changed in
-# their second block; the even names' did not. Keeping an even name sets the
-# times they share, and replacing an odd name takes a link from the file.
+# their second block; the even names' did not, but their times differ. The
+# receiver changes nothing in a file with other names, so each name is
+# replaced by a file of its own, built from the old one: a changed name is
+# sent only its second block, an unchanged one nothing.
 ssh source python3 - <<'PY_LINKED_SOURCE'
 import os
 root = '/tmp/syq-real-ssh/linked-source'
@@ -1173,7 +1175,7 @@ if sys.argv[3] != 'whole':
         if marker in line
     ]
     assert any(
-        (counts.get('compared_files'), counts.get('kept_files'), counts.get('patched_files')) == (8, 4, 4)
+        (counts.get('compared_files'), counts.get('kept_files'), counts.get('patched_files')) == (8, 0, 8)
         for counts in observed
     ), observed
 PY_LINKED_RESULTS
@@ -1182,7 +1184,6 @@ PY_LINKED_RESULTS
 import os, sys
 root = '/tmp/syq-real-ssh/linked-destination'
 inode = int(open('/tmp/syq-real-ssh/linked-inode').read())
-whole = sys.argv[1] == 'whole'
 block = 64 * 1024
 old = bytes(i % 251 for i in range(2 * block))
 new = old[:block] + bytes([7]) * block
@@ -1192,16 +1193,11 @@ for i in range(8):
     status = os.stat(path)
     with open(path, 'rb') as f:
         contents = f.read()
-    if i % 2 or whole:
-        # A replaced name names a new file of its own.
-        assert contents == (new if i % 2 else old) and status.st_ino != inode, (i, status)
-        assert status.st_ino not in replaced, (i, status)
-        replaced.add(status.st_ino)
-        assert int(status.st_mtime) == 1_600_000_000 + (i if i % 2 else 0), (i, status)
-    else:
-        # A kept name still names the file the other kept names share.
-        assert contents == old and status.st_ino == inode, (i, status)
-        assert int(status.st_mtime) == 1_600_000_000, (i, status)
+    # Each name names a new file of its own.
+    assert contents == (new if i % 2 else old) and status.st_ino != inode, (i, status)
+    assert status.st_ino not in replaced and status.st_nlink == 1, (i, status)
+    replaced.add(status.st_ino)
+    assert int(status.st_mtime) == 1_600_000_000 + (i if i % 2 else 0), (i, status)
 PY_LINKED_CHECK
 done
 
