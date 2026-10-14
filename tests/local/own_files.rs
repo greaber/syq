@@ -421,6 +421,9 @@ fn an_access_time_rerun_keeps_a_hard_link_group_that_was_only_read() {
         for name in ["dst/a", "dst/b"] {
             assert_eq!(inode(&t.path(name)), group, "{route} {name}");
         }
-        assert_eq!(atime(&t.path("dst/a")), 1_500_000_000, "{route}");
+        // The source's access time, which macOS updates when the first copy
+        // reads it.
+        assert_eq!(atime(&t.path("dst/a")), atime(&t.path("src/a")), "{route}");
+        assert_ne!(atime(&t.path("dst/a")), 1_650_000_000, "{route}");
     }
 }
