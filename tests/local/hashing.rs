@@ -1114,9 +1114,13 @@ fn hash_keeps_hard_linked_destinations_that_already_match() {
         write(&t.path("src/b"), &contents);
         write(&t.path("dst/a"), &contents);
         fs::hard_link(t.path("dst/a"), t.path("dst/b")).unwrap();
+        // Matching times leave no metadata to change: a file with another
+        // name would be replaced to change it
+        // (`hash_replaces_a_matching_empty_destination_with_another_name`).
+        for name in ["src/a", "src/b", "dst/a"] {
+            set_mtime(&t.path(name), 1_700_000_000);
+        }
         let inode = fs::metadata(t.path("dst/a")).unwrap().ino();
-        // Keeping the first name changes the shared inode's metadata before
-        // the second is decided.
         if native {
             run_native_ok(&[
                 "cp",
