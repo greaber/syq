@@ -357,7 +357,11 @@ fn ordinary_coordinator_results_are_relayed_with_this_machines_sequence() {
     ] {
         let (_, writer) = results_file();
         let mut relay = Relay::new(TOKEN, Some(writer), None, (false, false));
-        relay_output(line.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+        let mut human = Vec::new();
+        let input = [line.as_slice(), b"after\n"].concat();
+        relay_output(input.as_slice(), &mut human, &mut None, &mut relay).unwrap();
+        // Nothing of a marked line reaches human output.
+        assert_eq!(human, b"after\n");
         assert!(settle(relay, settlement(0)).is_err());
     }
 }

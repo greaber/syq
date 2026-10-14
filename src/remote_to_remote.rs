@@ -257,6 +257,8 @@ fn relay_output(
     let mut head: Vec<u8> = Vec::with_capacity(prefix_len);
     let mut decided = false;
     let mut capturing: Option<Vec<u8>> = None;
+    // The rest of an oversized marked line, which is dropped.
+    let mut discarding = false;
     let finish_line = |relay: &mut Relay, mut line: Vec<u8>| {
         while line
             .last()
@@ -294,7 +296,7 @@ fn relay_output(
                 }
             } else if let Some(line) = capturing.as_mut() {
                 line.extend_from_slice(segment);
-            } else {
+            } else if !discarding {
                 forward(segment, false);
             }
             if capturing
@@ -302,25 +304,25 @@ fn relay_output(
                 .is_some_and(|line| line.len() > MAX_RELAYED_LINE_BYTES)
             {
                 capturing = None;
+                discarding = true;
                 relay.failure.get_or_insert_with(|| {
                     anyhow::anyhow!("a relayed results line exceeds {MAX_RELAYED_LINE_BYTES} bytes")
                 });
-                // Discard the rest of the line.
-                decided = true;
             }
             if ends_line {
                 if let Some(line) = capturing.take() {
                     finish_line(relay, line);
-                } else {
+                } else if !discarding {
                     forward(&[], true);
                 }
                 decided = false;
+                discarding = false;
             }
         }
         reader.consume(consumed);
     }
     // Output that ended without a newline.
-    if !head.is_empty() {
+    if !head.is_empty() && !discarding {
         if relay.marked(&head) {
             capturing = Some(std::mem::take(&mut head));
         } else {
