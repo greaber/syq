@@ -1,4 +1,4 @@
-//! File checksums. Authority and receipt commitments use their fixed algorithms.
+//! File checksums. Authority commitments use their fixed algorithms.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};

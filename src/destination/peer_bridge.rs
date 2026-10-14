@@ -49,7 +49,6 @@ pub(crate) fn select(args: &Args) -> Result<Option<Selection>> {
     };
     if args.interface != Interface::NativeCp
         || args.restricted_grant.is_some()
-        || args.receiver_receipt.is_some()
         || args.coordinate_at == CoordinateAt::Local
         || !source.is_remote()
         || !destination.is_remote()
@@ -279,8 +278,8 @@ pub(crate) struct Prepared {
     pub(crate) coordinator: RemoteSpec,
     pub(crate) peer: NativeEndpoint,
     pub(crate) approved: Approved,
-    pub(crate) receipt_secret: Option<crate::receipt::RecipientSecret>,
-    pub(crate) receipt_policy: crate::receipt::ReceiptPolicy,
+    /// This copy's recipient key for the destination's results.
+    pub(crate) recipient_secret: Option<crate::destination_results::RecipientSecret>,
     secret: String,
     closed: Arc<AtomicBool>,
     stop_coordinator: Arc<AtomicBool>,
@@ -310,18 +309,11 @@ impl Selection {
         )?;
         let peer_spec =
             super::account_copy::approved_connection(args, destination, &domain, &self.peer)?;
-        let (secret, recipient_public_key) = crate::receipt::generate_recipient()?;
-        let policy = crate::receipt::ReceiptPolicy {
-            required: true,
-            hashed: args.receiver_receipt == Some(crate::cli::ReceiptDetail::Hashes),
-            max_records: crate::receipt::DEFAULT_MAX_RECORDS,
-            max_plaintext_bytes: crate::receipt::DEFAULT_MAX_PLAINTEXT_BYTES,
-            delivery: crate::receipt::ReceiptDelivery::AttachedEncrypted {
-                suite: crate::receipt::HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
-                recipient_public_key,
-            },
-        };
-        let request = crate::restricted::named_request(args, policy.clone())?;
+        let (secret, recipient_public_key) = crate::destination_results::generate_recipient()?;
+        let request = crate::restricted::named_request(
+            args,
+            crate::destination_results::ReceiptPolicy::for_recipient(recipient_public_key),
+        )?;
         let (child, approved) =
             forward::peer_receiver(&peer_spec, request, Instant::now() + SETUP)?;
         let child = Arc::new(Mutex::new(Some(child)));
@@ -434,8 +426,7 @@ impl Selection {
             selection: self,
             coordinator,
             approved,
-            receipt_secret: Some(secret),
-            receipt_policy: policy,
+            recipient_secret: Some(secret),
             secret: secret_token,
             closed,
             stop_coordinator,

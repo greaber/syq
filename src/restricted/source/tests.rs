@@ -373,7 +373,8 @@ fn approved_sources_never_admit_mutation_or_pathname_authority() {
             congestion_control: None,
             send_rate: None,
         },
-        Request::Receipt,
+        Request::DestinationResults { records: true },
+        Request::FinishDestinationResults,
     ];
     for request in requests {
         assert!(fixture.control.authorize(&request).is_err(), "{request:?}");

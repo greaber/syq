@@ -700,6 +700,12 @@ fn spawn_observed_reader(
                     .read_budgeted_with_start::<Response>()
                     .map(ReceivedResponse::from_frame);
                 if let Ok(message) = &msg {
+                    // A restricted receiver's results are for the syq that
+                    // started this coordinator, not for any request here.
+                    if let Response::DestinationResults(frame) = &message.value {
+                        crate::destination_results::relay::forward(frame);
+                        continue;
+                    }
                     if let Response::TransportStats(stats) = &message.value {
                         if let Some(value) = &stats.observation {
                             let mut value = value.clone();

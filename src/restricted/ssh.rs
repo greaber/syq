@@ -307,7 +307,9 @@ mod tests {
             Response::Err(_)
         ));
         assert!(!root.path().join("outside").exists());
-        second_writer.write_msg(&Request::Receipt).unwrap();
+        second_writer
+            .write_msg(&Request::FinishDestinationResults)
+            .unwrap();
         assert!(matches!(
             second_reader.read_msg::<Response>().unwrap(),
             Response::Err(_)

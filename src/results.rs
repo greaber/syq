@@ -15,10 +15,10 @@
 //! aggregated in the terminal record only, and metadata-only copy updates are
 //! not reported per operation (dry runs do trace them as `metadata_differs`).
 //!
-//! Attached direct copies through a command-restricted receiver are the one
-//! exception: receipt emits their stream locally after verification, marks
-//! its provenance, omits source-side claims hostB cannot authenticate, and
-//! includes closure-time final-state records.
+//! A copy between two servers writes the remote coordinator's records on
+//! the invoking machine (`remote_to_remote`). Through a command-restricted
+//! receiver, the operation records for its changes come from the receiver
+//! itself (`destination_results`).
 
 use crate::cli::{Args, Interface};
 use crate::proto::OperatorSymlinkPolicy;
@@ -35,6 +35,9 @@ pub const SCHEMA_VERSION: u64 = 4;
 
 pub struct ResultsWriter {
     schema_version: u64,
+    /// A restricted destination reports the changes it settled itself, so
+    /// this coordinator leaves those operation records to it.
+    destination_reports: bool,
     parent: Option<Arc<ResultsWriter>>,
     phase_result: Mutex<Option<serde_json::Value>>,
     mapping_metadata: std::sync::OnceLock<
@@ -184,11 +187,18 @@ pub fn start(args: &Args, mode: RunMode) -> Result<Option<Arc<ResultsWriter>>> {
     if let Some(writer) = &args.results_override {
         return Ok(Some(writer.clone()));
     }
-    let requested = args.native_results.is_some() || args.native_results_fd.is_some();
+    let requested =
+        args.native_results.is_some() || args.native_results_fd.is_some() || args.relay_results;
     if !requested {
         return Ok(None);
     }
-    let out: Box<dyn std::io::Write + Send> = if let Some(fd) = args.native_results_fd {
+    let out: Box<dyn std::io::Write + Send> = if args.relay_results {
+        Box::new(crate::destination_results::relay::CoordinatorLines::new(
+            args.results_token
+                .as_deref()
+                .context("relayed results need their internal token")?,
+        ))
+    } else if let Some(fd) = args.native_results_fd {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags == -1 {
             bail!(
@@ -236,6 +246,8 @@ pub fn start(args: &Args, mode: RunMode) -> Result<Option<Arc<ResultsWriter>>> {
     if args.stream_mapping_fd.is_some() {
         writer.schema_version = 5;
     }
+    writer.destination_reports =
+        args.relay_results && crate::destination::reports_results(&args.restricted_grant);
     let writer = Arc::new(writer);
     let run_id = {
         let mut bytes = [0u8; 16];
@@ -330,6 +342,7 @@ impl ResultsWriter {
     pub fn new(out: Box<dyn Write + Send>) -> Self {
         ResultsWriter {
             schema_version: SCHEMA_VERSION,
+            destination_reports: false,
             parent: None,
             phase_result: Mutex::new(None),
             mapping_metadata: Default::default(),
@@ -572,6 +585,9 @@ impl ResultsWriter {
         op: &OperationRecord,
         expected: Option<&crate::hashing::Digest>,
     ) {
+        if self.destination_reports && matches!(op.disposition, "succeeded" | "failed") {
+            return;
+        }
         let mut record = serde_json::json!({
             "type": "operation_result",
             "action": op.action,
@@ -675,6 +691,10 @@ impl ResultsWriter {
         );
     }
 
+    pub(crate) fn schema_version(&self) -> u64 {
+        self.schema_version
+    }
+
     pub fn is_dead(&self) -> bool {
         self.dead.load(Relaxed)
     }
@@ -683,8 +703,9 @@ impl ResultsWriter {
         self.write_and_seal(record, false);
     }
 
-    /// Emit a caller-built record (receipt-attested emission); the envelope
-    /// and sequencing are applied like any other record.
+    /// Emit a caller-built record (relayed from a remote coordinator or a
+    /// restricted destination); the envelope and sequencing are applied like
+    /// any other record.
     pub(crate) fn emit_value(&self, record: serde_json::Value) {
         self.write_and_seal(record, false);
     }

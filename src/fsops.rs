@@ -2610,7 +2610,8 @@ impl FsOps {
             | Request::DestinationFilesystemInfo { .. }
             | Request::TransportStats
             | Request::ReceiverUser
-            | Request::Receipt
+            | Request::DestinationResults { .. }
+            | Request::FinishDestinationResults
             | Request::Shutdown
             | Request::PrepareSmallFiles(_)
             | Request::CopySmallFiles(_)

@@ -65,7 +65,7 @@ def copy(arguments, *, allow=True, disconnect=True, interrupt=False, ok=None, re
             raise AssertionError(f'approval unavailable; worker exit {process.poll()}: '+''.join(errors)) from error
         assert len(pending) == 1 and pending[0]['kind'] == 'storage', pending
         description = pending[0]['description']
-        assert '604800 seconds' in description and 'receiver receipts do not apply' in description, description
+        assert '604800 seconds' in description and 'aggregate limits do not apply' in description, description
         run('syq', 'persist', 'receive', 'approve' if allow else 'deny', pending[0]['id'])
         if allow and disconnect:
             # Data progress proves preparation has finished without parsing a

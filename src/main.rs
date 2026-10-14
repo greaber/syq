@@ -18,6 +18,7 @@ mod deletion;
 mod descriptor_broker;
 mod descriptor_copy;
 mod destination;
+mod destination_results;
 pub mod enrollment;
 mod expression;
 #[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
@@ -42,7 +43,6 @@ mod progress;
 mod proto;
 #[cfg(target_os = "linux")]
 mod read_ahead;
-mod receipt;
 mod receive_approval;
 mod receive_service;
 mod remote_helper;

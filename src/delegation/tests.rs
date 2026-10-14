@@ -905,13 +905,14 @@ fn in_process_enrollment_key_signature_is_accepted_by_openssh() {
 
     // The grant binds the complete receipt delivery policy, including the
     // per-transfer HPKE recipient key, into the signed grant transcript.
-    let expected_receipt_policy = crate::receipt::ReceiptPolicy {
+    let expected_receipt_policy = crate::destination_results::ReceiptPolicy {
         required: true,
         hashed: true,
         max_records: 32,
         max_plaintext_bytes: 64 * 1024,
-        delivery: crate::receipt::ReceiptDelivery::AttachedEncrypted {
-            suite: crate::receipt::HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
+        delivery: crate::destination_results::ReceiptDelivery::AttachedEncrypted {
+            suite:
+                crate::destination_results::HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
             recipient_public_key: [4; 32],
         },
     };

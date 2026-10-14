@@ -176,11 +176,7 @@ fn receiver_is_one_subcommand_with_its_verbs_beneath_it() {
 fn native_receiver_ceilings_apply_only_to_direct_remote_copies() {
     let t = Tmp::new();
     write(&t.path("src/file"), b"data");
-    for option in [
-        "--receiver-max-entries=5",
-        "--receiver-max-bytes=1M",
-        "--receiver-receipt=sizes",
-    ] {
+    for option in ["--receiver-max-entries=5", "--receiver-max-bytes=1M"] {
         let out = Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([
                 "cp",
@@ -201,6 +197,19 @@ fn native_receiver_ceilings_apply_only_to_direct_remote_copies() {
         );
         assert!(!t.path("dst").exists(), "{option} copied anyway");
     }
+    // Receipts are gone; their option with them.
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--receiver-receipt=sizes", "--srcs-in"])
+        .arg(t.path("src"))
+        .args(["--into", &t.s("dst")])
+        .run()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unexpected argument '--receiver-receipt"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

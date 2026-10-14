@@ -659,7 +659,7 @@ impl Sched {
 
     /// File jobs and queues are index-addressed while workers are active. Once
     /// every worker and the tuner have joined, release their retained capacity
-    /// before deletion, deferred metadata, and receipt settlement continue.
+    /// before deletion, deferred metadata, and the destination's results continue.
     pub fn clear_finished_work(&self) {
         self.jobs.lock().unwrap().release();
         let mut inner = self.inner.lock().unwrap();
