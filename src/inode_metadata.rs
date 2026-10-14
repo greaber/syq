@@ -694,7 +694,19 @@ pub(crate) fn would_change_besides_atime(
     if platform::would_change(file, metadata, mode)? {
         return Ok(true);
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = mode;
+        if metadata.acls.is_some() {
+            return Ok(true);
+        }
+        if let Some(attributes) = &metadata.xattrs {
+            if macos_xattrs::would_change(file, attributes)? {
+                return Ok(true);
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = mode;
         if metadata.acls.is_some() || metadata.xattrs.is_some() {

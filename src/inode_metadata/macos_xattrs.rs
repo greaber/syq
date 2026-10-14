@@ -147,7 +147,11 @@ pub(super) fn capture(file: &File) -> Result<ExtendedAttributes> {
         values,
     })
 }
-pub(super) fn apply(file: &File, attributes: &ExtendedAttributes) -> Result<()> {
+/// The attributes `apply` would set (`Some`) or remove (`None`) on `file`.
+fn changes<'a>(
+    file: &File,
+    attributes: &'a ExtendedAttributes,
+) -> Result<Vec<(Vec<u8>, Option<&'a [u8]>)>> {
     let is_compressed = compressed(file)?;
     let mut previous: Option<&[u8]> = None;
     let mut values = Vec::with_capacity(attributes.values.len());
@@ -181,6 +185,16 @@ pub(super) fn apply(file: &File, attributes: &ExtendedAttributes) -> Result<()> 
             changes.push((name.to_vec(), Some(value)));
         }
     }
+    Ok(changes)
+}
+
+/// Whether `apply` would change any of `file`'s attributes.
+pub(super) fn would_change(file: &File, attributes: &ExtendedAttributes) -> Result<bool> {
+    Ok(!changes(file, attributes)?.is_empty())
+}
+
+pub(super) fn apply(file: &File, attributes: &ExtendedAttributes) -> Result<()> {
+    let changes = changes(file, attributes)?;
     if changes.is_empty() {
         return Ok(());
     }
