@@ -3073,6 +3073,62 @@ fn older_observation_does_not_release_newer_real_reservation() {
 }
 
 #[test]
+fn results_count_directories_as_an_ordinary_copy_does() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    for (placement, root_counted) in [
+        (DestinationPlacement::DirectoryContents, false),
+        (DestinationPlacement::ExactPath, true),
+    ] {
+        let _ = fs::remove_dir_all(root.join("target"));
+        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let (secret, policy) = results_policy();
+        let authority = test_authority_with_results(
+            &root,
+            DeletionPolicy::Forbid,
+            1024,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            ExistingDestinationPolicy::Replace,
+            placement,
+            RootExistence::Any,
+            Some((key, policy)),
+        )
+        .unwrap();
+        let mut reader = start_results(&authority, secret);
+        for path in [root.join("target"), root.join("target/sub")] {
+            let mut mkdir = apply(Op::Mkdir {
+                path: path_bytes(&path),
+                mode: 0o755,
+                condition: proto::TargetCondition::Any,
+            });
+            let settlement = authority.authorize(&mut mkdir, false).unwrap();
+            fs::create_dir(&path).unwrap();
+            authority.settle(settlement, &proto::Response::Applied(vec![None]));
+        }
+        let results = finish_results(&authority, &mut reader);
+        // The directory a copy goes into is neither counted nor listed; a
+        // copied directory at an exact path is counted.
+        assert_eq!(
+            results.totals.directories_created,
+            1 + u64::from(root_counted),
+            "{placement:?}"
+        );
+        assert_eq!(
+            results.changes(),
+            [(
+                "create_directory".to_owned(),
+                b"sub".to_vec(),
+                "succeeded".to_owned()
+            )],
+            "{placement:?}"
+        );
+    }
+}
+
+#[test]
 fn results_list_each_settled_change_in_ordinary_form() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");

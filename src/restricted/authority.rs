@@ -867,20 +867,20 @@ impl RestrictedAuthority {
     }
 
     /// Add one settled change to the results, if they have started.
-    pub(super) fn record_change(
-        &self,
-        path: &[u8],
-        change: crate::destination_results::Change,
-        error: Option<&str>,
-    ) {
+    pub(super) fn record_change(&self, path: &[u8], change: Change, error: Option<&str>) {
         if !self.results_started.load(Ordering::Acquire) {
             return;
         }
-        let directory = matches!(
-            change,
-            crate::destination_results::Change::EnsureDirectory
-                | crate::destination_results::Change::DeleteDirectory
-        );
+        // As an ordinary copy counts them, the directory a copy goes into is
+        // not one of the directories it created.
+        if change == Change::EnsureDirectory
+            && error.is_none()
+            && path == self.destination
+            && self.copy.policy.placement != DestinationPlacement::ExactPath
+        {
+            return;
+        }
+        let directory = matches!(change, Change::EnsureDirectory | Change::DeleteDirectory);
         let dst = self.result_path(path, directory);
         if let Some(stream) = self.results.lock().unwrap().as_mut() {
             stream.record(change, dst.as_deref(), error);
