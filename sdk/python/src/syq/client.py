@@ -654,7 +654,6 @@ def _copy_arguments(
     performance_tuning: str | None,
     receiver_max_entries: int | None,
     receiver_max_bytes: str | int | None,
-    receiver_receipt: str | None,
     ignore: IgnoreSelector | None,
     ignore_from: Selector | None,
     copy_metadata: str | Iterable[str] | None,
@@ -771,11 +770,6 @@ def _copy_arguments(
     if receiver_max_entries is not None:
         argv.extend(("--receiver-max-entries", str(receiver_max_entries)))
     _append_text(argv, "--receiver-max-bytes", receiver_max_bytes)
-    if receiver_receipt is not None:
-        receipt_value = _text_arg(receiver_receipt, label="receiver_receipt")
-        if receipt_value not in {"sizes", "hashes"}:
-            raise SyqInvocationError("--receiver-receipt must be sizes or hashes")
-        argv.extend(("--receiver-receipt", receipt_value))
     ignore_start = len(argv)
     if ignore is not None:
         rules = (ignore,) if isinstance(ignore, (str, IgnoreFrom)) else tuple(ignore)
@@ -1299,7 +1293,6 @@ class Client:
         peer_auth: str | None = None,
         receiver_max_entries: int | None = None,
         receiver_max_bytes: str | int | None = None,
-        receiver_receipt: str | None = None,
         ignore: IgnoreSelector | None = None,
         ignore_from: Selector | None = None,
         copy_metadata: str | Iterable[str] | None = None,
@@ -1368,7 +1361,6 @@ class Client:
             transfer_strategy=transfer_strategy,
             receiver_max_entries=receiver_max_entries,
             receiver_max_bytes=receiver_max_bytes,
-            receiver_receipt=receiver_receipt,
             ignore=ignore,
             ignore_from=ignore_from,
             copy_metadata=copy_metadata,
@@ -1595,7 +1587,6 @@ class Client:
             performance_tuning=None,
             receiver_max_entries=None,
             receiver_max_bytes=None,
-            receiver_receipt=None,
             ignore=None,
             ignore_from=None,
             copy_metadata=None,

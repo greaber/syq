@@ -32,13 +32,12 @@ Use a descriptor for pipes or other non-regular sinks. Named results paths
 follow the normal native symlink rules; `--follow` permits traversal.
 Human stdout and stderr are not part of this contract.
 
-Results are written on the invoking machine, including for remote removal.
-For direct restricted remote-to-remote copies, they are derived from the
-verified destination receipt and marked `provenance: "receiver_attested"`.
-Those records arrive after receipt verification. Otherwise remote-to-remote
-results require `--coordinate-at local`, which relays data through your
-machine. Remote-to-remote `--dry-run --results`
-also requires that local route.
+Results are written on the invoking machine, including for remote removal
+and for copies between two servers. When one of the servers coordinates the
+copy, its records come back over your SSH connection as it works. Through a
+command-restricted receiver, the records of what changed on the destination
+come from the receiver itself; see
+[Results from the destination](remote-reference.md#results-from-the-destination).
 
 `--results` supports native `cp` (including pruning), `rm`, and `clean-partials`.
 Cleanup uses the removal records described below. Results cannot combine with
@@ -150,20 +149,19 @@ An outcome for a completed copy change or a failed mapping entry.
 
 | Field | Meaning |
 |---|---|
-| `action` | `transfer_file`, `create_directory`, `create_symlink`, `create_special`, or `delete`; attested streams also use `set_metadata` and `observe_hash` |
+| `action` | `transfer_file`, `create_directory`, `create_symlink`, `create_special`, or `delete` |
 | `dst` | Path relative to the destination container |
 | `src` | Mapping source path, where available; absent for ordinary copies and deletions |
 | `kind` | `file`, `dir`, `symlink`, or `special`, when known |
-| `disposition` | `succeeded`, `failed`, `blocked`; attested streams also use `incomplete` and `observed` |
+| `disposition` | `succeeded`, `failed`, or `blocked` |
 | `bytes`, `attempts` | Optional transfer information |
 | `expected_hash` | Expected whole-file digest, when supplied: an object with `algorithm` and hexadecimal `value`; preserve it in retry mappings |
 | `metadata` | Explicit destination attributes from the mapping, when supplied; preserve them in retry mappings |
 | `retryable` | On failures: `yes`, `no`, or `unknown` |
 | `class`, `os_kind`, `message` | Error details where available |
-| `provenance`, `scope`, `code` | Attested origin, signed destination-scope index, and receiver outcome code |
 
-In attested records, `dst` is relative to the destination area identified by
-`scope`. An attested `set_metadata` omits `kind`.
+A command-restricted receiver's own records have no `src`, `attempts`, or
+`retryable`; a file it did not finish is `failed`.
 
 Unchanged and excluded entries have totals only. Ordinary live streams do not
 emit per-operation records for metadata-only updates, though dry runs emit
@@ -243,21 +241,8 @@ provided where known. Classes are `io`, `transport`, `conflict`, `integrity`,
 OS kinds are `not_found`, `permission_denied`, `already_exists`,
 `invalid_input`, `no_space`, `quota_exceeded`, `read_only`, and `other`.
 They preserve OS error meaning across hosts without requiring matching errno
-numbers. Receiver refusals use `class: "safety_limit"` with provenance and
-the receiver's `code`.
-
-### `final_state`
-
-Attested streams only: the destination's final observation of a path the
-transfer could have changed. Includes `scope`, `dst`, and an `object`:
-absent, an observation failure, or present with kind, size, applicable
-metadata, and symlink target. With `--receiver-receipt hashes`, regular
-files also have a BLAKE3 hash.
-
-Object kinds distinguish directories, files, symlinks, FIFOs, sockets,
-character/block devices, and other objects. Metadata fields are `mode`, `uid`,
-`gid`, `mtime`, `mtime_nsec`, and `rdev`. Consult the schema for exact shapes.
-This observes destination state; it does not attest source completeness.
+numbers. A command-restricted receiver's refusals use
+`class: "safety_limit"`.
 
 ### `result`
 
@@ -273,7 +258,7 @@ carry the same object, with measurements advancing while that work runs:
 | `setup_ms` | Preparing endpoints, establishing control and worker connections (including connections added during copying), and choosing the data transport; excludes helper installation |
 | `planning_ms` | Discovering source entries, inspecting destinations, deciding what to copy, and preparing the work, including directories created during planning |
 | `transfer_ms` | From the first selected file operation to the last completed file operation, including reads, hashing, writes, per-file metadata, waits, and retries |
-| `finalization_ms` | Work after file workers finish: remaining hardlinks, pruning, directory metadata, and receipts |
+| `finalization_ms` | Work after file workers finish: remaining hardlinks, pruning, and directory metadata |
 | `helper_install_ms` | Installing matching helpers and remote syq commands, including the installation's platform probe |
 
 Setup and planning count the time spent in those activities, counting concurrent
@@ -284,14 +269,12 @@ copying can begin while planning continues. Installation on two hosts also count
 once where it overlaps.
 
 Filesystem copy coordinators report all six fields, including zero for work that
-was not needed or took less than a millisecond. S3 copies also report `transfer_ms` once file work starts. Other engines,
-removal, and receiver-attested results report `total_ms` and omit unavailable
-measurements. Total starts with the executing
-coordinator's run clock, before SSH authorization selection for a filesystem copy,
-and continues across a local helper handoff;
+was not needed or took less than a millisecond. S3 copies also report `transfer_ms` once file work starts. Other engines
+and removal report `total_ms` and omit unavailable measurements. Total starts
+with the executing coordinator's run clock, before SSH authorization selection
+for a filesystem copy, and continues across a local helper handoff;
 it is not the entire process lifetime. Use an external timer to include process
-startup, input handling, and shutdown. For an attached receiver-attested result,
-total covers the invoking machine's coordination and settlement instead.
+startup, input handling, and shutdown.
 
 The filesystem progress bar and summary use `transfer_ms` for elapsed time.
 While copying, progress estimates the recent transfer rate; once file work
@@ -305,19 +288,14 @@ symlinks and specials, transferred/unchanged bytes, and on pruning runs
 failure reports what finished before it stopped. Dry-run totals describe
 planned work, not committed changes.
 
-For results without destination attestations, `files_excluded` includes
-ignore-rule skips on filesystem and S3 routes, in both live copies and dry runs.
+`files_excluded` includes ignore-rule skips on filesystem and S3 routes, in
+both live copies and dry runs.
 An ignored directory counts once; its unscanned descendants are not counted.
 
-Attested terminals add `receipt_status` (`clean`, `failed`, or `incomplete`),
-provenance, and receipt counts. They can attest only what the receiver saw:
-
-- Unchanged and excluded totals are zero, not a claim that every source entry
-  changed.
-- Only `deletions_completed` appears; planned and blocked deletion totals are
-  omitted.
-- `errors` counts attested error records for failed/incomplete operations,
-  refusals, and failed or partial final-state observations.
+Through a command-restricted receiver, the totals of what changed (files and
+bytes transferred, directories, symlinks and specials created, and deletions
+completed) come from the receiver. The other totals and `timings` come from
+the coordinating server, and `errors` counts the error records in the stream.
 
 Removal terminals have `mode: "rm"` and totals for selectors, resolved and
 missing selectors, planned/removed/already-absent entries, and failed entries.
@@ -451,7 +429,6 @@ creation without a source path. It does not guarantee that retrying will
 succeed; fix the underlying error first. Unchanged and excluded files appear
 only in summary totals, not as individual results.
 
-For command-restricted copies between servers, `--results` contains verified
-receiver receipts; see [Signed results](remote-reference.md#signed-results). These describe
-destination changes rather than source entry failures; retry the original
-mapping instead of applying the `operation_result` filter above.
+For command-restricted copies between servers, the operation records come from
+the receiver and carry no source paths; retry the original mapping instead of
+applying the `operation_result` filter above.

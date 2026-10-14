@@ -260,7 +260,6 @@ fn settlement(coordinator_exit_code: i32) -> Settlement<'static> {
         src_host: "source",
         dst_host: "destination",
         coordinator_exit_code,
-        dry_run: false,
         elapsed_ms: 1,
         verbose: false,
         quiet: true,
@@ -290,7 +289,7 @@ fn coordinator_terminal() -> serde_json::Value {
 fn ordinary_coordinator_results_are_relayed_with_this_machines_sequence() {
     let (file, writer) = results_file();
     writer.emit_value(serde_json::json!({"type": "run", "run_id": "local"}));
-    let mut relay = Relay::new(TOKEN, Some(writer), None);
+    let mut relay = Relay::new(TOKEN, Some(writer), None, (false, false));
     let mut input = b"syq: transferred 1 files\xff\r\n".to_vec();
     input.extend(coordinator_line(
         serde_json::json!({"type": "run", "run_id": "remote"}),
@@ -332,7 +331,7 @@ fn ordinary_coordinator_results_are_relayed_with_this_machines_sequence() {
 
     // A coordinator that ends without its final result fails the stream.
     let (file, writer) = results_file();
-    let relay = Relay::new(TOKEN, Some(writer), None);
+    let relay = Relay::new(TOKEN, Some(writer), None, (false, false));
     assert!(settle(relay, settlement(0)).is_err());
     let records = read_records(file);
     assert_eq!(records.last().unwrap()["status"], "failed");
@@ -357,7 +356,7 @@ fn ordinary_coordinator_results_are_relayed_with_this_machines_sequence() {
         },
     ] {
         let (_, writer) = results_file();
-        let mut relay = Relay::new(TOKEN, Some(writer), None);
+        let mut relay = Relay::new(TOKEN, Some(writer), None, (false, false));
         relay_output(line.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
         assert!(settle(relay, settlement(0)).is_err());
     }
@@ -447,7 +446,7 @@ fn destination_results_supply_its_changes_whatever_the_human_output_does() {
     for flush_only in [false, true] {
         let (mut stream, expectation) = destination(true);
         let (file, writer) = results_file();
-        let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation));
+        let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
         let mut input = b"human line\n".to_vec();
         // The coordinator's own record of a destination change gives way to
         // the destination's; its error records and totals remain.
@@ -501,7 +500,7 @@ fn destination_refusals_and_failures_decide_the_outcome() {
     // success, and is reported.
     let (mut stream, expectation) = destination(true);
     let (file, writer) = results_file();
-    let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation));
+    let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
     let mut input = destination_lines(&mut stream, 2);
     input.extend(coordinator_line(coordinator_terminal(), 0));
     relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
@@ -520,12 +519,12 @@ fn destination_refusals_and_failures_decide_the_outcome() {
     // Without --results the destination sends only its totals; a refusal
     // still fails the copy.
     let (mut stream, expectation) = destination(false);
-    let mut relay = Relay::new(TOKEN, None, Some(expectation));
+    let mut relay = Relay::new(TOKEN, None, Some(expectation), (false, false));
     let input = destination_lines(&mut stream, 1);
     relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
     assert!(settle(relay, settlement(0)).is_err());
     let (mut stream, expectation) = destination(false);
-    let mut relay = Relay::new(TOKEN, None, Some(expectation));
+    let mut relay = Relay::new(TOKEN, None, Some(expectation), (false, false));
     let input = destination_lines(&mut stream, 0);
     relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
     assert_eq!(settle(relay, settlement(0)).unwrap(), 0);
@@ -538,7 +537,7 @@ fn cut_or_altered_destination_results_fail_the_copy() {
     for spoil in 0..4 {
         let (mut stream, expectation) = destination(true);
         let (file, writer) = results_file();
-        let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation));
+        let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
         let lines = destination_lines(&mut stream, 0);
         let mut lines: Vec<Vec<u8>> = lines
             .split_inclusive(|byte| *byte == b'\n')

@@ -76,8 +76,7 @@ class ErrorAndTimeoutTests(unittest.TestCase):
         self.assertNotIsInstance(caught.exception, syq.SyqError)
 
     def test_grouped_metadata_keeps_saved_wire_records_unchanged(self):
-        client = syq.Client(executable=self.executable,
-                            env={**os.environ, "SYQ_FAKE_SHAPE": "attested"})
+        client = syq.Client(executable=self.executable)
         events = []
         output = io.BytesIO()
         result = client.cp("source", into="destination", results=output,
@@ -89,18 +88,9 @@ class ErrorAndTimeoutTests(unittest.TestCase):
                              {key: record[key] for key in ("schema", "schema_version", "seq", "type")})
             self.assertNotIn("protocol", record)
             self.assertFalse(hasattr(event, "seq"))
-        self.assertIs(result.receipt.status, syq.ReceiptStatus.CLEAN)
-        self.assertEqual(result.receipt.records, records[-1]["receipt_records"])
-        self.assertEqual(result.receipt.provenance, records[-1]["provenance"])
-        self.assertFalse(hasattr(result, "receipt_status"))
+        self.assertFalse(hasattr(result, "receipt"))
         with self.assertRaises(dataclasses.FrozenInstanceError):
             result.protocol.seq = 0
-        with self.assertRaises(dataclasses.FrozenInstanceError):
-            result.receipt.records = 0
-        final = next(event for event in events if isinstance(event, syq.FinalStateEvent))
-        # Filesystem metadata and protocol metadata remain distinct.
-        self.assertIsInstance(final.protocol, syq.ProtocolMetadata)
-        self.assertTrue(final.metadata is None or isinstance(final.metadata, syq.ObjectMetadata))
 
 
 class AsyncTimeoutTests(unittest.IsolatedAsyncioTestCase):

@@ -87,8 +87,7 @@ Interrupting the request, stopping or changing receiving, or losing the
 connection forcibly stops the command's process group. Cleanup handlers do not
 run. Remaining children in that group are also stopped when the foreground
 program exits. Detached processes and applications launched through macOS
-`open` can survive this cleanup. Commands do not emit copy receipts or copy
-automation records.
+`open` can survive this cleanup. Commands do not emit copy automation records.
 
 ## Execution details
 

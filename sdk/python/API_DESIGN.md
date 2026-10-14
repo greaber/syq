@@ -58,24 +58,19 @@ to no timeout.
 
 Every automation event and terminal result has a frozen `protocol` object with
 `schema`, `schema_version`, `seq`, and `type`. The uniform name allows a callback
-to inspect the envelope without special-casing terminal results. It also avoids
-colliding with the filesystem `metadata` on `FinalStateEvent`.
+to inspect the envelope without special-casing terminal results.
 
-Copy results have `receipt: ReceiptSummary | None`, containing `status`,
-`operations`, `final_states`, `records`, and `provenance`. Ordinary counts and
-operation status remain directly on the result. Receiver receipts continue to
-have distinct observable totals; grouping fields does not infer source-side
-information a receipt cannot attest.
+Copy results through a command-restricted receiver are ordinary `CpResult`
+values: the receiver's own records arrive as ordinary `OperationResult` events.
 
-Migration: use `event.protocol.seq` instead of `event.seq`, and
-`result.receipt.status` instead of `result.receipt_status`, checking for `None`.
-No aliases retain the old flattened fields in this pre-adoption revision.
+Migration: use `event.protocol.seq` instead of `event.seq`. No aliases retain
+the old flattened fields in this pre-adoption revision.
 
 ## Compatibility boundaries
 
 Only Python call semantics and Python object shapes change. The native CLI,
 helper pinning and wire protocol, mapping NDJSON, automation NDJSON, enrollment,
-signed grants and redemption records, receiver receipts, replay protection,
+signed grants and redemption records, replay protection,
 resume identities, caches, release manifests, package pin, and documentation
 URLs remain unchanged. Python objects are process-local and have no promised
 pickle/storage format.

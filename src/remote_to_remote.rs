@@ -76,6 +76,9 @@ struct Relay {
     /// operation records for its changes.
     destination: Option<crate::destination_results::Reader>,
     coordinator_terminal: Option<serde_json::Value>,
+    /// The run's shape, for a final result this machine writes itself.
+    dry_run: bool,
+    prune: bool,
     /// Error records written to the results so far.
     errors: u64,
     /// The first problem with what arrived; later lines are drained unread.
@@ -87,6 +90,7 @@ impl Relay {
         token: &str,
         results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
         destination: Option<crate::destination_results::Expectation>,
+        (dry_run, prune): (bool, bool),
     ) -> Self {
         Self {
             coordinator_prefix: crate::destination_results::relay::coordinator_prefix(token)
@@ -96,6 +100,8 @@ impl Relay {
             results,
             destination: destination.map(crate::destination_results::Reader::new),
             coordinator_terminal: None,
+            dry_run,
+            prune,
             errors: 0,
             failure: None,
         }
@@ -333,7 +339,6 @@ struct Settlement<'a> {
     src_host: &'a str,
     dst_host: &'a str,
     coordinator_exit_code: i32,
-    dry_run: bool,
     elapsed_ms: u64,
     verbose: bool,
     quiet: bool,
@@ -347,7 +352,6 @@ fn settle(mut relay: Relay, settlement: Settlement<'_>) -> Result<i32> {
         src_host,
         dst_host,
         coordinator_exit_code,
-        dry_run,
         elapsed_ms,
         verbose,
         quiet,
@@ -355,7 +359,7 @@ fn settle(mut relay: Relay, settlement: Settlement<'_>) -> Result<i32> {
     if let Some(error) = relay.failure.take() {
         let message = format!("the results relayed by {src_host} are unusable: {error:#}");
         relay.error(&message, "integrity");
-        fail_results(&relay, dry_run, elapsed_ms);
+        fail_results(&relay, elapsed_ms);
         bail!(message);
     }
     let Some(reader) = relay.destination.as_mut() else {
@@ -368,7 +372,7 @@ fn settle(mut relay: Relay, settlement: Settlement<'_>) -> Result<i32> {
                         &format!("the coordinating server on {src_host} sent no final result"),
                         "io",
                     );
-                    fail_results(&relay, dry_run, elapsed_ms);
+                    fail_results(&relay, elapsed_ms);
                     bail!("the coordinating server on {src_host} ended without its results");
                 }
             }
@@ -382,7 +386,7 @@ fn settle(mut relay: Relay, settlement: Settlement<'_>) -> Result<i32> {
                 "the results of the command-restricted receiver on {dst_host}, relayed by {src_host}, could not be verified: {error:#}; what landed is unknown"
             );
             relay.error(&message, "integrity");
-            fail_results(&relay, dry_run, elapsed_ms);
+            fail_results(&relay, elapsed_ms);
             bail!(message);
         }
     };
@@ -415,10 +419,10 @@ fn settle(mut relay: Relay, settlement: Settlement<'_>) -> Result<i32> {
             };
             relay.error(message, class);
         }
-        let terminal = compose_terminal(&relay, &totals, outcome, dry_run, elapsed_ms);
+        let terminal = compose_terminal(&relay, &totals, outcome, elapsed_ms);
         // The coordinator's summary was suppressed: render it from the same
         // final result the machine reads, so the two cannot disagree.
-        if !quiet && !dry_run {
+        if !quiet && !relay.dry_run {
             print_summary(&terminal);
         }
         relay
@@ -461,19 +465,12 @@ fn compose_terminal(
     relay: &Relay,
     totals: &crate::destination_results::Totals,
     outcome: SettlementOutcome,
-    dry_run: bool,
     elapsed_ms: u64,
 ) -> serde_json::Value {
-    let mut terminal = relay.coordinator_terminal.clone().unwrap_or_else(|| {
-        serde_json::json!({
-            "type": "result",
-            "dry_run": dry_run,
-            "files_unchanged": 0,
-            "files_excluded": 0,
-            "bytes_unchanged": 0,
-            "timings": {"total_ms": elapsed_ms},
-        })
-    });
+    let mut terminal = relay
+        .coordinator_terminal
+        .clone()
+        .unwrap_or_else(|| empty_terminal(relay, elapsed_ms));
     let object = terminal
         .as_object_mut()
         .expect("a final result is an object");
@@ -481,7 +478,7 @@ fn compose_terminal(
     object.insert("exit_code".into(), outcome.exit_code.into());
     object.insert("errors".into(), relay.errors.into());
     // A dry run changes nothing: its plan is the coordinator's.
-    if !dry_run {
+    if !relay.dry_run {
         for (key, value) in [
             ("files_transferred", totals.files_transferred),
             ("bytes_transferred", totals.bytes_transferred),
@@ -541,26 +538,45 @@ fn print_summary(terminal: &serde_json::Value) {
     );
 }
 
+/// A final result with every count zero, for a run without the
+/// coordinator's own.
+fn empty_terminal(relay: &Relay, elapsed_ms: u64) -> serde_json::Value {
+    let mut terminal = serde_json::json!({
+        "type": "result",
+        "status": "failed",
+        "exit_code": 1,
+        "dry_run": relay.dry_run,
+        "files_transferred": 0,
+        "files_unchanged": 0,
+        "files_excluded": 0,
+        "directories_created": 0,
+        "symlinks_created": 0,
+        "specials_created": 0,
+        "errors": relay.errors,
+        "bytes_transferred": 0,
+        "bytes_unchanged": 0,
+        "timings": {"total_ms": elapsed_ms},
+    });
+    if relay.prune {
+        let object = terminal
+            .as_object_mut()
+            .expect("a final result is an object");
+        for key in [
+            "deletions_planned",
+            "deletions_completed",
+            "deletions_blocked",
+        ] {
+            object.insert(key.into(), 0.into());
+        }
+    }
+    terminal
+}
+
 /// Settle a stream whose results could not be trusted: a failed final
 /// result keeps the counts nothing vouches for at zero.
-fn fail_results(relay: &Relay, dry_run: bool, elapsed_ms: u64) {
+fn fail_results(relay: &Relay, elapsed_ms: u64) {
     if let Some(writer) = &relay.results {
-        writer.emit_terminal_value(serde_json::json!({
-            "type": "result",
-            "status": "failed",
-            "exit_code": 1,
-            "dry_run": dry_run,
-            "files_transferred": 0,
-            "files_unchanged": 0,
-            "files_excluded": 0,
-            "directories_created": 0,
-            "symlinks_created": 0,
-            "specials_created": 0,
-            "errors": relay.errors,
-            "bytes_transferred": 0,
-            "bytes_unchanged": 0,
-            "timings": {"total_ms": elapsed_ms},
-        }));
+        writer.emit_terminal_value(empty_terminal(relay, elapsed_ms));
     }
 }
 
@@ -1513,9 +1529,14 @@ fn run_remote(
     if !args.quiet {
         crate::output::diagnostic!("syq: remote-to-remote: running on {coordinator_host}");
     }
-    let relay = results_token
-        .as_deref()
-        .map(|token| Relay::new(token, results.clone(), destination_results.take()));
+    let relay = results_token.as_deref().map(|token| {
+        Relay::new(
+            token,
+            results.clone(),
+            destination_results.take(),
+            (args.dry_run, args.delete),
+        )
+    });
     let run = |relay: Option<Relay>| {
         if let Some(bridge) = &peer_bridge {
             let mapping = args.mapping_contents.clone();
@@ -1624,7 +1645,6 @@ fn run_remote(
                 src_host: &coordinator_host,
                 dst_host: peer.host.as_deref().unwrap_or("the peer endpoint"),
                 coordinator_exit_code: code,
-                dry_run: args.dry_run,
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 verbose: args.verbose > 0,
                 quiet: args.quiet,

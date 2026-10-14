@@ -40,49 +40,12 @@ class OperationAction(_StringEnum):
     CREATE_SYMLINK = "create_symlink"
     CREATE_SPECIAL = "create_special"
     DELETE = "delete"
-    SET_METADATA = "set_metadata"
-    OBSERVE_HASH = "observe_hash"
 
 
 class Disposition(_StringEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     BLOCKED = "blocked"
-    INCOMPLETE = "incomplete"
-    OBSERVED = "observed"
-
-
-class ReceiptCode(_StringEnum):
-    NONE = "none"
-    EXECUTION_FAILED = "execution_failed"
-    AUTHORIZATION_REFUSED = "authorization_refused"
-    FILE_LIFECYCLE_INCOMPLETE = "file_lifecycle_incomplete"
-    OBSERVATION_FAILED = "observation_failed"
-
-
-class FinalObjectState(_StringEnum):
-    PRESENT = "present"
-    ABSENT = "absent"
-    OBSERVATION_FAILED = "observation_failed"
-
-
-class FinalObjectKind(_StringEnum):
-    """The receiver's final-state vocabulary for what an object is."""
-
-    DIR = "dir"
-    FILE = "file"
-    SYMLINK = "symlink"
-    FIFO = "fifo"
-    SOCKET = "socket"
-    CHARACTER_DEVICE = "character_device"
-    BLOCK_DEVICE = "block_device"
-    OTHER = "other"
-
-
-class ReceiptStatus(_StringEnum):
-    CLEAN = "clean"
-    FAILED = "failed"
-    INCOMPLETE = "incomplete"
 
 
 class Retryability(_StringEnum):
@@ -337,17 +300,6 @@ class ProtocolMetadata:
 
 
 @dataclass(frozen=True, slots=True)
-class ReceiptSummary:
-    """Bookkeeping from a verified receiver receipt."""
-
-    status: ReceiptStatus
-    operations: int
-    final_states: int
-    records: int
-    provenance: str = "receiver_attested"
-
-
-@dataclass(frozen=True, slots=True)
 class RunEvent:
     protocol: ProtocolMetadata
     run_id: str
@@ -419,9 +371,6 @@ class OperationResult:
     class_: ErrorClass | None
     os_kind: OsKind | None
     message: str | None
-    provenance: str | None = None
-    scope: int | None = None
-    code: ReceiptCode | None = None
     expected_hash: Hash | None = None
     metadata: DestinationMetadata | None = None
 
@@ -489,47 +438,6 @@ class ErrorEvent:
     message: str
     class_: ErrorClass | None
     os_kind: OsKind | None
-    provenance: str | None = None
-    code: ReceiptCode | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ObjectMetadata:
-    """Filesystem metadata the receiver attested for a final object."""
-
-    mode: int
-    uid: int
-    gid: int
-    mtime: int
-    mtime_nsec: int
-    rdev: int
-
-
-@dataclass(frozen=True, slots=True)
-class AttestedHash:
-    """A content hash from the receipt, algorithm included."""
-
-    algorithm: str
-    value: str
-
-
-@dataclass(frozen=True, slots=True)
-class FinalStateEvent:
-    """A receiver-attested closure-time observation of one touched path."""
-
-    protocol: ProtocolMetadata
-    provenance: str
-    scope: int
-    dst: PathValue
-    state: FinalObjectState
-    kind: FinalObjectKind | None
-    size: int | None
-    metadata: ObjectMetadata | None
-    hash: AttestedHash | None
-    symlink_target: PathValue | None
-    observation_error: str | None
-    code: ReceiptCode | None
-    message: str | None
 
 
 class OperationSummary:
@@ -564,7 +472,6 @@ class CpResult(OperationSummary):
     deletions_planned: int | None
     deletions_completed: int | None
     deletions_blocked: int | None
-    receipt: ReceiptSummary | None = None
     bytes_total_known: bool | None = None
 
 
@@ -614,7 +521,6 @@ AutomationEvent = (
     | RemovalTrace
     | RemovalResult
     | ErrorEvent
-    | FinalStateEvent
     | CpResult
     | RmResult
 )

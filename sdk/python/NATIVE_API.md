@@ -112,7 +112,6 @@ In addition to the shared arguments above, it accepts:
 | `no_bootstrap`, `no_tcp_encryption`, `no_tcp` | Boolean remote/transport controls |
 | `tcp_ports`, `tcp_congestion` | Port range and congestion-control strings |
 | `receiver_max_entries`, `receiver_max_bytes` | Receiver ceilings: integer entries, native size string or integer bytes |
-| `receiver_receipt` | `"sizes"` or `"hashes"` |
 | `on_event`, `results`, `check` | See [events and failures](https://greaber.github.io/syq/python-results.html) |
 
 Option behavior is covered in [Copy files](https://greaber.github.io/syq/reference.html),
@@ -562,16 +561,14 @@ unsuccessful copy. Read attributes directly, for example
 | `deletions_planned` | `int` or `None` | Entries selected for pruning |
 | `deletions_completed` | `int` or `None` | Entries pruned |
 | `deletions_blocked` | `int` or `None` | Pruning deletions blocked by a safety limit |
-| `receipt` | `ReceiptSummary` or `None` | Verified receiver receipt details; `None` for ordinary copies |
 
 With `dry_run=True`, mutation totals describe planned changes.
 A failed call reports work completed before it stopped.
 
-Ordinary copies have all three deletion fields with `prune=True` or `prune_before=True`;
-otherwise they are `None`. Receiver-attested results have only
-`deletions_completed`, and their unchanged/excluded totals are always zero
-because the receiver cannot observe source-side skips. `receipt` is
-`None` for ordinary copies.
+Copies have all three deletion fields with `prune=True` or `prune_before=True`;
+otherwise they are `None`. Through a command-restricted receiver, the totals
+of what changed come from the receiver and the others from the coordinating
+server.
 
 ### RmResult
 
@@ -634,18 +631,6 @@ or diagnosing a stream.
 | `schema_version` | `int` | `4`; callback mappings use `5` |
 | `seq` | `int` | Record sequence number, starting at zero |
 | `type` | `str` | Wire record type; `"result"` for terminal totals |
-
-### ReceiptSummary
-
-Frozen dataclass accessed through `CpResult.receipt` for receiver-attested copies.
-
-| Attribute | Type | Meaning |
-|---|---|---|
-| `status` | `ReceiptStatus` | Receiver receipt outcome |
-| `operations` | `int` | Attested operation record count |
-| `final_states` | `int` | Attested final-state record count |
-| `records` | `int` | Total receipt record count |
-| `provenance` | `str` | `"receiver_attested"` |
 
 ### OperationStatus
 
@@ -754,11 +739,11 @@ reason: TraceReason
 
 ### OperationResult
 
-One copy outcome. `dst` is destination-relative, or relative to the signed
-destination `scope` for a receiver receipt. `src` is present for mapping entries
-when available. `bytes` and `attempts` give transfer information. Error details
-are present when known; `message` is display text. `provenance`, `scope`, and
-`code` apply to receiver-attested outcomes.
+One copy outcome. `dst` is relative to the destination container. `src` is
+present for mapping entries when available. `bytes` and `attempts` give transfer
+information. Error details are present when known; `message` is display text.
+A command-restricted receiver's own outcomes have no `src`, `attempts`, or
+`retryable`.
 
 `protocol.type = "operation_result"`. Fields in addition to the common envelope:
 
@@ -776,9 +761,6 @@ os_kind: OsKind | None
 message: str | None
 expected_hash: Hash | None
 metadata: DestinationMetadata | None
-provenance: str | None
-scope: int | None
-code: ReceiptCode | None
 ```
 
 ### SelectionResult
@@ -836,7 +818,7 @@ s3_delete_marker: bool | None
 ### ErrorEvent
 
 One counted error. `message` is display text; `class_` and `os_kind` classify
-it when known. Receiver errors can also carry `provenance` and `code`.
+it when known.
 
 `protocol.type = "error"`. Fields in addition to the common envelope:
 
@@ -844,46 +826,17 @@ it when known. Receiver errors can also carry `provenance` and `code`.
 message: str
 class_: ErrorClass | None
 os_kind: OsKind | None
-provenance: str | None
-code: ReceiptCode | None
-```
-
-### FinalStateEvent
-
-Receiver-attested destination state. `dst` is relative to the signed `scope`.
-`provenance` is `"receiver_attested"`. Present objects have `kind` and byte
-`size`; `metadata`, `hash`, and `symlink_target` are present where available.
-`observation_error` describes a partial observation. Absent objects have no
-object details; failed observations have `code` and optional `message`.
-
-`protocol.type = "final_state"`. Fields in addition to the common envelope:
-
-```python
-provenance: str
-scope: int
-dst: PathValue
-state: FinalObjectState
-kind: FinalObjectKind | None
-size: int | None
-metadata: ObjectMetadata | None
-hash: AttestedHash | None
-symlink_target: PathValue | None
-observation_error: str | None
-code: ReceiptCode | None
-message: str | None
 ```
 
 <a id="endpoint-objectmetadata-and-attesteddigest"></a>
 
-### Endpoint, ObjectMetadata, and AttestedHash
+### Endpoint
 
-Nested frozen dataclasses used by events:
+A nested frozen dataclass used by run events:
 
 | Type | Fields | Meaning |
 |---|---|---|
 | `Endpoint` | `role: EndpointRole`, `kind: EndpointKind`, `host: str \| None`, `user: str \| None` | Source/destination and local/SSH/S3 identity; host and user are optional |
-| `ObjectMetadata` | `mode: int`, `uid: int`, `gid: int`, `mtime: int`, `mtime_nsec: int`, `rdev: int` | Unix mode, owner/group IDs, modification time (seconds plus nanoseconds), and device ID |
-| `AttestedHash` | `algorithm: str`, `value: str` | `"blake3"` and its 64 lowercase hexadecimal hash characters |
 
 ## Enums
 
@@ -896,12 +849,8 @@ values use lowercase, for example `EntryKind.FILE.value == "file"`.
 | `EntryKind` | `FILE`, `DIR`, `SYMLINK`, `SPECIAL` |
 | `EndpointKind` | `LOCAL`, `SSH`, `S3` |
 | `EndpointRole` | `SOURCE`, `DESTINATION` |
-| `OperationAction` | `TRANSFER_FILE`, `CREATE_DIRECTORY`, `CREATE_SYMLINK`, `CREATE_SPECIAL`, `DELETE`, `SET_METADATA`, `OBSERVE_HASH` |
-| `Disposition` | `SUCCEEDED`, `FAILED`, `BLOCKED`, `INCOMPLETE`, `OBSERVED` |
-| `ReceiptCode` | `NONE`, `EXECUTION_FAILED`, `AUTHORIZATION_REFUSED`, `FILE_LIFECYCLE_INCOMPLETE`, `OBSERVATION_FAILED` |
-| `FinalObjectState` | `PRESENT`, `ABSENT`, `OBSERVATION_FAILED` |
-| `FinalObjectKind` | `DIR`, `FILE`, `SYMLINK`, `FIFO`, `SOCKET`, `CHARACTER_DEVICE`, `BLOCK_DEVICE`, `OTHER` |
-| `ReceiptStatus` | `CLEAN`, `FAILED`, `INCOMPLETE` |
+| `OperationAction` | `TRANSFER_FILE`, `CREATE_DIRECTORY`, `CREATE_SYMLINK`, `CREATE_SPECIAL`, `DELETE` |
+| `Disposition` | `SUCCEEDED`, `FAILED`, `BLOCKED` |
 | `Retryability` | `YES`, `NO`, `UNKNOWN` |
 | `ErrorClass` | `IO`, `TRANSPORT`, `CONFLICT`, `INTEGRITY`, `SAFETY_LIMIT`, `USAGE`, `INTERNAL` |
 | `OsKind` | `NOT_FOUND`, `PERMISSION_DENIED`, `ALREADY_EXISTS`, `INVALID_INPUT`, `NO_SPACE`, `QUOTA_EXCEEDED`, `READ_ONLY`, `OTHER` |
@@ -909,9 +858,8 @@ values use lowercase, for example `EntryKind.FILE.value == "file"`.
 | `SelectionStatus` | `RESOLVED`, `MISSING` |
 | `RemovalDisposition` | `WOULD_REMOVE`, `REMOVED`, `ALREADY_ABSENT`, `FAILED` |
 
-`ReceiptStatus.CLEAN` means a clean receipt, `FAILED` reports receiver failures,
-and `INCOMPLETE` reports an incomplete lifecycle. `Retryability.YES`, `NO`, and
-`UNKNOWN` state whether a failed entry can be retried.
+`Retryability.YES`, `NO`, and `UNKNOWN` state whether a failed entry can be
+retried.
 
 ## Failure model
 

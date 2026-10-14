@@ -69,7 +69,7 @@ to refresh the installed receiver. Compatible grant-signing keys and replay reco
 are preserved. An older enrollment that used one key for both purposes gains a
 separate SSH key on its next copy or explicit enrollment; the original key
 continues signing grants. A dry run requires this upgrade to be completed first
-with `receiver enroll`. The upgrade also preserves its receipt key and identity.
+with `receiver enroll`. The upgrade also preserves its signing key and identity.
 Older clients cannot use the upgraded enrollment; use the newer build to manage
 or revoke it. Different client builds cannot share one installed receiver
 concurrently; each needs a matching receiver.
@@ -108,24 +108,24 @@ their original limits.
 
 Restricted copies use encrypted TCP when reachable and otherwise use SSH
 workers from the source to the destination. Both transports share the same
-copy authorization, limits, revocation, and signed receipt. A failed direct
+copy authorization, limits, revocation, and results. A failed direct
 connection never selects a relay through your machine; choose
 `--coordinate-at local` explicitly to send data through it.
 
-## Signed results
+<a id="signed-results"></a>
 
-The destination signs a receipt and your machine verifies it before reporting
-results. Use `-v` for totals or `--results FILE` for
-[automation](automation.md). These results arrive after verification, rather
-than as live per-file progress. For `--dry-run --results`, use
-`--coordinate-at local` to get the preview stream.
+## Results from the destination
 
-`--receiver-receipt hashes` adds BLAKE3 hashes of affected regular files.
-Receipts allow up to four million records and 512 MiB of plaintext. Reaching
-a cap stops further changes and reports an incomplete outcome.
+The destination reports each change it makes as the copy runs. Your machine
+checks that the reports come from the destination and that the source, which
+passes them on, left none out and added none. A refusal or a failed change on
+the destination decides the outcome even if the source reports success, and
+reports cut short fail the copy. Use `-v` for the destination's totals or
+`--results FILE` for [automation](automation.md); `--dry-run --results`
+previews the copy.
 
-A receipt does not prove that the source supplied every intended file or the
-right contents. See [A compromised source server](security.md#a-compromised-source-server).
+The destination's reports do not prove that the source supplied every intended
+file or the right contents. See [A compromised source server](security.md#a-compromised-source-server).
 
 ## Other authentication modes
 
@@ -168,8 +168,7 @@ can instead request the source-read authorization described below.
 server can authenticate independently. It cannot use the restricted receiver
 or `--results`.
 
-Save the reported remote log location. The log is not a signed receipt.
-If printing the location fails, the command reports an error but the job may
+Save the reported remote log location. If printing the location fails, the command reports an error but the job may
 still be running. The coordinating server needs `/bin/kill` and either
 `setsid` or `perl`.
 
@@ -203,9 +202,7 @@ An existing [approved account connection](persistence-reference.md#approved-acco
 for the same authorizer and endpoint supplies full account access without
 another prompt. Otherwise an ordinary copy requests account access from the
 provider. See [account permissions](persistence-reference.md#account-permissions)
-for Allow and Remember. `--receiver-receipt` applies only to direct copies
-between two remote endpoints; it does not select per-copy authorization for a
-copy between this machine and one SSH server.
+for Allow and Remember.
 `--auth-from ssh` uses this machine's native SSH access and ignores account approvals.
 These options choose authorization, not the destination: `--to host` names an
 SSH destination, while `--to @NAME` sends files to a receiving machine.
@@ -254,7 +251,7 @@ account's authority. To prepare connections in advance, use
 
 This route uses the default source coordinator or `--coordinate-at src`, with
 `--peer-auth restricted`. It supports `--no-tcp`, helper overrides, mappings,
-and receiver receipts. `--pscope` selects approved connections and authorization
+and `--results`. `--pscope` selects approved connections and authorization
 choices in that local domain. Custom `--rsh`, detached copies, destination
 coordination, and other peer-auth modes keep their separate
 connection requirements. `--coordinate-at local` can reuse approved access to
@@ -274,7 +271,7 @@ payload relay. Syq creates a receiver for this copy over the destination's
 approved account connection, which must not log in as root; durable receiver
 enrollment is unnecessary.
 The destination's [restricted-copy limits](#limits-and-unsupported-options)
-and [signed results](#signed-results) still apply. Helpers must match the
+and [results from the destination](#results-from-the-destination) still apply. Helpers must match the
 invoking build; normal bootstrap installs them unless disabled.
 
 ## Verification

@@ -12,7 +12,6 @@ from .models import (
     AutomationEvent,
     CpResult,
     ProtocolMetadata,
-    ReceiptSummary,
     Disposition,
     Endpoint,
     EndpointKind,
@@ -20,12 +19,7 @@ from .models import (
     EntryKind,
     ErrorClass,
     ErrorEvent,
-    AttestedHash,
     Hash,
-    FinalObjectKind,
-    FinalObjectState,
-    FinalStateEvent,
-    ObjectMetadata,
     MappingEntry,
     MappingStreamResult,
     DestinationMetadata,
@@ -34,8 +28,6 @@ from .models import (
     OperationStatus,
     OperationSummary,
     OsKind,
-    ReceiptCode,
-    ReceiptStatus,
     PathValue,
     ProgressEvent,
     Retryability,
@@ -92,15 +84,6 @@ def _integer(record: dict[str, Any], key: str, *, nonnegative: bool = True) -> i
             f"automation field {key!r} exceeds the signed 64-bit range"
         )
     return value
-
-
-def _attested_provenance(record: dict[str, Any], label: str) -> str | None:
-    provenance = _optional_string(record, "provenance")
-    if provenance is not None and provenance != "receiver_attested":
-        raise SyqProtocolError(
-            f"a {label}'s provenance can only be receiver_attested"
-        )
-    return provenance
 
 
 def _optional_integer(record: dict[str, Any], key: str) -> int | None:
@@ -443,18 +426,6 @@ class AutomationDecoder:
                 raise SyqProtocolError(
                     "a dry-run automation stream contains an operation result"
                 )
-            provenance = _attested_provenance(record, "operation result")
-            if provenance is None:
-                for field in ("scope", "code"):
-                    if field in record:
-                        raise SyqProtocolError(
-                            f"receipt field {field!r} appears on an operation "
-                            "result without receiver_attested provenance"
-                        )
-            elif "scope" not in record:
-                raise SyqProtocolError(
-                    "a receiver-attested operation result must carry its scope"
-                )
             return OperationResult(
                 **common,
                 action=_enum(record, "action", OperationAction),
@@ -468,9 +439,6 @@ class AutomationDecoder:
                 class_=_optional_enum(record, "class", ErrorClass),
                 os_kind=_optional_enum(record, "os_kind", OsKind),
                 message=_optional_string(record, "message"),
-                provenance=provenance,
-                scope=_optional_integer(record, "scope"),
-                code=_optional_enum(record, "code", ReceiptCode),
                 expected_hash=_expected_hash(record),
                 metadata=_destination_metadata(record),
             )
@@ -584,128 +552,15 @@ class AutomationDecoder:
                 s3_delete_marker=_boolean(record, "s3_delete_marker") if "s3_delete_marker" in record else None,
             )
         if record_type == "error":
-            provenance = _attested_provenance(record, "error record")
-            if provenance is None and "code" in record:
-                raise SyqProtocolError(
-                    "a receipt code appears on an error record without "
-                    "receiver_attested provenance"
-                )
             event = ErrorEvent(
                 **common,
                 message=_string(record, "message"),
                 class_=_optional_enum(record, "class", ErrorClass),
                 os_kind=_optional_enum(record, "os_kind", OsKind),
-                provenance=provenance,
-                code=_optional_enum(record, "code", ReceiptCode),
             )
             if self.run.mode == "rm":
                 self._rm_error_records += 1
             return event
-        if record_type == "final_state":
-            if self.run.mode != "cp":
-                raise SyqProtocolError(
-                    "an rm automation stream contains a receiver final state"
-                )
-            state = record.get("object")
-            if not isinstance(state, dict):
-                raise SyqProtocolError("final_state record has no object")
-            variant = _enum(state, "state", FinalObjectState)
-            # Each state admits exactly its own fields (spec: automation results).
-            allowed, required = {
-                FinalObjectState.PRESENT: (
-                    {
-                        "state",
-                        "kind",
-                        "size",
-                        "metadata",
-                        "hash",
-                        "symlink_target",
-                        "observation_error",
-                    },
-                    {"kind", "size", "metadata"},
-                ),
-                FinalObjectState.ABSENT: ({"state"}, set()),
-                FinalObjectState.OBSERVATION_FAILED: (
-                    {"state", "code", "message"},
-                    {"code"},
-                ),
-            }[variant]
-            known = {
-                "state",
-                "kind",
-                "size",
-                "metadata",
-                "hash",
-                "symlink_target",
-                "observation_error",
-                "code",
-                "message",
-            }
-            extra = (set(state) & known) - allowed
-            if extra:
-                raise SyqProtocolError(
-                    f"final_state object carries fields from another state "
-                    f"variant than {variant.value!r}: {sorted(extra)}"
-                )
-            missing = required - set(state)
-            if missing:
-                raise SyqProtocolError(
-                    f"final_state {variant.value!r} object is missing "
-                    f"{sorted(missing)}"
-                )
-            hash_record = state.get("hash")
-            hash = None
-            if hash_record is not None:
-                if not isinstance(hash_record, dict):
-                    raise SyqProtocolError("final_state hash is not an object")
-                algorithm = _string(hash_record, "algorithm")
-                if algorithm != "blake3":
-                    raise SyqProtocolError(
-                        "final_state hash algorithm is not blake3"
-                    )
-                value = _string(hash_record, "value")
-                if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
-                    raise SyqProtocolError(
-                        "final_state hash value is not 64 lowercase hex digits"
-                    )
-                hash = AttestedHash(algorithm=algorithm, value=value)
-            metadata_record = state.get("metadata")
-            metadata = None
-            if metadata_record is not None:
-                if not isinstance(metadata_record, dict):
-                    raise SyqProtocolError("final_state metadata is not an object")
-                metadata = ObjectMetadata(
-                    mode=_integer(metadata_record, "mode"),
-                    uid=_integer(metadata_record, "uid"),
-                    gid=_integer(metadata_record, "gid"),
-                    mtime=_integer(metadata_record, "mtime", nonnegative=False),
-                    mtime_nsec=_integer(metadata_record, "mtime_nsec"),
-                    rdev=_integer(metadata_record, "rdev"),
-                )
-            provenance = _string(record, "provenance")
-            if provenance != "receiver_attested":
-                raise SyqProtocolError(
-                    "final_state records carry receiver_attested provenance"
-                )
-            return FinalStateEvent(
-                **common,
-                provenance=provenance,
-                scope=_integer(record, "scope"),
-                dst=_tagged(record.get("dst"), label="dst"),
-                state=variant,
-                kind=_optional_enum(state, "kind", FinalObjectKind),
-                size=_optional_integer(state, "size"),
-                metadata=metadata,
-                hash=hash,
-                symlink_target=(
-                    _tagged(state["symlink_target"], label="symlink_target")
-                    if "symlink_target" in state
-                    else None
-                ),
-                observation_error=_optional_string(state, "observation_error"),
-                code=_optional_enum(state, "code", ReceiptCode),
-                message=_optional_string(state, "message"),
-            )
         if record_type == "result":
             if self.stream_entries is not None and record.get("status") in {"success", "partial"} and self.stream_outcomes != self.stream_entries:
                 raise SyqProtocolError("stream mapping result omitted callback outcomes")
@@ -874,21 +729,7 @@ class AutomationDecoder:
                     "deletions_blocked",
                 )
             )
-            provenance = _attested_provenance(record, "result")
-            attested = provenance is not None
-            if attested:
-                # A receipt attests settled deletions (deletions_completed);
-                # it cannot vouch for planning or --max-delete blocking, so
-                # the other two totals never appear.
-                if deletion_values[0] is not None or deletion_values[2] is not None:
-                    raise SyqProtocolError(
-                        "a receiver-attested result may only contain deletions_completed"
-                    )
-                if deletion_values[1] is None:
-                    raise SyqProtocolError(
-                        "a receiver-attested result must contain deletions_completed"
-                    )
-            elif self.run.prune and any(value is None for value in deletion_values):
+            if self.run.prune and any(value is None for value in deletion_values):
                 raise SyqProtocolError(
                     "a prune result must contain every deletion total"
                 )
@@ -898,22 +739,6 @@ class AutomationDecoder:
                 raise SyqProtocolError(
                     "a non-prune result may not contain deletion totals"
                 )
-            if not attested:
-                stray = [
-                    field
-                    for field in (
-                        "receipt_status",
-                        "operations",
-                        "final_states",
-                        "receipt_records",
-                    )
-                    if field in record
-                ]
-                if stray:
-                    raise SyqProtocolError(
-                        "receipt bookkeeping appears on a result without "
-                        f"receiver_attested provenance: {stray}"
-                    )
             result = CpResult(
                 **common,
                 bytes_total_known=_boolean(record, "bytes_total_known") if "bytes_total_known" in record else None,
@@ -933,15 +758,6 @@ class AutomationDecoder:
                 deletions_planned=deletion_values[0],
                 deletions_completed=deletion_values[1],
                 deletions_blocked=deletion_values[2],
-                receipt=(
-                    ReceiptSummary(
-                        status=_enum(record, "receipt_status", ReceiptStatus),
-                        operations=_integer(record, "operations"),
-                        final_states=_integer(record, "final_states"),
-                        records=_integer(record, "receipt_records"),
-                    )
-                    if attested else None
-                ),
             )
             self.result = result
             return result

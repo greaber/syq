@@ -2551,7 +2551,6 @@ impl RestrictedAuthority {
                 {
                     bail!("file write extends past the size declared for it");
                 }
-                if *inplace {}
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
