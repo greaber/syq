@@ -1078,6 +1078,9 @@ syq cp --if-exists=update-if-older --no-progress --performance-tuning workers=2 
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = newer; test -e /tmp/syq-real-ssh/direct-destination/policy-new'
 
+printf 'case: results of server-to-server copies on every route\n'
+python3 /usr/local/libexec/syq-test-results-stream.py
+
 printf 'case: restricted receiver prunes without a stated deletion limit\n'
 ssh source 'mkdir -p /tmp/syq-real-ssh/prune-source && printf kept > /tmp/syq-real-ssh/prune-source/kept'
 ssh destination 'mkdir -p /tmp/syq-real-ssh/prune-destination && printf extra > /tmp/syq-real-ssh/prune-destination/extra && printf extra > /tmp/syq-real-ssh/prune-destination/other'
