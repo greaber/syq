@@ -135,7 +135,7 @@ impl Planner<'_> {
             let replaced = matched
                 && destination
                     .clone()
-                    .is_some_and(|d| self.must_replace(&leaf.dst_rel, &leaf.e, &d));
+                    .is_some_and(|d| self.must_replace((&leaf.dst, &leaf.dst_rel), &leaf.e, &d));
             matched &= !replaced;
             if matched {
                 self.progress.files_unchanged.fetch_add(1, Relaxed);

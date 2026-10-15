@@ -775,6 +775,9 @@ struct PreparedSmallCopy {
     destinations: Vec<Option<libc::stat>>,
     permitted: Vec<bool>,
     unchanged: Vec<bool>,
+    /// Unchanged files the receiver replaces from their payloads, since it
+    /// cannot change their metadata in place (`fsops::vouch`).
+    replace: Vec<bool>,
 }
 
 pub struct FsOps {
@@ -1383,36 +1386,6 @@ impl FsOps {
                 outcome: SmallCopyOutcome::UnsupportedTarget,
             }));
         }
-        // An unchanged file whose metadata the receiver cannot change in
-        // place must be replaced from the source, whose contents this path
-        // does not fetch for it: the general engine copies such a batch.
-        let directory = selection.directory.metadata()?;
-        let link_counts_trusted = fs_caps::profile(&selection.directory).link_counts_trusted;
-        if request
-            .files
-            .iter()
-            .zip(&destinations)
-            .zip(unchanged.iter().zip(&permitted))
-            .any(|((file, stat), (unchanged, permitted))| {
-                let Some(stat) = stat.as_ref().filter(|_| *unchanged && *permitted) else {
-                    return false;
-                };
-                let repair = small_copy_repair(request.flags, stat, &file.meta);
-                repair != 0
-                    && !vouch::lookup_allows(
-                        stat,
-                        link_counts_trusted,
-                        (directory.gid(), directory.mode()),
-                        &file.meta,
-                        repair,
-                    )
-            })
-        {
-            return Ok(Response::SmallFilesCopied(SmallCopyResponse {
-                anchor,
-                outcome: SmallCopyOutcome::UnsupportedTarget,
-            }));
-        }
         // The offer contains whole-file payloads. Only existing files that
         // need content work can benefit from multi-block reuse; keep new
         // files, rejected entries and quick-check matches on this path.
@@ -1432,6 +1405,47 @@ impl FsOps {
         let directory = self.descriptor_session.acquire(&ticket)?;
         self.install_destination(directory, &request.request_prefix)?;
 
+        // An unchanged file whose metadata the receiver cannot change in
+        // place is replaced from its payload, as a changed file is, and
+        // only that file. The check reads the file itself, through a
+        // descriptor: its own filesystem, its owner and its names.
+        let mut unchanged = unchanged;
+        let mut replace = vec![false; request.files.len()];
+        for (i, file) in request.files.iter().enumerate() {
+            let Some(stat) = destinations[i]
+                .as_ref()
+                .filter(|_| unchanged[i] && permitted[i])
+            else {
+                continue;
+            };
+            let repair = small_copy_repair(request.flags, stat, &file.meta);
+            if repair == 0 {
+                continue;
+            }
+            let path = self.destination_relative(&file.path)?;
+            let target = self
+                .rooted_destination_target(&path, None)?
+                .context("small copy requires a destination root")?;
+            let handle = target.root.open_metadata(&target.relative)?;
+            let current = handle.metadata()?;
+            // A file that changed since it was inspected is copied, and its
+            // publication then finds that it changed.
+            let same_file =
+                (current.dev(), current.ino()) == (stat.st_dev as u64, stat.st_ino as u64);
+            if !same_file
+                || !vouch::allows(
+                    &target,
+                    &handle,
+                    &current,
+                    &file.meta,
+                    repair | (request.flags & flags::OWNERSHIP),
+                )?
+            {
+                unchanged[i] = false;
+                replace[i] = same_file;
+            }
+        }
+
         let needed = unchanged
             .iter()
             .map(|unchanged| !unchanged)
@@ -1443,6 +1457,7 @@ impl FsOps {
             destinations,
             permitted,
             unchanged,
+            replace,
         });
         if needed.iter().any(|needed| *needed) {
             Ok(Response::SmallFilesPrepared(needed))
@@ -1461,6 +1476,7 @@ impl FsOps {
             destinations,
             permitted,
             mut unchanged,
+            replace,
         } = self
             .prepared_small_copy
             .take()
@@ -1508,7 +1524,11 @@ impl FsOps {
         // its payload instead (`same` but not `unchanged`).
         let mut matched_content: Vec<Option<(RootedTarget, File)>> =
             (0..request.files.len()).map(|_| None).collect();
-        let mut same = unchanged.clone();
+        let mut same: Vec<bool> = unchanged
+            .iter()
+            .zip(&replace)
+            .map(|(unchanged, replace)| *unchanged || *replace)
+            .collect();
         for (i, file) in request.files.iter().enumerate() {
             if (request.reuse_block_size.is_none()
                 && request.if_exists != crate::cli::IfExists::ErrorIfDifferent)
@@ -1550,7 +1570,8 @@ impl FsOps {
                 let current = opened.metadata()?;
                 let stat = destinations[i].as_ref().unwrap();
                 let repair = (request.matching_flags & flags::TIMES)
-                    | small_copy_repair(request.flags, stat, &file.meta);
+                    | small_copy_repair(request.flags, stat, &file.meta)
+                    | (request.flags & flags::OWNERSHIP);
                 let keep = vouch::allows(&target, &opened, &current, &file.meta, repair)?;
                 Ok(Some(keep.then_some((target, opened))))
             });
@@ -1682,6 +1703,9 @@ impl FsOps {
                             } else {
                                 0
                             } | small_copy_repair(request.flags, &stat, &file.meta);
+                            // The owner and group the file is to end with, for
+                            // the receiver's check (`flags::OWNERSHIP`).
+                            let checked = repair | (request.flags & flags::OWNERSHIP);
                             let disposition = if matched_content.is_some() {
                                 SmallCopyDisposition::ContentMatched
                             } else {
@@ -1700,7 +1724,7 @@ impl FsOps {
                                         condition,
                                     )?;
                                     let current = held.metadata()?;
-                                    vouch::require(&target, &held, &current, &file.meta, repair)?;
+                                    vouch::require(&target, &held, &current, &file.meta, checked)?;
                                     set_meta_file_known(&held, &file.meta, repair, &current)?;
                                     require_rooted_named_identity(
                                         &target.root,
@@ -1722,7 +1746,7 @@ impl FsOps {
                                                 path,
                                                 condition,
                                                 meta: file.meta.clone(),
-                                                flags: repair,
+                                                flags: checked,
                                             }],
                                             None,
                                         )

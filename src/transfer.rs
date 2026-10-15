@@ -364,6 +364,11 @@ impl Opts {
                 .map_or(0, |m| m.apply_flags())
     }
 
+    /// The ownership `path`'s copy selects (`flags::OWNERSHIP`).
+    fn ownership_flags(&self, path: &[u8]) -> u8 {
+        self.flags_for(path) & flags::OWNERSHIP
+    }
+
     fn matching_flags_for(&self, path: &[u8]) -> u8 {
         self.matching_flags
             | self
@@ -4315,6 +4320,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         blocked_mapping_parents: std::collections::HashSet::new(),
         directory_restorations: Default::default(),
         receiver_uid: None,
+        parent_groups: Default::default(),
         // The destination directory itself when its owner lacks write or
         // search permission. Whatever the placement, an existing directory
         // at the destination path belongs to the copy.

@@ -573,6 +573,10 @@ pub mod flags {
     /// This changes only the reply; restricted grants authorize it with
     /// hard links.
     pub const REPORT_IDENTITY: u8 = 128;
+    /// The ownership a request selects. A metadata repair that sends only
+    /// what changed still sends these, so that the receiver knows which
+    /// owner and group the file is to end with (`fsops::vouch`).
+    pub const OWNERSHIP: u8 = OWNER | GROUP | REQUIRE_OWNER | REQUIRE_GROUP;
 }
 
 /// Best-effort kernel counters for one end of a TCP data socket. `None` means

@@ -2860,6 +2860,7 @@ impl Worker {
                     flags: self
                         .opts
                         .metadata_fix_flags(&job.rel_bytes, &job.entry, destination)
+                        | self.opts.ownership_flags(&job.rel_bytes)
                         | (self.publication_flags(job) & flags::REPORT_IDENTITY),
                 }],
                 guard: job.container_guard.clone(),

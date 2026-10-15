@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Privileged-copy checks confined to the disposable OpenSSH runner container."""
 import ctypes
+import json
 import os
 from pathlib import Path
 import signal
@@ -142,6 +143,53 @@ def planted_files_are_replaced(root):
     print("A planted hard-link representative gets no new name", flush=True)
 
 
+def preview(root, name, source, destination, metadata):
+    """The file traces of a `syq cp` preview."""
+    results = root / f"{name}.jsonl"
+    run(["syq", "cp", "--dry-run", f"--copy-metadata={metadata}", "--results", str(results),
+         "--srcs-in", str(source), "--into", str(destination), "--no-progress"])
+    records = [json.loads(line) for line in results.read_text().splitlines()]
+    return [record for record in records if record.get("action") == "transfer_file"]
+
+
+def root_metadata_repairs(root):
+    """Root changes in place the permissions of a file that already has the
+    owner and group the copy gives it: `syq rsync -a` keeps the file, with
+    an attribute the copy does not select, and a preview counts no content
+    work. Without -g, a file whose group a new file would not get is
+    replaced, and a preview counts it as rewritten."""
+    for size in (100, 1 << 20):  # the small-file copy and the ordinary one
+        source = root / f"repair-{size}-source"
+        destination = root / f"repair-{size}-destination"
+        source.mkdir()
+        (source / "file").write_bytes(b"x" * size)
+        os.chown(source / "file", 1000, 1000)
+        (source / "file").chmod(0o644)
+        os.utime(source / "file", (1_700_000_000, 1_700_000_000))
+        run(["syq", "rsync", "-a", str(source) + "/", str(destination) + "/", "--no-progress"])
+        target = destination / "file"
+        os.setxattr(target, "user.keep", b"kept")
+        inode = target.stat().st_ino
+        (source / "file").chmod(0o600)
+        traces = preview(root, f"repair-{size}", source, destination, "ownership,permissions,mtime")
+        assert [(t["reason"], t.get("bytes")) for t in traces] == [("metadata_differs", None)], traces
+        run(["syq", "rsync", "-a", str(source) + "/", str(destination) + "/", "--no-progress"])
+        status = target.stat()
+        assert (status.st_ino, status.st_uid, status.st_mode & 0o7777) == (inode, 1000, 0o600), (size, status)
+        assert os.getxattr(target, "user.keep") == b"kept", size
+
+        # Without -g, in a directory of group 0 without the set-group-ID bit.
+        target.chmod(0o644)
+        os.chown(target, 0, 1001)
+        traces = preview(root, f"group-{size}", source, destination, "permissions,mtime")
+        assert [(t["reason"], t.get("bytes")) for t in traces] == [("metadata_differs", size)], traces
+        run(["syq", "cp", "--copy-metadata=permissions,mtime", "--srcs-in", str(source),
+             "--into", str(destination), "--no-progress"])
+        status = target.stat()
+        assert status.st_ino != inode and (status.st_uid, status.st_gid) == (0, 0), (size, status)
+    print("Root repairs keep correctly owned files and preview replacements", flush=True)
+
+
 def main():
     assert os.geteuid() == 0, "run this check as root only inside the disposable lab"
     libc = ctypes.CDLL(None, use_errno=True)
@@ -152,6 +200,7 @@ def main():
         root = Path(temporary)
         ownership_only_directories(root)
         planted_files_are_replaced(root)
+        root_metadata_repairs(root)
         for interface in ["native", "native-owner", "rsync"]:
             source = root / f"source-{interface}"
             destination = root / f"destination-{interface}"

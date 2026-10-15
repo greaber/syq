@@ -75,6 +75,9 @@ pub(super) struct Planner<'a> {
         std::collections::HashMap<PathBytes, crate::proto::DirectoryMode>,
     /// The receiving account's user ID, None until asked.
     pub(super) receiver_uid: Option<u32>,
+    /// The group and mode of destination directories, as `must_replace`
+    /// read them for a root receiver; None for one that does not exist.
+    pub(super) parent_groups: std::collections::HashMap<PathBytes, Option<(u32, u32)>>,
     /// The destination directory's own entry when its owner lacks write or
     /// search permission, checked with the first batch.
     pub(super) root_access_check: Option<Entry>,
@@ -1973,7 +1976,7 @@ impl Planner<'_> {
             && dst_entry.as_ref().is_some_and(|d| {
                 (opts.metadata_fix_flags(&dst_rel, &e, d) != 0
                     || opts.inode_metadata_differs(&dst_rel, &e, d))
-                    && self.must_replace(&dst_rel, &e, d)
+                    && self.must_replace((&dst_path, &dst_rel), &e, d)
             });
         if quick && !replace {
             // Content is up to date, but still reconcile metadata
@@ -2009,7 +2012,7 @@ impl Planner<'_> {
                                 condition => condition,
                             },
                             meta: opts.metadata_for(&dst_rel, &e),
-                            flags: ff,
+                            flags: ff | opts.ownership_flags(&dst_rel),
                         },
                         dst_rel: dst_rel.clone(),
                         kind: DeclaredKind::File,
@@ -3613,7 +3616,7 @@ impl Planner<'_> {
             && self.container_guard.is_none();
         let src_rel = self.mapping_source_rel(&rel_bytes);
         let replace = dst_entry.as_ref().is_some_and(|destination| {
-            replace || self.must_replace(&rel_bytes, &entry, destination)
+            replace || self.must_replace((&dst, &rel_bytes), &entry, destination)
         });
         let scanned = match &dst_entry {
             Some(d) if d.kind == Kind::File => {
@@ -4570,7 +4573,12 @@ impl Planner<'_> {
     /// owner is not one the receiver accepts. This predicts the receiver's
     /// decision from the scan; the receiver decides for itself, and a file
     /// it refuses is replaced then (`Worker::replace_instead`).
-    pub(super) fn must_replace(&mut self, rel: &[u8], source: &Entry, destination: &Entry) -> bool {
+    pub(super) fn must_replace(
+        &mut self,
+        (dst, rel): (&[u8], &[u8]),
+        source: &Entry,
+        destination: &Entry,
+    ) -> bool {
         if destination.kind != Kind::File {
             return false;
         }
@@ -4599,7 +4607,11 @@ impl Planner<'_> {
                 } else {
                     0
                 }
-                && (flags & flags::GROUP == 0 || destination.gid == meta.gid)
+                && if flags & flags::GROUP != 0 {
+                    destination.gid == meta.gid
+                } else {
+                    !self.new_file_group_may_differ(dst, destination.gid)
+                }
         };
         if representative && !owned {
             return true;
@@ -4609,6 +4621,39 @@ impl Planner<'_> {
                 || !owned
                 || !self.opts.destination_link_counts_trusted.load(Relaxed)
                 || (flags & flags::MODE != 0 && meta.mode & 0o6000 & !destination.mode != 0))
+    }
+
+    /// Whether a file a root receiver creates at `dst` might get a group
+    /// other than `group`, as `fsops::apply::group_may_differ` judges it on
+    /// Linux, taking root's group to be 0: from its directory's group and
+    /// set-group-ID bit, read once per directory.
+    fn new_file_group_may_differ(&mut self, dst: &[u8], group: u32) -> bool {
+        let Some(parent) = dst
+            .iter()
+            .rposition(|&c| c == b'/')
+            .map(|i| dst[..i.max(1)].to_vec())
+        else {
+            return true;
+        };
+        let directory = match self.parent_groups.get(&parent) {
+            Some(directory) => *directory,
+            None => {
+                let directory = self
+                    .stat_many(vec![parent.clone()])
+                    .ok()
+                    .and_then(|mut stats| stats.pop().flatten())
+                    .filter(|entry| entry.kind == Kind::Dir)
+                    .map(|entry| (entry.gid, entry.mode));
+                self.parent_groups.insert(parent, directory);
+                directory
+            }
+        };
+        match directory {
+            None => true,
+            Some((parent_group, parent_mode)) => {
+                parent_group != group || (parent_mode & 0o2000 == 0 && group != 0)
+            }
+        }
     }
 
     /// Sort existing directories whose owner lacks write or search
