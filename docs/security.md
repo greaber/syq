@@ -85,9 +85,10 @@ holds with `--in-place=new` too, which writes only new files at their final
 names. It does not hold for an `--as-fd` output, which syq writes into the
 descriptor it is given, or for directories, whose metadata syq changes in
 place. Nor does it hold for `--in-place=update` (`syq rsync --inplace`), which
-writes into an existing file whose metadata syq could change in place, as
-below, and whose permissions are no wider than the copy's, so that anyone
-who already has that file open can read the new contents.
+writes into an existing file with one name that belongs to the account syq
+runs as (run as root, one that already has the owner and group the copy
+gives it), and whose permissions are no wider than the copy's, so that
+anyone who already has that file open can read the new contents.
 
 Syq changes an existing file's permissions, owner, group, modification time,
 ACLs or extended attributes in place only when the file has no other names, the

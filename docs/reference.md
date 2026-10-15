@@ -430,11 +430,15 @@ This has two risks:
 - An interruption leaves the file partly updated, a mixture of old and new
   contents, until a rerun finishes it.
 
-Syq updates a file in place only when it can change its metadata in place
-(see [Copy metadata](#copy-metadata): one name, a filesystem whose link counts
-syq trusts, and the right owner), it has no set-user-ID or set-group-ID bit
-or file capability, and nobody can open it whom its final permissions would
-keep out: its permission bits must be among the final ones, its group the
+Syq updates a file in place only when it has no other names, on a filesystem
+whose link counts syq trusts (see [Copy metadata](#copy-metadata)), and
+belongs to the account syq runs as, as the files syq creates there show. Run
+as root, syq needs the file to already have the owner and group the copy
+gives it: without `--copy-metadata=ownership`, those of a file root creates
+there, so another user's file is replaced. The file must have no
+set-user-ID or set-group-ID bit or file capability, the copy must add none
+and set or remove no `security.*` or `trusted.*` attribute, and nobody may
+be able to open the file whom its final permissions would keep out: its permission bits must be among the final ones, its group the
 final one or unable to read it, and its ACL none beyond its mode bits, unless
 the copy gives it that exact ACL. It replaces any other existing file. The
 summary, and `replaced_not_in_place` in [`--results`](automation.md), say how

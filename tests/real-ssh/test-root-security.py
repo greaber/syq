@@ -276,50 +276,55 @@ def root_metadata_by_the_change(root):
 
 def in_place_update_by_the_change(root):
     """Under --in-place=update, root writes into an existing file only when
-    the copy keeps its owner and group. One another user owns, to which the
-    copy gives the source's owner, is replaced: someone who had it open
-    keeps the old contents, and the summary, --results and a preview say
+    it already has the owner and group the copy gives it: without -o and -g,
+    those of a file root creates. One another user owns is replaced, so
+    that user cannot read the new contents through it, and someone who had
+    it open keeps the old ones. The summary, --results and a preview say
     why."""
-    source = root / "update-source"
-    destination = root / "update-destination"
-    source.mkdir()
-    destination.mkdir()
     payload = b"source contents\n" * 65536
     old = bytearray(payload)
     old[1000] ^= 1
     old = bytes(old)
-    for name, owner in (("theirs", 1001), ("mine", 1000)):
-        (source / name).write_bytes(payload)
-        os.chown(source / name, 1000, 1000)
-        (source / name).chmod(0o644)
-        os.utime(source / name, (1_700_000_000, 1_700_000_000))
-        target = destination / name
-        target.write_bytes(old)
-        os.chown(target, owner, owner)
-        target.chmod(0o644)
-        os.utime(target, (1_600_000_000, 1_600_000_000))
-    inodes = {name: (destination / name).stat().st_ino for name in ("theirs", "mine")}
-    command = ["syq", "cp", "--in-place=update", "--copy-metadata=ownership,permissions,mtime",
-               "--srcs-in", str(source), "--into", str(destination), "--no-progress"]
+    for name, metadata, final in (
+        ("ownership", "ownership,permissions,mtime", 1000),
+        ("no-ownership", "permissions,mtime", 0),
+    ):
+        source = root / f"update-{name}-source"
+        destination = root / f"update-{name}-destination"
+        source.mkdir()
+        destination.mkdir()
+        for file, owner in (("theirs", 1001), ("mine", final)):
+            (source / file).write_bytes(payload)
+            os.chown(source / file, 1000, 1000)
+            (source / file).chmod(0o644)
+            os.utime(source / file, (1_700_000_000, 1_700_000_000))
+            target = destination / file
+            target.write_bytes(old)
+            os.chown(target, owner, owner)
+            target.chmod(0o644)
+            os.utime(target, (1_600_000_000, 1_600_000_000))
+        inodes = {file: (destination / file).stat().st_ino for file in ("theirs", "mine")}
+        command = ["syq", "cp", "--in-place=update", f"--copy-metadata={metadata}",
+                   "--srcs-in", str(source), "--into", str(destination), "--no-progress"]
 
-    def replaced(results):
-        return json.loads(results.read_text().splitlines()[-1])["replaced_not_in_place"]
+        def replaced(results):
+            return json.loads(results.read_text().splitlines()[-1])["replaced_not_in_place"]
 
-    preview = root / "update-preview.jsonl"
-    run([*command, "--dry-run", "--results", str(preview)])
-    assert replaced(preview) == {"owner": 1}, replaced(preview)
-    results = root / "update.jsonl"
-    with open(destination / "theirs", "rb") as held:
-        output = run([*command, "--results", str(results)], capture_output=True, text=True)
-        assert held.read() == old
-    summary = "syq: replaced 1 existing file instead of updating it in place: 1 with another owner or group"
-    assert summary in output.stdout, output
-    assert replaced(results) == {"owner": 1}, replaced(results)
-    for name, kept in (("theirs", False), ("mine", True)):
-        status = (destination / name).stat()
-        assert (status.st_ino == inodes[name], status.st_uid) == (kept, 1000), (name, status)
-        assert (destination / name).read_bytes() == payload, name
-    print("Root updates in place only files whose owner the copy keeps", flush=True)
+        preview = root / f"update-{name}-preview.jsonl"
+        run([*command, "--dry-run", "--results", str(preview)])
+        assert replaced(preview) == {"owner": 1}, (name, replaced(preview))
+        results = root / f"update-{name}.jsonl"
+        with open(destination / "theirs", "rb") as held:
+            output = run([*command, "--results", str(results)], capture_output=True, text=True)
+            assert held.read() == old, name
+        summary = "syq: replaced 1 existing file instead of updating it in place: 1 with another owner or group"
+        assert summary in output.stdout, (name, output)
+        assert replaced(results) == {"owner": 1}, (name, replaced(results))
+        for file, kept in (("theirs", False), ("mine", True)):
+            status = (destination / file).stat()
+            assert (status.st_ino == inodes[file], status.st_uid) == (kept, final), (name, file, status)
+            assert (destination / file).read_bytes() == payload, (name, file)
+    print("Root updates in place only files that already have the owner they end with", flush=True)
 
 
 def main():

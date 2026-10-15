@@ -4737,20 +4737,32 @@ impl Planner<'_> {
         }
         let meta = self.opts.metadata_for(rel, source);
         let flags = self.opts.flags_for(rel);
-        // As for a metadata change (`must_replace`): root decides by the
-        // change, anyone else needs the file owned as its files show.
-        // Without the receiving account, or whom its files show, the
-        // receiver decides alone.
+        // The file must be owned as the files the receiver creates show, or,
+        // for root, already by the owner and group it ends with: without -o
+        // or -g, those a new file would get (`vouch::owner_vouches`). Its
+        // owner could read what is written. Without the receiving account,
+        // or whom its files show, the receiver decides alone.
         let receiver = self.receiver_uid().ok();
         if let Some(uid) = receiver {
-            let owner = if uid == 0 {
-                (flags & flags::OWNER != 0 && destination.uid != meta.uid)
-                    || (flags & flags::GROUP != 0 && destination.gid != meta.gid)
-            } else {
-                let dry_run = self.opts.dry_run;
-                self.new_file_owner(dst)
-                    .and_then(|new_file| new_file.owner.or(dry_run.then_some(uid)))
-                    .is_some_and(|created| destination.uid != created)
+            let dry_run = self.opts.dry_run;
+            let new_file = self.new_file_owner(dst);
+            let created = new_file.and_then(|new_file| new_file.owner.or(dry_run.then_some(uid)));
+            let owner = match (created, new_file) {
+                (Some(created), Some(new_file)) if uid == 0 => {
+                    let final_owner = if flags & flags::OWNER != 0 {
+                        meta.uid
+                    } else {
+                        created
+                    };
+                    destination.uid != final_owner
+                        || if flags & flags::GROUP != 0 {
+                            destination.gid != meta.gid
+                        } else {
+                            self.new_file_group_may_differ(dst, destination.gid, new_file)
+                        }
+                }
+                (Some(created), _) => destination.uid != created,
+                (None, _) => false,
             };
             if owner {
                 return Some(Owner);

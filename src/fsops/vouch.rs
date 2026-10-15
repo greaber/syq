@@ -37,8 +37,11 @@
 //!
 //! `--in-place=update` writes new contents into an existing file only when
 //! the receiver can vouch for it in the same way, whatever its metadata
-//! change, and when no one who can open it now could not once the copy
-//! gives it its final metadata (`update_refusal`). Anyone who opened it
+//! change, with root's owner test that of a file to get new names: the
+//! owner can read what is written, so root writes only into a file that
+//! already has the owner and group it ends with. No one who can open the
+//! file now may be unable to once the copy gives it its final metadata
+//! (`update_refusal`). Anyone who opened it
 //! earlier, or opens it while it is written, can still read what the copy
 //! writes: the option's documented tradeoff.
 
@@ -251,8 +254,10 @@ pub(super) fn refusal(
 /// Whether the receiver may write new contents into `file`, the existing
 /// file at `place`, in place (`--in-place=update`), to finalize it with
 /// `meta` under `flags`, and if not, why. It must pass the checks for any
-/// metadata change (`refusal`), and as a hard-link representative the
-/// owner check (`require`), have no set-ID bit or file capability,
+/// metadata change (`refusal`) and, for root or as a hard-link
+/// representative, the owner check (`owner_vouches`): root writes only into
+/// a file that already has the owner and group it ends with. It must have
+/// no set-ID bit or file capability,
 /// which writing it would take away, and let no one read or write it whom
 /// its final permissions do not: its permission bits must be among the
 /// final ones, its group the final one or unable to read it, and its ACL
@@ -270,11 +275,16 @@ pub(crate) fn update_refusal(
     if let Some(refused) = refusal(place, file, current, meta, flags)? {
         return Ok(Some(refused));
     }
-    // As `require` asks of a hard-link representative, whatever changes.
-    if flags & flags::REPORT_IDENTITY != 0 && !owner_vouches(place, current, meta, flags) {
+    // Root decides metadata changes by the change, which writes no data.
+    // New contents would be readable by the file's owner, so root writes
+    // them only into a file that already has the owner and group it ends
+    // with, as `require` asks of a hard-link representative.
+    if (is_superuser() || flags & flags::REPORT_IDENTITY != 0)
+        && !owner_vouches(place, current, meta, flags)
+    {
         return Ok(Some((
             Owner,
-            "it is to get new names, and syq did not create it and does not own it as it would",
+            "syq did not create it and it does not have the owner and group the copy gives it",
         )));
     }
     if current.mode() & 0o6000 != 0 || crate::inode_metadata::has_file_capability(file)? {
