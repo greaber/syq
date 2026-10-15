@@ -175,8 +175,8 @@ pub(crate) enum PublicationPolicy {
     AtomicStaged,
     /// The in-place policy of earlier releases, under which a receiver
     /// wrote existing files in place. A receiver now treats it as
-    /// `InPlaceNew`, which allows less, and a receiving machine turns a
-    /// request in it into `InPlaceNew` before approving it.
+    /// `InPlaceNew`, which allows less. A named destination never receives
+    /// it: its requests come only from a matching build.
     InPlace,
     /// `--in-place=new`: new files may be written directly at their final
     /// names, and existing files are replaced as under `AtomicStaged`. A

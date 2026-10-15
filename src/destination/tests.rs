@@ -970,16 +970,7 @@ fn named_requests_accept_in_place_new_and_prune_within_the_machines_limit() {
         accepted.copy.policy.publication,
         crate::delegation::PublicationPolicy::InPlaceNew
     );
-    constrain(accepted.clone(), temporary.path(), 1000, 1000, 0, false).unwrap();
-    // A client from before `--in-place=new` asks in the earlier in-place
-    // policy; the machine approves and carries it out as `--in-place=new`.
-    let mut legacy = accepted;
-    legacy.copy.policy.publication = crate::delegation::PublicationPolicy::InPlace;
-    let constrained = constrain(legacy, temporary.path(), 1000, 1000, 0, false).unwrap();
-    assert_eq!(
-        constrained.copy.policy.publication,
-        crate::delegation::PublicationPolicy::InPlaceNew
-    );
+    constrain(accepted, temporary.path(), 1000, 1000, 0, false).unwrap();
 
     // Without --max-delete, the request may delete what this machine allows.
     let mut pruning = args(&temporary.path().join("source"), "output");

@@ -1504,6 +1504,15 @@ impl RestrictedAuthority {
     /// staged and published without replacing anything, so that no one
     /// sees it partly written, unless this grant created it.
     pub(super) fn constrain_inplace(&self, path: &[u8]) -> Result<()> {
+        // In place, the receiver creates the file when its name is free,
+        // and the name can become free after any check here: only a grant
+        // that lets the copy replace and create alike allows that.
+        if self.copy.policy.existing != ExistingDestinationPolicy::Replace {
+            bail!(
+                "signed grant does not let {} be created or replaced freely: it is not written in place",
+                String::from_utf8_lossy(path)
+            );
+        }
         let root_must_be_new =
             self.root_existence == RootExistence::New && path == self.destination;
         if root_must_be_new && !self.created_by_this_grant(path) {
@@ -2839,13 +2848,16 @@ impl RestrictedAuthority {
                         bail!("expected-hash files require checked finalization");
                     }
                     self.charge_bytes(&put.path, 0, put.data.len())?;
+                    if put.inplace {
+                        self.constrain_inplace(&put.path)?;
+                    }
                     self.constrain_creation(&put.path, &mut put.condition, false, index, pending)?;
                     outcomes.push(PendingOutcome::Logical {
                         index,
                         path: put.path.clone(),
                         action: crate::receipt::OperationAction::PublishFile {
                             size: put.data.len() as u64,
-                            inplace: false,
+                            inplace: put.inplace,
                         },
                     });
                     touched.push(put.path.clone());

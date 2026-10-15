@@ -7073,6 +7073,118 @@ fn both_receivers_put_small_files_in_place_only_when_new() {
     }
 }
 
+/// In place, the receiver creates a file whose name is free, and a name can
+/// become free after any check: a grant that does not let the copy both
+/// replace and create refuses in-place work, here one that changes only
+/// existing files.
+#[test]
+fn in_place_work_needs_a_grant_that_replaces_and_creates() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("existing"), b"old").unwrap();
+    let authority = test_authority_with_existence(
+        &root,
+        DeletionPolicy::Forbid,
+        1 << 20,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::InPlaceNew,
+        ExistingDestinationPolicy::MustExist,
+        DestinationPlacement::ExactPath,
+        RootExistence::Any,
+    )
+    .unwrap();
+    let path = path_bytes(&target.join("existing"));
+    let mut prepare = Request::Prepare {
+        path: path.clone(),
+        size: 3,
+        inplace: true,
+        copy_id: [6; 16],
+        mode: 0o644,
+        flags: 0,
+        acl: false,
+        scanned: proto::ScannedDestination::Unknown,
+        attempt: 0,
+        create_if_missing: true,
+        guard: None,
+        group: None,
+    };
+    let error = authority.authorize(&mut prepare, false).unwrap_err();
+    assert!(
+        error.to_string().contains("not written in place"),
+        "{error:#}"
+    );
+    let Request::PutSmallBatch(mut puts) = small_put(&target.join("existing")) else {
+        unreachable!()
+    };
+    puts[0].inplace = true;
+    let error = authority
+        .authorize(&mut Request::PutSmallBatch(puts), false)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("not written in place"),
+        "{error:#}"
+    );
+}
+
+/// A small file put in place is recorded as written in place.
+#[test]
+fn receipts_record_small_files_put_in_place() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let (secret, policy) = encrypted_policy(true);
+    let authority = test_authority_with_receipt(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::InPlaceNew,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::ExactPath,
+        RootExistence::Any,
+        Some((key, policy.clone())),
+    )
+    .unwrap();
+    let Request::PutSmallBatch(mut puts) = small_put(&target.join("new")) else {
+        unreachable!()
+    };
+    puts[0].inplace = true;
+    let mut request = Request::PutSmallBatch(puts);
+    let settlement = authority.authorize(&mut request, false).unwrap();
+    fs::write(target.join("new"), b"new").unwrap();
+    authority.settle(settlement, &proto::Response::Applied(vec![None]));
+    let mut verified = open_issued(&authority, &secret, &policy);
+    let mut records = Vec::new();
+    verified
+        .for_each_record(|record| {
+            records.push(record);
+            Ok(())
+        })
+        .unwrap();
+    let action = records
+        .iter()
+        .find_map(|record| match record {
+            crate::receipt::ReceiptRecord::Operation(operation) if operation.path == b"new" => {
+                Some(operation.action)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{records:?}"));
+    assert_eq!(
+        action,
+        crate::receipt::OperationAction::PublishFile {
+            size: 3,
+            inplace: true
+        }
+    );
+}
+
 #[test]
 fn both_receivers_restore_set_id_bits_after_writing_in_place() {
     // Writes clear an existing file's set-ID bits. Without word from the
