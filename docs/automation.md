@@ -139,7 +139,10 @@ or `destination_only`.
 For filesystem copies of regular files, `content_differs` means sizes or compared
 hashes differ;
 `metadata_differs` also covers copies selected by the metadata quick check.
-A `transfer_file` trace omits `bytes` when only metadata would change.
+A `transfer_file` trace omits `bytes` when only metadata would change in
+place. A file whose metadata syq would change by replacing it (see
+[Copy metadata](reference.md#copy-metadata)) has `metadata_differs` with its
+`bytes`, and counts as transferred.
 
 A trace cannot be matched by identity to a later live operation: the filesystem
 may change between runs.

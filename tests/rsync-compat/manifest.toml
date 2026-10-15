@@ -272,7 +272,7 @@ platforms = ["linux"]
 run_as = "root"
 tags = ["local", "inplace", "permissions"]
 requirements = ["root", "Linux fs.protected_regular"]
-note = "--inplace can update a foreign-owned file in a sticky directory when the caller has authority."
+note = "As root, --inplace updates a foreign-owned file in a sticky directory by replacing it through a staging file."
 
 [[tests]]
 name = "sender-scan-dir-escape"

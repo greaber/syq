@@ -404,10 +404,10 @@ syq cp --in-place=new large-file --to server --into /backup
 
 This avoids a temporary name and a rename for each new file. Readers can see
 a new file before it is complete, and an interruption leaves it incomplete
-at its final name; a rerun finishes it. Before giving the file its final
-metadata, syq checks that the name still leads to the file it created, where
-the filesystem's inode numbers can be trusted, and reports the file as failed
-if it does not.
+at its final name; a rerun finishes it. Once the file has its final metadata,
+syq checks that the name still leads to the file it created, where the
+filesystem's inode numbers can be trusted, and reports the file as failed if
+it does not.
 
 An existing file is still replaced as without the option: syq builds the new
 version beside it and renames it over the name. Syq never writes new contents
@@ -455,8 +455,10 @@ Access times, which `atimes` restores, are set in place on any file. A
 replaced file gets a new inode number, needs write permission on its directory
 and room for a second copy, and does not keep attributes the copy does not
 select, such as ACLs or extended attributes without `acls` or `xattrs`. Syq
-does not trust link counts on SMB, SSHFS, NFS mounted with `nocto`, or
-filesystems it does not recognize, so there a metadata-only change rewrites
+does not trust link counts on SMB, SSHFS and other FUSE filesystems, NFS
+mounted with `nocto`, CephFS mounted with `ino32`, or filesystems it does not
+recognize, nor on macOS anywhere but APFS and HFS+, so its NFS, SMB, FAT and
+exFAT volumes count as untrusted too. There a metadata-only change rewrites
 every affected file, which takes as long as copying it. A dry run counts such
 files as rewritten. Narrowing permissions in place does not cut off a process
 that already has the file open. A symlink, device or named pipe whose metadata

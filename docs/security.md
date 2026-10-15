@@ -82,7 +82,9 @@ files the copy creates. It updates an existing file by building a new one
 beside it and renaming that over the name, so a hard link to the old file
 elsewhere, or someone who already has it open, keeps the old contents. This
 holds with `--in-place=new` too, which writes only new files at their final
-names.
+names. It does not hold for an `--as-fd` output, which syq writes into the
+descriptor it is given, or for directories, whose metadata syq changes in
+place.
 
 Syq changes an existing file's permissions, owner, group, modification time,
 ACLs or extended attributes in place only when the file has no other names, the
@@ -90,10 +92,11 @@ filesystem's link counts can be trusted, the file belongs to the account syq
 runs as (as root: already to the owner and group it ends with), and the change
 adds no set-user-ID or set-group-ID bit or file capability. Otherwise syq
 replaces the file as if its contents had changed. So a hard link planted in the
-destination never takes the copy's metadata, and root never gives a file
-another user planted there the source's owner or permissions, even when its
-size and time match the source's. A symlink, device or named pipe whose
-metadata changes is created again with it. Narrowing a file's permissions in
+destination never takes the copy's metadata, other than the access time that
+`--copy-metadata=atimes` restores in place on any file, and root never gives
+a file another user planted there the source's owner or permissions, even
+when its size and time match the source's. A symlink, device or named pipe
+whose metadata changes is created again with it. Narrowing a file's permissions in
 place does not cut off someone who already has it open, though they can read
 only the contents they could read before.
 

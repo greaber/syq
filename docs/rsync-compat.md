@@ -17,7 +17,7 @@ See [`syq rsync`](commands/rsync.md) for all accepted options.
 | Read-only destination directories | Like rsync, briefly adds owner access to directories the copy includes, but always restores each one's exact mode; rsync can leave owner read and search added. `--syq-widen-dirs=none` or `all` widens nothing or more ([details](reference.md#copy-metadata)) |
 | Resume | Keeps syq partial files a later copy can resume from; cannot reuse rsync partials |
 | `--inplace` | Writes only new files at their final names. An existing file is still replaced through a staging file and gets a new inode, so its other hard links and open readers keep the old contents |
-| Metadata-only changes | Made in place only to a file with no other names that belongs to the receiving account (as root: already to its final owner and group); other files are replaced and get a new inode ([details](reference.md#copy-metadata)) |
+| Metadata-only changes | Made in place only to a file with no other names that belongs to the receiving account (as root: already to its final owner and group), on a filesystem whose link counts syq trusts; other files are replaced and get a new inode. Access times (`-U`) are restored in place on any file ([details](reference.md#copy-metadata)) |
 | Delta transfer | Reuses matching blocks at the same offsets in the corresponding destination file; shifted blocks are not matched. Local copies default to whole-file and remote copies to block reuse. `-W` / `--whole-file` disables reuse; `--no-W` / `--no-whole-file` enables it |
 | `--rsync-path PATH` | Exact syq executable path, not a shell fragment |
 | Remote-to-remote | Refused; use native `syq cp` |

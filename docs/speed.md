@@ -137,12 +137,12 @@ details, units, and supported routes.
 
 <a id="options-that-change-the-tradeoff"></a>
 
-## Compression and in-place writes
+<a id="compression-and-in-place-writes"></a>
+
+## Compression
 
 `--no-compress` can help when compression costs more CPU time than it saves
-in network traffic; see [Transport compression](reference.md#transport-compression). `--in-place=new` writes new
-files at their final names, but shows readers incomplete files. Read
-[in-place writes](reference.md#in-place-writes) before using it.
+in network traffic; see [Transport compression](reference.md#transport-compression).
 
 <a id="how-many-connections"></a>
 <a id="benchmark-tuning"></a>
