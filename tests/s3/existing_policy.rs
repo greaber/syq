@@ -562,3 +562,72 @@ fn update_if_older_uses_service_time_for_foreign_objects() {
         );
     }
 }
+
+/// A destination file that holds its object's contents, but whose metadata
+/// the receiver cannot change in place, here because it has another name,
+/// is replaced by a copy of itself, checked against the object's hash where
+/// one is known: nothing is downloaded for it, the other name keeps the old
+/// file, and a preview counts it as a metadata change.
+#[test]
+fn matching_downloads_that_cannot_change_in_place_are_replaced_without_downloading() {
+    for (fault, extra, time, downloads) in [
+        (
+            "existing-policy-hash-blake3",
+            &["--copy-metadata=mtime", "--if-exists=error-if-different"][..],
+            20,
+            false,
+        ),
+        (
+            "existing-policy-nohash-once",
+            &["--copy-metadata=mtime", "--if-exists=error-if-different"][..],
+            20,
+            true,
+        ),
+        (
+            "existing-policy",
+            &["--copy-metadata=permissions"][..],
+            10,
+            false,
+        ),
+    ] {
+        let temp = test_support::tempdir().unwrap();
+        let dest = temp.path().join("destination");
+        file(&dest, b"stored", time);
+        std::fs::hard_link(&dest, temp.path().join("outside")).unwrap();
+        let mut args = vec!["--from", "s3://bucket", "object", "--as", "destination"];
+        args.extend_from_slice(extra);
+
+        let server = Server::start(fault);
+        let mut preview = args.clone();
+        preview.extend(["--dry-run", "--results", "results.jsonl"]);
+        let output = server.cp(temp.path(), &preview);
+        assert!(output.status.success(), "{fault}: {}", output_text(&output));
+        let traces: Vec<_> = parsed_results(temp.path())
+            .into_iter()
+            .filter(|record| record["action"] == "transfer_file")
+            .collect();
+        assert_eq!(traces.len(), 1, "{fault}: {traces:?}");
+        assert_eq!(
+            traces[0]["reason"], "metadata_differs",
+            "{fault}: {traces:?}"
+        );
+
+        let server = Server::start(fault);
+        let output = server.cp(temp.path(), &args);
+        assert!(output.status.success(), "{fault}: {}", output_text(&output));
+        assert_eq!(server.gate.0.load(Ordering::Relaxed), downloads, "{fault}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"stored");
+        let replaced = std::fs::metadata(&dest).unwrap();
+        let outside = std::fs::metadata(temp.path().join("outside")).unwrap();
+        assert_ne!(replaced.ino(), outside.ino(), "{fault}");
+        assert_eq!(replaced.mtime(), 10, "{fault}");
+        assert_eq!(
+            (outside.mtime(), outside.mode() & 0o777),
+            (time as i64, 0o600),
+            "{fault}"
+        );
+        if extra.contains(&"--copy-metadata=permissions") {
+            assert_eq!(replaced.mode() & 0o777, 0o640, "{fault}");
+        }
+    }
+}

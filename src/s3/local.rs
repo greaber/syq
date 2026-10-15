@@ -753,6 +753,9 @@ pub(super) fn symlink_metadata(
     if args.group || explicit.gid.is_some() {
         selected |= flags::GROUP;
     }
+    if explicit.gid.is_some() {
+        selected |= flags::REQUIRE_GROUP;
+    }
     if (copied && args.times) || args.copy_mtime_metadata || explicit.mtime.is_some() {
         selected |= flags::TIMES;
     }

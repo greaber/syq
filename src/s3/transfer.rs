@@ -117,6 +117,9 @@ pub(super) struct Engine {
     /// What new downloaded files' directories let them have.
     file_permissions: std::sync::Mutex<local::CreationPermissions>,
     outage: Arc<super::outage::Outage>,
+    /// Destinations a preview found unchanged that the copy would replace
+    /// to change their metadata (`replace_from_local`), for their reason.
+    metadata_replacements: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 impl Drop for Engine {
     fn drop(&mut self) {
@@ -284,6 +287,7 @@ impl Engine {
             copy_checksum_unsupported: Default::default(),
             content_md5: content_md5.into(),
             file_permissions: Default::default(),
+            metadata_replacements: Default::default(),
             copy_tagging_unsupported: Default::default(),
             outage,
         }))
@@ -731,13 +735,18 @@ impl Engine {
                 }
                 if let Some(writer) = self.progress.results_writer() {
                     if self.args.dry_run {
+                        let reason = if self.metadata_replacements.lock().unwrap().contains(dst) {
+                            "metadata_differs"
+                        } else {
+                            "content_differs"
+                        };
                         writer.emit_trace(&crate::results::TraceRecord {
                             action,
                             src: Some(src),
                             dst: dst.as_bytes(),
                             kind: kind.as_str(),
                             bytes: Some(*bytes),
-                            reason: "content_differs",
+                            reason,
                         });
                     } else {
                         writer.emit_operation_expected(
@@ -2634,6 +2643,8 @@ impl Engine {
             return Ok(Some(bytes.len() as u64));
         }
         let mut unchanged = false;
+        // The digest of the existing file that matched the object's.
+        let mut compared = None;
         if let Some(m) = existing.filter(|m| m.is_file() && m.len == object.size) {
             unchanged = !self.args.checksum
                 && explicit.mtime.is_none()
@@ -2643,7 +2654,8 @@ impl Engine {
                     || self.args.protects_existing_contents()
                     || self.stored_comparison_hash(&object).is_some())
             {
-                unchanged = self.verify_download(root, &path, &object).await?;
+                compared = self.verify_download(root, &path, &object).await?;
+                unchanged = compared.is_some();
             }
         }
         anyhow::ensure!(
@@ -2658,16 +2670,37 @@ impl Engine {
                 .is_ok();
         }
         // A file whose metadata the receiver cannot change in place is
-        // downloaded again to replace it; a kept one gets its metadata now.
-        if unchanged {
-            unchanged = local::keep_unchanged_file(
+        // replaced by a checked copy of itself; a kept one gets its
+        // metadata now.
+        if unchanged
+            && !local::keep_unchanged_file(
                 root,
                 &path,
                 &metadata,
                 &self.args,
                 explicit,
                 self.args.dry_run,
-            )?;
+            )?
+        {
+            if self.args.dry_run {
+                self.metadata_replacements
+                    .lock()
+                    .unwrap()
+                    .insert(job.path.clone());
+                self.progress.add_bytes(object.size);
+                return Ok(Some(object.size));
+            }
+            let mode = existing.map(|m| m.mode & 0o7777);
+            return self
+                .replace_from_local(
+                    root,
+                    &path,
+                    &object,
+                    (&metadata, expected_hash, explicit),
+                    mode,
+                    compared,
+                )
+                .await;
         }
         if unchanged {
             if self.args.dry_run {
@@ -2758,7 +2791,11 @@ impl Engine {
             }
             None => None,
         };
-        let (mut record, file) = self.new_download_state(root, &job.path, &object, &state)?;
+        // With a donor, the record keeps naming the earlier partial until
+        // the new one holds its parts: a failure in between leaves the
+        // earlier run's progress for the next.
+        let (mut record, file) =
+            self.new_download_state(root, &job.path, &object, &state, donor.is_none())?;
         let mut seeded = std::collections::BTreeSet::new();
         if let Some((old, donor)) = donor {
             let size = object.size;
@@ -2774,7 +2811,16 @@ impl Engine {
                     (algorithm, new_algorithm),
                 )
             })
-            .await??;
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|copied| copied);
+            let copied = match copied {
+                Ok(copied) => copied,
+                Err(error) => {
+                    remove_partial(root, &record)?;
+                    return Err(error);
+                }
+            };
             for (index, hash) in copied {
                 record.parts.insert(index, hash);
                 seeded.insert(index);
@@ -3069,6 +3115,7 @@ impl Engine {
         path: &str,
         object: &Object,
         state: &State,
+        save: bool,
     ) -> Result<(DownloadState, File)> {
         let parent = path.rsplit_once('/').map_or("", |(p, _)| p);
         let mut random = [0u8; 16];
@@ -3089,7 +3136,9 @@ impl Engine {
             parts: BTreeMap::new(),
             hash_algorithm: self.args.hash_algorithm,
         };
-        state.save(&record)?;
+        if save {
+            state.save(&record)?;
+        }
         Ok((record, file))
     }
     async fn get_small(
@@ -3127,12 +3176,14 @@ impl Engine {
         }
         Ok(bytes)
     }
+    /// Compare the existing file at `path` with `object` by their hashes,
+    /// and return its digest if they match.
     async fn verify_download(
         &self,
         root: &Root,
         path: &RelativePath,
         object: &Object,
-    ) -> Result<bool> {
+    ) -> Result<Option<Digest>> {
         let file = root.open_regular_read(path)?;
         let stored = self.stored_comparison_hash(object);
         let algorithm = stored.map_or(self.args.hash_algorithm, |(algorithm, _)| algorithm);
@@ -3142,7 +3193,112 @@ impl Engine {
             Some((_, hash)) => hash.to_owned(),
             None => self.remote_hash_as(object, algorithm).await?,
         };
-        Ok(actual.eq_ignore_ascii_case(&expected))
+        Ok(actual.eq_ignore_ascii_case(&expected).then(|| Digest {
+            algorithm,
+            value: expected.to_ascii_lowercase(),
+        }))
+    }
+
+    /// Replace the existing file at `path`, found to hold `object`'s
+    /// contents, with a copy of itself that gets `metadata`, without
+    /// downloading anything: the receiver cannot change that file's metadata
+    /// in place (`fsops::vouch`). The copy, cloned where the filesystem
+    /// can, is checked against every hash known for the object (the one
+    /// `compared` matched, a stored one, an expected one); where none is,
+    /// the size and times that showed the file unchanged must hold through
+    /// the copy. It replaces only the file it was copied from.
+    async fn replace_from_local(
+        &self,
+        root: &Root,
+        path: &RelativePath,
+        object: &Object,
+        (metadata, expected_hash, explicit): (&Metadata, Option<&Digest>, crate::mapping::Metadata),
+        mode: Option<u32>,
+        compared: Option<Digest>,
+    ) -> Result<Option<u64>> {
+        let existing = Arc::new(root.open_regular_read(path)?);
+        let before = existing.metadata()?;
+        let target = String::from_utf8_lossy(&path.to_bytes()).into_owned();
+        let parent = target.rsplit_once('/').map_or("", |(parent, _)| parent);
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random)?;
+        let partial = local::join(parent, &super::prune::partial_name(&random));
+        let partial_path = RelativePath::new(partial.as_bytes())?;
+        let staged = Arc::new(root.create_file(&partial_path, 0o600)?);
+        let created = staged.metadata()?;
+        let _cleanup = PartialCleanup {
+            root,
+            path: partial_path.clone(),
+            identity: (created.dev(), created.ino()),
+        };
+        let (donor, output, size) = (existing.clone(), staged.clone(), before.len());
+        tokio::task::spawn_blocking(move || crate::fsops::copy_from_donor(&donor, &output, size))
+            .await??;
+        staged.set_len(size)?;
+        let mut digests: Vec<Digest> = compared.into_iter().collect();
+        if let Some((algorithm, value)) = self.stored_comparison_hash(object) {
+            digests.push(Digest {
+                algorithm,
+                value: value.to_ascii_lowercase(),
+            });
+        }
+        digests.extend(self.download_digests(metadata, expected_hash));
+        digests.dedup();
+        if digests.is_empty() {
+            let after = existing.metadata()?;
+            anyhow::ensure!(
+                (
+                    after.len(),
+                    after.mtime(),
+                    after.mtime_nsec(),
+                    after.ctime(),
+                    after.ctime_nsec()
+                ) == (
+                    before.len(),
+                    before.mtime(),
+                    before.mtime_nsec(),
+                    before.ctime(),
+                    before.ctime_nsec()
+                ),
+                "{} changed while it was copied",
+                target
+            );
+        }
+        for digest in digests {
+            let file = staged.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                use std::io::Seek;
+                let mut reader = &*file;
+                reader.seek(std::io::SeekFrom::Start(0))?;
+                digest.verify_reader(&mut reader)
+            })
+            .await??;
+        }
+        anyhow::ensure!(
+            staged.metadata()?.len() == object.size,
+            "{} no longer has the source's size",
+            target
+        );
+        let label = std::path::PathBuf::from(&target);
+        let writer = staged.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::fsops::check_destination_writes(&writer, &label)
+        })
+        .await??;
+        local::apply_file_metadata(&staged, metadata, &self.args, mode, explicit, || {
+            local::CreationPermissions::shared_for_file(&self.file_permissions, root, path)
+        })?;
+        let published = staged.metadata()?;
+        root.replace_regular_if_same(
+            &partial_path,
+            path,
+            (published.dev(), published.ino()),
+            before.dev(),
+            before.ino(),
+            Some((before.ctime(), before.ctime_nsec() as u32)),
+        )?;
+        self.progress.add_bytes(object.size);
+        Ok(Some(object.size))
     }
 
     fn stored_comparison_hash<'a>(&self, object: &'a Object) -> Option<(HashAlgorithm, &'a str)> {
@@ -3302,11 +3458,17 @@ fn hash_range(file: &File, offset: u64, length: u64, algorithm: HashAlgorithm) -
     }
     Ok(Digest::from_hash(algorithm, &hash.finalize()).value)
 }
-/// Copy into `output` each part of an earlier run's partial `donor` whose
-/// recorded hash (`parts`, by part index, in the first algorithm) its bytes
-/// still match, for a download of `size` bytes in parts of `part_size`.
-/// Each part is read once and written as read. Returns the parts copied,
-/// with their hashes in the second algorithm, the new record's.
+
+/// The bytes a seeded part is hashed in at a time.
+const SEED_HASH_CHUNK: usize = 1 << 20;
+
+/// Copy into the new partial `output` the parts of an earlier run's partial
+/// `donor` that its record vouches for, and return each kept part's hash in
+/// `new_algorithm`. The donor is only a hint: each part is hashed as the new
+/// partial now holds it, in bounded pieces, and one that does not match its
+/// record is not kept, so that a download overwrites it. The donor is cloned
+/// where the filesystem can, and its parts are otherwise copied in the
+/// kernel or through a bounded buffer.
 fn seed_download_parts(
     donor: &File,
     output: &File,
@@ -3314,39 +3476,53 @@ fn seed_download_parts(
     parts: &BTreeMap<u64, String>,
     (algorithm, new_algorithm): (HashAlgorithm, HashAlgorithm),
 ) -> Result<Vec<(u64, String)>> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SYQ_TEST_FAIL_DOWNLOAD_SEED").is_some() {
+        bail!("injected download seeding failure");
+    }
+    let cloned = crate::fsops::clone_donor(donor, output, size.min(donor.metadata()?.len()));
+    let mut buffer = vec![0; SEED_HASH_CHUNK.min(part_size as usize)];
     let mut copied = Vec::new();
-    let mut buffer = Vec::new();
     for (&index, hash) in parts {
         let offset = index.saturating_mul(part_size);
         if offset >= size {
             continue;
         }
-        let length = part_size.min(size - offset) as usize;
-        buffer.resize(length, 0);
-        if donor.read_exact_at(&mut buffer, offset).is_err() {
+        let length = part_size.min(size - offset);
+        if !cloned {
+            crate::fsops::copy_donor_range(donor, output, offset, offset + length)?;
+        }
+        let mut recorded = algorithm.hasher();
+        let mut converted = (new_algorithm != algorithm).then(|| new_algorithm.hasher());
+        let mut done = 0;
+        while done < length {
+            let piece = (length - done).min(buffer.len() as u64) as usize;
+            output.read_exact_at(&mut buffer[..piece], offset + done)?;
+            recorded.update(&buffer[..piece]);
+            if let Some(converted) = &mut converted {
+                converted.update(&buffer[..piece]);
+            }
+            done += piece as u64;
+        }
+        if Digest::from_hash(algorithm, &recorded.finalize()).value != *hash {
             continue;
         }
-        if Digest::hash_bytes(algorithm, &buffer).value != *hash {
-            continue;
-        }
-        output.write_all_at(&buffer, offset)?;
-        let hash = if new_algorithm == algorithm {
-            hash.clone()
-        } else {
-            Digest::hash_bytes(new_algorithm, &buffer).value
+        let hash = match converted {
+            Some(converted) => Digest::from_hash(new_algorithm, &converted.finalize()).value,
+            None => hash.clone(),
         };
         copied.push((index, hash));
     }
     Ok(copied)
 }
-
+/// Remove the partial `record` names if its name still leads to the file
+/// recorded; anything else there is not this download's, and is left alone.
 fn remove_partial(root: &Root, record: &DownloadState) -> Result<()> {
     let path = RelativePath::new(record.partial.as_bytes())?;
     if let Some(m) = root.metadata_optional(&path)? {
-        if m.dev != record.dev || m.ino != record.ino || !m.is_file() || m.nlink != 1 {
-            bail!("obsolete partial changed identity; refusing to remove it");
+        if (m.dev, m.ino) == (record.dev, record.ino) && m.is_file() && m.nlink == 1 {
+            root.unlink(&path)?;
         }
-        root.unlink(&path)?;
     }
     Ok(())
 }

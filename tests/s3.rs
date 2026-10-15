@@ -2584,6 +2584,114 @@ fn s3_multipart_download_reads_a_recorded_partial_only_as_a_donor() {
     assert!(!partial.exists(), "the donor is removed once it is read");
 }
 
+/// The recovery record of a failed multipart download in `temp`, with its
+/// path.
+fn recovery_record(temp: &Path) -> (std::path::PathBuf, serde_json::Value) {
+    let record = std::fs::read_dir(temp.join("cache/syq/s3"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .expect("failed publication keeps its completed ranges");
+    let saved = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    (record, saved)
+}
+
+/// A stale record whose partial's name now holds another file does not
+/// stop a retry: that file is left alone, and the download starts afresh.
+#[test]
+fn s3_stale_recovery_record_leaves_another_file_at_its_partial_name() {
+    // The first attempt fails before publication; the retry may request
+    // every range again.
+    let server = Server::start("prefix-recovery-fresh");
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("download")).unwrap();
+    let args = [
+        "--from",
+        "s3://bucket",
+        "--srcs-in",
+        "data",
+        "--into",
+        "download",
+    ];
+    let first = server.cp(temp.path(), &args);
+    assert!(!first.status.success(), "{}", output_text(&first));
+    let (record, mut saved) = recovery_record(temp.path());
+    saved["etag"] = serde_json::json!("\"an earlier version\"");
+    std::fs::write(&record, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let partial = temp.path().join("download").join(
+        saved["partial"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap(),
+    );
+    std::fs::remove_file(&partial).unwrap();
+    std::fs::write(&partial, b"someone else's").unwrap();
+    let retry = server.cp(temp.path(), &args);
+    assert!(retry.status.success(), "{}", output_text(&retry));
+    assert_eq!(
+        std::fs::read(temp.path().join("download/file")).unwrap(),
+        vec![b'x'; SIZE]
+    );
+    assert_eq!(std::fs::read(&partial).unwrap(), b"someone else's");
+}
+
+/// When seeding a new partial from the recorded one fails, the record still
+/// names the recorded partial, which is kept, and the new one is removed:
+/// the next attempt resumes from it.
+#[cfg(debug_assertions)]
+#[test]
+fn s3_failed_seeding_keeps_the_recorded_partial_for_the_next_attempt() {
+    let server = Server::start("prefix-recovery-first");
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("download")).unwrap();
+    let args = [
+        "--from",
+        "s3://bucket",
+        "--srcs-in",
+        "data",
+        "--into",
+        "download",
+    ];
+    let first = server.cp(temp.path(), &args);
+    assert!(!first.status.success(), "{}", output_text(&first));
+    let (record, saved) = recovery_record(temp.path());
+    let names = || {
+        let mut names: Vec<_> = std::fs::read_dir(temp.path().join("download"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = names();
+    let failed = server
+        .command(temp.path())
+        .args(["--s3-endpoint", &server.address])
+        .args(args)
+        .env("SYQ_TEST_FAIL_DOWNLOAD_SEED", "1")
+        .capture_output()
+        .unwrap();
+    assert!(!failed.status.success(), "{}", output_text(&failed));
+    let (_, kept) = recovery_record(temp.path());
+    assert_eq!(kept, saved, "the record changed");
+    assert_eq!(names(), before, "a partial was orphaned or lost");
+    server.requests.store(0, Ordering::Relaxed);
+    let retry = server.cp(temp.path(), &args);
+    assert!(retry.status.success(), "{}", output_text(&retry));
+    assert_eq!(
+        std::fs::read(temp.path().join("download/file")).unwrap(),
+        vec![b'x'; SIZE]
+    );
+    // Discovery HEAD + LIST, identity HEAD, final HEAD: nothing downloaded.
+    assert_eq!(server.requests.load(Ordering::Relaxed), 4);
+    assert!(!record.exists());
+}
+
 #[test]
 fn s3_invalid_initial_ranges_never_publish_a_fresh_download() {
     for fault in ["ignore-range", "etag", "corrupt", "truncated"] {

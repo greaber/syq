@@ -33,6 +33,38 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 mod apply;
 mod basis_copy;
+
+/// Copy the first `len` bytes of `input` into `output`, which this receiver
+/// created: by cloning where the filesystem can, or else by copying `input`'s
+/// data in the kernel or through a bounded buffer, keeping its holes.
+pub(crate) fn copy_from_donor(input: &File, output: &File, len: u64) -> Result<()> {
+    basis_copy::seed(input, output, len, || Ok(()))
+}
+
+/// Clone all of `input` into `output`, if the filesystem can.
+pub(crate) fn clone_donor(input: &File, output: &File, len: u64) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        basis_copy::try_clone(input, output, len)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (input, output, len);
+        false
+    }
+}
+
+/// Copy the bytes of `input` from `start` to `end` to the same offsets of
+/// `output`, in the kernel where it can, else through a bounded buffer. A
+/// shorter `input` leaves the rest as it was.
+pub(crate) fn copy_donor_range(
+    input: &File,
+    output: &File,
+    start: u64,
+    end: u64,
+) -> io::Result<()> {
+    basis_copy::copy_extent(input, output, start, end)
+}
 #[cfg(target_os = "linux")]
 mod btrfs;
 mod entry;
