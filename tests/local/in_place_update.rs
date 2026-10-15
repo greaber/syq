@@ -142,7 +142,8 @@ fn a_file_of_ones_own_is_updated_in_place_writing_only_what_changed() {
             assert_eq!(written_bytes(&log), 2 * 64 * 1024, "{route}");
         }
         assert!(partial_files(&t.0).is_empty(), "{route}");
-        assert!(stderr_of(&out).contains(WARNING), "{route}: {out:?}");
+        // `syq rsync --inplace` warns of nothing, as rsync does not.
+        assert!(!stderr_of(&out).contains(WARNING), "{route}: {out:?}");
         assert!(
             !String::from_utf8_lossy(&out.stdout).contains("instead of updating"),
             "{route}: {out:?}"
@@ -480,6 +481,75 @@ fn a_file_only_the_receiver_refuses_is_read_once_there() {
         .map(|line| line.split(' ').nth(1).unwrap().parse::<u64>().unwrap())
         .sum();
     assert_eq!(hashed, 16 << 20);
+}
+
+/// An unchanged file the receiver will not update in place, here because
+/// its ACL is not the one it would end with, is kept as it is, with its
+/// ACL and extended attributes, whether `--hash` compares it or
+/// `--if-exists=error-if-different` does.
+#[cfg(target_os = "linux")]
+#[test]
+fn unchanged_files_the_receiver_will_not_update_are_kept() {
+    let reader = acl(&[
+        (1, 6, u32::MAX),
+        (2, 4, 12345),
+        (4, 4, u32::MAX),
+        (16, 4, u32::MAX),
+        (32, 4, u32::MAX),
+    ]);
+    for route in ["local", "ssh"] {
+        for compare in ["--hash", "--if-exists=error-if-different"] {
+            let t = Tmp::new();
+            let contents = prng(1 << 20, 690);
+            write(&t.path("src/file"), &contents);
+            write(&t.path("dst/file"), &contents);
+            fs::set_permissions(t.path("dst/file"), fs::Permissions::from_mode(0o644)).unwrap();
+            if !set_attribute(&t.path("dst/file"), "system.posix_acl_access", &reader)
+                || !set_attribute(&t.path("dst/file"), "user.keep", b"kept")
+            {
+                eprintln!("skipped: this filesystem has no POSIX ACLs or user attributes");
+                return;
+            }
+            set_mtime(&t.path("src/file"), 1_700_000_000);
+            set_mtime(&t.path("dst/file"), 1_600_000_000);
+            let before = inode(&t.path("dst/file"));
+            let out = cp_update(&t, route, &[compare], &[]);
+            let case = format!("{route}, {compare}");
+            assert_output_ok(&out);
+            assert_eq!(inode(&t.path("dst/file")), before, "{case}");
+            assert_eq!(read(&t.path("dst/file")), contents, "{case}");
+            let attribute = |name: &str| {
+                let path =
+                    std::ffi::CString::new(t.path("dst/file").as_os_str().as_encoded_bytes())
+                        .unwrap();
+                let name = std::ffi::CString::new(name).unwrap();
+                let mut value = vec![0u8; 1024];
+                let count = unsafe {
+                    libc::getxattr(
+                        path.as_ptr(),
+                        name.as_ptr(),
+                        value.as_mut_ptr().cast(),
+                        value.len(),
+                    )
+                };
+                (count >= 0).then(|| value[..count as usize].to_vec())
+            };
+            assert_eq!(
+                attribute("system.posix_acl_access").as_deref(),
+                Some(&reader[..]),
+                "{case}"
+            );
+            assert_eq!(
+                attribute("user.keep").as_deref(),
+                Some(&b"kept"[..]),
+                "{case}"
+            );
+            assert!(
+                !String::from_utf8_lossy(&out.stdout).contains("instead of updating"),
+                "{case}: {out:?}"
+            );
+        }
+    }
 }
 
 /// Without ACL copying, a file whose ACL is the one a new file inherits

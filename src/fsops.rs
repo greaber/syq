@@ -863,6 +863,9 @@ pub struct FsOps {
     /// The permission bits each directory's default ACL lets new files
     /// have, by root and directory, read once per connection.
     creation_permissions: Mutex<receiver_mode::CreationPermissions>,
+    /// The ACL each directory gives new files, read once per connection
+    /// (`inherited_acl`).
+    inherited_acls: Mutex<InheritedAcls>,
     operator_selection: Option<OperatorDirectorySelection>,
     /// Destination ancestors `--widen-dirs=all` widened, restored when the
     /// copy asks or this connection ends.
@@ -890,11 +893,19 @@ struct ComparisonWindow {
     sparse: bool,
 }
 
+/// What each directory gives new files of its ACL, by root identity and
+/// directory, as `receiver_mode::CreationPermissions` keys them.
+type InheritedAcls = HashMap<(u64, u64, Vec<Vec<u8>>), crate::inode_metadata::Inherited>;
+
 struct HeldBasis {
     location: FileLocation,
     label: PathBuf,
     copy_id: CopyId,
     file: File,
+    /// `--in-place=update`'s answer for this file, when the sender asked
+    /// with the comparison: why the receiver will not update it in place,
+    /// if it will not (`vouch::update_refusal`).
+    update_check: Option<Option<vouch::Refusal>>,
 }
 
 struct SourceRootHandle {
@@ -1096,6 +1107,7 @@ impl FsOps {
             inplace_parents: Default::default(),
             narrow_new_directories: false,
             creation_permissions: Default::default(),
+            inherited_acls: Default::default(),
             prepared_small_copy: None,
             patch_stream: None,
             operator_selection: None,

@@ -268,6 +268,7 @@ impl FsOps {
                                     &opened,
                                     &update.meta,
                                     update.flags,
+                                    || self.inherited_acl(target),
                                 )?
                             }
                             Err(_) => None,
@@ -289,18 +290,30 @@ impl FsOps {
                 };
             }
         };
+        let mut checked = None;
         if let Some(compared) = compared {
-            let compared = compared.file.metadata()?;
-            if (compared.dev(), compared.ino()) != (opened.dev(), opened.ino()) {
+            let identity = compared.file.metadata()?;
+            if (identity.dev(), identity.ino()) != (opened.dev(), opened.ino()) {
                 bail!(
                     "destination {} changed after it was compared",
                     target.label.display()
                 );
             }
+            // The comparison asked already, through this file.
+            checked = compared.update_check;
         }
-        if let Some(refused) =
-            vouch::update_refusal(target.into(), &file, &opened, &update.meta, update.flags)?
-        {
+        let refused = match checked {
+            Some(refused) => refused,
+            None => vouch::update_refusal(
+                target.into(),
+                &file,
+                &opened,
+                &update.meta,
+                update.flags,
+                || self.inherited_acl(target),
+            )?,
+        };
+        if let Some(refused) = refused {
             return Err(vouch::replace_required(&target.label, DOING, refused));
         }
         let in_use = stages::hold(
@@ -723,6 +736,7 @@ impl FsOps {
         guard: Option<&ContainerGuard>,
     ) -> Result<(Vec<ContentDigest>, u64)> {
         self.hash_and_hold_window(path, copy_id, 0, block, len, condition, guard, None)
+            .map(|(hashes, len, _)| (hashes, len))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -736,7 +750,7 @@ impl FsOps {
         condition: TargetCondition,
         guard: Option<&ContainerGuard>,
         update: Option<&InPlaceUpdate>,
-    ) -> Result<(Vec<ContentDigest>, u64)> {
+    ) -> Result<(Vec<ContentDigest>, u64, Option<ReplaceReason>)> {
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_FAIL_HASH_BASIS").is_some() {
             bail!("injected retained-basis hash failure");
@@ -750,7 +764,7 @@ impl FsOps {
             .as_ref()
             .map(|target| target.location())
             .unwrap_or_else(|| FileLocation::Path(resolve(path)));
-        let (mut file, location, label) = if off > 0 {
+        let (mut file, location, label, mut update_check) = if off > 0 {
             let held = self
                 .held_basis
                 .take()
@@ -759,34 +773,36 @@ impl FsOps {
                 held.location == location && held.copy_id == *copy_id,
                 "retained comparison basis does not match requested file"
             );
-            (held.file, held.location, held.label)
+            (held.file, held.location, held.label, held.update_check)
         } else if let Some(target) = &rooted {
             (
                 target.root.open_regular_read(&target.relative)?,
                 target.location(),
                 target.label.clone(),
+                None,
             )
         } else {
             let p = resolve(path);
             open_existing_regular(&p, false)
                 .with_context(|| format!("open {} as repair basis", p.display()))
-                .map(|file| (file, FileLocation::Path(p.clone()), p))?
+                .map(|file| (file, FileLocation::Path(p.clone()), p, None))?
         };
         require_open_target(&file, &label, condition)?;
-        // `--in-place=update`: a file the receiver will not update in place
-        // is refused before it is read, and the sender replaces it, comparing
-        // it then.
+        // `--in-place=update`: the sender learns with the hashes whether the
+        // receiver would update the file in place. It finishes a matching
+        // file through its metadata, and replaces a differing one it may not
+        // update from this held file. A preparation to update it then reuses
+        // the answer.
         if let (Some(update), Some(target), 0) = (update, &rooted, off) {
             let current = file.metadata()?;
-            if let Some(refused) =
-                vouch::update_refusal(target.into(), &file, &current, &update.meta, update.flags)?
-            {
-                return Err(vouch::replace_required(
-                    &label,
-                    "update it in place",
-                    refused,
-                ));
-            }
+            update_check = Some(vouch::update_refusal(
+                target.into(),
+                &file,
+                &current,
+                &update.meta,
+                update.flags,
+                || self.inherited_acl(target),
+            )?);
         }
         #[cfg(debug_assertions)]
         record_test_event(
@@ -806,6 +822,7 @@ impl FsOps {
             label,
             copy_id: *copy_id,
             file,
+            update_check,
         });
         #[cfg(debug_assertions)]
         if off == 0 {
@@ -825,7 +842,33 @@ impl FsOps {
             .file
             .metadata()?
             .len();
-        Ok((hashes, held_len))
+        Ok((
+            hashes,
+            held_len,
+            update_check.flatten().map(|(reason, _)| reason),
+        ))
+    }
+
+    /// What a new file at `target` gets of its directory's ACL, read once
+    /// per directory and connection.
+    pub(super) fn inherited_acl(
+        &self,
+        target: &RootedTarget,
+    ) -> Result<crate::inode_metadata::Inherited> {
+        let (parents, _) = target.relative.leaf()?;
+        let identity = target.root.identity();
+        let key = (identity.dev, identity.ino, parents.to_vec());
+        if let Some(inherited) = self.inherited_acls.lock().unwrap().get(&key) {
+            return Ok(inherited.clone());
+        }
+        let inherited =
+            crate::inode_metadata::inherited_acl(&target.root.parent_directory(&target.relative)?)?;
+        let mut cache = self.inherited_acls.lock().unwrap();
+        if cache.len() >= receiver_mode::CREATION_PERMISSION_DIRECTORIES {
+            cache.clear();
+        }
+        cache.insert(key, inherited.clone());
+        Ok(inherited)
     }
 
     pub(super) fn take_held_basis(
@@ -3519,7 +3562,11 @@ impl FsOps {
                 }
                 result
             })()
-            .map(|(hashes, len)| Response::HeldHashes { hashes, len }),
+            .map(|(hashes, len, refused)| Response::HeldHashes {
+                hashes,
+                len,
+                refused,
+            }),
             Request::FinishBasis {
                 expected_hash,
                 path,

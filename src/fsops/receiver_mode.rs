@@ -296,7 +296,7 @@ impl FsOps {
 
 /// Directories whose default ACL a connection remembers before it starts
 /// over.
-const CREATION_PERMISSION_DIRECTORIES: usize = 4096;
+pub(super) const CREATION_PERMISSION_DIRECTORIES: usize = 4096;
 
 /// The permission bits each directory's default ACL lets new files have, by
 /// root identity and directory.

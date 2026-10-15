@@ -262,8 +262,8 @@ pub(super) fn refusal(
 /// its final permissions do not: its permission bits must be among the
 /// final ones, its group the final one or unable to read or write it, and
 /// its ACL the one it ends with: the one the copy gives it, or without ACL
-/// copying the one a new file there would inherit
-/// (`inode_metadata::acl_differs_from_final`). Without `-p` or `-g`, the
+/// copying the one a new file there would inherit from its directory, as
+/// `inherited` gives it (`inode_metadata::acl_differs_from_final`). Without `-p` or `-g`, the
 /// file keeps its mode or group. `current` was read through `file`.
 pub(crate) fn update_refusal(
     place: Place<'_>,
@@ -271,6 +271,7 @@ pub(crate) fn update_refusal(
     current: &fs::Metadata,
     meta: &Meta,
     flags: u8,
+    inherited: impl FnOnce() -> Result<crate::inode_metadata::Inherited>,
 ) -> Result<Option<Refusal>> {
     use ReplaceReason::*;
     if let Some(refused) = refusal(place, file, current, meta, flags)? {
@@ -314,7 +315,7 @@ pub(crate) fn update_refusal(
     if crate::inode_metadata::acl_differs_from_final(
         file,
         meta.inode_metadata.as_deref(),
-        || place.root.parent_directory(place.relative),
+        inherited,
         mode,
     )? {
         return Ok(Some((

@@ -1103,8 +1103,8 @@ pub enum WireRequest<Data> {
         len: u64,
         condition: TargetCondition,
         guard: Option<ContainerGuard>,
-        /// As in `Prepare`: a file the receiver will not update in place is
-        /// refused, with `WireIoKind::ReplaceRequired`, before it is read.
+        /// As in `Prepare`: the receiver says, with the hashes, whether it
+        /// would update the file in place (`Response::HeldHashes::refused`).
         update: Option<Box<InPlaceUpdate>>,
     },
     /// Apply metadata through the retained basis descriptor. If another job
@@ -1681,6 +1681,11 @@ pub enum Response {
     HeldHashes {
         hashes: Vec<ContentDigest>,
         len: u64,
+        /// For a `HashAndHold` with `update`, why the receiver will not
+        /// update the file in place, if it will not. The file is hashed and
+        /// held either way: a matching file needs only its metadata, and a
+        /// differing one is replaced from it.
+        refused: Option<ReplaceReason>,
     },
     Block {
         off: u64,

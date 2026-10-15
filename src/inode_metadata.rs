@@ -829,17 +829,52 @@ pub(crate) fn has_file_capability(file: &File) -> Result<bool> {
     }
 }
 
+/// What a new file in a directory gets of the directory's ACL: on Linux,
+/// its default ACL, if it has one; on macOS, whether any of its entries
+/// pass on to new files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Inherited {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Default(Option<Vec<u8>>),
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Entries(bool),
+    #[cfg_attr(any(target_os = "linux", target_os = "macos"), allow(dead_code))]
+    Nothing,
+}
+
+/// What a new file in `directory` gets of its ACL (`Inherited`).
+pub(crate) fn inherited_acl(directory: &File) -> Result<Inherited> {
+    #[cfg(target_os = "linux")]
+    return Ok(Inherited::Default(platform::get(
+        directory,
+        b"system.posix_acl_default",
+    )?));
+    #[cfg(target_os = "macos")]
+    return Ok(Inherited::Entries(
+        macos_acl::read(directory)?
+            .entries
+            .iter()
+            .any(|entry| entry.flags & MAC_FILE_INHERIT != 0),
+    ));
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = directory;
+        Ok(Inherited::Nothing)
+    }
+}
+
 /// Whether `file`'s ACL differs from the one it ends with, so that one of
 /// them may let in someone the other keeps out: the ACL the copy gives it
 /// (`metadata` selecting ACLs), or else the one a new file there inherits
-/// from its `directory`, with the final `mode` applied either way. An ACL
-/// that only repeats the mode bits counts as none. On macOS, without ACL
-/// copying, any ACL on the file, and any entry its directory passes on to
-/// new files, counts as a difference: the inherited ACL is not worked out.
+/// from its directory (`inherited`, asked only then), with the final `mode`
+/// applied either way. An ACL that only repeats the mode bits counts as
+/// none. On macOS, without ACL copying, any ACL on the file, and any entry
+/// its directory passes on to new files, counts as a difference: the
+/// inherited ACL is not worked out.
 pub(crate) fn acl_differs_from_final(
     file: &File,
     metadata: Option<&InodeMetadata>,
-    directory: impl FnOnce() -> Result<File>,
+    inherited: impl FnOnce() -> Result<Inherited>,
     mode: u32,
 ) -> Result<bool> {
     #[cfg(target_os = "linux")]
@@ -847,7 +882,10 @@ pub(crate) fn acl_differs_from_final(
         let current = platform::extended_access_acl(file)?;
         let wanted = match metadata.and_then(|metadata| metadata.acls.as_ref()) {
             Some(acls) => acls.access.clone(),
-            None => platform::get(&directory()?, b"system.posix_acl_default")?,
+            None => match inherited()? {
+                Inherited::Default(acl) => acl,
+                _ => None,
+            },
         };
         let wanted = wanted
             .map(|acl| platform::access_for_mode(&acl, mode))
@@ -865,16 +903,12 @@ pub(crate) fn acl_differs_from_final(
             } else {
                 &current != wanted
             }),
-            None => Ok(!current.entries.is_empty()
-                || macos_acl::read(&directory()?)?
-                    .entries
-                    .iter()
-                    .any(|entry| entry.flags & MAC_FILE_INHERIT != 0)),
+            None => Ok(!current.entries.is_empty() || inherited()? == Inherited::Entries(true)),
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (file, metadata, directory, mode);
+        let _ = (file, metadata, inherited, mode);
         Ok(false)
     }
 }

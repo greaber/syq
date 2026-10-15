@@ -2312,10 +2312,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         bail!("--coordinate-at currently applies only to copies between two remote endpoints");
     }
     // The copy runs here, not on a remote coordinator, which warns itself.
-    if args.in_place_update && !args.dry_run && !args.quiet {
+    // `syq rsync --inplace` warns of nothing, as rsync does not.
+    if args.in_place_update && !args.dry_run && !args.quiet && args.interface != Interface::Rsync {
         crate::output::diagnostic!(
-            "syq: warning: {}: anyone who already has an existing file open can read its new contents, and an interruption leaves a file partly updated",
-            interface_option(&args, "--in-place=update", "--inplace")
+            "syq: warning: --in-place=update: anyone who already has an existing file open can read its new contents, and an interruption leaves a file partly updated"
         );
     }
     let prepared_source = args.prepared_source.take();

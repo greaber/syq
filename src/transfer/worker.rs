@@ -48,6 +48,9 @@ pub(super) struct BlockDiff {
     pub(super) ranges: Vec<(u64, u64)>,
     pub(super) held_len: Option<u64>,
     pub(super) source_hashes: Vec<ContentDigest>,
+    /// Under `--in-place=update`, why the receiver will not update the held
+    /// file in place, if it will not.
+    pub(super) refused: Option<crate::proto::ReplaceReason>,
 }
 
 impl Worker {
@@ -1215,6 +1218,26 @@ impl Worker {
                         self.finish_matched_basis(idx, &job)?;
                         return Ok((vec![], false));
                     }
+                    // `--in-place=update`: a differing file the receiver will
+                    // not update in place is replaced, from the file it
+                    // holds: a stage is seeded from its matching blocks, so
+                    // it is read for no second comparison.
+                    if let Some(reason) = diff.refused {
+                        self.refuse_in_place(idx, reason);
+                        let job = self.job(idx);
+                        if !reuse_blocks {
+                            self.prepare_file(&job, true)?;
+                            return Ok((full(), true));
+                        }
+                        let prepared = self.prepare_file(&job, false)?;
+                        if prepared.partial_size.is_some() {
+                            return Ok((self.resume_ranges(idx, &job)?, true));
+                        }
+                        return Ok((
+                            self.reuse_blocks(&job, diff.source_hashes, &diff.ranges)?,
+                            true,
+                        ));
+                    }
                     Some(diff)
                 } else {
                     None
@@ -1483,7 +1506,8 @@ impl Worker {
             let destination = self.dst.recv();
             let source = Self::hashes(ok(source?, "hash equality window")?)?;
             let (destination, held_len) =
-                Self::destination_hashes(ok(destination?, "hash retained equality window")?)?;
+                Self::destination_hashes(ok(destination?, "hash retained equality window")?)
+                    .map(|(hashes, len, _)| (hashes, len))?;
             if held_len != Some(job.entry.size)
                 || source.len() as u64 != len.div_ceil(block)
                 || source != destination
@@ -1809,12 +1833,13 @@ impl Worker {
         let source_response = self.src.recv();
         let destination_response = self.dst.recv();
         let source = Self::hashes(ok(source_response?, "hash source")?)?;
-        let (destination, held_len) =
+        let (destination, held_len, refused) =
             Self::destination_hashes(ok(destination_response?, destination_label)?)?;
         Ok(BlockDiff {
             ranges: Self::different_ranges(&source, &destination, block, size),
             source_hashes: source,
             held_len,
+            refused,
         })
     }
 
@@ -1827,14 +1852,22 @@ impl Worker {
 
     pub(super) fn destination_hashes(
         response: Response,
-    ) -> Result<(Vec<ContentDigest>, Option<u64>)> {
+    ) -> Result<(
+        Vec<ContentDigest>,
+        Option<u64>,
+        Option<crate::proto::ReplaceReason>,
+    )> {
         match response {
-            Response::Hashes(hashes) => Ok((hashes, None)),
-            Response::HeldHashes { hashes, len } => Ok((hashes, Some(len))),
+            Response::Hashes(hashes) => Ok((hashes, None, None)),
+            Response::HeldHashes {
+                hashes,
+                len,
+                refused,
+            } => Ok((hashes, Some(len), refused)),
             Response::SeededBasis(SeededBasis {
                 hashes,
                 selected_final: false,
-            }) => Ok((hashes, None)),
+            }) => Ok((hashes, None, None)),
             other => bail!("unexpected response {other:?}"),
         }
     }

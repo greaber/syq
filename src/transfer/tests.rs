@@ -2507,6 +2507,7 @@ fn bandwidth_limited_remote_sources_compare_before_pacing_only_differing_reads()
                 dst.lock().unwrap().replies.push_back(Response::HeldHashes {
                     hashes: vec![[1; 32], [2; 32], [9; 32]],
                     len: 1536,
+                    refused: None,
                 });
             }
             dst.lock().unwrap().replies.extend([

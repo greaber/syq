@@ -7710,8 +7710,12 @@ fn equality_windows_keep_the_same_destination_inode() {
     let second = ops.handle(&request(block));
     match (first, second) {
         (
-            Response::HeldHashes { hashes: a, len: al },
-            Response::HeldHashes { hashes: b, len: bl },
+            Response::HeldHashes {
+                hashes: a, len: al, ..
+            },
+            Response::HeldHashes {
+                hashes: b, len: bl, ..
+            },
         ) => {
             assert_eq!(a, b);
             assert_eq!(al, block * 2);
