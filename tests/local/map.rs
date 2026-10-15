@@ -559,10 +559,6 @@ fn native_map_refusals() {
     );
     refuse(&["d1", "--to", "remotehost"], "unexpected argument '--to'");
     refuse(&["d1", "--ignore", "n"], "unexpected argument '--ignore'");
-    refuse(
-        &["d1", "--receiver-receipt", "sizes"],
-        "unexpected argument '--receiver-receipt'",
-    );
 }
 
 #[test]
@@ -620,7 +616,6 @@ fn native_map_exposes_source_and_manifest_options() {
         "--in-place",
         "--receiver-max-entries",
         "--receiver-max-bytes",
-        "--receiver-receipt",
     ] {
         assert!(
             !declarations.contains(option),

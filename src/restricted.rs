@@ -17,7 +17,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use ssh_key::private::Ed25519Keypair;
 use ssh_key::{LineEnding, PrivateKey};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -115,8 +115,9 @@ struct InstallResponse {
     canonical_root: String,
     canonical_destination: String,
     receiver_path: String,
-    /// OpenSSH public key of the receipt signing key hostB generated for
-    /// this enrollment; the local side verifies receipts against it.
+    /// OpenSSH public key of the signing key hostB generated for this
+    /// enrollment; the local side verifies the header of hostB's results
+    /// with it. Stored enrollments keep the field's original name.
     receipt_public_key: String,
     change: String,
 }
@@ -168,13 +169,12 @@ pub(crate) struct PreparedTransfer {
     pub(crate) canonical_destination: Vec<u8>,
     pub(crate) grant: String,
     pub(crate) enrollment_id: EnrollmentId,
-    /// The nonce the grant was signed with; the receipt must name it.
+    /// The nonce the grant was signed with; the results must name it.
     pub(crate) request_id: RequestId,
-    /// Verifier for the receipt hostB will issue.
-    pub(crate) receipt_public_key: String,
-    /// Attached transfers keep this ephemeral HPKE key only until settlement.
-    pub(crate) receipt_recipient_secret: Option<crate::receipt::RecipientSecret>,
-    pub(crate) receipt_policy: crate::receipt::ReceiptPolicy,
+    /// Verifier for the header of hostB's results.
+    pub(crate) results_public_key: String,
+    /// This copy's recipient key for hostB's results, named in the grant.
+    pub(crate) recipient_secret: crate::destination_results::RecipientSecret,
     pub(crate) grant_digest: [u8; 32],
 }
 

@@ -123,10 +123,7 @@ pub(crate) fn replace_required(
 /// Why `error` says the file must be replaced (`replace_required`), if it
 /// does.
 pub(crate) fn replace_reason(error: &anyhow::Error) -> Option<ReplaceReason> {
-    error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<WireError>())
-        .and_then(replace_reason_wire)
+    crate::conn::wire_error_of(error).and_then(replace_reason_wire)
 }
 
 /// Whether `error` says the file must be replaced (`replace_required`).

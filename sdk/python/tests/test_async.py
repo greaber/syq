@@ -68,7 +68,6 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             hash=True,
             receiver_max_entries=100,
             receiver_max_bytes="2G",
-            receiver_receipt="sizes",
             pscope="scope",
             on_event=observe,
         )
@@ -89,11 +88,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--follow-dst", self.argv())
         self.assertIn("--receiver-max-entries", self.argv())
         self.assertIn("--receiver-max-bytes", self.argv())
-        self.assertIn("--receiver-receipt", self.argv())
         self.assertIn("--pscope", self.argv())
-        self.assertEqual(
-            self.argv()[self.argv().index("--receiver-receipt") + 1], "sizes"
-        )
         self.assertEqual(self.argv().count("--src"), 2)
 
         prune = await self.client.cp(
@@ -172,20 +167,6 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         finally:
             sink.close()
             os.close(read_fd)
-
-    async def test_results_preserves_receiver_attested_records(self) -> None:
-        output = io.BytesIO()
-        client = syq.AsyncClient(
-            executable=self.executable,
-            env={**self.env, "SYQ_FAKE_SHAPE": "attested"},
-        )
-
-        result = await client.cp("source", into="target", results=output)
-
-        records = [json.loads(line) for line in output.getvalue().splitlines()]
-        self.assertEqual(records[-2]["type"], "final_state")
-        self.assertEqual(records[-1]["provenance"], "receiver_attested")
-        self.assertEqual(result.receipt.status, syq.ReceiptStatus.CLEAN)
 
     async def test_version_matches_synchronous_client(self) -> None:
         self.assertEqual(await self.client.version(), "9.8.7")

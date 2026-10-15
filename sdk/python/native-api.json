@@ -40,7 +40,6 @@
         "peer-auth",
         "receiver-max-entries",
         "receiver-max-bytes",
-        "receiver-receipt",
         "hash",
         "hash-or-copy",
         "if-exists",
@@ -71,7 +70,8 @@
         "stream-mapping-fd",
         "stream-concurrency",
         "results-fd",
-        "suppress-summary"
+        "suppress-summary",
+        "relay-results"
       ],
       "aliases": {
         "srcs": "src",

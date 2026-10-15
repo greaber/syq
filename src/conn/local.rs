@@ -112,7 +112,8 @@ impl Conn for LocalConn {
                     | Request::PrepareSmallFiles(_)
                     | Request::CopySmallFiles(_)
                     | Request::PruneLookup { .. }
-                    | Request::Receipt
+                    | Request::DestinationResults { .. }
+                    | Request::FinishDestinationResults
             )
         {
             self.pending.push_back(Response::Err(

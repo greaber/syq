@@ -351,7 +351,7 @@ pub(crate) fn prepare_transfer(
     };
     let private_key = load_signing_key(&directory, destination_agent)?;
     let ssh_key = load_ssh_key(&directory)?;
-    let receipt_public_key = metadata.receipt_public_key.clone();
+    let results_public_key = metadata.receipt_public_key.clone();
     let grant = grant_for(
         args,
         sources,
@@ -367,28 +367,8 @@ pub(crate) fn prepare_transfer(
     let GrantOperation::Copy(copy) = &grant.operation;
     reject_control_plane_scopes(copy, &protected)?;
     let request_id = grant.request_id;
-    let (receipt_recipient_secret, receipt_delivery) = if args.detach {
-        (
-            None,
-            crate::receipt::ReceiptDelivery::DetachedSignedPlaintext,
-        )
-    } else {
-        let (secret, public) = crate::receipt::generate_recipient()?;
-        (
-            Some(secret),
-            crate::receipt::ReceiptDelivery::AttachedEncrypted {
-                suite: crate::receipt::HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
-                recipient_public_key: public,
-            },
-        )
-    };
-    let receipt_policy = crate::receipt::ReceiptPolicy {
-        required: true,
-        hashed: args.receiver_receipt == Some(crate::cli::ReceiptDetail::Hashes),
-        max_records: crate::receipt::DEFAULT_MAX_RECORDS,
-        max_plaintext_bytes: crate::receipt::DEFAULT_MAX_PLAINTEXT_BYTES,
-        delivery: receipt_delivery,
-    };
+    let (recipient_secret, recipient_public_key) =
+        crate::destination_results::generate_recipient()?;
     let grant = delegation::sign_grant_with(
         grant,
         GrantConstraints {
@@ -404,7 +384,9 @@ pub(crate) fn prepare_transfer(
                 delete_excluded: args.delete_excluded,
             },
             root_existence: root_existence_for(args.target_existence),
-            receipt_policy: receipt_policy.clone(),
+            receipt_policy: crate::destination_results::ReceiptPolicy::for_recipient(
+                recipient_public_key,
+            ),
             extra_options: extra_copy_options(args),
         },
         |payload| private_key.sign_grant(payload),
@@ -413,9 +395,8 @@ pub(crate) fn prepare_transfer(
     Ok(PreparedTransfer {
         ssh_key,
         request_id,
-        receipt_public_key,
-        receipt_recipient_secret,
-        receipt_policy,
+        results_public_key,
+        recipient_secret,
         grant_digest,
         canonical_destination,
         grant: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(grant),
@@ -437,7 +418,7 @@ pub(crate) fn enrolled_grant(grant: &str) -> bool {
 /// The receiving laptop separately confines and approves every mutation scope.
 pub(crate) fn named_request(
     args: &Args,
-    receipt_policy: crate::receipt::ReceiptPolicy,
+    receipt_policy: crate::destination_results::ReceiptPolicy,
 ) -> Result<crate::destination::CopyRequest> {
     let (destination, sources) = args
         .locations
@@ -555,7 +536,7 @@ pub(crate) fn named_authority(
         enrollment: id,
         request: request_id,
         digest,
-        receipt_key: key.public_key().to_openssh()?,
+        results_key: key.public_key().to_openssh()?,
         max_delete: None,
     };
     let authority = RestrictedAuthority::new(

@@ -6,8 +6,9 @@ use crate::cli::{
     Location, Placement, SourceSelection, WidenDirs,
 };
 use crate::conn::{
-    data_address, endpoint_error, ok, parse_ports, Conn, DataAddressSource, DataTransport,
-    Endpoint, RemoteSpec, SshMultiplexer, TcpCandidate, TcpPairStats,
+    change_ok, data_address, endpoint_error, ok, parse_ports, ChangeFailed, Conn,
+    DataAddressSource, DataTransport, Endpoint, RemoteSpec, SshMultiplexer, TcpCandidate,
+    TcpPairStats,
 };
 use crate::copy_policy::FreshCapacityAssessment;
 #[cfg(test)]
@@ -537,15 +538,12 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
         None => Endpoint::local(),
         Some(h) => {
             let forwarded = args.return_source.clone().or_else(|| {
-                args.named_receipt
-                    .as_ref()
-                    .filter(|_| {
-                        matches!(
-                            args.auth_from,
-                            crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(_))
-                        )
-                    })
-                    .and_then(|receipt| receipt.connection.clone())
+                args.return_destination.clone().filter(|_| {
+                    matches!(
+                        args.auth_from,
+                        crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(_))
+                    )
+                })
             });
             let rsh = parse_rsh(&args.rsh)?;
             if loc.port.is_some() && args.rsh.is_some() && !rsh[0].ends_with("ssh") {
@@ -1591,8 +1589,8 @@ fn attempt_small_copy(
 
 fn show_statistics(args: &Args) -> bool {
     // Restricted coordinators suppress their outcome summary because the
-    // invoking machine prints the verified receipt. That receipt does not
-    // contain diagnostics, so requested statistics still come from here.
+    // invoking machine prints it from the destination's results. Those do
+    // not contain diagnostics, so requested statistics still come from here.
     !args.suppress_summary || args.restricted_grant.is_some()
 }
 
@@ -1623,8 +1621,9 @@ fn print_timings(args: &Args, progress: &Progress) {
 /// from the path that carried the copy, since a copy that never started data
 /// workers has neither a worker count nor data sockets to report.
 fn print_statistics(opts: &Opts, progress: &Progress, connections: &str, tcp_stats: &str) {
-    // --stats is additional human output, not the summary line the local
-    // attested settlement re-renders; a delegated coordinator keeps it.
+    // --stats is additional human output, not the summary line the invoking
+    // machine re-renders from a restricted copy's results; a delegated
+    // coordinator keeps it.
     let (files_label, unchanged_files_label, bytes_label, unchanged_bytes_label, bytes_work) =
         if opts.dry_run {
             (
@@ -1654,8 +1653,6 @@ fn print_statistics(opts: &Opts, progress: &Progress, connections: &str, tcp_sta
     );
 }
 
-/// The one summary line a completed copy prints, rendered from the same
-/// record the results stream settles with.
 /// Under `--in-place=update`, what replaced or, in a dry run, would replace
 /// existing files rather than update them in place, as "N existing files
 /// ...: M with other hard links, ...", or `None` when nothing did.
@@ -1688,7 +1685,13 @@ pub(crate) fn in_place_refusal_summary(
     })
 }
 
-fn print_transfer_summary(terminal: &crate::results::ResultRecord, elapsed: f64, deletions: &str) {
+/// The one summary line a completed copy prints, rendered from the same
+/// record the results stream settles with.
+pub(crate) fn print_transfer_summary(
+    terminal: &crate::results::ResultRecord,
+    elapsed: f64,
+    deletions: &str,
+) {
     crate::output::human_stdout!(
         "syq: transferred {} files ({}), {} unchanged ({} files), {} dirs created{}{}{}",
         commas(terminal.files_transferred),
@@ -1834,9 +1837,13 @@ pub fn run(mut args: Args) -> Result<i32> {
             .store(show_statistics(&args) && !args.quiet, Relaxed);
         progress.observations.enable();
     }
-    // The detach and remote-coordinator combinations were refused at
-    // argument parsing (exit 2, no stream); every request that reaches this
-    // point settles with a terminal record.
+    // A remote coordinator relays a restricted destination's results frames
+    // from whichever connection they arrive on.
+    if let Some(token) = &args.results_token {
+        crate::destination_results::relay::install(token);
+    }
+    // Detached runs were refused at argument parsing (exit 2, no stream);
+    // every request that reaches this point settles with a terminal record.
     if let Some(writer) = crate::results::start(
         &args,
         crate::results::RunMode::Cp {
@@ -1924,10 +1931,7 @@ pub(crate) fn uses_remote_coordinator(args: &Args, sources: &[Location], dst: &L
 }
 
 fn os_kind_of(error: &anyhow::Error) -> Option<&'static str> {
-    if let Some(error) = error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<WireError>())
-    {
+    if let Some(error) = crate::conn::wire_error_of(error) {
         return wire_os_kind(error);
     }
     let io = error
@@ -2010,10 +2014,7 @@ fn permission_error_message(
 
 /// A copy failure, with `hint` when it is one the hint is for.
 fn copy_error_message(error: &anyhow::Error, hint: Option<&str>) -> String {
-    let kind = error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<WireError>())
-        .and_then(|error| error.io_kind);
+    let kind = crate::conn::wire_error_of(error).and_then(|error| error.io_kind);
     permission_error_message(format!("{error:#}"), kind, hint)
 }
 
@@ -2590,6 +2591,21 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }
         }
     };
+    // A restricted destination between two servers reports its own results
+    // to the syq that started this coordinator, from before any change.
+    let destination_results = crate::destination::reports_results(&args.restricted_grant);
+    if destination_results {
+        anyhow::ensure!(
+            args.results_token.is_some(),
+            "the destination's results need a relay from the syq that started this copy"
+        );
+        ok(
+            dst_ctl.call(Request::DestinationResults {
+                records: args.relay_results,
+            })?,
+            "start the destination's results",
+        )?;
+    }
     let planning = progress.clock.planning.begin();
     let clone_claim_workers = match &early_sources {
         Some(sources) => sources.claim_workers,
@@ -4847,60 +4863,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         progress.specials_created.load(Relaxed),
     );
     drop(st);
-    // With a command-restricted receiver, ask for its signed receipt now that
-    // every mutation is settled, and hand its bounded frames to the invoking
-    // machine as marked lines. That machine verifies it; this coordinator's
-    // own report is not trusted for what landed.
-    if let Some(receipt) = &args.named_receipt {
-        if let Err(error) = crate::destination::finish_receipt(receipt, dst_ctl.as_mut()) {
-            progress.error(&format!("syq: receipt: {error:#}"));
-        }
-    } else if args.restricted_grant.is_some() {
-        use base64::Engine as _;
-        if let Err(error) = dst_ctl.send(Request::Receipt) {
-            progress.error(&format!("syq: receipt: {error:#}"));
-        } else {
-            loop {
-                match dst_ctl.recv() {
-                    Ok(Response::Receipt(frame)) => {
-                        let terminal = match crate::receipt::receipt_frame_is_end(&frame) {
-                            Ok(terminal) => terminal,
-                            Err(error) => {
-                                progress.error(&format!("syq: receipt: {error:#}"));
-                                break;
-                            }
-                        };
-                        if let Err(error) = crate::output::write_stdout(format_args!(
-                            "{}{}",
-                            crate::receipt::RECEIPT_LINE_PREFIX,
-                            base64::engine::general_purpose::STANDARD_NO_PAD.encode(frame)
-                        )) {
-                            progress.error(&format!("syq: write receipt: {error}"));
-                            break;
-                        }
-                        if terminal {
-                            break;
-                        }
-                    }
-                    Ok(Response::Err(error)) => {
-                        progress.error(&format!("syq: receipt: {error}"));
-                        break;
-                    }
-                    Ok(other) => {
-                        progress.error(&format!("syq: receipt: unexpected response {other:?}"));
-                        break;
-                    }
-                    Err(error) => {
-                        progress.error(&format!("syq: receipt: {error:#}"));
-                        break;
-                    }
-                }
-            }
+    // Every change is settled: end the destination's results, which also
+    // ends its grant.
+    if destination_results {
+        let finished = dst_ctl
+            .call(Request::FinishDestinationResults)
+            .and_then(|response| ok(response, "end the destination's results"));
+        if let Err(error) = finished {
+            progress.error(&format!("syq: destination results: {error:#}"));
         }
     }
 
-    // The destination's own directories are restored; its ancestors last,
-    // after a restricted receiver has observed what landed for its receipt.
+    // The destination's own directories are restored; its ancestors last.
     if destination_path_prepared {
         let restored = dst_ctl
             .call(Request::RestoreDestinationPath)

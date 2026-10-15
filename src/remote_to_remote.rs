@@ -3,57 +3,47 @@
 
 use crate::cli::PeerAuth;
 use crate::cli::{parse_rsh, Args, Existence, Interface, Location, Placement, SourceSelection};
-use crate::delegation::RequestId;
-use crate::enrollment::EnrollmentId;
 use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
-use std::io::{BufRead, IsTerminal, Read, Seek, Write};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
 
-/// What the invoking machine expects hostB's receipt to say about itself.
-#[derive(Debug)]
-struct ReceiptExpectation {
-    public_key: String,
-    enrollment_id: EnrollmentId,
-    request_id: RequestId,
-    recipient_secret: Option<crate::receipt::RecipientSecret>,
-    policy: crate::receipt::ReceiptPolicy,
-    grant_digest: Option<[u8; 32]>,
+/// What the destination's own results say, for the outcome rule.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DestinationStatus {
+    Clean,
+    /// Some change failed or was left unfinished.
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ReceiptSettlementOutcome {
+struct SettlementOutcome {
     results_status: &'static str,
     exit_code: i32,
-    rejects_receipt: bool,
+    /// The destination's results contradict the coordinator's exit status.
+    rejects: bool,
 }
 
-fn receipt_settlement_outcome(
-    receipt_status: crate::receipt::ReceiptStatus,
+fn settlement_outcome(
+    destination: DestinationStatus,
     refusals: u64,
     coordinator_exit_code: i32,
-) -> ReceiptSettlementOutcome {
-    // The receipt decides whether verification fails the run: a non-clean
-    // receipt against a coordinator that claimed success is a contradiction
-    // the exit code must surface.
-    let rejects_receipt = refusals > 0
-        || (receipt_status != crate::receipt::ReceiptStatus::Clean && coordinator_exit_code == 0);
+) -> SettlementOutcome {
+    // The destination's results decide whether settlement fails the run: a
+    // refusal, or a failed change against a coordinator that claimed
+    // success, is a contradiction the exit code must surface.
+    let rejects =
+        refusals > 0 || (destination != DestinationStatus::Clean && coordinator_exit_code == 0);
     // Status first, then the exit code the automation contract pairs with
     // it — the two can never disagree.
-    let results_status = if receipt_status == crate::receipt::ReceiptStatus::Incomplete {
-        // An incomplete receipt stream can omit operations. Never describe it
-        // as safe input for a per-entry retry, even when the coordinator also
-        // reported a conventional partial-transfer exit.
-        "aborted"
-    } else if coordinator_exit_code == 1 {
-        // A coordinator-fatal run may hold unsettled entries; the attested
-        // records still describe what did land.
+    let results_status = if coordinator_exit_code == 1 {
+        // A coordinator-fatal run may hold unsettled entries; the
+        // destination's records still describe what did land.
         "failed"
     } else if refusals > 0 || coordinator_exit_code == 25 {
         "refused"
-    } else if receipt_status != crate::receipt::ReceiptStatus::Clean || coordinator_exit_code == 23
-    {
+    } else if destination != DestinationStatus::Clean || coordinator_exit_code == 23 {
         "partial"
     } else {
         "success"
@@ -64,110 +54,210 @@ fn receipt_settlement_outcome(
         "refused" => 25,
         _ => 1,
     };
-    ReceiptSettlementOutcome {
+    SettlementOutcome {
         results_status,
         exit_code,
-        rejects_receipt,
+        rejects,
     }
 }
 
-const MAX_RECEIPT_LINE_BYTES: usize = 192 * 1024;
-const MAX_RECEIPT_CAPTURE_BYTES: u64 = 640 * 1024 * 1024;
-
-struct CapturedReceipt {
-    file: std::fs::File,
-    frames: u64,
-    bytes: u64,
-    ended: bool,
+/// An error record the final result counts: not one that only explains a
+/// failure another record counts.
+fn counted_error(record: &serde_json::Value) -> bool {
+    record.get("type").and_then(serde_json::Value::as_str) == Some("error")
+        && record.get(crate::results::DIAGNOSTIC_FOR).is_none()
 }
 
-impl CapturedReceipt {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            file: tempfile::tempfile().context("create encrypted receipt spool")?,
-            frames: 0,
-            bytes: 0,
-            ended: false,
-        })
+/// The longest relayed results line: a coordinator record, or a base64
+/// destination frame.
+const MAX_RELAYED_LINE_BYTES: usize = 1024 * 1024;
+
+/// Results arriving on a remote coordinator's standard output: its own
+/// records and, through a restricted receiver, the destination's frames.
+/// Each is written as it arrives; nothing accumulates. Through a restricted
+/// receiver, the destination's records of what it changed, refused, or
+/// failed are the only ones of their kind: the coordinator leaves out its
+/// records of the failures the destination lists, and its claims of success
+/// are dropped here.
+struct Relay {
+    coordinator_prefix: Vec<u8>,
+    destination_prefix: Vec<u8>,
+    results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
+    /// The restricted destination's stream, which also supplies the
+    /// operation records for its changes.
+    destination: Option<crate::destination_results::Reader>,
+    coordinator_terminal: Option<serde_json::Value>,
+    /// The run's shape, for a final result this machine writes itself.
+    dry_run: bool,
+    prune: bool,
+    /// Counted error records written to the results so far.
+    errors: u64,
+    /// The first problem with what arrived; later lines are drained unread.
+    failure: Option<anyhow::Error>,
+}
+
+impl Relay {
+    fn new(
+        token: &str,
+        results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
+        destination: Option<crate::destination_results::Expectation>,
+        (dry_run, prune): (bool, bool),
+    ) -> Self {
+        Self {
+            coordinator_prefix: crate::destination_results::relay::coordinator_prefix(token)
+                .into_bytes(),
+            destination_prefix: crate::destination_results::relay::destination_prefix(token)
+                .into_bytes(),
+            results,
+            destination: destination.map(crate::destination_results::Reader::new),
+            coordinator_terminal: None,
+            dry_run,
+            prune,
+            errors: 0,
+            failure: None,
+        }
     }
 
-    fn push(&mut self, encoded: &[u8]) -> Result<()> {
-        if self.ended {
-            bail!("the relayed receipt contains a frame after its terminal frame");
+    /// Whether a line is one of ours.
+    fn marked(&self, line: &[u8]) -> bool {
+        line.starts_with(&self.coordinator_prefix) || line.starts_with(&self.destination_prefix)
+    }
+
+    fn line(&mut self, line: &[u8]) {
+        if self.failure.is_some() {
+            return;
         }
-        let terminal = crate::receipt::receipt_frame_is_end(encoded)?;
-        let length = u32::try_from(encoded.len()).context("receipt frame length exceeds u32")?;
-        let added = 4u64 + u64::from(length);
-        self.bytes = self
-            .bytes
-            .checked_add(added)
-            .context("receipt capture byte count overflow")?;
-        if self.bytes > MAX_RECEIPT_CAPTURE_BYTES {
-            bail!("the relayed receipt exceeds its local capture limit");
+        let result = if let Some(record) = line.strip_prefix(self.coordinator_prefix.as_slice()) {
+            self.coordinator_record(record)
+        } else if let Some(frame) = line.strip_prefix(self.destination_prefix.as_slice()) {
+            self.destination_frame(frame)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
+            self.failure = Some(error);
         }
-        self.file.write_all(&length.to_be_bytes())?;
-        self.file.write_all(encoded)?;
-        self.frames += 1;
-        self.ended = terminal;
+    }
+
+    fn coordinator_record(&mut self, line: &[u8]) -> Result<()> {
+        let Some(writer) = &self.results else {
+            bail!("the coordinating server sent results that were not requested");
+        };
+        let mut record: serde_json::Value =
+            serde_json::from_slice(line).context("decode a relayed results record")?;
+        let object = record
+            .as_object_mut()
+            .context("a relayed results record is not an object")?;
+        let schema = object.remove("schema");
+        let version = object.remove("schema_version");
+        object.remove("seq");
+        anyhow::ensure!(
+            schema.as_ref().and_then(serde_json::Value::as_str) == Some(crate::results::SCHEMA)
+                && version.as_ref().and_then(serde_json::Value::as_u64)
+                    == Some(writer.schema_version()),
+            "the coordinating server writes another results format; use the same syq version on both machines"
+        );
+        let kind = object
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        match kind.as_str() {
+            // This machine's own run record opened the stream.
+            "run" => {}
+            "result" => {
+                anyhow::ensure!(
+                    self.coordinator_terminal.is_none(),
+                    "the coordinating server sent two final results"
+                );
+                self.coordinator_terminal = Some(record);
+            }
+            // The destination reports the changes it made.
+            "operation_result"
+                if self.destination.is_some()
+                    && object
+                        .get("disposition")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("succeeded") => {}
+            _ => {
+                anyhow::ensure!(
+                    self.coordinator_terminal.is_none(),
+                    "the coordinating server sent results after its final result"
+                );
+                if counted_error(&record) {
+                    self.errors += 1;
+                }
+                writer.emit_value(record);
+            }
+        }
         Ok(())
     }
 
-    fn frames(&mut self) -> Result<CapturedFrames<'_>> {
-        self.file.flush()?;
-        self.file.seek(std::io::SeekFrom::Start(0))?;
-        Ok(CapturedFrames {
-            file: &mut self.file,
-            remaining: self.frames,
-        })
-    }
-}
-
-struct CapturedFrames<'a> {
-    file: &'a mut std::fs::File,
-    remaining: u64,
-}
-
-impl Iterator for CapturedFrames<'_> {
-    type Item = Result<Vec<u8>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
+    fn destination_frame(&mut self, line: &[u8]) -> Result<()> {
+        let reader = self.destination.as_mut().context(
+            "the coordinating server relayed destination results that were not expected",
+        )?;
+        let frame = base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(line.trim_ascii())
+            .context("decode a relayed destination results frame")?;
+        let mut records = Vec::new();
+        reader.accept(&frame, |record| {
+            records.push(record);
+            Ok(())
+        })?;
+        self.errors += records
+            .iter()
+            .filter(|record| counted_error(record))
+            .count() as u64;
+        // A frame's records are written together.
+        if let Some(writer) = &self.results {
+            writer.emit_values(records);
         }
-        self.remaining -= 1;
-        Some((|| {
-            let mut length = [0u8; 4];
-            self.file.read_exact(&mut length)?;
-            let mut encoded = vec![0u8; u32::from_be_bytes(length) as usize];
-            self.file.read_exact(&mut encoded)?;
-            Ok(encoded)
-        })())
+        Ok(())
+    }
+
+    fn error(&mut self, message: &str, class: &'static str) {
+        if let Some(writer) = &self.results {
+            writer.emit_value(serde_json::json!({
+                "type": "error",
+                "class": class,
+                "message": message,
+            }));
+            self.errors += 1;
+        }
     }
 }
 
-/// Pass the coordinator's stdout through byte for byte, keeping only the
-/// receipt marker lines to ourselves. Used only when a receipt is expected;
-/// other transfers inherit stdout untouched. Frames are decoded one line
-/// at a time and spooled rather than accumulated in memory.
-fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
+/// Pass the coordinator's stdout through byte for byte, handing only lines
+/// marked with this copy's results token to `relay`.
+fn relay_stdout(stdout: impl std::io::Read, mut relay: Relay) -> Result<Relay> {
     let mut output_error = None;
-    let result = relay_output(stdout, &mut std::io::stdout().lock(), &mut output_error);
-    // Report only after releasing stdout, including when receipt parsing fails.
+    let result = relay_output(
+        stdout,
+        &mut std::io::stdout().lock(),
+        &mut output_error,
+        &mut relay,
+    );
+    // Report only after releasing stdout.
     if let Some(error) = output_error {
         crate::output::warn_stdout(&error);
     }
-    result
+    result.map(|()| relay)
 }
 
 fn relay_output(
     stdout: impl std::io::Read,
     out: &mut impl Write,
     output_error: &mut Option<std::io::Error>,
-) -> Result<Option<CapturedReceipt>> {
-    let prefix = crate::receipt::RECEIPT_LINE_PREFIX.as_bytes();
+    relay: &mut Relay,
+) -> Result<()> {
+    let prefix_len = relay
+        .coordinator_prefix
+        .len()
+        .max(relay.destination_prefix.len());
     let mut reader = std::io::BufReader::with_capacity(64 * 1024, stdout);
-    // A failed human-output sink must not discard the receiver's evidence.
-    // Keep draining and validating receipt frames after the first write error.
+    // A failed human-output sink must not discard results; keep relaying
+    // marked lines after the first write error.
     let mut forward = |bytes: &[u8], flush: bool| {
         if output_error.is_none() {
             let result = out
@@ -178,20 +268,21 @@ fn relay_output(
             }
         }
     };
-    let mut receipt = None;
     // The first bytes of the current line, held only until the prefix
-    // decision; then either the receipt payload being collected or nothing.
-    let mut head: Vec<u8> = Vec::with_capacity(prefix.len());
+    // decision; then either the marked line being collected or nothing.
+    let mut head: Vec<u8> = Vec::with_capacity(prefix_len);
     let mut decided = false;
     let mut capturing: Option<Vec<u8>> = None;
-    let finish_capture = |payload: &mut Vec<u8>| {
-        while payload
+    // The rest of an oversized marked line, which is dropped.
+    let mut discarding = false;
+    let finish_line = |relay: &mut Relay, mut line: Vec<u8>| {
+        while line
             .last()
             .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
         {
-            payload.pop();
+            line.pop();
         }
-        std::mem::take(payload)
+        relay.line(&line);
     };
     loop {
         let buffer = reader
@@ -210,242 +301,145 @@ fn relay_output(
             consumed += segment.len();
             if !decided {
                 head.extend_from_slice(segment);
-                if head.len() >= prefix.len() || ends_line {
+                if head.len() >= prefix_len || ends_line {
                     decided = true;
-                    if head.starts_with(prefix) {
-                        capturing = Some(head[prefix.len()..].to_vec());
+                    if relay.marked(&head) {
+                        capturing = Some(std::mem::take(&mut head));
                     } else {
                         forward(&head, false);
                     }
                     head.clear();
                 }
-            } else if let Some(payload) = capturing.as_mut() {
-                payload.extend_from_slice(segment);
-            } else {
+            } else if let Some(line) = capturing.as_mut() {
+                line.extend_from_slice(segment);
+            } else if !discarding {
                 forward(segment, false);
             }
-            if let Some(payload) = capturing.as_mut() {
-                if payload.len() > MAX_RECEIPT_LINE_BYTES {
-                    bail!("the relayed receipt line exceeds {MAX_RECEIPT_LINE_BYTES} bytes");
-                }
+            if capturing
+                .as_ref()
+                .is_some_and(|line| line.len() > MAX_RELAYED_LINE_BYTES)
+            {
+                capturing = None;
+                discarding = true;
+                relay.failure.get_or_insert_with(|| {
+                    anyhow::anyhow!("a relayed results line exceeds {MAX_RELAYED_LINE_BYTES} bytes")
+                });
             }
             if ends_line {
-                if let Some(mut payload) = capturing.take() {
-                    store_receipt_line(&mut receipt, finish_capture(&mut payload))?;
-                } else {
+                if let Some(line) = capturing.take() {
+                    finish_line(relay, line);
+                } else if !discarding {
                     forward(&[], true);
                 }
                 decided = false;
+                discarding = false;
             }
         }
         reader.consume(consumed);
     }
     // Output that ended without a newline.
-    if !head.is_empty() {
-        if head.starts_with(prefix) {
-            capturing = Some(head[prefix.len()..].to_vec());
+    if !head.is_empty() && !discarding {
+        if relay.marked(&head) {
+            capturing = Some(std::mem::take(&mut head));
         } else {
             forward(&head, false);
         }
     }
-    if let Some(mut payload) = capturing.take() {
-        store_receipt_line(&mut receipt, finish_capture(&mut payload))?;
+    if let Some(line) = capturing.take() {
+        finish_line(relay, line);
     }
     forward(&[], true);
-    Ok(receipt)
+    Ok(())
 }
 
-fn store_receipt_line(captured: &mut Option<CapturedReceipt>, payload: Vec<u8>) -> Result<()> {
-    let encoded = base64::engine::general_purpose::STANDARD_NO_PAD
-        .decode(payload.trim_ascii())
-        .context("decode a receipt frame relayed from the source host")?;
-    let receipt = match captured {
-        Some(receipt) => receipt,
-        None => captured.insert(CapturedReceipt::new()?),
-    };
-    receipt.push(&encoded)
-}
-
-/// Verify hostB's receipt against the grant this machine signed. A missing,
-/// unverifiable, or mismatching receipt fails the transfer regardless of
-/// what the source-side coordinator reported.
-/// The context a captured receipt settles against.
-struct ReceiptSettlement<'a> {
+/// The context relayed results settle against.
+struct Settlement<'a> {
     src_host: &'a str,
     dst_host: &'a str,
     coordinator_exit_code: i32,
-    results: Option<&'a crate::results::ResultsWriter>,
     elapsed_ms: u64,
     verbose: bool,
     quiet: bool,
 }
 
-/// Returns the process exit code the settled stream advertises, so the two
-/// can never disagree.
-fn settle_receipt(
-    expectation: &ReceiptExpectation,
-    captured: Option<&mut CapturedReceipt>,
-    settlement: ReceiptSettlement<'_>,
-) -> Result<i32> {
-    let Some(captured) = captured else {
-        bail!(
-            "the command-restricted receiver on {} issued no receipt through {}; what landed cannot be verified",
-            settlement.dst_host,
-            settlement.src_host
-        );
-    };
-    settle_captured_receipt(expectation, captured, settlement)
-}
-
-fn settle_captured_receipt(
-    expectation: &ReceiptExpectation,
-    captured: &mut CapturedReceipt,
-    settlement: ReceiptSettlement<'_>,
-) -> Result<i32> {
-    let ReceiptSettlement {
+/// Write the run's final result from what the coordinator and, through a
+/// restricted receiver, the destination reported. Returns the process exit
+/// code the final result advertises, so the two can never disagree.
+fn settle(mut relay: Relay, settlement: Settlement<'_>) -> Result<i32> {
+    let Settlement {
         src_host,
         dst_host,
         coordinator_exit_code,
-        results,
         elapsed_ms,
         verbose,
         quiet,
     } = settlement;
-    if !captured.ended {
-        bail!("the receipt relayed through {src_host} has no terminal frame");
+    if let Some(error) = relay.failure.take() {
+        let message = format!("the results relayed by {src_host} are unusable: {error:#}");
+        relay.error(&message, "integrity");
+        fail_results(&relay, elapsed_ms);
+        bail!(message);
     }
-    let secret = expectation
-        .recipient_secret
-        .as_ref()
-        .context("the local HPKE receipt key is unavailable")?;
-    let policy = &expectation.policy;
-    if !matches!(
-        policy.delivery,
-        crate::receipt::ReceiptDelivery::AttachedEncrypted { .. }
-    ) {
-        bail!("an attached transfer has a detached receipt policy");
-    }
-    let grant_digest = expectation
-        .grant_digest
-        .context("the signed grant digest is unavailable")?;
-    let frames = captured.frames()?;
-    let mut receipt = crate::receipt::open_attached_frames(
-        frames,
-        secret,
-        &expectation.public_key,
-        expectation.enrollment_id,
-        expectation.request_id,
-        grant_digest,
-        policy,
-    )
-    .with_context(|| format!("decrypt and verify the receipt from {dst_host}"))?;
-
-    let mut first_problem = None;
-    receipt.for_each_record(|record| {
-        if first_problem.is_none() {
-            first_problem = match record {
-                crate::receipt::ReceiptRecord::Operation(record)
-                    if !matches!(
-                        record.disposition,
-                        crate::receipt::OperationDisposition::Succeeded
-                            | crate::receipt::OperationDisposition::Observed
-                    ) =>
-                {
-                    Some(format!(
-                        "{:?} {:?} for scope {} path {:?}{}",
-                        record.action,
-                        record.disposition,
-                        record.scope,
-                        String::from_utf8_lossy(&record.path),
-                        record
-                            .diagnostic
-                            .as_deref()
-                            .map(|message| format!(": {message}"))
-                            .unwrap_or_default()
-                    ))
+    let Some(reader) = relay.destination.as_mut() else {
+        // An ordinary coordinator's own final result is the run's.
+        if let Some(writer) = &relay.results {
+            match relay.coordinator_terminal.take() {
+                Some(terminal) => writer.emit_terminal_value(terminal),
+                None => {
+                    relay.error(
+                        &format!("the coordinating server on {src_host} sent no final result"),
+                        "io",
+                    );
+                    fail_results(&relay, elapsed_ms);
+                    bail!("the coordinating server on {src_host} ended without its results");
                 }
-                crate::receipt::ReceiptRecord::Refusal(record) => Some(format!(
-                    "receiver refusal{}",
-                    record
-                        .diagnostic
-                        .as_deref()
-                        .map(|message| format!(": {message}"))
-                        .unwrap_or_default()
-                )),
-                crate::receipt::ReceiptRecord::FinalState(record)
-                    if matches!(
-                        record.object,
-                        crate::receipt::FinalObject::ObservationFailed { .. }
-                            | crate::receipt::FinalObject::Present {
-                                observation_error: Some(_),
-                                ..
-                            }
-                    ) =>
-                {
-                    Some(format!(
-                        "final-state observation failed for scope {} path {:?}",
-                        record.scope,
-                        String::from_utf8_lossy(&record.path)
-                    ))
-                }
-                _ => None,
-            };
+            }
         }
-        Ok(())
-    })?;
-
-    let terminal = receipt.terminal.clone();
-    let outcome = receipt_settlement_outcome(
-        terminal.status,
-        terminal.summary.refusals,
-        coordinator_exit_code,
-    );
-    let settlement_error = if terminal.summary.refusals > 0 {
+        return Ok(coordinator_exit_code);
+    };
+    let totals = match reader.finish() {
+        Ok(totals) => totals,
+        Err(error) => {
+            let message = format!(
+                "the results of the command-restricted receiver on {dst_host}, relayed by {src_host}, could not be verified: {error:#}; what landed is unknown"
+            );
+            relay.error(&message, "integrity");
+            fail_results(&relay, elapsed_ms);
+            bail!(message);
+        }
+    };
+    let status = if totals.failed > 0 {
+        DestinationStatus::Failed
+    } else {
+        DestinationStatus::Clean
+    };
+    let outcome = settlement_outcome(status, totals.refused, coordinator_exit_code);
+    let settlement_error = if totals.refused > 0 {
         Some(format!(
-            "the receiver on {dst_host} refused {} request(s) from {src_host}; first: {}",
-            terminal.summary.refusals,
-            first_problem.as_deref().unwrap_or("(no detail recorded)")
+            "the receiver on {dst_host} refused {} request(s) from {src_host}",
+            totals.refused
         ))
-    } else if terminal.status != crate::receipt::ReceiptStatus::Clean && coordinator_exit_code == 0
-    {
+    } else if status != DestinationStatus::Clean && coordinator_exit_code == 0 {
         Some(format!(
-            "the receiver on {dst_host} issued a {:?} receipt{}, yet {src_host} reported success",
-            terminal.status,
-            first_problem
-                .as_deref()
-                .map(|problem| format!("; first: {problem}"))
-                .unwrap_or_default()
+            "the receiver on {dst_host} reports {} failed change(s), yet {src_host} reported success",
+            totals.failed
         ))
     } else {
         None
     };
-    debug_assert_eq!(outcome.rejects_receipt, settlement_error.is_some());
-    if let Some(writer) = results {
-        let emitted = crate::receipt::emit_automation_records(
-            &mut receipt,
-            writer,
-            outcome.results_status,
-            outcome.exit_code,
-            elapsed_ms,
-        )
-        .context("write receiver-attested --results stream")?;
-        // The human summary renders from the same verified terminal the
-        // machine just received (the coordinator's own summary was
-        // suppressed), so the two can never disagree.
-        if !quiet {
-            crate::output::human_stdout!(
-                "syq: receiver-attested: {} files published ({}), {} deleted, {} error(s); receipt {}; {}",
-                terminal.summary.published_files,
-                crate::progress::human(terminal.summary.transferred_bytes),
-                terminal.summary.deletions,
-                emitted.errors,
-                crate::receipt::receipt_status_label(terminal.status),
-                outcome.results_status,
-            );
+    debug_assert_eq!(outcome.rejects, settlement_error.is_some());
+    if let Some(writer) = &relay.results {
+        // The destination listed each refusal and failure with its error
+        // record; the complaint itself goes to stderr.
+        let terminal = compose_terminal(&relay, &totals, outcome, elapsed_ms);
+        // The coordinator's summary was suppressed: render it from the same
+        // final result the machine reads, so the two cannot disagree.
+        if !quiet && !relay.dry_run {
+            print_summary(&terminal);
         }
-        // A stream was settled: the process must exit with the code that
-        // stream advertises. Verification complaints reach stderr; they do
-        // not fork the exit code away from the terminal record.
+        writer.emit_terminal_value(terminal);
+        // A stream was settled: the process exits with the code it
+        // advertises.
         if let Some(message) = settlement_error {
             crate::output::diagnostic!("syq: {message}");
         }
@@ -454,28 +448,157 @@ fn settle_captured_receipt(
     if let Some(message) = settlement_error {
         bail!(message);
     }
-    if terminal.status != crate::receipt::ReceiptStatus::Clean {
-        let message = format!(
-            "the receiver on {dst_host} issued a {:?} receipt{}",
-            terminal.status,
-            first_problem
-                .as_deref()
-                .map(|problem| format!("; first: {problem}"))
-                .unwrap_or_default()
+    if status != DestinationStatus::Clean {
+        crate::output::diagnostic!(
+            "syq: warning: the receiver on {dst_host} reports {} failed change(s)",
+            totals.failed
         );
-        crate::output::diagnostic!("syq: warning: {message}");
     }
     if verbose {
         crate::output::diagnostic!(
-            "syq: encrypted receipt from {dst_host} verified: {} operations, {} final states, {} files published ({}), {} deletions",
-            terminal.summary.operations,
-            terminal.summary.final_states,
-            terminal.summary.published_files,
-            crate::progress::human(terminal.summary.published_bytes),
-            terminal.summary.deletions
+            "syq: results from {dst_host} verified: {} files transferred ({}), {} dirs created, {} deleted, {} failed",
+            totals.files_transferred,
+            crate::progress::human(totals.bytes_transferred),
+            totals.directories_created,
+            totals.deletions_completed,
+            totals.failed
         );
     }
     Ok(coordinator_exit_code)
+}
+
+/// The run's final result through a restricted receiver: what changed comes
+/// from the destination, the rest from the coordinator.
+fn compose_terminal(
+    relay: &Relay,
+    totals: &crate::destination_results::Totals,
+    outcome: SettlementOutcome,
+    elapsed_ms: u64,
+) -> serde_json::Value {
+    let mut terminal = relay
+        .coordinator_terminal
+        .clone()
+        .unwrap_or_else(|| empty_terminal(relay, elapsed_ms));
+    let object = terminal
+        .as_object_mut()
+        .expect("a final result is an object");
+    object.insert("status".into(), outcome.results_status.into());
+    object.insert("exit_code".into(), outcome.exit_code.into());
+    object.insert("errors".into(), relay.errors.into());
+    // A dry run changes nothing: its plan is the coordinator's.
+    if !relay.dry_run {
+        for (key, value) in [
+            ("files_transferred", totals.files_transferred),
+            ("bytes_transferred", totals.bytes_transferred),
+            ("directories_created", totals.directories_created),
+            ("symlinks_created", totals.symlinks_created),
+            ("specials_created", totals.specials_created),
+        ] {
+            object.insert(key.into(), value.into());
+        }
+        if object.contains_key("deletions_completed") {
+            object.insert(
+                "deletions_completed".into(),
+                totals.deletions_completed.into(),
+            );
+        }
+    }
+    terminal
+}
+
+fn print_summary(terminal: &serde_json::Value) {
+    let count = |key: &str| terminal.get(key).and_then(serde_json::Value::as_u64);
+    let value = |key: &str| count(key).unwrap_or(0);
+    let deletions = match (count("deletions_blocked"), count("deletions_completed")) {
+        (Some(blocked), _) if blocked > 0 => format!(
+            ", {} planned for deletion (blocked)",
+            value("deletions_planned")
+        ),
+        (_, Some(deleted)) => format!(", {deleted} deleted"),
+        _ => String::new(),
+    };
+    let timings = &terminal["timings"];
+    let elapsed_ms = timings["transfer_ms"]
+        .as_u64()
+        .or_else(|| timings["total_ms"].as_u64())
+        .unwrap_or(0);
+    crate::transfer::print_transfer_summary(
+        &crate::results::ResultRecord {
+            status: "",
+            exit_code: 0,
+            dry_run: false,
+            files_transferred: value("files_transferred"),
+            files_unchanged: value("files_unchanged"),
+            files_excluded: value("files_excluded"),
+            directories_created: value("directories_created"),
+            symlinks_created: value("symlinks_created"),
+            specials_created: value("specials_created"),
+            errors: value("errors"),
+            bytes_transferred: value("bytes_transferred"),
+            bytes_unchanged: value("bytes_unchanged"),
+            timings: Default::default(),
+            deletions_planned: None,
+            deletions_completed: None,
+            deletions_blocked: None,
+            replaced_not_in_place: terminal
+                .get("replaced_not_in_place")
+                .and_then(serde_json::Value::as_object)
+                .map(|counts| {
+                    crate::proto::ReplaceReason::ALL
+                        .iter()
+                        .map(|reason| {
+                            let count =
+                                counts.get(reason.key()).and_then(serde_json::Value::as_u64);
+                            (*reason, count.unwrap_or(0))
+                        })
+                        .collect()
+                }),
+        },
+        elapsed_ms as f64 / 1000.0,
+        &deletions,
+    );
+}
+
+/// A final result with every count zero, for a run without the
+/// coordinator's own.
+fn empty_terminal(relay: &Relay, elapsed_ms: u64) -> serde_json::Value {
+    let mut terminal = serde_json::json!({
+        "type": "result",
+        "status": "failed",
+        "exit_code": 1,
+        "dry_run": relay.dry_run,
+        "files_transferred": 0,
+        "files_unchanged": 0,
+        "files_excluded": 0,
+        "directories_created": 0,
+        "symlinks_created": 0,
+        "specials_created": 0,
+        "errors": relay.errors,
+        "bytes_transferred": 0,
+        "bytes_unchanged": 0,
+        "timings": {"total_ms": elapsed_ms},
+    });
+    if relay.prune {
+        let object = terminal
+            .as_object_mut()
+            .expect("a final result is an object");
+        for key in [
+            "deletions_planned",
+            "deletions_completed",
+            "deletions_blocked",
+        ] {
+            object.insert(key.into(), 0.into());
+        }
+    }
+    terminal
+}
+
+/// Settle a stream whose results could not be trusted: a failed final
+/// result keeps the counts nothing vouches for at zero.
+fn fail_results(relay: &Relay, elapsed_ms: u64) {
+    if let Some(writer) = &relay.results {
+        writer.emit_terminal_value(empty_terminal(relay, elapsed_ms));
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -871,17 +994,23 @@ fn run_remote(
     let mut constrained_rsh = None;
     let mut restricted_destination_path = None;
     let mut restricted_grant = None;
-    let mut receipt_expectation = None;
+    // The restricted destination's results: who signs them and which copy.
+    let mut destination_results = None;
     let default_ssh_agent_policy = if let Some(bridge) = &mut peer_bridge {
         restricted_destination_path = Some(bridge.approved.destination.clone());
         restricted_grant = Some(crate::destination::peer_bridge::GRANT.into());
-        receipt_expectation = Some(ReceiptExpectation {
-            public_key: bridge.approved.receipt_key.clone(),
-            enrollment_id: bridge.approved.enrollment,
-            request_id: bridge.approved.request,
-            recipient_secret: bridge.receipt_secret.take(),
-            policy: bridge.receipt_policy.clone(),
-            grant_digest: Some(bridge.approved.digest),
+        destination_results = Some(crate::destination_results::Expectation {
+            public_key: bridge.approved.results_key.clone(),
+            binding: crate::destination_results::Binding {
+                enrollment_id: bridge.approved.enrollment,
+                request_id: bridge.approved.request,
+                grant_digest: bridge.approved.digest,
+            },
+            secret: bridge
+                .recipient_secret
+                .take()
+                .context("the results recipient key is unavailable")?,
+            records: results.is_some(),
         });
         Some(AgentForwarding::Disabled)
     } else if args.rsh.is_some() {
@@ -956,13 +1085,15 @@ fn run_remote(
             ));
             restricted_destination_path = Some(prepared.canonical_destination);
             restricted_grant = Some(prepared.grant);
-            receipt_expectation = Some(ReceiptExpectation {
-                public_key: prepared.receipt_public_key.clone(),
-                enrollment_id: prepared.enrollment_id,
-                request_id: prepared.request_id,
-                recipient_secret: prepared.receipt_recipient_secret,
-                policy: prepared.receipt_policy,
-                grant_digest: Some(prepared.grant_digest),
+            destination_results = Some(crate::destination_results::Expectation {
+                public_key: prepared.results_public_key.clone(),
+                binding: crate::destination_results::Binding {
+                    enrollment_id: prepared.enrollment_id,
+                    request_id: prepared.request_id,
+                    grant_digest: prepared.grant_digest,
+                },
+                secret: prepared.recipient_secret,
+                records: results.is_some(),
             });
             if !args.quiet {
                 crate::output::diagnostic!(
@@ -991,13 +1122,11 @@ fn run_remote(
             broker: socket,
         })
     };
-    if (args.receiver_max_entries.is_some()
-        || args.receiver_max_bytes.is_some()
-        || args.receiver_receipt.is_some())
+    if (args.receiver_max_entries.is_some() || args.receiver_max_bytes.is_some())
         && restricted_grant.is_none()
     {
         bail!(
-            "--receiver-max-entries, --receiver-max-bytes, and --receiver-receipt address the command-restricted receiver, but this transfer does not use the enrolled receiver"
+            "--receiver-max-entries and --receiver-max-bytes address the command-restricted receiver, but this transfer does not use the enrolled receiver"
         );
     }
     let coordinator_target = endpoint_display(coordinator);
@@ -1048,11 +1177,14 @@ fn run_remote(
     }
     .into()];
     remote.push("--delegated-operands-b64".into());
-    if results.is_some() && receipt_expectation.is_some() {
-        // The invoking machine renders the summary from the verified
-        // attested terminal; the coordinator's own summary would race it
-        // and could disagree.
-        remote.push("--suppress-summary".into());
+    if results.is_some() {
+        // The coordinator writes its results for this machine to relay.
+        remote.push("--relay-results".into());
+        if destination_results.is_some() && !args.dry_run {
+            // This machine renders the summary from the final result it
+            // composes; the coordinator's own summary could disagree.
+            remote.push("--suppress-summary".into());
+        }
     }
     let mut short = String::new();
     for (flag, on) in [('n', args.dry_run), ('q', args.quiet)] {
@@ -1179,15 +1311,6 @@ fn run_remote(
     if let Some(n) = args.max_delete {
         remote.push(format!("--max-delete={n}"));
     }
-    if results.is_some() && receipt_expectation.is_none() {
-        // Without a command-restricted receiver there is no verified
-        // channel to carry per-operation records home from a remote
-        // coordinator; the wrapper turns this into a failed terminal
-        // record, so the stream still settles.
-        bail!(
-            "--results with a direct remote-to-remote copy needs a command-restricted receiver enrollment (its verified receipt is the stream) or --coordinate-at local to route the transfer through this machine"
-        );
-    }
     // Helper selection applies to ordinary remote syq processes. The local
     // launcher already used it for this coordinator; an enrolled destination
     // is selected by its forced authorized_keys command instead.
@@ -1195,7 +1318,7 @@ fn run_remote(
         &mut remote,
         args.syq_path.as_deref(),
         args.no_bootstrap,
-        receipt_expectation.is_some(),
+        destination_results.is_some(),
     );
     if args.no_tcp {
         remote.push("--no-tcp".into());
@@ -1308,6 +1431,16 @@ fn run_remote(
     if let Some(known_hosts) = receiver_known_hosts {
         internal_environment.push((RECEIVER_KNOWN_HOSTS, known_hosts));
     }
+    // Results come back as lines on the coordinator's output, marked with a
+    // token file names printed there cannot guess.
+    let results_token = (results.is_some() || destination_results.is_some())
+        .then(crate::destination_results::relay::new_token)
+        .transpose()?;
+    if let Some(token) = &results_token {
+        internal_environment.push((crate::destination_results::relay::TOKEN_ENV, token.clone()));
+    }
+    #[cfg(debug_assertions)]
+    internal_environment.extend(crate::destination_results::test_environment());
     if args.dry_run {
         internal_environment.push((
             "SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST",
@@ -1417,9 +1550,26 @@ fn run_remote(
     if !args.quiet {
         crate::output::diagnostic!("syq: remote-to-remote: running on {coordinator_host}");
     }
-    let run = || {
+    let relay = results_token.as_deref().map(|token| {
+        Relay::new(
+            token,
+            results.clone(),
+            destination_results.take(),
+            (args.dry_run, args.delete),
+        )
+    });
+    let run = |relay: Option<Relay>| {
         if let Some(bridge) = &peer_bridge {
-            return bridge.run(&remote_cmd, args.mapping_contents.clone(), relay_stdout);
+            let mapping = args.mapping_contents.clone();
+            return match relay {
+                Some(relay) => bridge.run(&remote_cmd, mapping, move |stdout| {
+                    relay_stdout(stdout, relay).map(Some)
+                }),
+                None => bridge.run(&remote_cmd, mapping, |mut stdout| {
+                    std::io::copy(&mut stdout, &mut std::io::stdout())?;
+                    Ok(None)
+                }),
+            };
         }
         let mut cmd = make_command();
         cmd.stdin(if follow_requester || args.mapping_contents.is_some() {
@@ -1428,7 +1578,7 @@ fn run_remote(
             Stdio::null()
         })
         .stderr(Stdio::inherit());
-        if receipt_expectation.is_some() {
+        if relay.is_some() {
             cmd.stdout(Stdio::piped());
         }
         let mut child = cmd
@@ -1453,9 +1603,9 @@ fn run_remote(
                 Ok::<_, std::io::Error>(Some(stdin))
             })
         });
-        let relayed = match child.stdout.take() {
-            Some(stdout) => relay_stdout(stdout),
-            None => Ok(None),
+        let relayed = match (child.stdout.take(), relay) {
+            (Some(stdout), Some(relay)) => relay_stdout(stdout, relay).map(Some),
+            (_, relay) => Ok(relay),
         };
         let status = child
             .wait()
@@ -1473,10 +1623,10 @@ fn run_remote(
         }
         Ok::<_, anyhow::Error>((status, relayed?))
     };
-    let (mut status, mut receipt_payload) = run()?;
+    let (mut status, mut relay) = run(relay)?;
     if peer_bridge.is_none() && helper_missing(status.code(), spec.bootstrap_helper) {
         spec.install_helper()?;
-        (status, receipt_payload) = run()?;
+        (status, relay) = run(relay)?;
     }
     // Keep the broker alive until the outer SSH connection and all forwarded
     // channels have closed.
@@ -1485,14 +1635,12 @@ fn run_remote(
         Some(0) => Ok(0),
         // 1 (fatal), 23 (some files failed) and 25 (--max-delete refused)
         // pass through: they are defined transfer results, the remote's
-        // stderr was inherited so its errors are already printed, and the
-        // coordinator requested the receipt before exiting — settlement
-        // below still emits the captured attested evidence. Other statuses
-        // receive source-host connectivity or constrained-authentication
-        // context here.
+        // stderr was inherited so its errors are already printed, and
+        // settlement below still writes the results that arrived. Other
+        // statuses receive source-host connectivity or
+        // constrained-authentication context here, and the caller settles
+        // the results as failed.
         Some(c @ (1 | 23 | 25)) => Ok(c),
-        // These arms build Err values rather than bailing: every failure
-        // must pass through the held-terminal settlement below.
         Some(c) if peer_bridge.is_some() => Err(anyhow::anyhow!(
             "approved server-to-server copy on {coordinator_host} failed (exit {c}); check the preceding SSH error and reconnect the approved account connection if it closed"
         )),
@@ -1511,15 +1659,13 @@ fn run_remote(
         )),
     };
     let mut code = outcome?;
-    if let Some(expectation) = &receipt_expectation {
-        code = settle_receipt(
-            expectation,
-            receipt_payload.as_mut(),
-            ReceiptSettlement {
+    if let Some(relay) = relay {
+        code = settle(
+            relay,
+            Settlement {
                 src_host: &coordinator_host,
                 dst_host: peer.host.as_deref().unwrap_or("the peer endpoint"),
                 coordinator_exit_code: code,
-                results: results.as_deref(),
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 verbose: args.verbose > 0,
                 quiet: args.quiet,

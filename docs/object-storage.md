@@ -79,9 +79,12 @@ objects.
   stored in the local user cache and removed on success. If that cache cannot be used, for example
   because it is read-only or belongs to another user, the copy continues with a
   warning, but unsaved progress cannot be reused on a later run.
-  A retried download copies the parts it already has into a new file, which
-  briefly needs room for both; if that copy fails, for example for lack of
-  space, syq warns, removes the earlier file and downloads the object again.
+  A retried download copies the parts it already has from the earlier
+  `.syq-s3-*.partial` file into a new one, which needs room for both. Without
+  that room, the file fails and keeps the earlier partial, so a later run
+  can resume once there is space; remove that partial to start over instead.
+  If the copy fails for another reason, syq warns, removes the earlier
+  partial and downloads the object again.
   If you abandon an upload, remove its unfinished parts with provider tools or a
   lifecycle rule.
 

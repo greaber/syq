@@ -104,7 +104,7 @@ pub(crate) fn emit_human_stdout(args: Arguments<'_>) {
     }
 }
 
-/// Essential output (such as a receipt frame or detach handoff) must let
+/// Essential output (such as a relayed results line or detach handoff) must let
 /// its caller handle failure. The stdout lock is released before returning.
 pub(crate) fn write_stdout(args: Arguments<'_>) -> io::Result<()> {
     // A full pipe must not freeze stderr progress or diagnostics.

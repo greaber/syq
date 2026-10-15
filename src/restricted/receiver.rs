@@ -71,13 +71,13 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
     enforce_grant_security_key_flags(&envelope, config.security_key_flags)?;
     let verified = delegation::verify_and_redeem(&envelope, &context, &policy, &replay)?;
     let (grant, extensions, grant_digest, deadline) = verified.into_parts();
-    let receipt_key = load_receipt_key(replay_path.parent().context("receiver state directory")?)?;
+    let results_key = load_receipt_key(replay_path.parent().context("receiver state directory")?)?;
     let authority = std::sync::Arc::new(RestrictedAuthority::new(
         &config,
         grant,
         extensions,
         grant_digest,
-        receipt_key,
+        results_key,
         deadline,
         &protected,
     )?);

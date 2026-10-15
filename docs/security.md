@@ -235,9 +235,10 @@ The protection has several parts:
    limits, and expiry. HostB's receiver verifies the signature, records that
    the grant has been used, and enforces it throughout the transfer. HostA
    cannot broaden the grant or redeem it again for a later copy.
-4. **Check the outcome with hostB.** The receiver signs a receipt of its
-   changes. Your laptop verifies it using hostB's receipt key, saved during
-   setup. HostA can relay the receipt, but cannot forge it.
+4. **Check the outcome with hostB.** The receiver reports each change it
+   makes, protected by a key hostB created during setup. HostA passes the
+   reports to your laptop, which checks that they are hostB's and that hostA
+   left none out, added none, and did not cut them short.
 
 File data travels directly from hostA to hostB, over encrypted TCP or SSH.
 Your laptop provides authorization and verifies the result without carrying
@@ -271,7 +272,7 @@ HostA can:
 - Omit a source file and, if pruning is authorized, cause its destination copy
   to be deleted.
 - Inspect destination entries for copy planning and consume the allowed space.
-- Stop the transfer or withhold its receipt.
+- Stop the transfer or withhold hostB's reports, which fails the copy.
 
 HostA cannot:
 
@@ -282,7 +283,7 @@ HostA cannot:
   only creating new ones, or delete files without permission.
 - Exceed the signed byte, entry, or deletion limits.
 - Reuse the grant for another copy or use the restricted key to run a shell.
-- Forge hostB's receipt.
+- Forge, alter, or cut short hostB's reports of its changes.
 
 A grant that permits only creating new files refuses hard links on
 filesystems whose link counts syq does not trust, such as SMB, SSHFS, and
@@ -293,11 +294,10 @@ already exist, but a file another program creates at a name in the instant
 between syq's check and its rename can be replaced.
 
 The filesystem limitations above still apply. HostB's account and receiver
-remain trusted to
-enforce the grant and report accurately. A verified receipt describes their
-work; it cannot prove that hostA supplied the right files. For example, a
-successful receipt can accurately report that hostB wrote false contents
-provided by hostA.
+remain trusted to enforce the grant and report accurately. HostB's reports
+describe their work; they cannot prove that hostA supplied the right files. For
+example, they can accurately report that hostB wrote false contents provided by
+hostA.
 
 <a id="file-contents"></a>
 <a id="expected-contents-and-corruption-checks"></a>
@@ -418,8 +418,8 @@ and object settings, such as tags or Object Lock retention, within the
 authorizing credentials' permissions: some services accept request headers that
 a signature does not cover.
 Anyone with the URLs can reuse them until expiry; stopping receiving does not
-revoke them. Filesystem receiver roots, aggregate limits, one-use grants, and
-signed receipts do not apply.
+revoke them. Filesystem receiver roots, aggregate limits, and one-use grants
+do not apply.
 
 ## SSH account access
 
