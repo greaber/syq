@@ -4097,24 +4097,20 @@ impl Planner<'_> {
                         let Some(dst_rel) = strip_dst_root(p, &self.dst_root) else {
                             continue;
                         };
-                        results.emit_operation_listed(
-                            &crate::results::OperationRecord {
-                                action: "delete",
-                                dst: dst_rel,
-                                src: None,
-                                kind,
-                                disposition: "blocked",
-                                bytes: None,
-                                attempts: None,
-                                retryable: None,
-                                class: Some("safety_limit"),
-                                os_kind: None,
-                                message: None,
-                            },
-                            None,
-                            // The receiver lists its failures itself.
-                            crate::results::ReceiverListing::Listed,
-                        );
+                        // This copy's own limit blocked it; no receiver saw it.
+                        results.emit_operation(&crate::results::OperationRecord {
+                            action: "delete",
+                            dst: dst_rel,
+                            src: None,
+                            kind,
+                            disposition: "blocked",
+                            bytes: None,
+                            attempts: None,
+                            retryable: None,
+                            class: Some("safety_limit"),
+                            os_kind: None,
+                            message: None,
+                        });
                     }
                 }
                 self.max_delete_hit = true;
@@ -4192,19 +4188,24 @@ impl Planner<'_> {
                         let Some(dst_rel) = strip_dst_root(p, &me.dst_root) else {
                             continue;
                         };
-                        results.emit_operation(&crate::results::OperationRecord {
-                            action: "delete",
-                            dst: dst_rel,
-                            src: None,
-                            kind,
-                            disposition: if failed { "failed" } else { "succeeded" },
-                            bytes: None,
-                            attempts: None,
-                            retryable: failed.then_some("unknown"),
-                            class: failed.then_some("io"),
-                            os_kind: None,
-                            message: None,
-                        });
+                        results.emit_operation_listed(
+                            &crate::results::OperationRecord {
+                                action: "delete",
+                                dst: dst_rel,
+                                src: None,
+                                kind,
+                                disposition: if failed { "failed" } else { "succeeded" },
+                                bytes: None,
+                                attempts: None,
+                                retryable: failed.then_some("unknown"),
+                                class: failed.then_some("io"),
+                                os_kind: None,
+                                message: None,
+                            },
+                            None,
+                            // The receiver lists its failures itself.
+                            crate::results::ReceiverListing::Listed,
+                        );
                     }
                 }
             }

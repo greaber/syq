@@ -894,35 +894,21 @@ impl RestrictedAuthority {
 
     /// A refused request for a file being written lists that file as
     /// failed; it is not listed again as unfinished when the results end.
-    /// A later publication still reports it.
+    /// A later publication still reports it. A file not being written has
+    /// nothing to mark, and a refusal adds nothing that lasts.
     fn end_refused_lifecycles(&self, state: &mut AuthorityState, request: &Request) {
-        let (path, copy_id, size) = match request {
-            Request::Prepare {
-                path,
-                copy_id,
-                size,
-                ..
-            } => (path, *copy_id, *size),
-            Request::StageBasis {
-                path, copy_id, len, ..
-            }
-            | Request::SeedBasis {
-                path, copy_id, len, ..
-            } => (path, *copy_id, *len),
-            Request::WriteRange { path, copy_id, .. }
+        let (path, copy_id) = match request {
+            Request::Prepare { path, copy_id, .. }
+            | Request::StageBasis { path, copy_id, .. }
+            | Request::SeedBasis { path, copy_id, .. }
+            | Request::WriteRange { path, copy_id, .. }
             | Request::ReuseComparedRange { path, copy_id, .. }
-            | Request::Finalize { path, copy_id, .. } => (path, *copy_id, 0),
+            | Request::Finalize { path, copy_id, .. } => (path, *copy_id),
             _ => return,
         };
-        state
-            .file_lifecycles
-            .entry((path.clone(), copy_id))
-            .or_insert(FileLifecycle {
-                size,
-                last_error: None,
-                listed: false,
-            })
-            .listed = true;
+        if let Some(lifecycle) = state.file_lifecycles.get_mut(&(path.clone(), copy_id)) {
+            lifecycle.listed = true;
+        }
     }
 
     /// The changes a request asked for, by destination path where a record
@@ -1018,6 +1004,12 @@ impl RestrictedAuthority {
                 proto::Response::PatchedBatch(results) => match results.get(index) {
                     Some(Ok(_)) => None,
                     Some(Err(error)) => Some(error.error.as_str()),
+                    None => Some("receiver returned no outcome for this file"),
+                },
+                // Small files published with their identities, for links.
+                proto::Response::PublishedBatch(results) => match results.get(index) {
+                    Some(Ok(_)) => None,
+                    Some(Err(error)) => Some(error.as_str()),
                     None => Some("receiver returned no outcome for this file"),
                 },
                 _ => None,

@@ -3130,6 +3130,72 @@ fn results_count_directories_as_an_ordinary_copy_does() {
 }
 
 #[test]
+fn a_small_file_batch_with_links_reports_each_failed_write() {
+    // Files with more than one link are published with their identities;
+    // a file that failed is neither written nor this copy's own.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    let written = target.join("written");
+    let failed = target.join("failed");
+    fs::create_dir_all(&target).unwrap();
+    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let (secret, policy) = results_policy();
+    let authority = test_authority_with_results(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Skip,
+        DestinationPlacement::ExactPath,
+        RootExistence::Any,
+        Some((key, policy)),
+    )
+    .unwrap();
+    let mut reader = start_results(&authority, secret);
+    let put = |path: &Path| proto::SmallPut {
+        path: path_bytes(path),
+        copy_id: [7; 16],
+        data: b"new".to_vec(),
+        hash: crate::fsops::content_digest(b"new"),
+        meta: plain_meta(),
+        flags: 0,
+        inplace: false,
+        condition: proto::TargetCondition::Any,
+        guard: None,
+        replaces: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
+    };
+    let mut batch = Request::PutSmallBatch(vec![put(&written), put(&failed)]);
+    let settlement = authority.authorize(&mut batch, false).unwrap();
+    fs::write(&written, b"new").unwrap();
+    authority.settle(
+        settlement,
+        &proto::Response::PublishedBatch(vec![
+            Ok(Some((1, 2))),
+            Err(proto::WireError {
+                message: "No space left on device".into(),
+                io_kind: Some(proto::WireIoKind::NoSpace),
+                raw_os_error: Some(28),
+            }),
+        ]),
+    );
+    assert!(authority.created_by_this_grant(&path_bytes(&written)));
+    // Another process may create it now; keeping existing files must not
+    // let a later write replace that one.
+    assert!(!authority.created_by_this_grant(&path_bytes(&failed)));
+    let results = finish_results(&authority, &mut reader);
+    assert_eq!(
+        (results.totals.files_transferred, results.totals.failed),
+        (1, 1)
+    );
+    assert!(results.has("transfer_file", b"written", "succeeded"));
+    assert!(results.has("transfer_file", b"failed", "failed"));
+}
+
+#[test]
 fn results_list_each_settled_change_in_ordinary_form() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
@@ -3302,6 +3368,43 @@ fn unfinished_in_place_files_are_reported_failed() {
             "succeeded".to_owned()
         )]
     );
+}
+
+#[test]
+fn refused_preparations_leave_nothing_behind() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let (secret, policy) = results_policy();
+    let authority = existence_authority_with_results(&root, &policy, 60_000);
+    let mut reader = start_results(&authority, secret);
+    // A coordinator can ask for any number of files the grant refuses.
+    for index in 0..100 {
+        let mut prepare = Request::Prepare {
+            path: path_bytes(&target.join(format!("large-{index}"))),
+            size: 1 << 20,
+            inplace: false,
+            copy_id: [1; 16],
+            mode: 0o600,
+            flags: 0,
+            acl: false,
+            scanned: crate::proto::ScannedDestination::Unknown,
+            attempt: 0,
+            create_if_missing: true,
+            guard: None,
+            group: None,
+        };
+        let error = authority.authorize(&mut prepare, false).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("per-file byte limit"),
+            "{error:#}"
+        );
+    }
+    assert!(authority.state.lock().unwrap().file_lifecycles.is_empty());
+    let results = finish_results(&authority, &mut reader);
+    assert_eq!(results.totals.refused, 100);
+    assert_eq!(results.changes().len(), 100);
 }
 
 #[test]

@@ -131,6 +131,24 @@ def main():
     assert secret[1]["disposition"] == "failed" and secret[1]["retryable"] == "unknown", records
     assert not any("diagnostic_for" in record for record in records), records
 
+    print("results: a deletion the receiver fails is listed once", flush=True)
+    ssh("source", f"from pathlib import Path; p=Path({ROOT + '/prune-source/sub'!r}); p.mkdir(parents=True); "
+                  "(p/'kept').write_bytes(b'kept')")
+    copy("prune-failed", source="prune-source")
+    ssh("destination", f"from pathlib import Path; p=Path({ROOT + '/prune-failed/sub'!r}); "
+                       "(p/'extra').write_bytes(b'extra'); p.chmod(0o555)")
+    try:
+        _, records = copy("prune-failed", "--prune", expected=23, source="prune-source")
+    finally:
+        ssh("destination", f"from pathlib import Path; Path({ROOT + '/prune-failed/sub'!r}).chmod(0o755)")
+    extra = [record for record in records if record.get("dst", {}).get("value") == "sub/extra"
+             or "sub/extra" in record.get("message", "")]
+    # Once, from the receiver: its error record and operation record.
+    assert [record["type"] for record in extra] == ["error", "operation_result"], records
+    assert extra[1]["action"] == "delete" and extra[1]["disposition"] == "failed", records
+    assert "retryable" not in extra[1], records
+    assert records[-1]["errors"] == 1 and records[-1]["status"] == "partial", records[-1]
+
     print("results: a stream the coordinator cuts short fails the copy", flush=True)
     cut = {"SYQ_TEST_DROP_DESTINATION_RESULTS_END": "1"}
     result, records = copy("cut", expected=1, env=cut)
