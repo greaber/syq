@@ -95,10 +95,13 @@ def hashing(root, source, temporary):
     inode_query = f"from pathlib import Path; print((Path({destination!r})/'checked').stat().st_ino)"
     inode = ssh("destination", inode_query).stdout
     run(command + ["--results", results], data=manifest(selected, expected))
-    summary = json.loads(Path(results).read_text().splitlines()[-1])
-    # Receiver-attested summaries count confirmed mutations, not source skips.
-    assert summary["provenance"] == "receiver_attested" and summary["bytes_transferred"] == 0, summary
-    assert summary["status"] == "success" and summary["receipt_status"] == "clean", summary
+    records = [json.loads(line) for line in Path(results).read_text().splitlines()]
+    summary = records[-1]
+    # The destination reports no change; the coordinator counts the
+    # unchanged file.
+    assert summary["bytes_transferred"] == 0 and summary["files_unchanged"] == 1, summary
+    assert summary["status"] == "success", summary
+    assert not any(r["type"] == "operation_result" for r in records), records
     assert ssh("destination", inode_query).stdout == inode
     wrong = {"algorithm": "sha256", "value": hashlib.sha256(b"different bytes").hexdigest()}
     run(command, data=manifest(selected, wrong), expected=23)
@@ -131,11 +134,13 @@ def direct():
             print(f"mapping route: {name}", flush=True)
             destination = root + "/" + name
             results_path = Path(temporary) / f"results-{name}.ndjson"
-            result_flags = ["--results", str(results_path)] if name in {"tcp", "ssh", "fallback"} else []
-            result = run(prefix + ["--mapping", operand, "--to", "destination", "--into", destination] + flags + result_flags, data=contents if operand == "-" else None)
-            if result_flags:
-                records = [json.loads(line) for line in results_path.read_text().splitlines()]
-                assert records[-1]["type"] == "result" and records[-1]["status"] == "success", records[-1]
+            result = run(prefix + ["--mapping", operand, "--to", "destination", "--into", destination, "--results", str(results_path)] + flags, data=contents if operand == "-" else None)
+            # Every route writes the same ordinary results on this machine.
+            records = [json.loads(line) for line in results_path.read_text().splitlines()]
+            assert records[0]["type"] == "run" and [r["seq"] for r in records] == list(range(len(records))), records
+            assert records[-1]["type"] == "result" and records[-1]["status"] == "success", records[-1]
+            changed = sorted(r["dst"]["value"] for r in records if r["type"] == "operation_result" and r["disposition"] == "succeeded")
+            assert changed == ["directory", "link", "nested", "nested/renamed"] or changed == ["directory", "link", "nested/renamed"], (name, changed)
             if name == "fallback":
                 assert b"data over ssh" in result.stderr, result.stderr
             ssh("destination", f"from pathlib import Path; p=Path({destination!r}); assert (p/'nested'/'renamed').read_bytes()==b'mapped contents'; assert (p/'link').is_symlink(); assert (p/'nested').stat().st_mode & 0o777 == 0o755; assert (p/'directory').is_dir(); assert not (p/'directory'/'unselected').exists()")
@@ -261,9 +266,10 @@ def direct():
         result = run(prefix + ["--mapping", "-", "--to", "destination", "--into", blocked, "--no-tcp", "--results", str(results_path)], data=selected, expected=23)
         assert result.stderr.count(b"blocks an implicit mapping parent") == len(blocked_entries), result.stderr
         records = [json.loads(line) for line in results_path.read_text().splitlines()]
-        # Remote-to-remote results attest receiver operations; planner failures
-        # are diagnostics and still make the terminal outcome partial.
+        # Planner failures arrive as the coordinator's error records and make
+        # the outcome partial.
         assert records[-1]["status"] == "partial", records[-1]
+        assert any(r["type"] == "error" and "blocks an implicit mapping parent" in r["message"] for r in records), records
         ssh("destination", f"from pathlib import Path; p=Path({blocked!r}); assert (p/'blocked-file').read_bytes()==b'keep file'; assert (p/'blocked-link').is_symlink(); assert list((p/'protected').iterdir())==[p/'protected'/'sentinel']; assert (p/'protected'/'sentinel').read_bytes()==b'keep target'; assert (p/'good'/'item').read_bytes()==b'mapped contents'")
         # Exceeds both the old grant scope count and one mapping protocol chunk.
         ssh("source", f"from pathlib import Path; import os; p=Path({source!r})/'directory'; p.chmod(0o750); os.utime(p,(1500000000,1500000000))")

@@ -469,17 +469,17 @@ struct GrantBody {
     max_file_data_bytes_per_second: u64,
     filters: FilterPolicy,
     root_existence: RootExistence,
-    receipt_policy: crate::receipt::ReceiptPolicy,
+    receipt_policy: crate::destination_results::ReceiptPolicy,
 }
 
 #[cfg(test)]
-fn test_receipt_policy() -> crate::receipt::ReceiptPolicy {
-    crate::receipt::ReceiptPolicy {
+fn test_receipt_policy() -> crate::destination_results::ReceiptPolicy {
+    crate::destination_results::ReceiptPolicy {
         required: true,
         hashed: false,
-        max_records: crate::receipt::DEFAULT_MAX_RECORDS,
-        max_plaintext_bytes: crate::receipt::DEFAULT_MAX_PLAINTEXT_BYTES,
-        delivery: crate::receipt::ReceiptDelivery::DetachedSignedPlaintext,
+        max_records: crate::destination_results::DEFAULT_MAX_RECORDS,
+        max_plaintext_bytes: crate::destination_results::DEFAULT_MAX_PLAINTEXT_BYTES,
+        delivery: crate::destination_results::ReceiptDelivery::DetachedSignedPlaintext,
     }
 }
 
@@ -489,7 +489,7 @@ pub(crate) struct SignedGrantEnvelope {
     pub max_file_data_bytes_per_second: u64,
     pub filters: FilterPolicy,
     pub root_existence: RootExistence,
-    pub receipt_policy: crate::receipt::ReceiptPolicy,
+    pub receipt_policy: crate::destination_results::ReceiptPolicy,
     /// Canonical OpenSSH armored SSHSIG bytes.
     pub signature: Vec<u8>,
     pub tcp_congestion: Option<String>,
@@ -767,7 +767,7 @@ fn signing_payload(
     max_file_data_bytes_per_second: u64,
     filters: &FilterPolicy,
     root_existence: RootExistence,
-    receipt_policy: &crate::receipt::ReceiptPolicy,
+    receipt_policy: &crate::destination_results::ReceiptPolicy,
     tcp_congestion: Option<&str>,
     mapping: Option<&crate::mapping::Authorization>,
     hashing: Option<&crate::hashing::CopyHashing>,
@@ -802,7 +802,7 @@ fn canonical_body_bytes(
     max_file_data_bytes_per_second: u64,
     filters: &FilterPolicy,
     root_existence: RootExistence,
-    receipt_policy: &crate::receipt::ReceiptPolicy,
+    receipt_policy: &crate::destination_results::ReceiptPolicy,
     tcp_congestion: Option<&str>,
     mapping: Option<&crate::mapping::Authorization>,
     hashing: Option<&crate::hashing::CopyHashing>,
@@ -1300,7 +1300,7 @@ pub(crate) struct VerifiedGrant {
     max_file_data_bytes_per_second: u64,
     filters: FilterPolicy,
     root_existence: RootExistence,
-    receipt_policy: crate::receipt::ReceiptPolicy,
+    receipt_policy: crate::destination_results::ReceiptPolicy,
     grant_digest: [u8; 32],
     execution_deadline: Instant,
     pub tcp_congestion: Option<String>,
@@ -1315,7 +1315,7 @@ pub(crate) struct GrantConstraints {
     pub max_file_data_bytes_per_second: u64,
     pub filters: FilterPolicy,
     pub root_existence: RootExistence,
-    pub receipt_policy: crate::receipt::ReceiptPolicy,
+    pub receipt_policy: crate::destination_results::ReceiptPolicy,
     pub tcp_congestion: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mapping: Option<crate::mapping::Authorization>,

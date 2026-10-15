@@ -114,8 +114,7 @@ without retrying it.
 Copies selecting the matching provider, explicitly or through a saved choice,
 can reuse the login, including SSH data in either direction with `--no-tcp`.
 Copies between this machine and one server use full account access without a
-per-copy grant. `--receiver-receipt` applies only to direct copies between two
-remote endpoints. Direct copies between two other servers can use approved
+per-copy grant. Direct copies between two other servers can use approved
 connections to both endpoints and give the source only
 [this copy's destination access](remote-reference.md#approved-account-copies).
 An explicit `--coordinate-at local` can also reuse account connections for both
@@ -374,7 +373,6 @@ or than its own `--max-delete`, deletes nothing and exits 25.
 A dry run of it exits 25 too, so you can check first. Validation failures
 leave the copy unstarted.
 Errors during copying fail visibly and may leave partial files for retry.
-The sender verifies a signed receipt before reporting success.
 
 ## Connection lifetime and waits
 

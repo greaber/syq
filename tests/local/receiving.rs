@@ -176,11 +176,7 @@ fn receiver_is_one_subcommand_with_its_verbs_beneath_it() {
 fn native_receiver_ceilings_apply_only_to_direct_remote_copies() {
     let t = Tmp::new();
     write(&t.path("src/file"), b"data");
-    for option in [
-        "--receiver-max-entries=5",
-        "--receiver-max-bytes=1M",
-        "--receiver-receipt=sizes",
-    ] {
+    for option in ["--receiver-max-entries=5", "--receiver-max-bytes=1M"] {
         let out = Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([
                 "cp",

@@ -126,4 +126,4 @@ This uses your machine's bandwidth and ordinary SSH access to each endpoint.
 Other authentication modes can use server-held credentials, a destination-
 restricted SSH agent, or full agent forwarding. They grant different authority;
 see the [Remote copy reference](remote-reference.md) before choosing one.
-That page also covers detached copies, signed results, and direct-mode limits.
+That page also covers detached copies, results from the destination, and direct-mode limits.

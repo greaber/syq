@@ -1,5 +1,5 @@
 //! Ordinary operations use account access selected by their authorizer.
-//! Narrow grants and explicit receipt requests keep their own authority.
+//! Narrow grants keep their own authority.
 use crate::cli::{Args, AuthFrom, CoordinateAt, Interface, Location, NativeEndpoint, PeerAuth};
 use anyhow::{bail, Result};
 
@@ -13,11 +13,7 @@ pub(crate) fn prepare_handoff(args: &Args) -> Result<()> {
     {
         return Ok(());
     }
-    if args.s3.is_none()
-        && !args.delegated
-        && args.restricted_grant.is_none()
-        && args.receiver_receipt.is_none()
-        && args.rsh.is_none()
+    if args.s3.is_none() && !args.delegated && args.restricted_grant.is_none() && args.rsh.is_none()
     {
         let locations = if args.locations.is_empty() {
             args.paths
@@ -66,7 +62,6 @@ pub(crate) fn remote(args: &Args) -> Option<(&Location, bool)> {
         || args.rsh.is_some()
         || args.detach
         || args.restricted_grant.is_some()
-        || args.receiver_receipt.is_some()
         || args.peer_auth != PeerAuth::Restricted
         || args.coordinate_at != CoordinateAt::Auto
     {
@@ -142,8 +137,7 @@ pub(crate) fn approved_operation(
         || args.delegated
         || args.restricted_grant.is_some()
         || args.return_source.is_some()
-        || args.named_receipt.is_some()
-        || args.receiver_receipt.is_some()
+        || args.return_destination.is_some()
     {
         return Ok(None);
     }
@@ -268,7 +262,7 @@ mod tests {
         assert!(remote(&pull).is_some());
     }
     #[test]
-    fn ordinary_account_copies_keep_native_copy_features_and_explicit_receipts_stay_narrow() {
+    fn ordinary_account_copies_keep_native_copy_features_and_narrow_grants_stay_narrow() {
         for words in [
             vec![
                 "cp",
@@ -300,9 +294,6 @@ mod tests {
         ] {
             let mut args = args(&words);
             assert!(remote(&args).is_some());
-            args.receiver_receipt = Some(crate::cli::ReceiptDetail::Hashes);
-            assert!(remote(&args).is_none());
-            args.receiver_receipt = None;
             args.restricted_grant = Some("narrow-grant".into());
             assert!(remote(&args).is_none());
         }

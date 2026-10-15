@@ -1,4 +1,5 @@
 use super::*;
+use crate::destination_results::Change;
 
 pub(super) struct AuthorityState {
     pub(super) paths: HashSet<Vec<u8>>,
@@ -24,22 +25,21 @@ pub(super) struct AuthorityState {
     pub(super) deletions: u64,
     pub(super) live_connections: u16,
     pub(super) tcp_listener_started: bool,
-    /// What hostB will attest to in its receipt.
-    /// Receipt records live in an anonymous spool; only mutation-relevant paths
-    /// enter `touched`, never paths merely returned by a destination scan.
-    pub(super) receipt_stream: Option<crate::receipt::ReceiptStreamWriter>,
-    pub(super) touched: BTreeSet<Vec<u8>>,
+    /// Files this grant's results stream is writing that have not been
+    /// published yet: reported as unfinished if the copy ends without them.
     pub(super) file_lifecycles: HashMap<(Vec<u8>, proto::CopyId), FileLifecycle>,
     /// Files a grant that publishes in place has staged instead, because
     /// they must be new: their writes and publication stay staged.
     pub(super) staged_new: HashSet<(Vec<u8>, proto::CopyId)>,
     /// Requests authorized for execution whose outcome has not been settled
-    /// yet, across every connection. The receipt waits for zero.
+    /// yet, across every connection. The results' end waits for zero.
     pub(super) in_flight: u64,
-    /// Set when the receipt is being issued: no new mutation is authorized
-    /// from then on, so the receipt describes a final state.
-    pub(super) receipt_closing: bool,
-    pub(super) receipt_issued: bool,
+    /// Set when the results end: no new change is authorized from then on,
+    /// so they describe every change the grant made.
+    pub(super) results_closing: bool,
+    /// A change was attempted or a request refused. Results must start
+    /// before either, so that they leave nothing out.
+    pub(super) recorded_any: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -120,9 +120,14 @@ pub(crate) struct RestrictedAuthority {
     pub(super) root_existence: RootExistence,
     pub(super) enrollment_id: EnrollmentId,
     pub(super) request_id: RequestId,
-    pub(super) receipt_policy: crate::receipt::ReceiptPolicy,
+    pub(super) receipt_policy: crate::destination_results::ReceiptPolicy,
     pub(super) grant_digest: [u8; 32],
-    pub(super) receipt_key: PrivateKey,
+    /// Signs the header of this grant's results for the invoking machine.
+    pub(super) results_key: PrivateKey,
+    /// The results for the invoking machine, once the coordinator starts
+    /// them. Locked after `state` when both are held.
+    pub(super) results: Mutex<Option<crate::destination_results::Stream>>,
+    pub(super) results_started: AtomicBool,
     pub(super) file_data_limit: Option<crate::bwlimit::BandwidthLimit>,
     pub(super) deadline: Instant,
     pub(super) control_open: AtomicBool,
@@ -202,7 +207,7 @@ impl RestrictedAuthority {
         grant: Grant,
         extensions: GrantConstraints,
         grant_digest: [u8; 32],
-        receipt_key: PrivateKey,
+        results_key: PrivateKey,
         deadline: Instant,
         protected: &[ReceiverControlPath],
     ) -> Result<Self> {
@@ -259,7 +264,7 @@ impl RestrictedAuthority {
         )?;
         let file_data_limit = (max_file_data_bytes_per_second > 0)
             .then(|| crate::bwlimit::BandwidthLimit::new(max_file_data_bytes_per_second));
-        let receipt_stream = Some(crate::receipt::ReceiptStreamWriter::new(&receipt_policy)?);
+        receipt_policy.validate()?;
         let authority = Self {
             hashing,
             extra_options,
@@ -287,7 +292,9 @@ impl RestrictedAuthority {
             request_id,
             receipt_policy,
             grant_digest,
-            receipt_key,
+            results_key,
+            results: Mutex::new(None),
+            results_started: AtomicBool::new(false),
             file_data_limit,
             deadline,
             control_open: AtomicBool::new(true),
@@ -303,31 +310,58 @@ impl RestrictedAuthority {
                 deletions: 0,
                 live_connections: 0,
                 tcp_listener_started: false,
-                receipt_stream,
-                touched: BTreeSet::new(),
                 file_lifecycles: HashMap::new(),
                 staged_new: HashSet::new(),
                 in_flight: 0,
-                receipt_closing: false,
-                receipt_issued: false,
+                results_closing: false,
+                recorded_any: false,
             }),
         };
         authority.check_root_existence()?;
         Ok(authority)
     }
 
-    /// Sign hostB's account of this grant and close it to further mutation.
-    pub(crate) fn issue_receipt(&self) -> Result<crate::receipt::IssuedReceipt> {
-        let key = &self.receipt_key;
-        let policy = self.receipt_policy.clone();
-        // Close the grant first, then wait for every request already
-        // authorized on any connection to execute and settle, so the receipt
-        // describes a final state rather than a snapshot with work in flight.
+    /// Start this grant's results for the invoking machine. Nothing may have
+    /// changed yet: results that start late could leave changes out.
+    pub(crate) fn start_results(&self, records: bool) -> Result<()> {
+        let state = self.state.lock().unwrap();
+        anyhow::ensure!(
+            !state.recorded_any && !state.results_closing,
+            "destination results must start before any change"
+        );
+        let mut results = self.results.lock().unwrap();
+        anyhow::ensure!(
+            results.is_none(),
+            "destination results have already started"
+        );
+        *results = Some(crate::destination_results::Stream::start(
+            &self.receipt_policy,
+            crate::destination_results::Binding {
+                enrollment_id: self.enrollment_id,
+                request_id: self.request_id,
+                grant_digest: self.grant_digest,
+            },
+            &self.results_key,
+            records,
+        )?);
+        self.results_started.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// End this grant's results and its authority to change anything: once
+    /// every request already authorized on any connection has settled,
+    /// report the files left unfinished and the end frame.
+    pub(crate) fn finish_results(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        if state.receipt_issued || state.receipt_closing {
-            bail!("the receipt for this grant has already been issued");
-        }
-        state.receipt_closing = true;
+        anyhow::ensure!(
+            self.results_started.load(Ordering::Acquire),
+            "destination results were not started"
+        );
+        anyhow::ensure!(
+            !state.results_closing,
+            "destination results have already ended"
+        );
+        state.results_closing = true;
         while state.in_flight > 0 {
             let remaining = self
                 .deadline
@@ -335,176 +369,54 @@ impl RestrictedAuthority {
                 .unwrap_or_default();
             if remaining.is_zero() {
                 bail!(
-                    "{} request(s) were still in flight at the grant deadline; no receipt can be issued",
+                    "{} request(s) were still in flight at the grant deadline; the destination's results cannot end",
                     state.in_flight
                 );
             }
             state = self.settled.wait_timeout(state, remaining).unwrap().0;
         }
-        state.receipt_issued = true;
-        let mut stream = state
-            .receipt_stream
-            .take()
-            .context("receiver receipt spool is unavailable")?;
-        let lifecycles = std::mem::take(&mut state.file_lifecycles);
-        let touched = std::mem::take(&mut state.touched);
-        let entries_touched = touched.len() as u64;
+        let unfinished = std::mem::take(&mut state.file_lifecycles);
         let transferred_bytes = state.transferred_bytes;
-        drop(state);
-
-        for ((path, _), lifecycle) in lifecycles {
-            if lifecycle.recorded {
+        let mut results = self.results.lock().unwrap();
+        let stream = results
+            .as_mut()
+            .context("destination results are unavailable")?;
+        for ((path, _), lifecycle) in unfinished {
+            if lifecycle.listed {
                 continue;
             }
-            self.append_operation_to_stream(
-                &mut stream,
-                &path,
-                crate::receipt::OperationAction::PublishFile {
+            stream.record(
+                crate::destination_results::Change::PublishFile {
                     size: lifecycle.size,
-                    inplace: lifecycle.inplace,
                 },
-                if lifecycle.last_error.is_some() {
-                    crate::receipt::OperationDisposition::Failed
-                } else {
-                    crate::receipt::OperationDisposition::Incomplete
-                },
-                lifecycle.last_error.as_deref().or(Some(
-                    "file lifecycle ended without a successful finalization",
-                )),
+                self.result_path(&path, false).as_deref(),
+                Some(
+                    lifecycle
+                        .last_error
+                        .as_deref()
+                        .unwrap_or("the file was not finished"),
+                ),
             );
         }
+        stream.finish(transferred_bytes)?;
+        Ok(())
+    }
 
-        for path in touched {
-            let object = match self.observe_final(&path) {
-                Ok(None) => crate::receipt::FinalObject::Absent,
-                Ok(Some(metadata)) => {
-                    let kind = kind_from_mode(metadata.mode);
-                    let mut observation_error = None;
-                    let digest = if kind == proto::Kind::File && policy.hashed {
-                        match self.digest_published(&path) {
-                            Ok(digest) => Some(digest),
-                            Err(error) => {
-                                observation_error = crate::receipt::bounded_format(format_args!(
-                                    "hash final file: {error:#}"
-                                ));
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    let symlink_target = if kind == proto::Kind::Symlink {
-                        match self.read_published_link(&path) {
-                            Ok(target) => Some(target),
-                            Err(error) => {
-                                observation_error = crate::receipt::bounded_format(format_args!(
-                                    "read final symlink: {error:#}"
-                                ));
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    crate::receipt::FinalObject::Present {
-                        kind,
-                        size: metadata.len,
-                        digest,
-                        symlink_target,
-                        metadata: crate::receipt::ObjectMetadata {
-                            mode: metadata.mode,
-                            uid: metadata.uid,
-                            gid: metadata.gid,
-                            mtime: metadata.mtime,
-                            mtime_nsec: metadata.mtime_nsec,
-                            rdev: metadata.rdev,
-                        },
-                        observation_error,
-                    }
-                }
-                Err(error) => crate::receipt::FinalObject::ObservationFailed {
-                    code: crate::receipt::OutcomeCode::ObservationFailed,
-                    diagnostic: crate::receipt::bounded_format(format_args!("{error:#}")),
-                },
-            };
-            let Some((scope, relative)) = self.receipt_location(&path) else {
-                stream.mark_recording_failure();
-                continue;
-            };
-            let sequence = stream.next_sequence();
-            stream.append(&crate::receipt::ReceiptRecord::FinalState(
-                crate::receipt::FinalStateReceiptRecord {
-                    sequence,
-                    scope,
-                    path: relative,
-                    object,
-                },
-            ));
+    /// Results frames ready to go out on the connection about to respond.
+    pub(crate) fn take_results_frames(&self) -> Vec<Vec<u8>> {
+        if !self.results_started.load(Ordering::Acquire) {
+            return Vec::new();
         }
-        stream.finish(crate::receipt::ReceiptClosure {
-            enrollment_id: self.enrollment_id,
-            request_id: self.request_id,
-            grant_digest: self.grant_digest,
-            issued_at: now()?,
-            policy,
-            entries_touched,
-            transferred_bytes,
-            signing_key: key,
-        })
-    }
-
-    /// Metadata of a touched path in the final tree, with a missing path or
-    /// a missing ancestor reported as absent rather than as an error.
-    pub(super) fn observe_final(&self, path: &[u8]) -> Result<Option<RootMetadata>> {
-        match self.rooted_metadata(path) {
-            Ok(observed) => Ok(observed),
-            Err(error)
-                if error.chain().any(|cause| {
-                    cause
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
-                }) =>
-            {
-                Ok(None)
-            }
-            Err(error) => Err(error),
+        let mut results = self.results.lock().unwrap();
+        let Some(stream) = results.as_mut() else {
+            return Vec::new();
+        };
+        if !stream.due(Instant::now()) {
+            return Vec::new();
         }
-    }
-
-    /// BLAKE3 of a file this grant published, read back through the root.
-    pub(super) fn digest_published(&self, path: &[u8]) -> Result<[u8; 32]> {
-        let root_path = Path::new(OsStr::from_bytes(&self.guard.root));
-        let relative = Path::new(OsStr::from_bytes(path))
-            .strip_prefix(root_path)
-            .context("published path is outside the enrolled root")?;
-        let relative = RelativePath::new(relative.as_os_str().as_bytes())?;
-        let root = Root::open_verified(
-            root_path,
-            RootIdentity {
-                dev: self.guard.dev,
-                ino: self.guard.ino,
-            },
-        )?;
-        let mut file = root.open_regular_read(&relative)?;
-        let mut hasher = blake3::Hasher::new();
-        std::io::copy(&mut file, &mut hasher)?;
-        Ok(*hasher.finalize().as_bytes())
-    }
-
-    pub(super) fn read_published_link(&self, path: &[u8]) -> Result<Vec<u8>> {
-        let root_path = Path::new(OsStr::from_bytes(&self.guard.root));
-        let relative = Path::new(OsStr::from_bytes(path))
-            .strip_prefix(root_path)
-            .context("published path is outside the enrolled root")?;
-        let relative = RelativePath::new(relative.as_os_str().as_bytes())?;
-        let root = Root::open_verified(
-            root_path,
-            RootIdentity {
-                dev: self.guard.dev,
-                ino: self.guard.ino,
-            },
-        )?;
-        root.read_link(&relative)
+        // A frame that cannot be encoded leaves a gap the invoking machine
+        // reports; the copy itself goes on.
+        stream.take_frames(Instant::now()).unwrap_or_default()
     }
 
     /// Check the signed placement-root precondition once, against the
@@ -907,21 +819,13 @@ impl RestrictedAuthority {
     }
 
     /// Whether the grant allows changes at all now: not a read-only one, and
-    /// not after its receipt.
+    /// not after its results ended.
     fn check_mutation_allowed(&self) -> Result<()> {
         if self.copy.options.dry_run || self.copy.options.verify_only {
             bail!("signed read-only transfer forbids destination mutations");
         }
-        let state = self.state.lock().unwrap();
-        if state.receipt_issued || state.receipt_closing {
-            bail!("the signed grant is closed: its receipt has been issued");
-        }
-        if state
-            .receipt_stream
-            .as_ref()
-            .is_some_and(crate::receipt::ReceiptStreamWriter::is_failed)
-        {
-            bail!("the signed grant is closed because receipt recording failed");
+        if self.state.lock().unwrap().results_closing {
+            bail!("the signed grant is closed: its results have ended");
         }
         Ok(())
     }
@@ -953,71 +857,124 @@ impl RestrictedAuthority {
         self.state.lock().unwrap().created.contains(path)
     }
 
-    pub(super) fn receipt_location(&self, path: &[u8]) -> Option<(u32, Vec<u8>)> {
-        self.copy
-            .mutation_scopes
-            .iter()
-            .enumerate()
-            .filter(|(_, scope)| Self::scope_allows(scope, path))
-            .max_by_key(|(index, scope)| (scope.path.len(), std::cmp::Reverse(*index)))
-            .and_then(|(index, scope)| {
-                let relative = if path == scope.path {
-                    Vec::new()
-                } else {
-                    path.get(scope.path.len() + 1..)?.to_vec()
-                };
-                Some((u32::try_from(index).ok()?, relative))
-            })
+    /// A changed path as ordinary results name it: relative to the signed
+    /// destination. Paths above it, and the directory a copy goes into, are
+    /// counted but not listed, as an ordinary copy lists them.
+    pub(super) fn result_path(&self, path: &[u8], directory: bool) -> Option<Vec<u8>> {
+        if path == self.destination {
+            return (!directory).then(Vec::new);
+        }
+        path.strip_prefix(self.destination.as_slice())
+            .and_then(|rest| rest.strip_prefix(b"/"))
+            .map(<[u8]>::to_vec)
     }
 
-    pub(super) fn append_operation(
-        &self,
-        state: &mut AuthorityState,
-        path: &[u8],
-        action: crate::receipt::OperationAction,
-        disposition: crate::receipt::OperationDisposition,
-        error: Option<&str>,
-    ) {
-        let Some(stream) = state.receipt_stream.as_mut() else {
+    /// Add one settled change to the results, if they have started.
+    pub(super) fn record_change(&self, path: &[u8], change: Change, error: Option<&str>) {
+        if !self.results_started.load(Ordering::Acquire) {
             return;
-        };
-        self.append_operation_to_stream(stream, path, action, disposition, error);
+        }
+        // As an ordinary copy counts them, the directory a copy goes into is
+        // not one of the directories it created.
+        if change == Change::EnsureDirectory
+            && error.is_none()
+            && path == self.destination
+            && self.copy.policy.placement != DestinationPlacement::ExactPath
+        {
+            return;
+        }
+        // A failure is listed even at the destination itself.
+        let directory =
+            error.is_none() && matches!(change, Change::EnsureDirectory | Change::DeleteDirectory);
+        let dst = self.result_path(path, directory);
+        if let Some(stream) = self.results.lock().unwrap().as_mut() {
+            stream.record(change, dst.as_deref(), error);
+        }
     }
 
-    pub(super) fn append_operation_to_stream(
-        &self,
-        stream: &mut crate::receipt::ReceiptStreamWriter,
-        path: &[u8],
-        action: crate::receipt::OperationAction,
-        disposition: crate::receipt::OperationDisposition,
-        error: Option<&str>,
-    ) {
-        let Some((scope, relative)) = self.receipt_location(path) else {
-            stream.mark_recording_failure();
-            return;
+    /// A refused request for a file being written lists that file as
+    /// failed; it is not listed again as unfinished when the results end.
+    /// A later publication still reports it. A file not being written has
+    /// nothing to mark, and a refusal adds nothing that lasts.
+    fn end_refused_lifecycles(&self, state: &mut AuthorityState, request: &Request) {
+        let (path, copy_id) = match request {
+            Request::Prepare { path, copy_id, .. }
+            | Request::StageBasis { path, copy_id, .. }
+            | Request::SeedBasis { path, copy_id, .. }
+            | Request::WriteRange { path, copy_id, .. }
+            | Request::ReuseComparedRange { path, copy_id, .. }
+            | Request::Finalize { path, copy_id, .. } => (path, *copy_id),
+            _ => return,
         };
-        let sequence = stream.next_sequence();
-        let code = match disposition {
-            crate::receipt::OperationDisposition::Failed => {
-                crate::receipt::OutcomeCode::ExecutionFailed
+        if let Some(lifecycle) = state.file_lifecycles.get_mut(&(path.clone(), copy_id)) {
+            lifecycle.listed = true;
+        }
+    }
+
+    /// The changes a request asked for, by destination path where a record
+    /// could name one, for the results to list when it is refused.
+    fn requested_changes(&self, request: &Request) -> Vec<(Option<Vec<u8>>, Change)> {
+        let file =
+            |path: &[u8], size: u64| (self.result_path(path, false), Change::PublishFile { size });
+        match request {
+            Request::Apply { ops, .. } => ops
+                .iter()
+                .map(|op| {
+                    let (path, change) = match op {
+                        Op::Mkdir { path, .. } => (path, Change::EnsureDirectory),
+                        Op::Symlink { path, .. } => (path, Change::CreateSymlink),
+                        Op::Mknod { path, .. } => (path, Change::CreateSpecial),
+                        Op::Hardlink { path, .. } => (path, Change::LinkFile),
+                        Op::Rmdir { path } => (path, Change::DeleteDirectory),
+                        Op::Unlink { path } | Op::Remove { path } => {
+                            (path, Change::DeleteNonDirectory)
+                        }
+                        Op::SetMeta { path, .. } => (
+                            path,
+                            Change::SetMetadata {
+                                kind: self
+                                    .rooted_metadata(path)
+                                    .ok()
+                                    .flatten()
+                                    .map_or(proto::Kind::File, |metadata| {
+                                        kind_from_mode(metadata.mode)
+                                    }),
+                            },
+                        ),
+                        Op::SetFileMetaIfSame { path, .. } => (
+                            path,
+                            Change::SetMetadata {
+                                kind: proto::Kind::File,
+                            },
+                        ),
+                    };
+                    (self.result_path(path, false), change)
+                })
+                .collect(),
+            Request::PutSmallBatch(puts) => puts
+                .iter()
+                .map(|put| file(&put.path, put.data.len() as u64))
+                .collect(),
+            Request::PatchSmallBatch(patches) => patches
+                .iter()
+                .map(|patch| file(&patch.path, patch.len))
+                .collect(),
+            Request::PatchBegin { patch, .. } => vec![file(&patch.path, patch.len)],
+            Request::Prepare { path, size, .. } => vec![file(path, *size)],
+            Request::StageBasis { path, len, .. } | Request::SeedBasis { path, len, .. } => {
+                vec![file(path, *len)]
             }
-            crate::receipt::OperationDisposition::Incomplete => {
-                crate::receipt::OutcomeCode::FileLifecycleIncomplete
-            }
-            crate::receipt::OperationDisposition::Succeeded
-            | crate::receipt::OperationDisposition::Observed => crate::receipt::OutcomeCode::None,
-        };
-        stream.append(&crate::receipt::ReceiptRecord::Operation(
-            crate::receipt::ReceiptOperationRecord {
-                sequence,
-                scope,
-                path: relative,
-                action,
-                disposition,
-                code,
-                diagnostic: error.and_then(crate::receipt::bounded_diagnostic),
-            },
-        ));
+            Request::WriteRange { path, .. }
+            | Request::ReuseComparedRange { path, .. }
+            | Request::Finalize { path, .. } => vec![file(path, 0)],
+            Request::FinishBasis { path, .. } => vec![(
+                self.result_path(path, false),
+                Change::SetMetadata {
+                    kind: proto::Kind::File,
+                },
+            )],
+            _ => Vec::new(),
+        }
     }
 
     /// Confirm or forget the provisional creations of an executed request.
@@ -1028,11 +985,10 @@ impl RestrictedAuthority {
         let Settlement {
             creations,
             outcomes,
-            touched,
             tracked,
             stream: _,
         } = settlement;
-        if creations.is_empty() && outcomes.is_empty() && touched.is_empty() && !tracked {
+        if creations.is_empty() && outcomes.is_empty() && !tracked {
             return;
         }
         let outcome_error = |index: usize| -> Option<&str> {
@@ -1050,6 +1006,12 @@ impl RestrictedAuthority {
                     Some(Err(error)) => Some(error.error.as_str()),
                     None => Some("receiver returned no outcome for this file"),
                 },
+                // Small files published with their identities, for links.
+                proto::Response::PublishedBatch(results) => match results.get(index) {
+                    Some(Ok(_)) => None,
+                    Some(Err(error)) => Some(error.as_str()),
+                    None => Some("receiver returned no outcome for this file"),
+                },
                 _ => None,
             }
         };
@@ -1065,34 +1027,17 @@ impl RestrictedAuthority {
                 state.created.insert(creation.path);
             }
         }
-        state.touched.extend(touched);
+        if !outcomes.is_empty() {
+            state.recorded_any = true;
+        }
+        let streaming = self.results_started.load(Ordering::Acquire);
         for outcome in outcomes {
             match outcome {
-                PendingOutcome::Observe { path } => {
-                    if let proto::Response::FileHash { .. } = response {
-                        self.append_operation(
-                            &mut state,
-                            &path,
-                            crate::receipt::OperationAction::ObserveFileHash,
-                            crate::receipt::OperationDisposition::Observed,
-                            None,
-                        );
-                    } else {
-                        self.append_operation(
-                            &mut state,
-                            &path,
-                            crate::receipt::OperationAction::ObserveFileHash,
-                            crate::receipt::OperationDisposition::Failed,
-                            outcome_error(0).or(Some("receiver returned no file hash")),
-                        );
-                    }
-                }
                 PendingOutcome::Patch {
                     index,
                     path,
                     copy_id,
                     size,
-                    kept_flags,
                     hold,
                 } => {
                     let reply = match response {
@@ -1133,65 +1078,37 @@ impl RestrictedAuthority {
                     if stale {
                         continue;
                     }
-                    let error = outcome_error(index);
-                    self.append_operation(
-                        &mut state,
+                    self.record_change(
                         &path,
                         if kept {
-                            crate::receipt::OperationAction::SetMetadata { flags: kept_flags }
-                        } else {
-                            crate::receipt::OperationAction::PublishFile {
-                                size,
-                                inplace: false,
+                            Change::SetMetadata {
+                                kind: proto::Kind::File,
                             }
-                        },
-                        if error.is_some() {
-                            crate::receipt::OperationDisposition::Failed
                         } else {
-                            crate::receipt::OperationDisposition::Succeeded
+                            Change::PublishFile { size }
                         },
-                        error,
+                        outcome_error(index),
                     );
                 }
                 PendingOutcome::LogicalIfFailed {
                     index,
                     path,
-                    action,
+                    change,
                 } => {
                     if let Some(error) = outcome_error(index) {
-                        self.append_operation(
-                            &mut state,
-                            &path,
-                            action,
-                            crate::receipt::OperationDisposition::Failed,
-                            Some(error),
-                        );
+                        self.record_change(&path, change, Some(error));
                     }
                 }
                 PendingOutcome::Logical {
                     index,
                     path,
-                    action,
-                } => {
-                    let error = outcome_error(index);
-                    self.append_operation(
-                        &mut state,
-                        &path,
-                        action,
-                        if error.is_some() {
-                            crate::receipt::OperationDisposition::Failed
-                        } else {
-                            crate::receipt::OperationDisposition::Succeeded
-                        },
-                        error,
-                    );
-                }
+                    change,
+                } => self.record_change(&path, change, outcome_error(index)),
                 PendingOutcome::FileStage {
                     index,
                     path,
                     copy_id,
                     size,
-                    inplace,
                     stage,
                     skip_if_absent,
                     observation_hold,
@@ -1209,62 +1126,33 @@ impl RestrictedAuthority {
                         Self::settle_observation_reservation(&mut state, &key, hold, !absent);
                     }
                     // If no sidecar existed, the observation performed no
-                    // file-lifecycle mutation and must not create an
-                    // incomplete receipt entry.
-                    if absent {
+                    // file-lifecycle mutation and must not report an
+                    // unfinished file.
+                    if absent || !streaming {
                         continue;
                     }
-                    if state.receipt_stream.is_none() {
-                        continue;
-                    }
-                    let error = outcome_error(index);
-                    let mut inconsistent = false;
-                    let emit_complete = {
-                        let lifecycle = state
-                            .file_lifecycles
-                            .entry((path.clone(), copy_id))
-                            .or_insert(FileLifecycle {
-                                size,
-                                inplace,
-                                recorded: false,
-                                last_error: None,
-                            });
-                        if lifecycle.size != size || lifecycle.inplace != inplace {
-                            inconsistent = true;
-                        }
-                        if matches!(stage, FileStage::Prepare | FileStage::Write)
-                            && lifecycle.recorded
-                        {
-                            lifecycle.recorded = false;
-                            lifecycle.last_error = None;
-                        }
-                        if let Some(error) = error {
-                            lifecycle.last_error = crate::receipt::bounded_diagnostic(error);
-                            if stage == FileStage::Finalize {
-                                lifecycle.recorded = false;
+                    let key = (path.clone(), copy_id);
+                    match (stage, outcome_error(index)) {
+                        // Published: reported now and no longer tracked. A
+                        // repeated finalization reports nothing new.
+                        (FileStage::Finalize, None) => {
+                            if state.file_lifecycles.remove(&key).is_some() {
+                                self.record_change(&path, Change::PublishFile { size }, None);
                             }
-                            false
-                        } else if stage == FileStage::Finalize && !lifecycle.recorded {
-                            lifecycle.recorded = true;
-                            lifecycle.last_error = None;
-                            true
-                        } else {
-                            false
                         }
-                    };
-                    if inconsistent {
-                        if let Some(stream) = state.receipt_stream.as_mut() {
-                            stream.mark_recording_failure();
+                        (_, error) => {
+                            let lifecycle =
+                                state.file_lifecycles.entry(key).or_insert(FileLifecycle {
+                                    size,
+                                    last_error: None,
+                                    listed: false,
+                                });
+                            lifecycle.size = size;
+                            if let Some(error) = error {
+                                lifecycle.last_error =
+                                    crate::destination_results::bounded_diagnostic(error);
+                            }
                         }
-                    }
-                    if emit_complete {
-                        self.append_operation(
-                            &mut state,
-                            &path,
-                            crate::receipt::OperationAction::PublishFile { size, inplace },
-                            crate::receipt::OperationDisposition::Succeeded,
-                            None,
-                        );
                     }
                 }
             }
@@ -1819,7 +1707,6 @@ impl RestrictedAuthority {
         patches: &mut [proto::SmallPatch],
         pending: &mut Vec<PendingCreation>,
         outcomes: &mut Vec<PendingOutcome>,
-        touched: &mut Vec<Vec<u8>>,
     ) -> Result<()> {
         if self.copy.policy.publication != PublicationPolicy::AtomicStaged {
             bail!("small-file publication does not match the signed publication policy");
@@ -1861,10 +1748,8 @@ impl RestrictedAuthority {
                 path: patch.path.clone(),
                 copy_id: patch.copy_id,
                 size: patch.len,
-                kept_flags: patch.unchanged_flags,
                 hold,
             });
-            touched.push(patch.path.clone());
             patch.guard = Some(self.guard.clone());
         }
         Ok(())
@@ -1888,7 +1773,6 @@ impl RestrictedAuthority {
         index: usize,
         pending: &mut Vec<PendingCreation>,
         outcomes: &mut Vec<PendingOutcome>,
-        touched: &mut Vec<Vec<u8>>,
     ) -> Result<()> {
         if !self.extra_options.hardlinks {
             bail!("hardlink creation is not authorized by the signed grant");
@@ -1931,20 +1815,19 @@ impl RestrictedAuthority {
                 ino: identity.1,
             };
         }
-        touched.push(path.to_vec());
         let path = path.to_vec();
-        let action = crate::receipt::OperationAction::LinkFile;
+        let change = Change::LinkFile;
         outcomes.push(if linked {
             PendingOutcome::LogicalIfFailed {
                 index,
                 path,
-                action,
+                change,
             }
         } else {
             PendingOutcome::Logical {
                 index,
                 path,
-                action,
+                change,
             }
         });
         Ok(())
@@ -1956,7 +1839,6 @@ impl RestrictedAuthority {
         index: usize,
         pending: &mut Vec<PendingCreation>,
         outcomes: &mut Vec<PendingOutcome>,
-        touched: &mut Vec<Vec<u8>>,
     ) -> Result<()> {
         if let Op::Hardlink {
             path,
@@ -1971,7 +1853,6 @@ impl RestrictedAuthority {
                 index,
                 pending,
                 outcomes,
-                touched,
             );
         }
         let path = match &*operation {
@@ -1999,9 +1880,8 @@ impl RestrictedAuthority {
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
-                    action: crate::receipt::OperationAction::DeleteDirectory,
+                    change: Change::DeleteDirectory,
                 });
-                touched.push(path.clone());
                 return Ok(());
             }
             Op::Unlink { path } => {
@@ -2009,17 +1889,21 @@ impl RestrictedAuthority {
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
-                    action: crate::receipt::OperationAction::DeleteFile,
+                    change: Change::DeleteNonDirectory,
                 });
-                touched.push(path.clone());
                 return Ok(());
             }
         };
-        let is_dir = match operation {
-            Op::Mkdir { .. } => true,
+        // What a metadata change applies to, for its record if it fails.
+        let metadata_kind = match operation {
             Op::SetMeta { .. } => self
                 .rooted_metadata(path)?
-                .is_some_and(|metadata| metadata.is_dir()),
+                .map_or(proto::Kind::File, |metadata| kind_from_mode(metadata.mode)),
+            _ => proto::Kind::File,
+        };
+        let is_dir = match operation {
+            Op::Mkdir { .. } => true,
+            Op::SetMeta { .. } => metadata_kind == proto::Kind::Dir,
             _ => false,
         };
         self.check_mutation_path(path, is_dir)?;
@@ -2081,9 +1965,8 @@ impl RestrictedAuthority {
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
-                    action: crate::receipt::OperationAction::EnsureDirectory,
+                    change: Change::EnsureDirectory,
                 });
-                touched.push(path.clone());
                 Ok(())
             }
             Op::Symlink {
@@ -2093,9 +1976,8 @@ impl RestrictedAuthority {
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
-                    action: crate::receipt::OperationAction::CreateSymlink,
+                    change: Change::CreateSymlink,
                 });
-                touched.push(path.clone());
                 Ok(())
             }
             Op::Mknod {
@@ -2128,9 +2010,8 @@ impl RestrictedAuthority {
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
-                    action: crate::receipt::OperationAction::CreateSpecial { kind },
+                    change: Change::CreateSpecial,
                 });
-                touched.push(path.clone());
                 Ok(())
             }
             Op::SetMeta {
@@ -2165,9 +2046,10 @@ impl RestrictedAuthority {
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
-                    action: crate::receipt::OperationAction::SetMetadata { flags: *flags },
+                    change: Change::SetMetadata {
+                        kind: metadata_kind,
+                    },
                 });
-                touched.push(path.clone());
                 Ok(())
             }
             Op::SetFileMetaIfSame {
@@ -2181,9 +2063,10 @@ impl RestrictedAuthority {
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
-                    action: crate::receipt::OperationAction::SetMetadata { flags: *flags },
+                    change: Change::SetMetadata {
+                        kind: proto::Kind::File,
+                    },
                 });
-                touched.push(path.clone());
                 Ok(())
             }
             Op::Remove { .. } | Op::Rmdir { .. } | Op::Unlink { .. } => Ok(()),
@@ -2208,11 +2091,10 @@ impl RestrictedAuthority {
     ) -> Result<Settlement> {
         let mut pending = Vec::new();
         let mut outcomes = Vec::new();
-        let mut touched = Vec::new();
-        // Requests the server executes and then settles; the receipt waits
-        // for all of them. The others are answered inline without settling.
-        // Restoring the destination's ancestors only undoes what this
-        // connection widened, after the receipt has observed what landed.
+        // Requests the server executes and then settles; the results' end
+        // waits for all of them. The others are answered inline without
+        // settling. Restoring the destination's ancestors only undoes what
+        // this connection widened, and changes nothing the results list.
         let tracked = !matches!(
             request,
             Request::Hello { .. }
@@ -2220,45 +2102,36 @@ impl RestrictedAuthority {
                 | Request::TcpListen { .. }
                 | Request::TransportStats
                 | Request::WriteStreamFence
-                | Request::Receipt
+                | Request::DestinationResults { .. }
+                | Request::FinishDestinationResults
                 | Request::Shutdown
                 | Request::RestoreDestinationPath
         );
         // Admission and closure are decided under one lock: a request either
-        // counts as in flight before the receipt can observe the count, or
-        // it is refused because the receipt has started. Authorization may
+        // counts as in flight before the results' end can observe the count,
+        // or it is refused because the results have ended. Authorization may
         // block afterwards (the file-data limiter, say) without letting the
-        // receipt slip past it.
+        // end slip past it.
         {
             let mut state = self.state.lock().unwrap();
             if !self.control_is_open() {
                 bail!("transfer control is closed or expired");
             }
-            if tracked && (state.receipt_issued || state.receipt_closing) {
-                bail!("the signed grant is closed: its receipt has been issued");
-            }
-            if tracked
-                && state
-                    .receipt_stream
-                    .as_ref()
-                    .is_some_and(crate::receipt::ReceiptStreamWriter::is_failed)
-            {
-                bail!("the signed grant is closed because receipt recording failed");
+            if tracked && state.results_closing {
+                bail!("the signed grant is closed: its results have ended");
             }
             if tracked {
                 state.in_flight += 1;
             }
         }
         let mut step = StreamStep::None;
-        let authorized =
-            self.authorize_inner(request, over_ssh, &mut pending, &mut outcomes, &mut touched);
+        let authorized = self.authorize_inner(request, over_ssh, &mut pending, &mut outcomes);
         let authorized =
             authorized.and_then(|()| self.authorize_stream(request, stream, &mut step));
         match authorized {
             Ok(()) => Ok(Settlement {
                 creations: pending,
                 outcomes,
-                touched,
                 tracked,
                 stream: step,
             }),
@@ -2267,20 +2140,29 @@ impl RestrictedAuthority {
                 // entries authorized before the refusing one.
                 self.forget_provisional(&pending);
                 self.release_patch_holds(outcomes.into_iter());
+                // What it asked for, classified before taking the state lock:
+                // classifying may look at the destination.
+                let changes = if self.results_started.load(Ordering::Acquire) {
+                    self.requested_changes(request)
+                } else {
+                    Vec::new()
+                };
+                // Every refusal counts, and lists the changes it refused, as
+                // the coordinator could have hidden it. It is recorded before
+                // the request stops counting as in flight, so the results
+                // cannot end between the two. The state lock is taken before
+                // the results lock, as everywhere.
                 let mut state = self.state.lock().unwrap();
+                state.recorded_any = true;
+                if self.results_started.load(Ordering::Acquire) {
+                    if let Some(stream) = self.results.lock().unwrap().as_mut() {
+                        stream.refused(&format!("refused: {error:#}"), &changes);
+                    }
+                    self.end_refused_lifecycles(&mut state, request);
+                }
                 if tracked {
                     state.in_flight = state.in_flight.saturating_sub(1);
                     self.settled.notify_all();
-                }
-                if let Some(stream) = state.receipt_stream.as_mut() {
-                    let sequence = stream.next_sequence();
-                    stream.append(&crate::receipt::ReceiptRecord::Refusal(
-                        crate::receipt::RefusalReceiptRecord {
-                            sequence,
-                            code: crate::receipt::OutcomeCode::AuthorizationRefused,
-                            diagnostic: crate::receipt::bounded_format(format_args!("{error:#}")),
-                        },
-                    ));
                 }
                 Err(error)
             }
@@ -2293,7 +2175,6 @@ impl RestrictedAuthority {
         over_ssh: bool,
         pending: &mut Vec<PendingCreation>,
         outcomes: &mut Vec<PendingOutcome>,
-        touched: &mut Vec<Vec<u8>>,
     ) -> Result<()> {
         self.check_deadline()?;
         let bounded_basis = matches!(request, Request::StageBasis { .. });
@@ -2498,7 +2379,7 @@ impl RestrictedAuthority {
                         mode: 0o700,
                         condition: *condition,
                     };
-                    self.authorize_op(&mut op, index, pending, outcomes, touched)?;
+                    self.authorize_op(&mut op, index, pending, outcomes)?;
                     let Op::Mkdir {
                         condition: authorized,
                         ..
@@ -2555,7 +2436,7 @@ impl RestrictedAuthority {
                             continue;
                         }
                     }
-                    self.authorize_op(operation, index, pending, outcomes, touched)?;
+                    self.authorize_op(operation, index, pending, outcomes)?;
                 }
                 *guard = Some(self.guard.clone());
             }
@@ -2572,7 +2453,6 @@ impl RestrictedAuthority {
                     bail!("source references are not valid on a command-restricted destination");
                 }
                 self.check_observation_path(path)?;
-                outcomes.push(PendingOutcome::Observe { path: path.clone() });
                 *guard = Some(self.guard.clone());
             }
             Request::HashBlocks {
@@ -2661,7 +2541,6 @@ impl RestrictedAuthority {
                     path: path.clone(),
                     copy_id: *copy_id,
                     size: *len,
-                    inplace: false,
                     stage: FileStage::Prepare,
                     skip_if_absent: false,
                     observation_hold: None,
@@ -2684,9 +2563,10 @@ impl RestrictedAuthority {
                 outcomes.push(PendingOutcome::Logical {
                     index: 0,
                     path: path.clone(),
-                    action: crate::receipt::OperationAction::SetMetadata { flags: *flags },
+                    change: Change::SetMetadata {
+                        kind: proto::Kind::File,
+                    },
                 });
-                touched.push(path.clone());
                 *guard = Some(self.guard.clone());
             }
             Request::Prepare {
@@ -2739,16 +2619,10 @@ impl RestrictedAuthority {
                     path: path.clone(),
                     copy_id: *copy_id,
                     size: *size,
-                    inplace: *inplace,
                     stage: FileStage::Prepare,
                     skip_if_absent: !*create_if_missing,
                     observation_hold,
                 });
-                if *inplace {
-                    // In-place preparation resizes the final file itself:
-                    // the receipt must know even if no final step follows.
-                    touched.push(path.clone());
-                }
                 *guard = Some(self.guard.clone());
             }
             Request::ReuseComparedRange {
@@ -2774,7 +2648,6 @@ impl RestrictedAuthority {
                     path: path.clone(),
                     copy_id: *copy_id,
                     size: declared,
-                    inplace: false,
                     stage: FileStage::Write,
                     skip_if_absent: false,
                     observation_hold: None,
@@ -2800,15 +2673,11 @@ impl RestrictedAuthority {
                 {
                     bail!("file write extends past the size declared for it");
                 }
-                if *inplace {
-                    touched.push(path.clone());
-                }
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
                     copy_id: *copy_id,
                     size: declared,
-                    inplace: *inplace,
                     stage: FileStage::Write,
                     skip_if_absent: false,
                     observation_hold: None,
@@ -2854,12 +2723,10 @@ impl RestrictedAuthority {
                     path: path.clone(),
                     copy_id: *copy_id,
                     size: self.declared_size(path, *copy_id)?,
-                    inplace: *inplace,
                     stage: FileStage::Finalize,
                     skip_if_absent: false,
                     observation_hold: None,
                 });
-                touched.push(path.clone());
                 self.check_metadata(meta, *flags)?;
                 *guard = Some(self.guard.clone());
             }
@@ -2890,19 +2757,17 @@ impl RestrictedAuthority {
                     outcomes.push(PendingOutcome::Logical {
                         index,
                         path: put.path.clone(),
-                        action: crate::receipt::OperationAction::PublishFile {
+                        change: Change::PublishFile {
                             size: put.data.len() as u64,
-                            inplace: false,
                         },
                     });
-                    touched.push(put.path.clone());
                     self.check_metadata(&put.meta, put.flags)?;
                     put.guard = Some(self.guard.clone());
                 }
             }
             Request::PatchSmallBatch(patches) => {
                 let first = outcomes.len();
-                if let Err(error) = self.authorize_patches(patches, pending, outcomes, touched) {
+                if let Err(error) = self.authorize_patches(patches, pending, outcomes) {
                     // A refused batch executes nothing: release the sizes
                     // its patches already hold.
                     self.release_patch_holds(outcomes.drain(first..));
@@ -2929,7 +2794,7 @@ impl RestrictedAuthority {
                 }
                 let first = outcomes.len();
                 let patches = std::slice::from_mut(&mut **patch);
-                if let Err(error) = self.authorize_patches(patches, pending, outcomes, touched) {
+                if let Err(error) = self.authorize_patches(patches, pending, outcomes) {
                     self.release_patch_holds(outcomes.drain(first..));
                     return Err(error);
                 }
@@ -2984,9 +2849,9 @@ impl RestrictedAuthority {
                 bail!("descriptor copies are not valid on a command-restricted receiver")
             }
             Request::Hello { .. } => bail!("unexpected second receiver handshake"),
-            Request::Receipt => {
+            Request::DestinationResults { .. } | Request::FinishDestinationResults => {
                 if !over_ssh {
-                    bail!("the receipt is issued only on the signed control connection");
+                    bail!("destination results run only on the signed control connection");
                 }
             }
             Request::TransportStats
@@ -3000,13 +2865,11 @@ impl RestrictedAuthority {
 
 /// What an authorized request recorded provisionally: creations, keyed by
 /// the operation or small-put index the executor reports on, and the
-/// outcomes the receipt will attest to once the executor confirms them.
+/// changes the results report once the executor confirms them.
 #[derive(Debug, Default)]
 pub(crate) struct Settlement {
     pub(super) creations: Vec<PendingCreation>,
     pub(super) outcomes: Vec<PendingOutcome>,
-    /// Final destination paths this admitted request could have changed.
-    pub(super) touched: Vec<Vec<u8>>,
     /// The request counts as in flight until settled.
     pub(super) tracked: bool,
     /// Where the request leaves its connection's streamed patch.
@@ -3144,37 +3007,36 @@ pub(super) fn kind_from_mode(mode: u32) -> proto::Kind {
     }
 }
 
+/// A file whose writing has begun under the results stream and which has not
+/// been published.
 #[derive(Debug)]
 pub(super) struct FileLifecycle {
     pub(super) size: u64,
-    pub(super) inplace: bool,
-    pub(super) recorded: bool,
     pub(super) last_error: Option<String>,
+    /// A refusal already listed it as failed: the end does not list it again.
+    pub(super) listed: bool,
 }
 
-/// One receipt-relevant effect of a request, confirmed by `settle`.
+/// One change a request makes, reported by `settle` once the executor
+/// confirms it.
 #[derive(Debug)]
 pub(super) enum PendingOutcome {
-    Observe {
-        path: Vec<u8>,
-    },
     Logical {
         index: usize,
         path: Vec<u8>,
-        action: crate::receipt::OperationAction,
+        change: Change,
     },
     /// An operation expected to change nothing, recorded only if it fails.
     LogicalIfFailed {
         index: usize,
         path: Vec<u8>,
-        action: crate::receipt::OperationAction,
+        change: Change,
     },
     FileStage {
         index: usize,
         path: Vec<u8>,
         copy_id: proto::CopyId,
         size: u64,
-        inplace: bool,
         stage: FileStage,
         /// Ignore a successful observation-only Prepare when it found no
         /// resumable sidecar and therefore performed no lifecycle mutation.
@@ -3190,8 +3052,6 @@ pub(super) enum PendingOutcome {
         path: Vec<u8>,
         copy_id: proto::CopyId,
         size: u64,
-        /// The metadata flags applied if the existing file is kept.
-        kept_flags: u8,
         /// The size a publication occupies, held until the reply.
         hold: Option<ReservationHoldId>,
     },

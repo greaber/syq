@@ -825,7 +825,9 @@ mod tests {
             reader.read_msg::<Response>().unwrap(),
             Response::Err(_)
         ));
-        writer.write_msg(&Request::Receipt).unwrap();
+        writer
+            .write_msg(&Request::FinishDestinationResults)
+            .unwrap();
         assert!(matches!(
             reader.read_msg::<Response>().unwrap(),
             Response::Err(_)

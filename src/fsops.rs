@@ -586,10 +586,7 @@ fn errstr(e: &anyhow::Error) -> String {
 }
 
 pub(crate) fn wire_error(error: &anyhow::Error) -> WireError {
-    if let Some(wire) = error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<WireError>())
-    {
+    if let Some(wire) = crate::conn::wire_error_of(error) {
         return WireError {
             message: errstr(error),
             io_kind: wire.io_kind,
@@ -2610,7 +2607,8 @@ impl FsOps {
             | Request::DestinationFilesystemInfo { .. }
             | Request::TransportStats
             | Request::ReceiverUser
-            | Request::Receipt
+            | Request::DestinationResults { .. }
+            | Request::FinishDestinationResults
             | Request::Shutdown
             | Request::PrepareSmallFiles(_)
             | Request::CopySmallFiles(_)

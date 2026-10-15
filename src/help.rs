@@ -243,8 +243,7 @@ pub(crate) fn filesystem(command: Command) -> Command {
                 | "detach"
                 | "peer_auth"
                 | "receiver_max_entries"
-                | "receiver_max_bytes"
-                | "receiver_receipt" => "Remote-to-remote transfers",
+                | "receiver_max_bytes" => "Remote-to-remote transfers",
                 "help" | "version" => "Help and version",
                 "dry_run" | "verbose" | "quiet" => "Preview and output",
                 _ => "Copy policy and filtering",
@@ -313,8 +312,7 @@ fn copy_heading(id: &str) -> (&'static str, usize) {
         | "detach"
         | "peer_auth"
         | "receiver_max_entries"
-        | "receiver_max_bytes"
-        | "receiver_receipt" => ("Connections and remote execution", 5),
+        | "receiver_max_bytes" => ("Connections and remote execution", 5),
         "s3_endpoint" | "s3_region" | "s3_profile" | "s3_header" | "s3_write_header" => {
             ("S3 connection settings", 6)
         }

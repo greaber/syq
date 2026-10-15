@@ -1078,6 +1078,9 @@ syq cp --if-exists=update-if-older --no-progress --performance-tuning workers=2 
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = newer; test -e /tmp/syq-real-ssh/direct-destination/policy-new'
 
+printf 'case: results of server-to-server copies on every route\n'
+python3 /usr/local/libexec/syq-test-results-stream.py
+
 printf 'case: restricted receiver prunes without a stated deletion limit\n'
 ssh source 'mkdir -p /tmp/syq-real-ssh/prune-source && printf kept > /tmp/syq-real-ssh/prune-source/kept'
 ssh destination 'mkdir -p /tmp/syq-real-ssh/prune-destination && printf extra > /tmp/syq-real-ssh/prune-destination/extra && printf extra > /tmp/syq-real-ssh/prune-destination/other'
@@ -1545,14 +1548,14 @@ from pathlib import Path
 records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
 assert records[-1]['type'] == 'result' and records[-1]['status'] == 'success', records
 assert records[-1]['bytes_transferred'] == 4 * 65536, records[-1]
+# The receiver lists the files it patched; kept files are unchanged.
 operations = {
     record['dst']['value'].rsplit('/', 1)[-1]: (record['action'], record['disposition'])
     for record in records
     if record['type'] == 'operation_result'
 }
-for n in range(1, 9):
-    action = 'transfer_file' if n <= 4 else 'set_metadata'
-    assert operations.get(f'file-{n}') == (action, 'succeeded'), operations
+assert operations == {f'file-{n}': ('transfer_file', 'succeeded') for n in range(1, 5)}, operations
+assert records[-1]['files_unchanged'] == 4, records[-1]
 marker = 'syq: tuning observed: '
 observed = [
     json.loads(line.split(marker, 1)[1])

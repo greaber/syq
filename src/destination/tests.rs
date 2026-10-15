@@ -330,25 +330,23 @@ pub(super) fn command(source: &Path, options: &[&str]) -> Vec<Vec<u8>> {
 pub(super) fn requested(
     source: &Path,
     options: &[&str],
-) -> (Vec<Vec<u8>>, CopyRequest, crate::receipt::RecipientSecret) {
+) -> (
+    Vec<Vec<u8>>,
+    CopyRequest,
+    crate::destination_results::RecipientSecret,
+) {
     let command = command(source, options);
     let (request, secret) = request(&crate::approval_command::parse(&command).unwrap());
     (command, request, secret)
 }
-pub(super) fn request(args: &Args) -> (CopyRequest, crate::receipt::RecipientSecret) {
-    let (secret, public) = crate::receipt::generate_recipient().unwrap();
-    let policy = crate::receipt::ReceiptPolicy {
-        required: true,
-        hashed: false,
-        max_records: crate::receipt::DEFAULT_MAX_RECORDS,
-        max_plaintext_bytes: crate::receipt::DEFAULT_MAX_PLAINTEXT_BYTES,
-        delivery: crate::receipt::ReceiptDelivery::AttachedEncrypted {
-            suite: crate::receipt::HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
-            recipient_public_key: public,
-        },
-    };
+pub(super) fn request(args: &Args) -> (CopyRequest, crate::destination_results::RecipientSecret) {
+    let (secret, public) = crate::destination_results::generate_recipient().unwrap();
     (
-        crate::restricted::named_request(args, policy).unwrap(),
+        crate::restricted::named_request(
+            args,
+            crate::destination_results::ReceiptPolicy::for_recipient(public),
+        )
+        .unwrap(),
         secret,
     )
 }
@@ -869,12 +867,12 @@ fn named_failed_open_reply_releases_its_session() {
 }
 
 #[test]
-fn named_copy_uses_confined_workers_and_verifies_receipt() {
+fn named_copy_uses_confined_workers() {
     named_copy_with_transport(false);
 }
 
 #[test]
-fn named_tcp_copy_uses_confined_workers_and_verifies_receipt() {
+fn named_tcp_copy_uses_confined_workers() {
     named_copy_with_transport(true);
 }
 
@@ -888,20 +886,13 @@ fn named_copy_with_transport(tcp: bool) {
     fs::write(source.join("large"), vec![42; 5_000_000]).unwrap();
     std::os::unix::fs::symlink("hello", source.join("link")).unwrap();
     let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
-    let (command, request, secret) = requested(&source, &[]);
+    let (command, request, _) = requested(&source, &[]);
     let mut args = crate::approval_command::parse(&command).unwrap();
-    let policy = request.constraints.receipt_policy.clone();
     let approved = approve(&registration, command, request);
     // The route below replaces discovery of the named receiver.
     args.locations.last_mut().unwrap().host = Some("server".into());
     args.locations.last_mut().unwrap().path = approved.destination.clone();
     args.restricted_grant = Some(route(registration, approved.token.clone()));
-    args.named_receipt = Some(Arc::new(NamedReceipt {
-        connection: None,
-        secret,
-        approved,
-        policy,
-    }));
     args.no_tcp = !tcp;
     assert_eq!(crate::transfer::run(args).unwrap(), 0);
     assert_eq!(
@@ -932,24 +923,17 @@ fn named_copy_accepts_ownership_and_special_files() {
     let fifo = std::ffi::CString::new(source.join("pipe").as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o640) }, 0);
     let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
-    let (command, request, secret) = requested(
+    let (command, request, _) = requested(
         &source,
         &["--copy-metadata", "mtime,permissions,ownership,specials"],
     );
     let options = &request.copy.options;
     assert!(options.preserve_owner && options.preserve_group && options.preserve_devices);
     let mut args = crate::approval_command::parse(&command).unwrap();
-    let policy = request.constraints.receipt_policy.clone();
     let approved = approve(&registration, command, request);
     args.locations.last_mut().unwrap().host = Some("server".into());
     args.locations.last_mut().unwrap().path = approved.destination.clone();
     args.restricted_grant = Some(route(registration, approved.token.clone()));
-    args.named_receipt = Some(Arc::new(NamedReceipt {
-        connection: None,
-        secret,
-        approved,
-        policy,
-    }));
     assert_eq!(crate::transfer::run(args).unwrap(), 0);
     assert_eq!(
         fs::read(root.join("source/hello")).unwrap(),
@@ -1006,7 +990,7 @@ fn named_requests_keep_inplace_refused_and_prune_within_the_machines_limit() {
         enrollment: crate::enrollment::EnrollmentId::random(),
         request: crate::delegation::RequestId::fresh(1).unwrap(),
         digest: [0; 32],
-        receipt_key: String::new(),
+        results_key: String::new(),
         max_delete: None,
     };
     for (stated, machine, planned, from_machine) in [
@@ -1173,21 +1157,14 @@ fn approve_pending(receiver: &Arc<Receiver>) -> std::thread::JoinHandle<String> 
 
 /// Run the copy of `source` that `options` describe through `registration`.
 fn named_copy(registration: &Registration, source: &Path, options: &[&str]) -> i32 {
-    let (command, request, secret) = requested(source, options);
+    let (command, request, _) = requested(source, options);
     let mut args = crate::approval_command::parse(&command).unwrap();
-    let policy = request.constraints.receipt_policy.clone();
     let approved = approve(registration, command, request);
     // As `prepare` does with the approval.
     apply_deletion_limit(&mut args, &approved);
     args.locations.last_mut().unwrap().host = Some("server".into());
     args.locations.last_mut().unwrap().path = approved.destination.clone();
     args.restricted_grant = Some(route(registration.clone(), approved.token.clone()));
-    args.named_receipt = Some(Arc::new(NamedReceipt {
-        connection: None,
-        secret,
-        approved,
-        policy,
-    }));
     crate::transfer::run(args).unwrap()
 }
 

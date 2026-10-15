@@ -210,8 +210,10 @@ pub struct Args {
     /// Local source work overlapped with the automatic authorization SSH attempt.
     #[arg(skip)]
     pub(crate) prepared_source: Option<std::sync::Arc<crate::transfer::PreparedSource>>,
+    /// The approved control channel of a copy to another server that a
+    /// receiving machine authorized and connects.
     #[arg(skip)]
-    pub(crate) named_receipt: Option<std::sync::Arc<crate::destination::NamedReceipt>>,
+    pub(crate) return_destination: Option<std::sync::Arc<crate::destination::ReturnConnection>>,
     #[arg(skip)]
     pub(crate) auth_from_explicit: bool,
     /// Which public command produced this execution request.
@@ -279,9 +281,17 @@ pub struct Args {
     #[arg(skip)]
     pub native_results_fd: Option<i32>,
     /// Internal delegated-run marker: skip the final human summary (the
-    /// invoking machine renders it from the verified attested terminal).
+    /// invoking machine renders it from the results it settles).
     #[arg(skip)]
     pub suppress_summary: bool,
+    /// Internal: a remote coordinator writes its results as marked lines on
+    /// standard output for the syq that started it.
+    #[arg(skip)]
+    pub relay_results: bool,
+    /// Internal: the token marking results lines a remote coordinator relays,
+    /// its own and a restricted destination's.
+    #[arg(skip)]
+    pub(crate) results_token: Option<String>,
     /// Internal: this run is a remote-to-remote coordinator, whose `--rsh`
     /// was chosen by the invoking machine.
     #[arg(skip)]
@@ -604,9 +614,6 @@ pub struct Args {
     pub receiver_max_entries: Option<u64>,
     #[arg(skip)]
     pub receiver_max_bytes: Option<u64>,
-    /// Native-only: the receipt detail `--receiver-receipt` asked for, if any.
-    #[arg(skip)]
-    pub receiver_receipt: Option<ReceiptDetail>,
     /// Skip regular files that are newer on the destination (directories,
     /// symlinks and specials are unaffected)
     #[arg(short = 'u', long)]
@@ -1382,9 +1389,6 @@ struct NativeCopyOperationalArgs {
     /// Command-restricted receiver ceiling: refuse to write more than SIZE bytes of file data in total
     #[arg(long, value_name = "SIZE", help_heading = REMOTE_TO_REMOTE_HEADING)]
     receiver_max_bytes: Option<String>,
-    /// Command-restricted receiver receipt detail: final sizes (default) or also final BLAKE3 file hashes
-    #[arg(long, value_name = "DETAIL", value_enum, help_heading = REMOTE_TO_REMOTE_HEADING)]
-    receiver_receipt: Option<ReceiptDetail>,
 }
 
 /// How a remote coordinator authenticates to the peer of a direct
@@ -1400,15 +1404,6 @@ pub enum PeerAuth {
     OwnCredentials,
     /// Expose the complete local SSH agent to the coordinator, as `ssh -A` would
     FullAgent,
-}
-
-/// What the command-restricted receiver records in its signed receipt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum ReceiptDetail {
-    /// Final type and size of every path the transfer could have changed
-    Sizes,
-    /// Sizes plus a closure-time BLAKE3 hash of every regular file
-    Hashes,
 }
 
 const REMOTE_TO_REMOTE_HEADING: &str = "Remote-to-remote transfers";
@@ -1547,9 +1542,13 @@ struct NativeCopyFields {
     #[arg(long, hide = true)]
     delegated_operands_b64: bool,
     /// Internal: skip the final human summary — the invoking machine
-    /// renders it from the verified attested terminal instead.
+    /// renders it from the results it settles instead.
     #[arg(long, hide = true)]
     suppress_summary: bool,
+    /// Internal: relay this coordinator's results to the syq that started
+    /// it, as lines marked with its internal token.
+    #[arg(long, hide = true)]
+    relay_results: bool,
     #[command(flatten)]
     selection: NativeSelectionArgs,
     /// Destination SSH endpoint, @NAME, or s3://BUCKET; placement defaults to --into .
@@ -2547,6 +2546,7 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
     args.native_results = results.map(OsStringExt::into_vec);
     args.native_results_fd = results_fd;
     args.suppress_summary = copy.suppress_summary;
+    args.relay_results = copy.relay_results;
     args.delegated = copy.delegated_operands_b64;
     args.pscope = pscope;
     args.native_source_cwd = copy.selection.source.cwd.clone().map(OsStringExt::into_vec);
@@ -2561,10 +2561,7 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
     args.native_follow_dst = copy.follow_dst;
     apply_native_copy_operational(&mut args, copy.operational, &matches)?;
     apply_native_remote(&mut args, remote)?;
-    if args.receiver_max_entries.is_some()
-        || args.receiver_max_bytes.is_some()
-        || args.receiver_receipt.is_some()
-    {
+    if args.receiver_max_entries.is_some() || args.receiver_max_bytes.is_some() {
         // These are assertions for hostB's enrolled receiver to enforce; with
         // no such receiver in the topology, nothing would enforce them, so
         // refuse rather than let them read as local limits.
@@ -2572,7 +2569,7 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
         let dst_remote = args.locations.last().is_some_and(|l| l.host.is_some());
         if !(src_remote && dst_remote) {
             bail!(
-                "--receiver-max-entries, --receiver-max-bytes, and --receiver-receipt address the command-restricted receiver; they apply only to direct remote-to-remote copies"
+                "--receiver-max-entries and --receiver-max-bytes address the command-restricted receiver; they apply only to direct remote-to-remote copies"
             );
         }
     }
@@ -2586,18 +2583,12 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
                 "--results cannot be used with --detach because the result stream would not remain attached"
             );
         }
-        // A dry run's traces and planned totals exist only on the
-        // coordinator, and a receiver receipt cannot attest a plan; until
-        // the coordinator's own stream can be relayed home (recorded
-        // follow-up), remote dry-run streams are refused up front.
-        let src_remote = args.locations.first().is_some_and(|l| l.host.is_some());
-        let dst_remote = args.locations.last().is_some_and(|l| l.host.is_some());
-
-        if args.dry_run && src_remote && dst_remote && args.coordinate_at != CoordinateAt::Local {
-            bail!(
-                "--dry-run with --results needs a local coordinator for a remote-to-remote copy; pass --coordinate-at local to preview with the full trace stream"
-            );
-        }
+    }
+    if args.relay_results {
+        anyhow::ensure!(
+            args.delegated && args.results_token.is_some(),
+            "--relay-results is internal to a copy between two servers"
+        );
     }
     if let Some(options) = &args.s3 {
         if args.devices {
@@ -3062,13 +3053,11 @@ fn apply_native_copy_operational(
         inplace,
         receiver_max_entries,
         receiver_max_bytes,
-        receiver_receipt,
     } = operational;
     args.expressions =
         crate::expression::Policy::compile(where_expression.as_deref(), copy_if.as_deref())?;
     args.where_expression = where_expression;
     args.copy_if = copy_if;
-    args.receiver_receipt = receiver_receipt;
     args.receiver_max_entries = receiver_max_entries;
     args.receiver_max_bytes = receiver_max_bytes.as_deref().map(parse_size).transpose()?;
     args.checksum = hash;
@@ -3196,6 +3185,13 @@ fn apply_internal_native_direct(args: &mut Args) -> Result<()> {
             .transpose()
     };
     args.restricted_grant = utf8("SYQ_INTERNAL_NATIVE_RESTRICTED_GRANT")?;
+    args.results_token = utf8(crate::destination_results::relay::TOKEN_ENV)?;
+    if let Some(token) = &args.results_token {
+        anyhow::ensure!(
+            crate::destination_results::relay::valid_token(token),
+            "invalid internal results token"
+        );
+    }
     args.receiver_known_hosts = utf8(crate::remote_to_remote::RECEIVER_KNOWN_HOSTS)?;
     args.plan_source_host = utf8("SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST")?;
     args.requester_stdin = utf8(crate::remote_to_remote::REQUESTER_STDIN)?

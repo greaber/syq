@@ -176,18 +176,10 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
         ..
     } = selection;
     let target = target.context("remote authorization target missing")?;
-    let (secret, public) = crate::receipt::generate_recipient()?;
-    let policy = crate::receipt::ReceiptPolicy {
-        required: true,
-        hashed: args.receiver_receipt == Some(crate::cli::ReceiptDetail::Hashes),
-        max_records: crate::receipt::DEFAULT_MAX_RECORDS,
-        max_plaintext_bytes: crate::receipt::DEFAULT_MAX_PLAINTEXT_BYTES,
-        delivery: crate::receipt::ReceiptDelivery::AttachedEncrypted {
-            suite: crate::receipt::HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
-            recipient_public_key: public,
-        },
-    };
-    let request = crate::restricted::named_request(args, policy.clone())?;
+    let request = crate::restricted::named_request(
+        args,
+        crate::destination_results::ReceiptPolicy::unused()?,
+    )?;
     crate::output::diagnostic!("syq: requesting permission from @{name} to copy to {target:?}; approve on that machine with its desktop prompt or syq persist receive pending");
     let (stream, reply) = exchange(
         &registration,
@@ -213,12 +205,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
     // marker selects its restricted executor and per-copy worker admission.
     args.restricted_grant = Some(super::RETURN_GRANT.into());
     let ssh = ssh::Client::new(registration, approved.token.clone());
-    args.named_receipt = Some(Arc::new(NamedReceipt {
-        connection: Some(ReturnConnection::new(stream, Some(ssh))),
-        secret,
-        approved,
-        policy,
-    }));
+    args.return_destination = Some(ReturnConnection::new(stream, Some(ssh)));
     Ok(())
 }
 
@@ -260,14 +247,6 @@ impl Receiver {
         )?;
         let max_delete = super::deletion_ceiling(&request, self.max_delete);
         crate::delegation::validate_return_request(&request)?;
-        if !request.constraints.receipt_policy.required
-            || !matches!(
-                request.constraints.receipt_policy.delivery,
-                crate::receipt::ReceiptDelivery::AttachedEncrypted { .. }
-            )
-        {
-            bail!("remote copies require an attached encrypted receipt");
-        }
         let count = self.forward_count.fetch_add(1, Ordering::AcqRel);
         let _slot = Slot(&self.forward_count);
         if count >= 8 {

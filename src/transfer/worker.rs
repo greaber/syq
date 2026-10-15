@@ -382,9 +382,14 @@ impl Worker {
         indices: impl IntoIterator<Item = usize>,
         error: &anyhow::Error,
     ) {
+        let change = ChangeFailed::is(error);
         let error = crate::fsops::wire_error(error);
         for idx in indices {
-            results[idx] = Some(Err(endpoint_error(error.clone())));
+            results[idx] = Some(Err(if change {
+                ChangeFailed::whole(error.clone())
+            } else {
+                endpoint_error(error.clone())
+            }));
         }
     }
 
@@ -393,7 +398,7 @@ impl Worker {
         response: Response,
         results: &mut [Option<SmallPutOutcome>],
     ) -> bool {
-        let applied = ok(response, "put small batch").and_then(|response| match response {
+        let applied = change_ok(response, "put small batch").and_then(|response| match response {
             Response::Applied(applied) if applied.len() == sent.len() => Ok(applied
                 .into_iter()
                 .map(|e| e.map_or(Ok(None), Err))
@@ -412,8 +417,7 @@ impl Worker {
             results[idx] = Some(
                 error
                     .map(SmallPutResult::Published)
-                    .map_err(endpoint_error)
-                    .context("put"),
+                    .map_err(|error| ChangeFailed::replying("put", error)),
             );
         }
         true
@@ -856,12 +860,20 @@ impl Worker {
             if let Err(e) = res {
                 let os_kind = os_kind_of(&e);
                 let message = copy_error_message(&e, self.opts.failure_hint_at(&j.dst));
-                self.progress.error_classified(
+                // The receiver lists a publication it refused or failed; a
+                // file that could not be read never reached it.
+                let listing = if ChangeFailed::is(&e) {
+                    crate::results::ReceiverListing::Listed
+                } else {
+                    crate::results::ReceiverListing::Unlisted
+                };
+                self.progress.entry_error_classified(
                     &format!("syq: {}: {message}", j.rel),
                     Some("io"),
                     os_kind,
+                    Some((&j.rel_bytes, listing)),
                 );
-                self.emit_file_result_failed(j, "unknown", os_kind, &message);
+                self.emit_file_result_failed(j, "unknown", os_kind, &message, listing);
                 self.sched.fail_file(*idx);
                 if capacity_os_kind(os_kind) {
                     self.sched.abort();
@@ -941,6 +953,7 @@ impl Worker {
                 "yes",
                 None,
                 "source changed during transfer (or vanished)",
+                crate::results::ReceiverListing::Unlisted,
             );
             self.sched.fail_file(idx);
         }
@@ -957,17 +970,55 @@ impl Worker {
             let job = self.job(idx);
             let os_kind = os_kind_of(&e);
             let message = copy_error_message(&e, self.opts.failure_hint_at(&job.dst));
-            self.progress.error_classified(
+            let listing = self.receiver_listing(idx, &e);
+            self.progress.entry_error_classified(
                 &format!("syq: {}: {message}", job.rel),
                 Some("io"),
                 os_kind,
+                Some((&job.rel_bytes, listing)),
             );
-            self.emit_file_result_failed(&job, "unknown", os_kind, &message);
+            self.emit_file_result_failed(&job, "unknown", os_kind, &message, listing);
             if capacity_os_kind(os_kind) {
                 self.sched.abort();
             }
         }
         Ok(())
+    }
+
+    /// How a command-restricted receiver reports this file's failure: as
+    /// its own reply to a change, as a file it was writing and never
+    /// published, or not at all.
+    fn receiver_listing(
+        &self,
+        idx: usize,
+        error: &anyhow::Error,
+    ) -> crate::results::ReceiverListing {
+        if !self.progress.receiver_lists_failures() {
+            return crate::results::ReceiverListing::Unlisted;
+        }
+        let held = self.sched.take_receiver_hold(idx);
+        if ChangeFailed::is(error) {
+            crate::results::ReceiverListing::Listed
+        } else if held {
+            crate::results::ReceiverListing::Explained
+        } else {
+            crate::results::ReceiverListing::Unlisted
+        }
+    }
+
+    /// A command-restricted receiver now holds this file unfinished, until
+    /// it is published.
+    pub(super) fn receiver_holds(&self, idx: usize) {
+        if self.progress.receiver_lists_failures() {
+            self.sched.receiver_holds(idx);
+        }
+    }
+
+    /// The receiver published this file.
+    pub(super) fn receiver_published(&self, idx: usize) {
+        if self.progress.receiver_lists_failures() {
+            self.sched.receiver_published(idx);
+        }
     }
 
     /// One failed-transfer result record; the error itself was already
@@ -978,6 +1029,7 @@ impl Worker {
         retryable: &'static str,
         os_kind: Option<&'static str>,
         message: &str,
+        listing: crate::results::ReceiverListing,
     ) {
         // Verification reports differences and inspection failures as errors,
         // never as a transfer operation that could be mistaken for a write.
@@ -985,7 +1037,7 @@ impl Worker {
             return;
         }
         if let Some(results) = self.progress.results_writer() {
-            results.emit_operation_expected(
+            results.emit_operation_listed(
                 &crate::results::OperationRecord {
                     action: "transfer_file",
                     dst: &job.rel_bytes,
@@ -1000,6 +1052,7 @@ impl Worker {
                     message: Some(message),
                 },
                 self.opts.expected_for(&job.rel_bytes),
+                listing,
             );
         }
     }
@@ -1195,6 +1248,7 @@ impl Worker {
             // it. When a final-file basis exists, leave an absent sidecar
             // absent until the content comparison shows a difference.
             let prepared = self.prepare_file(
+                idx,
                 &job,
                 inplace || !final_is_file || (!reuse_blocks && !checksum),
             )?;
@@ -1219,7 +1273,7 @@ impl Worker {
                     // Discovery can report a donor without creating our output.
                     // Even an empty replacement needs its own file to publish.
                     if prepared.partial_size.is_none() {
-                        self.prepare_file(&job, true)?;
+                        self.prepare_file(idx, &job, true)?;
                     }
                     return Ok((vec![], true));
                 }
@@ -1258,7 +1312,7 @@ impl Worker {
                             return Ok((vec![], false));
                         }
                     }
-                    let prepared = self.prepare_file(&job, true)?;
+                    let prepared = self.prepare_file(idx, &job, true)?;
                     if prepared.partial_size.is_some() || prepared.has_candidates {
                         return Ok((self.resume_ranges(idx, &job)?, true));
                     }
@@ -1272,7 +1326,11 @@ impl Worker {
                     return Ok((vec![], false));
                 }
                 return Ok((
-                    self.reuse_blocks(&job, diff.source_hashes, &diff.ranges)?,
+                    {
+                        // Seeding from the final file prepares this one.
+                        self.receiver_holds(idx);
+                        self.reuse_blocks(&job, diff.source_hashes, &diff.ranges)?
+                    },
                     true,
                 ));
             }
@@ -1402,6 +1460,7 @@ impl Worker {
             // range/stream path pays their budget before requesting them.
             // Empty final ranges prohibit using the final file if the partial
             // disappears before seeding.
+            self.receiver_holds(idx);
             return self
                 .diff_with(
                     job,
@@ -1419,7 +1478,8 @@ impl Worker {
     }
 
     fn stage_comparison(&mut self, idx: usize, job: &WorkerJob, allow_final: bool) -> Result<()> {
-        let compare_final = match ok(
+        self.receiver_holds(idx);
+        let compare_final = match change_ok(
             self.dst.call(Request::StageBasis {
                 path: job.dst.clone(),
                 copy_id: self.copy_id(),
@@ -1565,7 +1625,7 @@ impl Worker {
         let response = self
             .dst
             .call(self.seed_request(job, Some(matching.clone())))?;
-        let Response::SeededBasis(reused) = ok(response, "reuse destination blocks")? else {
+        let Response::SeededBasis(reused) = change_ok(response, "reuse destination blocks")? else {
             bail!("destination did not return seeded block hashes");
         };
         Self::different_seeded_ranges(&hashes, &reused, &matching, self.opts.block, job.entry.size)
@@ -1606,13 +1666,14 @@ impl Worker {
 
     fn prepare_file(
         &mut self,
+        idx: usize,
         job: &WorkerJob,
         create_if_missing: bool,
     ) -> Result<crate::proto::Preparation> {
         // The receiver creates an in-place file in its final mode and a
         // sidecar in its staged mode, the final bits, unless a group change
         // or an ACL keeps either private until finalize.
-        match ok(
+        let reply = change_ok(
             self.dst.call(Request::Prepare {
                 path: job.dst.clone(),
                 size: job.entry.size,
@@ -1628,7 +1689,21 @@ impl Worker {
                 group: self.publication_group(job),
             })?,
             "prepare",
-        )? {
+        );
+        // A restricted receiver now holds the file unfinished, unless the
+        // preparation only looked and found nothing of it, as the receiver
+        // judges.
+        let holds = match &reply {
+            Ok(Response::Prepared(prepared)) => {
+                !(prepared.has_candidates
+                    || (!create_if_missing && prepared.partial_size.is_none()))
+            }
+            _ => true,
+        };
+        if holds {
+            self.receiver_holds(idx);
+        }
+        match reply? {
             Response::Prepared(prepared) => Ok(prepared),
             other => bail!("unexpected response {other:?}"),
         }
@@ -1679,6 +1754,7 @@ impl Worker {
     ) -> Result<BlockDiff> {
         let block = self.opts.block;
         let size = job.entry.size;
+        let seeds = matches!(destination_request, Request::SeedBasis { .. });
         // Send the destination request first: a local source hashes in place
         // during `send`, and the destination is always a separate process, so
         // this order lets both hashes run concurrently.
@@ -1700,8 +1776,13 @@ impl Worker {
         let source_response = self.src.recv();
         let destination_response = self.dst.recv();
         let source = Self::hashes(ok(source_response?, "hash source")?)?;
-        let (destination, held_len) =
-            Self::destination_hashes(ok(destination_response?, destination_label)?)?;
+        // Seeding a basis prepares the file; the other requests only read.
+        let destination_response = if seeds {
+            change_ok(destination_response?, destination_label)
+        } else {
+            ok(destination_response?, destination_label)
+        };
+        let (destination, held_len) = Self::destination_hashes(destination_response?)?;
         Ok(BlockDiff {
             ranges: Self::different_ranges(&source, &destination, block, size),
             source_hashes: source,
@@ -1952,7 +2033,7 @@ impl Worker {
                         Some((off, end, Self::window_hashes(response?, off, end, block)?));
                 }
                 while let Some((len, reused)) = writes.pop_front() {
-                    match ok(self.dst.recv()?, "write compared block")? {
+                    match change_ok(self.dst.recv()?, "write compared block")? {
                         Response::Ok => {}
                         _ => {
                             return Err(anyhow::Error::new(RangeReplyMismatch)
@@ -2109,13 +2190,13 @@ impl Worker {
     ) -> Result<bool> {
         let slow = if adaptive {
             let (response, arrived) = received.unwrap_or_else(|| self.dst.recv_with_arrival())?;
-            ok(response, "write")?;
+            change_ok(response, "write")?;
             let elapsed = arrived.saturating_duration_since(started);
             let slow = elapsed > budget.latency_target();
             budget.observe(WorkSize { bytes: n, files: 0 }, elapsed);
             slow
         } else {
-            ok(self.dst.recv()?, "write")?;
+            change_ok(self.dst.recv()?, "write")?;
             false
         };
         Self::acknowledge_range_write(&self.sched, &self.progress, job, flights, slot, n);
@@ -2575,7 +2656,7 @@ impl Worker {
         }
         let mut meta = self.opts.metadata_for(&job.rel_bytes, &job.entry);
         meta.mode = self.create_mode(&job);
-        let finalized = ok(
+        let finalized = change_ok(
             self.dst.call(Request::Finalize {
                 expected_hash: self.opts.expected_hashes_for(&job),
                 path: job.dst.clone(),
@@ -2635,6 +2716,7 @@ impl Worker {
             "SYQ_TEST_FINALIZE_CONTINUE_FILE",
             "finalize-ready",
         )?;
+        self.receiver_published(idx);
         self.complete_file(job, false)
     }
 
@@ -2797,7 +2879,7 @@ impl Worker {
         }
         // Preserve the ordinary quick check's metadata reconciliation and
         // require the same destination inode observed by the planner.
-        let response = ok(
+        let response = change_ok(
             self.dst.call(Request::Apply {
                 ops: vec![Op::SetFileMetaIfSame {
                     path: job.dst.clone(),
@@ -2817,7 +2899,10 @@ impl Worker {
         match response {
             Response::Applied(results) if results.len() == 1 => {
                 if let Some(error) = &results[0] {
-                    bail!("update metadata after expected digest match: {error}");
+                    return Err(ChangeFailed::replying(
+                        "update metadata after expected digest match",
+                        error.clone(),
+                    ));
                 }
             }
             other => bail!("unexpected metadata response: {other:?}"),

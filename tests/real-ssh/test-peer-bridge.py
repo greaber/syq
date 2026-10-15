@@ -410,11 +410,12 @@ def main():
                        + shlex.quote(f"{a}/{name}.{attempts[name]}.ndjson")).splitlines()]
             terminal = records[-1]
             assert terminal["type"] == "result" and terminal["status"] == "success", terminal
-            assert terminal["provenance"] == "receiver_attested", terminal
-            assert terminal["receipt_status"] == "clean", terminal
-            assert terminal["files_transferred"] == 1, terminal
-            assert any(record["type"] == "final_state" and record["provenance"] == "receiver_attested"
-                       for record in records), records
+            assert terminal["files_transferred"] == 1 and terminal["errors"] == 0, terminal
+            # The destination's own record of the file, relayed by the
+            # coordinating server, in the ordinary format.
+            assert [record["action"] for record in records
+                    if record["type"] == "operation_result"] == ["transfer_file"], records
+            assert not any("provenance" in record for record in records), records
             assert digest("destination", c + "/" + name) == expected_digest
             assert fingerprint("source") == b_keys
             wait_for("destination temporary key cleanup", lambda: fingerprint("destination") == c_keys)
