@@ -1002,6 +1002,15 @@ struct PartialTarget<'a> {
     guard: Option<&'a ContainerGuard>,
 }
 
+/// How a sidecar is seeded (`FsOps::seed_basis_impl`): only staged, for a
+/// comparison to follow (`Request::StageBasis`), or seeded and hashed, from
+/// a clone of the final file where asked and possible.
+#[derive(Clone, Copy, Default)]
+struct SeedHow {
+    stage_only: bool,
+    clone_final: bool,
+}
+
 struct PrepareOptions<'a> {
     size: u64,
     inplace: bool,

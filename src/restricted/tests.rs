@@ -2285,6 +2285,7 @@ fn signed_skip_allows_seeding_and_retrying_a_new_file() {
             block: authority.copy.limits.hash_block_bytes,
             attempt,
             guard: None,
+            clone_final: false,
         };
         let settlement = authority.authorize(&mut seed, false).unwrap();
         let response = ops.handle(&seed);
@@ -2406,6 +2407,7 @@ fn signed_skip_policy_retains_preexisting_objects() {
         block: proto::MIN_HASH_BLOCK_BYTES,
         attempt: 0,
         guard: None,
+        clone_final: false,
     };
     assert!(authority.authorize(&mut seed, false).is_err());
     let mut delete = apply(Op::Unlink {
@@ -4813,6 +4815,7 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
         block: proto::MIN_HASH_BLOCK_BYTES,
         attempt: 0,
         guard: None,
+        clone_final: false,
     };
     assert!(authority.authorize(&mut seed, false).is_err());
 

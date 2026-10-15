@@ -49,6 +49,11 @@ fn rsync_inplace(t: &Tmp, route: &str, args: &[&str], env: &[(&str, &str)]) -> O
 /// `args`, on this machine or (`ssh`) to a remote helper over SSH. `env` is
 /// set for syq and its helper.
 fn cp_update(t: &Tmp, route: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
+    cp_update_command(t, route, args, env).run().unwrap()
+}
+
+/// The command `cp_update` runs.
+fn cp_update_command(t: &Tmp, route: &str, args: &[&str], env: &[(&str, &str)]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
     command
         .args(["cp", "--in-place=update", "--no-progress"])
@@ -71,7 +76,8 @@ fn cp_update(t: &Tmp, route: &str, args: &[&str], env: &[(&str, &str)]) -> Outpu
             );
     }
     command.arg("--into").arg(t.s("dst"));
-    command.envs(env.iter().copied()).run().unwrap()
+    command.envs(env.iter().copied());
+    command
 }
 
 fn inode(path: &Path) -> u64 {
@@ -481,6 +487,72 @@ fn a_file_only_the_receiver_refuses_is_read_once_there() {
         .map(|line| line.split(' ').nth(1).unwrap().parse::<u64>().unwrap())
         .sum();
     assert_eq!(hashed, 16 << 20);
+}
+
+/// A differing file the receiver refuses to update in place is replaced
+/// from the file it holds: cloned into the stage where the filesystem can,
+/// and hashed there. The receiver does not vouch for the file, which here
+/// changes after it was compared: the replacement still holds the source's
+/// bytes, since the stage's hashes, not the comparison's, decide what is
+/// sent.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn a_refused_file_changed_after_its_comparison_is_replaced_with_the_sources_bytes() {
+    use std::os::unix::fs::FileExt as _;
+    let reader = acl(&[
+        (1, 6, u32::MAX),
+        (2, 4, 12345),
+        (4, 4, u32::MAX),
+        (16, 4, u32::MAX),
+        (32, 4, u32::MAX),
+    ]);
+    let t = Tmp::new();
+    let new = prng(16 << 20, 700);
+    let mut old = new.clone();
+    old[(9 << 20) + 5] ^= 1;
+    write(&t.path("src/file"), &new);
+    write(&t.path("dst/file"), &old);
+    fs::set_permissions(t.path("dst/file"), fs::Permissions::from_mode(0o644)).unwrap();
+    if !set_attribute(&t.path("dst/file"), "system.posix_acl_access", &reader) {
+        eprintln!("skipped: this filesystem has no POSIX ACLs");
+        return;
+    }
+    set_mtime(&t.path("src/file"), 1_700_000_000);
+    let before = inode(&t.path("dst/file"));
+    let (ready, continuation, clones) = (t.path("ready"), t.path("continue"), t.path("clones"));
+    let mut child = cp_update_command(
+        &t,
+        "ssh",
+        &[],
+        &[
+            ("SYQ_TEST_BASIS_READY_FILE", &ready.to_string_lossy()),
+            (
+                "SYQ_TEST_BASIS_CONTINUE_FILE",
+                &continuation.to_string_lossy(),
+            ),
+            ("SYQ_TEST_SEED_CLONES", &clones.to_string_lossy()),
+        ],
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .start()
+    .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "the comparison");
+    // A block that matched the source when it was compared no longer does.
+    OpenOptions::new()
+        .write(true)
+        .open(t.path("dst/file"))
+        .unwrap()
+        .write_all_at(b"planted after the comparison", 2 << 20)
+        .unwrap();
+    release_confinement_barrier(&continuation);
+    let out = child.wait_with_output().unwrap();
+    assert_output_ok(&out);
+    assert_ne!(inode(&t.path("dst/file")), before);
+    assert!(read(&t.path("dst/file")) == new);
+    if fs::read_to_string(&clones).unwrap_or_default().is_empty() {
+        eprintln!("note: this filesystem did not clone; the stage was copied");
+    }
 }
 
 /// An unchanged file the receiver will not update in place, here because

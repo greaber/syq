@@ -1132,6 +1132,11 @@ pub enum WireRequest<Data> {
         block: u64,
         attempt: u32,
         guard: Option<ContainerGuard>,
+        /// Clone the final file `final_ranges` select into the sidecar where
+        /// the filesystem can, and hash those ranges from the sidecar, rather
+        /// than copying them. The file may have changed since it was
+        /// compared: the hashes show what the sidecar holds.
+        clone_final: bool,
     },
     /// Receiver-side copy of a same-machine file (Linux copy_file_range,
     /// macOS cloning, or an eligible sequential userspace fallback).

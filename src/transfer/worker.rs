@@ -1273,8 +1273,12 @@ impl Worker {
                     }
                     // `--in-place=update`: a differing file the receiver will
                     // not update in place is replaced, from the file it
-                    // holds: a stage is seeded from its matching blocks, so
-                    // it is read for no second comparison.
+                    // holds: a stage is seeded from its matching blocks, a
+                    // clone where the filesystem can make one, and hashed as
+                    // it is seeded, so neither file is compared again. The
+                    // receiver does not vouch for the file, which may have
+                    // changed since: the stage's hashes, not the
+                    // comparison's, decide what is sent.
                     if let Some(reason) = diff.refused {
                         self.refuse_in_place(idx, reason);
                         let job = self.job(idx);
@@ -1287,7 +1291,7 @@ impl Worker {
                             return Ok((self.resume_ranges(idx, &job)?, true));
                         }
                         return Ok((
-                            self.reuse_blocks(&job, diff.source_hashes, &diff.ranges)?,
+                            self.reuse_blocks_from(&job, diff.source_hashes, &diff.ranges, true)?,
                             true,
                         ));
                     }
@@ -1740,6 +1744,18 @@ impl Worker {
         hashes: Vec<ContentDigest>,
         different: &[(u64, u64)],
     ) -> Result<Vec<(u64, u64)>> {
+        self.reuse_blocks_from(job, hashes, different, false)
+    }
+
+    /// `reuse_blocks`, the matching blocks cloned from the final file
+    /// where the receiver can, when `clone_final`, rather than copied.
+    pub(super) fn reuse_blocks_from(
+        &mut self,
+        job: &WorkerJob,
+        hashes: Vec<ContentDigest>,
+        different: &[(u64, u64)],
+        clone_final: bool,
+    ) -> Result<Vec<(u64, u64)>> {
         let mut matching = Vec::new();
         let mut pos = 0;
         for &(start, end) in different {
@@ -1751,9 +1767,14 @@ impl Worker {
         if pos < job.entry.size {
             matching.push((pos, job.entry.size));
         }
-        let response = self
-            .dst
-            .call(self.seed_request(job, Some(matching.clone())))?;
+        let mut request = self.seed_request(job, Some(matching.clone()));
+        if let Request::SeedBasis {
+            clone_final: clone, ..
+        } = &mut request
+        {
+            *clone = clone_final;
+        }
+        let response = self.dst.call(request)?;
         let Response::SeededBasis(reused) = change_ok(response, "reuse destination blocks")? else {
             bail!("destination did not return seeded block hashes");
         };
@@ -1852,6 +1873,7 @@ impl Worker {
             final_ranges,
             attempt: job.attempt,
             guard: job.container_guard.clone(),
+            clone_final: false,
         }
     }
 

@@ -942,6 +942,7 @@ impl FsOps {
         published_identity(&held.file, flags)
     }
 
+    #[cfg(test)]
     pub(super) fn seed_basis(
         &mut self,
         target: PartialTarget<'_>,
@@ -950,8 +951,15 @@ impl FsOps {
         final_ranges: Option<&[(u64, u64)]>,
         attempt: u32,
     ) -> Result<SeededBasis> {
-        self.seed_basis_impl(target, len, block, final_ranges, attempt, false)
-            .map(|(basis, _)| basis)
+        self.seed_basis_impl(
+            target,
+            len,
+            block,
+            final_ranges,
+            attempt,
+            SeedHow::default(),
+        )
+        .map(|(basis, _)| basis)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -962,8 +970,12 @@ impl FsOps {
         block: u64,
         final_ranges: Option<&[(u64, u64)]>,
         attempt: u32,
-        stage_only: bool,
+        how: SeedHow,
     ) -> Result<(SeededBasis, bool)> {
+        let SeedHow {
+            stage_only,
+            clone_final,
+        } = how;
         let PartialTarget {
             path,
             id: copy_id,
@@ -994,14 +1006,18 @@ impl FsOps {
             .held_basis
             .take()
             .filter(|held| held.location == expected && held.copy_id == *copy_id);
+        // On macOS a clone is a new file, made before the sidecar: then the
+        // whole sidecar is hashed, as a resumed one is.
         #[cfg(target_os = "macos")]
-        if stage_only {
+        if stage_only || (clone_final && final_ranges.is_some_and(|ranges| !ranges.is_empty())) {
             self.try_clone_basis(
                 &target,
                 copy_id,
                 final_ranges.is_none_or(|ranges| !ranges.is_empty()),
             )?;
         }
+        #[cfg(not(target_os = "macos"))]
+        let _ = clone_final;
         let creation = sidecars::begin()?;
         let (relative, label, (opened, own_donor)) =
             with_rooted_partial(&target, copy_id, |relative, label| {
@@ -1190,14 +1206,44 @@ impl FsOps {
                 compare_final,
             ));
         }
-        if basis_size.unwrap_or(0) == 0 {
+        // Where the filesystem can clone, the final file the comparison
+        // selected is cloned into the sidecar when asked, and its matching
+        // blocks are hashed from the sidecar: nothing is written for them,
+        // and the hashes show what the sidecar holds, whatever the file held
+        // when it was compared. The sidecar then holds the file's other
+        // bytes too until they are replaced, so only a file whose access the
+        // sidecar's admits is cloned.
+        #[cfg(target_os = "linux")]
+        let cloned = clone_final
+            && selected_final.is_some()
+            && !self.sparse
+            && basis_size.unwrap_or(0) == 0
+            && match input.as_ref() {
+                Some(donor) if SeedAccess::new(&output).admits(donor) => {
+                    let size = len.min(donor.metadata()?.len());
+                    let cloned = super::basis_copy::try_clone(donor, &output, size);
+                    #[cfg(debug_assertions)]
+                    if cloned {
+                        record_test_event("SYQ_TEST_SEED_CLONES", format_args!("clone {size}"))?;
+                    }
+                    cloned
+                }
+                _ => false,
+            };
+        #[cfg(not(target_os = "linux"))]
+        let cloned = false;
+        if basis_size.unwrap_or(0) == 0 && !cloned {
             self.preallocate_new_partial(&output, len)?;
         }
         // A cached donor can disappear or become unsuitable before opening.
         // Freshly allocated zeros are not old copy data worth scanning.
         // Retry bytes are read through the held sidecar's own descriptor.
         let own = input.is_none() && basis_size.unwrap_or(0) > 0;
-        let reader = input.as_ref().or(own.then_some(&output));
+        let reader = if cloned {
+            Some(&output)
+        } else {
+            input.as_ref().or(own.then_some(&output))
+        };
         let mut hashes = Vec::new();
         if let Some(reader) = reader {
             let whole = [(0, len)];
@@ -1217,7 +1263,7 @@ impl FsOps {
                         break 'ranges;
                     }
                     let hash = self.hash_policy.algorithm.hash(bytes);
-                    if input.is_some() {
+                    if input.is_some() && !cloned {
                         #[cfg(debug_assertions)]
                         test_race_barrier(
                             "SYQ_TEST_REUSE_READY_FILE",
@@ -3605,7 +3651,10 @@ impl FsOps {
                     *block,
                     if *allow_final { None } else { Some(&[]) },
                     *attempt,
-                    true,
+                    SeedHow {
+                        stage_only: true,
+                        clone_final: false,
+                    },
                 )
                 .map(|(_, compare_final)| Response::BasisStaged { compare_final }),
             Request::HashWindow {
@@ -3694,8 +3743,9 @@ impl FsOps {
                 final_ranges,
                 attempt,
                 guard,
+                clone_final,
             } => self
-                .seed_basis(
+                .seed_basis_impl(
                     PartialTarget {
                         path,
                         id: copy_id,
@@ -3705,8 +3755,12 @@ impl FsOps {
                     *block,
                     final_ranges.as_deref(),
                     *attempt,
+                    SeedHow {
+                        stage_only: false,
+                        clone_final: *clone_final,
+                    },
                 )
-                .map(Response::SeededBasis),
+                .map(|(basis, _)| Response::SeededBasis(basis)),
             Request::CopyLocal {
                 source,
                 dst,
