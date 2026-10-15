@@ -913,6 +913,7 @@ fn macos_receiver_refuses_inplace_copy_without_touching_files() {
             size: 9,
             mode: 0o600,
             group: None,
+            update: None,
         });
         assert!(
             matches!(response, Response::CopyLocalUnsupported),
