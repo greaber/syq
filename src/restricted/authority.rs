@@ -382,6 +382,9 @@ impl RestrictedAuthority {
             .as_mut()
             .context("destination results are unavailable")?;
         for ((path, _), lifecycle) in unfinished {
+            if lifecycle.listed {
+                continue;
+            }
             stream.record(
                 crate::destination_results::Change::PublishFile {
                     size: lifecycle.size,
@@ -889,6 +892,39 @@ impl RestrictedAuthority {
         }
     }
 
+    /// A refused request for a file being written lists that file as
+    /// failed; it is not listed again as unfinished when the results end.
+    /// A later publication still reports it.
+    fn end_refused_lifecycles(&self, state: &mut AuthorityState, request: &Request) {
+        let (path, copy_id, size) = match request {
+            Request::Prepare {
+                path,
+                copy_id,
+                size,
+                ..
+            } => (path, *copy_id, *size),
+            Request::StageBasis {
+                path, copy_id, len, ..
+            }
+            | Request::SeedBasis {
+                path, copy_id, len, ..
+            } => (path, *copy_id, *len),
+            Request::WriteRange { path, copy_id, .. }
+            | Request::ReuseComparedRange { path, copy_id, .. }
+            | Request::Finalize { path, copy_id, .. } => (path, *copy_id, 0),
+            _ => return,
+        };
+        state
+            .file_lifecycles
+            .entry((path.clone(), copy_id))
+            .or_insert(FileLifecycle {
+                size,
+                last_error: None,
+                listed: false,
+            })
+            .listed = true;
+    }
+
     /// The changes a request asked for, by destination path where a record
     /// could name one, for the results to list when it is refused.
     fn requested_changes(&self, request: &Request) -> Vec<(Option<Vec<u8>>, Change)> {
@@ -904,7 +940,9 @@ impl RestrictedAuthority {
                         Op::Mknod { path, .. } => (path, Change::CreateSpecial),
                         Op::Hardlink { path, .. } => (path, Change::LinkFile),
                         Op::Rmdir { path } => (path, Change::DeleteDirectory),
-                        Op::Unlink { path } | Op::Remove { path } => (path, Change::DeleteFile),
+                        Op::Unlink { path } | Op::Remove { path } => {
+                            (path, Change::DeleteNonDirectory)
+                        }
                         Op::SetMeta { path, .. } => (
                             path,
                             Change::SetMetadata {
@@ -1115,6 +1153,7 @@ impl RestrictedAuthority {
                                 state.file_lifecycles.entry(key).or_insert(FileLifecycle {
                                     size,
                                     last_error: None,
+                                    listed: false,
                                 });
                             lifecycle.size = size;
                             if let Some(error) = error {
@@ -1858,7 +1897,7 @@ impl RestrictedAuthority {
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
-                    change: Change::DeleteFile,
+                    change: Change::DeleteNonDirectory,
                 });
                 return Ok(());
             }
@@ -2109,20 +2148,29 @@ impl RestrictedAuthority {
                 // entries authorized before the refusing one.
                 self.forget_provisional(&pending);
                 self.release_patch_holds(outcomes.into_iter());
-                let mut state = self.state.lock().unwrap();
-                if tracked {
-                    state.in_flight = state.in_flight.saturating_sub(1);
-                    self.settled.notify_all();
-                }
+                // What it asked for, classified before taking the state lock:
+                // classifying may look at the destination.
+                let changes = if self.results_started.load(Ordering::Acquire) {
+                    self.requested_changes(request)
+                } else {
+                    Vec::new()
+                };
                 // Every refusal counts, and lists the changes it refused, as
-                // the coordinator could have hidden it.
+                // the coordinator could have hidden it. It is recorded before
+                // the request stops counting as in flight, so the results
+                // cannot end between the two. The state lock is taken before
+                // the results lock, as everywhere.
+                let mut state = self.state.lock().unwrap();
                 state.recorded_any = true;
-                drop(state);
                 if self.results_started.load(Ordering::Acquire) {
-                    let changes = self.requested_changes(request);
                     if let Some(stream) = self.results.lock().unwrap().as_mut() {
                         stream.refused(&format!("refused: {error:#}"), &changes);
                     }
+                    self.end_refused_lifecycles(&mut state, request);
+                }
+                if tracked {
+                    state.in_flight = state.in_flight.saturating_sub(1);
+                    self.settled.notify_all();
                 }
                 Err(error)
             }
@@ -2973,6 +3021,8 @@ pub(super) fn kind_from_mode(mode: u32) -> proto::Kind {
 pub(super) struct FileLifecycle {
     pub(super) size: u64,
     pub(super) last_error: Option<String>,
+    /// A refusal already listed it as failed: the end does not list it again.
+    pub(super) listed: bool,
 }
 
 /// One change a request makes, reported by `settle` once the executor

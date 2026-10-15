@@ -596,6 +596,9 @@ pub struct Sched {
     pub jobs: Mutex<Jobs>,
     pub block: u64,
     pub min_split: u64,
+    /// Files a command-restricted receiver is writing and has not
+    /// published: it lists each as failed if the copy ends without it.
+    receiver_holds: Mutex<HashSet<usize>>,
 }
 
 impl Sched {
@@ -627,6 +630,7 @@ impl Sched {
             jobs: Mutex::new(Jobs::default()),
             block,
             min_split: min_split.max(2 * block),
+            receiver_holds: Mutex::new(HashSet::new()),
         }
     }
 
@@ -783,6 +787,22 @@ impl Sched {
 
     pub fn is_aborted(&self) -> bool {
         self.inner.lock().unwrap().abort
+    }
+
+    /// A command-restricted receiver now holds this file unfinished.
+    pub fn receiver_holds(&self, idx: usize) {
+        self.receiver_holds.lock().unwrap().insert(idx);
+    }
+
+    /// The receiver published this file: it no longer lists it as failed.
+    pub fn receiver_published(&self, idx: usize) {
+        self.receiver_holds.lock().unwrap().remove(&idx);
+    }
+
+    /// Whether the receiver held this file unfinished, forgetting it: the
+    /// file's failure is being reported.
+    pub fn take_receiver_hold(&self, idx: usize) -> bool {
+        self.receiver_holds.lock().unwrap().remove(&idx)
     }
 
     /// Record failure before retiring work or reporting it. The return value

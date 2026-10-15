@@ -707,6 +707,9 @@
         },
         "os_kind": {
           "$ref": "#/$defs/osKind"
+        },
+        "diagnostic_for": {
+          "$ref": "#/$defs/taggedPath"
         }
       },
       "required": [

@@ -61,17 +61,24 @@ fn settlement_outcome(
     }
 }
 
+/// An error record the final result counts: not one that only explains a
+/// failure another record counts.
+fn counted_error(record: &serde_json::Value) -> bool {
+    record.get("type").and_then(serde_json::Value::as_str) == Some("error")
+        && record.get(crate::results::DIAGNOSTIC_FOR).is_none()
+}
+
 /// The longest relayed results line: a coordinator record, or a base64
 /// destination frame.
 const MAX_RELAYED_LINE_BYTES: usize = 1024 * 1024;
 
 /// Results arriving on a remote coordinator's standard output: its own
 /// records and, through a restricted receiver, the destination's frames.
-/// Each is handled as it arrives. Through a restricted receiver, the
-/// destination's records of its changes replace the coordinator's: of the
-/// coordinator's records about a destination path, only failures the
-/// destination did not list are kept, as source failures, so only failures
-/// are ever held.
+/// Each is written as it arrives; nothing accumulates. Through a restricted
+/// receiver, the destination's records of what it changed, refused, or
+/// failed are the only ones of their kind: the coordinator leaves out its
+/// records of the failures the destination lists, and its claims of success
+/// are dropped here.
 struct Relay {
     coordinator_prefix: Vec<u8>,
     destination_prefix: Vec<u8>,
@@ -83,21 +90,10 @@ struct Relay {
     /// The run's shape, for a final result this machine writes itself.
     dry_run: bool,
     prune: bool,
-    /// Error records written to the results so far.
+    /// Counted error records written to the results so far.
     errors: u64,
-    /// Paths of the failures the destination listed.
-    destination_failed: std::collections::HashSet<String>,
-    /// The coordinator's failure records for paths the destination has not
-    /// listed, with their arrival order; written before the final result.
-    held: std::collections::HashMap<String, Vec<(u64, serde_json::Value)>>,
-    arrivals: u64,
     /// The first problem with what arrived; later lines are drained unread.
     failure: Option<anyhow::Error>,
-}
-
-/// A destination path, as records tag it, compared as text.
-fn entry_key(dst: &serde_json::Value) -> String {
-    dst.to_string()
 }
 
 impl Relay {
@@ -118,9 +114,6 @@ impl Relay {
             dry_run,
             prune,
             errors: 0,
-            destination_failed: Default::default(),
-            held: Default::default(),
-            arrivals: 0,
             failure: None,
         }
     }
@@ -179,61 +172,25 @@ impl Relay {
                 );
                 self.coordinator_terminal = Some(record);
             }
+            // The destination reports the changes it made.
+            "operation_result"
+                if self.destination.is_some()
+                    && object
+                        .get("disposition")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("succeeded") => {}
             _ => {
                 anyhow::ensure!(
                     self.coordinator_terminal.is_none(),
                     "the coordinating server sent results after its final result"
                 );
-                let entry = object.remove(crate::results::RELAY_ENTRY);
-                if self.destination.is_some() {
-                    let disposition = object
-                        .get("disposition")
-                        .and_then(serde_json::Value::as_str);
-                    let failure = match kind.as_str() {
-                        // The destination reports the changes it made.
-                        "operation_result" if disposition == Some("succeeded") => return Ok(()),
-                        "operation_result" if disposition == Some("failed") => {
-                            object.get("dst").map(entry_key)
-                        }
-                        "error" => entry.as_ref().map(entry_key),
-                        _ => None,
-                    };
-                    if let Some(key) = failure {
-                        if !self.destination_failed.contains(&key) {
-                            self.arrivals += 1;
-                            self.held
-                                .entry(key)
-                                .or_default()
-                                .push((self.arrivals, record));
-                        }
-                        return Ok(());
-                    }
-                }
-                if kind == "error" {
+                if counted_error(&record) {
                     self.errors += 1;
                 }
                 writer.emit_value(record);
             }
         }
         Ok(())
-    }
-
-    /// Write the coordinator's failures the destination did not list, in
-    /// the order they arrived.
-    fn release_held(&mut self) {
-        let mut held: Vec<_> = std::mem::take(&mut self.held)
-            .into_values()
-            .flatten()
-            .collect();
-        held.sort_by_key(|(order, _)| *order);
-        for (_, record) in held {
-            if record.get("type").and_then(serde_json::Value::as_str) == Some("error") {
-                self.errors += 1;
-            }
-            if let Some(writer) = &self.results {
-                writer.emit_value(record);
-            }
-        }
     }
 
     fn destination_frame(&mut self, line: &[u8]) -> Result<()> {
@@ -243,34 +200,20 @@ impl Relay {
         let frame = base64::engine::general_purpose::STANDARD_NO_PAD
             .decode(line.trim_ascii())
             .context("decode a relayed destination results frame")?;
-        let Self {
-            results,
-            errors,
-            destination_failed,
-            held,
-            ..
-        } = self;
+        let mut records = Vec::new();
         reader.accept(&frame, |record| {
-            match record.get("type").and_then(serde_json::Value::as_str) {
-                Some("error") => *errors += 1,
-                Some("operation_result")
-                    if record
-                        .get("disposition")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("failed") =>
-                {
-                    // The coordinator's own record of this failure is left out.
-                    let key = entry_key(&record["dst"]);
-                    held.remove(&key);
-                    destination_failed.insert(key);
-                }
-                _ => {}
-            }
-            if let Some(writer) = results {
-                writer.emit_value(record);
-            }
+            records.push(record);
             Ok(())
-        })
+        })?;
+        self.errors += records
+            .iter()
+            .filter(|record| counted_error(record))
+            .count() as u64;
+        // A frame's records are written together.
+        if let Some(writer) = &self.results {
+            writer.emit_values(records);
+        }
+        Ok(())
     }
 
     fn error(&mut self, message: &str, class: &'static str) {
@@ -431,9 +374,6 @@ fn settle(mut relay: Relay, settlement: Settlement<'_>) -> Result<i32> {
         verbose,
         quiet,
     } = settlement;
-    // Everything has arrived: the coordinator's failures the destination did
-    // not list are source failures.
-    relay.release_held();
     if let Some(error) = relay.failure.take() {
         let message = format!("the results relayed by {src_host} are unusable: {error:#}");
         relay.error(&message, "integrity");

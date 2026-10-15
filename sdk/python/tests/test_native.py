@@ -200,6 +200,15 @@ elif shape == "failed-operation":
         "disposition": "failed", "retryable": "yes", "class": "io",
         "os_kind": "permission_denied", "message": "denied",
     })
+elif shape == "diagnostic":
+    records.insert(-1, {
+        "schema": "syq.automation", "schema_version": 4,
+        "seq": records[-1]["seq"], "type": "error", "class": "io",
+        "os_kind": "permission_denied",
+        "message": "syq: a.txt: read: Permission denied",
+        "diagnostic_for": {"encoding": "utf-8", "value": "a.txt"},
+    })
+    records[-1]["seq"] += 1
 elif shape == "unknown-event":
     records.insert(-1, {
         "schema": "syq.automation", "schema_version": 4,
@@ -659,6 +668,17 @@ class NativeClientTests(unittest.TestCase):
         self.assertIs(operation.class_, syq.ErrorClass.IO)
         self.assertIs(operation.os_kind, syq.OsKind.PERMISSION_DENIED)
 
+    def test_an_error_can_explain_a_failure_counted_elsewhere(self) -> None:
+        events: list[syq.AutomationEvent] = []
+        client = syq.Client(
+            executable=self.executable,
+            env={**self.env, "SYQ_FAKE_SHAPE": "diagnostic"},
+        )
+        client.cp("source", into="target", on_event=events.append)
+        error = next(event for event in events if isinstance(event, syq.ErrorEvent))
+        self.assertEqual(bytes(error.diagnostic_for), b"a.txt")
+        self.assertIs(error.os_kind, syq.OsKind.PERMISSION_DENIED)
+
     def test_protocol_rejects_unsupported_incomplete_and_gapped_streams(self) -> None:
         for shape, message in (
             ("bad-schema", "schema version"),
@@ -900,8 +920,6 @@ class NativeClientTests(unittest.TestCase):
             self.client.cp("source", into="target", coordinate_at="elsewhere")
         with self.assertRaisesRegex(syq.SyqInvocationError, "dry run"):
             self.client.cp(from_="alpha:src", to="beta:dst", dry_run=True)
-        with self.assertRaises(TypeError):
-            self.client.cp("source", into="target", receiver_receipt="sizes")
         with self.assertRaisesRegex(syq.SyqInvocationError, "--peer-auth"):
             self.client.cp("source", into="target", peer_auth="agent")
         with self.assertRaisesRegex(ValueError, "relative"):

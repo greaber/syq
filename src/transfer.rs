@@ -6,8 +6,9 @@ use crate::cli::{
     Location, Placement, SourceSelection, WidenDirs,
 };
 use crate::conn::{
-    data_address, endpoint_error, ok, parse_ports, Conn, DataAddressSource, DataTransport,
-    Endpoint, RemoteSpec, SshMultiplexer, TcpCandidate, TcpPairStats,
+    change_ok, data_address, endpoint_error, ok, parse_ports, ChangeFailed, Conn,
+    DataAddressSource, DataTransport, Endpoint, RemoteSpec, SshMultiplexer, TcpCandidate,
+    TcpPairStats,
 };
 use crate::copy_policy::FreshCapacityAssessment;
 #[cfg(test)]
@@ -1591,8 +1592,9 @@ fn print_timings(args: &Args, progress: &Progress) {
 /// from the path that carried the copy, since a copy that never started data
 /// workers has neither a worker count nor data sockets to report.
 fn print_statistics(opts: &Opts, progress: &Progress, connections: &str, tcp_stats: &str) {
-    // --stats is additional human output, not the summary line the local
-    // attested settlement re-renders; a delegated coordinator keeps it.
+    // --stats is additional human output, not the summary line the invoking
+    // machine re-renders from a restricted copy's results; a delegated
+    // coordinator keeps it.
     let (files_label, unchanged_files_label, bytes_label, unchanged_bytes_label, bytes_work) =
         if opts.dry_run {
             (
@@ -1859,10 +1861,7 @@ pub(crate) fn uses_remote_coordinator(args: &Args, sources: &[Location], dst: &L
 }
 
 fn os_kind_of(error: &anyhow::Error) -> Option<&'static str> {
-    if let Some(error) = error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<WireError>())
-    {
+    if let Some(error) = crate::conn::wire_error_of(error) {
         return wire_os_kind(error);
     }
     let io = error
@@ -1945,10 +1944,7 @@ fn permission_error_message(
 
 /// A copy failure, with `hint` when it is one the hint is for.
 fn copy_error_message(error: &anyhow::Error, hint: Option<&str>) -> String {
-    let kind = error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<WireError>())
-        .and_then(|error| error.io_kind);
+    let kind = crate::conn::wire_error_of(error).and_then(|error| error.io_kind);
     permission_error_message(format!("{error:#}"), kind, hint)
 }
 

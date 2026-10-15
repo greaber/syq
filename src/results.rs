@@ -17,8 +17,8 @@
 //!
 //! A copy between two servers writes the remote coordinator's records on
 //! the invoking machine (`remote_to_remote`). Through a command-restricted
-//! receiver, the operation records for its changes come from the receiver
-//! itself (`destination_results`).
+//! receiver, the records of its changes, and of the changes it refused or
+//! that failed there, come from the receiver itself (`destination_results`).
 
 use crate::cli::{Args, Interface};
 use crate::proto::OperatorSymlinkPolicy;
@@ -31,17 +31,31 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 pub const SCHEMA: &str = "syq.automation";
-/// The destination entry a relayed error is about, between a remote
-/// coordinator and the syq that started it.
-pub(crate) const RELAY_ENTRY: &str = "relay_entry";
 pub const SCHEMA_VERSION: u64 = 4;
+/// On an `error` record: the destination path whose failure the record
+/// explains. The failure itself is counted by another record, so this one
+/// is not.
+pub(crate) const DIAGNOSTIC_FOR: &str = "diagnostic_for";
+
+/// Whether a command-restricted receiver lists a failure at a destination
+/// path in its own results, which then count it instead of the coordinator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReceiverListing {
+    /// It does not: the coordinator's records count the failure.
+    Unlisted,
+    /// It does, with the reason it gave: the coordinator's own records of
+    /// the failure are left out.
+    Listed,
+    /// It lists the path as failed without knowing why, as a file it was
+    /// writing that was never finished: the coordinator's error explains
+    /// it, without counting it again.
+    Explained,
+}
 
 pub struct ResultsWriter {
     schema_version: u64,
-    /// A restricted destination reports the changes it settled itself, so
-    /// this coordinator leaves its successes to it and marks each error about
-    /// a destination entry with that entry, for the invoking machine to drop
-    /// where the destination reported the same failure.
+    /// A restricted destination reports the changes it settled itself, and
+    /// the failures it saw, so this coordinator leaves those records to it.
     destination_reports: bool,
     parent: Option<Arc<ResultsWriter>>,
     phase_result: Mutex<Option<serde_json::Value>>,
@@ -548,23 +562,42 @@ impl ResultsWriter {
         self.emit_entry_error(message, class, os_kind, None);
     }
 
+    pub(crate) fn destination_reports(&self) -> bool {
+        self.destination_reports
+    }
+
+    /// As for a coordinator relaying results through a restricted receiver.
+    #[cfg(test)]
+    pub(crate) fn reporting_destination(mut self) -> Self {
+        self.destination_reports = true;
+        self
+    }
+
     /// An error about one destination entry, `dst` relative to the
-    /// destination as in `operation_result`.
+    /// destination as in `operation_result`, which a restricted receiver
+    /// may list itself.
     pub(crate) fn emit_entry_error(
         &self,
         message: &str,
         class: Option<&'static str>,
         os_kind: Option<&'static str>,
-        dst: Option<&[u8]>,
+        entry: Option<(&[u8], ReceiverListing)>,
     ) {
+        let listing = entry.map_or(ReceiverListing::Unlisted, |(_, listing)| listing);
+        #[cfg(debug_assertions)]
+        if self.destination_reports && entry.is_some() && altered_failures().is_some() {
+            return;
+        }
+        if self.destination_reports && listing == ReceiverListing::Listed {
+            return;
+        }
         let mut record = serde_json::json!({
             "type": "error",
             "message": message,
         });
         let object = record.as_object_mut().expect("record is an object");
-        if let Some(dst) = dst.filter(|_| self.destination_reports) {
-            // Internal to the relay; the invoking machine removes it.
-            object.insert(RELAY_ENTRY.into(), tagged(dst));
+        if let (Some((dst, ReceiverListing::Explained)), true) = (entry, self.destination_reports) {
+            object.insert(DIAGNOSTIC_FOR.into(), tagged(dst));
         }
         if let Some(class) = class {
             object.insert("class".into(), class.into());
@@ -598,7 +631,7 @@ impl ResultsWriter {
     }
 
     pub fn emit_operation(&self, op: &OperationRecord) {
-        self.emit_operation_expected(op, None);
+        self.emit_operation_listed(op, None, ReceiverListing::Unlisted);
     }
 
     pub(crate) fn emit_operation_expected(
@@ -606,8 +639,39 @@ impl ResultsWriter {
         op: &OperationRecord,
         expected: Option<&crate::hashing::Digest>,
     ) {
-        if self.destination_reports && op.disposition == "succeeded" {
-            return;
+        self.emit_operation_listed(op, expected, ReceiverListing::Unlisted);
+    }
+
+    /// An operation record; a restricted receiver lists the changes it made,
+    /// and the failures `listing` says it lists, itself.
+    pub(crate) fn emit_operation_listed(
+        &self,
+        op: &OperationRecord,
+        expected: Option<&crate::hashing::Digest>,
+        listing: ReceiverListing,
+    ) {
+        if self.destination_reports {
+            if op.disposition == "succeeded" {
+                return;
+            }
+            if op.disposition == "failed" {
+                #[cfg(debug_assertions)]
+                if let Some(mode) = altered_failures() {
+                    if mode == "alter" {
+                        self.write(serde_json::json!({
+                            "type": "operation_result",
+                            "action": op.action,
+                            "dst": tagged(op.dst),
+                            "kind": op.kind,
+                            "disposition": "succeeded",
+                        }));
+                    }
+                    return;
+                }
+                if listing != ReceiverListing::Unlisted {
+                    return;
+                }
+            }
         }
         let mut record = serde_json::json!({
             "type": "operation_result",
@@ -731,6 +795,45 @@ impl ResultsWriter {
         self.write_and_seal(record, false);
     }
 
+    /// Emit caller-built records in order with one write, as `emit_value`
+    /// would one by one.
+    pub(crate) fn emit_values(&self, records: Vec<serde_json::Value>) {
+        if records.is_empty() || self.dead.load(Relaxed) {
+            return;
+        }
+        if self.parent.is_some() {
+            for record in records {
+                self.emit_value(record);
+            }
+            return;
+        }
+        let mut out = self.out.lock().unwrap();
+        if self.sealed.load(Relaxed) {
+            return;
+        }
+        let mut lines = Vec::new();
+        let mut encoded = Ok(());
+        for mut record in records {
+            let seq = self.seq.fetch_add(1, Relaxed);
+            let object = record.as_object_mut().expect("record is an object");
+            object.insert("schema".into(), SCHEMA.into());
+            object.insert("schema_version".into(), self.schema_version.into());
+            object.insert("seq".into(), seq.into());
+            encoded = serde_json::to_writer(&mut lines, &record);
+            if encoded.is_err() {
+                break;
+            }
+            lines.push(b'\n');
+        }
+        let written = encoded
+            .map_err(std::io::Error::from)
+            .and_then(|()| out.write_all(&lines));
+        if let Err(error) = written {
+            drop(out);
+            self.mark_dead(&error);
+        }
+    }
+
     /// Emit a caller-built terminal record and seal the stream, flushing
     /// inside the same critical section like `emit_result`.
     pub(crate) fn emit_terminal_value(&self, record: serde_json::Value) {
@@ -790,6 +893,17 @@ impl ResultsWriter {
             );
         }
     }
+}
+
+/// Test hook: a coordinator that leaves out (`omit`) or misreports as
+/// succeeded (`alter`) its own records of the failures a restricted
+/// receiver lists.
+#[cfg(debug_assertions)]
+pub(crate) const ALTER_FAILURES_ENV: &str = "SYQ_TEST_ALTER_RELAYED_FAILURES";
+
+#[cfg(debug_assertions)]
+fn altered_failures() -> Option<String> {
+    std::env::var(ALTER_FAILURES_ENV).ok()
 }
 
 pub(crate) fn tagged(path: &[u8]) -> serde_json::Value {

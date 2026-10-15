@@ -211,14 +211,16 @@ pub(crate) enum Change {
     SetMetadata {
         kind: crate::proto::Kind,
     },
-    DeleteFile,
+    /// The removal of a name that is not a directory, of a kind the
+    /// receiver does not look up.
+    DeleteNonDirectory,
     DeleteDirectory,
 }
 
 impl Change {
-    /// The ordinary record's action and kind.
-    fn action(self) -> (&'static str, &'static str) {
-        match self {
+    /// The ordinary record's action and kind, where known.
+    fn action(self) -> (&'static str, Option<&'static str>) {
+        let (action, kind) = match self {
             Change::PublishFile { .. } | Change::LinkFile => ("transfer_file", "file"),
             Change::EnsureDirectory => ("create_directory", "dir"),
             Change::CreateSymlink => ("create_symlink", "symlink"),
@@ -229,9 +231,10 @@ impl Change {
                 crate::proto::Kind::Symlink => ("create_symlink", "symlink"),
                 _ => ("create_special", "special"),
             },
-            Change::DeleteFile => ("delete", "file"),
+            Change::DeleteNonDirectory => return ("delete", None),
             Change::DeleteDirectory => ("delete", "dir"),
-        }
+        };
+        (action, Some(kind))
     }
 }
 
@@ -417,7 +420,9 @@ impl Stream {
             (Change::EnsureDirectory, None) => totals.directories_created += 1,
             (Change::CreateSymlink, None) => totals.symlinks_created += 1,
             (Change::CreateSpecial, None) => totals.specials_created += 1,
-            (Change::DeleteFile | Change::DeleteDirectory, None) => totals.deletions_completed += 1,
+            (Change::DeleteNonDirectory | Change::DeleteDirectory, None) => {
+                totals.deletions_completed += 1
+            }
             (Change::SetMetadata { .. }, None) => return,
         }
         let (Some(dst), true) = (dst, self.records) else {
@@ -428,9 +433,11 @@ impl Stream {
             "type": "operation_result",
             "action": action,
             "dst": crate::results::tagged(dst),
-            "kind": kind,
             "disposition": "succeeded",
         });
+        if let Some(kind) = kind {
+            record["kind"] = kind.into();
+        }
         let bytes = match change {
             Change::PublishFile { size } => Some(size),
             Change::LinkFile => Some(0),
@@ -487,15 +494,18 @@ impl Stream {
         }));
         if let Some(dst) = dst {
             let (action, kind) = change.action();
-            self.push(&serde_json::json!({
+            let mut record = serde_json::json!({
                 "type": "operation_result",
                 "action": action,
                 "dst": crate::results::tagged(dst),
-                "kind": kind,
                 "disposition": "failed",
                 "class": class,
                 "message": message,
-            }));
+            });
+            if let Some(kind) = kind {
+                record["kind"] = kind.into();
+            }
+            self.push(&record);
         }
     }
 
@@ -785,11 +795,6 @@ impl Reader {
 /// relay that cuts the stream would.
 #[cfg(debug_assertions)]
 const DROP_END_ENV: &str = "SYQ_TEST_DROP_DESTINATION_RESULTS_END";
-/// Test hook: a coordinator that leaves out (`omit`) or falsifies (`alter`)
-/// its own records of failures at destination paths.
-#[cfg(debug_assertions)]
-const ALTER_FAILURES_ENV: &str = "SYQ_TEST_ALTER_RELAYED_FAILURES";
-
 #[cfg(debug_assertions)]
 fn drop_end_requested() -> bool {
     std::env::var_os(DROP_END_ENV).is_some()
@@ -798,41 +803,10 @@ fn drop_end_requested() -> bool {
 /// The test hooks a syq passes on to the remote coordinator it starts.
 #[cfg(debug_assertions)]
 pub(crate) fn test_environment() -> Vec<(&'static str, String)> {
-    [DROP_END_ENV, ALTER_FAILURES_ENV]
+    [DROP_END_ENV, crate::results::ALTER_FAILURES_ENV]
         .into_iter()
         .filter_map(|name| Some((name, std::env::var(name).ok()?)))
         .collect()
-}
-
-/// A coordinator's own record, as the alteration test hook would relay it.
-#[cfg(debug_assertions)]
-fn altered_failure(record: &str) -> Option<String> {
-    let mode = std::env::var(ALTER_FAILURES_ENV).ok();
-    let Some(mode) = mode.as_deref() else {
-        return Some(record.to_owned());
-    };
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(record) else {
-        return Some(record.to_owned());
-    };
-    let failure = value.get(crate::results::RELAY_ENTRY).is_some()
-        || (value["type"] == "operation_result" && value["disposition"] == "failed");
-    if !failure {
-        return Some(record.to_owned());
-    }
-    match mode {
-        "omit" => None,
-        _ => {
-            let object = value.as_object_mut()?;
-            if object.get("type").and_then(serde_json::Value::as_str) == Some("operation_result") {
-                object.insert("disposition".into(), "succeeded".into());
-                object.remove("class");
-                object.remove("message");
-            } else {
-                object.insert("message".into(), "syq: nothing happened".into());
-            }
-            Some(value.to_string())
-        }
-    }
 }
 
 /// Lines carrying results from a remote coordinator to the syq that started
@@ -919,10 +893,6 @@ pub(crate) mod relay {
             let record = buf.strip_suffix(b"\n").unwrap_or(buf);
             let record = std::str::from_utf8(record)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-            #[cfg(debug_assertions)]
-            let Some(record) = super::altered_failure(record) else {
-                return Ok(buf.len());
-            };
             crate::output::write_stdout(format_args!("{}{record}", self.prefix))?;
             Ok(buf.len())
         }

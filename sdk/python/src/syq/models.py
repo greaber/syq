@@ -438,6 +438,7 @@ class ErrorEvent:
     message: str
     class_: ErrorClass | None
     os_kind: OsKind | None
+    diagnostic_for: PathValue | None = None
 
 
 class OperationSummary:

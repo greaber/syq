@@ -557,6 +557,11 @@ class AutomationDecoder:
                 message=_string(record, "message"),
                 class_=_optional_enum(record, "class", ErrorClass),
                 os_kind=_optional_enum(record, "os_kind", OsKind),
+                diagnostic_for=(
+                    _tagged(record["diagnostic_for"], label="diagnostic_for")
+                    if "diagnostic_for" in record
+                    else None
+                ),
             )
             if self.run.mode == "rm":
                 self._rm_error_records += 1

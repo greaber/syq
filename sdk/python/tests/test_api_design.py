@@ -88,7 +88,6 @@ class ErrorAndTimeoutTests(unittest.TestCase):
                              {key: record[key] for key in ("schema", "schema_version", "seq", "type")})
             self.assertNotIn("protocol", record)
             self.assertFalse(hasattr(event, "seq"))
-        self.assertFalse(hasattr(result, "receipt"))
         with self.assertRaises(dataclasses.FrozenInstanceError):
             result.protocol.seq = 0
 

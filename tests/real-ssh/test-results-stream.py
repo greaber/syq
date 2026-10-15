@@ -31,9 +31,9 @@ def ssh(host, script):
     return run(["ssh", host, "python3 -c " + shlex.quote(script)])
 
 
-def copy(name, *flags, expected=0, env=None, results=True):
+def copy(name, *flags, expected=0, env=None, results=True, source="source"):
     argv = ["syq", "cp", "--no-progress", "--performance-tuning", "workers=2",
-            "--from", "source", "--srcs-in", ROOT + "/source",
+            "--from", "source", "--srcs-in", ROOT + "/" + source,
             "--to", "destination", "--into", ROOT + "/" + name, *flags]
     with tempfile.TemporaryDirectory(prefix="syq-results-stream-") as temporary:
         path = Path(temporary) / "results.ndjson"
@@ -44,7 +44,6 @@ def copy(name, *flags, expected=0, env=None, results=True):
         assert records[0]["type"] == "run", records
         assert [record["seq"] for record in records] == list(range(len(records))), records
         assert records[-1]["type"] == "result", records
-        assert not any("provenance" in record or record["type"] == "final_state" for record in records), records
     return result, records
 
 
@@ -115,6 +114,22 @@ def main():
         assert not any("nothing happened" in record.get("message", "") for record in records), (name, records)
         errors = sum(record["type"] == "error" for record in records)
         assert terminal["errors"] == errors, (name, terminal, records)
+
+    print("results: the coordinator reports what it could not read", flush=True)
+    ssh("source", f"from pathlib import Path; p=Path({ROOT + '/unreadable'!r}); p.mkdir(); "
+                  "(p/'ok').write_bytes(b'ok'); s=p/'secret'; s.write_bytes(b'secret'); s.chmod(0)")
+    _, records = copy("unreadable", expected=23, source="unreadable")
+    terminal = records[-1]
+    assert terminal["status"] == "partial" and terminal["errors"] == 1, terminal
+    assert changed(records) == ["ok"], records
+    secret = [record for record in records if record.get("dst", {}).get("value") == "secret"
+              or "secret" in record.get("message", "")]
+    # Counted once, by the coordinator, which alone saw the source.
+    assert [(record["type"], record.get("class")) for record in secret] == [
+        ("error", "io"), ("operation_result", "io")], records
+    assert "Permission denied" in secret[0]["message"], records
+    assert secret[1]["disposition"] == "failed" and secret[1]["retryable"] == "unknown", records
+    assert not any("diagnostic_for" in record for record in records), records
 
     print("results: a stream the coordinator cuts short fails the copy", flush=True)
     cut = {"SYQ_TEST_DROP_DESTINATION_RESULTS_END": "1"}

@@ -818,8 +818,10 @@ s3_delete_marker: bool | None
 
 ### ErrorEvent
 
-One counted error. `message` is display text; `class_` and `os_kind` classify
-it when known.
+One error. `message` is display text; `class_` and `os_kind` classify it when
+known. Each counts toward `errors`, except one with `diagnostic_for`: it
+explains why a command-restricted receiver reported that destination path as
+failed, and the receiver's own error counts the failure.
 
 `protocol.type = "error"`. Fields in addition to the common envelope:
 
@@ -827,9 +829,8 @@ it when known.
 message: str
 class_: ErrorClass | None
 os_kind: OsKind | None
+diagnostic_for: PathValue | None
 ```
-
-<a id="endpoint-objectmetadata-and-attesteddigest"></a>
 
 ### Endpoint
 

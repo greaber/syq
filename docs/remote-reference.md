@@ -118,13 +118,14 @@ connection never selects a relay through your machine; choose
 
 The destination reports each change it makes, refuses, or fails as the copy
 runs. Your machine checks that the reports come from the destination and that
-the source, which passes them on, left none out and added none. Where the
-destination reports a path, the source's own report of it is left out; the
-source reports what it could not read. A refusal or a failed change on the
-destination decides the outcome even if the source reports success, and
-reports cut short fail the copy. Use `-v` for the destination's totals or
-`--results FILE` for [automation](automation.md); `--dry-run --results`
-previews the copy.
+the source, which passes them on, left none out and added none. The source
+leaves out its own report of each failure the destination reports, and reports
+what it could not read as it happens. When that leaves a file unfinished on the
+destination, the source's error explains the destination's report instead of
+counting the failure again. A refusal or a failed change on the destination
+decides the outcome even if the source reports success, and reports cut short
+fail the copy. Use `-v` for the destination's totals or `--results FILE` for
+[automation](automation.md); `--dry-run --results` previews the copy.
 
 The destination's reports do not prove that the source supplied every intended
 file or the right contents. See [A compromised source server](security.md#a-compromised-source-server).

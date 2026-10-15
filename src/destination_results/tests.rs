@@ -83,7 +83,7 @@ fn sample(records: bool) -> (Reader, Vec<Vec<u8>>) {
         ],
     );
     all.extend(drain(&mut stream));
-    stream.record(Change::DeleteFile, Some(b"old"), None);
+    stream.record(Change::DeleteNonDirectory, Some(b"old"), None);
     stream.record(Change::LinkFile, Some(b"dir/c"), None);
     stream.finish(8).unwrap();
     all.extend(drain(&mut stream));
@@ -147,6 +147,8 @@ fn records_and_totals_round_trip_in_ordinary_form() {
     );
     assert_eq!(records[5]["class"], "safety_limit");
     assert_eq!(records[7]["bytes"], 0);
+    // A removed name's kind is not known.
+    assert!(records[6].get("kind").is_none());
 }
 
 #[test]

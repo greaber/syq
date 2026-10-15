@@ -351,19 +351,27 @@ impl Progress {
     }
 
     /// A counted error about one destination entry, `dst` relative to the
-    /// destination: a restricted destination may report the same failure.
+    /// destination, which a restricted receiver may list itself.
     pub fn entry_error_classified(
         &self,
         line: &str,
         class: Option<&'static str>,
         os_kind: Option<&'static str>,
-        dst: Option<&[u8]>,
+        entry: Option<(&[u8], crate::results::ReceiverListing)>,
     ) {
         self.errors.fetch_add(1, Relaxed);
         self.eprintln(line);
         if let Some(results) = self.results.get() {
-            results.emit_entry_error(line, class, os_kind, dst);
+            results.emit_entry_error(line, class, os_kind, entry);
         }
+    }
+
+    /// Whether a restricted receiver lists failures itself: only then does
+    /// the coordinator need to know which it lists.
+    pub fn receiver_lists_failures(&self) -> bool {
+        self.results
+            .get()
+            .is_some_and(|results| results.destination_reports())
     }
 
     pub fn warning(&self, message: &str) {

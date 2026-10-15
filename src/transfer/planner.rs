@@ -1355,6 +1355,7 @@ impl Planner<'_> {
                     "conflict",
                     None,
                     message,
+                    crate::results::ReceiverListing::Unlisted,
                 );
                 continue;
             }
@@ -2780,7 +2781,7 @@ impl Planner<'_> {
                     ),
                     Some("io"),
                     os_kind,
-                    Some(b""),
+                    Some((b"", crate::results::ReceiverListing::Listed)),
                 );
                 if capacity_os_kind(os_kind) {
                     return Err(endpoint_error(error)).context("apply destination changes");
@@ -2851,7 +2852,10 @@ impl Planner<'_> {
                         &format!("syq: {}", self.opts.wire_error_message_at(err, name)),
                         Some("io"),
                         os_kind,
-                        Some(destination_entry(name, dst_root)),
+                        Some((
+                            destination_entry(name, dst_root),
+                            crate::results::ReceiverListing::Listed,
+                        )),
                     );
                     if name == &self.dst_root && *condition != TargetCondition::Any {
                         self.collision = true;
@@ -2872,19 +2876,28 @@ impl Planner<'_> {
                     } else {
                         self.mapping_source_rel(dst_rel)
                     };
-                    results.emit_operation(&crate::results::OperationRecord {
-                        action: "create_directory",
-                        dst: dst_rel,
-                        src: src.as_deref(),
-                        kind: "dir",
-                        disposition: if created { "succeeded" } else { "failed" },
-                        bytes: None,
-                        attempts: None,
-                        retryable: (!created).then_some(if implicit { "no" } else { "unknown" }),
-                        class: (!created).then_some("io"),
-                        os_kind,
-                        message: err.as_ref().map(WireError::as_str),
-                    });
+                    results.emit_operation_listed(
+                        &crate::results::OperationRecord {
+                            action: "create_directory",
+                            dst: dst_rel,
+                            src: src.as_deref(),
+                            kind: "dir",
+                            disposition: if created { "succeeded" } else { "failed" },
+                            bytes: None,
+                            attempts: None,
+                            retryable: (!created).then_some(if implicit {
+                                "no"
+                            } else {
+                                "unknown"
+                            }),
+                            class: (!created).then_some("io"),
+                            os_kind,
+                            message: err.as_ref().map(WireError::as_str),
+                        },
+                        None,
+                        // The receiver lists its failures itself.
+                        crate::results::ReceiverListing::Listed,
+                    );
                 }
             }
             self.progress
@@ -3080,11 +3093,13 @@ impl Planner<'_> {
 
     fn report_metadata_failure(&self, dst: Option<&[u8]>, kind: DeclaredKind, error: &WireError) {
         let os_kind = wire_os_kind(error);
+        // The receiver's reply to a metadata change.
+        let listing = crate::results::ReceiverListing::Listed;
         self.progress.entry_error_classified(
             &format!("syq: {}", self.opts.wire_error_message(error)),
             Some("io"),
             os_kind,
-            dst,
+            dst.map(|dst| (dst, listing)),
         );
         if let Some(dst) = dst {
             self.emit_entry_failed(
@@ -3097,6 +3112,7 @@ impl Planner<'_> {
                 "io",
                 os_kind,
                 error.as_str(),
+                listing,
             );
         }
     }
@@ -3122,7 +3138,7 @@ impl Planner<'_> {
                     &format!("syq: {}", self.opts.wire_error_message_at(e, &path)),
                     Some("io"),
                     os_kind,
-                    Some(&queued.dst_rel),
+                    Some((&queued.dst_rel, crate::results::ReceiverListing::Listed)),
                 );
             } else {
                 // Counted only once the operation settles: a fatal
@@ -3141,23 +3157,28 @@ impl Planner<'_> {
                 }
             }
             if let Some(results) = self.progress.results_writer() {
-                results.emit_operation(&crate::results::OperationRecord {
-                    action: queued.action,
-                    dst: &queued.dst_rel,
-                    src: self.mapping_source_rel(&queued.dst_rel).as_deref(),
-                    kind: queued.kind,
-                    disposition: if error.is_none() {
-                        "succeeded"
-                    } else {
-                        "failed"
+                results.emit_operation_listed(
+                    &crate::results::OperationRecord {
+                        action: queued.action,
+                        dst: &queued.dst_rel,
+                        src: self.mapping_source_rel(&queued.dst_rel).as_deref(),
+                        kind: queued.kind,
+                        disposition: if error.is_none() {
+                            "succeeded"
+                        } else {
+                            "failed"
+                        },
+                        bytes: None,
+                        attempts: None,
+                        retryable: error.is_some().then_some("unknown"),
+                        class: error.is_some().then_some("io"),
+                        os_kind,
+                        message: error.as_ref().map(WireError::as_str),
                     },
-                    bytes: None,
-                    attempts: None,
-                    retryable: error.is_some().then_some("unknown"),
-                    class: error.is_some().then_some("io"),
-                    os_kind,
-                    message: error.as_ref().map(WireError::as_str),
-                });
+                    None,
+                    // The receiver lists its failures itself.
+                    crate::results::ReceiverListing::Listed,
+                );
             }
         }
         if let Some(error) = capacity_error {
@@ -3300,6 +3321,7 @@ impl Planner<'_> {
             "conflict",
             None,
             &message,
+            crate::results::ReceiverListing::Unlisted,
         );
     }
 
@@ -3371,6 +3393,7 @@ impl Planner<'_> {
             class,
             os_kind,
             message,
+            crate::results::ReceiverListing::Unlisted,
         );
     }
 
@@ -3381,6 +3404,7 @@ impl Planner<'_> {
         class: &'static str,
         os_kind: Option<&'static str>,
         message: &str,
+        listing: crate::results::ReceiverListing,
     ) {
         // Dry runs are trace-only: the error record and terminal accounting
         // still reflect the failure.
@@ -3394,7 +3418,7 @@ impl Planner<'_> {
                 Some(DeclaredKind::Special) => ("create_special", "special"),
                 _ => ("transfer_file", "file"),
             };
-            results.emit_operation_expected(
+            results.emit_operation_listed(
                 &crate::results::OperationRecord {
                     action,
                     dst: entry.dst,
@@ -3409,6 +3433,7 @@ impl Planner<'_> {
                     message: Some(message),
                 },
                 self.opts.expected_for(entry.dst),
+                listing,
             );
         }
     }
@@ -3612,6 +3637,7 @@ impl Planner<'_> {
                 "conflict",
                 None,
                 message,
+                crate::results::ReceiverListing::Unlisted,
             );
         }
     }
@@ -4071,19 +4097,24 @@ impl Planner<'_> {
                         let Some(dst_rel) = strip_dst_root(p, &self.dst_root) else {
                             continue;
                         };
-                        results.emit_operation(&crate::results::OperationRecord {
-                            action: "delete",
-                            dst: dst_rel,
-                            src: None,
-                            kind,
-                            disposition: "blocked",
-                            bytes: None,
-                            attempts: None,
-                            retryable: None,
-                            class: Some("safety_limit"),
-                            os_kind: None,
-                            message: None,
-                        });
+                        results.emit_operation_listed(
+                            &crate::results::OperationRecord {
+                                action: "delete",
+                                dst: dst_rel,
+                                src: None,
+                                kind,
+                                disposition: "blocked",
+                                bytes: None,
+                                attempts: None,
+                                retryable: None,
+                                class: Some("safety_limit"),
+                                os_kind: None,
+                                message: None,
+                            },
+                            None,
+                            // The receiver lists its failures itself.
+                            crate::results::ReceiverListing::Listed,
+                        );
                     }
                 }
                 self.max_delete_hit = true;
@@ -4151,7 +4182,10 @@ impl Planner<'_> {
                             &format!("syq: delete {rel}: {}", opts.wire_error_message_at(&e, p)),
                             Some("io"),
                             None,
-                            Some(destination_entry(p, &me.dst_root)),
+                            Some((
+                                destination_entry(p, &me.dst_root),
+                                crate::results::ReceiverListing::Listed,
+                            )),
                         ),
                     }
                     if let Some(results) = me.progress.results_writer() {

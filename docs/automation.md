@@ -162,8 +162,8 @@ An outcome for a completed copy change or a failed mapping entry.
 | `class`, `os_kind`, `message` | Error details where available |
 
 A command-restricted receiver's own records have no `src`, `attempts`, or
-`retryable`; a file it did not finish is `failed`, and a change it refused is
-`failed` with `class: "safety_limit"`.
+`retryable`, and a deletion has no `kind`; a file it did not finish is
+`failed`, and a change it refused is `failed` with `class: "safety_limit"`.
 
 Unchanged and excluded entries have totals only. Ordinary live streams do not
 emit per-operation records for metadata-only updates, though dry runs emit
@@ -239,6 +239,12 @@ produce failed removal results, but never successful removal results.
 One per counted error. `message` is display text; `class` and `os_kind` are
 provided where known. Classes are `io`, `transport`, `conflict`, `integrity`,
 `safety_limit`, `usage`, and `internal`.
+
+An error with `diagnostic_for`, a destination path, is not counted in
+`errors`. It explains why a command-restricted receiver reported that path as
+failed: for example, the source file could not be read after the receiver had
+started writing it, so the receiver lists the file as not finished. The
+receiver's own records count the failure.
 
 OS kinds are `not_found`, `permission_denied`, `already_exists`,
 `invalid_input`, `no_space`, `quota_exceeded`, `read_only`, and `other`.

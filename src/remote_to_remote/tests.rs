@@ -539,82 +539,81 @@ fn destination_refusals_and_failures_decide_the_outcome() {
     assert_eq!(settle(relay, settlement(0)).unwrap(), 0);
 }
 
-#[test]
-fn a_refused_path_appears_once_from_the_receiver_whatever_the_coordinator_relays() {
-    let path = |name: &str| serde_json::json!({"encoding": "utf-8", "value": name});
-    let failure = |name: &str, message: &str, seq: u64| {
-        [
-            coordinator_line(
-                serde_json::json!({"type": "error", "class": "io",
-                    "message": format!("syq: {name}: {message}"),
-                    crate::results::RELAY_ENTRY: path(name)}),
-                seq,
-            ),
-            coordinator_line(
-                serde_json::json!({"type": "operation_result", "action": "transfer_file",
-                    "dst": path(name), "kind": "file", "disposition": "failed",
-                    "retryable": "unknown", "class": "io", "message": message}),
-                seq + 1,
-            ),
-        ]
-        .concat()
-    };
-    // What the invoking machine reports about one path.
-    let about = |records: &[serde_json::Value], name: &str| -> Vec<serde_json::Value> {
-        records
-            .iter()
-            .filter(|record| {
-                record["dst"] == path(name)
-                    || record["message"]
-                        .as_str()
-                        .is_some_and(|message| message.starts_with(&format!("syq: {name}:")))
-            })
-            .cloned()
-            .collect()
-    };
+fn tagged_path(name: &str) -> serde_json::Value {
+    serde_json::json!({"encoding": "utf-8", "value": name})
+}
+
+/// The coordinator's records of a failure at `name` it counts itself.
+fn coordinator_failure(name: &str, message: &str, seq: u64) -> Vec<u8> {
+    [
+        coordinator_line(
+            serde_json::json!({"type": "error", "class": "io",
+                "message": format!("syq: {name}: {message}")}),
+            seq,
+        ),
+        coordinator_line(
+            serde_json::json!({"type": "operation_result", "action": "transfer_file",
+                "dst": tagged_path(name), "kind": "file", "disposition": "failed",
+                "retryable": "unknown", "class": "io", "message": message}),
+            seq + 1,
+        ),
+    ]
+    .concat()
+}
+
+/// What the invoking machine reports about one path.
+fn records_about(records: &[serde_json::Value], name: &str) -> Vec<serde_json::Value> {
+    records
+        .iter()
+        .filter(|record| {
+            record["dst"] == tagged_path(name)
+                || record["diagnostic_for"] == tagged_path(name)
+                || record["message"]
+                    .as_str()
+                    .is_some_and(|message| message.starts_with(&format!("syq: {name}:")))
+        })
+        .cloned()
+        .collect()
+}
+
+fn schema_validator() -> jsonschema::Validator {
     let schema: serde_json::Value =
         serde_json::from_str(include_str!("../../schemas/automation.schema.json")).unwrap();
-    let validator = jsonschema::validator_for(&schema).unwrap();
+    jsonschema::validator_for(&schema).unwrap()
+}
+
+#[test]
+fn a_refused_path_appears_once_from_the_receiver_whatever_the_coordinator_claims() {
+    let validator = schema_validator();
     let mut reports = Vec::new();
-    for coordinator in ["honest-first", "honest-last", "omit", "alter"] {
+    // The coordinator leaves its own record of the refusal out, or claims
+    // the path succeeded; s0 failed reading the source, which only the
+    // coordinator saw.
+    for coordinator in ["silent", "claims-success"] {
         let (mut stream, expectation) = destination(true);
         let (file, writer) = results_file();
         let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
-        // r0 was refused by the destination; s0 failed reading the source.
-        // A coordinator can always add error records of its own, but its
-        // records about a path the destination listed never appear.
-        let refused = failure("r0", "refused: signed grant entry limit exceeded", 0);
-        let altered = [
-            coordinator_line(
-                serde_json::json!({"type": "operation_result", "action": "transfer_file",
-                    "dst": path("r0"), "kind": "file", "disposition": "succeeded", "bytes": 1}),
-                0,
-            ),
-            coordinator_line(
-                serde_json::json!({"type": "error", "message": "syq: r0: copied after all",
-                    crate::results::RELAY_ENTRY: path("r0")}),
-                1,
-            ),
-        ]
-        .concat();
-        let source = failure("s0", "Permission denied (os error 13)", 2);
         let mut input = Vec::new();
-        match coordinator {
-            "honest-first" => input.extend(&refused),
-            "alter" => input.extend(&altered),
-            _ => {}
+        if coordinator == "claims-success" {
+            input.extend(coordinator_line(
+                serde_json::json!({"type": "operation_result", "action": "transfer_file",
+                    "dst": tagged_path("r0"), "kind": "file", "disposition": "succeeded",
+                    "bytes": 1}),
+                0,
+            ));
         }
-        input.extend(&source);
+        input.extend(coordinator_failure(
+            "s0",
+            "Permission denied (os error 13)",
+            1,
+        ));
         input.extend(destination_lines(&mut stream, 1));
-        if coordinator == "honest-last" {
-            input.extend(&refused);
-        }
-        input.extend(coordinator_line(coordinator_terminal(), 4));
+        input.extend(coordinator_line(coordinator_terminal(), 3));
         relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
         assert_eq!(settle(relay, settlement(23)).unwrap(), 25, "{coordinator}");
         let records = read_records(file);
-        let refused = about(&records, "r0");
-        // Once, from the receiver: its operation record and error record.
+        let refused = records_about(&records, "r0");
+        // Once, from the receiver: its error record and operation record.
         assert_eq!(
             refused
                 .iter()
@@ -631,31 +630,174 @@ fn a_refused_path_appears_once_from_the_receiver_whatever_the_coordinator_relays
         );
         assert_eq!(refused[1]["disposition"], "failed");
         // The source failure is the coordinator's, once.
-        let source = about(&records, "s0");
+        let source = records_about(&records, "s0");
         assert_eq!(source.len(), 2, "{coordinator}: {records:?}");
         assert_eq!(source[1]["retryable"], "unknown");
-        // Ordinary records, without the relay's internal field.
+        assert_eq!(records.last().unwrap()["errors"], 2, "{coordinator}");
         for record in &records {
             assert!(
                 validator.validate(record).is_ok(),
                 "{coordinator}: {record}"
             );
         }
-        reports.push(refused);
-    }
-    assert!(reports.windows(2).all(|pair| {
-        let strip = |records: &Vec<serde_json::Value>| {
-            records
-                .iter()
-                .map(|record| {
-                    let mut record = record.clone();
+        reports.push(
+            refused
+                .into_iter()
+                .map(|mut record| {
                     record.as_object_mut().unwrap().remove("seq");
                     record
                 })
-                .collect::<Vec<_>>()
-        };
-        strip(&pair[0]) == strip(&pair[1])
-    }));
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(reports[0], reports[1]);
+}
+
+#[test]
+fn a_source_failure_explains_a_file_the_receiver_left_unfinished_at_once() {
+    let (mut stream, expectation) = destination(true);
+    let (file, writer) = results_file();
+    let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
+    // A file's destination was prepared, then reading its source failed:
+    // the coordinator's error explains the failure as it happens, and the
+    // receiver, which cannot know why, lists the file unfinished at the end.
+    let input = coordinator_line(
+        serde_json::json!({
+            "type": "error", "class": "io", "os_kind": "permission_denied",
+            "message": "syq: a: read: Permission denied (os error 13)",
+            "diagnostic_for": tagged_path("a"),
+        }),
+        0,
+    );
+    relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+    // Written already, before the receiver's stream ends.
+    let early = read_records(file.try_clone().unwrap());
+    assert_eq!(early.len(), 1, "{early:?}");
+    assert_eq!(early[0]["os_kind"], "permission_denied");
+    let mut input = Vec::new();
+    let mut take = |stream: &mut crate::destination_results::Stream| {
+        for frame in stream
+            .take_frames(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .unwrap()
+        {
+            input.extend(destination_line(&frame));
+        }
+    };
+    take(&mut stream);
+    stream.record(
+        crate::destination_results::Change::PublishFile { size: 4096 },
+        Some(b"a"),
+        Some("the file was not finished"),
+    );
+    stream.finish(0).unwrap();
+    take(&mut stream);
+    input.extend(coordinator_line(coordinator_terminal(), 1));
+    relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+    assert_eq!(settle(relay, settlement(23)).unwrap(), 23);
+    let records = read_records(file);
+    let about = records_about(&records, "a");
+    assert!(
+        about[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("read: Permission denied"),
+        "source failure was lost: {records:?}"
+    );
+    // The file counts once, from the receiver.
+    assert_eq!(about.len(), 3, "{records:?}");
+    assert_eq!(records.last().unwrap()["errors"], 1, "{records:?}");
+    let validator = schema_validator();
+    for record in &records {
+        assert!(validator.validate(record).is_ok(), "{record}");
+    }
+}
+
+#[test]
+fn records_relayed_before_an_unexpected_exit_are_kept() {
+    let (_stream, expectation) = destination(true);
+    let (file, writer) = results_file();
+    let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
+    let input = coordinator_failure("s0", "Permission denied (os error 13)", 0);
+    relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+    // The coordinator's SSH command then ends with a status that is not a
+    // copy's, and nothing is settled.
+    drop(relay);
+    let records = read_records(file);
+    assert_eq!(records_about(&records, "s0").len(), 2, "{records:?}");
+}
+
+#[test]
+fn a_coordinator_leaves_the_failures_the_receiver_lists_to_it() {
+    use crate::results::ReceiverListing::{Explained, Listed, Unlisted};
+    let file = tempfile::tempfile().unwrap();
+    let writer = crate::results::ResultsWriter::new(Box::new(file.try_clone().unwrap()))
+        .reporting_destination();
+    for (name, listing) in [
+        ("listed", Listed),
+        ("explained", Explained),
+        ("unlisted", Unlisted),
+    ] {
+        writer.emit_entry_error(
+            &format!("syq: {name}: failed"),
+            Some("io"),
+            None,
+            Some((name.as_bytes(), listing)),
+        );
+        writer.emit_operation_listed(
+            &crate::results::OperationRecord {
+                action: "transfer_file",
+                dst: name.as_bytes(),
+                src: None,
+                kind: "file",
+                disposition: "failed",
+                bytes: None,
+                attempts: Some(1),
+                retryable: Some("unknown"),
+                class: Some("io"),
+                os_kind: None,
+                message: Some("failed"),
+            },
+            None,
+            listing,
+        );
+    }
+    // Its successes are the receiver's to report.
+    writer.emit_operation(&crate::results::OperationRecord {
+        action: "transfer_file",
+        dst: b"copied",
+        src: None,
+        kind: "file",
+        disposition: "succeeded",
+        bytes: Some(1),
+        attempts: Some(1),
+        retryable: None,
+        class: None,
+        os_kind: None,
+        message: None,
+    });
+    let records = read_records(file);
+    let summary: Vec<_> = records
+        .iter()
+        .map(|record| {
+            (
+                record["type"].as_str().unwrap(),
+                record["dst"]["value"]
+                    .as_str()
+                    .or(record["diagnostic_for"]["value"].as_str())
+                    .unwrap_or_default(),
+                record.get("diagnostic_for").is_some(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("error", "explained", true),
+            ("error", "", false),
+            ("operation_result", "unlisted", false),
+        ],
+        "{records:?}"
+    );
 }
 
 #[test]

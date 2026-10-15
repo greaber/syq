@@ -3188,6 +3188,13 @@ fn results_list_each_settled_change_in_ordinary_form() {
     assert_eq!(results.totals.deletions_completed, 1);
     assert!(results.has("transfer_file", &copied_name, "succeeded"));
     assert!(results.has("delete", b"removed", "succeeded"));
+    // The receiver does not look up what kind of name it removed.
+    let deletion = results
+        .records
+        .iter()
+        .find(|record| record["action"] == "delete")
+        .unwrap();
+    assert!(deletion.get("kind").is_none(), "{deletion}");
     let failure = results
         .records
         .iter()
@@ -3295,6 +3302,81 @@ fn unfinished_in_place_files_are_reported_failed() {
             "succeeded".to_owned()
         )]
     );
+}
+
+#[test]
+fn a_refused_write_to_an_unfinished_file_lists_it_once() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    let image = target.join("image");
+    fs::create_dir_all(&target).unwrap();
+    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let (secret, policy) = results_policy();
+    let authority = test_authority_with_results(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::InPlace,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::ExactPath,
+        RootExistence::Any,
+        Some((key, policy)),
+    )
+    .unwrap();
+    let mut reader = start_results(&authority, secret);
+    let mut prepare = Request::Prepare {
+        path: path_bytes(&image),
+        size: 4,
+        inplace: true,
+        copy_id: [1; 16],
+        mode: 0o600,
+        flags: 0,
+        acl: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
+        attempt: 0,
+        create_if_missing: true,
+        guard: None,
+        group: None,
+    };
+    let settlement = authority.authorize(&mut prepare, false).unwrap();
+    fs::write(&image, b"half").unwrap();
+    authority.settle(settlement, &proto::Response::Ok);
+    // A write past the size the file declared is refused.
+    let mut write = Request::WriteRange {
+        path: path_bytes(&image),
+        inplace: true,
+        copy_id: [1; 16],
+        attempt: 0,
+        off: 4,
+        hash: crate::fsops::content_digest(b"ha"),
+        data: b"ha".to_vec().into(),
+        guard: None,
+    };
+    let error = authority.authorize(&mut write, false).unwrap_err();
+    assert!(format!("{error:#}").contains("declared"), "{error:#}");
+    let results = finish_results(&authority, &mut reader);
+    assert_eq!((results.totals.refused, results.totals.failed), (1, 0));
+    // Once, as refused, and not again as unfinished.
+    assert_eq!(
+        results.changes(),
+        [(
+            "transfer_file".to_owned(),
+            b"image".to_vec(),
+            "failed".to_owned()
+        )],
+        "{:?}",
+        results.records
+    );
+    let errors: Vec<_> = results
+        .records
+        .iter()
+        .filter(|record| record["type"] == "error")
+        .collect();
+    assert_eq!(errors.len(), 1, "{:?}", results.records);
+    assert_eq!(errors[0]["class"], "safety_limit");
 }
 
 #[test]
@@ -7703,4 +7785,63 @@ fn separate_ssh_key_preserves_grant_key_and_survives_retry() {
     // A damaged or accidentally reused grant key must never be exposed.
     atomic_write(directory.path(), "ssh-key", encoded.as_bytes(), 0o600).unwrap();
     assert!(ensure_ssh_key(directory.path()).is_err());
+}
+
+#[test]
+fn a_refusal_racing_the_results_end_is_still_counted() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let (secret, policy) = results_policy();
+    let authority = std::sync::Arc::new(existence_authority_with_results(&root, &policy, 30_000));
+    let mut reader = start_results(&authority, secret);
+    let mut ops = vec![Op::Mkdir {
+        path: path_bytes(&root.join("outside")),
+        mode: 0o755,
+        condition: proto::TargetCondition::Any,
+    }];
+    // The first operation refuses the batch. Classifying its other requested
+    // changes takes long enough for the control connection to end results.
+    for _ in 0..20_000 {
+        ops.push(Op::SetMeta {
+            path: path_bytes(&target),
+            meta: proto::Meta {
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+                inode_metadata: None,
+            },
+            flags: 0,
+            condition: proto::TargetCondition::Any,
+            directory: true,
+        });
+    }
+    let other = authority.clone();
+    let worker = std::thread::spawn(move || {
+        let mut request = Request::Apply { ops, guard: None };
+        assert!(other.authorize(&mut request, false).is_err());
+    });
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let state = authority.state.lock().unwrap();
+        if state.recorded_any {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "refusal did not arrive; in_flight={}",
+            state.in_flight
+        );
+        drop(state);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let results = finish_results(&authority, &mut reader);
+    worker.join().unwrap();
+    assert_eq!(
+        results.totals.refused, 1,
+        "authenticated end omitted a refused request"
+    );
 }

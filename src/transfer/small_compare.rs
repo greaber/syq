@@ -1104,9 +1104,10 @@ impl Worker {
                 self.progress.bytes_total.fetch_sub(reused, Relaxed);
                 self.complete_file(job, false)
             }
+            // The receiver failed keeping it, and lists that itself.
             Compared::KeepFailed(error) => self.file_error(
                 idx,
-                anyhow::Error::new(error).context("finish content-identical destination"),
+                ChangeFailed::replying("finish content-identical destination", error),
             ),
             Compared::SourceChanged(_)
             | Compared::ResumePartial

@@ -524,6 +524,79 @@ pub fn endpoint_error(error: WireError) -> anyhow::Error {
     anyhow::Error::new(error)
 }
 
+/// The destination's reply refusing or failing a change it was asked to
+/// make. A command-restricted receiver lists each such failure in its own
+/// results, so the coordinator relaying them leaves out its own record of
+/// it. Displays and chains as `ok` would have reported the same reply.
+#[derive(Debug)]
+pub struct ChangeFailed {
+    /// What was asked, when the destination's error follows it in the chain.
+    context: Option<String>,
+    error: WireError,
+}
+
+impl ChangeFailed {
+    /// A change's failure the destination reported as `error`, in reply to
+    /// `what`.
+    pub fn replying(what: &str, error: WireError) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            context: Some(what.to_owned()),
+            error,
+        })
+    }
+
+    /// A change's failure whose message already says what was asked.
+    pub fn whole(error: WireError) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            context: None,
+            error,
+        })
+    }
+
+    /// Whether `error` is, or came from, such a reply.
+    pub fn is(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| cause.is::<Self>())
+    }
+}
+
+/// The destination's error in `error`'s chain, if it has one.
+pub fn wire_error_of(error: &anyhow::Error) -> Option<&WireError> {
+    error.chain().find_map(|cause| {
+        cause.downcast_ref::<WireError>().or_else(|| {
+            cause
+                .downcast_ref::<ChangeFailed>()
+                .map(|change| &change.error)
+        })
+    })
+}
+
+impl std::fmt::Display for ChangeFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.context.as_deref().unwrap_or(&self.error.message))
+    }
+}
+
+impl std::error::Error for ChangeFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.context
+            .as_ref()
+            .map(|_| &self.error as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// As `ok`, for the reply to a request that changes the destination.
+pub fn change_ok(resp: Response, what: &str) -> Result<Response> {
+    match resp {
+        Response::Err(e) => Err(ChangeFailed::whole(WireError {
+            message: format!("{what}: {e}"),
+            io_kind: None,
+            raw_os_error: None,
+        })),
+        Response::EndpointError(error) => Err(ChangeFailed::replying(what, error)),
+        r => Ok(r),
+    }
+}
+
 #[derive(Clone)]
 struct RpcObservation {
     actor: std::sync::Arc<crate::transfer_observations::Actor>,
