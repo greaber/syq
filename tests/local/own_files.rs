@@ -3,6 +3,7 @@
 //! Anything else is replaced, as a changed file is.
 
 use super::*;
+use std::os::unix::ffi::OsStrExt as _;
 
 /// The routes these copies take: on this machine, through ranged writes,
 /// and to a remote helper over SSH and over TCP.
@@ -237,7 +238,6 @@ fn a_symlink_or_fifo_whose_metadata_differs_is_created_again() {
                 tv_nsec: 0,
             },
         ];
-        use std::os::unix::ffi::OsStrExt;
         let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
         assert_eq!(
             unsafe {
@@ -361,7 +361,6 @@ fn a_preview_counts_a_replaced_file_as_rewritten() {
 #[test]
 fn an_access_time_rerun_keeps_a_hard_link_group_that_was_only_read() {
     let set_atime = |path: &Path, seconds: i64| {
-        use std::os::unix::ffi::OsStrExt;
         let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
         let times = [
             libc::timespec {
@@ -426,4 +425,135 @@ fn an_access_time_rerun_keeps_a_hard_link_group_that_was_only_read() {
         assert_eq!(atime(&t.path("dst/a")), atime(&t.path("src/a")), "{route}");
         assert_ne!(atime(&t.path("dst/a")), 1_650_000_000, "{route}");
     }
+}
+
+/// A FIFO whose time changes is created again with the permissions it had,
+/// which the copy does not select, rather than the source's.
+#[test]
+fn a_recreated_fifo_keeps_permissions_the_copy_does_not_select() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("src")).unwrap();
+    fs::create_dir_all(t.path("dst")).unwrap();
+    mkfifo(&t.path("src/fifo"));
+    mkfifo(&t.path("dst/fifo"));
+    fs::set_permissions(t.path("src/fifo"), fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(t.path("dst/fifo"), fs::Permissions::from_mode(0o600)).unwrap();
+    set_mtime(&t.path("src/fifo"), 1_700_000_000);
+    set_mtime(&t.path("dst/fifo"), 1_600_000_000);
+    let before = fs::symlink_metadata(t.path("dst/fifo")).unwrap().ino();
+    run_native_ok(&[
+        "cp",
+        "--copy-metadata=specials,mtime",
+        "--srcs-in",
+        &t.s("src"),
+        "--into",
+        &t.s("dst"),
+    ]);
+    let after = fs::symlink_metadata(t.path("dst/fifo")).unwrap();
+    assert!(after.file_type().is_fifo());
+    assert_ne!(after.ino(), before);
+    assert_eq!(after.mtime(), 1_700_000_000);
+    assert_eq!(after.mode() & 0o7777, 0o600);
+}
+
+/// A `-aUX` rerun leaves an unchanged symlink as it is, and gives one that
+/// was only read its access time back in place.
+#[test]
+fn access_time_reruns_keep_unchanged_symlinks() {
+    let lstat_atime = |path: &Path| {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        (metadata.ino(), metadata.atime())
+    };
+    let t = Tmp::new();
+    write(&t.path("src/target"), b"target");
+    std::os::unix::fs::symlink("target", t.path("src/link")).unwrap();
+    run_ok(&["-aUX", &t.s("src/"), &t.s("dst/")]);
+    let (inode, _) = lstat_atime(&t.path("dst/link"));
+    run_ok(&["-aUX", &t.s("src/"), &t.s("dst/")]);
+    assert_eq!(lstat_atime(&t.path("dst/link")).0, inode);
+    // Someone reads the copy's link.
+    let path = std::ffi::CString::new(t.path("dst/link").as_os_str().as_bytes()).unwrap();
+    let times = [
+        libc::timespec {
+            tv_sec: 1_650_000_000,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+    ];
+    assert_eq!(
+        unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        },
+        0
+    );
+    run_ok(&["-aUX", &t.s("src/"), &t.s("dst/")]);
+    let (after, atime) = lstat_atime(&t.path("dst/link"));
+    assert_eq!(after, inode);
+    assert_ne!(atime, 1_650_000_000);
+    assert_eq!(atime, lstat_atime(&t.path("src/link")).1);
+}
+
+/// Linux before 5.8 cannot set times through a handle with an empty path:
+/// a directory's times are then set through its handle's `/proc` link, and
+/// a new symlink's by the name it was just created at, never following it.
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[test]
+fn times_are_set_without_empty_paths_on_older_kernels() {
+    let t = Tmp::new();
+    write(&t.path("outside"), b"outside");
+    set_mtime(&t.path("outside"), 1_500_000_000);
+    fs::create_dir_all(t.path("src/dir")).unwrap();
+    std::os::unix::fs::symlink(t.path("outside"), t.path("src/link")).unwrap();
+    let set_link_mtime = |path: &Path, seconds: i64| {
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            libc::timespec {
+                tv_sec: seconds as _,
+                tv_nsec: 0,
+            },
+        ];
+        assert_eq!(
+            unsafe {
+                libc::utimensat(
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    times.as_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            },
+            0
+        );
+    };
+    set_link_mtime(&t.path("src/link"), 1_650_000_000);
+    set_mtime(&t.path("src/dir"), 1_600_000_000);
+    let out = compat_command()
+        .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
+        .env("SYQ_TEST_REFUSE_EMPTY_PATH_TIMES", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(
+        fs::metadata(t.path("dst/dir")).unwrap().mtime(),
+        1_600_000_000
+    );
+    assert_eq!(
+        fs::symlink_metadata(t.path("dst/link")).unwrap().mtime(),
+        1_650_000_000
+    );
+    assert_eq!(
+        fs::metadata(t.path("outside")).unwrap().mtime(),
+        1_500_000_000
+    );
 }

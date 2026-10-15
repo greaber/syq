@@ -377,11 +377,14 @@ fn apply_one_rooted(
             ..
         } => {
             let replacement = leaf_replacement(target, *condition, MODE_SYMLINK)?;
-            if symlink_already_holds(target, replacement, link, meta, *flags)? {
+            let existing = existing_leaf(target, replacement, MODE_SYMLINK, meta, *flags, |_| {
+                Ok(target.root.read_link(&target.relative)? == *link)
+            })?;
+            let Some((meta, flags)) = existing.settle(meta, *flags)? else {
                 return Ok(());
-            }
+            };
             root.publish_symlink(path, link, replacement, |directory, name| {
-                set_new_leaf_metadata(root, directory, name, MODE_SYMLINK, meta, *flags)
+                set_new_leaf_metadata(root, directory, name, MODE_SYMLINK, &meta, flags)
             })
         }
         Op::Mknod {
@@ -394,8 +397,21 @@ fn apply_one_rooted(
         } => {
             let file_type = file_type_bits(*mode);
             let replacement = leaf_replacement(target, *condition, file_type)?;
-            root.publish_node(path, *mode, *rdev, replacement, |directory, name| {
-                set_new_leaf_metadata(root, directory, name, file_type, meta, *flags)
+            let existing =
+                existing_leaf(target, replacement, file_type, meta, *flags, |current| {
+                    Ok(current.rdev() == *rdev)
+                })?;
+            let Some((meta, flags)) = existing.settle(meta, *flags)? else {
+                return Ok(());
+            };
+            // A node created again starts with the permissions it ends with.
+            let mode = if flags & flags::MODE != 0 {
+                file_type | (meta.mode & 0o7777)
+            } else {
+                *mode
+            };
+            root.publish_node(path, mode, *rdev, replacement, |directory, name| {
+                set_new_leaf_metadata(root, directory, name, file_type, &meta, flags)
             })
         }
         Op::Hardlink {
@@ -505,57 +521,135 @@ fn leaf_replacement(
 /// selects, as when only its access time was to be restored and it had
 /// not changed. It is then left as it is. ACLs, extended attributes and
 /// birth times are not compared here.
-fn symlink_already_holds(
+/// What the existing symlink or node of type `file_type` that `replacement`
+/// names needs to hold `meta` under `flags` (`existing_leaf`).
+enum ExistingLeaf {
+    /// Nothing: it already holds them.
+    Holds,
+    /// Only its access time, restored in place through this handle of it,
+    /// as on any file (`fsops::vouch`).
+    AccessTime(File, crate::inode_metadata::Timestamp),
+    /// To be created again, keeping the permissions, owner and group the
+    /// copy does not select: these.
+    Recreate { mode: u32, uid: u32, gid: u32 },
+    /// Created with what the request gives: there is no existing entry to
+    /// keep anything of.
+    New,
+}
+
+impl ExistingLeaf {
+    /// Restore an access time in place, and return the metadata and flags
+    /// to create the entry with, if it is to be created.
+    fn settle(self, meta: &Meta, flags: u8) -> Result<Option<(Meta, u8)>> {
+        match self {
+            Self::Holds => Ok(None),
+            Self::AccessTime(handle, atime) => {
+                let metadata = crate::inode_metadata::InodeMetadata {
+                    atime: Some(atime),
+                    ..Default::default()
+                };
+                crate::inode_metadata::apply_after_acls(&handle, Some(&metadata), meta.mode)?;
+                Ok(None)
+            }
+            Self::New => Ok(Some((meta.clone(), flags))),
+            Self::Recreate { mode, uid, gid } => {
+                let mut meta = meta.clone();
+                let mut flags = flags;
+                if flags & flags::MODE == 0 {
+                    meta.mode = (meta.mode & !0o7777) | mode;
+                    flags = (flags & !flags::RECEIVER_MODE) | flags::MODE;
+                }
+                // Only root can keep another account's owner; a group is kept
+                // where the receiving account may give it.
+                if flags & flags::OWNER == 0 && is_superuser() {
+                    meta.uid = uid;
+                    flags |= flags::OWNER;
+                }
+                if flags & flags::GROUP == 0 {
+                    meta.gid = gid;
+                    flags |= flags::GROUP;
+                }
+                Ok(Some((meta, flags)))
+            }
+        }
+    }
+}
+
+/// What the existing entry `replacement` names, a symlink or node of type
+/// `file_type` whose contents `same_contents` compares (its target, or its
+/// device number), needs to hold `meta` under `flags`. Every value is read
+/// through a handle of the entry, after its identity is checked.
+fn existing_leaf(
     target: &RootedTarget,
     replacement: crate::rooted::LeafReplacement,
-    link: &[u8],
+    file_type: u32,
     meta: &Meta,
     flags: u8,
-) -> Result<bool> {
+    same_contents: impl FnOnce(&fs::Metadata) -> Result<bool>,
+) -> Result<ExistingLeaf> {
     let crate::rooted::LeafReplacement::Same { dev, ino } = replacement else {
-        return Ok(false);
+        return Ok(ExistingLeaf::New);
     };
-    let Some(current) = target.root.metadata_optional(&target.relative)? else {
-        return Ok(false);
+    let Ok(handle) = target.root.open_metadata(&target.relative) else {
+        return Ok(ExistingLeaf::New);
     };
-    let symlink = current.is_symlink();
-    let owner = flags & flags::OWNER != 0
-        && (is_superuser() || flags & flags::REQUIRE_OWNER != 0)
-        && current.uid != meta.uid;
-    let group = flags & flags::GROUP != 0 && current.gid != meta.gid;
-    let mode = flags & flags::MODE != 0
-        && !(symlink && cfg!(target_os = "linux"))
-        && current.mode & 0o7777 != meta.mode & 0o7777;
+    let current = handle.metadata()?;
+    if file_type_bits(current.mode()) != file_type || (current.dev(), current.ino()) != (dev, ino) {
+        // Publication refuses to replace it (`LeafReplacement::Same`).
+        return Ok(ExistingLeaf::New);
+    }
+    let kept = ExistingLeaf::Recreate {
+        mode: current.mode() & 0o7777,
+        uid: current.uid(),
+        gid: current.gid(),
+    };
+    if !same_contents(&current)? {
+        return Ok(kept);
+    }
+    let symlink = file_type == MODE_SYMLINK;
     // A symlink's times are not set where the filesystem would set its
     // target's instead (`Profile::symlink_times`).
+    let link_times = !symlink
+        || !target
+            .root
+            .known_profile(current.dev())
+            .is_some_and(|profile| !profile.symlink_times);
+    let owner = flags & flags::OWNER != 0
+        && (is_superuser() || flags & flags::REQUIRE_OWNER != 0)
+        && current.uid() != meta.uid;
+    let group = flags & flags::GROUP != 0 && current.gid() != meta.gid;
+    let mode = flags & flags::MODE != 0
+        && !(symlink && cfg!(target_os = "linux"))
+        && current.mode() & 0o7777 != meta.mode & 0o7777;
     let times = flags & flags::TIMES != 0
-        && !(symlink
-            && target
-                .root
-                .known_profile(current.dev)
-                .is_some_and(|profile| !profile.symlink_times))
-        && (current.mtime, current.mtime_nsec) != (meta.mtime, meta.mtime_nsec);
-    let inode = match meta.inode_metadata.as_deref() {
-        None => false,
-        Some(inode) => {
-            inode.acls.is_some()
-                || inode.macos_acl.is_some()
-                || inode.xattrs.is_some()
-                || inode.crtime.is_some()
-                || inode.atime.is_some_and(|atime| atime != current.atime)
-        }
-    };
-    if !symlink
-        || (current.dev, current.ino) != (dev, ino)
-        || owner
+        && link_times
+        && (current.mtime(), current.mtime_nsec() as u32) != (meta.mtime, meta.mtime_nsec);
+    if owner
         || group
         || mode
         || times
-        || inode
+        || crate::inode_metadata::would_change_besides_atime(
+            &handle,
+            meta.inode_metadata.as_deref(),
+            meta.mode,
+        )?
     {
-        return Ok(false);
+        return Ok(kept);
     }
-    Ok(target.root.read_link(&target.relative)? == link)
+    match meta
+        .inode_metadata
+        .as_deref()
+        .and_then(|inode| inode.atime)
+        .filter(|_| link_times)
+    {
+        Some(atime)
+            if (current.atime(), current.atime_nsec() as u32)
+                != (atime.seconds, atime.nanoseconds) =>
+        {
+            Ok(ExistingLeaf::AccessTime(handle, atime))
+        }
+        _ => Ok(ExistingLeaf::Holds),
+    }
 }
 
 /// The step that gives a new symlink, before `Root::publish_symlink`
@@ -590,15 +684,14 @@ fn set_new_leaf_metadata(
         return Ok(());
     }
     let symlink = file_type == MODE_SYMLINK;
-    #[cfg(target_os = "macos")]
-    if file_type == libc::S_IFCHR as u32 || file_type == libc::S_IFBLK as u32 {
-        return set_new_device_metadata(directory, name, meta, flags);
-    }
     #[cfg(target_os = "linux")]
     let open = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // A device node is opened for events only, without its terminal
+    // becoming the controlling one, as for any entry's metadata.
     #[cfg(target_os = "macos")]
     let open = libc::O_EVTONLY
         | libc::O_NONBLOCK
+        | libc::O_NOCTTY
         | libc::O_CLOEXEC
         | if symlink {
             libc::O_SYMLINK
@@ -627,107 +720,109 @@ fn set_new_leaf_metadata(
     } else {
         flags
     };
-    set_handle_metadata(&handle, meta, flags, &current)
+    set_handle_metadata(&handle, meta, flags, &current, Some((directory, name)))
 }
 
 /// Apply `meta` under `flags` to the object `handle` refers to, whose
 /// metadata `current` was read through it, never by a name. The times go
 /// first: macOS may lower a birth time when an older modification time is
-/// set, and the birth time follows.
+/// set, and the birth time follows. `created` is the temporary name of an
+/// entry this receiver just created there, for a symlink's times where the
+/// kernel cannot set them through its handle (`set_handle_times`).
 fn set_handle_metadata(
     handle: &File,
     meta: &Meta,
     flags: u8,
     current: &fs::Metadata,
+    created: Option<(&File, &CStr)>,
 ) -> Result<()> {
     if flags & flags::TIMES != 0
         && (current.mtime(), current.mtime_nsec() as u32) != (meta.mtime, meta.mtime_nsec)
     {
-        set_handle_times(
-            handle,
-            &[
-                timespec(0, libc::UTIME_OMIT as u32),
-                timespec(meta.mtime, meta.mtime_nsec),
-            ],
-        )?;
-    }
-    set_meta_handle_known_portable(handle, meta, flags & !flags::TIMES, current)
-}
-
-/// Set the times of the object `handle` refers to, which may be a symlink
-/// or a directory, through `handle`.
-pub(crate) fn set_handle_times(handle: &File, times: &[libc::timespec; 2]) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    let result = unsafe {
-        libc::utimensat(
-            handle.as_raw_fd(),
-            c"".as_ptr(),
-            times.as_ptr(),
-            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    #[cfg(not(target_os = "linux"))]
-    let result = unsafe { libc::futimens(handle.as_raw_fd(), times.as_ptr()) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-/// macOS: give a new device node, at `name` in `directory`, its metadata by
-/// that name, which only this receiver uses, once it shows itself to be the
-/// node created.
-#[cfg(target_os = "macos")]
-fn set_new_device_metadata(directory: &File, name: &CStr, meta: &Meta, flags: u8) -> Result<()> {
-    let current = crate::rooted::metadata_at(directory.as_raw_fd(), name)?;
-    anyhow::ensure!(
-        current.nlink == 1 && current.uid == unsafe { libc::geteuid() },
-        "the new entry changed before its metadata was set"
-    );
-    let fd = directory.as_raw_fd();
-    apply_owner_if_changed(flags, meta, current.uid, current.gid, |uid, gid| {
-        let result = unsafe {
-            libc::fchownat(
-                fd,
-                name.as_ptr(),
-                uid.unwrap_or(u32::MAX),
-                gid.unwrap_or(u32::MAX),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    })?;
-    if flags & flags::MODE != 0 {
-        let result = unsafe {
-            libc::fchmodat(
-                fd,
-                name.as_ptr(),
-                (meta.mode & 0o7777) as libc::mode_t,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        if result != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-    }
-    if flags & flags::TIMES != 0 {
         let times = [
             timespec(0, libc::UTIME_OMIT as u32),
             timespec(meta.mtime, meta.mtime_nsec),
         ];
-        let result = unsafe {
-            libc::utimensat(fd, name.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW)
-        };
-        if result != 0 {
-            return Err(io::Error::last_os_error().into());
+        match (set_handle_times(handle, &times), created) {
+            (Ok(()), _) => {}
+            (Err(error), Some((directory, name))) if error.kind() == io::ErrorKind::Unsupported => {
+                set_created_symlink_times(directory, name, current, &times)?
+            }
+            (Err(error), _) => return Err(error.into()),
         }
     }
+    set_meta_handle_known_portable(handle, meta, flags & !flags::TIMES, current)
+}
+
+/// Set the times of the symlink `current` describes, which this receiver
+/// just created at `name` in `directory`, by that name and without
+/// following it, once the name shows itself to lead to it still.
+fn set_created_symlink_times(
+    directory: &File,
+    name: &CStr,
+    current: &fs::Metadata,
+    times: &[libc::timespec; 2],
+) -> Result<()> {
+    let named = crate::rooted::metadata_at(directory.as_raw_fd(), name)?;
+    anyhow::ensure!(
+        (named.dev, named.ino) == (current.dev(), current.ino()) && named.is_symlink(),
+        "the new entry changed before its metadata was set"
+    );
+    crate::sys::retry_zero(|| unsafe {
+        libc::utimensat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    })?;
     Ok(())
+}
+
+/// Set the times of the object `handle` refers to, which may be a symlink
+/// or a directory, through `handle`. Linux before 5.8 cannot set times
+/// through a handle with an empty path: then anything but a symlink is
+/// reached through the handle's `/proc/self/fd` link, which leads to the
+/// object itself and to no name, and a symlink, whose link would lead on to
+/// its target, is refused as `Unsupported` for the caller to set by a name
+/// it has checked (`set_created_symlink_times`).
+pub(crate) fn set_handle_times(handle: &File, times: &[libc::timespec; 2]) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        #[cfg(debug_assertions)]
+        let refused = std::env::var_os("SYQ_TEST_REFUSE_EMPTY_PATH_TIMES").is_some();
+        #[cfg(not(debug_assertions))]
+        let refused = false;
+        let result = if refused {
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        } else {
+            crate::sys::retry_zero(|| unsafe {
+                libc::utimensat(
+                    handle.as_raw_fd(),
+                    c"".as_ptr(),
+                    times.as_ptr(),
+                    libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+                )
+            })
+        };
+        match result {
+            Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+                if handle.metadata()?.file_type().is_symlink() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "this kernel cannot set a symlink's times through a handle",
+                    ));
+                }
+                let path = std::ffi::CString::new(crate::sys::proc_fd_path(handle))?;
+                crate::sys::retry_zero(|| unsafe {
+                    libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0)
+                })
+            }
+            result => result,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    crate::sys::retry_zero(|| unsafe { libc::futimens(handle.as_raw_fd(), times.as_ptr()) })
 }
 
 /// Apply `meta` to the directory at `target`. It goes only to a directory:
@@ -791,7 +886,7 @@ pub(super) fn set_meta_rooted(
     if !owner_differs && !mode_differs && !time_differs && meta.inode_metadata.is_none() {
         return Ok(());
     }
-    set_handle_metadata(&handle, meta, flags, &opened)?;
+    set_handle_metadata(&handle, meta, flags, &opened, None)?;
     // The final lookup resolves from Root again.
     require_rooted_named_identity_known(
         &target.root,

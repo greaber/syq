@@ -1480,6 +1480,8 @@ fn matching_condition_can_replace_a_same_type_special_file() {
     make_fifo(&fifo, 0o644);
     let before = fs::symlink_metadata(&fifo).unwrap();
 
+    // Its time changes; its permissions, which the request does not
+    // select, stay as they were, not the 0600 the request proposes.
     let errors = destination_ops(&dir).apply(
         &[Op::Mknod {
             path: b"fifo".to_vec(),
@@ -1489,18 +1491,45 @@ fn matching_condition_can_replace_a_same_type_special_file() {
                 dev: before.dev(),
                 ino: before.ino(),
             },
-            meta: Default::default(),
-            flags: 0,
+            meta: Meta {
+                mode: 0o600,
+                mtime: 1_600_000_000,
+                ..Default::default()
+            },
+            flags: flags::TIMES,
         }],
         None,
     );
     let after = fs::symlink_metadata(&fifo).unwrap();
+    // A request that would change nothing leaves the entry as it is.
+    let unchanged = destination_ops(&dir).apply(
+        &[Op::Mknod {
+            path: b"fifo".to_vec(),
+            mode: file_type_bits(before.mode()) | 0o600,
+            rdev: 0,
+            condition: TargetCondition::Matches {
+                dev: after.dev(),
+                ino: after.ino(),
+            },
+            meta: Meta {
+                mode: 0o600,
+                mtime: 1_600_000_000,
+                ..Default::default()
+            },
+            flags: flags::TIMES,
+        }],
+        None,
+    );
+    let kept = fs::symlink_metadata(&fifo).unwrap();
     fs::remove_dir_all(&dir).unwrap();
 
     assert_eq!(errors, vec![None]);
     assert!(after.file_type().is_fifo());
     assert_ne!(after.ino(), before.ino());
-    assert_eq!(after.mode() & 0o777, 0o600);
+    assert_eq!(after.mode() & 0o777, 0o644);
+    assert_eq!(after.mtime(), 1_600_000_000);
+    assert_eq!(unchanged, vec![None]);
+    assert_eq!(kept.ino(), after.ino());
 }
 
 #[test]
@@ -2629,6 +2658,48 @@ fn offered_small_copy(prefix: &[u8], names: &[&[u8]]) -> SmallCopyRequest {
             })
             .collect(),
     }
+}
+
+/// An unchanged file whose metadata the receiver cannot change in place,
+/// here because it has another name, is replaced from its payload within
+/// the small-file copy: the shortcut asks for that payload rather than
+/// declining the batch, and the other name keeps the old file.
+#[test]
+fn small_copy_replaces_an_unchanged_file_it_cannot_change_in_place() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let prefix = dir.path().as_os_str().as_bytes();
+    let existing = dir.path().join("existing");
+    fs::write(&existing, b"old").unwrap();
+    fs::set_permissions(&existing, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&existing)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+        .unwrap();
+    let outside = crate::test_support::tempdir().unwrap();
+    fs::hard_link(&existing, outside.path().join("alias")).unwrap();
+    let before = fs::metadata(&existing).unwrap().ino();
+    let mut offer = offered_small_copy(prefix, &[b"existing"]);
+    offer.flags = flags::MODE | flags::TIMES;
+    let mut operations = FsOps::new();
+    let response = complete_small_copy(&mut operations, (offer, vec![b"old".to_vec()]));
+    match &response {
+        Response::SmallFilesCopied(SmallCopyResponse {
+            outcome: SmallCopyOutcome::Published(results),
+            ..
+        }) => assert!(
+            results.iter().all(|result| result.error.is_none()),
+            "{response:?}"
+        ),
+        _ => panic!("{response:?}"),
+    }
+    let after = fs::metadata(&existing).unwrap();
+    assert_ne!(after.ino(), before);
+    assert_eq!(after.mode() & 0o7777, 0o600);
+    assert_eq!(fs::read(&existing).unwrap(), b"old");
+    let alias = fs::metadata(outside.path().join("alias")).unwrap();
+    assert_eq!((alias.ino(), alias.mode() & 0o7777), (before, 0o644));
 }
 
 #[test]
