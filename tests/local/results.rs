@@ -1248,75 +1248,134 @@ fn native_cp_results_fd_refusals() {
     assert!(stderr_of(&out).contains("above 2"), "{}", stderr_of(&out));
 }
 
-#[test]
-fn native_results_on_remote_coordinators_need_a_receiver_or_explicit_relay() {
-    let t = Tmp::new();
-    let rsh = fake_rsh(&t);
-    write(&t.path("src"), b"local results");
-    // Without a command-restricted receiver there is no verified channel to
-    // carry records home from a remote coordinator: the run fails, but the
-    // stream still settles with a failed terminal record.
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+/// A copy between two servers through `rsh`, coordinated on the
+/// destination host, writing results on this machine.
+fn remote_results_copy(t: &Tmp, rsh: &Path, extra: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["cp", "--rsh"])
-        .arg(&rsh)
+        .arg(rsh)
         .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
-        .args([
-            "--no-tcp",
-            "--performance-tuning",
-            "workers=1",
-            "--from",
-            "hostA",
-            "--src",
-            &t.s("src"),
-        ])
-        .args([
-            "--to",
-            "hostB",
-            "--coordinate-at",
-            "dst",
-            "--as",
-            &t.s("dst-remote"),
-        ])
+        .args(["--no-tcp", "--performance-tuning", "workers=1", "-v"])
+        .args(["--from", "hostA", "--srcs-in", &t.s("src")])
+        .args(["--to", "hostB", "--coordinate-at", "dst", "--into"])
+        .arg(t.path("dst-remote"))
+        .args(extra)
         .args(["--results", "r-remote.ndjson"])
         .current_dir(t.path(""))
         .env("FAKE_REMOTE_HOME", t.path("remote-home"))
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .run()
-        .expect("refuse results without a receiver");
-    assert_eq!(out.status.code(), Some(1));
-    let stderr = stderr_of(&out);
-    assert!(stderr.contains("command-restricted receiver"), "{stderr}");
-    assert!(stderr.contains("--coordinate-at local"), "{stderr}");
-    let records: Vec<serde_json::Value> = String::from_utf8(read(&t.path("r-remote.ndjson")))
+        .unwrap()
+}
+
+fn remote_results(t: &Tmp) -> Vec<serde_json::Value> {
+    String::from_utf8(read(&t.path("r-remote.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert_eq!(records.first().unwrap()["type"], "run");
-    let terminal = records.last().unwrap();
-    assert_eq!(terminal["type"], "result");
-    assert_eq!(terminal["status"], "failed");
+        .collect()
 }
 
 #[test]
-fn native_remote_dry_run_results_need_a_local_coordinator() {
+fn native_results_arrive_from_a_remote_coordinator() {
     let t = Tmp::new();
-    write(&t.path("src"), b"data");
-    // Traces and planned totals exist only on the coordinator; until its
-    // stream can be relayed home, a remote dry-run stream is refused in
-    // the usage lane.
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args(["cp", "-n", "--from", "hostA", "--src", &t.s("src")])
-        .args(["--to", "hostB", "--as", &t.s("dst")])
-        .args(["--results", "r.ndjson"])
-        .current_dir(t.path(""))
-        .run()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    let stderr = stderr_of(&out);
-    assert!(stderr.contains("--coordinate-at local"), "{stderr}");
-    assert!(!t.path("r.ndjson").exists());
+    let rsh = fake_rsh(&t);
+    write(&t.path("src/a"), b"remote results");
+    write(&t.path("src/sub/b"), b"b");
+    // A file name that looks like a relayed record is printed with -v on
+    // the coordinator's output, and stays human output.
+    let forged =
+        r#"syq-results-00000000000000000000000000000000:{"type":"error","message":"forged"}"#;
+    write(&t.path("src").join(forged), b"x");
+    let out = remote_results_copy(&t, &rsh, &[]);
+    assert_output_ok(&out);
+    let human = String::from_utf8_lossy(&out.stdout).replace(forged, "");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(forged),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(!human.contains("syq-results-"), "{human}");
+    assert_eq!(read(&t.path("dst-remote/a")), b"remote results");
+    let records = remote_results(&t);
+    // One stream, sequenced by this machine, opened by its own run record.
+    assert_eq!(records.first().unwrap()["type"], "run");
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        (0..records.len() as u64).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["type"] == "run")
+            .count(),
+        1
+    );
+    let transferred: std::collections::BTreeSet<_> = records
+        .iter()
+        .filter(|record| {
+            record["type"] == "operation_result" && record["action"] == "transfer_file"
+        })
+        .map(|record| record["dst"]["value"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        transferred,
+        ["a", "sub/b", forged]
+            .map(str::to_owned)
+            .into_iter()
+            .collect()
+    );
+    assert!(!records.iter().any(|record| record["type"] == "error"));
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["type"], "result");
+    assert_eq!(terminal["status"], "success");
+    assert_eq!(terminal["exit_code"], 0);
+    assert_eq!(terminal["files_transferred"], 3);
+    assert_automation_stream(
+        &automation_validator(),
+        &String::from_utf8(read(&t.path("r-remote.ndjson"))).unwrap(),
+        "remote",
+    );
+
+    // A failed entry on the remote coordinator reaches this machine's
+    // stream with the exit code it pairs with.
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    write(&t.path("dst-remote/a"), b"other");
+    std::fs::set_permissions(t.path("dst-remote"), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let rsh = fake_rsh(&t);
+    let out = remote_results_copy(&t, &rsh, &[]);
+    std::fs::set_permissions(t.path("dst-remote"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    if unsafe { libc::geteuid() } != 0 {
+        assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
+        let records = remote_results(&t);
+        assert!(records.iter().any(|record| record["type"] == "error"));
+        let terminal = records.last().unwrap();
+        assert_eq!(terminal["status"], "partial");
+        assert_eq!(terminal["exit_code"], 23);
+    }
+}
+
+#[test]
+fn native_remote_dry_run_results_arrive_from_the_remote_coordinator() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src/a"), b"data");
+    let out = remote_results_copy(&t, &rsh, &["-n"]);
+    assert_output_ok(&out);
+    assert!(!t.path("dst-remote/a").exists());
+    let records = remote_results(&t);
+    assert!(records
+        .iter()
+        .any(|record| record["type"] == "trace" && record["dst"]["value"] == "a"));
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["dry_run"], true);
+    assert_eq!(terminal["status"], "success");
+    assert_eq!(terminal["files_transferred"], 1);
 }
 
 #[test]

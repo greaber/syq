@@ -121,6 +121,7 @@ COPY tests/real-ssh/test-receiver-revoke.py /usr/local/libexec/syq-test-receiver
 COPY tests/real-ssh/test-requester-loss.py /usr/local/libexec/syq-test-requester-loss.py
 
 COPY tests/real-ssh/test-restricted-mapping.py /usr/local/libexec/syq-test-restricted-mapping.py
+COPY tests/real-ssh/test-results-stream.py /usr/local/libexec/syq-test-results-stream.py
 
 COPY tests/real-ssh/test-receiver-identity.py /usr/local/libexec/syq-test-receiver-identity.py
 

@@ -1216,9 +1216,15 @@ pub enum WireRequest<Data> {
     /// socket. SSH data transports report None at the coordinator instead of
     /// sending this request.
     TransportStats,
-    /// Ask a command-restricted receiver for its signed receipt. Issuing it
-    /// ends the grant's mutation authority.
-    Receipt,
+    /// Start a command-restricted receiver's own results for the invoking
+    /// machine, before any change; `records` asks it to list each change as
+    /// well as its totals. Its frames then arrive unsolicited.
+    DestinationResults {
+        records: bool,
+    },
+    /// End the receiver's results: the grant's authority to change anything
+    /// ends, and the final frame follows once requests in flight settle.
+    FinishDestinationResults,
     Shutdown,
     /// Supply only payloads requested by PrepareSmallFiles on this session.
     CopySmallFiles(Vec<SmallCopyPayload>),
@@ -1686,9 +1692,10 @@ pub enum Response {
     },
     Path(PathBytes),
     TransportStats(Box<TransportStatsReply>),
-    /// One bounded frame of a signed receipt stream. The final frame is marked
-    /// inside the canonical frame encoding.
-    Receipt(#[serde(with = "serde_bytes")] Vec<u8>),
+    /// One frame of a command-restricted receiver's results, sent
+    /// unsolicited ahead of a response on any of its connections. The
+    /// coordinator relays it unread to the invoking machine.
+    DestinationResults(#[serde(with = "serde_bytes")] Vec<u8>),
     Ok,
     /// An endpoint operation failed with a preserved OS error number. Server
     /// and authorization protocol failures continue to use Err(String).
@@ -2149,7 +2156,7 @@ impl SizeHint for Response {
             }
             Response::Hashes(v) | Response::HeldHashes { hashes: v, .. } => v.len() * 32 + 24,
             Response::SeededBasis(seed) => seed.hashes.len() * 32 + 24,
-            Response::Receipt(v) => v.len() + 16,
+            Response::DestinationResults(v) => v.len() + 16,
             _ => 256,
         }
     }

@@ -109,22 +109,16 @@ pub(crate) struct Approved {
     pub enrollment: crate::enrollment::EnrollmentId,
     pub request: crate::delegation::RequestId,
     pub digest: [u8; 32],
-    pub receipt_key: String,
+    /// Verifies the header of the receiving machine's own results. Only a
+    /// copy between two servers asks for them (`peer_bridge`); a coordinator
+    /// on the requesting machine reads every reply itself.
+    pub results_key: String,
     /// The approving machine's own deletion limit for this copy, when it has
     /// one. Both machines run the same build.
     pub max_delete: Option<u64>,
 }
 
-#[derive(Debug)]
-pub(crate) struct NamedReceipt {
-    pub(crate) connection: Option<Arc<ReturnConnection>>,
-    secret: crate::receipt::RecipientSecret,
-    approved: Approved,
-    policy: crate::receipt::ReceiptPolicy,
-}
-
-/// One approved control channel and its direct worker transport. Copies from
-/// an approved source use this without a destination receipt.
+/// One approved control channel and its direct worker transport.
 #[derive(Debug)]
 pub(crate) struct ReturnConnection {
     ssh: Option<forward::ssh::Client>,
@@ -887,6 +881,14 @@ pub(crate) fn is_named(grant: &Option<String>) -> bool {
     grant.as_deref().is_some_and(|s| s.starts_with(PREFIX))
 }
 
+/// Whether a coordinator holding this grant relays the destination's own
+/// results to the syq that started it: on copies between two servers, whose
+/// invoking machine does not see the destination's replies. A copy to a
+/// receiving machine, or one it forwards, is coordinated by the requester.
+pub(crate) fn reports_results(grant: &Option<String>) -> bool {
+    grant.as_deref().is_some_and(|grant| grant != RETURN_GRANT) && !is_named(grant)
+}
+
 fn select_copy(
     args: &mut crate::cli::Args,
     progress: Option<&crate::progress::Progress>,
@@ -1038,18 +1040,10 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     let handoff::Selection {
         name, registration, ..
     } = selection;
-    let (secret, public) = crate::receipt::generate_recipient()?;
-    let policy = crate::receipt::ReceiptPolicy {
-        required: true,
-        hashed: args.receiver_receipt == Some(crate::cli::ReceiptDetail::Hashes),
-        max_records: crate::receipt::DEFAULT_MAX_RECORDS,
-        max_plaintext_bytes: crate::receipt::DEFAULT_MAX_PLAINTEXT_BYTES,
-        delivery: crate::receipt::ReceiptDelivery::AttachedEncrypted {
-            suite: crate::receipt::HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
-            recipient_public_key: public,
-        },
-    };
-    let request = crate::restricted::named_request(args, policy.clone())?;
+    let request = crate::restricted::named_request(
+        args,
+        crate::destination_results::ReceiptPolicy::unused()?,
+    )?;
     crate::output::diagnostic!("syq: requesting permission from @{name} (up to 300 seconds; approve on the receiving machine with its desktop prompt or syq persist receive pending)");
     let (_, reply) = exchange(
         &registration,
@@ -1074,12 +1068,6 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
             token: approved.token.clone()
         })?)
     ));
-    args.named_receipt = Some(Arc::new(NamedReceipt {
-        connection: None,
-        secret,
-        approved,
-        policy,
-    }));
     Ok(())
 }
 
@@ -1110,51 +1098,6 @@ fn decode_route(grant: &str) -> Result<Route> {
     Ok(serde_json::from_slice(
         &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)?,
     )?)
-}
-
-pub(crate) fn finish_receipt(
-    expected: &NamedReceipt,
-    conn: &mut dyn crate::conn::Conn,
-) -> Result<()> {
-    use crate::proto::{Request, Response};
-    conn.send(Request::Receipt)?;
-    // The verifier streams bounded frames through an anonymous spool; it never
-    // buffers a complete receipt or trusts the sender's success report.
-    let mut ended = false;
-    let frames = std::iter::from_fn(|| {
-        if ended {
-            return None;
-        }
-        let result = match conn.recv() {
-            Ok(Response::Receipt(frame)) => match crate::receipt::receipt_frame_is_end(&frame) {
-                Ok(last) => {
-                    ended = last;
-                    Ok(frame)
-                }
-                Err(e) => Err(e),
-            },
-            Ok(Response::Err(error)) => Err(anyhow::anyhow!(error)),
-            Ok(_) => Err(anyhow::anyhow!("unexpected receipt response")),
-            Err(e) => Err(e),
-        };
-        if result.is_err() {
-            ended = true;
-        }
-        Some(result)
-    });
-    let receipt = crate::receipt::open_attached_frames(
-        frames,
-        &expected.secret,
-        &expected.approved.receipt_key,
-        expected.approved.enrollment,
-        expected.approved.request,
-        expected.approved.digest,
-        &expected.policy,
-    )?;
-    if receipt.terminal.status != crate::receipt::ReceiptStatus::Clean {
-        bail!("receiving machine reports {:?}", receipt.terminal.status);
-    }
-    Ok(())
 }
 
 struct Session {

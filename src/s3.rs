@@ -254,9 +254,9 @@ impl Options {
             "pscope",
             "receiver_max_entries",
             "receiver_max_bytes",
-            "receiver_receipt",
             "delegated_operands_b64",
             "suppress_summary",
+            "relay_results",
         ] {
             if explicit(id) {
                 bail!(

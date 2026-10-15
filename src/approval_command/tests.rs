@@ -37,15 +37,16 @@ fn receiving_authorizer_checks_the_command_without_local_preferences() {
     }
 }
 
-fn policy() -> crate::receipt::ReceiptPolicy {
-    let (_, public) = crate::receipt::generate_recipient().unwrap();
-    crate::receipt::ReceiptPolicy {
+fn policy() -> crate::destination_results::ReceiptPolicy {
+    let (_, public) = crate::destination_results::generate_recipient().unwrap();
+    crate::destination_results::ReceiptPolicy {
         required: true,
         hashed: false,
-        max_records: crate::receipt::DEFAULT_MAX_RECORDS,
-        max_plaintext_bytes: crate::receipt::DEFAULT_MAX_PLAINTEXT_BYTES,
-        delivery: crate::receipt::ReceiptDelivery::AttachedEncrypted {
-            suite: crate::receipt::HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
+        max_records: crate::destination_results::DEFAULT_MAX_RECORDS,
+        max_plaintext_bytes: crate::destination_results::DEFAULT_MAX_PLAINTEXT_BYTES,
+        delivery: crate::destination_results::ReceiptDelivery::AttachedEncrypted {
+            suite:
+                crate::destination_results::HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
             recipient_public_key: public,
         },
     }

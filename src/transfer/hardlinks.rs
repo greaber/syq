@@ -303,6 +303,7 @@ impl Planner<'_> {
                     self.hardlink_failure(
                         &follower,
                         "hardlink representative did not complete successfully".into(),
+                        crate::results::ReceiverListing::Unlisted,
                     );
                 }
                 continue;
@@ -378,6 +379,7 @@ impl Planner<'_> {
                 self.opts
                     .file_difference_message(&display(&follower.rel))
                     .into(),
+                crate::results::ReceiverListing::Unlisted,
             );
         }
         Ok(same)
@@ -417,6 +419,7 @@ impl Planner<'_> {
                 self.hardlink_failure(
                     follower,
                     "source hardlink group changed during the copy".into(),
+                    crate::results::ReceiverListing::Unlisted,
                 );
                 continue;
             }
@@ -448,7 +451,7 @@ impl Planner<'_> {
         );
         for ((group, follower), error) in pending.into_iter().zip(errors) {
             if let Some(error) = error {
-                self.hardlink_failure(follower, error);
+                self.hardlink_failure(follower, error, crate::results::ReceiverListing::Listed);
             } else if follower.destination == group.published {
                 self.progress.files_unchanged.fetch_add(1, Relaxed);
             } else {
@@ -514,12 +517,24 @@ impl Planner<'_> {
         }
     }
 
-    fn hardlink_failure(&self, follower: &Follower, error: WireError) {
-        self.progress.error(&format!(
-            "syq: hardlink {}: {}",
-            display(&follower.rel),
-            self.opts.wire_error_message_at(&error, &follower.dst)
-        ));
+    /// A follower that was not linked: `listing` says whether the receiver
+    /// refused or failed the link itself.
+    fn hardlink_failure(
+        &self,
+        follower: &Follower,
+        error: WireError,
+        listing: crate::results::ReceiverListing,
+    ) {
+        self.progress.entry_error_classified(
+            &format!(
+                "syq: hardlink {}: {}",
+                display(&follower.rel),
+                self.opts.wire_error_message_at(&error, &follower.dst)
+            ),
+            None,
+            None,
+            Some((&follower.rel, listing)),
+        );
         if !self.opts.dry_run {
             self.emit_entry_failed(
                 FailedEntry {
@@ -531,6 +546,7 @@ impl Planner<'_> {
                 "io",
                 wire_os_kind(&error),
                 error.as_str(),
+                listing,
             );
         }
     }
@@ -569,7 +585,7 @@ impl Worker {
     pub(super) fn finish_matched_basis(&mut self, idx: usize, job: &WorkerJob) -> Result<()> {
         let mut meta = self.opts.metadata_for(&job.rel_bytes, &job.entry);
         meta.mode = self.create_mode(job);
-        let response = ok(
+        let response = change_ok(
             self.dst.call(Request::FinishBasis {
                 expected_hash: self.opts.expected_hashes_for(job),
                 path: job.dst.clone(),

@@ -10,8 +10,10 @@ pub(super) fn generate_enrollment_key(id: EnrollmentId) -> Result<PrivateKey> {
         .context("construct enrollment key")
 }
 
-/// The receiver's own signing key for receipts. It lives only on hostB, in
-/// the enrollment's state directory, and is generated once per enrollment.
+/// The receiver's own signing key, which signs the header of its results
+/// for the invoking machine. It lives only on hostB, in the enrollment's
+/// state directory, and is generated once per enrollment. Its file and
+/// comment keep the names it had when it signed receipts.
 pub(super) fn generate_receipt_key(id: EnrollmentId) -> Result<PrivateKey> {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).context("generate receipt signing key")?;
@@ -23,7 +25,7 @@ pub(super) fn generate_receipt_key(id: EnrollmentId) -> Result<PrivateKey> {
 
 pub(super) const RECEIPT_KEY_FILE: &str = "receipt-key";
 
-/// The enrollment's receipt key: generated on first install and kept by
+/// The enrollment's results key: generated on first install and kept by
 /// every later install, so a refresh after a syq upgrade, or a retry after
 /// a lost reply, always reports the key the local side already holds.
 /// Rotation is explicit: revoke, then enroll again.

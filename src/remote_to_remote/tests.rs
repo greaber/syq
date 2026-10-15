@@ -184,11 +184,11 @@ fn broker_capacity_is_bounded_independently_of_automatic_workers() {
 }
 
 #[test]
-fn receipt_settlement_preserves_terminal_outcomes() {
-    use crate::receipt::ReceiptStatus::{Clean, Failed, Incomplete};
+fn settlement_preserves_terminal_outcomes() {
+    use DestinationStatus::{Clean, Failed};
 
     // Every (status, exit_code) pair matches the automation contract's
-    // table: success/0, partial/23, refused/25, failed/1, aborted/1.
+    // table: success/0, partial/23, refused/25, failed/1.
     let cases = [
         (Clean, 0, 0, "success", 0, false),
         (Clean, 0, 23, "partial", 23, false),
@@ -199,72 +199,243 @@ fn receipt_settlement_preserves_terminal_outcomes() {
         (Failed, 1, 23, "refused", 25, true),
         (Failed, 0, 1, "failed", 1, false),
         (Failed, 1, 1, "failed", 1, true),
-        (Incomplete, 0, 0, "aborted", 1, true),
-        (Incomplete, 0, 23, "aborted", 1, false),
-        (Incomplete, 1, 23, "aborted", 1, true),
-        (Incomplete, 0, 1, "aborted", 1, false),
+        (Clean, 1, 0, "refused", 25, true),
     ];
-    for (receipt_status, refusals, coordinator, status, exit_code, rejects) in cases {
-        let outcome = receipt_settlement_outcome(receipt_status, refusals, coordinator);
+    for (destination, refusals, coordinator, status, exit_code, rejects) in cases {
+        let outcome = settlement_outcome(destination, refusals, coordinator);
         assert_eq!(outcome.results_status, status);
         assert_eq!(outcome.exit_code, exit_code);
-        assert_eq!(outcome.rejects_receipt, rejects);
+        assert_eq!(outcome.rejects, rejects);
     }
 }
 
-#[test]
-fn relay_passes_output_through_and_spools_receipt_frames() {
-    // Ordinary output streams through byte for byte, including bytes
-    // that are not UTF-8; a stream with no receipt lines captures
-    // nothing.
-    assert!(relay_stdout(b"plain\n".as_slice()).unwrap().is_none());
-    assert!(relay_stdout(b"syq: transferred 1 files\xff\r\n".as_slice())
-        .unwrap()
-        .is_none());
+const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
-    // Marker lines are decoded and spooled as separate bounded frames,
-    // not accumulated into one receipt allocation.
-    let frames = [
-        crate::receipt::ReceiptFrame::Start {
-            mode: crate::receipt::ReceiptDeliveryKind::DetachedSignedPlaintext,
-            encapsulated_key: Vec::new(),
+/// A results writer whose records can be read back.
+fn results_file() -> (std::fs::File, std::sync::Arc<crate::results::ResultsWriter>) {
+    let file = tempfile::tempfile().unwrap();
+    let writer = crate::results::ResultsWriter::new(Box::new(file.try_clone().unwrap()));
+    (file, std::sync::Arc::new(writer))
+}
+
+fn read_records(mut file: std::fs::File) -> Vec<serde_json::Value> {
+    use std::io::Seek;
+    let mut text = String::new();
+    file.rewind().unwrap();
+    file.read_to_string(&mut text).unwrap();
+    text.lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// One of a remote coordinator's own records as it relays it.
+fn coordinator_line(record: serde_json::Value, seq: u64) -> Vec<u8> {
+    let mut record = record;
+    let object = record.as_object_mut().unwrap();
+    object.insert("schema".into(), crate::results::SCHEMA.into());
+    object.insert(
+        "schema_version".into(),
+        crate::results::SCHEMA_VERSION.into(),
+    );
+    object.insert("seq".into(), seq.into());
+    let mut line = crate::destination_results::relay::coordinator_prefix(TOKEN).into_bytes();
+    line.extend_from_slice(&serde_json::to_vec(&record).unwrap());
+    line.push(b'\n');
+    line
+}
+
+fn destination_line(frame: &[u8]) -> Vec<u8> {
+    let mut line = crate::destination_results::relay::destination_prefix(TOKEN).into_bytes();
+    line.extend_from_slice(
+        base64::engine::general_purpose::STANDARD_NO_PAD
+            .encode(frame)
+            .as_bytes(),
+    );
+    line.push(b'\n');
+    line
+}
+
+fn settlement(coordinator_exit_code: i32) -> Settlement<'static> {
+    Settlement {
+        src_host: "source",
+        dst_host: "destination",
+        coordinator_exit_code,
+        elapsed_ms: 1,
+        verbose: false,
+        quiet: true,
+    }
+}
+
+fn coordinator_terminal() -> serde_json::Value {
+    serde_json::json!({
+        "type": "result",
+        "status": "success",
+        "exit_code": 0,
+        "dry_run": false,
+        "files_transferred": 99,
+        "files_unchanged": 4,
+        "files_excluded": 2,
+        "directories_created": 0,
+        "symlinks_created": 0,
+        "specials_created": 0,
+        "errors": 0,
+        "bytes_transferred": 99,
+        "bytes_unchanged": 40,
+        "timings": {"total_ms": 5, "transfer_ms": 3},
+    })
+}
+
+#[test]
+fn ordinary_coordinator_results_are_relayed_with_this_machines_sequence() {
+    let (file, writer) = results_file();
+    writer.emit_value(serde_json::json!({"type": "run", "run_id": "local"}));
+    let mut relay = Relay::new(TOKEN, Some(writer), None, (false, false));
+    let mut input = b"syq: transferred 1 files\xff\r\n".to_vec();
+    input.extend(coordinator_line(
+        serde_json::json!({"type": "run", "run_id": "remote"}),
+        0,
+    ));
+    input.extend(coordinator_line(
+        serde_json::json!({"type": "operation_result", "action": "transfer_file",
+            "dst": {"encoding": "utf-8", "value": "a"}, "kind": "file",
+            "disposition": "succeeded", "bytes": 1}),
+        1,
+    ));
+    // A line marked with another copy's token, as a crafted file name
+    // printed by -v could be, is ordinary output.
+    let forged = b"syq-results-ffffffffffffffffffffffffffffffff:{\"type\":\"error\"}\n";
+    input.extend_from_slice(forged);
+    input.extend(coordinator_line(coordinator_terminal(), 2));
+    input.extend_from_slice(b"last line without a newline");
+    let mut human = Vec::new();
+    relay_output(input.as_slice(), &mut human, &mut None, &mut relay).unwrap();
+    assert_eq!(
+        human,
+        [
+            b"syq: transferred 1 files\xff\r\n".as_slice(),
+            forged,
+            b"last line without a newline"
+        ]
+        .concat()
+    );
+    assert_eq!(settle(relay, settlement(0)).unwrap(), 0);
+    let records = read_records(file);
+    let kinds: Vec<_> = records.iter().map(|r| r["type"].clone()).collect();
+    assert_eq!(kinds, ["run", "operation_result", "result"]);
+    assert_eq!(records[0]["run_id"], "local");
+    assert_eq!(
+        records.iter().map(|r| r["seq"].clone()).collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    assert_eq!(records[2]["files_transferred"], 99);
+
+    // A coordinator that ends without its final result fails the stream.
+    let (file, writer) = results_file();
+    let relay = Relay::new(TOKEN, Some(writer), None, (false, false));
+    assert!(settle(relay, settlement(0)).is_err());
+    let records = read_records(file);
+    assert_eq!(records.last().unwrap()["status"], "failed");
+
+    // Another results format, and an oversized line, are refused.
+    for line in [
+        {
+            let mut line =
+                crate::destination_results::relay::coordinator_prefix(TOKEN).into_bytes();
+            line.extend_from_slice(
+                br#"{"type":"error","message":"x","schema":"syq.automation","schema_version":1,"seq":0}"#,
+            );
+            line.push(b'\n');
+            line
         },
-        crate::receipt::ReceiptFrame::Chunk {
-            sequence: 0,
-            payload: b"stream".to_vec(),
+        {
+            let mut line =
+                crate::destination_results::relay::coordinator_prefix(TOKEN).into_bytes();
+            line.extend(std::iter::repeat_n(b'A', MAX_RELAYED_LINE_BYTES + 1));
+            line.push(b'\n');
+            line
         },
-        crate::receipt::ReceiptFrame::End {
-            sequence: 1,
-            payload: b"terminal".to_vec(),
+    ] {
+        let (_, writer) = results_file();
+        let mut relay = Relay::new(TOKEN, Some(writer), None, (false, false));
+        let mut human = Vec::new();
+        let input = [line.as_slice(), b"after\n"].concat();
+        relay_output(input.as_slice(), &mut human, &mut None, &mut relay).unwrap();
+        // Nothing of a marked line reaches human output.
+        assert_eq!(human, b"after\n");
+        assert!(settle(relay, settlement(0)).is_err());
+    }
+}
+
+/// A destination's stream for one copy, with the expectation that reads it.
+fn destination(
+    records: bool,
+) -> (
+    crate::destination_results::Stream,
+    crate::destination_results::Expectation,
+) {
+    let key = ssh_key::PrivateKey::new(
+        ssh_key::private::Ed25519Keypair::from_seed(&[19; 32]).into(),
+        "results-test",
+    )
+    .unwrap();
+    let (secret, public) = crate::destination_results::generate_recipient().unwrap();
+    let binding = crate::destination_results::Binding {
+        enrollment_id: crate::enrollment::EnrollmentId::random(),
+        request_id: crate::delegation::RequestId::fresh(1_900_000_000).unwrap(),
+        grant_digest: [17; 32],
+    };
+    let stream = crate::destination_results::Stream::start(
+        &crate::destination_results::ReceiptPolicy::for_recipient(public),
+        binding,
+        &key,
+        records,
+    )
+    .unwrap();
+    (
+        stream,
+        crate::destination_results::Expectation {
+            public_key: key.public_key().to_openssh().unwrap(),
+            binding,
+            secret,
+            records,
         },
-    ]
-    .map(|frame| crate::receipt::encode_receipt_frame(&frame).unwrap());
-    let mut output = b"ordinary line\n".to_vec();
-    for frame in &frames {
-        output.extend_from_slice(crate::receipt::RECEIPT_LINE_PREFIX.as_bytes());
-        output.extend_from_slice(
-            base64::engine::general_purpose::STANDARD_NO_PAD
-                .encode(frame)
-                .as_bytes(),
+    )
+}
+
+/// The destination's frames for a copy that published `a` and created `d`,
+/// then refused `refusals` requests, each for one file `r0`, `r1`, ...,
+/// as relayed lines.
+fn destination_lines(stream: &mut crate::destination_results::Stream, refusals: u64) -> Vec<u8> {
+    use crate::destination_results::Change;
+    let mut lines = Vec::new();
+    let mut take = |stream: &mut crate::destination_results::Stream| {
+        for frame in stream
+            .take_frames(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .unwrap()
+        {
+            lines.extend(destination_line(&frame));
+        }
+    };
+    take(stream);
+    stream.record(Change::PublishFile { size: 5 }, Some(b"a"), None);
+    stream.record(Change::EnsureDirectory, Some(b"d"), None);
+    take(stream);
+    for index in 0..refusals {
+        stream.refused(
+            "refused: signed grant entry limit exceeded",
+            &[(
+                Some(format!("r{index}").into_bytes()),
+                Change::PublishFile { size: 1 },
+            )],
         );
-        output.push(b'\n');
     }
-    let mut captured = relay_stdout(&output[..])
-        .unwrap()
-        .expect("captured receipt frames");
-    let captured: Vec<Vec<u8>> = captured.frames().unwrap().map(Result::unwrap).collect();
-    assert_eq!(captured, frames);
-
-    // An oversized marker line is refused instead of buffered.
-    let mut oversized = crate::receipt::RECEIPT_LINE_PREFIX.as_bytes().to_vec();
-    oversized.extend(std::iter::repeat_n(b'A', MAX_RECEIPT_LINE_BYTES + 1));
-    oversized.push(b'\n');
-    assert!(relay_stdout(oversized.as_slice()).is_err());
+    stream.finish(5).unwrap();
+    take(stream);
+    lines
 }
 
 #[test]
-fn relay_output_failure_preserves_verified_receipt_and_rejects_corruption() {
-    use crate::receipt::*;
+fn destination_results_supply_its_changes_whatever_the_human_output_does() {
     struct FailingOutput {
         flush_only: bool,
     }
@@ -280,130 +451,394 @@ fn relay_output_failure_preserves_verified_receipt_and_rejects_corruption() {
             Err(std::io::ErrorKind::BrokenPipe.into())
         }
     }
-    let signing_key = ssh_key::PrivateKey::new(
-        ssh_key::private::Ed25519Keypair::from_seed(&[19; 32]).into(),
-        "output-test",
-    )
-    .unwrap();
-    let (secret, public) = generate_recipient().unwrap();
-    let policy = ReceiptPolicy {
-        required: true,
-        hashed: false,
-        max_records: 32,
-        max_plaintext_bytes: 64 * 1024,
-        delivery: ReceiptDelivery::AttachedEncrypted {
-            suite: HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
-            recipient_public_key: public,
-        },
-    };
-    let enrollment_id = EnrollmentId::random();
-    let request_id = RequestId::fresh(1_900_000_000).unwrap();
-    let grant_digest = [17; 32];
-    let issued = ReceiptStreamWriter::new(&policy)
-        .unwrap()
-        .finish(ReceiptClosure {
-            enrollment_id,
-            request_id,
-            grant_digest,
-            issued_at: 1_900_000_001,
-            policy: policy.clone(),
-            entries_touched: 0,
-            transferred_bytes: 0,
-            signing_key: &signing_key,
-        })
-        .unwrap();
-    let mut encoded = Vec::new();
-    emit_receipt_frames(issued, |frame| {
-        encoded.extend_from_slice(RECEIPT_LINE_PREFIX.as_bytes());
-        encoded.extend_from_slice(
-            base64::engine::general_purpose::STANDARD_NO_PAD
-                .encode(frame)
-                .as_bytes(),
-        );
-        encoded.push(b'\n');
-        Ok(())
-    })
-    .unwrap();
-    let expected = ReceiptExpectation {
-        public_key: signing_key.public_key().to_openssh().unwrap(),
-        enrollment_id,
-        request_id,
-        recipient_secret: Some(secret),
-        policy,
-        grant_digest: Some(grant_digest),
-    };
     for flush_only in [false, true] {
-        // Fail either before the receipt arrives or after it was captured.
-        for human_first in [false, true] {
-            let input = if human_first {
-                [b"human line\n".as_slice(), &encoded].concat()
-            } else {
-                [&encoded, b"human line\n".as_slice()].concat()
-            };
-            let mut output_error = None;
-            let mut captured = relay_output(
-                input.as_slice(),
-                &mut FailingOutput { flush_only },
-                &mut output_error,
-            )
-            .unwrap();
-            assert_eq!(output_error.unwrap().kind(), std::io::ErrorKind::BrokenPipe);
-            let file = tempfile::tempfile().unwrap();
-            let writer = crate::results::ResultsWriter::new(Box::new(file.try_clone().unwrap()));
-            assert_eq!(
-                settle_receipt(
-                    &expected,
-                    captured.as_mut(),
-                    ReceiptSettlement {
-                        src_host: "source",
-                        dst_host: "destination",
-                        coordinator_exit_code: 0,
-                        results: Some(&writer),
-                        elapsed_ms: 1,
-                        verbose: false,
-                        quiet: false,
-                    }
-                )
-                .unwrap(),
-                0
-            );
-            let mut text = String::new();
-            let mut file = file;
-            file.rewind().unwrap();
-            file.read_to_string(&mut text).unwrap();
-            let result: serde_json::Value =
-                serde_json::from_str(text.lines().last().unwrap()).unwrap();
-            assert_eq!(result["exit_code"], 0);
-            assert_eq!(result["provenance"], "receiver_attested");
-        }
+        let (mut stream, expectation) = destination(true);
+        let (file, writer) = results_file();
+        let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
+        let mut input = b"human line\n".to_vec();
+        // The coordinator's own record of a destination change gives way to
+        // the destination's; its error records and totals remain.
+        input.extend(coordinator_line(
+            serde_json::json!({"type": "operation_result", "action": "transfer_file",
+                "dst": {"encoding": "utf-8", "value": "forged"}, "kind": "file",
+                "disposition": "succeeded", "bytes": 1}),
+            0,
+        ));
+        input.extend(coordinator_line(
+            serde_json::json!({"type": "error", "message": "syq: c: Permission denied"}),
+            1,
+        ));
+        input.extend(destination_lines(&mut stream, 0));
+        input.extend(coordinator_line(coordinator_terminal(), 2));
+        let mut output_error = None;
+        relay_output(
+            input.as_slice(),
+            &mut FailingOutput { flush_only },
+            &mut output_error,
+            &mut relay,
+        )
+        .unwrap();
+        assert_eq!(output_error.unwrap().kind(), std::io::ErrorKind::BrokenPipe);
+        // The coordinator reported its source failure as a partial copy.
+        assert_eq!(settle(relay, settlement(23)).unwrap(), 23);
+        let records = read_records(file);
+        let operations: Vec<_> = records
+            .iter()
+            .filter(|record| record["type"] == "operation_result")
+            .map(|record| record["dst"]["value"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(operations, ["a", "d"]);
+        let terminal = records.last().unwrap();
+        assert_eq!(terminal["type"], "result");
+        assert_eq!(terminal["status"], "partial");
+        assert_eq!(terminal["exit_code"], 23);
+        assert_eq!(terminal["files_transferred"], 1);
+        assert_eq!(terminal["bytes_transferred"], 5);
+        assert_eq!(terminal["directories_created"], 1);
+        assert_eq!(terminal["files_unchanged"], 4);
+        assert_eq!(terminal["bytes_unchanged"], 40);
+        assert_eq!(terminal["errors"], 1);
+        assert!(terminal.get("provenance").is_none());
     }
-    // Losing human output never disables receipt framing or verification.
-    let invalid = format!("human line\n{RECEIPT_LINE_PREFIX}invalid!\n");
-    assert!(relay_output(
-        invalid.as_bytes(),
-        &mut FailingOutput { flush_only: false },
-        &mut None
-    )
-    .is_err());
-    let mut captured = relay_output(encoded.as_slice(), &mut Vec::new(), &mut None).unwrap();
-    let wrong_expected = ReceiptExpectation {
-        grant_digest: Some([99; 32]),
-        ..expected
-    };
-    assert!(settle_receipt(
-        &wrong_expected,
-        captured.as_mut(),
-        ReceiptSettlement {
-            src_host: "source",
-            dst_host: "destination",
-            coordinator_exit_code: 0,
-            results: None,
-            elapsed_ms: 1,
-            verbose: false,
-            quiet: true,
+}
+
+#[test]
+fn destination_refusals_and_failures_decide_the_outcome() {
+    // A refusal makes the copy refused even if the coordinator reported
+    // success, and is reported.
+    let (mut stream, expectation) = destination(true);
+    let (file, writer) = results_file();
+    let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
+    let mut input = destination_lines(&mut stream, 2);
+    input.extend(coordinator_line(coordinator_terminal(), 0));
+    relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+    assert_eq!(settle(relay, settlement(0)).unwrap(), 25);
+    let records = read_records(file);
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["status"], "refused");
+    // One error record for each refused change, from the destination.
+    assert_eq!(terminal["errors"], 2);
+    for name in ["r0", "r1"] {
+        assert!(records.iter().any(|record| record["type"] == "error"
+            && record["class"] == "safety_limit"
+            && record["message"]
+                == format!("syq: {name}: refused: signed grant entry limit exceeded")));
+    }
+
+    // Without --results the destination sends only its totals; a refusal
+    // still fails the copy.
+    let (mut stream, expectation) = destination(false);
+    let mut relay = Relay::new(TOKEN, None, Some(expectation), (false, false));
+    let input = destination_lines(&mut stream, 1);
+    relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+    assert!(settle(relay, settlement(0)).is_err());
+    let (mut stream, expectation) = destination(false);
+    let mut relay = Relay::new(TOKEN, None, Some(expectation), (false, false));
+    let input = destination_lines(&mut stream, 0);
+    relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+    assert_eq!(settle(relay, settlement(0)).unwrap(), 0);
+}
+
+fn tagged_path(name: &str) -> serde_json::Value {
+    serde_json::json!({"encoding": "utf-8", "value": name})
+}
+
+/// The coordinator's records of a failure at `name` it counts itself.
+fn coordinator_failure(name: &str, message: &str, seq: u64) -> Vec<u8> {
+    [
+        coordinator_line(
+            serde_json::json!({"type": "error", "class": "io",
+                "message": format!("syq: {name}: {message}")}),
+            seq,
+        ),
+        coordinator_line(
+            serde_json::json!({"type": "operation_result", "action": "transfer_file",
+                "dst": tagged_path(name), "kind": "file", "disposition": "failed",
+                "retryable": "unknown", "class": "io", "message": message}),
+            seq + 1,
+        ),
+    ]
+    .concat()
+}
+
+/// What the invoking machine reports about one path.
+fn records_about(records: &[serde_json::Value], name: &str) -> Vec<serde_json::Value> {
+    records
+        .iter()
+        .filter(|record| {
+            record["dst"] == tagged_path(name)
+                || record["diagnostic_for"] == tagged_path(name)
+                || record["message"]
+                    .as_str()
+                    .is_some_and(|message| message.starts_with(&format!("syq: {name}:")))
+        })
+        .cloned()
+        .collect()
+}
+
+fn schema_validator() -> jsonschema::Validator {
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../schemas/automation.schema.json")).unwrap();
+    jsonschema::validator_for(&schema).unwrap()
+}
+
+#[test]
+fn a_refused_path_appears_once_from_the_receiver_whatever_the_coordinator_claims() {
+    let validator = schema_validator();
+    let mut reports = Vec::new();
+    // The coordinator leaves its own record of the refusal out, or claims
+    // the path succeeded; s0 failed reading the source, which only the
+    // coordinator saw.
+    for coordinator in ["silent", "claims-success"] {
+        let (mut stream, expectation) = destination(true);
+        let (file, writer) = results_file();
+        let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
+        let mut input = Vec::new();
+        if coordinator == "claims-success" {
+            input.extend(coordinator_line(
+                serde_json::json!({"type": "operation_result", "action": "transfer_file",
+                    "dst": tagged_path("r0"), "kind": "file", "disposition": "succeeded",
+                    "bytes": 1}),
+                0,
+            ));
         }
-    )
-    .is_err());
+        input.extend(coordinator_failure(
+            "s0",
+            "Permission denied (os error 13)",
+            1,
+        ));
+        input.extend(destination_lines(&mut stream, 1));
+        input.extend(coordinator_line(coordinator_terminal(), 3));
+        relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+        assert_eq!(settle(relay, settlement(23)).unwrap(), 25, "{coordinator}");
+        let records = read_records(file);
+        let refused = records_about(&records, "r0");
+        // Once, from the receiver: its error record and operation record.
+        assert_eq!(
+            refused
+                .iter()
+                .map(|record| (
+                    record["type"].as_str().unwrap().to_owned(),
+                    record["class"].as_str().unwrap_or_default().to_owned()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("error".to_owned(), "safety_limit".to_owned()),
+                ("operation_result".to_owned(), "safety_limit".to_owned())
+            ],
+            "{coordinator}: {records:?}"
+        );
+        assert_eq!(refused[1]["disposition"], "failed");
+        // The source failure is the coordinator's, once.
+        let source = records_about(&records, "s0");
+        assert_eq!(source.len(), 2, "{coordinator}: {records:?}");
+        assert_eq!(source[1]["retryable"], "unknown");
+        assert_eq!(records.last().unwrap()["errors"], 2, "{coordinator}");
+        for record in &records {
+            assert!(
+                validator.validate(record).is_ok(),
+                "{coordinator}: {record}"
+            );
+        }
+        reports.push(
+            refused
+                .into_iter()
+                .map(|mut record| {
+                    record.as_object_mut().unwrap().remove("seq");
+                    record
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(reports[0], reports[1]);
+}
+
+#[test]
+fn a_source_failure_explains_a_file_the_receiver_left_unfinished_at_once() {
+    let (mut stream, expectation) = destination(true);
+    let (file, writer) = results_file();
+    let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
+    // A file's destination was prepared, then reading its source failed:
+    // the coordinator's error explains the failure as it happens, and the
+    // receiver, which cannot know why, lists the file unfinished at the end.
+    let input = coordinator_line(
+        serde_json::json!({
+            "type": "error", "class": "io", "os_kind": "permission_denied",
+            "message": "syq: a: read: Permission denied (os error 13)",
+            "diagnostic_for": tagged_path("a"),
+        }),
+        0,
+    );
+    relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+    // Written already, before the receiver's stream ends.
+    let early = read_records(file.try_clone().unwrap());
+    assert_eq!(early.len(), 1, "{early:?}");
+    assert_eq!(early[0]["os_kind"], "permission_denied");
+    let mut input = Vec::new();
+    let mut take = |stream: &mut crate::destination_results::Stream| {
+        for frame in stream
+            .take_frames(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .unwrap()
+        {
+            input.extend(destination_line(&frame));
+        }
+    };
+    take(&mut stream);
+    stream.record(
+        crate::destination_results::Change::PublishFile { size: 4096 },
+        Some(b"a"),
+        Some("the file was not finished"),
+    );
+    stream.finish(0).unwrap();
+    take(&mut stream);
+    input.extend(coordinator_line(coordinator_terminal(), 1));
+    relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+    assert_eq!(settle(relay, settlement(23)).unwrap(), 23);
+    let records = read_records(file);
+    let about = records_about(&records, "a");
+    assert!(
+        about[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("read: Permission denied"),
+        "source failure was lost: {records:?}"
+    );
+    // The file counts once, from the receiver.
+    assert_eq!(about.len(), 3, "{records:?}");
+    assert_eq!(records.last().unwrap()["errors"], 1, "{records:?}");
+    let validator = schema_validator();
+    for record in &records {
+        assert!(validator.validate(record).is_ok(), "{record}");
+    }
+}
+
+#[test]
+fn records_relayed_before_an_unexpected_exit_are_kept() {
+    let (_stream, expectation) = destination(true);
+    let (file, writer) = results_file();
+    let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
+    let input = coordinator_failure("s0", "Permission denied (os error 13)", 0);
+    relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+    // The coordinator's SSH command then ends with a status that is not a
+    // copy's, and nothing is settled.
+    drop(relay);
+    let records = read_records(file);
+    assert_eq!(records_about(&records, "s0").len(), 2, "{records:?}");
+}
+
+#[test]
+fn a_coordinator_leaves_the_failures_the_receiver_lists_to_it() {
+    use crate::results::ReceiverListing::{Explained, Listed, Unlisted};
+    let file = tempfile::tempfile().unwrap();
+    let writer = crate::results::ResultsWriter::new(Box::new(file.try_clone().unwrap()))
+        .reporting_destination();
+    for (name, listing) in [
+        ("listed", Listed),
+        ("explained", Explained),
+        ("unlisted", Unlisted),
+    ] {
+        writer.emit_entry_error(
+            &format!("syq: {name}: failed"),
+            Some("io"),
+            None,
+            Some((name.as_bytes(), listing)),
+        );
+        writer.emit_operation_listed(
+            &crate::results::OperationRecord {
+                action: "transfer_file",
+                dst: name.as_bytes(),
+                src: None,
+                kind: "file",
+                disposition: "failed",
+                bytes: None,
+                attempts: Some(1),
+                retryable: Some("unknown"),
+                class: Some("io"),
+                os_kind: None,
+                message: Some("failed"),
+            },
+            None,
+            listing,
+        );
+    }
+    // Its successes are the receiver's to report.
+    writer.emit_operation(&crate::results::OperationRecord {
+        action: "transfer_file",
+        dst: b"copied",
+        src: None,
+        kind: "file",
+        disposition: "succeeded",
+        bytes: Some(1),
+        attempts: Some(1),
+        retryable: None,
+        class: None,
+        os_kind: None,
+        message: None,
+    });
+    let records = read_records(file);
+    let summary: Vec<_> = records
+        .iter()
+        .map(|record| {
+            (
+                record["type"].as_str().unwrap(),
+                record["dst"]["value"]
+                    .as_str()
+                    .or(record["diagnostic_for"]["value"].as_str())
+                    .unwrap_or_default(),
+                record.get("diagnostic_for").is_some(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("error", "explained", true),
+            ("error", "", false),
+            ("operation_result", "unlisted", false),
+        ],
+        "{records:?}"
+    );
+}
+
+#[test]
+fn cut_or_altered_destination_results_fail_the_copy() {
+    // Each way a relay can spoil the stream: drop its end, drop a frame,
+    // alter a frame, or send nothing.
+    for spoil in 0..4 {
+        let (mut stream, expectation) = destination(true);
+        let (file, writer) = results_file();
+        let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
+        let lines = destination_lines(&mut stream, 0);
+        let mut lines: Vec<Vec<u8>> = lines
+            .split_inclusive(|byte| *byte == b'\n')
+            .map(<[u8]>::to_vec)
+            .collect();
+        match spoil {
+            0 => {
+                lines.pop();
+            }
+            1 => {
+                lines.remove(1);
+            }
+            2 => {
+                let line = &mut lines[1];
+                let index = line.len() - 5;
+                line[index] = if line[index] == b'A' { b'B' } else { b'A' };
+            }
+            _ => lines.clear(),
+        }
+        let mut input = lines.concat();
+        input.extend(coordinator_line(coordinator_terminal(), 0));
+        relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+        assert!(settle(relay, settlement(0)).is_err(), "spoiled {spoil}");
+        let records = read_records(file);
+        let terminal = records.last().unwrap();
+        assert_eq!(terminal["status"], "failed", "spoiled {spoil}");
+        assert_eq!(terminal["exit_code"], 1);
+        assert!(records
+            .iter()
+            .any(|record| record["type"] == "error" && record["class"] == "integrity"));
+    }
 }
 
 #[test]

@@ -2121,7 +2121,7 @@ fn clean_root_pins_the_edge_cases() {
 }
 
 #[test]
-fn attested_outcome_summary_does_not_hide_coordinator_statistics() {
+fn suppressed_summary_does_not_hide_coordinator_statistics() {
     let mut args = Args::parse_args(&[
         "cp".into(),
         "source".into(),
@@ -5888,4 +5888,75 @@ fn preview_lookups_skip_a_denied_directory_and_keep_going() {
         &mut |_, _| panic!("not a denial"),
     )
     .is_err());
+}
+
+#[test]
+fn a_restricted_receivers_listed_failures_are_left_to_it() {
+    // A file the receiver started writing whose source could not then be
+    // read, and a file whose preparation the receiver refused.
+    for refused in [false, true] {
+        let sched = Arc::new(Sched::new(512, 8192));
+        sched.push_file(pipeline_job(b"file", 1536));
+        sched.scan_done();
+        assert!(matches!(sched.next(), Item::File(0)));
+        let src = Arc::new(Mutex::new(PipelineState::default()));
+        let dst = Arc::new(Mutex::new(PipelineState::default()));
+        if refused {
+            dst.lock()
+                .unwrap()
+                .replies
+                .push_back(Response::Err("signed grant entry limit exceeded".into()));
+        } else {
+            dst.lock()
+                .unwrap()
+                .replies
+                .push_back(Response::Prepared(Preparation {
+                    partial_size: None,
+                    has_candidates: false,
+                }));
+            // Each pipelined read of its three blocks fails.
+            src.lock().unwrap().replies.extend((0..3).map(|_| {
+                Response::EndpointError(WireError {
+                    message: "Permission denied (os error 13)".into(),
+                    io_kind: Some(WireIoKind::PermissionDenied),
+                    raw_os_error: Some(13),
+                })
+            }));
+        }
+        let worker = pipeline_worker(&sched, &src, &dst, false);
+        let mut worker = worker;
+        let file = tempfile::tempfile().unwrap();
+        worker.progress.set_results(Arc::new(
+            crate::results::ResultsWriter::new(Box::new(file.try_clone().unwrap()))
+                .reporting_destination(),
+        ));
+        worker.progress.files_total.store(1, Relaxed);
+        worker.progress.bytes_total.store(1536, Relaxed);
+        // A failure while planning reaches the worker's caller; one while
+        // copying is reported by the worker itself.
+        if let Err(error) = worker.handle_file(0) {
+            worker.file_error(0, error).unwrap();
+        }
+        // Counted here for the coordinator's own exit status.
+        assert_eq!(worker.progress.errors.load(Relaxed), 1);
+        let mut text = String::new();
+        let mut file = file;
+        std::io::Seek::rewind(&mut file).unwrap();
+        std::io::Read::read_to_string(&mut file, &mut text).unwrap();
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        if refused {
+            // The receiver lists the refusal with its reason.
+            assert!(records.is_empty(), "{records:?}");
+        } else {
+            // The receiver lists the file unfinished; this error says why,
+            // without counting it again.
+            assert_eq!(records.len(), 1, "{records:?}");
+            assert_eq!(records[0]["type"], "error");
+            assert_eq!(records[0]["os_kind"], "permission_denied");
+            assert_eq!(records[0]["diagnostic_for"]["value"], "file");
+        }
+    }
 }

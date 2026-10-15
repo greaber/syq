@@ -214,7 +214,7 @@ struct ServeSession {
     handshake_pending: Option<Arc<std::sync::atomic::AtomicBool>>,
     ssh_worker_ticket: Option<std::result::Result<String, String>>,
     allow_tcp: bool,
-    /// A bridged control may carry metadata and receipts, never file payloads.
+    /// A bridged control may carry metadata and results, never file payloads.
     metadata_control: bool,
     /// A local copy's receiver: listen for data on loopback only and
     /// advertise no interface addresses.
@@ -700,7 +700,8 @@ fn file_payload_request(request: &Request) -> bool {
         | Request::TransportStats
         | Request::ReceiverUser
         | Request::NewFileOwner { .. }
-        | Request::Receipt
+        | Request::DestinationResults { .. }
+        | Request::FinishDestinationResults
         | Request::Shutdown
         | Request::ListDirDetails { .. }
         | Request::StopReadStream
@@ -1209,6 +1210,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
         enabled: false,
         socket: telemetry_socket,
         source_authority: source_authority.clone(),
+        destination_results: authority.clone(),
     };
 
     // A restricted receiver holds each streamed patch to its grant across
@@ -1272,7 +1274,8 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     | Request::PrepareSmallFiles(_)
                     | Request::CopySmallFiles(_)
                     | Request::PruneLookup { .. }
-                    | Request::Receipt
+                    | Request::DestinationResults { .. }
+                    | Request::FinishDestinationResults
                     | Request::MappingChunk { .. }
             )
         {
@@ -1754,20 +1757,30 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 }
                 w.write_msg(&response)?;
             }
-            Request::Receipt => match &authority {
-                Some(authority) => match authority.issue_receipt() {
-                    Ok(receipt) => {
-                        crate::receipt::emit_receipt_frames(receipt, |frame| {
-                            w.write_msg(&Response::Receipt(frame))?;
-                            Ok(())
-                        })?;
-                    }
-                    Err(error) => w.write_msg(&Response::Err(format!("{error:#}")))?,
-                },
-                None => w.write_msg(&Response::Err(
-                    "receipts are issued only by a command-restricted receiver".into(),
-                ))?,
-            },
+            Request::DestinationResults { records } => {
+                let response = match &authority {
+                    Some(authority) => match authority.start_results(records) {
+                        Ok(()) => Response::Ok,
+                        Err(error) => Response::Err(format!("{error:#}")),
+                    },
+                    None => Response::Err(
+                        "destination results come only from a command-restricted receiver".into(),
+                    ),
+                };
+                w.write_msg(&response)?;
+            }
+            Request::FinishDestinationResults => {
+                let response = match &authority {
+                    Some(authority) => match authority.finish_results() {
+                        Ok(()) => Response::Ok,
+                        Err(error) => Response::Err(format!("{error:#}")),
+                    },
+                    None => Response::Err(
+                        "destination results come only from a command-restricted receiver".into(),
+                    ),
+                };
+                w.write_msg(&response)?;
+            }
             mut other => {
                 let resp = if let Some(source) = source_permit
                     .as_ref()
@@ -2276,6 +2289,8 @@ struct ObservedWriter<W: Write> {
     enabled: bool,
     socket: Option<std::net::TcpStream>,
     source_authority: Option<Arc<crate::restricted::source::SourceAuthority>>,
+    /// A restricted receiver's results go out ahead of any response.
+    destination_results: Option<Arc<crate::restricted::RestrictedAuthority>>,
 }
 impl<W: Write> ObservedWriter<W> {
     fn write_msg(&mut self, response: &Response) -> std::io::Result<()> {
@@ -2306,6 +2321,12 @@ impl<W: Write> ObservedWriter<W> {
                     ErrorKind::PermissionDenied,
                     error.to_string(),
                 ));
+            }
+        }
+        if let Some(authority) = &self.destination_results {
+            for frame in authority.take_results_frames() {
+                self.inner
+                    .write_owned(Response::DestinationResults(frame))?;
             }
         }
         if self.enabled

@@ -3650,7 +3650,8 @@ impl FsOps {
             | Request::NativeMap(_)
             | Request::NativeRemove { .. }
             | Request::TransportStats
-            | Request::Receipt
+            | Request::DestinationResults { .. }
+            | Request::FinishDestinationResults
             | Request::Shutdown
             | Request::TcpListen { .. }
             | Request::ReadStream(_)

@@ -106,10 +106,7 @@ pub(crate) fn replace_required(label: &Path, reason: &str) -> anyhow::Error {
 
 /// Whether `error` says the file must be replaced (`replace_required`).
 pub(crate) fn is_replace_required(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<WireError>())
-        .is_some_and(is_replace_required_wire)
+    crate::conn::wire_error_of(error).is_some_and(is_replace_required_wire)
 }
 
 /// The same for an error the receiver sent.
