@@ -3282,6 +3282,7 @@ fn probe_created_owner_unnamed(directory: &File) -> Option<(u64, u32)> {
         libc::O_TMPFILE | libc::O_WRONLY | libc::O_CLOEXEC,
         0o600,
     ) {
+        note_probe_for_test();
         let created = file.metadata().ok()?;
         note_created_owner(created.dev(), created.uid());
         return Some((created.dev(), created.uid()));
@@ -3290,21 +3291,50 @@ fn probe_created_owner_unnamed(directory: &File) -> Option<(u64, u32)> {
     None
 }
 
+/// Debug builds count each probe file, unnamed or named, in the file
+/// `SYQ_TEST_PROBE_LOG` names, a line each.
+fn note_probe_for_test() {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("SYQ_TEST_PROBE_LOG") {
+        use std::io::Write;
+        if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(log, "probe");
+        }
+    }
+}
+
 /// `created_owner` for a preview, which creates nothing anyone can see:
 /// only an unnamed file, where the filesystem can make one.
 pub(crate) fn created_owner_unseen(directory: &File, dev: u64) -> Option<u32> {
-    if let Some(uid) = known_created_owner(dev) {
+    if let Some(uid) = known_created_owner(dev).or_else(|| faithful_owner(directory, dev)) {
         return Some(uid);
     }
     probe_created_owner_unnamed(directory).and_then(|(probed, uid)| (probed == dev).then_some(uid))
 }
 
-/// The owner files this process creates on `dev` show. If it has created
-/// nothing there yet, it creates a file in `directory`, notes the owner it
-/// shows and removes it. None where that directory is on another device or
-/// nothing can be created in it: an owner is never assumed.
+/// The account this process runs as, where `directory` is on `dev` and on a
+/// local filesystem that shows what this process creates as owned by it
+/// (`fsops::reports_owners_faithfully`): nothing needs to be created there to
+/// learn it.
+fn faithful_owner(directory: &File, dev: u64) -> Option<u32> {
+    let on_dev = directory.metadata().ok()?.dev() == dev;
+    (on_dev && crate::fsops::reports_owners_faithfully(directory)).then(|| {
+        let uid = own_uid();
+        note_created_owner(dev, uid);
+        uid
+    })
+}
+
+/// The owner files this process creates on `dev` show: on a local
+/// filesystem that shows it faithfully, the account it runs as; elsewhere,
+/// what a file it created there showed. If it has created nothing there yet,
+/// it creates a file in `directory` to learn it, unnamed where Linux can
+/// make one, and else named and removed at once, which leaves the
+/// directory's modification time changed. None where that directory is on
+/// another device or nothing can be created in it: an owner is never
+/// assumed.
 pub(crate) fn created_owner(directory: &File, dev: u64) -> Option<u32> {
-    if let Some(uid) = known_created_owner(dev) {
+    if let Some(uid) = known_created_owner(dev).or_else(|| faithful_owner(directory, dev)) {
         return Some(uid);
     }
     let (probed, uid) = probe_created_owner(directory).ok()?;
@@ -3314,13 +3344,13 @@ pub(crate) fn created_owner(directory: &File, dev: u64) -> Option<u32> {
 /// Create a file in `directory` to learn the owner files this process
 /// creates there show, and note it. Linux makes the file unnamed where the
 /// filesystem can, so that the directory does not change; elsewhere a named
-/// file is created and removed, and the directory's modification time put
-/// back where this process may.
+/// file is created and removed. Its directory's modification time is left
+/// as that leaves it: putting it back could undo another program's change.
 fn probe_created_owner(directory: &File) -> io::Result<(u64, u32)> {
     if let Some(probed) = probe_created_owner_unnamed(directory) {
         return Ok(probed);
     }
-    let before = directory.metadata()?;
+    note_probe_for_test();
     let mut random = [0u8; 8];
     getrandom::fill(&mut random).map_err(io::Error::other)?;
     let name = format!(
@@ -3344,17 +3374,6 @@ fn probe_created_owner(directory: &File) -> io::Result<(u64, u32)> {
     {
         let _ = retry_zero(|| unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) });
     }
-    let times = [
-        libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_OMIT,
-        },
-        libc::timespec {
-            tv_sec: before.mtime() as _,
-            tv_nsec: before.mtime_nsec() as _,
-        },
-    ];
-    let _ = crate::fsops::set_handle_times(directory, &times);
     note_created_owner(created.dev(), created.uid());
     Ok((created.dev(), created.uid()))
 }

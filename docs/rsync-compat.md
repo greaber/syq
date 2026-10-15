@@ -16,11 +16,27 @@ See [`syq rsync`](commands/rsync.md) for all accepted options.
 | `--update` | Checks mtimes only for regular files; replacements between non-directory types still occur |
 | Read-only destination directories | Like rsync, briefly adds owner access to directories the copy includes, but always restores each one's exact mode; rsync can leave owner read and search added. `--syq-widen-dirs=none` or `all` widens nothing or more ([details](reference.md#copy-metadata)) |
 | Resume | Keeps syq partial files a later copy can resume from; cannot reuse rsync partials |
-| `--inplace` | Writes only new files at their final names. An existing file is still replaced through a staging file and gets a new inode, so its other hard links and open readers keep the old contents |
-| Metadata-only changes | Made in place only to a file with no other names, on a filesystem whose link counts syq trusts, that belongs to the receiving account (as root: any file, unless the change gives it another owner or group); a change that adds a set-ID bit or changes a `security.*` or `trusted.*` attribute, or any change to another file, replaces it, with a new inode. Access times (`-U`) are restored in place on any file ([details](reference.md#copy-metadata)) |
+| Existing files | Often replaced where rsync changes them in place; see [below](#existing-files) |
 | Delta transfer | Reuses matching blocks at the same offsets in the corresponding destination file; shifted blocks are not matched. Local copies default to whole-file and remote copies to block reuse. `-W` / `--whole-file` disables reuse; `--no-W` / `--no-whole-file` enables it |
 | `--rsync-path PATH` | Exact syq executable path, not a shell fragment |
 | Remote-to-remote | Refused; use native `syq cp` |
+
+### Existing files
+
+Rsync changes the following in place, through every name a file has. Syq
+gives the name a new file instead, with a new inode number, and other names
+of the old file keep it as it was:
+
+- `--inplace` writes only new files in place; an existing file is replaced.
+- When only metadata changed, a file with other hard links, or one not owned
+  as syq expects, is replaced. Access times (`-U`) are still set in place.
+- On filesystems whose link counts syq does not trust (SMB, SSHFS, NFS
+  mounted with `nocto`, macOS volumes other than APFS and HFS+), every
+  metadata-only change rewrites the file.
+- Symlinks, named pipes and devices whose metadata changes are created
+  again.
+
+See [Copy metadata](reference.md#copy-metadata) for the details.
 
 Scan and copy errors prevent deletion. A destination that contains its source
 on the same host cannot be pruned. Preview deletion scope with `--dry-run -v`;

@@ -295,6 +295,77 @@ pub(crate) fn override_profiles_for_test(
     Restore
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests stand in for filesystems that show other owners.
+    static UNFAITHFUL_OWNERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Until the returned guard drops, no filesystem looked up on this thread
+/// counts as reporting owners faithfully (`reports_owners_faithfully`).
+#[cfg(test)]
+pub(crate) fn distrust_owners_for_test() -> impl Drop {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            UNFAITHFUL_OWNERS.set(false);
+        }
+    }
+    UNFAITHFUL_OWNERS.set(true);
+    Restore
+}
+
+/// Whether the filesystem `file` is on is a local one that shows a file this
+/// process creates as owned by the account it runs as, and a new file's
+/// group as the platform's rule gives it: ext4, XFS, btrfs, ZFS, tmpfs,
+/// overlayfs and f2fs on Linux, APFS and HFS+ on macOS. On network, FUSE and
+/// other filesystems, such as NFS that squashes root, SSHFS without uid
+/// mapping or CIFS mounted with `uid=`, the owner is learned from what this
+/// process creates there (`rooted::created_owner`). Debug builds given
+/// another account to compare owners with (`SYQ_TEST_OWN_UID`) stand in for
+/// such a filesystem everywhere.
+pub(crate) fn reports_owners_faithfully(file: &File) -> bool {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SYQ_TEST_OWN_UID").is_some() {
+        return false;
+    }
+    #[cfg(test)]
+    if UNFAITHFUL_OWNERS.get() {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+        // SAFETY: fstatfs writes only into the local structure.
+        if unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        let stats = unsafe { stats.assume_init() };
+        matches!(
+            stats.f_type as u32,
+            0xef53 // ext2, ext3, ext4
+                | 0x5846_5342 // XFS
+                | 0x9123_683e // btrfs
+                | 0x0102_1994 // tmpfs
+                | 0x794c_7630 // overlayfs
+                | ZFS_SUPER_MAGIC
+                | F2FS_SUPER_MAGIC
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        volume_of(file.as_raw_fd())
+            .is_some_and(|volume| matches!(volume.kind.as_slice(), b"apfs" | b"hfs"))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = file;
+        false
+    }
+}
+
 /// The profile of the filesystem `file` is on.
 pub(crate) fn profile(file: &File) -> Profile {
     #[cfg(target_os = "linux")]

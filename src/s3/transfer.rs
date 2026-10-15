@@ -3124,6 +3124,7 @@ impl Engine {
         let file = root.create_file(&RelativePath::new(partial.as_bytes())?, 0o600)?;
         file.set_len(object.size)?;
         let m = file.metadata()?;
+        crate::rooted::note_created_owner(m.dev(), m.uid());
         let record = DownloadState {
             schema: 2,
             etag: object.etag.clone(),

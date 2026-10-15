@@ -79,6 +79,7 @@ impl FsOps {
         let mode = mode & 0o777;
         let file = self.create_new_inplace_file(root, relative, mode | 0o200, false)?;
         let created = file.metadata()?;
+        note_created_owner(&created);
         if created.mode() & 0o200 == 0 {
             // A umask or inherited default ACL can remove even owner write.
             file.set_permissions(fs::Permissions::from_mode(created.mode() | 0o200))?;
@@ -194,6 +195,7 @@ impl FsOps {
         ) {
             Ok(file) => {
                 let created = file.metadata()?;
+                note_created_owner(&created);
                 let in_use = stages::hold(
                     held_for,
                     &target.relative,
@@ -2000,6 +2002,7 @@ impl FsOps {
             }
         };
         let created = file.metadata()?;
+        note_created_owner(&created);
         // Without -p a new file gets the mode creating it gives.
         if *flags & flags::RECEIVER_MODE != 0 {
             meta.to_mut().mode = self.new_file_mode(rooted, meta.mode)?;

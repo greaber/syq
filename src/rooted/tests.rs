@@ -2810,10 +2810,12 @@ fn hardlink_publication_honors_its_target_condition() {
     assert_eq!(names(), ["existing", "new", "source"]);
 }
 
-/// The owner the files this process creates show is learned from a file it
-/// creates, which leaves nothing behind, and never assumed: in a directory
-/// nothing can be created in, on a device it has created nothing on, it is
-/// not known, and a directory on one device tells nothing of another.
+/// The owner the files this process creates show is the account it runs
+/// as on a local filesystem, without creating anything. Elsewhere it is
+/// learned from a file it creates, which leaves nothing behind, and never
+/// assumed: in a directory nothing can be created in, on a device it has
+/// created nothing on, it is not known, and a directory on one device tells
+/// nothing of another.
 #[test]
 fn the_owner_new_files_show_is_learned_and_never_assumed() {
     if unsafe { libc::geteuid() } == 0 {
@@ -2825,21 +2827,28 @@ fn the_owner_new_files_show_is_learned_and_never_assumed() {
     let read_only = directory.path().join("read-only");
     fs::create_dir(&read_only).unwrap();
     fs::set_permissions(&read_only, fs::Permissions::from_mode(0o555)).unwrap();
+    let handle = File::open(directory.path()).unwrap();
     if known_created_owner(dev).is_none() {
+        let distrusted = crate::fsops::distrust_owners_for_test();
         assert_eq!(created_owner(&File::open(&read_only).unwrap(), dev), None);
         assert_eq!(known_created_owner(dev), None);
+        assert_eq!(
+            created_owner(&handle, dev),
+            Some(unsafe { libc::geteuid() })
+        );
+        assert_eq!(
+            fs::read_dir(directory.path()).unwrap().count(),
+            1,
+            "the probe was left behind"
+        );
+        assert_eq!(created_owner(&handle, dev.wrapping_add(1)), None);
+        drop(distrusted);
     }
-    let handle = File::open(directory.path()).unwrap();
-    assert_eq!(
-        created_owner(&handle, dev),
-        Some(unsafe { libc::geteuid() })
-    );
-    assert_eq!(known_created_owner(dev), Some(unsafe { libc::geteuid() }));
-    assert_eq!(
-        fs::read_dir(directory.path()).unwrap().count(),
-        1,
-        "the probe was left behind"
-    );
-    assert_eq!(created_owner(&handle, dev.wrapping_add(1)), None);
+    if crate::fsops::reports_owners_faithfully(&handle) {
+        assert_eq!(
+            created_owner(&File::open(&read_only).unwrap(), dev),
+            Some(unsafe { libc::geteuid() })
+        );
+    }
     fs::set_permissions(&read_only, fs::Permissions::from_mode(0o755)).unwrap();
 }

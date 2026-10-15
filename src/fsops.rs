@@ -33,6 +33,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 mod apply;
 mod basis_copy;
+#[cfg(test)]
+pub(crate) use fs_caps::distrust_owners_for_test;
+pub(crate) use fs_caps::reports_owners_faithfully;
 
 /// Copy the first `len` bytes of `input` into `output`, which this receiver
 /// created: by cloning where the filesystem can, or else by copying `input`'s

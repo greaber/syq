@@ -597,9 +597,44 @@ fn owners_are_compared_with_the_owner_new_files_show() {
             .is_fifo());
         let kept = inode(&t.path("dst/file"));
         fs::set_permissions(t.path("src/file"), fs::Permissions::from_mode(0o600)).unwrap();
-        let out = rsync_with(&t, route, &["-aHD"], &env);
+        // Nothing is created on this rerun: the owner is learned by a probe.
+        let probes = t.path("probes");
+        let log = probes.to_string_lossy().into_owned();
+        let rerun = [env[0], ("SYQ_TEST_PROBE_LOG", log.as_str())];
+        let out = rsync_with(&t, route, &["-aHD"], &rerun);
         assert_output_ok(&out);
         assert_eq!(inode(&t.path("dst/file")), kept, "{route}");
         assert_eq!(mode(&t.path("dst/file")), 0o600, "{route}");
+        assert!(probes.exists(), "{route}: the owner was not learned");
+    }
+}
+
+/// On a local filesystem, which shows what syq creates as owned by the
+/// account it runs as, syq never creates a file just to learn that owner:
+/// not for new symlinks, FIFOs and hard links, and not for a metadata-only
+/// rerun that creates nothing else.
+#[cfg(debug_assertions)]
+#[test]
+fn no_owner_probe_on_local_filesystems() {
+    for route in ["local", "ranges", "ssh"] {
+        let t = Tmp::new();
+        write(&t.path("src/file"), &prng(1 << 20, 510));
+        write(&t.path("src/a"), b"linked");
+        fs::hard_link(t.path("src/a"), t.path("src/b")).unwrap();
+        std::os::unix::fs::symlink("file", t.path("src/link")).unwrap();
+        mkfifo(&t.path("src/fifo"));
+        let probes = t.path("probes");
+        let log = probes.to_string_lossy().into_owned();
+        let env = [("SYQ_TEST_PROBE_LOG", log.as_str())];
+        assert_output_ok(&rsync_with(&t, route, &["-aHD"], &env));
+        fs::set_permissions(t.path("src/file"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(t.path("src/a"), fs::Permissions::from_mode(0o600)).unwrap();
+        assert_output_ok(&rsync_with(&t, route, &["-aHD"], &env));
+        assert_eq!(mode(&t.path("dst/file")), 0o600, "{route}");
+        assert!(
+            !probes.exists(),
+            "{route}: {}",
+            fs::read_to_string(&probes).unwrap_or_default()
+        );
     }
 }
