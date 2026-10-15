@@ -610,10 +610,10 @@ fn existing_leaf(
     // A symlink's times are not set where the filesystem would set its
     // target's instead (`Profile::symlink_times`).
     let link_times = !symlink
-        || !target
+        || target
             .root
             .known_profile(current.dev())
-            .is_some_and(|profile| !profile.symlink_times);
+            .is_none_or(|profile| profile.symlink_times);
     let owner = flags & flags::OWNER != 0
         && (is_superuser() || flags & flags::REQUIRE_OWNER != 0)
         && current.uid() != meta.uid;
