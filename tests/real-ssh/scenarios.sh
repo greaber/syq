@@ -1276,6 +1276,74 @@ if variant != 'permissions':
 PY_MODE_CHECK
 done
 
+printf 'case: ordinary and restricted receivers update the same files in place\n'
+# Under --in-place=update both receivers write a file of their own with one
+# name where it is, and replace one with another name and one more widely
+# readable than the copy leaves it; each copy says so.
+update_tree=$(cat <<'PY_UPDATE_TREE'
+import os, sys
+root = sys.argv[1]
+os.makedirs(root)
+for name, mode in [('mine', 0o644), ('linked', 0o644), ('wider', 0o600)]:
+    with open(f'{root}/{name}', 'wb') as f:
+        f.write(bytes(range(256)) * 4096)
+    os.chmod(f'{root}/{name}', mode)
+    os.utime(f'{root}/{name}', (1_700_000_000, 1_700_000_000))
+PY_UPDATE_TREE
+)
+printf '%s\n' "$update_tree" | python3 - /tmp/syq-real-ssh-update-tree
+printf '%s\n' "$update_tree" | ssh source python3 - /tmp/syq-real-ssh/update-tree
+for update_receiver in ordinary restricted; do
+    update_destination=/tmp/syq-real-ssh/update-$update_receiver
+    # The fixture path is set by this loop.
+    # shellcheck disable=SC2029
+    ssh destination "python3 - $update_destination" <<'PY_UPDATE_DESTINATION'
+import json, os, sys
+root = sys.argv[1]
+os.makedirs(root)
+inodes = {}
+for name in ['mine', 'linked', 'wider']:
+    data = bytearray(bytes(range(256)) * 4096)
+    data[1000] ^= 1
+    with open(f'{root}/{name}', 'wb') as f:
+        f.write(data)
+    os.chmod(f'{root}/{name}', 0o644)
+    inodes[name] = os.stat(f'{root}/{name}').st_ino
+os.link(f'{root}/linked', f'{root}.outside')
+with open(f'{root}.inodes', 'w') as f:
+    json.dump(inodes, f)
+PY_UPDATE_DESTINATION
+    if [ "$update_receiver" = ordinary ]; then
+        update_output=$(syq cp --in-place=update --copy-metadata=permissions --no-progress \
+            --srcs-in /tmp/syq-real-ssh-update-tree --to destination --into "$update_destination")
+    else
+        update_output=$(syq cp --in-place=update --copy-metadata=permissions --no-progress \
+            --from source --srcs-in /tmp/syq-real-ssh/update-tree \
+            --to destination --into "$update_destination")
+    fi
+    case "$update_output" in
+        *'replaced 2 existing files instead of updating them in place: 1 with other hard links, 1 with wider permissions'*) ;;
+        *)
+            printf 'the %s copy did not report its replacements:\n%s\n' "$update_receiver" "$update_output" >&2
+            exit 1
+            ;;
+    esac
+    # shellcheck disable=SC2029
+    ssh destination "python3 - $update_destination" <<'PY_UPDATE_CHECK'
+import json, os, sys
+root = sys.argv[1]
+with open(f'{root}.inodes') as f:
+    inodes = json.load(f)
+expected = bytes(range(256)) * 4096
+for name, kept in [('mine', True), ('linked', False), ('wider', False)]:
+    with open(f'{root}/{name}', 'rb') as f:
+        assert f.read() == expected, name
+    assert (os.stat(f'{root}/{name}').st_ino == inodes[name]) == kept, name
+with open(f'{root}.outside', 'rb') as f:
+    assert f.read() != expected
+PY_UPDATE_CHECK
+done
+
 printf 'case: expression selection on source, destination, and local coordinators\n'
 ssh source 'mkdir -p /tmp/syq-real-ssh/expressions/sub; printf selected > /tmp/syq-real-ssh/expressions/sub/keep; printf x > /tmp/syq-real-ssh/expressions/sub/tiny'
 for coordinator in src dst local; do

@@ -274,6 +274,54 @@ def root_metadata_by_the_change(root):
     print("Root changes metadata in place by the change, not the owner", flush=True)
 
 
+def in_place_update_by_the_change(root):
+    """Under --in-place=update, root writes into an existing file only when
+    the copy keeps its owner and group. One another user owns, to which the
+    copy gives the source's owner, is replaced: someone who had it open
+    keeps the old contents, and the summary, --results and a preview say
+    why."""
+    source = root / "update-source"
+    destination = root / "update-destination"
+    source.mkdir()
+    destination.mkdir()
+    payload = b"source contents\n" * 65536
+    old = bytearray(payload)
+    old[1000] ^= 1
+    old = bytes(old)
+    for name, owner in (("theirs", 1001), ("mine", 1000)):
+        (source / name).write_bytes(payload)
+        os.chown(source / name, 1000, 1000)
+        (source / name).chmod(0o644)
+        os.utime(source / name, (1_700_000_000, 1_700_000_000))
+        target = destination / name
+        target.write_bytes(old)
+        os.chown(target, owner, owner)
+        target.chmod(0o644)
+        os.utime(target, (1_600_000_000, 1_600_000_000))
+    inodes = {name: (destination / name).stat().st_ino for name in ("theirs", "mine")}
+    command = ["syq", "cp", "--in-place=update", "--copy-metadata=ownership,permissions,mtime",
+               "--srcs-in", str(source), "--into", str(destination), "--no-progress"]
+
+    def replaced(results):
+        return json.loads(results.read_text().splitlines()[-1])["replaced_not_in_place"]
+
+    preview = root / "update-preview.jsonl"
+    run([*command, "--dry-run", "--results", str(preview)])
+    assert replaced(preview) == {"owner": 1}, replaced(preview)
+    results = root / "update.jsonl"
+    with open(destination / "theirs", "rb") as held:
+        output = run([*command, "--results", str(results)], capture_output=True, text=True)
+        assert held.read() == old
+    summary = "syq: replaced 1 existing file instead of updating it in place: 1 with another owner or group"
+    assert summary in output.stdout, output
+    assert replaced(results) == {"owner": 1}, replaced(results)
+    for name, kept in (("theirs", False), ("mine", True)):
+        status = (destination / name).stat()
+        assert (status.st_ino == inodes[name], status.st_uid) == (kept, 1000), (name, status)
+        assert (destination / name).read_bytes() == payload, name
+    print("Root updates in place only files whose owner the copy keeps", flush=True)
+
+
 def main():
     assert os.geteuid() == 0, "run this check as root only inside the disposable lab"
     libc = ctypes.CDLL(None, use_errno=True)
@@ -286,6 +334,7 @@ def main():
         planted_files_are_replaced(root)
         root_metadata_repairs(root)
         root_metadata_by_the_change(root)
+        in_place_update_by_the_change(root)
         for interface in ["native", "native-owner", "rsync"]:
             source = root / f"source-{interface}"
             destination = root / f"destination-{interface}"

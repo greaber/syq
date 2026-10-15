@@ -1865,12 +1865,6 @@ pub fn run(mut args: Args) -> Result<i32> {
     let dry_run = args.dry_run;
     let prune = args.delete;
     let in_place_update = args.in_place_update;
-    if in_place_update && !dry_run {
-        crate::output::diagnostic!(
-            "syq: warning: {}: anyone who already has an existing file open can read its new contents, and an interruption leaves a file partly updated",
-            interface_option(&args, "--in-place=update", "--inplace")
-        );
-    }
     let outcome = handoff.and_then(|()| run_transfer(args, Arc::clone(&progress)));
     if let Some(history) = progress.tuning_history.get() {
         history.complete(matches!(&outcome, Ok(0)), serde_json::json!({
@@ -2316,6 +2310,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     } else if args.interface != Interface::Rsync && args.coordinate_at != CoordinateAt::Auto {
         bail!("--coordinate-at currently applies only to copies between two remote endpoints");
+    }
+    // The copy runs here, not on a remote coordinator, which warns itself.
+    if args.in_place_update && !args.dry_run {
+        crate::output::diagnostic!(
+            "syq: warning: {}: anyone who already has an existing file open can read its new contents, and an interruption leaves a file partly updated",
+            interface_option(&args, "--in-place=update", "--inplace")
+        );
     }
     let prepared_source = args.prepared_source.take();
     let src_ep = match args.direct_source.take() {

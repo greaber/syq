@@ -1408,11 +1408,12 @@ impl Worker {
         true
     }
 
-    /// Under `--in-place=update`, the metadata a file is to be finalized
-    /// with, which decides whether the receiver writes an existing file at
-    /// its name in place (`Request::Prepare`).
+    /// Under `--in-place=update`, for a file the scan found, the metadata
+    /// it is to be finalized with, which decides whether the receiver
+    /// writes it in place (`Request::Prepare`). A file the scan did not
+    /// find is created, without looking for one first.
     pub(super) fn in_place_update(&self, job: &WorkerJob) -> Option<Box<InPlaceUpdate>> {
-        if !(self.opts.inplace_update && job.inplace) {
+        if !(self.opts.inplace_update && job.inplace && job.dst_entry.is_some()) {
             return None;
         }
         let mut meta = self.opts.metadata_for(&job.rel_bytes, &job.entry);

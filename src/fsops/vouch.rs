@@ -251,7 +251,8 @@ pub(super) fn refusal(
 /// Whether the receiver may write new contents into `file`, the existing
 /// file at `place`, in place (`--in-place=update`), to finalize it with
 /// `meta` under `flags`, and if not, why. It must pass the checks for any
-/// metadata change (`refusal`), have no set-ID bit or file capability,
+/// metadata change (`refusal`), and as a hard-link representative the
+/// owner check (`require`), have no set-ID bit or file capability,
 /// which writing it would take away, and let no one read or write it whom
 /// its final permissions do not: its permission bits must be among the
 /// final ones, its group the final one or unable to read it, and its ACL
@@ -268,6 +269,13 @@ pub(crate) fn update_refusal(
     use ReplaceReason::*;
     if let Some(refused) = refusal(place, file, current, meta, flags)? {
         return Ok(Some(refused));
+    }
+    // As `require` asks of a hard-link representative, whatever changes.
+    if flags & flags::REPORT_IDENTITY != 0 && !owner_vouches(place, current, meta, flags) {
+        return Ok(Some((
+            Owner,
+            "it is to get new names, and syq did not create it and does not own it as it would",
+        )));
     }
     if current.mode() & 0o6000 != 0 || crate::inode_metadata::has_file_capability(file)? {
         return Ok(Some((
