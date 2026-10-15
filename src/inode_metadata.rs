@@ -54,9 +54,6 @@ pub(crate) struct InodeMetadata {
 }
 
 impl InodeMetadata {
-    /// Whether giving a file with `current` (none read: nothing) this
-    /// metadata would change anything but its access time, which syq
-    /// restores in place on any file (`fsops::vouch`).
     /// Whether giving a file with `current` this metadata would set, change
     /// or remove a `security.*` or `trusted.*` attribute.
     pub(crate) fn privileged_attributes_differ(&self, current: Option<&Self>) -> bool {
@@ -82,6 +79,9 @@ impl InodeMetadata {
                 .unwrap_or_default()
     }
 
+    /// Whether giving a file with `current` (none read: nothing) this
+    /// metadata would change anything but its access time, which syq
+    /// restores in place on any file (`fsops::vouch`).
     pub(crate) fn differs_besides_atime(&self, current: Option<&Self>) -> bool {
         let empty = Self::default();
         let current = current.unwrap_or(&empty);

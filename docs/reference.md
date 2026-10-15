@@ -405,9 +405,9 @@ syq cp --in-place=new large-file --to server --into /backup
 This avoids a temporary name and a rename for each new file. Readers can see
 a new file before it is complete, and an interruption leaves it incomplete
 at its final name; a rerun finishes it. Once the file has its final metadata,
-syq checks that the name still leads to the file it created, where the
-filesystem's inode numbers can be trusted, and reports the file as failed if
-it does not.
+syq checks that the name still leads to the file it created, on filesystems
+whose link counts it trusts ([Copy metadata](#copy-metadata) lists those it
+does not), and reports the file as failed if it does not.
 
 An existing file is still replaced as without the option: syq builds the new
 version beside it and renames it over the name. Syq never writes new contents
@@ -450,15 +450,15 @@ When only an existing file's metadata differs, syq changes it in place if the
 file has no other names, the filesystem's link counts can be trusted, and the
 change adds no set-user-ID or set-group-ID bit and sets or removes no
 `security.*` or `trusted.*` attribute. Run as another account, syq also needs
-the file to belong to it, as the files it creates there show (on SSHFS
-without uid mapping, NFS that squashes users, or CIFS mounted with `uid=`,
-that is not the account itself). Off the local filesystems that show owners
+the file to belong to it, as the files it creates there show (on NFS that
+squashes users, that is not the account itself). Off the local filesystems that show owners
 faithfully (ext4, XFS, btrfs, ZFS, tmpfs, overlayfs, f2fs, APFS and HFS+),
 syq learns that owner from a file it creates; where it has created none yet,
 it creates and removes one, which leaves that directory's modification time
-changed. A dry run creates nothing and assumes the account itself. Run as root, it changes in place what the
-file's owner could change, such as its permissions, times, ordinary extended
-attributes and ACLs, and replaces the file to give it another owner or group.
+changed. A dry run creates nothing and assumes the account itself. Run as
+root, it changes in place what the file's owner could change, such as its
+permissions, times, ordinary extended attributes and ACLs, and replaces the
+file to give it another owner or group.
 Otherwise it replaces the file as if its contents had changed.
 Access times, which `atimes` restores, are set in place on any file. A
 replaced file gets a new inode number, needs write permission on its directory
@@ -569,8 +569,9 @@ including updates, reruns, and `--in-place=new`. Only names eligible under the
 overwrite policy join the group; links outside the selected sources are not
 reconstructed. Existing extra destination links are not necessarily split.
 Syq gives new names only to an existing destination file that belongs to the
-account syq runs as, as the files it creates there show (as root: already to
-the owner and group it ends with); it replaces any other. A group whose metadata changes is replaced and its names
+account syq runs as, as the files it creates there show; it replaces any
+other. Run as root, syq gives them to a file that already has the owner and
+group a new copy of it would get. A group whose metadata changes is replaced and its names
 linked to the new file, since its file has other names.
 
 Hardlink preservation scans all selected sources before changing the destination.

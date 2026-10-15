@@ -4292,6 +4292,52 @@ fn receiver_enforces_authorized_hashing_and_supplies_omitted_expectation() {
     assert!(authority.authorize(&mut small_put(&target), false).is_err());
 }
 
+/// A grant that allows no changes, a preview or verify-only one, never lets
+/// the receiver create a file to learn whom its files show. Once the receipt
+/// is issued, the request is refused.
+#[test]
+fn grants_that_allow_no_changes_create_no_owner_probe() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    for case in ["preview", "verify", "after receipt", "copy"] {
+        let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+        match case {
+            "preview" => authority.copy.options.dry_run = true,
+            "verify" => authority.copy.options.verify_only = true,
+            "after receipt" => authority.state.lock().unwrap().receipt_issued = true,
+            _ => {}
+        }
+        let mut request = Request::NewFileOwner {
+            path: path_bytes(&target),
+            probe: true,
+            guard: None,
+        };
+        let authorized = authority.authorize(&mut request, false);
+        if case == "after receipt" {
+            assert!(authorized.is_err());
+            continue;
+        }
+        authorized.unwrap();
+        let Request::NewFileOwner { probe, .. } = request else {
+            unreachable!()
+        };
+        assert_eq!(probe, case == "copy", "{case}");
+        let _distrusted = crate::fsops::distrust_owners_for_test();
+        let before = crate::rooted::probes_for_test();
+        let response = crate::fsops::FsOps::new().handle(&request);
+        assert!(
+            matches!(response, proto::Response::NewFileOwner(_)),
+            "{case}: {response:?}"
+        );
+        if case != "copy" {
+            assert_eq!(crate::rooted::probes_for_test(), before, "{case}");
+        }
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0, "{case}");
+    }
+}
+
 #[test]
 fn signed_read_only_modes_reject_every_destination_mutation() {
     let temporary = crate::test_support::tempdir().unwrap();

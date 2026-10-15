@@ -2954,10 +2954,14 @@ impl RestrictedAuthority {
                     bail!("the receipt is issued only on the signed control connection");
                 }
             }
-            Request::NewFileOwner { path, guard, .. } => {
+            Request::NewFileOwner { path, probe, guard } => {
                 // A probe the receiver creates to learn whom its files show
-                // stays inside the destination and is removed at once.
+                // stays inside the destination and is removed at once, and
+                // is made only while the grant allows changes.
                 self.check_observation_path(path)?;
+                if self.check_mutation_allowed().is_err() {
+                    *probe = false;
+                }
                 *guard = Some(self.guard.clone());
             }
             Request::TransportStats

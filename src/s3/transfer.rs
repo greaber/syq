@@ -2704,8 +2704,9 @@ impl Engine {
             {
                 return Ok(Some(size));
             }
-            // A staging file others could read cannot take the file's
-            // bytes: the object is downloaded instead.
+            // The file does not hold the object's contents after all, or a
+            // staging file others could read cannot take its bytes: the
+            // object is downloaded instead.
             unchanged = false;
         }
         if unchanged {
@@ -2783,7 +2784,28 @@ impl Engine {
         let donor = match saved {
             Some(old) => {
                 let partial = RelativePath::new(old.partial.as_bytes())?;
-                let donor = root.open_regular_read(&partial).ok().filter(|file| {
+                let opened = match root.open_regular_read(&partial) {
+                    Ok(file) => Some(file),
+                    Err(error) => {
+                        // The recorded partial is there but cannot be read:
+                        // that is reported, it is removed, and the object
+                        // downloaded again.
+                        let recorded = root
+                            .metadata_optional(&partial)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|m| (m.dev, m.ino) == (old.dev, old.ino));
+                        if recorded {
+                            self.progress.warning(&format!(
+                                "{}: cannot read the partial an earlier download left ({error:#}); downloading it again",
+                                job.path
+                            ));
+                            remove_partial(root, &old)?;
+                        }
+                        None
+                    }
+                };
+                let donor = opened.filter(|file| {
                     file.metadata().is_ok_and(|m| {
                         (m.dev(), m.ino()) == (old.dev, old.ino) && m.is_file() && m.nlink() == 1
                     })
@@ -3216,17 +3238,17 @@ impl Engine {
             value: expected.to_ascii_lowercase(),
         }))
     }
-
-    /// Replace the existing file at `path`, found to hold `object`'s
-    /// contents, with a copy of itself that gets `metadata`, without
-    /// downloading anything: the receiver cannot change that file's metadata
-    /// in place (`fsops::vouch`). The copy, cloned where the filesystem
-    /// can, is checked against every hash known for the object (the one
-    /// `compared` matched, a stored one, an expected one); where none is,
-    /// the size and times that showed the file unchanged must hold through
-    /// the copy. It replaces only the file it was copied from. None, having
-    /// changed nothing, when the staging file would let someone read the
-    /// file's bytes whom the file does not (`fsops::SeedAccess`).
+    /// Replace the existing file at `path`, found unchanged, with a copy of
+    /// itself that gets `metadata`, without downloading anything: the receiver cannot change that file's metadata
+    /// in place (`fsops::vouch`). Before anything is copied, the file is
+    /// checked, in one read, against every hash known for the object (the
+    /// one `compared` matched, a stored one, an expected one), so bytes
+    /// that are not the object's are never copied anywhere. Its size and
+    /// times must then hold through the copy, cloned where the filesystem
+    /// can. It replaces only the file it was copied from. None, having
+    /// changed nothing, when the object is to be downloaded instead: the
+    /// file does not match a hash, or the staging file would let someone
+    /// read its bytes whom the file does not (`fsops::SeedAccess`).
     async fn replace_from_local(
         &self,
         root: &Root,
@@ -3239,6 +3261,27 @@ impl Engine {
         let existing = Arc::new(root.open_regular_read(path)?);
         let before = existing.metadata()?;
         let target = String::from_utf8_lossy(&path.to_bytes()).into_owned();
+        let mut digests: Vec<Digest> = compared.into_iter().collect();
+        if let Some((algorithm, value)) = self.stored_comparison_hash(object) {
+            digests.push(Digest {
+                algorithm,
+                value: value.to_ascii_lowercase(),
+            });
+        }
+        digests.extend(self.download_digests(metadata, expected_hash));
+        digests.dedup();
+        if !digests.is_empty() {
+            let file = existing.clone();
+            let matches =
+                tokio::task::spawn_blocking(move || holds_digests(&file, &digests)).await??;
+            if !matches {
+                anyhow::ensure!(
+                    !self.args.protects_existing_contents(),
+                    "destination contents differ: {target} (--if-exists=error-if-different)"
+                );
+                return Ok(None);
+            }
+        }
         let parent = target.rsplit_once('/').map_or("", |(parent, _)| parent);
         let mut random = [0u8; 16];
         getrandom::fill(&mut random)?;
@@ -3258,45 +3301,24 @@ impl Engine {
         tokio::task::spawn_blocking(move || crate::fsops::copy_from_donor(&donor, &output, size))
             .await??;
         staged.set_len(size)?;
-        let mut digests: Vec<Digest> = compared.into_iter().collect();
-        if let Some((algorithm, value)) = self.stored_comparison_hash(object) {
-            digests.push(Digest {
-                algorithm,
-                value: value.to_ascii_lowercase(),
-            });
-        }
-        digests.extend(self.download_digests(metadata, expected_hash));
-        digests.dedup();
-        if digests.is_empty() {
-            let after = existing.metadata()?;
-            anyhow::ensure!(
-                (
-                    after.len(),
-                    after.mtime(),
-                    after.mtime_nsec(),
-                    after.ctime(),
-                    after.ctime_nsec()
-                ) == (
-                    before.len(),
-                    before.mtime(),
-                    before.mtime_nsec(),
-                    before.ctime(),
-                    before.ctime_nsec()
-                ),
-                "{} changed while it was copied",
-                target
-            );
-        }
-        for digest in digests {
-            let file = staged.clone();
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                use std::io::Seek;
-                let mut reader = &*file;
-                reader.seek(std::io::SeekFrom::Start(0))?;
-                digest.verify_reader(&mut reader)
-            })
-            .await??;
-        }
+        let after = existing.metadata()?;
+        anyhow::ensure!(
+            (
+                after.len(),
+                after.mtime(),
+                after.mtime_nsec(),
+                after.ctime(),
+                after.ctime_nsec()
+            ) == (
+                before.len(),
+                before.mtime(),
+                before.mtime_nsec(),
+                before.ctime(),
+                before.ctime_nsec()
+            ),
+            "{} changed while it was copied",
+            target
+        );
         anyhow::ensure!(
             staged.metadata()?.len() == object.size,
             "{} no longer has the source's size",
@@ -3581,6 +3603,42 @@ fn remove_partial(root: &Root, record: &DownloadState) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether `file` holds contents with every one of `digests`, hashed in
+/// one read however many there are.
+fn holds_digests(file: &std::fs::File, digests: &[Digest]) -> Result<bool> {
+    let mut algorithms: Vec<HashAlgorithm> = Vec::new();
+    for digest in digests {
+        if !algorithms.contains(&digest.algorithm) {
+            algorithms.push(digest.algorithm);
+        }
+    }
+    let mut hashers: Vec<_> = algorithms.iter().map(|a| a.hasher()).collect();
+    let mut buffer = vec![0; 1 << 20];
+    let mut offset = 0;
+    loop {
+        let count = match file.read_at(&mut buffer, offset) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for hasher in &mut hashers {
+            hasher.update(&buffer[..count]);
+        }
+        offset += count as u64;
+    }
+    let computed: Vec<Digest> = algorithms
+        .iter()
+        .zip(hashers)
+        .map(|(algorithm, hasher)| Digest::from_hash(*algorithm, &hasher.finalize()))
+        .collect();
+    Ok(digests.iter().all(|digest| {
+        computed.iter().any(|actual| {
+            actual.algorithm == digest.algorithm && actual.value.eq_ignore_ascii_case(&digest.value)
+        })
+    }))
 }
 
 // Downloads without a recovery record have no reusable saved progress. Remove

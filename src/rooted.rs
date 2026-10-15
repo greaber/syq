@@ -3290,6 +3290,8 @@ fn probe_created_owner_unnamed(directory: &File) -> Option<(u64, u32)> {
 /// Debug builds count each probe file, unnamed or named, in the file
 /// `SYQ_TEST_PROBE_LOG` names, a line each.
 fn note_probe_for_test() {
+    #[cfg(test)]
+    PROBES.set(PROBES.get() + 1);
     #[cfg(debug_assertions)]
     if let Some(path) = std::env::var_os("SYQ_TEST_PROBE_LOG") {
         use std::io::Write;
@@ -3297,6 +3299,17 @@ fn note_probe_for_test() {
             let _ = writeln!(log, "probe");
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many owner probes this thread has created.
+#[cfg(test)]
+pub(crate) fn probes_for_test() -> usize {
+    PROBES.get()
 }
 
 /// `created_owner` for a preview, which creates nothing, not even an

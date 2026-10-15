@@ -4610,23 +4610,26 @@ impl Planner<'_> {
         // A preview, which cannot learn it by creating a file anyone could
         // see, predicts with the receiving account instead.
         let owner = new_file.owner.or(self.opts.dry_run.then_some(uid));
-        let owned = owner.is_some_and(|created| {
-            if uid != 0 {
-                destination.uid == created
-            } else {
-                destination.uid
-                    == if flags & flags::OWNER != 0 {
-                        meta.uid
-                    } else {
-                        created
-                    }
-                    && if flags & flags::GROUP != 0 {
-                        destination.gid == meta.gid
-                    } else {
-                        !self.new_file_group_may_differ(dst, destination.gid, new_file)
-                    }
-            }
-        });
+        // Root needs it only for a hard-link representative: working out the
+        // group a new file would get reads its folder.
+        let owned = (representative || uid != 0)
+            && owner.is_some_and(|created| {
+                if uid != 0 {
+                    destination.uid == created
+                } else {
+                    destination.uid
+                        == if flags & flags::OWNER != 0 {
+                            meta.uid
+                        } else {
+                            created
+                        }
+                        && if flags & flags::GROUP != 0 {
+                            destination.gid == meta.gid
+                        } else {
+                            !self.new_file_group_may_differ(dst, destination.gid, new_file)
+                        }
+                }
+            });
         if representative && !owned {
             return true;
         }

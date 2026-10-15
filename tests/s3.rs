@@ -2643,6 +2643,53 @@ fn s3_stale_recovery_record_leaves_another_file_at_its_partial_name() {
     assert_eq!(std::fs::read(&partial).unwrap(), b"someone else's");
 }
 
+/// A recorded partial that cannot be read is reported and removed, and the
+/// object is downloaded again.
+#[test]
+fn s3_unreadable_recorded_partial_is_reported_and_removed() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root reads files whatever their mode");
+        return;
+    }
+    let server = Server::start("prefix-recovery-fresh");
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("download")).unwrap();
+    let args = [
+        "--from",
+        "s3://bucket",
+        "--srcs-in",
+        "data",
+        "--into",
+        "download",
+    ];
+    let first = server.cp(temp.path(), &args);
+    assert!(!first.status.success(), "{}", output_text(&first));
+    let (record, saved) = recovery_record(temp.path());
+    let partial = temp.path().join("download").join(
+        saved["partial"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap(),
+    );
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let retry = server.cp(temp.path(), &args);
+    assert!(retry.status.success(), "{}", output_text(&retry));
+    assert!(
+        output_text(&retry).contains("cannot read the partial an earlier download left"),
+        "{}",
+        output_text(&retry)
+    );
+    assert_eq!(
+        std::fs::read(temp.path().join("download/file")).unwrap(),
+        vec![b'x'; SIZE]
+    );
+    assert!(!record.exists());
+    assert!(!partial.exists(), "the unreadable partial was left behind");
+}
+
 /// When seeding a new partial from the recorded one fails, the record still
 /// names the recorded partial, which is kept, and the new one is removed:
 /// the next attempt resumes from it.

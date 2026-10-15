@@ -632,6 +632,53 @@ fn matching_downloads_that_cannot_change_in_place_are_replaced_without_downloadi
     }
 }
 
+/// A file that matches the object by size and time but not by its stored
+/// hash, and that cannot change in place, is checked before it is copied:
+/// the object is downloaded to replace it, or, under
+/// `--if-exists=error-if-different`, the copy fails and leaves it alone.
+#[test]
+fn replacements_check_the_file_before_copying_it() {
+    for policy in [None, Some("--if-exists=error-if-different")] {
+        let temp = test_support::tempdir().unwrap();
+        let dest = temp.path().join("destination");
+        file(&dest, b"STORED", 10);
+        std::fs::hard_link(&dest, temp.path().join("outside")).unwrap();
+        let mut args = vec![
+            "--from",
+            "s3://bucket",
+            "object",
+            "--as",
+            "destination",
+            "--copy-metadata=permissions",
+        ];
+        args.extend(policy);
+        let server = Server::start("existing-policy-hash-blake3");
+        let output = server.cp(temp.path(), &args);
+        assert_eq!(
+            std::fs::read(temp.path().join("outside")).unwrap(),
+            b"STORED",
+            "{policy:?}"
+        );
+        if policy.is_some() {
+            assert!(!output.status.success(), "{}", output_text(&output));
+            assert!(
+                output_text(&output).contains("destination contents differ"),
+                "{}",
+                output_text(&output)
+            );
+            assert_eq!(std::fs::read(&dest).unwrap(), b"STORED");
+            continue;
+        }
+        assert!(output.status.success(), "{}", output_text(&output));
+        assert!(
+            server.gate.0.load(Ordering::Relaxed),
+            "nothing was downloaded"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"stored");
+        assert_eq!(std::fs::metadata(&dest).unwrap().mode() & 0o777, 0o640);
+    }
+}
+
 /// On macOS a new file takes its directory's inheritable ACL entries
 /// whatever its mode. A file that cannot change in place is not copied into
 /// a staging file that lets someone read it whom the file does not: the

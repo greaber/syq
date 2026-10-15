@@ -99,10 +99,10 @@ Otherwise syq replaces the file as if its contents had changed. So a hard link
 planted in the destination never takes the copy's other metadata, and root
 never hands a file another user planted there to another owner or group, or
 gives it privileges, even when its size and time match the source's. Access
-times are the exception: `--copy-metadata=atimes` restores them in place on
-any file, and they show through all of its names, including names outside the
-copy. A symlink, device or named pipe
-whose metadata changes is created again with it. Narrowing a file's permissions in
+times are the exception: `--copy-metadata=atimes` (`-U` in `syq rsync`)
+restores them in place on any file, and they show through all of its names,
+including names outside the copy. A symlink, device or named pipe whose
+metadata changes is created again with it. Narrowing a file's permissions in
 place does not cut off someone who already has it open, though they can read
 only the contents they could read before.
 
@@ -281,7 +281,7 @@ HostA cannot:
 - Forge hostB's receipt.
 
 A grant that permits only creating new files refuses hard links on
-filesystems whose inode numbers syq cannot trust, such as SMB, SSHFS, and
+filesystems whose link counts syq does not trust, such as SMB, SSHFS, and
 types syq does not recognize, because it cannot tell which file a link would
 name. On filesystems with neither an atomic no-replace rename nor hard links,
 such as FAT and exFAT on macOS and rclone mounts, it still refuses files that

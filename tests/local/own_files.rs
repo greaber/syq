@@ -648,3 +648,42 @@ fn no_owner_probe_on_local_filesystems() {
         );
     }
 }
+
+/// A root receiver decides metadata-only changes by the change, so the
+/// planner does not read each folder to predict a new file's group, which
+/// over SSH is a round trip per folder. It does so only for hard-link
+/// representatives.
+#[cfg(debug_assertions)]
+#[test]
+fn root_metadata_changes_need_no_lookup_per_folder() {
+    const FOLDERS: usize = 40;
+    for route in ["local", "ssh"] {
+        let t = Tmp::new();
+        for folder in 0..FOLDERS {
+            write(&t.path(&format!("src/{folder}/file")), b"contents");
+        }
+        assert_output_ok(&rsync_with(&t, route, &["-rlpt"], &[]));
+        for folder in 0..FOLDERS {
+            fs::set_permissions(
+                t.path(&format!("src/{folder}/file")),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        // The receiver reports itself as root.
+        let lookups = t.path("lookups");
+        let log = lookups.to_string_lossy().into_owned();
+        let env = [
+            ("SYQ_TEST_OWN_UID", "0"),
+            ("SYQ_TEST_DESTINATION_LOOKUPS", log.as_str()),
+        ];
+        assert_output_ok(&rsync_with(&t, route, &["-rlpt"], &env));
+        assert_eq!(mode(&t.path("dst/0/file")), 0o600, "{route}");
+        let recorded = fs::read_to_string(&lookups).unwrap_or_default();
+        let count = recorded.lines().filter(|line| *line == "stat 1").count();
+        assert!(
+            count < FOLDERS / 2,
+            "{route}: {count} single-path lookups for {FOLDERS} folders\n{recorded}"
+        );
+    }
+}

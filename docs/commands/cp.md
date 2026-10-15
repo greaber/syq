@@ -181,13 +181,12 @@ makes a read-only one writable only as
 [`--widen-dirs`](../reference.md#copy-metadata) allows.
 
 `--if-exists=keep` and `update-if-older` cannot combine with `--in-place=new`:
-an interrupted copy could leave an incomplete new file that a retry skips. With
-`--if-exists=error-if-different`, a retry rejects differing final contents,
-including an incomplete file left by an interrupted in-place copy. The default
-`update` policy can repair that incomplete file. With `--in-place=new`, a file
-that must be new, an `--as-new` file or a new file under `--if-exists=error` or
-`error-if-different`, is still written under a temporary name and then renamed
-into place, so an interrupted copy resumes it. Every destination publishes such
+an interrupted copy could leave an incomplete new file that a retry skips. The
+default `update` policy repairs that file on a retry. With `--in-place=new`, a
+file that must be new, an `--as-new` file or a new file under
+`--if-exists=error` or `error-if-different`, is still written under a temporary
+name and then renamed into place, so an interrupted copy leaves no incomplete
+file at its name, and a retry resumes it. Every destination publishes such
 a file without replacing anything: a file put at its name in the meantime is
 kept, and that file's copy fails. S3 destinations do not support
 `--in-place=new`.
