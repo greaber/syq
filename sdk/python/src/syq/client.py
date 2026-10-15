@@ -659,8 +659,9 @@ def _copy_arguments(
     copy_metadata: str | Iterable[str] | None,
     open_noatime: bool,
     sparse: bool,
-    inplace: bool,
+    in_place: str | None,
     max_delete: int | None,
+    inplace: None = None,
     prune_before: bool = False,
     widen_dirs: str | None = None,
     transfer_strategy: str | None = None,
@@ -804,8 +805,15 @@ def _copy_arguments(
         argv.append("--open-noatime")
     if sparse:
         argv.append("--sparse")
-    if inplace:
-        argv.append("--inplace")
+    if inplace is not None:
+        raise SyqInvocationError(
+            'inplace= is no longer supported: use in_place="new", which writes only new '
+            "files in place and replaces existing files through a staging file"
+        )
+    if in_place is not None:
+        if in_place != "new":
+            raise SyqInvocationError("in_place must be new")
+        argv.append(f"--in-place={in_place}")
     max_delete = _nonnegative_integer(max_delete, option="--max-delete")
     if max_delete is not None:
         if not (prune or prune_before):
@@ -1298,7 +1306,8 @@ class Client:
         copy_metadata: str | Iterable[str] | None = None,
         open_noatime: bool = False,
         sparse: bool = False,
-        inplace: bool = False,
+        in_place: str | None = None,
+        inplace: None = None,
         max_delete: int | None = None,
         on_event: Callable[[AutomationEvent], object] | None = None,
         timeout: Timeout = CLIENT_DEFAULT,
@@ -1366,6 +1375,7 @@ class Client:
             copy_metadata=copy_metadata,
             open_noatime=open_noatime,
             sparse=sparse,
+            in_place=in_place,
             inplace=inplace,
             max_delete=max_delete,
             allow_missing_placement=mapping is not None and not isinstance(mapping, (str, bytes, os.PathLike)),
@@ -1592,7 +1602,7 @@ class Client:
             copy_metadata=None,
             open_noatime=False,
             sparse=False,
-            inplace=False,
+            in_place=None,
             max_delete=None,
             where=where,
         )

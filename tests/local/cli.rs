@@ -978,8 +978,8 @@ fn native_copy_policy_conflicts_refuse_before_writing() {
     for pair in [
         ["--if-exists=keep", "--only-existing"],
         ["--if-exists=keep", "--if-exists=update-if-older"],
-        ["--if-exists=keep", "--inplace"],
-        ["--if-exists=update-if-older", "--inplace"],
+        ["--if-exists=keep", "--in-place=new"],
+        ["--if-exists=update-if-older", "--in-place=new"],
     ] {
         let out = native_syq(&[
             "cp",

@@ -234,16 +234,16 @@ side writes each piece as it arrives.
 
 Explicit `--hash` comparisons of files up to 64 MiB use the same batches;
 without block reuse, they only decide whether a file is unchanged, and a file
-that differs is then copied whole. Same-machine copies without block reuse,
-larger files and `--inplace` updates are compared one file at a time, in
-comparison blocks of 4 MiB by default. For
+that differs is then copied whole. Same-machine copies without block reuse
+and larger files are compared one file at a time, in comparison blocks of
+4 MiB by default. For
 those, a difference near the end can add almost a full extra read of both
 files before copying. An output already being written by the current run
 resumes before that probe. Leftover partials from earlier runs do not bypass
 checking whether the completed file already matches, and a file with leftover
 partials takes this path so that it can resume from them.
 
-Changed files still use atomic replacement unless `--inplace` is selected.
+Changed files still use atomic replacement.
 Reflinks can reduce replacement writes on supporting filesystems; otherwise the
 replacement must include every byte, including matching blocks. Comparison can
 use up to 64 MiB of destination buffers per worker (up to 32 MiB at default
@@ -255,9 +255,7 @@ reuse costs while keeping range transfers, compare
 `--performance-tuning=copy-path=ranges --transfer-strategy=aligned-block`
 with `--performance-tuning=copy-path=ranges --transfer-strategy=whole-file`.
 Restore the same initial destination before each run and keep worker counts,
-request sizes and cache preparation identical. Leave `--inplace` unchanged too:
-normal staging must populate a new file, whereas in-place updates can leave
-matching destination ranges untouched.
+request sizes and cache preparation identical.
 
 ### Scattered edits in existing files
 
@@ -274,8 +272,8 @@ Both endpoints still read the full file to compare it. Most staged updates and
 partial resume compare bounded windows; their hash memory does not grow with
 file size. Bandwidth-limited pulls and relays compare before requesting source
 data, so matching blocks do not consume the bandwidth budget. These copies and
-explicit whole-file comparisons (protected-existing-file policies, in-place
-reuse, and `--hash` other than for same-machine copies without block reuse,
+explicit whole-file comparisons (protected-existing-file policies and
+`--hash` other than for same-machine copies without block reuse,
 which compare in bounded windows) have a hash-response limit: at 64 KiB, files
 must be smaller than 130 GiB. Increasing `comparison-block-size` increases that
 limit proportionally.

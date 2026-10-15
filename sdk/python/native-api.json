@@ -51,7 +51,7 @@
         "widen-dirs",
         "open-noatime",
         "sparse",
-        "inplace",
+        "in-place",
         "s3-endpoint",
         "s3-region",
         "s3-profile",
@@ -86,7 +86,8 @@
         "stats",
         "detach",
         "src-fd",
-        "as-fd"
+        "as-fd",
+        "inplace"
       ],
       "follow_up": []
     },

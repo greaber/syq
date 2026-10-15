@@ -152,8 +152,10 @@ fn checksum_toggle_accepts_prior_partial_candidates() {
     assert_eq!(partial_files(&t.0), vec![partial]);
 }
 
+/// An existing file is replaced with `--in-place=new` too, so a digest that
+/// fails leaves it as it was.
 #[test]
-fn hash_policy_inplace_mismatch_reports_changed_contents() {
+fn hash_policy_inplace_mismatch_leaves_an_existing_file_alone() {
     let t = Tmp::new();
     let contents = prng(5 * 1024 * 1024, 991);
     write(&t.path("src/source"), &contents);
@@ -162,7 +164,7 @@ fn hash_policy_inplace_mismatch_reports_changed_contents() {
     let output = native_syq(&[
         "cp",
         "--if-exists=update",
-        "--inplace",
+        "--in-place=new",
         "--mapping",
         &super::hashing::expected_mapping(
             &t,
@@ -176,9 +178,8 @@ fn hash_policy_inplace_mismatch_reports_changed_contents() {
         &t.s(""),
     ]);
     assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
-    assert_eq!(read(&t.path("destination")), contents);
+    assert_eq!(read(&t.path("destination")), vec![b'o'; contents.len()]);
     assert_eq!(fs::metadata(t.path("destination")).unwrap().ino(), inode);
-    assert!(partial_files(&t.0).is_empty());
 }
 
 #[cfg(debug_assertions)]
@@ -240,8 +241,10 @@ fn hash_policy_expected_hash_covers_resumed_bytes_after_algorithm_change() {
     );
 }
 
+/// `--in-place=new` writes no existing file, so a hard link to it keeps the
+/// old contents: the name the copy updates gets a new file.
 #[test]
-fn copy_paths_inplace_preserve_hardlinks() {
+fn copy_paths_inplace_leave_another_name_of_an_existing_file_alone() {
     for engine in ["auto", "ranges"] {
         let t = Tmp::new();
         write(&t.path("source"), &prng(4194, 351));
@@ -255,7 +258,7 @@ fn copy_paths_inplace_preserve_hardlinks() {
                 &t.s("source"),
                 "--as",
                 &t.s("destination"),
-                "--inplace",
+                "--in-place=new",
                 "--no-progress",
                 "--performance-tuning",
                 "workers=2",
@@ -264,8 +267,10 @@ fn copy_paths_inplace_preserve_hardlinks() {
             .run()
             .unwrap();
         assert_output_ok(&out);
-        assert_eq!(fs::metadata(t.path("destination")).unwrap().ino(), inode);
-        assert_eq!(read(&t.path("alias")), read(&t.path("source")));
+        assert_ne!(fs::metadata(t.path("destination")).unwrap().ino(), inode);
+        assert_eq!(read(&t.path("destination")), read(&t.path("source")));
+        assert_eq!(read(&t.path("alias")), b"old destination");
+        assert_eq!(fs::metadata(t.path("alias")).unwrap().ino(), inode);
     }
 }
 
@@ -1278,7 +1283,7 @@ fn copy_local_exdev_fallback_leaves_no_partial() {
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
-fn native_inplace_exdev_fallback_preserves_hardlink_aliases() {
+fn native_inplace_exdev_fallback_leaves_another_name_alone() {
     let t = Tmp::new();
     let contents = vec![b'n'; 8 * 1024 * 1024];
     write(&t.path("src"), &contents);
@@ -1292,7 +1297,7 @@ fn native_inplace_exdev_fallback_preserves_hardlink_aliases() {
         .args([
             "cp",
             "--if-exists=update",
-            "--inplace",
+            "--in-place=new",
             "--src",
             &t.s("src"),
             "--as",
@@ -1305,8 +1310,8 @@ fn native_inplace_exdev_fallback_preserves_hardlink_aliases() {
 
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), contents);
-    assert_eq!(read(&t.path("alias")), contents);
-    assert_eq!(fs::metadata(t.path("dst")).unwrap().ino(), original_inode);
+    assert_eq!(read(&t.path("alias")), vec![b'o'; contents.len()]);
+    assert_ne!(fs::metadata(t.path("dst")).unwrap().ino(), original_inode);
     assert_eq!(fs::metadata(t.path("alias")).unwrap().ino(), original_inode);
     assert!(partial_files(&t.0).is_empty());
 }
@@ -2303,8 +2308,10 @@ fn local_read_ahead_preserves_staged_and_inplace_contents() {
             let t = Tmp::new();
             let data = prng((17 << 20) + 73, 918);
             write(&t.path("source"), &data);
-            write(&t.path("destination"), b"old destination");
-            let inode = fs::metadata(t.path("destination")).unwrap().ino();
+            // In place, only a new file is written at its name.
+            if !inplace {
+                write(&t.path("destination"), b"old destination");
+            }
             let mut command = compat_command();
             command.args(["-a", "--no-progress", &t.s("source"), &t.s("destination")]);
             if inplace {
@@ -2323,9 +2330,6 @@ fn local_read_ahead_preserves_staged_and_inplace_contents() {
                 assert!(stderr_of(&out).contains("source read-ahead started"));
             }
             assert_eq!(read(&t.path("destination")), data);
-            if inplace {
-                assert_eq!(fs::metadata(t.path("destination")).unwrap().ino(), inode);
-            }
             assert!(partial_files(&t.0).is_empty());
         }
     }

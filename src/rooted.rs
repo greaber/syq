@@ -242,6 +242,37 @@ pub(crate) struct Root {
 }
 
 impl Root {
+    /// `created_owner_in` for a preview, which creates nothing: what is
+    /// known without it (`created_owner_known`).
+    pub(crate) fn created_owner_known_in(&self, directory: &RelativePath, dev: u64) -> Option<u32> {
+        if let Some(uid) = self
+            .open_directory(directory)
+            .ok()
+            .and_then(|handle| created_owner_known(&handle, dev))
+        {
+            return Some(uid);
+        }
+        created_owner_known(&self.directory, dev)
+    }
+
+    /// The owner files this process creates on `dev` show (`created_owner`),
+    /// learned in `directory` below the root or, failing that, in the root.
+    pub(crate) fn created_owner_in(&self, directory: &RelativePath, dev: u64) -> Option<u32> {
+        if let Some(uid) = known_created_owner(dev) {
+            return Some(uid);
+        }
+        if let Some(uid) = self
+            .open_directory(directory)
+            .ok()
+            .and_then(|handle| created_owner(&handle, dev))
+        {
+            return Some(uid);
+        }
+        created_owner(&self.directory, dev)
+    }
+}
+
+impl Root {
     /// Open an explicit root. Symlinks in this user-selected path are followed;
     /// symlinks in every later descendant path are rejected.
     pub(crate) fn open(path: &Path) -> Result<Self> {
@@ -524,24 +555,6 @@ impl Root {
         self.profile_on(dev, directory).symlink_times
     }
 
-    /// Set a symlink's times where `sets_symlink_times` allows; otherwise
-    /// leave them. Returns whether they were set.
-    pub(crate) fn set_symlink_times(
-        &self,
-        path: &RelativePath,
-        times: &[libc::timespec; 2],
-    ) -> Result<bool> {
-        let parent = self.resolve_parent(path)?;
-        let dev = parent.directory.metadata()?.dev();
-        if !self.sets_symlink_times(&parent.directory, dev) {
-            return Ok(false);
-        }
-        parent
-            .set_times(times)
-            .with_context(|| format!("set times on confined path {}", path.label()))?;
-        Ok(true)
-    }
-
     /// Whether the directory `name` directly beneath this root lies on a
     /// network filesystem: this root's own, or another one mounted there, as
     /// on the target of an exact placement. A missing entry would be created
@@ -657,30 +670,13 @@ impl Root {
 
     /// Open an existing regular file for mutation. Truncation occurs only after
     /// the opened descriptor has been verified as a regular file.
+    #[cfg(test)]
     pub(crate) fn open_regular_write(&self, path: &RelativePath, truncate: bool) -> Result<File> {
         self.open_regular(path, libc::O_WRONLY, truncate)
     }
 
     pub(crate) fn open_regular_read_write(&self, path: &RelativePath) -> Result<File> {
         self.open_regular(path, libc::O_RDWR, false)
-    }
-
-    /// Open an existing regular file for writing only, with the metadata
-    /// read when it was opened.
-    pub(crate) fn open_regular_write_known(
-        &self,
-        path: &RelativePath,
-    ) -> Result<(File, std::fs::Metadata)> {
-        self.open_regular_known(path, libc::O_WRONLY)
-    }
-
-    /// Open an existing regular file for reading and writing, with the
-    /// metadata read when it was opened.
-    pub(crate) fn open_regular_read_write_known(
-        &self,
-        path: &RelativePath,
-    ) -> Result<(File, std::fs::Metadata)> {
-        self.open_regular_known(path, libc::O_RDWR)
     }
 
     pub(crate) fn open_metadata(&self, path: &RelativePath) -> Result<File> {
@@ -1563,6 +1559,7 @@ impl Root {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn create_symlink(&self, path: &RelativePath, target: &[u8]) -> Result<()> {
         let parent = self.resolve_parent(path)?;
         let target = CString::new(target).context("symlink target contains NUL")?;
@@ -1576,6 +1573,7 @@ impl Root {
         .with_context(|| format!("create confined symlink {}", path.label()))
     }
 
+    #[cfg(test)]
     pub(crate) fn create_node(&self, path: &RelativePath, mode: u32, rdev: u64) -> Result<()> {
         let parent = self.resolve_parent(path)?;
         retry_zero(|| unsafe {
@@ -1589,100 +1587,160 @@ impl Root {
         .with_context(|| format!("create confined node {}", path.label()))
     }
 
-    pub(crate) fn chown(
+    #[cfg(test)]
+    pub(crate) fn replace_symlink(&self, path: &RelativePath, target: &[u8]) -> Result<()> {
+        self.publish_symlink(path, target, LeafReplacement::Any, |_, _| Ok(()))
+    }
+
+    /// Make the symlink `path` pointing at `target`: created at a temporary
+    /// name in its directory, given what `prepare` gives it there through
+    /// that directory (`directory`, `name`), and then published as
+    /// `replacement` allows. Its metadata is so in place before anyone can
+    /// reach it by its name, and nothing is ever applied by that name.
+    pub(crate) fn publish_symlink(
         &self,
         path: &RelativePath,
-        uid: Option<u32>,
-        gid: Option<u32>,
-    ) -> io::Result<()> {
-        let (directory, leaf) = if path.is_empty() {
-            (
-                DirectoryHandle::Borrowed(&self.directory),
-                component_cstring(b"."),
-            )
-        } else {
-            let parent = self
-                .resolve_parent(path)
-                .map_err(|error| io::Error::other(format!("{error:#}")))?;
-            (parent.directory, parent.leaf)
-        };
-        retry_zero(|| unsafe {
-            libc::fchownat(
-                directory.as_raw_fd(),
-                leaf.as_ptr(),
-                uid.unwrap_or(u32::MAX),
-                gid.unwrap_or(u32::MAX),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        })
-    }
-
-    pub(crate) fn set_times(&self, path: &RelativePath, times: &[libc::timespec; 2]) -> Result<()> {
-        let (parent, leaf) = if path.is_empty() {
-            (
-                DirectoryHandle::Borrowed(&self.directory),
-                component_cstring(b"."),
-            )
-        } else {
-            let parent = self.resolve_parent(path)?;
-            (parent.directory, parent.leaf)
-        };
-        retry_zero(|| unsafe {
-            libc::utimensat(
-                parent.as_raw_fd(),
-                leaf.as_ptr(),
-                times.as_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        })
-        .with_context(|| format!("set times on confined path {}", path.label()))
-    }
-
-    pub(crate) fn replace_symlink(&self, path: &RelativePath, target: &[u8]) -> Result<()> {
+        target: &[u8],
+        replacement: LeafReplacement,
+        prepare: impl FnOnce(&File, &CStr) -> Result<()>,
+    ) -> Result<()> {
         let target = CString::new(target).context("symlink target contains NUL")?;
-        self.replace_entry(path, |fd, name| {
-            retry_zero(|| unsafe { libc::symlinkat(target.as_ptr(), fd, name.as_ptr()) })
-        })
+        self.publish_leaf(
+            path,
+            MODE_SYMLINK,
+            replacement,
+            |fd, name| {
+                retry_zero(|| unsafe { libc::symlinkat(target.as_ptr(), fd, name.as_ptr()) })
+            },
+            prepare,
+        )
     }
 
-    pub(crate) fn replace_node(&self, path: &RelativePath, mode: u32, rdev: u64) -> Result<()> {
-        self.replace_entry(path, |fd, name| {
-            retry_zero(|| unsafe {
-                libc::mknodat(fd, name.as_ptr(), mode as libc::mode_t, rdev as libc::dev_t)
+    /// Make the device node, FIFO or socket `path` as `publish_symlink`
+    /// makes a symlink.
+    pub(crate) fn publish_node(
+        &self,
+        path: &RelativePath,
+        mode: u32,
+        rdev: u64,
+        replacement: LeafReplacement,
+        prepare: impl FnOnce(&File, &CStr) -> Result<()>,
+    ) -> Result<()> {
+        self.publish_leaf(
+            path,
+            mode & MODE_TYPE_MASK,
+            replacement,
+            |fd, name| {
+                retry_zero(|| unsafe {
+                    libc::mknodat(fd, name.as_ptr(), mode as libc::mode_t, rdev as libc::dev_t)
+                })
+            },
+            prepare,
+        )
+    }
+
+    fn publish_leaf(
+        &self,
+        path: &RelativePath,
+        expected_type: u32,
+        replacement: LeafReplacement,
+        create: impl Fn(RawFd, &CString) -> io::Result<()>,
+        prepare: impl FnOnce(&File, &CStr) -> Result<()>,
+    ) -> Result<()> {
+        match replacement {
+            LeafReplacement::Nothing => self.create_leaf_new(path, create, prepare),
+            LeafReplacement::Any => self.replace_entry(path, create, prepare),
+            LeafReplacement::Same { dev, ino } => {
+                self.replace_leaf_if_same(path, dev, ino, expected_type, create, prepare)
+            }
+        }
+    }
+
+    /// Publish a new leaf without replacing anything at `path`.
+    fn create_leaf_new(
+        &self,
+        path: &RelativePath,
+        create: impl Fn(RawFd, &CString) -> io::Result<()>,
+        prepare: impl FnOnce(&File, &CStr) -> Result<()>,
+    ) -> Result<()> {
+        let parent = self.resolve_parent(path)?;
+        let directory = parent.directory.as_raw_fd();
+        let temporary = create_temporary(&parent, create)?;
+        let result = (|| -> Result<()> {
+            prepare(&parent.directory, &temporary)?;
+            let created = metadata_at(directory, &temporary)?;
+            // The new leaf was created in the parent, on its filesystem.
+            let mut profile = self.profile_on(created.dev, &parent.directory);
+            let link = publication::Link::new_entry(profile);
+            #[cfg(any(target_os = "linux", test))]
+            let _permit = self.mutation_permit(path)?;
+            self.move_own_name_without_replacing(
+                &mut profile,
+                &parent.directory,
+                &publication::Placement {
+                    from_directory: directory,
+                    from: &temporary,
+                    to_directory: directory,
+                    to: &parent.leaf,
+                    link,
+                },
+            )
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    anyhow::anyhow!(
+                        "destination {} appeared before no-replace creation",
+                        path.label()
+                    )
+                } else {
+                    anyhow::Error::new(error)
+                        .context(format!("publish new confined path {}", path.label()))
+                }
             })
-        })
+        })();
+        if result.is_err() {
+            let _ = unlink_at(directory, &temporary, 0);
+        }
+        result
     }
 
     fn replace_entry(
         &self,
         path: &RelativePath,
         create: impl Fn(RawFd, &CString) -> io::Result<()>,
+        prepare: impl FnOnce(&File, &CStr) -> Result<()>,
     ) -> Result<()> {
         let parent = self.resolve_parent(path)?;
-        let before = metadata_at(parent.directory.as_raw_fd(), &parent.leaf)?;
-        if before.is_dir() {
-            bail!(
-                "cannot replace directory {} with a non-directory",
-                path.label()
-            );
-        }
-        // Stage the new leaf before touching the old one. renameat also refuses
-        // a directory that appears at the destination after the check above.
+        // Stage the new leaf before touching the old one. renameat refuses
+        // a directory at the destination.
         let temporary = create_temporary(&parent, create)?;
-        let result = retry_zero(|| unsafe {
-            libc::renameat(
-                parent.directory.as_raw_fd(),
-                temporary.as_ptr(),
-                parent.directory.as_raw_fd(),
-                parent.leaf.as_ptr(),
-            )
+        let result = prepare(&parent.directory, &temporary).and_then(|()| {
+            retry_zero(|| unsafe {
+                libc::renameat(
+                    parent.directory.as_raw_fd(),
+                    temporary.as_ptr(),
+                    parent.directory.as_raw_fd(),
+                    parent.leaf.as_ptr(),
+                )
+            })
+            .map_err(|error| {
+                if matches!(error.raw_os_error(), Some(libc::EISDIR | libc::ENOTEMPTY)) {
+                    anyhow::anyhow!(
+                        "cannot replace directory {} with a non-directory",
+                        path.label()
+                    )
+                } else {
+                    anyhow::Error::new(error)
+                        .context(format!("publish replacement for {}", path.label()))
+                }
+            })
         });
         if result.is_err() {
             let _ = unlink_at(parent.directory.as_raw_fd(), &temporary, 0);
         }
-        result.with_context(|| format!("publish replacement for {}", path.label()))
+        result
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_symlink_if_same(
         &self,
         path: &RelativePath,
@@ -1690,18 +1748,18 @@ impl Root {
         expected_dev: u64,
         expected_ino: u64,
     ) -> Result<()> {
-        let target = CString::new(target).context("symlink target contains NUL")?;
-        self.replace_leaf_if_same(
+        self.publish_symlink(
             path,
-            expected_dev,
-            expected_ino,
-            MODE_SYMLINK,
-            |fd, name| {
-                retry_zero(|| unsafe { libc::symlinkat(target.as_ptr(), fd, name.as_ptr()) })
+            target,
+            LeafReplacement::Same {
+                dev: expected_dev,
+                ino: expected_ino,
             },
+            |_, _| Ok(()),
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_node_if_same(
         &self,
         path: &RelativePath,
@@ -1710,16 +1768,15 @@ impl Root {
         expected_dev: u64,
         expected_ino: u64,
     ) -> Result<()> {
-        self.replace_leaf_if_same(
+        self.publish_node(
             path,
-            expected_dev,
-            expected_ino,
-            mode & MODE_TYPE_MASK,
-            |fd, name| {
-                retry_zero(|| unsafe {
-                    libc::mknodat(fd, name.as_ptr(), mode as libc::mode_t, rdev as libc::dev_t)
-                })
+            mode,
+            rdev,
+            LeafReplacement::Same {
+                dev: expected_dev,
+                ino: expected_ino,
             },
+            |_, _| Ok(()),
         )
     }
 
@@ -1730,6 +1787,7 @@ impl Root {
         expected_ino: u64,
         expected_type: u32,
         create: impl Fn(RawFd, &CString) -> io::Result<()>,
+        prepare: impl FnOnce(&File, &CStr) -> Result<()>,
     ) -> Result<()> {
         let parent = self.resolve_parent(path)?;
         let before = metadata_at(parent.directory.as_raw_fd(), &parent.leaf)?;
@@ -1743,6 +1801,10 @@ impl Root {
             );
         }
         let temporary = create_temporary(&parent, create)?;
+        if let Err(error) = prepare(&parent.directory, &temporary) {
+            let _ = unlink_at(parent.directory.as_raw_fd(), &temporary, 0);
+            return Err(error);
+        }
         let replacement = metadata_at(parent.directory.as_raw_fd(), &temporary)?;
         if replacement.file_type() != expected_type || replacement.nlink != 1 {
             let _ = unlink_at(parent.directory.as_raw_fd(), &temporary, 0);
@@ -1917,6 +1979,23 @@ impl Root {
         {
             bail!(
                 "hardlink representative {} changed before publication",
+                source.label()
+            );
+        }
+        // New names go only to a file owned as the files this process
+        // creates on its filesystem show, as the copy made or kept it
+        // (`fsops::vouch`). Root's representatives are checked against the
+        // owner and group they end with as the copy finishes them.
+        // A link to another filesystem fails with EXDEV below, whoever owns
+        // the file.
+        let euid = unsafe { libc::geteuid() };
+        if euid != 0
+            && parent.directory.metadata()?.dev() == opened.dev
+            && Some(opened.uid) != created_owner(&parent.directory, opened.dev)
+        {
+            bail!(
+                "hard link {} would give a new name to {}, which the receiving account does not own",
+                target.label(),
                 source.label()
             );
         }
@@ -2730,29 +2809,6 @@ impl ResolvedParent<'_> {
         })
     }
 
-    pub(crate) fn set_times(&self, times: &[libc::timespec; 2]) -> io::Result<()> {
-        retry_zero(|| unsafe {
-            libc::utimensat(
-                self.directory.as_raw_fd(),
-                self.leaf.as_ptr(),
-                times.as_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        })
-    }
-
-    pub(crate) fn chown(&self, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
-        retry_zero(|| unsafe {
-            libc::fchownat(
-                self.directory.as_raw_fd(),
-                self.leaf.as_ptr(),
-                uid.unwrap_or(u32::MAX),
-                gid.unwrap_or(u32::MAX),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        })
-    }
-
     /// Remove the leaf, which the caller has just inspected through
     /// `metadata`. Directories are refused by the kernel.
     pub(crate) fn unlink(&self) -> io::Result<()> {
@@ -3172,7 +3228,164 @@ pub(crate) fn filesystem_is(file: &File, name: &[u8]) -> io::Result<bool> {
     Ok(unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) }.to_bytes() == name)
 }
 
-fn metadata_at(parent: RawFd, name: &CStr) -> io::Result<RootMetadata> {
+/// The account this process runs as, for comparing owners with. Debug
+/// builds take another from `SYQ_TEST_OWN_UID`, so that tests can stand in
+/// for a filesystem whose files show owners other than that account.
+pub(crate) fn own_uid() -> u32 {
+    #[cfg(debug_assertions)]
+    {
+        static OVERRIDE: OnceLock<Option<u32>> = OnceLock::new();
+        if let Some(uid) = *OVERRIDE.get_or_init(|| {
+            std::env::var("SYQ_TEST_OWN_UID")
+                .ok()
+                .and_then(|uid| uid.parse().ok())
+        }) {
+            return uid;
+        }
+    }
+    unsafe { libc::geteuid() }
+}
+
+/// The owner that the files this process creates show, per device, as its
+/// own creations there showed it. Mostly the account it runs as; SSHFS
+/// without uid mapping, NFS that squashes root and CIFS mounted with `uid=`
+/// show another.
+fn created_owners() -> &'static Mutex<HashMap<u64, u32>> {
+    static OWNERS: OnceLock<Mutex<HashMap<u64, u32>>> = OnceLock::new();
+    OWNERS.get_or_init(Default::default)
+}
+
+/// Remember the owner a file this process has just created exclusively on
+/// `dev` shows.
+pub(crate) fn note_created_owner(dev: u64, uid: u32) {
+    created_owners().lock().unwrap().insert(dev, uid);
+}
+
+/// The owner files this process creates on `dev` show, if it has created
+/// one there.
+pub(crate) fn known_created_owner(dev: u64) -> Option<u32> {
+    created_owners().lock().unwrap().get(&dev).copied()
+}
+
+/// Learn the owner files this process creates in `directory` show from an
+/// unnamed file, where the filesystem can make one (Linux `O_TMPFILE`): it
+/// changes nothing a directory listing or a time shows.
+fn probe_created_owner_unnamed(directory: &File) -> Option<(u64, u32)> {
+    #[cfg(target_os = "linux")]
+    if let Ok(file) = open_at(
+        directory.as_raw_fd(),
+        c".",
+        libc::O_TMPFILE | libc::O_WRONLY | libc::O_CLOEXEC,
+        0o600,
+    ) {
+        note_probe_for_test();
+        let created = file.metadata().ok()?;
+        note_created_owner(created.dev(), created.uid());
+        return Some((created.dev(), created.uid()));
+    }
+    let _ = directory;
+    None
+}
+
+/// Debug builds count each probe file, unnamed or named, in the file
+/// `SYQ_TEST_PROBE_LOG` names, a line each.
+fn note_probe_for_test() {
+    #[cfg(test)]
+    PROBES.set(PROBES.get() + 1);
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("SYQ_TEST_PROBE_LOG") {
+        use std::io::Write;
+        if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(log, "probe");
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many owner probes this thread has created.
+#[cfg(test)]
+pub(crate) fn probes_for_test() -> usize {
+    PROBES.get()
+}
+
+/// `created_owner` for a preview, which creates nothing, not even an
+/// unnamed file: what this process has learned, or a local filesystem
+/// shows faithfully.
+pub(crate) fn created_owner_known(directory: &File, dev: u64) -> Option<u32> {
+    known_created_owner(dev).or_else(|| faithful_owner(directory, dev))
+}
+
+/// The account this process runs as, where `directory` is on `dev` and on a
+/// local filesystem that shows what this process creates as owned by it
+/// (`fsops::reports_owners_faithfully`): nothing needs to be created there to
+/// learn it.
+fn faithful_owner(directory: &File, dev: u64) -> Option<u32> {
+    let on_dev = directory.metadata().ok()?.dev() == dev;
+    (on_dev && crate::fsops::reports_owners_faithfully(directory)).then(|| {
+        let uid = own_uid();
+        note_created_owner(dev, uid);
+        uid
+    })
+}
+
+/// The owner files this process creates on `dev` show: on a local
+/// filesystem that shows it faithfully, the account it runs as; elsewhere,
+/// what a file it created there showed. If it has created nothing there yet,
+/// it creates a file in `directory` to learn it, unnamed where Linux can
+/// make one, and else named and removed at once, which leaves the
+/// directory's modification time changed. None where that directory is on
+/// another device or nothing can be created in it: an owner is never
+/// assumed.
+pub(crate) fn created_owner(directory: &File, dev: u64) -> Option<u32> {
+    if let Some(uid) = known_created_owner(dev).or_else(|| faithful_owner(directory, dev)) {
+        return Some(uid);
+    }
+    let (probed, uid) = probe_created_owner(directory).ok()?;
+    (probed == dev).then_some(uid)
+}
+
+/// Create a file in `directory` to learn the owner files this process
+/// creates there show, and note it. Linux makes the file unnamed where the
+/// filesystem can, so that the directory does not change; elsewhere a named
+/// file is created and removed. Its directory's modification time is left
+/// as that leaves it: putting it back could undo another program's change.
+fn probe_created_owner(directory: &File) -> io::Result<(u64, u32)> {
+    if let Some(probed) = probe_created_owner_unnamed(directory) {
+        return Ok(probed);
+    }
+    note_probe_for_test();
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).map_err(io::Error::other)?;
+    let name = format!(
+        ".syq-owner-{}",
+        random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let name = CString::new(name).expect("probe name has no NUL");
+    let file = open_at(
+        directory.as_raw_fd(),
+        &name,
+        libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o600,
+    )?;
+    let created = file.metadata()?;
+    // Remove only the file created, whatever the name holds by now.
+    if metadata_at(directory.as_raw_fd(), &name)
+        .is_ok_and(|named| (named.dev, named.ino) == (created.dev(), created.ino()))
+    {
+        let _ = retry_zero(|| unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) });
+    }
+    note_created_owner(created.dev(), created.uid());
+    Ok((created.dev(), created.uid()))
+}
+
+pub(crate) fn metadata_at(parent: RawFd, name: &CStr) -> io::Result<RootMetadata> {
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     retry_zero(|| unsafe {
         libc::fstatat(parent, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW)
@@ -3277,6 +3490,17 @@ fn create_temporary_in(
         }
     }
     bail!("could not allocate a replacement sidecar name")
+}
+
+/// What publishing a new symlink or node may replace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LeafReplacement {
+    /// Nothing: the name must be free.
+    Nothing,
+    /// Whatever is at the name, but a directory.
+    Any,
+    /// Only the entry with this identity, of the same type.
+    Same { dev: u64, ino: u64 },
 }
 
 /// The label of `name` in the directory that holds `path`.

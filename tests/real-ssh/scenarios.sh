@@ -388,7 +388,7 @@ with tempfile.TemporaryDirectory(prefix='syq-hardlinks-') as scratch:
         subprocess.run(command, check=True, timeout=30)
         subprocess.run(command, check=True, timeout=30)
         (source / 'a').write_bytes(b'changed payload')
-        subprocess.run([*command, '--if-exists=update', '--inplace'], check=True, timeout=30)
+        subprocess.run([*command, '--if-exists=update', '--in-place=new'], check=True, timeout=30)
         pull = Path(scratch) / label
         subprocess.run(['syq', 'cp', '--copy-metadata=hardlinks', '--from', 'destination', '--srcs-in', destination, '--into', str(pull), *transport], check=True, timeout=30)
         assert (pull / 'a').read_bytes() == b'changed payload'
@@ -1089,25 +1089,27 @@ syq cp --prune --no-progress --performance-tuning workers=2 \
     --to destination --into-existing /tmp/syq-real-ssh/prune-destination
 ssh destination 'cd /tmp/syq-real-ssh/prune-destination && test ! -e extra && test ! -e other && test "$(cat kept)" = kept'
 
-printf 'case: restricted receiver stages an --as-new file under --inplace\n'
+printf 'case: restricted receiver stages an --as-new file under --in-place=new\n'
 ssh source 'mkdir -p /tmp/syq-real-ssh/inplace-policy-source && printf new > /tmp/syq-real-ssh/inplace-policy-source/b'
 ssh destination 'mkdir -p /tmp/syq-real-ssh/inplace-policy'
-syq cp --inplace --no-progress --from source --src /tmp/syq-real-ssh/inplace-policy-source/b \
+syq cp --in-place=new --no-progress --from source --src /tmp/syq-real-ssh/inplace-policy-source/b \
     --to destination --as-new /tmp/syq-real-ssh/inplace-policy/created
 ssh destination 'test "$(cat /tmp/syq-real-ssh/inplace-policy/created)" = new'
 # A name that exists is refused and keeps its contents.
 ssh destination 'printf theirs > /tmp/syq-real-ssh/inplace-policy/taken'
-if taken_output=$(syq cp --inplace --no-progress --from source --src /tmp/syq-real-ssh/inplace-policy-source/b \
+if taken_output=$(syq cp --in-place=new --no-progress --from source --src /tmp/syq-real-ssh/inplace-policy-source/b \
     --to destination --as-new /tmp/syq-real-ssh/inplace-policy/taken 2>&1); then
-    printf 'an --inplace --as-new copy onto an existing name unexpectedly succeeded:\n%s\n' "$taken_output" >&2
+    printf 'an --in-place=new --as-new copy onto an existing name unexpectedly succeeded:\n%s\n' "$taken_output" >&2
     exit 1
 fi
 ssh destination 'test "$(cat /tmp/syq-real-ssh/inplace-policy/taken)" = theirs'
 
-printf 'case: restricted receiver keeps or replaces each name of a linked destination\n'
+printf 'case: restricted receiver replaces each name of a linked destination\n'
 # Eight names of one destination file. The odd names' sources changed in
-# their second block; the even names' did not. Keeping an even name sets the
-# times they share, and replacing an odd name takes a link from the file.
+# their second block; the even names' did not, but their times differ. The
+# receiver changes nothing in a file with other names, so each name is
+# replaced by a file of its own, built from the old one: a changed name is
+# sent only its second block, an unchanged one nothing.
 ssh source python3 - <<'PY_LINKED_SOURCE'
 import os
 root = '/tmp/syq-real-ssh/linked-source'
@@ -1176,7 +1178,7 @@ if sys.argv[3] != 'whole':
         if marker in line
     ]
     assert any(
-        (counts.get('compared_files'), counts.get('kept_files'), counts.get('patched_files')) == (8, 4, 4)
+        (counts.get('compared_files'), counts.get('kept_files'), counts.get('patched_files')) == (8, 0, 8)
         for counts in observed
     ), observed
 PY_LINKED_RESULTS
@@ -1185,7 +1187,6 @@ PY_LINKED_RESULTS
 import os, sys
 root = '/tmp/syq-real-ssh/linked-destination'
 inode = int(open('/tmp/syq-real-ssh/linked-inode').read())
-whole = sys.argv[1] == 'whole'
 block = 64 * 1024
 old = bytes(i % 251 for i in range(2 * block))
 new = old[:block] + bytes([7]) * block
@@ -1195,16 +1196,11 @@ for i in range(8):
     status = os.stat(path)
     with open(path, 'rb') as f:
         contents = f.read()
-    if i % 2 or whole:
-        # A replaced name names a new file of its own.
-        assert contents == (new if i % 2 else old) and status.st_ino != inode, (i, status)
-        assert status.st_ino not in replaced, (i, status)
-        replaced.add(status.st_ino)
-        assert int(status.st_mtime) == 1_600_000_000 + (i if i % 2 else 0), (i, status)
-    else:
-        # A kept name still names the file the other kept names share.
-        assert contents == old and status.st_ino == inode, (i, status)
-        assert int(status.st_mtime) == 1_600_000_000, (i, status)
+    # Each name names a new file of its own.
+    assert contents == (new if i % 2 else old) and status.st_ino != inode, (i, status)
+    assert status.st_ino not in replaced and status.st_nlink == 1, (i, status)
+    replaced.add(status.st_ino)
+    assert int(status.st_mtime) == 1_600_000_000 + (i if i % 2 else 0), (i, status)
 PY_LINKED_CHECK
 done
 
@@ -1236,7 +1232,7 @@ for mode_variant in default permissions inplace; do
     set --
     case "$mode_variant" in
         permissions) set -- --copy-metadata=permissions ;;
-        inplace) set -- --inplace ;;
+        inplace) set -- --in-place=new ;;
     esac
     for mode_receiver in ordinary restricted; do
         mode_destination=/tmp/syq-real-ssh/modes-$mode_variant-$mode_receiver
@@ -1613,10 +1609,10 @@ assert_same_tree source /tmp/syq-real-ssh/streamed-source \
 
 printf 'case: in-place copies of small files through a command-restricted receiver\n'
 ssh source 'mkdir -p /tmp/syq-real-ssh/inplace-small; for n in 1 2 3; do printf "small $n" >/tmp/syq-real-ssh/inplace-small/$n; done'
-syq cp --inplace --no-progress --from source --srcs-in /tmp/syq-real-ssh/inplace-small \
+syq cp --in-place=new --no-progress --from source --srcs-in /tmp/syq-real-ssh/inplace-small \
     --to destination --into /tmp/syq-real-ssh/inplace-small
 ssh source 'printf "changed 2" >/tmp/syq-real-ssh/inplace-small/2'
-syq cp --inplace --no-progress --from source --srcs-in /tmp/syq-real-ssh/inplace-small \
+syq cp --in-place=new --no-progress --from source --srcs-in /tmp/syq-real-ssh/inplace-small \
     --to destination --into /tmp/syq-real-ssh/inplace-small
 assert_same_tree source /tmp/syq-real-ssh/inplace-small \
     destination /tmp/syq-real-ssh/inplace-small inplace-small

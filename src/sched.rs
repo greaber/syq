@@ -56,6 +56,11 @@ pub struct FileJobData {
     /// Earlier runs left partial copies of this file: it takes the per-file
     /// path, which resumes from them.
     pub resume_partial: bool,
+    /// The existing destination must be replaced even if its contents
+    /// match: the receiver will not change its metadata in place
+    /// (`fsops::vouch`). It is copied as a changed file is, with the old
+    /// file at most a donor of blocks the source's hashes confirm.
+    pub replace: bool,
     /// How many times a grouped patch of this file found its destination no
     /// longer met the patch's target condition, and the file was compared
     /// again.

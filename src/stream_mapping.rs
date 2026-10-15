@@ -298,7 +298,7 @@ fn validate(args: &Args, manifest: &manifest::Manifest) -> Result<()> {
         !args.delete,
         "callback mappings cannot prune a tree: byte streams do not describe its complete contents"
     );
-    ensure!(!args.inplace, "callback mappings publish only after the producer succeeds; --inplace cannot provide that behavior");
+    ensure!(!args.inplace, "callback mappings publish only after the producer succeeds; --in-place cannot provide that behavior");
     ensure!(!args.checksum, "callback mappings cannot compare content before invoking producers; use expected_hash to check produced bytes");
     ensure!(
         args.ignore.is_empty() && args.ignore_from.is_empty() && args.ignore_lines.is_empty(),

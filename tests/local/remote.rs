@@ -1990,7 +1990,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
             "fake",
             "--ignore=*.tmp",
             "--copy-metadata=permissions",
-            "--inplace",
+            "--in-place=new",
             "--prune",
             "--max-delete=1",
             "--resource-limits=workers=2",
@@ -2009,11 +2009,8 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst/keep")), contents);
     let metadata = fs::metadata(t.path("dst/keep")).unwrap();
-    assert_eq!(
-        metadata.ino(),
-        original_inode,
-        "--inplace was not forwarded"
-    );
+    // `--in-place=new` replaces an existing file as any copy does.
+    assert_ne!(metadata.ino(), original_inode);
     assert_eq!(metadata.mode() & 0o777, 0o640);
     assert!(!t.path("dst/skip.tmp").exists());
     assert!(!t.path("dst/extra").exists());
@@ -2024,7 +2021,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
         "--root",
         "--ignore=*.tmp",
         "--copy-metadata=permissions",
-        "--inplace",
+        "--in-place=new",
         "--prune",
         "--max-delete=1",
         "--resource-limits=workers=2",
@@ -2807,7 +2804,7 @@ fn native_direct_missing_destination_skips_descendant_lookups() {
         "--no-progress",
         "--if-exists=keep",
         "--if-exists=update-if-older",
-        "--inplace",
+        "--in-place=new",
     ] {
         let t = Tmp::new();
         let rsh = fake_rsh(&t);
@@ -3108,7 +3105,7 @@ fn checksum_inplace_compares_before_writing_over_ssh_and_tcp() {
             }
             identities.push(fs::metadata(t.path(&format!("dst/{name}"))).unwrap().ino());
         }
-        for _ in 0..2 {
+        for run in 0..2 {
             let mut command = compat_command();
             command
                 .arg("-e")
@@ -3140,10 +3137,14 @@ fn checksum_inplace_compares_before_writing_over_ssh_and_tcp() {
                 command.arg("--syq-no-tcp");
             }
             assert_output_ok(&command.run().unwrap());
-            for ((name, source, _), inode) in cases.iter().zip(&identities) {
-                let destination = t.path(&format!("dst/{name}"));
-                assert_eq!(&read(&destination), source, "{name}, tcp={tcp}");
-                assert_eq!(fs::metadata(&destination).unwrap().ino(), *inode);
+            for ((name, source, destination), inode) in cases.iter().zip(&mut identities) {
+                let path = t.path(&format!("dst/{name}"));
+                assert_eq!(&read(&path), source, "{name}, tcp={tcp}");
+                // A matching file is kept; a changed one is replaced, never
+                // written in place, and kept on the second run.
+                let now = fs::metadata(&path).unwrap().ino();
+                assert_eq!(now == *inode, run > 0 || source == destination, "{name}");
+                *inode = now;
             }
             assert_eq!(
                 fs::metadata(t.path("dst/readonly")).unwrap().mode() & 0o7777,
@@ -3161,7 +3162,7 @@ fn empty_remote_directory_skips_redundant_destination_batch_lookup() {
         &["--copy-if", "not dst.exists"],
         &["--if-exists=keep"],
         &["--if-exists=update-if-older"],
-        &["--inplace"],
+        &["--in-place=new"],
         &["--hash"],
     ];
     let mut cases = vec![("populated", &policies[0])];

@@ -104,6 +104,13 @@ pub enum IfExists {
     UpdateIfOlder,
 }
 
+/// Which files `--in-place` writes directly at their final names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum InPlace {
+    /// Only files the copy creates; an existing file is still replaced through a staging file
+    New,
+}
+
 impl IfExists {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -479,10 +486,10 @@ pub struct Args {
     pub transfer_integrity: bool,
     #[arg(skip)]
     pub transfer_hash_type: Option<crate::hashing::HashAlgorithm>,
-    /// Update files in place instead of writing a partial and renaming. Use this to modify a
-    /// large existing file without copying it first (saves time and disk space when only part
-    /// of it changes). Cannot be combined with -u or --ignore-existing: an interrupted
-    /// in-place write leaves a newer-looking final file those filters would then skip forever
+    /// Write new files directly at their final names instead of writing a partial and renaming.
+    /// Existing files are still replaced through a partial, unlike rsync, which updates them in
+    /// place. Cannot be combined with -u or --ignore-existing: an interrupted in-place write
+    /// leaves a newer-looking final file those filters would then skip forever
     #[arg(long, conflicts_with_all = ["update", "ignore_existing"])]
     pub inplace: bool,
     /// Remote shell command (default: ssh); controls agent forwarding when set. An ssh command keeps shared and persistent connections unless its options configure connection sharing; -v shares them only within the run
@@ -1338,7 +1345,7 @@ struct NativeCopyOperationalArgs {
     #[arg(long = "where", value_name = "EXPR")]
     where_expression: Option<String>,
     /// Update only entries satisfying a source/destination expression
-    #[arg(long, value_name = "EXPR", conflicts_with = "inplace")]
+    #[arg(long, value_name = "EXPR", conflicts_with = "in_place")]
     copy_if: Option<String>,
     /// Disable transport compression
     #[arg(long)]
@@ -1380,8 +1387,11 @@ struct NativeCopyOperationalArgs {
     /// Turn written zero ranges into sparse holes
     #[arg(long)]
     sparse: bool,
-    /// Update destination files directly, using no full-sized staging file; interruption can leave them incomplete
-    #[arg(long)]
+    /// Write the files the copy creates directly at their final names, with no staging file; interruption can leave them incomplete
+    #[arg(long = "in-place", value_enum, value_name = "MODE")]
+    in_place: Option<InPlace>,
+    /// Replaced by --in-place=new
+    #[arg(long, hide = true)]
     inplace: bool,
     /// Command-restricted receiver ceiling: refuse to touch more than N destination entries
     #[arg(long, value_name = "N", help_heading = REMOTE_TO_REMOTE_HEADING)]
@@ -3050,10 +3060,16 @@ fn apply_native_copy_operational(
         widen_dirs,
         open_noatime,
         sparse,
+        in_place,
         inplace,
         receiver_max_entries,
         receiver_max_bytes,
     } = operational;
+    anyhow::ensure!(
+        !inplace,
+        "--inplace is no longer supported: use --in-place=new, which writes only new files in place and replaces existing files through a staging file"
+    );
+    let inplace = in_place == Some(InPlace::New);
     args.expressions =
         crate::expression::Policy::compile(where_expression.as_deref(), copy_if.as_deref())?;
     args.where_expression = where_expression;
@@ -3083,7 +3099,7 @@ fn apply_native_copy_operational(
     args.ignore_from = ignore_from;
     anyhow::ensure!(
         !inplace || !matches!(if_exists, IfExists::Keep | IfExists::UpdateIfOlder),
-        "--inplace cannot combine with --if-exists=keep or --if-exists=update-if-older"
+        "--in-place cannot combine with --if-exists=keep or --if-exists=update-if-older"
     );
     args.inplace = inplace;
     args.widen_dirs = widen_dirs;

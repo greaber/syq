@@ -537,7 +537,7 @@ pub struct SmallBlock {
     pub hash: ContentDigest,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Meta {
     pub mode: u32,
     pub uid: u32,
@@ -573,6 +573,10 @@ pub mod flags {
     /// This changes only the reply; restricted grants authorize it with
     /// hard links.
     pub const REPORT_IDENTITY: u8 = 128;
+    /// The ownership a request selects. A metadata repair that sends only
+    /// what changed still sends these, so that the receiver knows which
+    /// owner and group the file is to end with (`fsops::vouch`).
+    pub const OWNERSHIP: u8 = OWNER | GROUP | REQUIRE_OWNER | REQUIRE_GROUP;
 }
 
 /// Best-effort kernel counters for one end of a TCP data socket. `None` means
@@ -618,16 +622,24 @@ pub enum Op {
         mode: u32,
         condition: TargetCondition,
     },
+    /// Create a symlink, given `meta` under `flags` before it is published
+    /// at `path`: a later change of its metadata creates it again.
     Symlink {
         path: PathBytes,
         target: PathBytes,
         condition: TargetCondition,
+        meta: Meta,
+        flags: u8,
     },
+    /// Create a device node, FIFO or socket, given its metadata as a
+    /// symlink is.
     Mknod {
         path: PathBytes,
         mode: u32,
         rdev: u64,
         condition: TargetCondition,
+        meta: Meta,
+        flags: u8,
     },
     SetMeta {
         path: PathBytes,
@@ -675,9 +687,11 @@ impl Op {
                 path.len() + meta.size_hint() + 64
             }
             Self::Hardlink { path, source, .. } => path.len() + source.len() + 64,
-            Self::Symlink { path, target, .. } => path.len() + target.len() + 64,
+            Self::Symlink {
+                path, target, meta, ..
+            } => path.len() + target.len() + meta.size_hint() + 64,
+            Self::Mknod { path, meta, .. } => path.len() + meta.size_hint() + 96,
             Self::Mkdir { path, .. }
-            | Self::Mknod { path, .. }
             | Self::Remove { path }
             | Self::Unlink { path }
             | Self::Rmdir { path } => path.len() + 96,
@@ -1410,6 +1424,18 @@ pub enum WireRequest<Data> {
     },
     /// Restore the modes PrepareDestinationPath changed. Replies Ok.
     RestoreDestinationPath,
+    /// Who the files the receiver creates in the destination would belong
+    /// to, for predicting which existing files it can change in place
+    /// (`fsops::vouch`). With `probe`, a receiver that has created nothing
+    /// on the destination's filesystem yet creates a file to learn the
+    /// owner it shows; without, as a preview asks, it says only what it
+    /// knows without creating anything. Replies `NewFileOwner`.
+    NewFileOwner {
+        /// The destination directory, where a probe goes.
+        path: PathBytes,
+        probe: bool,
+        guard: Option<ContainerGuard>,
+    },
 }
 
 /// A non-fatal scan problem. `path` is where it happened, relative to the
@@ -1743,6 +1769,21 @@ pub enum Response {
     /// A scan warning with its path. Replaces ScanWarn, which carried only
     /// text.
     ScanWarnAt(ScanWarning),
+    /// Reply to NewFileOwner.
+    NewFileOwner(NewFileOwner),
+}
+
+/// Who a file the receiver creates in the destination belongs to.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NewFileOwner {
+    /// The owner the files it creates on the destination's filesystem show
+    /// (`rooted::created_owner`), if it knows.
+    pub owner: Option<u32>,
+    /// The receiving process's effective group.
+    pub group: u32,
+    /// New files take their directory's group, as on macOS, rather than
+    /// the creator's unless the directory is set-group-ID, as on Linux.
+    pub directory_group: bool,
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).
@@ -1776,6 +1817,9 @@ pub struct DestinationFilesystemInfo {
     /// FUSE), where each file operation can cost a round trip. Senders and
     /// receivers share an exact build, so the field needs no fallback.
     pub network: bool,
+    /// The directory's filesystem reports link counts and inode numbers the
+    /// receiver trusts (`fsops::Profile::link_counts_trusted`).
+    pub link_counts_trusted: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -1807,6 +1851,10 @@ pub enum WireIoKind {
     Other,
     /// Permission denied, with receiver evidence that owner directory access is missing.
     OwnedDirectoryPermissions,
+    /// The receiver will not change this existing file's metadata in place:
+    /// it cannot vouch for the file (`fsops::vouch`). The copy replaces it
+    /// as it replaces a changed file.
+    ReplaceRequired,
 }
 
 impl WireError {

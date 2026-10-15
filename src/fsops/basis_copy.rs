@@ -98,7 +98,7 @@ fn seek_extent(file: &File, off: u64, whence: i32) -> io::Result<u64> {
     }
 }
 
-fn copy_extent(input: &File, output: &File, start: u64, end: u64) -> io::Result<()> {
+pub(super) fn copy_extent(input: &File, output: &File, start: u64, end: u64) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         let mut pos = start;

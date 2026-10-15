@@ -98,8 +98,8 @@ to require known whole-file contents. The expectation includes its algorithm
 and hexadecimal value, independently of the comparison and transfer settings.
 
 Syq checks the complete result, including reused bytes. A mismatch fails the
-file. With normal staging, checking happens before replacing the destination;
-with `--inplace`, the destination has already been modified. Matching size and
+file. Checking happens before replacing an existing destination; a new file
+written with `--in-place=new` is already at its name. Matching size and
 time allow syq to check the existing destination first and skip copying if its
 hash matches. Selection filters still apply. Dry runs do not check expectations.
 
@@ -124,8 +124,9 @@ create a snapshot; use a filesystem snapshot or stop the writer when you need
 a consistent view. Filesystem-to-filesystem copies recheck source size and
 modification time after reading, before replacing the destination. A detected
 change can trigger a retry; a failed check leaves the previous destination in
-place. These checks do not detect every concurrent change. `--inplace` lets
-destination readers see partial updates, including after an interrupted copy.
+place. These checks do not detect every concurrent change. `--in-place=new` lets
+destination readers see incomplete new files, including after an interrupted
+copy.
 
 On Linux, and on NFS or SMB destinations mounted on macOS, normal file copies
 check for delayed write errors before replacing files. This catches failures

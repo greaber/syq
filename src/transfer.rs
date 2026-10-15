@@ -240,6 +240,11 @@ pub struct Opts {
     /// times. Cleared once a destination filesystem that leaves them alone
     /// is known, as where setting them would set the target's instead.
     pub symlink_times: AtomicBool,
+    /// The destination filesystem's link counts and inode numbers can be
+    /// trusted (`fsops::Profile::link_counts_trusted`), so the receiver may
+    /// change an existing file's metadata in place. Cleared once a
+    /// filesystem that lacks them is known; the receiver decides for itself.
+    pub destination_link_counts_trusted: AtomicBool,
     pub inplace: bool,
     /// The placement requires a new destination (`--as-new`, `--into-new`).
     pub new_target: bool,
@@ -360,6 +365,11 @@ impl Opts {
                 .map_or(0, |m| m.apply_flags())
     }
 
+    /// The ownership `path`'s copy selects (`flags::OWNERSHIP`).
+    fn ownership_flags(&self, path: &[u8]) -> u8 {
+        self.flags_for(path) & flags::OWNERSHIP
+    }
+
     fn matching_flags_for(&self, path: &[u8]) -> u8 {
         self.matching_flags
             | self
@@ -382,6 +392,21 @@ impl Opts {
     fn inode_metadata_differs(&self, path: &[u8], source: &Entry, destination: &Entry) -> bool {
         source.inode_metadata.is_some()
             && self.metadata_for(path, source).inode_metadata != destination.inode_metadata
+    }
+
+    /// The same, leaving out the access time, which the receiver restores
+    /// in place on any file (`fsops::vouch`).
+    fn inode_metadata_differs_besides_atime(
+        &self,
+        path: &[u8],
+        source: &Entry,
+        destination: &Entry,
+    ) -> bool {
+        self.metadata_for(path, source)
+            .inode_metadata
+            .is_some_and(|metadata| {
+                metadata.differs_besides_atime(destination.inode_metadata.as_deref())
+            })
     }
 
     fn metadata_fix_flags(&self, path: &[u8], source: &Entry, destination: &Entry) -> u8 {
@@ -1890,7 +1915,7 @@ fn wire_os_kind(error: &WireError) -> Option<&'static str> {
         WireIoKind::NoSpace => "no_space",
         WireIoKind::QuotaExceeded => "quota_exceeded",
         WireIoKind::ReadOnly => "read_only",
-        WireIoKind::Other => "other",
+        WireIoKind::Other | WireIoKind::ReplaceRequired => "other",
     })
 }
 
@@ -2371,6 +2396,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         precise_mtime: !matches!(args.placement, Placement::Rsync),
         two_second_mtimes: Default::default(),
         symlink_times: AtomicBool::new(true),
+        destination_link_counts_trusted: AtomicBool::new(true),
         inplace: args.inplace,
         new_target: args.target_existence == Existence::New,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
@@ -3569,6 +3595,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     {
         opts.symlink_times.store(false, Relaxed);
     }
+    if initial_destination_filesystem
+        .as_ref()
+        .is_some_and(|info| !info.link_counts_trusted)
+    {
+        opts.destination_link_counts_trusted.store(false, Relaxed);
+    }
     let network_destination = initial_destination_filesystem
         .as_ref()
         .is_some_and(|info| info.network);
@@ -3585,11 +3617,16 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     });
     let defer_destination_mutations =
         args.hardlinks || multiple_distinct_sources || args.prune_before;
-    // Native new/existing forms are intentionally only the lightweight
-    // pathname checks above. Once they pass, use the ordinary engine's target
-    // conditions and publication behavior; this adapter does not add an
-    // identity precondition or a mutation-time existence recheck.
-    let exact_condition = TargetCondition::Any;
+    // Native new/existing forms check their pathnames above. A new target
+    // (`--as-new`, `--into-new`) is then also published without replacing
+    // anything, so that one another program creates at its name first is
+    // kept and the copy fails; an existing one takes the ordinary engine's
+    // conditions, with no identity precondition of its own.
+    let exact_condition = if args.target_existence == Existence::New {
+        TargetCondition::Absent
+    } else {
+        TargetCondition::Any
+    };
     let mut mutation_root_condition = TargetCondition::Any;
     let guard_containers = false;
     let mut container_guard = None;
@@ -4089,8 +4126,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     .as_ref()
                     .map(|fs| fs.identity.as_str()),
                 tune::history::activity_mode(format!(
+                    // In-place copies of new files only are a workload of
+                    // their own, apart from the earlier in-place updates.
                     "inplace={};compress={};bandwidth={};checksum={};hash={:?};integrity={};transfer_hash={:?}{}",
-                    opts.inplace, args.compress, args.bwlimit_bytes, args.checksum,
+                    if opts.inplace { "new" } else { "false" }, args.compress, args.bwlimit_bytes, args.checksum,
                     args.hash_algorithm, args.transfer_integrity, args.transfer_hash_type,
                     opts.transfer_strategy.history_suffix(opts.same_host)
                 ), transport_activity),
@@ -4297,6 +4336,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         blocked_mapping_parents: std::collections::HashSet::new(),
         directory_restorations: Default::default(),
         receiver_uid: None,
+        parent_groups: Default::default(),
+        new_file_owner: None,
         // The destination directory itself when its owner lacks write or
         // search permission. Whatever the placement, an existing directory
         // at the destination path belongs to the copy.

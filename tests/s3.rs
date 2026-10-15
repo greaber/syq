@@ -442,16 +442,37 @@ fn serve(
         }
         return;
     }
-    if fault == "copy-root-marker" {
+    if fault == "copy-root-marker" || fault == "copy-root-marker-owned" {
         let path = first.split_whitespace().nth(1).unwrap();
         match (method, path.split('?').next().unwrap()) {
             ("HEAD", "/source/data" | "/destination/child") =>
                 reply(&mut socket, 404, &[], b"", true),
             ("GET", "/source/") if path.contains("list-type=2") => reply(&mut socket, 200, &[],
                 b"<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>data/</Key><Size>0</Size></Contents><Contents><Key>data/child</Key><Size>4</Size></Contents></ListBucketResult>", false),
-            ("HEAD", "/source/data/") => reply(&mut socket, 200,
-                &[("Content-Length".into(), "0".into()), ("ETag".into(), "\"marker\"".into()),
-                  ("Last-Modified".into(), "Wed, 01 Jan 2020 00:00:00 GMT".into())], b"", true),
+            ("HEAD", "/source/data/") => {
+                let mut fields: Vec<(String, String)> = vec![
+                    ("Content-Length".into(), "0".into()),
+                    ("ETag".into(), "\"marker\"".into()),
+                    ("Last-Modified".into(), "Wed, 01 Jan 2020 00:00:00 GMT".into()),
+                ];
+                if fault == "copy-root-marker-owned" {
+                    // The marker records the test's own account, which a
+                    // download may give the directory without privilege.
+                    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+                    for (name, value) in [
+                        ("format", "1".to_owned()),
+                        ("kind", "dir".to_owned()),
+                        ("mode", "493".to_owned()),
+                        ("uid", uid.to_string()),
+                        ("gid", gid.to_string()),
+                        ("mtime", "1577836800".to_owned()),
+                        ("mtime-nsec", "0".to_owned()),
+                    ] {
+                        fields.push((format!("x-amz-meta-syq-{name}"), value));
+                    }
+                }
+                reply(&mut socket, 200, &fields, b"", true)
+            }
             ("GET", "/source/data/child") => reply(&mut socket, 200,
                 &[("ETag".into(), "\"source\"".into())], b"data", false),
             ("HEAD", "/source/data/child") => reply(&mut socket, 200,
@@ -2496,6 +2517,351 @@ fn s3_multipart_download_reuses_completed_ranges_before_getting_more() {
     }
 }
 
+/// A download writes only files it created: the partial an earlier run
+/// recorded is only read, for the parts its record vouches for, into a new
+/// partial. A reader that holds the old one open sees nothing written to it.
+#[test]
+fn s3_multipart_download_reads_a_recorded_partial_only_as_a_donor() {
+    use std::os::unix::fs::FileExt;
+    let server = Server::start("prefix-recovery-first");
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("download")).unwrap();
+    let args = [
+        "--from",
+        "s3://bucket",
+        "--srcs-in",
+        "data",
+        "--into",
+        "download",
+    ];
+    let first = server.cp(temp.path(), &args);
+    assert!(!first.status.success(), "{}", output_text(&first));
+    let record = std::fs::read_dir(temp.path().join("cache/syq/s3"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .expect("failed publication keeps its completed ranges");
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    // The retry downloads this part again; the others come from the donor.
+    saved["parts"].as_object_mut().unwrap().remove("1").unwrap();
+    std::fs::write(&record, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let partial = temp.path().join("download").join(
+        saved["partial"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap(),
+    );
+    // The part the record no longer vouches for holds other bytes, which
+    // the retry would have to overwrite to use this file.
+    let part_size = saved["part_size"].as_u64().unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&partial)
+        .unwrap()
+        .write_all_at(
+            &vec![b'z'; part_size.min(SIZE as u64 - part_size) as usize],
+            part_size,
+        )
+        .unwrap();
+    let held = std::fs::File::open(&partial).unwrap();
+    let mut before = vec![0; held.metadata().unwrap().len() as usize];
+    held.read_exact_at(&mut before, 0).unwrap();
+    let retry = server.cp(temp.path(), &args);
+    assert!(retry.status.success(), "{}", output_text(&retry));
+    assert_eq!(
+        std::fs::read(temp.path().join("download/file")).unwrap(),
+        vec![b'x'; SIZE]
+    );
+    let mut after = vec![0; before.len()];
+    held.read_exact_at(&mut after, 0).unwrap();
+    assert!(after == before, "the recorded partial was written");
+    assert!(!partial.exists(), "the donor is removed once it is read");
+}
+
+/// The recovery record of a failed multipart download in `temp`, with its
+/// path.
+fn recovery_record(temp: &Path) -> (std::path::PathBuf, serde_json::Value) {
+    let record = std::fs::read_dir(temp.join("cache/syq/s3"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .expect("failed publication keeps its completed ranges");
+    let saved = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    (record, saved)
+}
+
+/// A stale record whose partial's name now holds another file does not
+/// stop a retry: that file is left alone, and the download starts afresh.
+#[test]
+fn s3_stale_recovery_record_leaves_another_file_at_its_partial_name() {
+    // The first attempt fails before publication; the retry may request
+    // every range again.
+    let server = Server::start("prefix-recovery-fresh");
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("download")).unwrap();
+    let args = [
+        "--from",
+        "s3://bucket",
+        "--srcs-in",
+        "data",
+        "--into",
+        "download",
+    ];
+    let first = server.cp(temp.path(), &args);
+    assert!(!first.status.success(), "{}", output_text(&first));
+    let (record, mut saved) = recovery_record(temp.path());
+    saved["etag"] = serde_json::json!("\"an earlier version\"");
+    std::fs::write(&record, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let partial = temp.path().join("download").join(
+        saved["partial"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap(),
+    );
+    // Another file, created while the recorded one still exists so that it
+    // cannot reuse its inode number, takes its name.
+    let other = temp.path().join("other");
+    std::fs::write(&other, b"someone else's").unwrap();
+    std::fs::rename(&other, &partial).unwrap();
+    let retry = server.cp(temp.path(), &args);
+    assert!(retry.status.success(), "{}", output_text(&retry));
+    assert_eq!(
+        std::fs::read(temp.path().join("download/file")).unwrap(),
+        vec![b'x'; SIZE]
+    );
+    assert_eq!(std::fs::read(&partial).unwrap(), b"someone else's");
+}
+
+/// A recorded partial that cannot be read is reported and removed, and the
+/// object is downloaded again.
+#[test]
+fn s3_unreadable_recorded_partial_is_reported_and_removed() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root reads files whatever their mode");
+        return;
+    }
+    let server = Server::start("prefix-recovery-fresh");
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("download")).unwrap();
+    let args = [
+        "--from",
+        "s3://bucket",
+        "--srcs-in",
+        "data",
+        "--into",
+        "download",
+    ];
+    let first = server.cp(temp.path(), &args);
+    assert!(!first.status.success(), "{}", output_text(&first));
+    let (record, saved) = recovery_record(temp.path());
+    let partial = temp.path().join("download").join(
+        saved["partial"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap(),
+    );
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let retry = server.cp(temp.path(), &args);
+    assert!(retry.status.success(), "{}", output_text(&retry));
+    assert!(
+        output_text(&retry).contains("cannot read the partial an earlier download left"),
+        "{}",
+        output_text(&retry)
+    );
+    assert_eq!(
+        std::fs::read(temp.path().join("download/file")).unwrap(),
+        vec![b'x'; SIZE]
+    );
+    assert!(!record.exists());
+    assert!(!partial.exists(), "the unreadable partial was left behind");
+}
+
+/// Without room to copy the recorded partial's parts into a new one, the
+/// file fails, saying how much room resuming needs and which file to remove
+/// instead. The new partial is removed, and the recorded one and its record
+/// are kept: a later run with room resumes from them.
+#[cfg(debug_assertions)]
+#[test]
+fn s3_seeding_without_room_keeps_the_recorded_partial_for_a_later_run() {
+    let server = Server::start("prefix-recovery-first");
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("download")).unwrap();
+    let args = [
+        "--from",
+        "s3://bucket",
+        "--srcs-in",
+        "data",
+        "--into",
+        "download",
+    ];
+    let first = server.cp(temp.path(), &args);
+    assert!(!first.status.success(), "{}", output_text(&first));
+    let (record, saved) = recovery_record(temp.path());
+    let partial = saved["partial"].as_str().unwrap().to_owned();
+    let names = || {
+        let mut names: Vec<_> = std::fs::read_dir(temp.path().join("download"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = names();
+    let full = server
+        .command(temp.path())
+        .args(["--s3-endpoint", &server.address])
+        .args(args)
+        .env("SYQ_TEST_FAIL_DOWNLOAD_SEED", "enospc")
+        .capture_output()
+        .unwrap();
+    assert!(!full.status.success(), "{}", output_text(&full));
+    let text = output_text(&full);
+    assert!(
+        text.contains(&format!(
+            "resuming needs room for another copy of the 6.00 MiB already downloaded into {partial} \
+             in the destination; free that much space, or remove that file to start over"
+        )),
+        "{text}"
+    );
+    let (_, kept) = recovery_record(temp.path());
+    assert_eq!(kept, saved, "the record changed");
+    assert_eq!(names(), before, "a partial was left behind or lost");
+    server.requests.store(0, Ordering::Relaxed);
+    let retry = server.cp(temp.path(), &args);
+    assert!(retry.status.success(), "{}", output_text(&retry));
+    assert_eq!(
+        std::fs::read(temp.path().join("download/file")).unwrap(),
+        vec![b'x'; SIZE]
+    );
+    // Discovery HEAD + LIST, identity HEAD, final HEAD: nothing downloaded.
+    assert_eq!(server.requests.load(Ordering::Relaxed), 4);
+    assert!(!record.exists());
+}
+
+/// When seeding a new partial from the recorded one fails for another reason
+/// than a lack of room, that is reported, the recorded partial is removed,
+/// and the object is downloaded afresh, so that no retry meets the same
+/// failure.
+#[cfg(debug_assertions)]
+#[test]
+fn s3_failed_seeding_gives_up_the_recorded_partial_and_downloads_afresh() {
+    let server = Server::start("prefix-recovery-fresh");
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("download")).unwrap();
+    let args = [
+        "--from",
+        "s3://bucket",
+        "--srcs-in",
+        "data",
+        "--into",
+        "download",
+    ];
+    let first = server.cp(temp.path(), &args);
+    assert!(!first.status.success(), "{}", output_text(&first));
+    let (record, saved) = recovery_record(temp.path());
+    let partial = temp.path().join("download").join(
+        saved["partial"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap(),
+    );
+    assert!(partial.exists());
+    server.requests.store(0, Ordering::Relaxed);
+    let retry = server
+        .command(temp.path())
+        .args(["--s3-endpoint", &server.address])
+        .args(args)
+        .env("SYQ_TEST_FAIL_DOWNLOAD_SEED", "1")
+        .capture_output()
+        .unwrap();
+    assert!(retry.status.success(), "{}", output_text(&retry));
+    assert!(
+        output_text(&retry).contains("cannot reuse what an earlier download left"),
+        "{}",
+        output_text(&retry)
+    );
+    assert_eq!(
+        std::fs::read(temp.path().join("download/file")).unwrap(),
+        vec![b'x'; SIZE]
+    );
+    // Discovery HEAD + LIST, identity HEAD, final HEAD, and the GETs.
+    assert!(server.requests.load(Ordering::Relaxed) > 4);
+    assert!(!record.exists());
+    assert!(!partial.exists(), "the recorded partial was left behind");
+    let names: Vec<_> = std::fs::read_dir(temp.path().join("download"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["file"]);
+}
+
+/// On macOS a new partial takes its directory's inheritable ACL entries
+/// whatever its mode. The recorded partial's bytes are not seeded into one
+/// that lets someone read them whom the recorded one does not: its parts are
+/// downloaded again.
+#[cfg(target_os = "macos")]
+#[test]
+fn s3_resume_seeds_no_partial_that_others_can_read() {
+    let server = Server::start("prefix-recovery-fresh");
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("download")).unwrap();
+    let args = [
+        "--from",
+        "s3://bucket",
+        "--srcs-in",
+        "data",
+        "--into",
+        "download",
+    ];
+    let first = server.cp(temp.path(), &args);
+    assert!(!first.status.success(), "{}", output_text(&first));
+    let (record, saved) = recovery_record(temp.path());
+    let partial = temp.path().join("download").join(
+        saved["partial"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap(),
+    );
+    let status = std::process::Command::new("chmod")
+        .args(["+a", "user:nobody allow read,file_inherit"])
+        .arg(temp.path().join("download"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    server.requests.store(0, Ordering::Relaxed);
+    let retry = server.cp(temp.path(), &args);
+    assert!(retry.status.success(), "{}", output_text(&retry));
+    assert_eq!(
+        std::fs::read(temp.path().join("download/file")).unwrap(),
+        vec![b'x'; SIZE]
+    );
+    // Discovery HEAD + LIST, identity HEAD, final HEAD, and the GETs.
+    assert!(
+        server.requests.load(Ordering::Relaxed) > 4,
+        "the recorded partial was seeded into one nobody may read"
+    );
+    assert!(!record.exists());
+    assert!(!partial.exists(), "the recorded partial was left behind");
+}
+
 #[test]
 fn s3_invalid_initial_ranges_never_publish_a_fresh_download() {
     for fault in ["ignore-range", "etag", "corrupt", "truncated"] {
@@ -2694,6 +3060,22 @@ fn s3_usage_errors_do_not_contact_storage() {
     let temp = crate::test_support::tempdir().unwrap();
     for args in [
         vec!["--from", "s3://bucket", "data", "--as", "out", "--inplace"],
+        vec![
+            "--from",
+            "s3://bucket",
+            "data",
+            "--as",
+            "out",
+            "--in-place=new",
+        ],
+        vec![
+            "out",
+            "--to",
+            "s3://bucket",
+            "--as",
+            "data",
+            "--in-place=new",
+        ],
         vec![
             "--from",
             "s3://bucket",
@@ -5674,6 +6056,38 @@ fn server_copy_directory_to_bucket_root_skips_root_marker() {
         .iter()
         .any(|r| r["type"] == "progress" && r["scan_done"] == true && r["files_total"] == 1));
     assert_eq!(records.last().unwrap()["files_transferred"], 1);
+}
+
+/// A download gives an existing directory its marker's owner and group
+/// through a handle of the directory.
+#[test]
+fn download_directory_to_root_sets_its_owner_through_a_handle() {
+    use std::os::unix::fs::MetadataExt;
+    let server = Server::start("copy-root-marker-owned");
+    let temp = crate::test_support::tempdir().unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--copy-metadata=ownership,mtime",
+            "--from",
+            "s3://source",
+            "--src-dir",
+            "data",
+            "--as",
+            ".",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(std::fs::read(temp.path().join("child")).unwrap(), b"data");
+    let metadata = std::fs::metadata(temp.path()).unwrap();
+    assert_eq!(
+        (metadata.uid(), metadata.gid(), metadata.mtime()),
+        (
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+            1577836800
+        )
+    );
 }
 
 #[test]

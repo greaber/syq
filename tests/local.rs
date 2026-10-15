@@ -1036,6 +1036,8 @@ mod local_copy_selection;
 mod map;
 #[path = "local/metadata.rs"]
 mod metadata;
+#[path = "local/own_files.rs"]
+mod own_files;
 #[path = "local/persistence.rs"]
 mod persistence;
 #[path = "local/progress.rs"]

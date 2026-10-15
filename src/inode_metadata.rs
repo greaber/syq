@@ -53,6 +53,48 @@ pub(crate) struct InodeMetadata {
     pub crtime: Option<Timestamp>,
 }
 
+impl InodeMetadata {
+    /// Whether giving a file with `current` this metadata would set, change
+    /// or remove a `security.*` or `trusted.*` attribute.
+    pub(crate) fn privileged_attributes_differ(&self, current: Option<&Self>) -> bool {
+        let Some(wanted) = self
+            .xattrs
+            .as_ref()
+            .filter(|attributes| attributes.privileged)
+        else {
+            return false;
+        };
+        let privileged = |attributes: &ExtendedAttributes| {
+            attributes
+                .values
+                .iter()
+                .filter(|(name, _)| privileged_attribute(name))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        privileged(wanted)
+            != current
+                .and_then(|current| current.xattrs.as_ref())
+                .map(privileged)
+                .unwrap_or_default()
+    }
+
+    /// Whether giving a file with `current` (none read: nothing) this
+    /// metadata would change anything but its access time, which syq
+    /// restores in place on any file (`fsops::vouch`).
+    pub(crate) fn differs_besides_atime(&self, current: Option<&Self>) -> bool {
+        let empty = Self::default();
+        let current = current.unwrap_or(&empty);
+        (&self.acls, &self.macos_acl, &self.xattrs, self.crtime)
+            != (
+                &current.acls,
+                &current.macos_acl,
+                &current.xattrs,
+                current.crtime,
+            )
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct MacAcl {
     pub flags: u32,
@@ -437,6 +479,70 @@ mod platform {
         Ok(narrowed)
     }
 
+    /// Whether `apply_acls` and `apply_xattrs` with `metadata` and `mode`
+    /// would change `file`, judged as they judge it.
+    pub(super) fn would_change(file: &File, metadata: &InodeMetadata, mode: u32) -> Result<bool> {
+        if let Some(acls) = &metadata.acls {
+            let current = file.metadata()?;
+            let access = acls
+                .access
+                .as_deref()
+                .map(|access| access_for_mode(access, mode))
+                .transpose()?;
+            if get(file, ACCESS)? != access
+                || (current.is_dir() && get(file, DEFAULT)?.as_deref() != acls.default.as_deref())
+                || (!current.is_dir() && acls.default.is_some())
+            {
+                return Ok(true);
+            }
+        }
+        if let Some(attributes) = &metadata.xattrs {
+            for name in names(file)? {
+                if selected(&name, attributes.privileged)
+                    && attributes
+                        .values
+                        .binary_search_by(|(n, _)| n.cmp(&name))
+                        .is_err()
+                {
+                    return Ok(true);
+                }
+            }
+            for (name, value) in &attributes.values {
+                if get(file, name)?.as_deref() != Some(value) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether `metadata` would give `file` a file capability it does not
+    /// have.
+    pub(super) fn changes_privileged_attributes(
+        file: &File,
+        metadata: &InodeMetadata,
+    ) -> Result<bool> {
+        let Some(attributes) = metadata.xattrs.as_ref().filter(|a| a.privileged) else {
+            return Ok(false);
+        };
+        for name in names(file)? {
+            if super::privileged_attribute(&name)
+                && attributes
+                    .values
+                    .binary_search_by(|(n, _)| n.cmp(&name))
+                    .is_err()
+            {
+                return Ok(true);
+            }
+        }
+        for (name, value) in &attributes.values {
+            if super::privileged_attribute(name) && get(file, name)?.as_deref() != Some(value) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(super) fn apply_xattrs(file: &File, metadata: &InodeMetadata) -> Result<()> {
         if let Some(attributes) = &metadata.xattrs {
             let mut previous: Option<&[u8]> = None;
@@ -565,11 +671,6 @@ pub(crate) fn default_permissions(directory: &File) -> Result<u32> {
     Ok(0o777 & !crate::fsops::process_umask())
 }
 
-pub(crate) fn apply(file: &File, metadata: Option<&InodeMetadata>, mode: u32) -> Result<()> {
-    apply_acls(file, metadata, mode, false)?;
-    apply_inner(file, metadata, mode, false)
-}
-
 /// Set the Linux POSIX ACLs. Call this before setting the mode: a stage is
 /// created private, which masks the entries it inherits from its directory's
 /// default ACL, and a chmod to the final mode first would widen that mask,
@@ -610,6 +711,87 @@ pub(crate) fn apply_after_acls_before_publication(
     mode: u32,
 ) -> Result<()> {
     apply_inner(file, metadata, mode, true)
+}
+
+/// Whether applying `metadata` with the final `mode` would change `file`:
+/// its ACLs, extended attributes, access time or birth time. Where a part
+/// cannot be compared it counts as a change.
+/// Whether applying `metadata` through `file` would change anything but its
+/// access time, which syq restores in place on any file (`fsops::vouch`).
+pub(crate) fn would_change_besides_atime(
+    file: &File,
+    metadata: Option<&InodeMetadata>,
+    mode: u32,
+) -> Result<bool> {
+    let Some(metadata) = metadata else {
+        return Ok(false);
+    };
+    #[cfg(target_os = "linux")]
+    if platform::would_change(file, metadata, mode)? {
+        return Ok(true);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = mode;
+        if metadata.acls.is_some() {
+            return Ok(true);
+        }
+        if let Some(attributes) = &metadata.xattrs {
+            if macos_xattrs::would_change(file, attributes)? {
+                return Ok(true);
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = mode;
+        if metadata.acls.is_some() || metadata.xattrs.is_some() {
+            return Ok(true);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(acl) = &metadata.macos_acl {
+        if &macos_acl::read(file)? != acl {
+            return Ok(true);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    if metadata.macos_acl.is_some() {
+        return Ok(true);
+    }
+    let current = file.metadata()?;
+    if let Some(crtime) = metadata.crtime {
+        let created = current
+            .created()
+            .ok()
+            .and_then(|created| Timestamp::from_system_time(created).ok());
+        if created != Some(crtime) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether a Linux extended attribute's namespace grants privileges or
+/// access: `security.*`, which holds file capabilities and SELinux labels,
+/// and `trusted.*`.
+fn privileged_attribute(name: &[u8]) -> bool {
+    name.starts_with(b"security.") || name.starts_with(b"trusted.")
+}
+
+/// Whether applying `metadata` through `file` would set, change or remove
+/// a `security.*` or `trusted.*` attribute (`privileged_attribute`). Only
+/// Linux has them.
+pub(crate) fn changes_privileged_attributes(
+    file: &File,
+    metadata: Option<&InodeMetadata>,
+) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    if let Some(metadata) = metadata {
+        return platform::changes_privileged_attributes(file, metadata);
+    }
+    let _ = (file, metadata);
+    Ok(false)
 }
 
 /// A staging inode cannot inherit access grants from its destination parent.

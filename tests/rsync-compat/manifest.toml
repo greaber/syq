@@ -218,12 +218,12 @@ classification = "adapted"
 adaptation = "inplace-syq-cli"
 adaptation_kind = "invocation"
 area = "publication"
-position = "compatible"
+position = "intentional-divergence"
 baseline = "pass"
 platforms = ["linux", "macos"]
 tags = ["local", "inplace", "inode"]
 requirements = ["stable inode numbers"]
-note = "--inplace retains the destination inode while the default atomic path replaces it."
+note = "--inplace writes only new files in place; an existing destination is replaced, getting a new inode as on the default path."
 
 [[tests]]
 name = "longdir"
@@ -272,7 +272,7 @@ platforms = ["linux"]
 run_as = "root"
 tags = ["local", "inplace", "permissions"]
 requirements = ["root", "Linux fs.protected_regular"]
-note = "--inplace can update a foreign-owned file in a sticky directory when the caller has authority."
+note = "As root, --inplace updates a foreign-owned file in a sticky directory by replacing it through a staging file."
 
 [[tests]]
 name = "sender-scan-dir-escape"

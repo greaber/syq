@@ -239,14 +239,21 @@ fn hardlinks_never_use_a_representative_replaced_after_publication() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("representative"));
 }
 
+/// Unlike rsync, `--inplace` writes no existing file, so it reaches no
+/// other name of one: each existing name is replaced, and a source group's
+/// names are linked to the file that replaces its representative.
 #[test]
-fn hardlinks_inplace_keeps_existing_alias_write_semantics() {
+fn hardlinks_inplace_replaces_existing_aliases_name_by_name() {
     let t = Tmp::new();
     write(&t.path("src/a"), b"aaaa");
     fs::hard_link(t.path("src/a"), t.path("src/b")).unwrap();
     write(&t.path("src/c"), b"ccccc");
     write(&t.path("dst/a"), b"stale");
     fs::hard_link(t.path("dst/a"), t.path("dst/c")).unwrap();
+    for name in ["src/a", "src/c"] {
+        set_mtime(&t.path(name), 1_700_000_000);
+    }
+    set_mtime(&t.path("dst/a"), 1_600_000_000);
     run_ok(&[
         "-aH",
         "--inplace",
@@ -255,10 +262,9 @@ fn hardlinks_inplace_keeps_existing_alias_write_semantics() {
         &t.s("dst/"),
     ]);
     assert_eq!(identity(&t.path("dst/a")), identity(&t.path("dst/b")));
-    assert_eq!(identity(&t.path("dst/a")), identity(&t.path("dst/c")));
-    let bytes = read(&t.path("dst/a"));
-    assert!(bytes == b"aaaa" || bytes == b"ccccc");
-    assert_eq!(bytes, read(&t.path("dst/c")));
+    assert_ne!(identity(&t.path("dst/a")), identity(&t.path("dst/c")));
+    assert_eq!(read(&t.path("dst/a")), b"aaaa");
+    assert_eq!(read(&t.path("dst/c")), b"ccccc");
 }
 
 #[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
@@ -333,7 +339,7 @@ fn hardlink_hash_assertions_accept_omitted_repeated_and_mixed_algorithms() {
         for extra in [
             &[][..],
             &["--performance-tuning=copy-path=ranges"],
-            &["--inplace"],
+            &["--in-place=new"],
         ] {
             let t = Tmp::new();
             write(&t.path("src/file-0"), &bytes);

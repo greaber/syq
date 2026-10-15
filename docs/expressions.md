@@ -68,9 +68,9 @@ division by zero and failed metadata reads, fail the copy and prevent pruning;
 files already completed can remain.
 
 Conditions use observed metadata. They are not locks or atomic assertions
-against concurrent changes. `--copy-if` cannot combine with `--inplace`: an
-interrupted write could change destination metadata and make a retry skip an
-incomplete file.
+against concurrent changes. `--copy-if` cannot combine with `--in-place=new`:
+an interrupted copy can leave an incomplete new file whose metadata makes a
+retry skip it.
 
 For restricted remote copies, expressions are evaluated by the coordinator
 as copy preferences. They do not add receiver-enforced restrictions to a signed

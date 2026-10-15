@@ -131,13 +131,18 @@ pub(super) fn hash_file_as(
 ) -> Result<String> {
     let mut hasher = algorithm.hasher();
     let mut buffer = vec![0; 1024 * 1024];
+    let mut total = 0u64;
     loop {
         let n = file.read(&mut buffer)?;
         if n == 0 {
             break;
         }
         hasher.update(&buffer[..n]);
+        total += n as u64;
     }
+    #[cfg(debug_assertions)]
+    crate::fsops::record_test_event("SYQ_TEST_LOCAL_HASHES", format_args!("hash {total}"))?;
+    let _ = total;
     Ok(crate::hashing::Digest::from_hash(algorithm, &hasher.finalize()).value)
 }
 
@@ -620,6 +625,50 @@ impl CreationPermissions {
     }
 }
 
+/// Keep the existing file at `path`, whose contents match the object
+/// whose `metadata` it gets, and give it the metadata a download applies to
+/// an unchanged file. Returns false, having changed nothing, when the
+/// receiver cannot vouch for changing its metadata in place
+/// (`fsops::vouch`): the object is then downloaded to replace it. A
+/// `preview` only says which.
+pub(super) fn keep_unchanged_file(
+    root: &Root,
+    path: &RelativePath,
+    metadata: &Metadata,
+    args: &Args,
+    explicit: crate::mapping::Metadata,
+    preview: bool,
+) -> Result<bool> {
+    let flags = args.matching_meta_flags() | explicit.apply_flags();
+    if flags == 0 {
+        return Ok(true);
+    }
+    let meta = crate::proto::Meta {
+        inode_metadata: None,
+        mode: metadata.mode,
+        uid: metadata.uid,
+        gid: metadata.gid,
+        mtime: metadata.mtime,
+        mtime_nsec: metadata.nsec,
+    };
+    let file = root.open_regular_read(path)?;
+    let current = file.metadata()?;
+    let label = path.to_path_buf();
+    let place = crate::fsops::vouch::Place {
+        root,
+        relative: path,
+        label: &label,
+        preview,
+    };
+    if !crate::fsops::vouch::allows(place, &file, &current, &meta, flags)? {
+        return Ok(false);
+    }
+    if !preview {
+        crate::fsops::set_meta_file(&file, &meta, flags)?;
+    }
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_metadata(
     root: &Root,
@@ -631,24 +680,10 @@ pub(super) fn apply_metadata(
     copied: bool,
     creation: &mut CreationPermissions,
 ) -> Result<()> {
-    if metadata.kind == super::client::ObjectKind::File && !copied {
-        let flags = args.matching_meta_flags() | explicit.apply_flags();
-        if flags == 0 {
-            return Ok(());
-        }
-        return crate::fsops::set_meta_file(
-            &root.open_regular_read(path)?,
-            &crate::proto::Meta {
-                inode_metadata: None,
-                mode: metadata.mode,
-                uid: metadata.uid,
-                gid: metadata.gid,
-                mtime: metadata.mtime,
-                mtime_nsec: metadata.nsec,
-            },
-            flags,
-        );
-    }
+    debug_assert!(
+        metadata.kind != super::client::ObjectKind::File || copied,
+        "an unchanged file is kept by `keep_unchanged_file`"
+    );
     if metadata.kind == super::client::ObjectKind::File {
         return apply_file_metadata(
             &root.open_regular_read(path)?,
@@ -659,21 +694,20 @@ pub(super) fn apply_metadata(
             || creation.for_file(root, path),
         );
     }
+    debug_assert!(
+        metadata.kind == super::client::ObjectKind::Dir,
+        "a symlink gets its metadata as it is created (`symlink_metadata`)"
+    );
+    // Every change goes through a handle of the directory, never its name.
+    let file = root.open_directory(path)?;
     if args.owner || args.group || explicit.uid.is_some() || explicit.gid.is_some() {
-        root.chown(
-            path,
+        crate::fsops::chown_handle(
+            &file,
             (args.owner || explicit.uid.is_some()).then_some(metadata.uid),
             (args.group || explicit.gid.is_some()).then_some(metadata.gid),
         )?;
     }
-    if metadata.kind != super::client::ObjectKind::Symlink
-        && (copied || args.perms || explicit.mode.is_some())
-    {
-        let file = if metadata.kind == super::client::ObjectKind::Dir {
-            root.open_directory(path)?
-        } else {
-            root.open_regular_read(path)?
-        };
+    if copied || args.perms || explicit.mode.is_some() {
         // Without -p, a directory this download created gets its marker's
         // permission bits and, as a native copy gives every new directory,
         // owner access, so that a later download can update it. Creating it
@@ -700,14 +734,48 @@ pub(super) fn apply_metadata(
                 tv_nsec: metadata.nsec as _,
             },
         ];
-        if metadata.kind == super::client::ObjectKind::Symlink {
-            // Left alone where it would set the link's target instead.
-            root.set_symlink_times(path, &times)?;
-        } else {
-            root.set_times(path, &times)?;
-        }
+        crate::fsops::set_handle_times(&file, &times)?;
     }
     Ok(())
+}
+
+/// The metadata a downloaded symlink gets, as it is created
+/// (`Root::publish_symlink`), and the flags selecting it. A symlink's times
+/// are set only where the filesystem sets the link's own.
+pub(super) fn symlink_metadata(
+    metadata: &Metadata,
+    args: &Args,
+    explicit: crate::mapping::Metadata,
+    copied: bool,
+) -> (crate::proto::Meta, u8) {
+    use crate::proto::flags;
+    let mut selected = 0;
+    if args.owner || explicit.uid.is_some() {
+        selected |= flags::OWNER;
+    }
+    if explicit.uid.is_some() {
+        selected |= flags::REQUIRE_OWNER;
+    }
+    if args.group || explicit.gid.is_some() {
+        selected |= flags::GROUP;
+    }
+    if explicit.gid.is_some() {
+        selected |= flags::REQUIRE_GROUP;
+    }
+    if (copied && args.times) || args.copy_mtime_metadata || explicit.mtime.is_some() {
+        selected |= flags::TIMES;
+    }
+    (
+        crate::proto::Meta {
+            inode_metadata: None,
+            mode: metadata.mode,
+            uid: metadata.uid,
+            gid: metadata.gid,
+            mtime: metadata.mtime,
+            mtime_nsec: metadata.nsec,
+        },
+        selected,
+    )
 }
 
 // Use the file we wrote, so replacement of a temporary pathname cannot redirect

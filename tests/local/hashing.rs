@@ -599,14 +599,19 @@ fn quick_check_repairs_mode_without_destination_read_permission() {
     assert_eq!(read(&t.path("dst")), b"same contents");
 }
 
+/// A planted hard link to a file outside the destination never sees a
+/// metadata change: a content-identical file with another name is replaced
+/// to take the source's mode and time, and the other name keeps the old
+/// file as it was.
 #[test]
-fn checksum_identical_file_preserves_destination_inode() {
+fn checksum_identical_file_with_another_name_is_replaced_to_change_metadata() {
     let t = Tmp::new();
     let contents = vec![b'a'; 8 * 1024 * 1024];
     write(&t.path("src"), &contents);
     write(&t.path("dst"), &contents);
     fs::hard_link(t.path("dst"), t.path("alias")).unwrap();
     fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o644)).unwrap();
     set_mtime(&t.path("src"), 1_600_000_001);
     set_mtime(&t.path("dst"), 1_600_000_000);
     let before = fs::metadata(t.path("dst")).unwrap();
@@ -619,13 +624,17 @@ fn checksum_identical_file_preserves_destination_inode() {
         &t.s("dst"),
     ]);
 
-    assert_eq!(transferred(&output), 0, "{output}");
+    assert_eq!(transferred(&output), 1, "{output}");
     let after = fs::metadata(t.path("dst")).unwrap();
-    assert_eq!(after.dev(), before.dev());
-    assert_eq!(after.ino(), before.ino());
-    assert_eq!(fs::metadata(t.path("alias")).unwrap().ino(), before.ino());
+    assert_ne!(after.ino(), before.ino());
     assert_eq!(after.mode() & 0o777, 0o600);
     assert_eq!(after.mtime(), 1_600_000_001);
+    assert_eq!(read(&t.path("dst")), contents);
+    let alias = fs::metadata(t.path("alias")).unwrap();
+    assert_eq!(
+        (alias.ino(), alias.mode() & 0o777, alias.mtime()),
+        (before.ino(), 0o644, 1_600_000_000)
+    );
     assert!(partial_files(&t.0).is_empty());
 }
 
@@ -1105,9 +1114,13 @@ fn hash_keeps_hard_linked_destinations_that_already_match() {
         write(&t.path("src/b"), &contents);
         write(&t.path("dst/a"), &contents);
         fs::hard_link(t.path("dst/a"), t.path("dst/b")).unwrap();
+        // Matching times leave no metadata to change: a file with another
+        // name would be replaced to change it
+        // (`hash_replaces_a_matching_empty_destination_with_another_name`).
+        for name in ["src/a", "src/b", "dst/a"] {
+            set_mtime(&t.path(name), 1_700_000_000);
+        }
         let inode = fs::metadata(t.path("dst/a")).unwrap().ino();
-        // Keeping the first name changes the shared inode's metadata before
-        // the second is decided.
         if native {
             run_native_ok(&[
                 "cp",
@@ -1146,7 +1159,10 @@ fn hash_keeps_hard_linked_destinations_that_already_match() {
 }
 
 #[test]
-fn hash_keeps_an_empty_destination_that_already_matches() {
+fn hash_replaces_a_matching_empty_destination_with_another_name() {
+    // The contents match, but the times differ, and the file has another
+    // name: syq changes no such file's metadata in place, so the name the
+    // copy updates gets a new file, and the other name keeps the old one.
     for (native, remote, extra) in [
         (false, false, &[][..]),
         (false, false, &["--no-W"]),
@@ -1164,6 +1180,7 @@ fn hash_keeps_an_empty_destination_that_already_matches() {
             run_native_ok(&[
                 "cp",
                 "--hash",
+                "--copy-metadata=mtime",
                 "--srcs-in",
                 &t.s("src"),
                 "--into-existing",
@@ -1172,27 +1189,22 @@ fn hash_keeps_an_empty_destination_that_already_matches() {
         } else {
             let out = copy_tree(&t, remote, "-ac", extra);
             assert_output_ok(&out);
-            // A grouped comparison keeps it; so does the per-file path of
-            // same-machine copies without block reuse.
-            let grouped = remote || !extra.is_empty();
             assert_eq!(
                 tuning_observed(&out)["kept_files"],
-                u64::from(grouped),
-                "remote={remote} {extra:?}"
-            );
-            assert_eq!(
-                fs::metadata(t.path("dst/a")).unwrap().mtime(),
-                1_600_000_000,
+                0,
                 "remote={remote} {extra:?}"
             );
         }
-        for name in ["a", "alias"] {
-            assert_eq!(
-                fs::metadata(t.path(&format!("dst/{name}"))).unwrap().ino(),
-                inode,
-                "native={native} remote={remote} {extra:?} {name}"
-            );
-        }
+        let case = format!("native={native} remote={remote} {extra:?}");
+        let updated = fs::metadata(t.path("dst/a")).unwrap();
+        assert_ne!(updated.ino(), inode, "{case}");
+        assert_eq!(updated.mtime(), 1_600_000_000, "{case}");
+        let alias = fs::metadata(t.path("dst/alias")).unwrap();
+        assert_eq!(
+            (alias.ino(), alias.mtime()),
+            (inode, 1_500_000_000),
+            "{case}"
+        );
     }
 }
 

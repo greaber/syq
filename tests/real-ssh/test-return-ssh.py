@@ -654,7 +654,7 @@ def cold_copy_and_remembered_cases(expected):
         run("ssh", "source", "cat > " + shlex.quote(root + "/cold"), stdin=data)
         transport = ["--no-tcp", "--performance-tuning", "workers=2"]
         args = ["syq", "cp", root + "/cold", "--to", "destination", "--as", remote_root + "/data",
-                "--inplace", "--syq-path", "/usr/local/bin/syq", *transport]
+                "--in-place=new", "--syq-path", "/usr/local/bin/syq", *transport]
         process = subprocess.Popen(["ssh", "source", "exec env " + native_path + " " + shlex.join(args)],
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         try:

@@ -68,25 +68,18 @@ impl FsOps {
         }
     }
 
-    fn create_inplace_file(
-        &self,
-        root: &Root,
-        relative: &RelativePath,
-        mode: u32,
-        copy_id: &CopyId,
-    ) -> Result<File> {
-        // Other range workers, or Prepare after a CopyLocal fallback, must
-        // reopen this new inode for writing. Finalize applies the requested
-        // mode after every writer is done. Never chmod an existing destination
-        // here: its write permissions still decide whether an update is allowed.
+    fn create_inplace_file(&self, root: &Root, relative: &RelativePath, mode: u32) -> Result<File> {
+        // Every writer goes through the descriptor this creates (`stages`),
+        // and Finalize applies the requested mode after they are done.
         // The data arrives before finalization, so the file is created no
         // wider than its final mode: as creating it with that mode allows,
         // limited by the directory's default ACL or else the umask, never
-        // with a special bit.
+        // with a special bit. Creation is exclusive: syq writes contents
+        // only into a file it created.
         let mode = mode & 0o777;
         let file = self.create_new_inplace_file(root, relative, mode | 0o200, false)?;
         let created = file.metadata()?;
-        receiver_mode::note_inplace_open(copy_id, &created, true);
+        note_created_owner(&created);
         if created.mode() & 0o200 == 0 {
             // A umask or inherited default ACL can remove even owner write.
             file.set_permissions(fs::Permissions::from_mode(created.mode() | 0o200))?;
@@ -155,33 +148,85 @@ impl FsOps {
         }
     }
 
-    /// Whether every new in-place file is created through a private
-    /// directory (`create_new_inplace_file`), and so only exclusively.
-    fn creates_inplace_files_privately(&self) -> bool {
-        cfg!(target_os = "macos") && self.inode_preservation.acls
-    }
-
-    /// The in-place file this copy holds for `target`, while its name still
-    /// leads to it (`stages`). When a new file this copy created no longer
-    /// is at its name, the file fails: nothing is written to what is there
-    /// now. An existing file that is no longer there is let go, and the name
-    /// is opened again.
+    /// The file this copy writes for an in-place request at `target`
+    /// (`stages`): the new file it created at that name, while the name
+    /// still leads to it, or the stage it writes instead because the name
+    /// already held a file (`create_inplace_output`). When the new file is no
+    /// longer at its name, the file fails: nothing is written to what is
+    /// there now. A stage no longer at its own name is let go, and a new one
+    /// is made, as for any stage.
     fn held_inplace(&self, target: &RootedTarget, copy_id: &CopyId) -> Result<Option<stages::Got>> {
         let held_for = stages::of(self.stage_scope, target, copy_id, true);
         let Some(held) = stages::get(held_for)? else {
             return Ok(None);
         };
         let opened = held.file.metadata()?;
-        let named = target.root.metadata_optional(&target.relative)?;
+        let named = target.root.metadata_optional(&held.relative)?;
         if named.is_some_and(|named| (named.dev, named.ino) == (opened.dev(), opened.ino())) {
             return Ok(Some(held));
         }
-        if held.created {
+        if held.relative == target.relative {
             return Err(stages::moved(&target.label));
         }
         drop(held);
         stages::take(held_for);
         Ok(None)
+    }
+
+    /// Create what an in-place request at `target` writes, and hold it for
+    /// the request's file (`stages`): a new file at the target's name,
+    /// created exclusively in `mode`, or, when the name already holds a
+    /// file, a new stage beside it. syq writes contents only into files it
+    /// created, so an existing file is replaced as any changed file is: the
+    /// stage is published over it when the file is finalized. Returns the
+    /// file, its metadata read at creation, and whether it is a stage.
+    fn create_inplace_output(
+        &mut self,
+        target: &RootedTarget,
+        copy_id: &CopyId,
+        mode: u32,
+        group: Option<u32>,
+    ) -> Result<(File, fs::Metadata, Arc<()>, bool)> {
+        let held_for = stages::of(self.stage_scope, target, copy_id, true);
+        match self.create_inplace_file(
+            &target.root,
+            &target.relative,
+            self.inplace_group_mode(target, mode, group, false),
+        ) {
+            Ok(file) => {
+                let created = file.metadata()?;
+                note_created_owner(&created);
+                let in_use = stages::hold(
+                    held_for,
+                    &target.relative,
+                    &file,
+                    Some(created.clone()),
+                    true,
+                )?;
+                return Ok((file, created, in_use, false));
+            }
+            Err(error) if !error_is_kind(&error, io::ErrorKind::AlreadyExists) => {
+                return Err(error);
+            }
+            Err(_) => {}
+        }
+        // The stage is private until finalize gives it its final mode.
+        let creation = sidecars::begin()?;
+        let (relative, _, (file, created)) =
+            with_rooted_partial(target, copy_id, |relative, label| {
+                self.uncache_rooted(&target.root, relative);
+                create_fresh_rooted_partial(&target.root, relative, label, || {
+                    self.create_partial_rooted(&target.root, relative, PRIVATE_PARTIAL_MODE)
+                })
+            })?;
+        creation.register(
+            &target.root,
+            &relative,
+            identity_of(&created),
+            Sidecar::Partial,
+        );
+        let in_use = stages::hold(held_for, &relative, &file, Some(created.clone()), true)?;
+        Ok((file, created, in_use, true))
     }
 
     pub(super) fn reusable_partial_permissions(&self, file: &File) -> Result<bool> {
@@ -372,7 +417,6 @@ impl FsOps {
             mode,
             attempt,
             create_if_missing,
-            scanned,
             group,
         } = options;
         let target = self.destination_mutation_target(path, guard)?;
@@ -393,44 +437,23 @@ impl FsOps {
         }
         if inplace {
             self.uncache_rooted(&target.root, &target.relative);
-            if self
+            // The coordinator reuses the hashes of a file it compared; they
+            // must be of the file this writes.
+            let compared = self
                 .held_basis
-                .as_ref()
-                .is_some_and(|held| held.location == target.location() && held.copy_id == *copy_id)
-            {
-                // The coordinator reuses hashes from this inode. Never resize
-                // or write a replacement name using that earlier comparison.
-                let held = self.held_basis.take().unwrap();
-                let metadata = held.file.metadata()?;
-                let file = target.root.open_regular_read_write(&target.relative)?;
-                require_open_target(
-                    &file,
-                    &target.label,
-                    TargetCondition::Matches {
-                        dev: metadata.dev(),
-                        ino: metadata.ino(),
-                    },
-                )?;
-                receiver_mode::note_inplace_open(copy_id, &metadata, false);
-                self.set_copy_length(&file, size)?;
-                let in_use = stages::hold(
-                    stages::of(self.stage_scope, &target, copy_id, true),
-                    &target.relative,
-                    &file,
-                    None,
-                    false,
-                )?;
-                self.cache_entry(
-                    target.location(),
-                    attempt,
-                    false,
-                    CachedFile::held(file, in_use),
-                );
-                return Ok(Preparation::default());
-            }
+                .take_if(|held| held.location == target.location() && held.copy_id == *copy_id);
             // A retry, or a worker that connected again, writes the file
             // this copy already holds.
             if let Some(held) = self.held_inplace(&target, copy_id)? {
+                if let Some(compared) = compared {
+                    let (compared, written) = (compared.file.metadata()?, held.file.metadata()?);
+                    if (compared.dev(), compared.ino()) != (written.dev(), written.ino()) {
+                        bail!(
+                            "destination {} changed after it was compared",
+                            target.label.display()
+                        );
+                    }
+                }
                 self.set_copy_length(&held.file, size)
                     .with_context(|| format!("resize confined file {}", target.label.display()))?;
                 self.cache_entry(
@@ -441,128 +464,34 @@ impl FsOps {
                 );
                 return Ok(Preparation::default());
             }
-            // Where the scan found nothing, the file is created exclusively
-            // at once; otherwise an existing file is opened first, read-write
-            // because a resume hashes it through this descriptor, and its
-            // metadata, read at the open, serves finalize. A file the copy
-            // creates is always created exclusively, so finalize knows on
-            // every receiver whether it is new: one created owner-only, to
-            // wait for its group or ACL, could pass for an existing file.
-            let mut expect_new = scanned == ScannedDestination::Absent;
-            if !expect_new {
-                match target.root.open_regular_read_write_known(&target.relative) {
-                    Ok((file, opened)) => {
-                        receiver_mode::note_inplace_open(copy_id, &opened, false);
-                        self.set_copy_length(&file, size).with_context(|| {
-                            format!("resize confined file {}", target.label.display())
-                        })?;
-                        let in_use = stages::hold(
-                            stages::of(self.stage_scope, &target, copy_id, true),
-                            &target.relative,
-                            &file,
-                            Some(opened.clone()),
-                            false,
-                        )?;
-                        self.cache_entry(
-                            target.location(),
-                            attempt,
-                            false,
-                            CachedFile::held(file, in_use),
-                        );
-                        return Ok(Preparation::default());
-                    }
-                    Err(error) if error_is_kind(&error, io::ErrorKind::NotFound) => {
-                        expect_new = true;
-                    }
-                    // Anything else at the name is sorted out below.
-                    Err(_) => {}
-                }
+            if compared.is_some() {
+                // Its blocks would be skipped in a file that lacks them.
+                bail!(
+                    "destination {} was compared, but this copy does not hold it",
+                    target.label.display()
+                );
             }
-            for _ in 0..8 {
-                let found = if std::mem::take(&mut expect_new) {
-                    None
-                } else {
-                    target.root.metadata_optional(&target.relative)?
-                };
-                match found {
-                    Some(metadata) if metadata.is_file() => {
-                        // Retain a descriptor that can service the
-                        // immediately following destination hash as well
-                        // as range writes. Its metadata, read before the
-                        // writes, serves finalize.
-                        let file = target.root.open_regular_read_write(&target.relative)?;
-                        require_rooted_metadata(&file, metadata, &target.label)?;
-                        let opened = file.metadata()?;
-                        receiver_mode::note_inplace_open(copy_id, &opened, false);
-                        self.set_copy_length(&file, size).with_context(|| {
-                            format!("resize confined file {}", target.label.display())
-                        })?;
-                        let in_use = stages::hold(
-                            stages::of(self.stage_scope, &target, copy_id, true),
-                            &target.relative,
-                            &file,
-                            Some(opened.clone()),
-                            false,
-                        )?;
-                        self.cache_entry(
-                            target.location(),
-                            attempt,
-                            false,
-                            CachedFile::held(file, in_use),
-                        );
-                        return Ok(Preparation::default());
-                    }
-                    Some(metadata) if metadata.is_dir() => {
-                        bail!("destination {} is a directory", target.label.display())
-                    }
-                    Some(_) => target.root.unlink(&target.relative)?,
-                    None => match self.create_inplace_file(
-                        &target.root,
-                        &target.relative,
-                        self.inplace_group_mode(&target, mode, group, false),
-                        copy_id,
-                    ) {
-                        Ok(file) => {
-                            let opened = file.metadata()?;
-                            self.set_copy_length(&file, size).with_context(|| {
-                                format!("resize confined file {}", target.label.display())
-                            })?;
-                            let in_use = stages::hold(
-                                stages::of(self.stage_scope, &target, copy_id, true),
-                                &target.relative,
-                                &file,
-                                Some(opened.clone()),
-                                true,
-                            )?;
-                            #[cfg(debug_assertions)]
-                            test_race_barrier(
-                                "SYQ_TEST_INPLACE_CREATED_READY_FILE",
-                                "SYQ_TEST_INPLACE_CREATED_CONTINUE_FILE",
-                                "in-place file created",
-                            )?;
-                            self.cache_entry(
-                                target.location(),
-                                attempt,
-                                false,
-                                CachedFile::held(file, in_use),
-                            );
-                            return Ok(Preparation::default());
-                        }
-                        Err(error)
-                            if error.downcast_ref::<io::Error>().is_some_and(|error| {
-                                error.kind() == io::ErrorKind::AlreadyExists
-                            }) =>
-                        {
-                            continue
-                        }
-                        Err(error) => return Err(error),
-                    },
-                }
+            let (file, _, in_use, staged) =
+                self.create_inplace_output(&target, copy_id, mode, group)?;
+            if staged {
+                self.preallocate_new_partial(&file, size)?;
+            } else {
+                self.set_copy_length(&file, size)
+                    .with_context(|| format!("resize confined file {}", target.label.display()))?;
+                #[cfg(debug_assertions)]
+                test_race_barrier(
+                    "SYQ_TEST_INPLACE_CREATED_READY_FILE",
+                    "SYQ_TEST_INPLACE_CREATED_CONTINUE_FILE",
+                    "in-place file created",
+                )?;
             }
-            bail!(
-                "destination {} changed repeatedly while opening it",
-                target.label.display()
+            self.cache_entry(
+                target.location(),
+                attempt,
+                false,
+                CachedFile::held(file, in_use),
             );
+            return Ok(Preparation::default());
         }
         // A partial this creates is registered, so that an interrupted
         // receiver removes it when it is too short to be worth resuming.
@@ -808,8 +737,24 @@ impl FsOps {
     ) -> Result<Option<(u64, u64)>> {
         let (held, target) = self.take_held_basis(path, copy_id, guard)?;
         require_open_target(&held.file, &held.label, condition)?;
-        set_meta_file(&held.file, meta, flags)
-            .with_context(|| format!("set metadata on basis {}", held.label.display()))?;
+        // A content-identical file is kept only when the receiver can vouch
+        // for changing its metadata in place; the copy replaces any other
+        // (`vouch`).
+        if flags
+            & (flags::MODE | flags::OWNER | flags::GROUP | flags::TIMES | flags::REPORT_IDENTITY)
+            != 0
+            || meta.inode_metadata.is_some()
+        {
+            let current = held.file.metadata()?;
+            // A basis another job replaced at its name meanwhile has no name
+            // left: the complete file there remains the winner, and the old
+            // one needs nothing.
+            if current.nlink() > 0 {
+                vouch::require(&target, &held.file, &current, meta, flags)?;
+                set_meta_file_known(&held.file, meta, flags, &current)
+                    .with_context(|| format!("set metadata on basis {}", held.label.display()))?;
+            }
+        }
         if guard.is_some() {
             // A signed receiver keeps the pre-existing guarded behavior:
             // even an `Any` update must still be attached to its enrolled
@@ -1395,58 +1340,32 @@ impl FsOps {
         // The bytes at the start of the output that hold old contents until
         // the copy writes over them: an in-place file's, within its new length.
         let mut old_len = 0;
-        // Whether this copy created the in-place file, for the registry.
-        let mut created_inplace = false;
         let d = if inplace {
             // A retry writes the file this copy already holds.
-            let held = self.held_inplace(&target, copy_id)?;
-            created_inplace = held.as_ref().is_some_and(|held| held.created);
-            let mut opened = held.map(|held| held.file);
-            // Whether the file was created just now, empty.
-            let mut fresh = false;
-            for _ in 0..8 {
-                if opened.is_some() {
-                    break;
+            let (file, fresh) = match self.held_inplace(&target, copy_id)? {
+                Some(held) => {
+                    // A stage, when the name held another file.
+                    if held.relative != target.relative {
+                        target_label = stages::label(&target, &held.relative);
+                        target_relative = held.relative;
+                    }
+                    (held.file, false)
                 }
-                match destination_root.metadata_optional(&target_relative)? {
-                    Some(metadata) if metadata.is_file() => {
-                        let file = destination_root.open_regular_write(&target_relative, false)?;
-                        require_rooted_metadata(&file, metadata, &target_label)?;
-                        opened = Some(file);
+                None => {
+                    // The coordinator sends the in-place creation mode
+                    // (`inplace_creation_mode`).
+                    let (file, _, _, staged) =
+                        self.create_inplace_output(&target, copy_id, mode, group)?;
+                    if staged {
+                        let held =
+                            stages::get(stages::of(self.stage_scope, &target, copy_id, true))?
+                                .ok_or_else(|| stages::not_held(&target.label))?;
+                        target_label = stages::label(&target, &held.relative);
+                        target_relative = held.relative;
                     }
-                    Some(metadata) if metadata.is_dir() => {
-                        bail!("destination {} is a directory", target_label.display())
-                    }
-                    Some(_) => destination_root.unlink(&target_relative)?,
-                    None => {
-                        // The coordinator sends the in-place creation mode
-                        // (`inplace_creation_mode`).
-                        let mode = self.inplace_group_mode(&target, mode, group, false);
-                        match self.create_inplace_file(
-                            &destination_root,
-                            &target_relative,
-                            mode,
-                            copy_id,
-                        ) {
-                            Ok(file) => {
-                                opened = Some(file);
-                                (created_inplace, fresh) = (true, true);
-                            }
-                            Err(error)
-                                if error.downcast_ref::<io::Error>().is_some_and(|error| {
-                                    error.kind() == io::ErrorKind::AlreadyExists
-                                }) => {}
-                            Err(error) => return Err(error),
-                        }
-                    }
+                    (file, true)
                 }
-            }
-            let file = opened.with_context(|| {
-                format!(
-                    "destination {} changed repeatedly while opening it",
-                    target_label.display()
-                )
-            })?;
+            };
             if !fresh {
                 let metadata = file.metadata()?;
                 if metadata.dev() == source_metadata.dev()
@@ -1459,9 +1378,10 @@ impl FsOps {
                 }
                 // Never empty the file before its new contents are written:
                 // a copy that fails part way, or a destination that refuses
-                // these writes, then leaves old data rather than nothing.
-                // Only bytes past the new end go now, which also lets a
-                // clone of a shorter, unaligned source replace the rest.
+                // these writes, then leaves the earlier attempt's data
+                // rather than nothing. Only bytes past the new end go now,
+                // which also lets a clone of a shorter, unaligned source
+                // replace the rest.
                 if metadata.len() > size {
                     file.set_len(size).with_context(|| {
                         format!("shorten confined file {}", target_label.display())
@@ -1705,10 +1625,10 @@ impl FsOps {
             // attempt for this path, so CopyLocal needs no wire attempt field.
             let in_use = stages::hold(
                 stages::of(self.stage_scope, &target, copy_id, true),
-                &target.relative,
+                &target_relative,
                 &d,
                 None,
-                created_inplace,
+                true,
             )?;
             self.cache_entry(target.location(), 0, false, CachedFile::held(d, in_use));
         } else {
@@ -2047,6 +1967,74 @@ impl FsOps {
         Ok(())
     }
 
+    /// Create `put`'s file at its name, exclusively, write it and set its
+    /// metadata, for `--in-place=new`. Returns `None`, having written
+    /// nothing, when the name already holds something, or when the file
+    /// must be published without replacing: then it is staged.
+    fn create_small_inplace(
+        &mut self,
+        put: &SmallPut,
+        rooted: &RootedTarget,
+        guarded: bool,
+        meta: &mut Cow<'_, Meta>,
+        flags: &mut u8,
+    ) -> Result<Option<Option<(u64, u64)>>> {
+        if matches!(
+            put.condition,
+            TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }
+        ) {
+            return Ok(None);
+        }
+        let acl = has_acl(meta.inode_metadata.as_deref());
+        // The group publication sets, which a new file created with another
+        // one waits for owner-only (`inplace_group_mode`).
+        let group = (*flags & flags::GROUP != 0).then_some(meta.gid);
+        let create_mode = inplace_creation_mode(meta.mode, *flags, acl);
+        let mode = self.inplace_group_mode(rooted, create_mode, group, true);
+        // The whole file is written here and never read back. Its metadata,
+        // read as soon as it is created, costs an NFS client nothing and
+        // serves the metadata step and the identity.
+        let file = match self.create_new_inplace_file(&rooted.root, &rooted.relative, mode, true) {
+            Ok(file) => file,
+            Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => return Ok(None),
+            Err(error) => {
+                return Err(error.context(format!("create {}", rooted.label.display())));
+            }
+        };
+        let created = file.metadata()?;
+        note_created_owner(&created);
+        // Without -p a new file gets the mode creating it gives.
+        if *flags & flags::RECEIVER_MODE != 0 {
+            meta.to_mut().mode = self.new_file_mode(rooted, meta.mode)?;
+            *flags = (*flags & !flags::RECEIVER_MODE) | flags::MODE;
+        }
+        let data = &put.data;
+        // Tests stop a small in-place copy after it created its file, as a
+        // destination that refuses the write does.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_FAIL_INPLACE_PUT").is_some() {
+            return Err(io::Error::from_raw_os_error(libc::EPERM))
+                .with_context(|| format!("write {}", rooted.label.display()));
+        }
+        observed_write(&self.operation, &file, data, 0, self.sparse)
+            .with_context(|| format!("write {}", rooted.label.display()))?;
+        check_destination_writes(&file, &rooted.label)?;
+        set_meta_written_file(&file, meta, *flags, &created)
+            .with_context(|| format!("set metadata {}", rooted.label.display()))?;
+        // As when an in-place file is finalized (`finalize_held`): the file
+        // is finished only while its name still leads to it.
+        if guarded || rooted.root.link_counts_trusted_on(created.dev(), &file) {
+            require_rooted_named_identity_known(
+                &rooted.root,
+                &rooted.relative,
+                &rooted.label,
+                &created,
+                TargetCondition::Any,
+            )?;
+        }
+        Ok(Some(known_identity(&created, *flags)))
+    }
+
     /// Write a whole small file through its private partial and atomically
     /// rename it into place. Keeping this as one request preserves pipelining;
     /// unlike an in-place write, no partial final-named file is ever visible.
@@ -2061,198 +2049,36 @@ impl FsOps {
         let mut meta = Cow::Borrowed(&put.meta);
         let mut flags = put.flags;
         let inplace = put.inplace;
-        let condition = put.condition;
         if self.hash_policy.transfer_integrity && self.observed_payload_hash(data) != hash {
             bail!("block hash mismatch on receive");
         }
         let rooted = self.destination_mutation_target(target.path, target.guard)?;
         self.uncache_rooted(&rooted.root, &rooted.relative);
         if inplace {
-            if target.guard.is_some() {
-                bail!("guarded small-file updates require atomic publication");
+            // Only a file this creates is written at its name. Whatever else
+            // the name holds is replaced through a stage, below, as any
+            // changed file is.
+            if let Some(identity) = self.create_small_inplace(
+                put,
+                &rooted,
+                target.guard.is_some(),
+                &mut meta,
+                &mut flags,
+            )? {
+                return Ok(identity);
             }
-            // Read a file's metadata as soon as it is open: the open has
-            // just primed an NFS client's attribute cache, so it costs
-            // nothing, and it serves the metadata step and the identity
-            // afterwards.
-            let mut created = None;
-            // The mode of the existing file opened, read before the writes
-            // that clear its set-ID bits, or `None` for a new file.
-            let mut found = None;
-            let acl = has_acl(meta.inode_metadata.as_deref());
-            // The group publication sets, which a new file created with
-            // another one waits for owner-only (`inplace_group_mode`).
-            let group = (flags & flags::GROUP != 0).then_some(meta.gid);
-            // Whether a new file may be created owner-only.
-            let private = group.is_some() || acl;
-            let create_mode = inplace_creation_mode(meta.mode, flags, acl);
-            let creation_mode = || self.inplace_group_mode(&rooted, create_mode, group, true);
-            // How far the file's old contents may extend. They are written
-            // over and only then cut to the new length, so a write that
-            // fails leaves old data rather than an emptied file.
-            let mut old_len = 0;
-            let file = match condition {
-                // The whole file is written here and never read back.
-                TargetCondition::Absent => {
-                    let file = self
-                        .create_new_inplace_file(
-                            &rooted.root,
-                            &rooted.relative,
-                            creation_mode(),
-                            true,
-                        )
-                        .with_context(|| format!("create {}", rooted.label.display()))?;
-                    created = Some(file.metadata()?);
-                    file
-                }
-                TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
-                    let file = rooted.root.open_regular_write(&rooted.relative, false)?;
-                    require_open_target(&file, &rooted.label, condition)?;
-                    if flags & flags::RECEIVER_MODE != 0 {
-                        found = Some(file.metadata()?.mode());
-                    }
-                    old_len = u64::MAX;
-                    file
-                }
-                TargetCondition::Any => {
-                    // Open the name directly, creating it when absent: a
-                    // regular file there, new or existing, is the in-place
-                    // destination. Looking the name up first cost an NFS
-                    // client a request for every new file. Anything else
-                    // at the name, or an open the kernel refused, is sorted
-                    // out by the checks below. A file created owner-only,
-                    // to wait for its group or ACL, could pass for an
-                    // existing one of that mode, so where the scan may have
-                    // found one, an existing file is opened without
-                    // creating one and a missing one is created exclusively.
-                    // One created through a private directory is only ever
-                    // created exclusively.
-                    let mut expect_new = false;
-                    let mut opened = if private && put.scanned != ScannedDestination::Absent {
-                        match rooted.root.open_regular_write_known(&rooted.relative) {
-                            Ok((file, metadata)) => {
-                                old_len = metadata.len();
-                                found = Some(metadata.mode());
-                                created = Some(metadata);
-                                Some(file)
-                            }
-                            Err(error) => {
-                                expect_new = error_is_kind(&error, io::ErrorKind::NotFound);
-                                None
-                            }
-                        }
-                    } else if self.creates_inplace_files_privately() {
-                        expect_new = put.scanned == ScannedDestination::Absent;
-                        None
-                    } else {
-                        match rooted
-                            .root
-                            .open_or_create_write_only_file(&rooted.relative, creation_mode())
-                        {
-                            Ok((file, metadata)) if metadata.is_file() => {
-                                old_len = metadata.len();
-                                // The open may have created the file; the
-                                // scan says whether one was there.
-                                if put.scanned != ScannedDestination::Absent {
-                                    found = Some(metadata.mode());
-                                }
-                                created = Some(metadata);
-                                Some(file)
-                            }
-                            Ok(_) => None,
-                            Err(error) if existing_leaf_refused(&error) => None,
-                            Err(error) => return Err(error),
-                        }
-                    };
-                    for _ in 0..8 {
-                        if opened.is_some() {
-                            break;
-                        }
-                        let existing = if std::mem::take(&mut expect_new) {
-                            None
-                        } else {
-                            rooted.root.metadata_optional(&rooted.relative)?
-                        };
-                        match existing {
-                            Some(metadata) if metadata.is_file() => {
-                                let file =
-                                    rooted.root.open_regular_write(&rooted.relative, false)?;
-                                require_rooted_metadata(&file, metadata, &rooted.label)?;
-                                found = Some(metadata.mode);
-                                old_len = metadata.len;
-                                opened = Some(file);
-                                break;
-                            }
-                            Some(metadata) if metadata.is_dir() => {
-                                bail!("destination {} is a directory", rooted.label.display())
-                            }
-                            Some(_) => rooted.root.unlink(&rooted.relative)?,
-                            None => match self.create_new_inplace_file(
-                                &rooted.root,
-                                &rooted.relative,
-                                creation_mode(),
-                                true,
-                            ) {
-                                Ok(file) => {
-                                    created = Some(file.metadata()?);
-                                    opened = Some(file);
-                                    break;
-                                }
-                                Err(error)
-                                    if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {}
-                                Err(error) => return Err(error),
-                            },
-                        }
-                    }
-                    opened.with_context(|| {
-                        format!(
-                            "destination {} changed repeatedly while opening it",
-                            rooted.label.display()
-                        )
-                    })?
-                }
-            };
-            // Without -p a new file gets the mode creating it gives, and an
-            // existing one the mode it had before these writes.
-            if flags & flags::RECEIVER_MODE != 0 {
-                let mode = match found {
-                    Some(mode) => mode & 0o7777,
-                    None => self.new_file_mode(&rooted, meta.mode)?,
-                };
-                meta.to_mut().mode = mode;
-                flags = (flags & !flags::RECEIVER_MODE) | flags::MODE;
-            }
-            let meta = &*meta;
-            observed_overwrite(&self.operation, &file, data, old_len, self.sparse)
-                .with_context(|| format!("write {}", rooted.label.display()))?;
-            let len = data.len() as u64;
-            // A sparse write may end in a hole that only the length makes.
-            if self.sparse || old_len > len {
-                file.set_len(len)
-                    .with_context(|| format!("set length of {}", rooted.label.display()))?;
-            }
-            check_destination_writes(&file, &rooted.label)?;
-            match &created {
-                Some(created) => set_meta_written_file(&file, meta, flags, created),
-                None => set_meta_file(&file, meta, flags),
-            }
-            .with_context(|| format!("set metadata {}", rooted.label.display()))?;
-            if matches!(
-                condition,
-                TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }
-            ) {
-                require_rooted_named_identity(
-                    &rooted.root,
-                    &rooted.relative,
-                    &rooted.label,
-                    &file,
-                    condition,
-                )?;
-            }
-            return match &created {
-                Some(created) => Ok(known_identity(created, flags)),
-                None => published_identity(&file, flags),
-            };
+            let mut put = put.clone();
+            self.resolve_publication(
+                &rooted,
+                &mut put.meta,
+                &mut put.flags,
+                &mut None,
+                put.scanned,
+            )?;
+            let stage = self.create_small_stage(&put, rooted)?;
+            self.write_small_stage(&put, None, &stage, None)?;
+            self.publish_small_stage(&put, &stage)?;
+            return self.finish_small_stage(&put, stage);
         }
         let stage = self.create_small_stage(put, rooted)?;
         self.write_small_stage(put, None, &stage, None)?;
@@ -2832,6 +2658,9 @@ impl FsOps {
         let held_for = stages::of(self.stage_scope, target, copy_id, inplace);
         let (held, _finalizing) =
             stages::finalize(held_for).ok_or_else(|| stages::not_held(&target.label))?;
+        // An in-place request whose name held another file wrote a stage
+        // (`create_inplace_output`), which is published as any stage is.
+        let in_place = inplace && held.relative == target.relative;
         let kept = (
             held.file.try_clone()?,
             held.opened.clone(),
@@ -2839,7 +2668,7 @@ impl FsOps {
             held.created,
         );
         let result = self.finalize_held(
-            target, held, inplace, copy_id, meta, flags, scanned, mutation, expected,
+            target, held, in_place, meta, flags, scanned, mutation, expected,
         );
         if result.is_err() {
             // A stage that publication removed is let go. An in-place file
@@ -2853,7 +2682,7 @@ impl FsOps {
                     .metadata_optional(&relative)?
                     .is_some_and(|named| (named.dev, named.ino) == (held.dev(), held.ino())))
             };
-            if inplace || at_name().unwrap_or(false) {
+            if in_place || at_name().unwrap_or(false) {
                 stages::hold(held_for, &relative, &file, opened, created)?;
             }
         }
@@ -2866,7 +2695,6 @@ impl FsOps {
         target: &RootedTarget,
         held: stages::Held,
         inplace: bool,
-        copy_id: &CopyId,
         meta: &Meta,
         flags: u8,
         scanned: ScannedDestination,
@@ -2890,6 +2718,12 @@ impl FsOps {
             // reported identity are satisfied by the metadata read at the
             // open, since writes change neither device nor inode. The
             // metadata step uses the open-time read when there is one.
+            // The copy created the file exclusively at its name, so a
+            // condition that the name be free was met then.
+            let condition = match condition {
+                TargetCondition::Absent => TargetCondition::Any,
+                condition => condition,
+            };
             let fingerprint = matches!(condition, TargetCondition::MatchesFingerprint { .. });
             let current = match &opened {
                 Some(opened) if !fingerprint => opened.clone(),
@@ -2900,8 +2734,7 @@ impl FsOps {
             if let Some(expected) = expected {
                 Self::verify_expected_held(&target.root, &target.relative, &file, expected)?;
             }
-            let resolved =
-                self.inplace_final_mode(target, copy_id, &current, meta, flags, scanned)?;
+            let resolved = self.inplace_final_mode(target, meta, flags)?;
             let (meta, flags) = resolved
                 .as_ref()
                 .map_or((meta, flags), |(meta, flags)| (meta, *flags));
@@ -2910,7 +2743,15 @@ impl FsOps {
                 None => set_meta_file_known(&file, meta, flags, &current),
             }
             .with_context(|| format!("set metadata {}", target.label.display()))?;
-            if guarded || condition != TargetCondition::Any {
+            // The file is finished only while its name still leads to it:
+            // a file someone renamed into its place got nothing of the
+            // copy's, and the copy fails it. Where inode numbers cannot show
+            // which file a name leads to, only a guarded or conditional
+            // update is checked, against its condition.
+            if guarded
+                || condition != TargetCondition::Any
+                || target.root.link_counts_trusted_on(current.dev(), &file)
+            {
                 require_rooted_named_identity_known(
                     &target.root,
                     &target.relative,
@@ -3243,7 +3084,27 @@ impl FsOps {
             Request::CheckOperatorDirectoryAncestry { checks } => self
                 .check_operator_directory_ancestry(checks, None)
                 .map(Response::DirectoryRelations),
-            Request::ReceiverUser => Ok(Response::ReceiverUser(unsafe { libc::geteuid() })),
+            Request::ReceiverUser => Ok(Response::ReceiverUser(crate::rooted::own_uid())),
+            Request::NewFileOwner { path, probe, guard } => {
+                let owner = self
+                    .rooted_destination_target(path, guard.as_ref())
+                    .ok()
+                    .flatten()
+                    .and_then(|target| {
+                        let directory = target.root.open_directory(&target.relative).ok()?;
+                        let dev = directory.metadata().ok()?.dev();
+                        if *probe {
+                            target.root.created_owner_in(&target.relative, dev)
+                        } else {
+                            target.root.created_owner_known_in(&target.relative, dev)
+                        }
+                    });
+                Ok(Response::NewFileOwner(crate::proto::NewFileOwner {
+                    owner,
+                    group: unsafe { libc::getegid() },
+                    directory_group: !cfg!(target_os = "linux"),
+                }))
+            }
             Request::PrepareDestinationPath {
                 path,
                 symlink_policy,
@@ -3465,7 +3326,6 @@ impl FsOps {
                             mode,
                             attempt: *attempt,
                             create_if_missing: *create_if_missing,
-                            scanned: *scanned,
                             group: *group,
                         },
                     )
@@ -4015,27 +3875,20 @@ pub(super) fn require_safe_partial(file: &File, target: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Devices where a file this process has just created exclusively reports
-/// another owner: sshfs without uid mapping, squashed NFS, a CIFS mount with
-/// a forced uid. Ownership cannot show there that a sidecar opened without
-/// exclusive creation is new, so sidecars are created exclusively from the
-/// start instead of after that check has failed.
-fn foreign_owner_devices() -> &'static Mutex<std::collections::HashSet<u64>> {
-    static DEVICES: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
-    DEVICES.get_or_init(Default::default)
-}
-
+/// Whether a file this process has created exclusively on `dev` showed
+/// another owner than the account it runs as: sshfs without uid mapping,
+/// squashed NFS, a CIFS mount with a forced uid. Ownership cannot show
+/// there that a sidecar opened without exclusive creation is new, so
+/// sidecars are created exclusively from the start instead of after that
+/// check has failed.
 pub(super) fn creates_foreign_owners(dev: u64) -> bool {
-    foreign_owner_devices().lock().unwrap().contains(&dev)
+    crate::rooted::known_created_owner(dev).is_some_and(|uid| uid != crate::rooted::own_uid())
 }
 
+/// Remember the owner a file this process has just created exclusively
+/// shows on its filesystem (`rooted::created_owner`).
 fn note_created_owner(metadata: &fs::Metadata) {
-    if metadata.uid() != unsafe { libc::geteuid() } {
-        foreign_owner_devices()
-            .lock()
-            .unwrap()
-            .insert(metadata.dev());
-    }
+    crate::rooted::note_created_owner(metadata.dev(), metadata.uid());
 }
 
 // Ownership is required when adopting a leftover, before chmod or writes.
@@ -4342,14 +4195,14 @@ pub(super) fn create_fresh_rooted_partial(
 /// read once, however many donors are weighed; each donor's is read only
 /// when the sidecar has entries. Elsewhere the owner-only mode suffices: it
 /// masks the named entries of a POSIX default ACL.
-pub(super) struct SeedAccess<'a> {
+pub(crate) struct SeedAccess<'a> {
     output: &'a File,
     #[cfg(target_os = "macos")]
     acl: std::cell::OnceCell<Option<crate::inode_metadata::MacAcl>>,
 }
 
 impl<'a> SeedAccess<'a> {
-    pub(super) fn new(output: &'a File) -> Self {
+    pub(crate) fn new(output: &'a File) -> Self {
         Self {
             output,
             #[cfg(target_os = "macos")]
@@ -4357,7 +4210,7 @@ impl<'a> SeedAccess<'a> {
         }
     }
 
-    pub(super) fn admits(&self, donor: &File) -> bool {
+    pub(crate) fn admits(&self, donor: &File) -> bool {
         #[cfg(target_os = "macos")]
         {
             use crate::inode_metadata::read_macos_acl;

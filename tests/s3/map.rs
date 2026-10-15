@@ -483,3 +483,39 @@ fn s3_null_mtime_keeps_download_fallback_with_optional_explicit_metadata() {
         "unchanged default copy downloaded data: {requests:?}"
     );
 }
+
+/// A mapping's explicit group must be given to a downloaded symlink, as to
+/// a file: one the user cannot give fails the copy.
+#[test]
+fn s3_mapping_group_must_be_given_to_a_downloaded_symlink() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("ownership denial requires a non-root test process");
+        return;
+    }
+    let temp = test_support::tempdir().unwrap();
+    let server = MapServer::new("syq");
+    let entry = serde_json::json!({"src": {"encoding": "utf-8", "value": "prefix/link"},
+        "dst": {"encoding": "utf-8", "value": "link"}, "kind": "symlink",
+        "metadata": {"gid": 4294967294u32}});
+    std::fs::write(temp.path().join("mapping"), entry.to_string()).unwrap();
+    let output = server
+        .command(
+            temp.path(),
+            &[
+                "cp",
+                "--mapping",
+                temp.path().join("mapping").to_str().unwrap(),
+                "--from",
+                "s3://bucket",
+                "--into",
+                temp.path().join("out").to_str().unwrap(),
+            ],
+        )
+        .capture_output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "an unapplied group reported success: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

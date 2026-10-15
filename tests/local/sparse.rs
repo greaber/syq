@@ -130,46 +130,47 @@ fn sparse_updates_and_inplace_clear_old_nonzero_data() {
         // Hole punching preserves contents regardless of the filesystem's
         // record size, sharing and allocation accounting. Assert allocated
         // space for fresh outputs, where zero ranges were never written.
-        if inplace {
-            assert_eq!(read(&t.path("dst")), data);
-        } else {
-            assert_sparse_copy(&t.path("dst"), &data);
-        }
-        if inplace {
-            assert_eq!(fs::metadata(t.path("dst")).unwrap().ino(), old_inode);
-        }
+        // An existing file is replaced with --inplace too, by a fresh one.
+        assert_sparse_copy(&t.path("dst"), &data);
+        assert_ne!(fs::metadata(t.path("dst")).unwrap().ino(), old_inode);
     }
 }
 
-/// Same-host in-place copies and small in-place puts write over the old
-/// file before cutting it to length: zeros over its old bytes must clear
-/// them rather than be skipped.
+/// Same-host in-place copies and small in-place puts write a new file at
+/// its name and replace an existing one: either way the result holds the
+/// source, holes included.
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
-fn sparse_inplace_local_copies_and_small_puts_clear_old_data() {
+fn sparse_inplace_local_copies_and_small_puts_hold_the_source() {
     let large = sparse_data();
     let mut small = vec![0; 48 << 10];
     small[100..4000].copy_from_slice(&prng(3900, 31));
     small[40 << 10..(40 << 10) + 900].copy_from_slice(&prng(900, 32));
     // The kernel clone where the filesystem has one, and the userspace copy.
     for refuse_kernel_copy in [false, true] {
-        for old_extra in [777, 0] {
+        for old_extra in [Some(777), Some(0), None] {
             let t = Tmp::new();
             write_sparse_source(&t.path("src/large"), &large);
             write(&t.path("src/small"), &small);
             for name in ["large", "small"] {
                 set_mtime(&t.path(&format!("src/{name}")), 1_700_000_000);
             }
-            write(&t.path("dst/large"), &prng(large.len() + old_extra, 33));
-            write(&t.path("dst/small"), &prng(small.len() + old_extra, 34));
-            for name in ["large", "small"] {
-                fs::File::open(t.path(&format!("dst/{name}")))
-                    .unwrap()
-                    .sync_all()
-                    .unwrap();
+            fs::create_dir_all(t.path("dst")).unwrap();
+            if let Some(old_extra) = old_extra {
+                write(&t.path("dst/large"), &prng(large.len() + old_extra, 33));
+                write(&t.path("dst/small"), &prng(small.len() + old_extra, 34));
+                for name in ["large", "small"] {
+                    fs::File::open(t.path(&format!("dst/{name}")))
+                        .unwrap()
+                        .sync_all()
+                        .unwrap();
+                }
             }
-            let inodes = ["large", "small"]
-                .map(|name| fs::metadata(t.path(&format!("dst/{name}"))).unwrap().ino());
+            let inodes = ["large", "small"].map(|name| {
+                fs::metadata(t.path(&format!("dst/{name}")))
+                    .ok()
+                    .map(|metadata| metadata.ino())
+            });
             let out = compat_command()
                 .args([
                     "-aS",
@@ -185,10 +186,8 @@ fn sparse_inplace_local_copies_and_small_puts_clear_old_data() {
             assert!(read(&t.path("dst/large")) == large);
             assert!(read(&t.path("dst/small")) == small);
             for (name, inode) in ["large", "small"].into_iter().zip(inodes) {
-                assert_eq!(
-                    fs::metadata(t.path(&format!("dst/{name}"))).unwrap().ino(),
-                    inode
-                );
+                let now = fs::metadata(t.path(&format!("dst/{name}"))).unwrap().ino();
+                assert_ne!(Some(now), inode);
             }
         }
     }

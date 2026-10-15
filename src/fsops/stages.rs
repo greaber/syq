@@ -1,5 +1,5 @@
 //! The files this receiver is writing a copy's data into: each copy's
-//! sidecars ("stages"), and the files `--inplace` writes. Every connection of
+//! sidecars ("stages"), and the new files `--in-place=new` writes. Every connection of
 //! a copy runs in this process, so the descriptor that created or opened such
 //! a file is kept here, and every later write, from any connection, and
 //! Finalize go through it. A file someone renames into its place in the
@@ -111,11 +111,10 @@ impl Held {
 }
 
 /// A duplicate of a held file's descriptor, sharing its open file
-/// description, with its name and whether this copy created it.
+/// description, with its name.
 pub(super) struct Got {
     pub(super) file: File,
     pub(super) relative: RelativePath,
-    pub(super) created: bool,
     pub(super) in_use: Arc<()>,
 }
 
@@ -204,7 +203,6 @@ pub(super) fn get(target: For<'_>) -> io::Result<Option<Got>> {
     Ok(Some(Got {
         file: held.file.try_clone()?,
         relative: held.relative.clone(),
-        created: held.created,
         in_use: held.in_use.clone(),
     }))
 }

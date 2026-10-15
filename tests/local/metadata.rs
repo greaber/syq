@@ -94,8 +94,10 @@ fn native_copies_limit_new_entries_by_a_default_acl_or_else_the_umask() {
                 dst.to_str().unwrap(),
             ];
             match variant {
-                "inplace" => args.push("--inplace"),
-                "ranges" => args.extend(["--inplace", "--performance-tuning", "copy-path=ranges"]),
+                "inplace" => args.push("--in-place=new"),
+                "ranges" => {
+                    args.extend(["--in-place=new", "--performance-tuning", "copy-path=ranges"])
+                }
                 _ => {}
             }
             let output = native_copy_with_umask(umask, &args);
@@ -222,7 +224,7 @@ fn in_place_updates_keep_existing_set_id_bits() {
         let mut args = vec![
             "cp",
             "--no-progress",
-            "--inplace",
+            "--in-place=new",
             "--srcs-in",
             &src,
             "--into",
@@ -398,7 +400,7 @@ fn new_in_place_files_are_written_private_until_their_group_or_acl_is_set() {
         for path in ["batched", "ranges", "local"] {
             let t = Tmp::new();
             let copy_metadata = format!("--copy-metadata={metadata}");
-            let args = ["cp", "--inplace", copy_metadata.as_str()];
+            let args = ["cp", "--in-place=new", copy_metadata.as_str()];
             for stopped in [true, false] {
                 let run = InplaceRun {
                     args: &args,
@@ -438,7 +440,7 @@ fn an_interrupted_in_place_copy_that_keeps_the_group_ends_with_the_normal_mode()
     // has its final mode from the start, so a copy stopped part way, and the
     // copy that then finishes it, leave it as an uninterrupted copy does.
     let commands: [&[&str]; 2] = [
-        &["cp", "--inplace", "--copy-metadata=ownership"],
+        &["cp", "--in-place=new", "--copy-metadata=ownership"],
         &["rsync", "-rg", "--inplace"],
     ];
     for args in commands {
@@ -1673,19 +1675,16 @@ fn inplace_local_copy_finalizes_a_new_readonly_file() {
     assert_eq!(metadata.mode() & 0o7777, 0o400);
     assert_eq!(metadata.mtime(), 1_577_934_245);
 
-    // Keeping the creation descriptor must not bypass write permissions on
-    // an existing destination in a later invocation.
+    // An existing destination is never written in place: a later
+    // invocation replaces it, read-only or not.
     fs::set_permissions(t.path("destination"), fs::Permissions::from_mode(0o600)).unwrap();
     fs::write(t.path("destination"), b"existing read-only data").unwrap();
     fs::set_permissions(t.path("destination"), fs::Permissions::from_mode(0o400)).unwrap();
+    let inode = fs::metadata(t.path("destination")).unwrap().ino();
     let output = syq(&args);
-    if unsafe { libc::geteuid() } != 0 {
-        assert!(!output.status.success());
-        assert_eq!(read(&t.path("destination")), b"existing read-only data");
-    } else {
-        assert_output_ok(&output);
-        assert_eq!(read(&t.path("destination")), data);
-    }
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("destination")), data);
+    assert_ne!(fs::metadata(t.path("destination")).unwrap().ino(), inode);
 }
 
 #[test]
@@ -1737,7 +1736,11 @@ fn check_new_readonly_inplace_copy(native: bool, fallback: bool, umask: libc::mo
         command
     };
     command.args([
-        "--inplace",
+        if native {
+            "--in-place=new"
+        } else {
+            "--inplace"
+        },
         "--performance-tuning=comparison-block-size=1M",
         "--no-progress",
     ]);
@@ -1769,18 +1772,14 @@ fn check_new_readonly_inplace_copy(native: bool, fallback: bool, umask: libc::mo
         assert_eq!(metadata.mtime(), 1_577_934_245);
     }
     // Temporary write permission belongs only to fresh files. A later copy
-    // cannot use it to overwrite an existing read-only destination.
+    // writes nothing into an existing read-only destination: it replaces it.
     fs::set_permissions(t.path("src/a"), fs::Permissions::from_mode(0o600)).unwrap();
     fs::write(t.path("src/a"), b"changed source").unwrap();
-    if unsafe { libc::geteuid() } != 0 {
-        let output = command.run().unwrap();
-        assert!(!output.status.success(), "{output:?}");
-        assert_eq!(read(&t.path("dst/a")), data);
-        assert_eq!(
-            fs::metadata(t.path("dst/a")).unwrap().mode() & 0o7777,
-            0o400
-        );
-    }
+    let inode = fs::metadata(t.path("dst/a")).unwrap().ino();
+    let output = command.run().unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst/a")), b"changed source");
+    assert_ne!(fs::metadata(t.path("dst/a")).unwrap().ino(), inode);
 }
 
 #[test]

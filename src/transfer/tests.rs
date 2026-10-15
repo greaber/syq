@@ -440,6 +440,7 @@ fn pipeline_worker(
         hash_or_copy: false,
         precise_mtime: true,
         two_second_mtimes: Default::default(),
+        destination_link_counts_trusted: std::sync::atomic::AtomicBool::new(true),
         symlink_times: std::sync::atomic::AtomicBool::new(true),
         inplace: false,
         same_host: false,
@@ -5201,9 +5202,26 @@ fn copy_through_restricted_receiver_with(
     }
 }
 
-#[test]
-fn a_restricted_receiver_keeps_both_names_of_a_matching_destination() {
+/// Each of `names` below `root/target` holds its contents and modification
+/// time, in a file of its own: a destination file's other names never
+/// share the change a name makes (`fsops::vouch`).
+fn assert_files_of_their_own(root: &std::path::Path, names: &[(&str, &[u8], i64)]) {
     use std::os::unix::fs::MetadataExt;
+    let mut inodes = std::collections::HashSet::new();
+    for (name, contents, mtime) in names {
+        let path = root.join("target").join(name);
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(&std::fs::read(&path).unwrap(), contents, "{name}");
+        assert_eq!(metadata.mtime(), *mtime, "{name}");
+        assert!(inodes.insert(metadata.ino()), "{name} shares a file");
+    }
+}
+
+#[test]
+fn a_restricted_receiver_gives_each_name_of_a_matching_linked_destination_its_own_file() {
+    // Both names of the destination file match their sources, but their
+    // times differ. The receiver changes no file with other names in place,
+    // so each name is replaced by a file built from the old one's blocks.
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path();
     for directory in ["source", "target"] {
@@ -5215,28 +5233,17 @@ fn a_restricted_receiver_keeps_both_names_of_a_matching_destination() {
     let (a, b) = (root.join("target/a"), root.join("target/b"));
     std::fs::write(&a, b"same").unwrap();
     std::fs::hard_link(&a, &b).unwrap();
-    let inode = std::fs::metadata(&a).unwrap().ino();
-    // Keeping one name sets the times of the file both names share, which
-    // changes its change time once the clock has moved on.
-    std::thread::sleep(std::time::Duration::from_millis(50));
     let executed = copy_through_restricted_receiver(
         root,
         &[("a", 1_600_000_000), ("b", 1_600_000_000)],
         1,
         || {},
     );
-    for path in [&a, &b] {
-        let metadata = std::fs::metadata(path).unwrap();
-        assert_eq!(
-            (metadata.ino(), metadata.mtime()),
-            (inode, 1_600_000_000),
-            "{}",
-            path.display()
-        );
-    }
-    // Each name was compared once and neither was copied whole: the second
-    // name's patch was authorized after the first name was kept, against
-    // the file as keeping it left it.
+    assert_files_of_their_own(
+        root,
+        &[("a", b"same", 1_600_000_000), ("b", b"same", 1_600_000_000)],
+    );
+    // Each name was compared once and neither was copied whole.
     assert_eq!((executed.compared, executed.whole), (vec![1, 1], 0));
 }
 
@@ -5320,19 +5327,17 @@ fn link_outside(root: &std::path::Path, name: &str, count: usize) {
 }
 
 #[test]
-fn a_restricted_receiver_keeps_every_name_of_a_matching_destination() {
+fn a_restricted_receiver_gives_every_name_of_a_matching_linked_destination_its_own_file() {
     use std::os::unix::fs::MetadataExt;
     for (count, workers, outside) in [(3, 1, 0), (8, 1, 0), (3, 3, 0), (5, 3, 0), (3, 3, 16)] {
         let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path();
         let (names, inode) = linked_destination(root, count, b"same");
-        // Names outside the copy are never kept or replaced, so they leave
-        // no condition stale.
+        // Names outside the copy keep the file and its times.
         link_outside(root, &names[0], outside);
-        // Each name has a source time of its own, so keeping each name sets
-        // new times on the file they all share. That changes its change
-        // time, once the clock has moved on, and would leave stale the
-        // conditions of the other names authorized before it.
+        let before = std::fs::metadata(root.join("target").join(&names[0])).unwrap();
+        // Each name has a source time of its own: each is replaced to take
+        // it while its file has other names.
         let files: Vec<_> = names
             .iter()
             .enumerate()
@@ -5342,14 +5347,21 @@ fn a_restricted_receiver_keeps_every_name_of_a_matching_destination() {
             std::thread::sleep(std::time::Duration::from_millis(50));
         });
         let case = format!("{count} names, {workers} workers, {outside} outside");
-        for name in &names {
-            let path = root.join("target").join(name);
+        let expected: Vec<_> = files
+            .iter()
+            .map(|(name, mtime)| (*name, &b"same"[..], *mtime))
+            .collect();
+        assert_files_of_their_own(root, &expected);
+        for i in 0..outside {
+            let path = root.join("snapshots").join(format!("{}.{i}", names[0]));
+            let metadata = std::fs::metadata(&path).unwrap();
             assert_eq!(
-                std::fs::metadata(&path).unwrap().ino(),
-                inode,
-                "{case}: {name}"
+                (metadata.ino(), metadata.mtime()),
+                (inode, before.mtime()),
+                "{case}: {}",
+                path.display()
             );
-            assert_eq!(std::fs::read(&path).unwrap(), b"same", "{case}: {name}");
+            assert_eq!(std::fs::read(&path).unwrap(), b"same", "{case}");
         }
         assert_eq!(executed.whole, 0, "{case}: a name was copied whole");
         // One worker patches the names in turn, each against the file as
@@ -5362,8 +5374,7 @@ fn a_restricted_receiver_keeps_every_name_of_a_matching_destination() {
 }
 
 #[test]
-fn a_restricted_receiver_keeps_or_replaces_each_name_of_a_linked_destination() {
-    use std::os::unix::fs::MetadataExt;
+fn a_restricted_receiver_replaces_each_name_of_a_linked_destination() {
     // Two blocks: a changed name's patch sends the second and reuses the
     // first.
     let block = MIN_HASH_BLOCK_BYTES as usize;
@@ -5374,10 +5385,8 @@ fn a_restricted_receiver_keeps_or_replaces_each_name_of_a_linked_destination() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path();
     let (names, inode) = linked_destination(root, count, &old);
-    // The odd names' sources changed. Keeping the first even name sets the
-    // times the even names share, and replacing an odd name takes a link
-    // from the file: each changes its change time once the clock has moved
-    // on.
+    // The odd names' sources changed; the even names match theirs but take
+    // new times, which no name of a file with other names takes in place.
     let files: Vec<_> = names
         .iter()
         .enumerate()
@@ -5393,22 +5402,13 @@ fn a_restricted_receiver_keeps_or_replaces_each_name_of_a_linked_destination() {
     let executed = copy_through_restricted_receiver(root, &files, 1, || {
         std::thread::sleep(std::time::Duration::from_millis(50));
     });
-    let mut replaced = std::collections::HashSet::new();
-    for (i, (name, mtime)) in files.iter().enumerate() {
-        let path = root.join("target").join(name);
-        let metadata = std::fs::metadata(&path).unwrap();
-        assert_eq!(metadata.mtime(), *mtime, "{name}");
-        if i % 2 == 0 {
-            // A kept name still names the file the other kept names share.
-            assert_eq!(metadata.ino(), inode, "{name}");
-            assert_eq!(std::fs::read(&path).unwrap(), old, "{name}");
-        } else {
-            // A replaced name names a new file of its own.
-            assert_ne!(metadata.ino(), inode, "{name}");
-            assert!(replaced.insert(metadata.ino()), "{name}");
-            assert_eq!(std::fs::read(&path).unwrap(), new, "{name}");
-        }
-    }
+    let _ = inode;
+    let expected: Vec<_> = files
+        .iter()
+        .enumerate()
+        .map(|(i, (name, mtime))| (*name, if i % 2 == 0 { &old[..] } else { &new[..] }, *mtime))
+        .collect();
+    assert_files_of_their_own(root, &expected);
     // One worker patches the names in turn, each against the file as the
     // last left it: each is compared once, and none is copied whole.
     assert_eq!((executed.compared, executed.whole), (vec![1; count], 0));
@@ -5508,11 +5508,13 @@ fn a_restricted_receiver_compares_many_linked_pairs_in_few_requests() {
     let executed = copy_through_restricted_receiver(root, &files, 1, || {
         std::thread::sleep(std::time::Duration::from_millis(50));
     });
-    for ((name, contents), inode) in names.iter().zip(&inodes) {
-        let path = root.join("target").join(name);
-        assert_eq!(std::fs::metadata(&path).unwrap().ino(), *inode, "{name}");
-        assert_eq!(&std::fs::read(&path).unwrap(), contents, "{name}");
-    }
+    let _ = inodes;
+    let expected: Vec<_> = names
+        .iter()
+        .zip(&files)
+        .map(|((name, contents), (_, mtime))| (name.as_str(), &contents[..], *mtime))
+        .collect();
+    assert_files_of_their_own(root, &expected);
     // All the names share one request, and each is compared once.
     assert_eq!(executed.compared, vec![1; 2 * pairs]);
     assert_eq!((executed.hash_batches, executed.whole), (1, 0));
@@ -5540,20 +5542,24 @@ fn a_restricted_receiver_preserving_permissions_compares_linked_names_together()
     let executed = copy_through_restricted_receiver_with(root, &files, 1, true, || {
         std::thread::sleep(std::time::Duration::from_millis(50));
     });
+    let _ = inode;
     for name in &names {
         let path = root.join("target").join(name);
         let metadata = std::fs::metadata(&path).unwrap();
-        assert_eq!(metadata.ino(), inode, "{name}");
         assert_eq!(metadata.mode() & 0o7777, 0o644, "{name}");
-        assert_eq!(std::fs::read(&path).unwrap(), b"same", "{name}");
     }
+    let expected: Vec<_> = files
+        .iter()
+        .map(|(name, mtime)| (*name, &b"same"[..], *mtime))
+        .collect();
+    assert_files_of_their_own(root, &expected);
     // All the names share one request, and each is compared once.
     assert_eq!(executed.compared, vec![1; count]);
     assert_eq!((executed.hash_batches, executed.whole), (1, 0));
 }
 
 #[test]
-fn a_restricted_receiver_keeps_a_linked_destination_mode_changed_outside() {
+fn a_restricted_receiver_replaces_a_linked_destination_with_the_mode_changed_outside() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let count = 3;
     let temporary = crate::test_support::tempdir().unwrap();
@@ -5577,15 +5583,19 @@ fn a_restricted_receiver_keeps_a_linked_destination_mode_changed_outside() {
             std::fs::set_permissions(&changed, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
     });
+    let _ = inode;
     for name in &names {
         let path = root.join("target").join(name);
         let metadata = std::fs::metadata(&path).unwrap();
-        assert_eq!(metadata.ino(), inode, "{name}");
-        assert_eq!(std::fs::read(&path).unwrap(), b"same", "{name}");
-        // The mode the file had when each name was kept, not the mode
+        // The mode the file had when each name was replaced, not the mode
         // chosen before the change.
         assert_eq!(metadata.mode() & 0o7777, 0o600, "{name}");
     }
+    let expected: Vec<_> = files
+        .iter()
+        .map(|(name, mtime)| (*name, &b"same"[..], *mtime))
+        .collect();
+    assert_files_of_their_own(root, &expected);
     // Each name was compared once.
     assert_eq!(executed.compared, [1, 1, 1]);
     assert_eq!(executed.whole, 0);

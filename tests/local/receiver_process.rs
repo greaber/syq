@@ -302,7 +302,7 @@ fn inplace_writes_never_reach_a_file_put_at_a_new_files_name() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
-            "--inplace",
+            "--in-place=new",
             "--no-progress",
             "--performance-tuning",
             // Small ranges, so that every worker writes some of them.

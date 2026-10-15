@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
@@ -285,7 +286,7 @@ class NativeClientTests(unittest.TestCase):
             copy_metadata=["times", "permissions", "ownership", "hardlinks", "acls", "xattrs", "atimes", "crtimes"],
             open_noatime=True,
             sparse=True,
-            inplace=True,
+            in_place="new",
             on_event=events.append,
         )
 
@@ -316,7 +317,7 @@ class NativeClientTests(unittest.TestCase):
             "--copy-metadata", "times", "permissions", "ownership", "hardlinks", "acls", "xattrs", "atimes", "crtimes",
             "--open-noatime",
             "--sparse",
-            "--inplace",
+            "--in-place=new",
         ):
             self.assertIn(expected, argv)
         self.assertTrue(
@@ -439,6 +440,22 @@ class NativeClientTests(unittest.TestCase):
         )
         self.assertIs(removal.class_, syq.ErrorClass.IO)
         self.assertIs(removal.os_kind, syq.OsKind.PERMISSION_DENIED)
+
+    def test_cp_refuses_the_old_inplace_keyword_naming_its_replacement(self) -> None:
+        self.argv_log.unlink(missing_ok=True)
+        for value in (True, False):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(syq.SyqInvocationError, 'in_place="new"'):
+                    self.client.cp("source", into="target", inplace=value)
+
+                async def copy() -> None:
+                    await syq.AsyncClient(executable=self.executable, env=self.env).cp(
+                        "source", into="target", inplace=value
+                    )
+
+                with self.assertRaisesRegex(syq.SyqInvocationError, 'in_place="new"'):
+                    asyncio.run(copy())
+        self.assertFalse(self.argv_log.exists())
 
     def test_rm_rejects_invalid_local_helper_arguments_before_launch(self) -> None:
         self.argv_log.unlink(missing_ok=True)

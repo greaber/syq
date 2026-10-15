@@ -562,3 +562,266 @@ fn update_if_older_uses_service_time_for_foreign_objects() {
         );
     }
 }
+
+/// A destination file that holds its object's contents, but whose metadata
+/// the receiver cannot change in place, here because it has another name,
+/// is replaced by a copy of itself, checked against the object's hash where
+/// one is known: nothing is downloaded for it, the other name keeps the old
+/// file, and a preview counts it as a metadata change.
+#[test]
+fn matching_downloads_that_cannot_change_in_place_are_replaced_without_downloading() {
+    for (fault, extra, time, downloads) in [
+        (
+            "existing-policy-hash-blake3",
+            &["--copy-metadata=mtime", "--if-exists=error-if-different"][..],
+            20,
+            false,
+        ),
+        (
+            "existing-policy-nohash-once",
+            &["--copy-metadata=mtime", "--if-exists=error-if-different"][..],
+            20,
+            true,
+        ),
+        (
+            "existing-policy",
+            &["--copy-metadata=permissions"][..],
+            10,
+            false,
+        ),
+    ] {
+        let temp = test_support::tempdir().unwrap();
+        let dest = temp.path().join("destination");
+        file(&dest, b"stored", time);
+        std::fs::hard_link(&dest, temp.path().join("outside")).unwrap();
+        let mut args = vec!["--from", "s3://bucket", "object", "--as", "destination"];
+        args.extend_from_slice(extra);
+
+        let server = Server::start(fault);
+        let mut preview = args.clone();
+        preview.extend(["--dry-run", "--results", "results.jsonl"]);
+        let output = server.cp(temp.path(), &preview);
+        assert!(output.status.success(), "{fault}: {}", output_text(&output));
+        let traces: Vec<_> = parsed_results(temp.path())
+            .into_iter()
+            .filter(|record| record["action"] == "transfer_file")
+            .collect();
+        assert_eq!(traces.len(), 1, "{fault}: {traces:?}");
+        assert_eq!(
+            traces[0]["reason"], "metadata_differs",
+            "{fault}: {traces:?}"
+        );
+
+        let server = Server::start(fault);
+        let output = server.cp(temp.path(), &args);
+        assert!(output.status.success(), "{fault}: {}", output_text(&output));
+        assert_eq!(server.gate.0.load(Ordering::Relaxed), downloads, "{fault}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"stored");
+        let replaced = std::fs::metadata(&dest).unwrap();
+        let outside = std::fs::metadata(temp.path().join("outside")).unwrap();
+        assert_ne!(replaced.ino(), outside.ino(), "{fault}");
+        assert_eq!(replaced.mtime(), 10, "{fault}");
+        assert_eq!(
+            (outside.mtime(), outside.mode() & 0o777),
+            (time as i64, 0o600),
+            "{fault}"
+        );
+        if extra.contains(&"--copy-metadata=permissions") {
+            assert_eq!(replaced.mode() & 0o777, 0o640, "{fault}");
+        }
+    }
+}
+
+/// A file that matches the object by size and time but not by its stored
+/// hash, and that cannot change in place, is checked before it is copied:
+/// the object is downloaded to replace it, or, under
+/// `--if-exists=error-if-different`, the copy fails and leaves it alone.
+#[test]
+fn replacements_check_the_file_before_copying_it() {
+    for policy in [None, Some("--if-exists=error-if-different")] {
+        let temp = test_support::tempdir().unwrap();
+        let dest = temp.path().join("destination");
+        file(&dest, b"STORED", 10);
+        std::fs::hard_link(&dest, temp.path().join("outside")).unwrap();
+        let mut args = vec![
+            "--from",
+            "s3://bucket",
+            "object",
+            "--as",
+            "destination",
+            "--copy-metadata=permissions",
+        ];
+        args.extend(policy);
+        let server = Server::start("existing-policy-hash-blake3");
+        let output = server.cp(temp.path(), &args);
+        assert_eq!(
+            std::fs::read(temp.path().join("outside")).unwrap(),
+            b"STORED",
+            "{policy:?}"
+        );
+        if policy.is_some() {
+            assert!(!output.status.success(), "{}", output_text(&output));
+            assert!(
+                output_text(&output).contains("destination contents differ"),
+                "{}",
+                output_text(&output)
+            );
+            assert_eq!(std::fs::read(&dest).unwrap(), b"STORED");
+            continue;
+        }
+        assert!(output.status.success(), "{}", output_text(&output));
+        assert!(
+            server.gate.0.load(Ordering::Relaxed),
+            "nothing was downloaded"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"stored");
+        assert_eq!(std::fs::metadata(&dest).unwrap().mode() & 0o777, 0o640);
+    }
+}
+
+/// A file just hashed to compare it with the object, whether by `--hash`
+/// or with a stored hash because the times differ, is not read again to
+/// check it before it is copied to replace it.
+#[cfg(debug_assertions)]
+#[test]
+fn replacements_hash_a_compared_file_once() {
+    for (fault, extra, time) in [
+        (
+            "existing-policy-hash-sha256",
+            &[
+                "--integrity-checking=compare=sha256",
+                "--copy-metadata=permissions",
+            ][..],
+            10,
+        ),
+        (
+            "existing-policy-hash-blake3",
+            &["--copy-metadata=mtime"][..],
+            20,
+        ),
+    ] {
+        let temp = test_support::tempdir().unwrap();
+        let dest = temp.path().join("destination");
+        file(&dest, b"stored", time);
+        std::fs::hard_link(&dest, temp.path().join("outside")).unwrap();
+        let hashes = temp.path().join("hashes");
+        let server = Server::start(fault);
+        let output = server
+            .command(temp.path())
+            .args(["--s3-endpoint", &server.address])
+            .args(["--from", "s3://bucket", "object", "--as", "destination"])
+            .args(extra)
+            .env("SYQ_TEST_LOCAL_HASHES", &hashes)
+            .capture_output()
+            .unwrap();
+        assert!(output.status.success(), "{fault}: {}", output_text(&output));
+        assert!(
+            !server.gate.0.load(Ordering::Relaxed),
+            "{fault}: downloaded"
+        );
+        let replaced = std::fs::metadata(&dest).unwrap();
+        let outside = std::fs::metadata(temp.path().join("outside")).unwrap();
+        assert_ne!(replaced.ino(), outside.ino(), "{fault}");
+        assert_eq!(
+            std::fs::read_to_string(&hashes).unwrap(),
+            "hash 6\n",
+            "{fault}: the file was not hashed exactly once"
+        );
+    }
+}
+
+/// On macOS a new file takes its directory's inheritable ACL entries
+/// whatever its mode. A file that cannot change in place is not copied into
+/// a staging file that lets someone read it whom the file does not: the
+/// object is downloaded instead, and replaces that file, under
+/// `--if-exists=error-if-different` too.
+#[cfg(target_os = "macos")]
+#[test]
+fn replacements_stage_no_copy_that_others_can_read() {
+    for policy in ["update", "error-if-different"] {
+        let temp = test_support::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let dest = shared.join("destination");
+        file(&dest, b"stored", 10);
+        std::fs::hard_link(&dest, temp.path().join("outside")).unwrap();
+        let status = std::process::Command::new("chmod")
+            .args(["+a", "user:nobody allow read,file_inherit"])
+            .arg(&shared)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let server = Server::start("existing-policy");
+        let if_exists = format!("--if-exists={policy}");
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--from",
+                "s3://bucket",
+                "object",
+                "--as",
+                "shared/destination",
+                "--copy-metadata=permissions",
+                if_exists.as_str(),
+            ],
+        );
+        // The download replaces the file it matched, as a copy would have,
+        // whatever the policy.
+        assert!(
+            output.status.success(),
+            "{policy}: {}",
+            output_text(&output)
+        );
+        assert!(
+            server.gate.0.load(Ordering::Relaxed),
+            "{policy}: the file was copied into a staging file nobody may read"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"stored");
+        let replaced = std::fs::metadata(&dest).unwrap();
+        let outside = std::fs::metadata(temp.path().join("outside")).unwrap();
+        assert_ne!(replaced.ino(), outside.ino(), "{policy}");
+        assert_eq!(replaced.mode() & 0o777, 0o640, "{policy}");
+    }
+}
+
+/// A preview creates nothing to learn whom the receiver's files belong to,
+/// even on a filesystem where it would have to: it predicts.
+#[cfg(debug_assertions)]
+#[test]
+fn previews_create_nothing_to_learn_file_owners() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: needs an account other than root");
+        return;
+    }
+    let temp = test_support::tempdir().unwrap();
+    let dest = temp.path().join("destination");
+    file(&dest, b"stored", 10);
+    let probes = temp.path().join("probes");
+    let other = (unsafe { libc::geteuid() } + 1).to_string();
+    let server = Server::start("existing-policy");
+    let output = server
+        .command(temp.path())
+        .args(["--s3-endpoint", &server.address])
+        .args([
+            "--from",
+            "s3://bucket",
+            "object",
+            "--as",
+            "destination",
+            "--copy-metadata=permissions",
+            "--dry-run",
+        ])
+        // A filesystem whose files show another owner than the account,
+        // where the owner would have to be learned by creating a file.
+        .env("SYQ_TEST_OWN_UID", &other)
+        .env("SYQ_TEST_PROBE_LOG", &probes)
+        .capture_output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(
+        !probes.exists(),
+        "a preview created a probe: {}",
+        std::fs::read_to_string(&probes).unwrap_or_default()
+    );
+    assert_eq!(std::fs::metadata(&dest).unwrap().mode() & 0o777, 0o600);
+}

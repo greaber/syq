@@ -207,6 +207,8 @@ os.utime(file, ns=(1_000_000_000_123456789, file.stat().st_mtime_ns))
 import os
 print(' '.join(str(os.stat({destination!r} + '/dir/' + name).st_ino) for name in ('file', 'alias', 'third')))
 ''')
+    # Reading the copy above changed its access time; the rerun restores it
+    # in place, so the group keeps its file and links the new name to it.
     assert after.split() == [before.strip()] * 3, (before, after)
     # Later core cases expect the destination to have no enrollment.
     import json
@@ -251,7 +253,7 @@ def failed_copies():
                         '--srcs-in', str(source), '--to', 'destination', '--into', destination,
                         '--syq-path', wrapper, '--performance-tuning=workers=1', '--no-progress', *transport]
                     if inplace:
-                        command.extend(['--if-exists=update', '--inplace'])
+                        command.extend(['--if-exists=update', '--in-place=new'])
                     result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, env=env)
                     assert result.returncode != 0, result.stdout
                     assert 'injected attribute reconciliation failure' in result.stdout, result.stdout
