@@ -679,47 +679,109 @@ fn replacements_check_the_file_before_copying_it() {
     }
 }
 
+/// A file just hashed to compare it with the object, whether by `--hash`
+/// or with a stored hash because the times differ, is not read again to
+/// check it before it is copied to replace it.
+#[cfg(debug_assertions)]
+#[test]
+fn replacements_hash_a_compared_file_once() {
+    for (fault, extra, time) in [
+        (
+            "existing-policy-hash-sha256",
+            &[
+                "--integrity-checking=compare=sha256",
+                "--copy-metadata=permissions",
+            ][..],
+            10,
+        ),
+        (
+            "existing-policy-hash-blake3",
+            &["--copy-metadata=mtime"][..],
+            20,
+        ),
+    ] {
+        let temp = test_support::tempdir().unwrap();
+        let dest = temp.path().join("destination");
+        file(&dest, b"stored", time);
+        std::fs::hard_link(&dest, temp.path().join("outside")).unwrap();
+        let hashes = temp.path().join("hashes");
+        let server = Server::start(fault);
+        let output = server
+            .command(temp.path())
+            .args(["--s3-endpoint", &server.address])
+            .args(["--from", "s3://bucket", "object", "--as", "destination"])
+            .args(extra)
+            .env("SYQ_TEST_LOCAL_HASHES", &hashes)
+            .capture_output()
+            .unwrap();
+        assert!(output.status.success(), "{fault}: {}", output_text(&output));
+        assert!(
+            !server.gate.0.load(Ordering::Relaxed),
+            "{fault}: downloaded"
+        );
+        let replaced = std::fs::metadata(&dest).unwrap();
+        let outside = std::fs::metadata(temp.path().join("outside")).unwrap();
+        assert_ne!(replaced.ino(), outside.ino(), "{fault}");
+        assert_eq!(
+            std::fs::read_to_string(&hashes).unwrap(),
+            "hash 6\n",
+            "{fault}: the file was not hashed exactly once"
+        );
+    }
+}
+
 /// On macOS a new file takes its directory's inheritable ACL entries
 /// whatever its mode. A file that cannot change in place is not copied into
 /// a staging file that lets someone read it whom the file does not: the
-/// object is downloaded instead.
+/// object is downloaded instead, and replaces that file, under
+/// `--if-exists=error-if-different` too.
 #[cfg(target_os = "macos")]
 #[test]
 fn replacements_stage_no_copy_that_others_can_read() {
-    let temp = test_support::tempdir().unwrap();
-    let shared = temp.path().join("shared");
-    std::fs::create_dir(&shared).unwrap();
-    let dest = shared.join("destination");
-    file(&dest, b"stored", 10);
-    std::fs::hard_link(&dest, temp.path().join("outside")).unwrap();
-    let status = std::process::Command::new("chmod")
-        .args(["+a", "user:nobody allow read,file_inherit"])
-        .arg(&shared)
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let server = Server::start("existing-policy");
-    let output = server.cp(
-        temp.path(),
-        &[
-            "--from",
-            "s3://bucket",
-            "object",
-            "--as",
-            "shared/destination",
-            "--copy-metadata=permissions",
-        ],
-    );
-    assert!(output.status.success(), "{}", output_text(&output));
-    assert!(
-        server.gate.0.load(Ordering::Relaxed),
-        "the file was copied into a staging file nobody may read"
-    );
-    assert_eq!(std::fs::read(&dest).unwrap(), b"stored");
-    let replaced = std::fs::metadata(&dest).unwrap();
-    let outside = std::fs::metadata(temp.path().join("outside")).unwrap();
-    assert_ne!(replaced.ino(), outside.ino());
-    assert_eq!(replaced.mode() & 0o777, 0o640);
+    for policy in ["update", "error-if-different"] {
+        let temp = test_support::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let dest = shared.join("destination");
+        file(&dest, b"stored", 10);
+        std::fs::hard_link(&dest, temp.path().join("outside")).unwrap();
+        let status = std::process::Command::new("chmod")
+            .args(["+a", "user:nobody allow read,file_inherit"])
+            .arg(&shared)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let server = Server::start("existing-policy");
+        let if_exists = format!("--if-exists={policy}");
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--from",
+                "s3://bucket",
+                "object",
+                "--as",
+                "shared/destination",
+                "--copy-metadata=permissions",
+                if_exists.as_str(),
+            ],
+        );
+        // The download replaces the file it matched, as a copy would have,
+        // whatever the policy.
+        assert!(
+            output.status.success(),
+            "{policy}: {}",
+            output_text(&output)
+        );
+        assert!(
+            server.gate.0.load(Ordering::Relaxed),
+            "{policy}: the file was copied into a staging file nobody may read"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"stored");
+        let replaced = std::fs::metadata(&dest).unwrap();
+        let outside = std::fs::metadata(temp.path().join("outside")).unwrap();
+        assert_ne!(replaced.ino(), outside.ino(), "{policy}");
+        assert_eq!(replaced.mode() & 0o777, 0o640, "{policy}");
+    }
 }
 
 /// A preview creates nothing to learn whom the receiver's files belong to,
