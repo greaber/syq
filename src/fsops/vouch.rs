@@ -260,10 +260,11 @@ pub(super) fn refusal(
 /// no set-ID bit or file capability,
 /// which writing it would take away, and let no one read or write it whom
 /// its final permissions do not: its permission bits must be among the
-/// final ones, its group the final one or unable to read it, and its ACL
-/// none beyond its mode, or exactly the final one. Without `-p`, `-g` or
-/// ACLs, the file keeps its mode, group or ACL. `current` was read through
-/// `file`.
+/// final ones, its group the final one or unable to read or write it, and
+/// its ACL the one it ends with: the one the copy gives it, or without ACL
+/// copying the one a new file there would inherit
+/// (`inode_metadata::acl_differs_from_final`). Without `-p` or `-g`, the
+/// file keeps its mode or group. `current` was read through `file`.
 pub(crate) fn update_refusal(
     place: Place<'_>,
     file: &File,
@@ -304,16 +305,21 @@ pub(crate) fn update_refusal(
             "its mode lets others read or write it whom the copy's mode does not",
         )));
     }
-    if flags & flags::GROUP != 0 && current.gid() != meta.gid && current.mode() & 0o040 != 0 {
+    if flags & flags::GROUP != 0 && current.gid() != meta.gid && current.mode() & 0o060 != 0 {
         return Ok(Some((
             WiderPermissions,
-            "its group, which the copy changes, can read it",
+            "its group, which the copy changes, can read or write it",
         )));
     }
-    if crate::inode_metadata::acl_wider_than_final(file, meta.inode_metadata.as_deref(), mode)? {
+    if crate::inode_metadata::acl_differs_from_final(
+        file,
+        meta.inode_metadata.as_deref(),
+        || place.root.parent_directory(place.relative),
+        mode,
+    )? {
         return Ok(Some((
             WiderPermissions,
-            "it has an ACL beyond its mode that the copy does not give it",
+            "its ACL is not the one it ends with, which may keep out someone it lets in",
         )));
     }
     Ok(None)

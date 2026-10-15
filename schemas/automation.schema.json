@@ -926,7 +926,7 @@
         },
         "replaced_not_in_place": {
           "type": "object",
-          "description": "With --in-place=update, existing files replaced instead of updated in place, by reason; planned replacements in a dry run.",
+          "description": "With --in-place=update, existing files replaced instead of updated in place, by reason; estimated in a dry run.",
           "properties": {
             "not_regular": {
               "$ref": "#/$defs/u64"

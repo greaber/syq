@@ -2312,7 +2312,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         bail!("--coordinate-at currently applies only to copies between two remote endpoints");
     }
     // The copy runs here, not on a remote coordinator, which warns itself.
-    if args.in_place_update && !args.dry_run {
+    if args.in_place_update && !args.dry_run && !args.quiet {
         crate::output::diagnostic!(
             "syq: warning: {}: anyone who already has an existing file open can read its new contents, and an interruption leaves a file partly updated",
             interface_option(&args, "--in-place=update", "--inplace")

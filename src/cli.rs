@@ -3086,7 +3086,7 @@ fn apply_native_copy_operational(
     } = operational;
     anyhow::ensure!(
         !inplace,
-        "--inplace is no longer supported: use --in-place=new, which writes only new files in place and replaces existing files through a staging file"
+        "--inplace is no longer supported: use --in-place=new, which writes only new files in place and replaces existing files through a staging file, or --in-place=update, which also updates existing files in place, as --inplace did, where syq can vouch for them"
     );
     let inplace = in_place.is_some();
     args.in_place_update = in_place == Some(InPlace::Update);

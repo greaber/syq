@@ -117,6 +117,7 @@ pub(super) struct Got {
     pub(super) relative: RelativePath,
     pub(super) in_use: Arc<()>,
     /// This copy created the file, as `Held::created`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(super) created: bool,
 }
 

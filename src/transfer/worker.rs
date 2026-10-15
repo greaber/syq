@@ -1107,6 +1107,9 @@ impl Worker {
                         Ok(matched) => matched,
                         Err(error) => {
                             self.sched.ranges_ready(idx, vec![]);
+                            if self.replace_instead(idx, &error) {
+                                return Ok(());
+                            }
                             if self.transport_dead() {
                                 self.sched.requeue(idx);
                             }
@@ -1205,14 +1208,14 @@ impl Worker {
             // below is reused rather than hashing the contents a second time.
             // A file the equality probe above found different is not compared
             // again.
-            let inplace_ranges =
+            let inplace_diff =
                 if inplace && final_is_file && (reuse_blocks || (checksum && !known_different)) {
                     let diff = self.diff_final_and_hold(&job)?;
                     if diff.ranges.is_empty() && diff.held_len == Some(size) {
                         self.finish_matched_basis(idx, &job)?;
                         return Ok((vec![], false));
                     }
-                    Some(diff.ranges)
+                    Some(diff)
                 } else {
                     None
                 };
@@ -1224,6 +1227,7 @@ impl Worker {
                 &job,
                 inplace || !final_is_file || (!reuse_blocks && (!checksum || job.replace)),
             )?;
+            let inplace_ranges = inplace_diff.map(|diff| diff.ranges);
 
             if prepared.partial_size.is_some() || prepared.has_candidates || final_is_file {
                 self.sched.request_direct_fallback();
@@ -1391,21 +1395,25 @@ impl Worker {
         let Some(reason) = crate::fsops::vouch::replace_reason(error) else {
             return false;
         };
-        let mut jobs = self.sched.jobs.lock().unwrap();
-        let job = &mut jobs[idx];
-        if job.replace {
+        if self.sched.jobs.lock().unwrap()[idx].replace {
             return false;
         }
+        self.refuse_in_place(idx, reason);
+        self.sched.requeue(idx);
+        true
+    }
+
+    /// Have the file at `idx` replaced, as the receiver asked for `reason`:
+    /// under `--in-place=update`, written to a stage instead of in place,
+    /// and counted (`note_replaced`).
+    fn refuse_in_place(&self, idx: usize, reason: crate::proto::ReplaceReason) {
+        let mut jobs = self.sched.jobs.lock().unwrap();
+        let job = &mut jobs[idx];
         job.replace = true;
-        // `--in-place=update` found the file one it will not update in
-        // place: it is copied to a stage instead.
         if self.opts.inplace_update {
             job.inplace = false;
             job.in_place_refusal = Some(reason);
         }
-        drop(jobs);
-        self.sched.requeue(idx);
-        true
     }
 
     /// Under `--in-place=update`, for a file the scan found, the metadata
@@ -1453,6 +1461,11 @@ impl Worker {
                 len,
                 condition: job.target_condition,
                 guard: job.container_guard.clone(),
+                update: if off == 0 {
+                    self.in_place_update(job)
+                } else {
+                    None
+                },
             })?;
             self.src.send(Request::HashBlocks {
                 off,
@@ -1756,6 +1769,9 @@ impl Worker {
                 len: job.entry.size,
                 condition: job.target_condition,
                 guard: job.container_guard.clone(),
+                // The receiver refuses a file it will not update in place
+                // before reading it.
+                update: self.in_place_update(job),
             },
             "hash and retain destination basis",
         )?;

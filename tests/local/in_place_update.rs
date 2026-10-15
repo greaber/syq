@@ -151,96 +151,84 @@ fn a_file_of_ones_own_is_updated_in_place_writing_only_what_changed() {
 }
 
 /// `syq cp --in-place=update` is the same option; `--in-place=new` replaces
-/// the file.
+/// the file. `-q` leaves out the warning.
 #[test]
 fn syq_cp_in_place_update_keeps_the_inode_and_new_replaces_it() {
-    for (mode, kept) in [("update", true), ("new", false)] {
+    for (mode, kept, quiet) in [
+        ("update", true, false),
+        ("update", true, true),
+        ("new", false, false),
+    ] {
         let t = Tmp::new();
         write(&t.path("src/file"), &prng(1 << 20, 602));
         write(&t.path("dst/file"), &prng(1 << 20, 603));
         set_mtime(&t.path("src/file"), 1_700_000_000);
         let before = inode(&t.path("dst/file"));
-        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
             .args(["cp", &format!("--in-place={mode}"), "--srcs-in"])
             .arg(t.s("src"))
             .arg("--into")
             .arg(t.s("dst"))
-            .arg("--no-progress")
-            .run()
-            .unwrap();
+            .arg("--no-progress");
+        if quiet {
+            command.arg("-q");
+        }
+        let out = command.run().unwrap();
         assert_output_ok(&out);
+        let case = format!("{mode}, quiet {quiet}");
         assert_eq!(
             read(&t.path("dst/file")),
             read(&t.path("src/file")),
-            "{mode}"
+            "{case}"
         );
-        assert_eq!(inode(&t.path("dst/file")) == before, kept, "{mode}");
-        assert_eq!(stderr_of(&out).contains(WARNING), kept, "{mode}: {out:?}");
+        assert_eq!(inode(&t.path("dst/file")) == before, kept, "{case}");
+        assert_eq!(
+            stderr_of(&out).contains(WARNING),
+            kept && !quiet,
+            "{case}: {out:?}"
+        );
     }
 }
 
-/// Set `name` to `value` on `path`, or say the filesystem has no such
-/// attributes.
-fn set_attribute(path: &Path, name: &str, value: &[u8]) -> bool {
-    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
-    let name = std::ffi::CString::new(name).unwrap();
-    let result = unsafe {
-        libc::setxattr(
-            path.as_ptr(),
-            name.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-        )
-    };
-    if result == 0 {
-        return true;
-    }
-    let error = std::io::Error::last_os_error();
-    assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP), "{error}");
-    false
-}
-
-/// A Linux access ACL that lets user 12345 read the file too.
-fn acl_with_a_named_reader() -> Vec<u8> {
-    let mut bytes = 2u32.to_le_bytes().to_vec();
-    for (tag, permissions, id) in [
-        (1u16, 6u16, u32::MAX),
-        (2, 4, 12345),
-        (4, 4, u32::MAX),
-        (16, 4, u32::MAX),
-        (32, 4, u32::MAX),
-    ] {
-        bytes.extend(tag.to_le_bytes());
-        bytes.extend(permissions.to_le_bytes());
-        bytes.extend(id.to_le_bytes());
-    }
-    bytes
+/// A supplementary group of this process's, other than its own group.
+fn another_group() -> Option<u32> {
+    let mut groups = vec![0 as libc::gid_t; 256];
+    let count = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+    let own = unsafe { libc::getegid() };
+    groups
+        .into_iter()
+        .take(count.max(0) as usize)
+        .find(|group| *group != own)
 }
 
 /// Each file syq cannot vouch for is replaced, and the rest updated in
 /// place: one with another name, one more widely readable than the copy's
-/// mode, one with an ACL the copy does not give it, one with a set-ID bit,
-/// and one its owner cannot write. The summary and `--results` count them
-/// by reason, and a preview counts the same.
+/// mode, one with a set-ID bit, one its owner cannot write, and, where this
+/// process has a second group, one whose group the copy changes and which
+/// that group can write but not read. The summary and `--results` count
+/// them by reason, and a preview counts the same.
 #[test]
 fn files_syq_cannot_vouch_for_are_replaced_and_counted_by_reason() {
     if unsafe { libc::geteuid() } == 0 {
         eprintln!("skipped: root opens files its mode does not let it write");
         return;
     }
+    let group = another_group();
     for route in ["local", "ssh"] {
         let t = Tmp::new();
         // name, source mode, destination mode
-        let files = [
+        let mut files = vec![
             ("mine", 0o644, 0o644),
             ("linked", 0o644, 0o644),
             ("wider", 0o600, 0o644),
-            ("acl", 0o644, 0o644),
             ("setid", 0o755, 0o4755),
             ("read-only", 0o444, 0o444),
         ];
-        for (seed, (name, source_mode, destination_mode)) in files.into_iter().enumerate() {
+        if group.is_some() {
+            files.push(("group", 0o620, 0o620));
+        }
+        for (seed, (name, source_mode, destination_mode)) in files.iter().copied().enumerate() {
             let source = t.path(&format!("src/{name}"));
             let destination = t.path(&format!("dst/{name}"));
             write(&source, &prng(256 << 10, 610 + seed as u64));
@@ -250,30 +238,26 @@ fn files_syq_cannot_vouch_for_are_replaced_and_counted_by_reason() {
                 .unwrap();
             set_mtime(&source, 1_700_000_000);
         }
+        if let Some(group) = group {
+            std::os::unix::fs::chown(t.path("dst/group"), None, Some(group)).unwrap();
+        }
         fs::hard_link(t.path("dst/linked"), t.path("outside")).unwrap();
-        let acls = set_attribute(
-            &t.path("dst/acl"),
-            "system.posix_acl_access",
-            &acl_with_a_named_reader(),
-        );
         let inodes: Vec<u64> = files
             .iter()
             .map(|(name, _, _)| inode(&t.path(&format!("dst/{name}"))))
             .collect();
-        let mut expected = serde_json::json!({
+        let wider = if group.is_some() { 2 } else { 1 };
+        let expected = serde_json::json!({
             "other_names": 1,
             "privileges": 1,
-            "wider_permissions": 2,
+            "wider_permissions": wider,
             "not_writable": 1,
         });
-        let mut summary = "replaced 5 existing files instead of updating them in place: 1 with other hard links, 1 with set-ID bits or privileged attributes, 2 with wider permissions, 1 that could not be opened for writing";
-        if !acls {
-            expected["wider_permissions"] = 1.into();
-            summary = "replaced 4 existing files instead of updating them in place: 1 with other hard links, 1 with set-ID bits or privileged attributes, 1 with wider permissions, 1 that could not be opened for writing";
-        }
-        // A preview counts the same files, copying ACLs, which it then
-        // reads.
-        let metadata = "--copy-metadata=permissions,acls";
+        let summary = format!(
+            "replaced {} existing files instead of updating them in place: 1 with other hard links, 1 with set-ID bits or privileged attributes, {wider} with wider permissions, 1 that could not be opened for writing",
+            3 + wider
+        );
+        let metadata = "--copy-metadata=permissions,ownership";
         let results = t.path("preview.jsonl");
         let out = cp_update(
             &t,
@@ -321,11 +305,240 @@ fn files_syq_cannot_vouch_for_are_replaced_and_counted_by_reason() {
                 read(&t.path(&format!("src/{name}"))),
                 "{route}"
             );
-            let kept = *name == "mine" || (*name == "acl" && !acls);
-            assert_eq!(inode(&destination) == *before, kept, "{route}: {name}");
+            assert_eq!(
+                inode(&destination) == *before,
+                *name == "mine",
+                "{route}: {name}"
+            );
         }
         assert_eq!(read(&t.path("outside")), prng(256 << 10, 621), "{route}");
         assert!(partial_files(&t.0).is_empty(), "{route}");
+    }
+}
+
+/// Set `name` to `value` on `path`, or say the filesystem has no such
+/// attributes.
+#[cfg(target_os = "linux")]
+fn set_attribute(path: &Path, name: &str, value: &[u8]) -> bool {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let name = std::ffi::CString::new(name).unwrap();
+    let result = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if result == 0 {
+        return true;
+    }
+    let error = std::io::Error::last_os_error();
+    assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP), "{error}");
+    false
+}
+
+/// A Linux ACL, as its extended attribute holds it, with these entries:
+/// tag, permissions and id. The owner, group and other entries carry
+/// `u32::MAX`.
+#[cfg(target_os = "linux")]
+fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+    let mut bytes = 2u32.to_le_bytes().to_vec();
+    for (tag, permissions, id) in entries {
+        bytes.extend(tag.to_le_bytes());
+        bytes.extend(permissions.to_le_bytes());
+        bytes.extend(id.to_le_bytes());
+    }
+    bytes
+}
+
+/// Copying ACLs, a file is updated in place only when it already has the
+/// ACL the copy gives it: one with an ACL the source lacks is replaced, and
+/// so is one without an ACL whose source's ACL keeps user 12345 out, whom
+/// the file's mode lets read it. A preview counts the same.
+#[cfg(target_os = "linux")]
+#[test]
+fn files_are_updated_in_place_only_with_the_acl_they_end_with() {
+    // The owner reads and writes; user 12345 can read, or not.
+    let reader = acl(&[
+        (1, 6, u32::MAX),
+        (2, 4, 12345),
+        (4, 4, u32::MAX),
+        (16, 4, u32::MAX),
+        (32, 4, u32::MAX),
+    ]);
+    let denied = acl(&[
+        (1, 6, u32::MAX),
+        (2, 0, 12345),
+        (4, 4, u32::MAX),
+        (16, 4, u32::MAX),
+        (32, 4, u32::MAX),
+    ]);
+    for route in ["local", "ssh"] {
+        let t = Tmp::new();
+        // name, the source's ACL, the destination's
+        let files = [
+            ("same", Some(&reader), Some(&reader)),
+            ("extra", None, Some(&reader)),
+            ("denied", Some(&denied), None),
+        ];
+        let mut inodes = Vec::new();
+        for (seed, (name, source_acl, destination_acl)) in files.iter().enumerate() {
+            let source = t.path(&format!("src/{name}"));
+            let destination = t.path(&format!("dst/{name}"));
+            write(&source, &prng(256 << 10, 640 + seed as u64));
+            write(&destination, &prng(256 << 10, 650 + seed as u64));
+            for (path, acl) in [(&source, source_acl), (&destination, destination_acl)] {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+                if let Some(acl) = acl {
+                    if !set_attribute(path, "system.posix_acl_access", acl) {
+                        eprintln!("skipped: this filesystem has no POSIX ACLs");
+                        return;
+                    }
+                }
+            }
+            set_mtime(&source, 1_700_000_000);
+            inodes.push(inode(&destination));
+        }
+        let expected = serde_json::json!({"wider_permissions": 2});
+        let metadata = "--copy-metadata=permissions,acls";
+        for dry_run in [true, false] {
+            let results = t.path(&format!("results-{dry_run}.jsonl"));
+            let results = results.to_string_lossy();
+            let mut args = vec![metadata, "--results", &results];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let out = cp_update(&t, route, &args, &[]);
+            assert_output_ok(&out);
+            let results = t.path(&format!("results-{dry_run}.jsonl"));
+            assert_eq!(
+                terminal(&results)["replaced_not_in_place"],
+                expected,
+                "{route}, dry run {dry_run}"
+            );
+        }
+        for ((name, _, _), before) in files.iter().zip(&inodes) {
+            let destination = t.path(&format!("dst/{name}"));
+            assert_eq!(read(&destination), read(&t.path(&format!("src/{name}"))));
+            assert_eq!(
+                inode(&destination) == *before,
+                *name == "same",
+                "{route}: {name}"
+            );
+        }
+    }
+}
+
+/// A file only the receiver refuses to update in place, here one with an
+/// ACL the copy does not copy, which the scan does not read, is refused
+/// before the receiver reads it, and then replaced: the receiver reads it
+/// for one comparison only.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn a_file_only_the_receiver_refuses_is_read_once_there() {
+    let reader = acl(&[
+        (1, 6, u32::MAX),
+        (2, 4, 12345),
+        (4, 4, u32::MAX),
+        (16, 4, u32::MAX),
+        (32, 4, u32::MAX),
+    ]);
+    let t = Tmp::new();
+    let new = prng(16 << 20, 680);
+    let mut old = new.clone();
+    old[(9 << 20) + 5] ^= 1;
+    write(&t.path("src/file"), &new);
+    write(&t.path("dst/file"), &old);
+    fs::set_permissions(t.path("dst/file"), fs::Permissions::from_mode(0o644)).unwrap();
+    if !set_attribute(&t.path("dst/file"), "system.posix_acl_access", &reader) {
+        eprintln!("skipped: this filesystem has no POSIX ACLs");
+        return;
+    }
+    set_mtime(&t.path("src/file"), 1_700_000_000);
+    let before = inode(&t.path("dst/file"));
+    let hashes = t.path("hashes");
+    let results = t.path("copy.jsonl");
+    let out = cp_update(
+        &t,
+        "ssh",
+        &["--results", &results.to_string_lossy()],
+        &[("SYQ_TEST_DESTINATION_HASHES", &hashes.to_string_lossy())],
+    );
+    assert_output_ok(&out);
+    assert!(read(&t.path("dst/file")) == new);
+    assert_ne!(inode(&t.path("dst/file")), before);
+    assert_eq!(
+        terminal(&results)["replaced_not_in_place"],
+        serde_json::json!({"wider_permissions": 1})
+    );
+    // The receiver hashed the file once.
+    let hashed: u64 = fs::read_to_string(&hashes)
+        .unwrap()
+        .lines()
+        .map(|line| line.split(' ').nth(1).unwrap().parse::<u64>().unwrap())
+        .sum();
+    assert_eq!(hashed, 16 << 20);
+}
+
+/// Without ACL copying, a file whose ACL is the one a new file inherits
+/// from its folder's default ACL, as `setfacl -d -m g:12345:rw` gives one,
+/// is updated in place, as a preview predicts: replacing it would give it
+/// the same ACL.
+#[cfg(target_os = "linux")]
+#[test]
+fn files_with_the_acl_their_folder_gives_are_updated_in_place() {
+    let default = acl(&[
+        (1, 7, u32::MAX),
+        (4, 5, u32::MAX),
+        (8, 6, 12345),
+        (16, 7, u32::MAX),
+        (32, 5, u32::MAX),
+    ]);
+    for route in ["local", "ssh"] {
+        let t = Tmp::new();
+        fs::create_dir_all(t.path("dst")).unwrap();
+        if !set_attribute(&t.path("dst"), "system.posix_acl_default", &default) {
+            eprintln!("skipped: this filesystem has no POSIX ACLs");
+            return;
+        }
+        let mut inodes = Vec::new();
+        for (seed, name) in ["a", "b"].into_iter().enumerate() {
+            let source = t.path(&format!("src/{name}"));
+            let destination = t.path(&format!("dst/{name}"));
+            write(&source, &prng(256 << 10, 660 + seed as u64));
+            // Created in the folder, the file takes its default ACL.
+            write(&destination, &prng(256 << 10, 670 + seed as u64));
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o640)).unwrap();
+            set_mtime(&source, 1_700_000_000);
+            inodes.push(inode(&destination));
+        }
+        for dry_run in [true, false] {
+            let results = t.path(&format!("results-{dry_run}.jsonl"));
+            let results = results.to_string_lossy();
+            let mut args = vec!["--results", &results];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let out = cp_update(&t, route, &args, &[]);
+            assert_output_ok(&out);
+            assert!(
+                !String::from_utf8_lossy(&out.stdout).contains("instead of updating"),
+                "{route}: {out:?}"
+            );
+            let results = t.path(&format!("results-{dry_run}.jsonl"));
+            assert_eq!(
+                terminal(&results)["replaced_not_in_place"],
+                serde_json::json!({}),
+                "{route}, dry run {dry_run}"
+            );
+        }
+        for (name, before) in ["a", "b"].into_iter().zip(&inodes) {
+            let destination = t.path(&format!("dst/{name}"));
+            assert_eq!(read(&destination), read(&t.path(&format!("src/{name}"))));
+            assert_eq!(inode(&destination), *before, "{route}: {name}");
+        }
     }
 }
 

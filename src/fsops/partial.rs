@@ -722,7 +722,7 @@ impl FsOps {
         condition: TargetCondition,
         guard: Option<&ContainerGuard>,
     ) -> Result<(Vec<ContentDigest>, u64)> {
-        self.hash_and_hold_window(path, copy_id, 0, block, len, condition, guard)
+        self.hash_and_hold_window(path, copy_id, 0, block, len, condition, guard, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -735,6 +735,7 @@ impl FsOps {
         len: u64,
         condition: TargetCondition,
         guard: Option<&ContainerGuard>,
+        update: Option<&InPlaceUpdate>,
     ) -> Result<(Vec<ContentDigest>, u64)> {
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_FAIL_HASH_BASIS").is_some() {
@@ -772,6 +773,21 @@ impl FsOps {
                 .map(|file| (file, FileLocation::Path(p.clone()), p))?
         };
         require_open_target(&file, &label, condition)?;
+        // `--in-place=update`: a file the receiver will not update in place
+        // is refused before it is read, and the sender replaces it, comparing
+        // it then.
+        if let (Some(update), Some(target), 0) = (update, &rooted, off) {
+            let current = file.metadata()?;
+            if let Some(refused) =
+                vouch::update_refusal(target.into(), &file, &current, &update.meta, update.flags)?
+            {
+                return Err(vouch::replace_required(
+                    &label,
+                    "update it in place",
+                    refused,
+                ));
+            }
+        }
         #[cfg(debug_assertions)]
         record_test_event(
             "SYQ_TEST_BASIS_HASH_EVENTS",
@@ -3485,8 +3501,9 @@ impl FsOps {
                 len,
                 condition,
                 guard,
-            } => self
-                .hash_and_hold_window(
+                update,
+            } => (|| {
+                let result = self.hash_and_hold_window(
                     path,
                     copy_id,
                     *off,
@@ -3494,8 +3511,15 @@ impl FsOps {
                     *len,
                     *condition,
                     guard.as_ref(),
-                )
-                .map(|(hashes, len)| Response::HeldHashes { hashes, len }),
+                    update.as_deref(),
+                );
+                #[cfg(debug_assertions)]
+                if result.is_ok() {
+                    record_test_event("SYQ_TEST_DESTINATION_HASHES", format_args!("hold {len}"))?;
+                }
+                result
+            })()
+            .map(|(hashes, len)| Response::HeldHashes { hashes, len }),
             Request::FinishBasis {
                 expected_hash,
                 path,
@@ -3546,8 +3570,10 @@ impl FsOps {
                 block,
                 attempt,
                 guard,
-            } => self
-                .hash_window(
+            } => (|| {
+                #[cfg(debug_assertions)]
+                record_test_event("SYQ_TEST_DESTINATION_HASHES", format_args!("window {len}"))?;
+                self.hash_window(
                     PartialTarget {
                         path,
                         id: copy_id,
@@ -3559,7 +3585,8 @@ impl FsOps {
                     *attempt,
                     *final_basis,
                 )
-                .map(Response::Hashes),
+            })()
+            .map(Response::Hashes),
             Request::ReuseComparedRange {
                 path,
                 copy_id,

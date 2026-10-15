@@ -438,12 +438,17 @@ gives it: without `--copy-metadata=ownership`, those of a file root creates
 there, so another user's file is replaced. The file must have no
 set-user-ID or set-group-ID bit or file capability, the copy must add none
 and set or remove no `security.*` or `trusted.*` attribute, and nobody may
-be able to open the file whom its final permissions would keep out: its permission bits must be among the final ones, its group the
-final one or unable to read it, and its ACL none beyond its mode bits, unless
-the copy gives it that exact ACL. It replaces any other existing file. The
-summary, and `replaced_not_in_place` in [`--results`](automation.md), say how
-many files it replaced and why. A dry run counts the same files, but sees an
-ACL only when the copy copies ACLs. New files keep owner-write
+be able to open the file whom its final permissions would keep out: its
+permission bits must be among the final ones, its group the final one or
+unable to read or write it, and its ACL the one it ends with. That is the ACL
+the copy gives it when it copies ACLs, and otherwise the one a new file there
+would get from its folder's default ACL, or none. On macOS, without ACL
+copying, a file with an ACL, or in a folder that passes ACL entries on to new
+files, is always replaced. Syq replaces any other existing file. The summary,
+and `replaced_not_in_place` in [`--results`](automation.md), say how many
+files it replaced and why. A dry run's counts are estimates: it cannot see
+everything the copy checks, such as file capabilities, ACLs it does not copy,
+or files in use as programs. New files keep owner-write
 permission until the copy succeeds and applies their final permissions. When
 the copy gives them a different group than they start with, or sets their
 ACL, they are open only to their owner until then. On macOS, a copy that sets

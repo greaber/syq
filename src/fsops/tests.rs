@@ -7701,6 +7701,7 @@ fn equality_windows_keep_the_same_destination_inode() {
         len: block,
         condition: TargetCondition::Any,
         guard: None,
+        update: None,
     };
     let first = ops.handle(&request(0));
     fs::rename(root.join("file"), root.join("original")).unwrap();

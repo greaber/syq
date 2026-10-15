@@ -4784,11 +4784,11 @@ impl Planner<'_> {
         if destination.mode & 0o777 & !mode != 0
             || (flags & flags::GROUP != 0
                 && destination.gid != meta.gid
-                && destination.mode & 0o040 != 0)
+                && destination.mode & 0o060 != 0)
             || meta
                 .inode_metadata
                 .as_deref()
-                .is_some_and(|inode| inode.acl_wider_than(destination.inode_metadata.as_deref()))
+                .is_some_and(|inode| inode.acl_differs(destination.inode_metadata.as_deref()))
         {
             return Some(WiderPermissions);
         }

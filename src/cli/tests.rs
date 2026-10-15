@@ -580,6 +580,7 @@ fn native_inplace_is_refused_naming_in_place_new_and_rsync_inplace_updates_in_pl
     let argv = ["--inplace", "source", "--into", "destination"].map(std::ffi::OsString::from);
     let error = parse_native_copy(&argv).unwrap_err().to_string();
     assert!(error.contains("--in-place=new"), "{error}");
+    assert!(error.contains("--in-place=update"), "{error}");
     for (mode, update) in [("new", false), ("update", true)] {
         let argv = [
             &format!("--in-place={mode}"),

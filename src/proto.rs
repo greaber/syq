@@ -1103,6 +1103,9 @@ pub enum WireRequest<Data> {
         len: u64,
         condition: TargetCondition,
         guard: Option<ContainerGuard>,
+        /// As in `Prepare`: a file the receiver will not update in place is
+        /// refused, with `WireIoKind::ReplaceRequired`, before it is read.
+        update: Option<Box<InPlaceUpdate>>,
     },
     /// Apply metadata through the retained basis descriptor. If another job
     /// renamed over the final path meanwhile, its complete file remains the

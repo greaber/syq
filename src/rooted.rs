@@ -1302,6 +1302,13 @@ impl Root {
     /// The permission bits a file created at `path` may have: its
     /// directory's default ACL's, when it has one, and otherwise those the
     /// umask leaves.
+    /// The directory `path` is in.
+    pub(crate) fn parent_directory(&self, path: &RelativePath) -> Result<File> {
+        let (parents, _) = path.leaf()?;
+        open_directory_components(&self.directory, parents)
+            .with_context(|| format!("resolve confined parent for {}", path.label()))
+    }
+
     pub(crate) fn creation_permissions(&self, path: &RelativePath) -> Result<u32> {
         let (parents, _) = path.leaf()?;
         let directory = open_directory_components(&self.directory, parents)
