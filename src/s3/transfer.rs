@@ -3459,8 +3459,10 @@ fn hash_range(file: &File, offset: u64, length: u64, algorithm: HashAlgorithm) -
     Ok(Digest::from_hash(algorithm, &hash.finalize()).value)
 }
 
-/// The bytes a seeded part is hashed in at a time.
+/// The bytes a seeded part is hashed in at a time, by each thread.
 const SEED_HASH_CHUNK: usize = 1 << 20;
+/// The most threads seeding a new partial.
+const SEED_THREADS: usize = 4;
 
 /// Copy into the new partial `output` the parts of an earlier run's partial
 /// `donor` that its record vouches for, and return each kept part's hash in
@@ -3468,7 +3470,8 @@ const SEED_HASH_CHUNK: usize = 1 << 20;
 /// partial now holds it, in bounded pieces, and one that does not match its
 /// record is not kept, so that a download overwrites it. The donor is cloned
 /// where the filesystem can, and its parts are otherwise copied in the
-/// kernel or through a bounded buffer.
+/// kernel or through a bounded buffer. A few threads share the parts, as
+/// the parallel downloads that checked them in place used to.
 fn seed_download_parts(
     donor: &File,
     output: &File,
@@ -3481,13 +3484,18 @@ fn seed_download_parts(
         bail!("injected download seeding failure");
     }
     let cloned = crate::fsops::clone_donor(donor, output, size.min(donor.metadata()?.len()));
-    let mut buffer = vec![0; SEED_HASH_CHUNK.min(part_size as usize)];
-    let mut copied = Vec::new();
-    for (&index, hash) in parts {
-        let offset = index.saturating_mul(part_size);
-        if offset >= size {
-            continue;
-        }
+    let parts: Vec<(u64, &String)> = parts
+        .iter()
+        .map(|(&index, hash)| (index, hash))
+        .filter(|(index, _)| index.saturating_mul(part_size) < size)
+        .collect();
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |threads| threads.get())
+        .clamp(1, SEED_THREADS)
+        .min(parts.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let seed_part = |buffer: &mut Vec<u8>, index: u64, hash: &String| -> Result<Option<String>> {
+        let offset = index * part_size;
         let length = part_size.min(size - offset);
         if !cloned {
             crate::fsops::copy_donor_range(donor, output, offset, offset + length)?;
@@ -3505,14 +3513,39 @@ fn seed_download_parts(
             done += piece as u64;
         }
         if Digest::from_hash(algorithm, &recorded.finalize()).value != *hash {
-            continue;
+            return Ok(None);
         }
-        let hash = match converted {
+        Ok(Some(match converted {
             Some(converted) => Digest::from_hash(new_algorithm, &converted.finalize()).value,
             None => hash.clone(),
-        };
-        copied.push((index, hash));
-    }
+        }))
+    };
+    let mut copied = std::thread::scope(|scope| -> Result<Vec<(u64, String)>> {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| -> Result<Vec<(u64, String)>> {
+                    let mut buffer = vec![0; SEED_HASH_CHUNK.min(part_size as usize)];
+                    let mut kept = Vec::new();
+                    while let Some(&(index, hash)) = parts.get(next.fetch_add(1, Relaxed)) {
+                        if let Some(hash) = seed_part(&mut buffer, index, hash)? {
+                            kept.push((index, hash));
+                        }
+                    }
+                    Ok(kept)
+                })
+            })
+            .collect();
+        let mut copied = Vec::new();
+        for worker in workers {
+            copied.extend(
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("a seeding thread panicked"))??,
+            );
+        }
+        Ok(copied)
+    })?;
+    copied.sort_unstable_by_key(|(index, _)| *index);
     Ok(copied)
 }
 /// Remove the partial `record` names if its name still leads to the file
