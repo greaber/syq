@@ -27,7 +27,9 @@ Rsync changes the following in place, through every name a file has. Syq
 gives the name a new file instead, with a new inode number, and other names
 of the old file keep it as it was:
 
-- `--inplace` writes only new files in place; an existing file is replaced.
+- With `--inplace`, a file with other hard links, another owner, or wider
+  permissions than the copy gives it ([In-place writes](reference.md#in-place-writes)).
+  Other existing files are updated in place, as rsync does.
 - When only metadata changed, a file with other hard links, or one not owned
   as syq expects, is replaced. Access times (`-U`) are still set in place.
 - On filesystems whose link counts syq does not trust (SMB, SSHFS, NFS

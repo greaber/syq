@@ -154,6 +154,9 @@ pub struct ResultRecord {
     pub deletions_planned: Option<u64>,
     pub deletions_completed: Option<u64>,
     pub deletions_blocked: Option<u64>,
+    /// `--in-place=update` runs only: existing files replaced rather than
+    /// updated in place, by reason.
+    pub replaced_not_in_place: Option<Vec<(crate::proto::ReplaceReason, u64)>>,
 }
 
 pub struct RmResultRecord {
@@ -650,6 +653,17 @@ impl ResultsWriter {
         if let Some(blocked) = result.deletions_blocked {
             object.insert("deletions_blocked".into(), blocked.into());
         }
+        if let Some(replaced) = &result.replaced_not_in_place {
+            object.insert(
+                "replaced_not_in_place".into(),
+                replaced
+                    .iter()
+                    .filter(|(_, count)| *count > 0)
+                    .map(|(reason, count)| (reason.key().to_owned(), (*count).into()))
+                    .collect::<serde_json::Map<_, _>>()
+                    .into(),
+            );
+        }
         self.write_and_seal(record, true);
     }
 
@@ -816,6 +830,7 @@ mod tests {
             deletions_planned: None,
             deletions_completed: None,
             deletions_blocked: None,
+            replaced_not_in_place: None,
         });
         let after = sink.0.lock().unwrap().len();
         // A straggling ticker render (or a second terminal) must be inert.
@@ -851,6 +866,7 @@ mod tests {
             deletions_planned: None,
             deletions_completed: None,
             deletions_blocked: None,
+            replaced_not_in_place: None,
         });
         assert_eq!(sink.0.lock().unwrap().len(), after);
     }

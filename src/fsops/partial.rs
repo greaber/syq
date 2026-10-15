@@ -229,6 +229,90 @@ impl FsOps {
         Ok((file, created, in_use, true))
     }
 
+    /// For `--in-place=update`: open the existing regular file at `target`
+    /// for writing, and hold it for the request's file (`stages`), when the
+    /// receiver can vouch for writing it in place
+    /// (`vouch::update_refusal`). A file it cannot vouch for, or cannot open
+    /// for writing, is refused with `vouch::replace_required`, and the copy
+    /// replaces it. `None` when the name holds no regular file: a new one is
+    /// then created, and anything else is replaced, as under
+    /// `--in-place=new`. When the coordinator `compared` a file, it must be
+    /// the one opened, whose blocks it reuses.
+    fn open_inplace_update(
+        &mut self,
+        target: &RootedTarget,
+        copy_id: &CopyId,
+        update: &InPlaceUpdate,
+        compared: Option<&HeldBasis>,
+    ) -> Result<Option<(File, Arc<()>)>> {
+        const DOING: &str = "update it in place";
+        let (file, opened) = match target.root.open_regular_read_write_known(&target.relative) {
+            Ok(opened) => opened,
+            Err(error) => {
+                let raw = error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<io::Error>())
+                    .map(|error| (error.kind(), error.raw_os_error()));
+                return match raw {
+                    // A file in use as a program, or one its permissions
+                    // keep closed, can still be replaced. Where it can be
+                    // read, a reason the checks give comes first, as the
+                    // sender's scan predicts it.
+                    Some((_, Some(libc::EACCES | libc::EPERM | libc::ETXTBSY))) => {
+                        let refused = match target.root.open_regular_read(&target.relative) {
+                            Ok(file) => {
+                                let opened = file.metadata()?;
+                                vouch::update_refusal(
+                                    target.into(),
+                                    &file,
+                                    &opened,
+                                    &update.meta,
+                                    update.flags,
+                                )?
+                            }
+                            Err(_) => None,
+                        };
+                        Err(vouch::replace_required(
+                            &target.label,
+                            DOING,
+                            refused.unwrap_or((
+                                ReplaceReason::NotWritable,
+                                "it cannot be opened for writing",
+                            )),
+                        ))
+                    }
+                    Some((io::ErrorKind::NotFound, _))
+                    | Some((_, Some(libc::ELOOP | libc::EISDIR | libc::ENXIO)))
+                    // Opened, but not a regular file.
+                    | None => Ok(None),
+                    Some(_) => Err(error),
+                };
+            }
+        };
+        if let Some(compared) = compared {
+            let compared = compared.file.metadata()?;
+            if (compared.dev(), compared.ino()) != (opened.dev(), opened.ino()) {
+                bail!(
+                    "destination {} changed after it was compared",
+                    target.label.display()
+                );
+            }
+        }
+        if let Some(refused) =
+            vouch::update_refusal(target.into(), &file, &opened, &update.meta, update.flags)?
+        {
+            return Err(vouch::replace_required(&target.label, DOING, refused));
+        }
+        let in_use = stages::hold(
+            stages::of(self.stage_scope, target, copy_id, true),
+            &target.relative,
+            &file,
+            Some(opened),
+            false,
+        )?;
+        Ok(Some((file, in_use)))
+    }
+
     pub(super) fn reusable_partial_permissions(&self, file: &File) -> Result<bool> {
         #[cfg(target_os = "macos")]
         if self.inode_preservation.acls {
@@ -418,6 +502,7 @@ impl FsOps {
             attempt,
             create_if_missing,
             group,
+            update,
         } = options;
         let target = self.destination_mutation_target(path, guard)?;
         // Existing finals get their equality check first. For new files,
@@ -463,6 +548,24 @@ impl FsOps {
                     CachedFile::held(held.file, held.in_use),
                 );
                 return Ok(Preparation::default());
+            }
+            // `--in-place=update` writes an existing file it can vouch for
+            // where it is.
+            if let Some(update) = update {
+                if let Some((file, in_use)) =
+                    self.open_inplace_update(&target, copy_id, update, compared.as_ref())?
+                {
+                    self.set_copy_length(&file, size).with_context(|| {
+                        format!("resize confined file {}", target.label.display())
+                    })?;
+                    self.cache_entry(
+                        target.location(),
+                        attempt,
+                        false,
+                        CachedFile::held(file, in_use),
+                    );
+                    return Ok(Preparation::default());
+                }
             }
             if compared.is_some() {
                 // Its blocks would be skipped in a file that lacks them.
@@ -1248,6 +1351,7 @@ impl FsOps {
         let CopyLocalPolicy {
             inplace,
             group,
+            update,
             replace_partial,
             allow_sequential_nfs_fallback,
             allow_sequential_local_fallback,
@@ -1340,18 +1444,32 @@ impl FsOps {
         // The bytes at the start of the output that hold old contents until
         // the copy writes over them: an in-place file's, within its new length.
         let mut old_len = 0;
+        // Whether this copy created the file it writes in place, rather
+        // than updating an existing one (`--in-place=update`).
+        let mut created_inplace = true;
         let d = if inplace {
-            // A retry writes the file this copy already holds.
-            let (file, fresh) = match self.held_inplace(&target, copy_id)? {
-                Some(held) => {
+            // A retry writes the file this copy already holds, and
+            // `--in-place=update` an existing one it can vouch for.
+            let held = self.held_inplace(&target, copy_id)?;
+            let updated = match (&held, update) {
+                (None, Some(update)) => self.open_inplace_update(&target, copy_id, update, None)?,
+                _ => None,
+            };
+            let (file, fresh) = match (held, updated) {
+                (Some(held), _) => {
                     // A stage, when the name held another file.
                     if held.relative != target.relative {
                         target_label = stages::label(&target, &held.relative);
                         target_relative = held.relative;
                     }
+                    created_inplace = held.created;
                     (held.file, false)
                 }
-                None => {
+                (None, Some((file, _))) => {
+                    created_inplace = false;
+                    (file, false)
+                }
+                (None, None) => {
                     // The coordinator sends the in-place creation mode
                     // (`inplace_creation_mode`).
                     let (file, _, _, staged) =
@@ -1628,7 +1746,7 @@ impl FsOps {
                 &target_relative,
                 &d,
                 None,
-                true,
+                created_inplace,
             )?;
             self.cache_entry(target.location(), 0, false, CachedFile::held(d, in_use));
         } else {
@@ -2512,6 +2630,11 @@ impl FsOps {
             let held = stages::of(self.stage_scope, &rooted, &copy_id, inplace);
             let (file, _) = self.cached_held(label, held, relative, attempt)?;
             let writing = operation.span(crate::transfer_observations::Stage::DestinationWrite);
+            #[cfg(debug_assertions)]
+            record_test_event(
+                "SYQ_TEST_DESTINATION_WRITES",
+                format_args!("write {off} {}", data.len()),
+            )?;
             let result = file.write_range_at(data, off, sparse);
             if result.is_ok() {
                 writing.bytes(data.len() as u64);
@@ -2710,7 +2833,7 @@ impl FsOps {
             // NFS client answers with a request. A file opened without that
             // read is read as before.
             self.uncache_rooted(&target.root, &target.relative);
-            let (file, opened) = (held.file, held.opened);
+            let (file, opened, created) = (held.file, held.opened, held.created);
             // The file is read at most once here. A fingerprint condition
             // holds the file's ctime as it is now, after the writes, so that
             // condition needs fresh metadata; every other condition, the
@@ -2721,12 +2844,12 @@ impl FsOps {
             // The copy created the file exclusively at its name, so a
             // condition that the name be free was met then.
             let condition = match condition {
-                TargetCondition::Absent => TargetCondition::Any,
+                TargetCondition::Absent if created => TargetCondition::Any,
                 condition => condition,
             };
             let fingerprint = matches!(condition, TargetCondition::MatchesFingerprint { .. });
             let current = match &opened {
-                Some(opened) if !fingerprint => opened.clone(),
+                Some(opened) if !fingerprint && created => opened.clone(),
                 _ => file.metadata()?,
             };
             require_open_target_known(&current, &target.label, condition)?;
@@ -2734,15 +2857,36 @@ impl FsOps {
             if let Some(expected) = expected {
                 Self::verify_expected_held(&target.root, &target.relative, &file, expected)?;
             }
-            let resolved = self.inplace_final_mode(target, meta, flags)?;
-            let (meta, flags) = resolved
-                .as_ref()
-                .map_or((meta, flags), |(meta, flags)| (meta, *flags));
-            match &opened {
-                Some(opened) => set_meta_written_file(&file, meta, flags, opened),
-                None => set_meta_file_known(&file, meta, flags, &current),
+            if !created {
+                // An existing file `--in-place=update` wrote keeps its mode
+                // unless the copy sets one, as one it replaces does. Its
+                // metadata goes through the checks for any metadata change,
+                // read now: someone may have given it another name since
+                // it was opened. Its contents are written already, so the
+                // file fails rather than being replaced.
+                let flags = flags & !flags::RECEIVER_MODE;
+                if let Err(error) = vouch::require(target, &file, &current, meta, flags) {
+                    if vouch::is_replace_required(&error) {
+                        bail!(
+                            "{} changed while this copy updated it in place: {error:#}",
+                            target.label.display()
+                        );
+                    }
+                    return Err(error);
+                }
+                set_meta_written_file(&file, meta, flags, &current)
+                    .with_context(|| format!("set metadata {}", target.label.display()))?;
+            } else {
+                let resolved = self.inplace_final_mode(target, meta, flags)?;
+                let (meta, flags) = resolved
+                    .as_ref()
+                    .map_or((meta, flags), |(meta, flags)| (meta, *flags));
+                match &opened {
+                    Some(opened) => set_meta_written_file(&file, meta, flags, opened),
+                    None => set_meta_file_known(&file, meta, flags, &current),
+                }
+                .with_context(|| format!("set metadata {}", target.label.display()))?;
             }
-            .with_context(|| format!("set metadata {}", target.label.display()))?;
             // The file is finished only while its name still leads to it:
             // a file someone renamed into its place got nothing of the
             // copy's, and the copy fails it. Where inode numbers cannot show
@@ -3303,6 +3447,7 @@ impl FsOps {
                 create_if_missing,
                 guard,
                 group,
+                update,
             } => self
                 .creation_mode(
                     path,
@@ -3327,6 +3472,7 @@ impl FsOps {
                             attempt: *attempt,
                             create_if_missing: *create_if_missing,
                             group: *group,
+                            update: update.as_deref(),
                         },
                     )
                 })
@@ -3498,6 +3644,7 @@ impl FsOps {
                 size,
                 mode,
                 group,
+                update,
             } => self
                 .copy_local(
                     source,
@@ -3505,6 +3652,7 @@ impl FsOps {
                     CopyLocalPolicy {
                         inplace: *inplace,
                         group: *group,
+                        update: update.as_deref(),
                         replace_partial: *replace_partial,
                         allow_sequential_nfs_fallback: *allow_sequential_nfs_fallback,
                         allow_sequential_local_fallback: *allow_sequential_local_fallback,

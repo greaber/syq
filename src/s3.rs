@@ -455,6 +455,7 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
             deletions_blocked: args
                 .delete
                 .then(|| progress.deletions_blocked.load(Relaxed)),
+            replaced_not_in_place: None,
         });
         if writer.is_dead() {
             bail!("S3 result stream could not be completed");

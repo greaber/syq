@@ -263,15 +263,15 @@ fn local_default_replaces_blocks_and_on_overrides_whole_file_copy() {
             let out = cmd.run().unwrap();
             assert_output_ok(&out);
             assert_eq!(read(&t.path("dst")), source);
-            // With block reuse, a file this size is patched in a group. An
-            // existing file is replaced with --inplace too, the same way.
+            // With block reuse, a file this size is patched in a group, or
+            // updated in place on the per-file path.
             let observed = tuning_observed(&out);
-            let grouped = reuse == Some("aligned-block");
+            let grouped = reuse == Some("aligned-block") && !inplace;
             assert_eq!(observed["patched_files"], u64::from(grouped));
             assert_eq!(
                 observed["range_requests"],
                 match reuse {
-                    Some("aligned-block") => 0,
+                    Some("aligned-block") => u64::from(inplace),
                     _ => 2,
                 }
             );

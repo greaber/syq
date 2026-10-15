@@ -1087,6 +1087,10 @@ pub enum WireRequest<Data> {
         /// in-place file that would start with another group is created
         /// owner-only.
         group: Option<u32>,
+        /// `--in-place=update`: an existing file at `path` is written in
+        /// place when the receiver can vouch for it, and refused with
+        /// `WireIoKind::ReplaceRequired` otherwise.
+        update: Option<Box<InPlaceUpdate>>,
     },
     /// Hash an existing final file and retain that open inode as the repair
     /// basis until FinishBasis or SeedBasis consumes it. Offset zero opens a
@@ -1149,6 +1153,8 @@ pub enum WireRequest<Data> {
         /// The group publication gives the file, when it sets one, as in
         /// `Prepare`.
         group: Option<u32>,
+        /// As in `Prepare`.
+        update: Option<Box<InPlaceUpdate>>,
     },
     HashBlocks {
         off: u64,
@@ -1844,10 +1850,76 @@ pub enum WireIoKind {
     Other,
     /// Permission denied, with receiver evidence that owner directory access is missing.
     OwnedDirectoryPermissions,
-    /// The receiver will not change this existing file's metadata in place:
-    /// it cannot vouch for the file (`fsops::vouch`). The copy replaces it
-    /// as it replaces a changed file.
-    ReplaceRequired,
+    /// The receiver will not change this existing file in place: it cannot
+    /// vouch for the file (`fsops::vouch`), for this reason. The copy
+    /// replaces it as it replaces a changed file.
+    ReplaceRequired(ReplaceReason),
+}
+
+/// Why the receiver will not change an existing file in place, and the copy
+/// replaces it instead (`fsops::vouch`).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum ReplaceReason {
+    NotRegular,
+    OtherNames,
+    /// Its filesystem's link counts cannot be trusted.
+    UntrustedFilesystem,
+    /// It belongs to another owner, or the copy gives it another owner or
+    /// group.
+    Owner,
+    /// A set-ID bit, a file capability, or a `security.*` or `trusted.*`
+    /// attribute.
+    Privileges,
+    /// Its permissions let someone read or write it whom the copy's do not.
+    WiderPermissions,
+    NotWritable,
+}
+
+impl ReplaceReason {
+    pub const ALL: [Self; 7] = [
+        Self::NotRegular,
+        Self::OtherNames,
+        Self::UntrustedFilesystem,
+        Self::Owner,
+        Self::Privileges,
+        Self::WiderPermissions,
+        Self::NotWritable,
+    ];
+
+    /// Its name in `--results`.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::NotRegular => "not_regular",
+            Self::OtherNames => "other_names",
+            Self::UntrustedFilesystem => "untrusted_filesystem",
+            Self::Owner => "owner",
+            Self::Privileges => "privileges",
+            Self::WiderPermissions => "wider_permissions",
+            Self::NotWritable => "not_writable",
+        }
+    }
+
+    /// What files replaced for it have, completing "N existing files ...".
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotRegular => "that were not regular files",
+            Self::OtherNames => "with other hard links",
+            Self::UntrustedFilesystem => "on filesystems whose link counts syq does not trust",
+            Self::Owner => "with another owner or group",
+            Self::Privileges => "with set-ID bits or privileged attributes",
+            Self::WiderPermissions => "with wider permissions",
+            Self::NotWritable => "that could not be opened for writing",
+        }
+    }
+}
+
+/// For `--in-place=update`: the metadata and flags a file is to be
+/// finalized with. They decide whether the receiver may write an existing
+/// file at the name in place (`fsops::vouch::update_refusal`).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct InPlaceUpdate {
+    pub meta: Meta,
+    pub flags: u8,
 }
 
 impl WireError {

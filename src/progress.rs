@@ -58,6 +58,9 @@ pub struct Progress {
     pub deletions_planned: AtomicU64,
     pub deletions_completed: AtomicU64,
     pub deletions_blocked: AtomicU64,
+    /// Under `--in-place=update`, existing files replaced rather than
+    /// updated in place, by reason; planned ones in a dry run.
+    pub in_place_refusals: InPlaceRefusals,
     /// Settled creations, mirrored here (like the deletion counters) so a
     /// fatal-error terminal record reports what the run actually did.
     pub directories_created: AtomicU64,
@@ -128,6 +131,30 @@ impl Drop for ProgressTicker {
     }
 }
 
+/// Counts of existing files replaced rather than updated in place, by
+/// reason (`ReplaceReason::ALL`).
+#[derive(Default)]
+pub struct InPlaceRefusals([AtomicU64; crate::proto::ReplaceReason::ALL.len()]);
+
+impl InPlaceRefusals {
+    pub fn add(&self, reason: crate::proto::ReplaceReason) {
+        let index = crate::proto::ReplaceReason::ALL
+            .iter()
+            .position(|known| *known == reason)
+            .expect("every reason is listed");
+        self.0[index].fetch_add(1, Relaxed);
+    }
+
+    /// Each reason with its count, in `ReplaceReason::ALL` order.
+    pub fn counts(&self) -> Vec<(crate::proto::ReplaceReason, u64)> {
+        crate::proto::ReplaceReason::ALL
+            .iter()
+            .zip(&self.0)
+            .map(|(reason, count)| (*reason, count.load(Relaxed)))
+            .collect()
+    }
+}
+
 impl Progress {
     /// Public total; keep the components separate for the dry-run explanation.
     pub fn excluded(&self) -> u64 {
@@ -171,6 +198,7 @@ impl Progress {
             deletions_planned: AtomicU64::new(0),
             deletions_completed: AtomicU64::new(0),
             deletions_blocked: AtomicU64::new(0),
+            in_place_refusals: Default::default(),
             directories_created: AtomicU64::new(0),
             symlinks_created: AtomicU64::new(0),
             specials_created: AtomicU64::new(0),

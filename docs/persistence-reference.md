@@ -356,7 +356,7 @@ falling back to SSH when TCP is unreachable. `--no-tcp` forces SSH;
 The receiving connection must stay open throughout the copy.
 
 Copies support directories, symlinks, modification times, filters, hashing,
-resume, mappings, the `--copy-metadata` options, `--sparse`, `--in-place=new`,
+resume, mappings, the `--copy-metadata` options, `--sparse`, `--in-place`,
 and the [overwrite policies](reference.md#choose-which-existing-files-to-update).
 Copies are refused while syq runs as root, so ownership and special files work
 as for any copy by an ordinary account.

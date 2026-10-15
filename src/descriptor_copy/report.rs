@@ -196,6 +196,7 @@ impl Report {
                 deletions_planned: None,
                 deletions_completed: None,
                 deletions_blocked: None,
+                replaced_not_in_place: None,
             },
             Some(known),
         );

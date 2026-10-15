@@ -3105,7 +3105,7 @@ fn checksum_inplace_compares_before_writing_over_ssh_and_tcp() {
             }
             identities.push(fs::metadata(t.path(&format!("dst/{name}"))).unwrap().ino());
         }
-        for run in 0..2 {
+        for _ in 0..2 {
             let mut command = compat_command();
             command
                 .arg("-e")
@@ -3137,14 +3137,12 @@ fn checksum_inplace_compares_before_writing_over_ssh_and_tcp() {
                 command.arg("--syq-no-tcp");
             }
             assert_output_ok(&command.run().unwrap());
-            for ((name, source, destination), inode) in cases.iter().zip(&mut identities) {
+            for ((name, source, _), inode) in cases.iter().zip(&identities) {
                 let path = t.path(&format!("dst/{name}"));
                 assert_eq!(&read(&path), source, "{name}, tcp={tcp}");
-                // A matching file is kept; a changed one is replaced, never
-                // written in place, and kept on the second run.
-                let now = fs::metadata(&path).unwrap().ino();
-                assert_eq!(now == *inode, run > 0 || source == destination, "{name}");
-                *inode = now;
+                // `--inplace` updates each of these files of the receiving
+                // account's, with one name, where it is.
+                assert_eq!(fs::metadata(&path).unwrap().ino(), *inode, "{name}");
             }
             assert_eq!(
                 fs::metadata(t.path("dst/readonly")).unwrap().mode() & 0o7777,

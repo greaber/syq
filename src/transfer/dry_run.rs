@@ -154,6 +154,13 @@ pub(super) fn print_dry_run_summary(
         human(progress.bytes_unchanged.load(Relaxed)),
         count_label(progress.files_unchanged.load(Relaxed), "file", "files")
     );
+    if let Some(summary) = opts
+        .inplace_update
+        .then(|| in_place_refusal_summary(&progress.in_place_refusals.counts(), true))
+        .flatten()
+    {
+        crate::output::human_stdout!("  in place: {summary}");
+    }
     if let Some(capacity) = capacity {
         let inode_detail = capacity.available_inodes.map_or_else(
             || {

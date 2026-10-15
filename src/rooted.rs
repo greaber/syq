@@ -679,6 +679,14 @@ impl Root {
         self.open_regular(path, libc::O_RDWR, false)
     }
 
+    /// The same, with the metadata read through the file once it is open.
+    pub(crate) fn open_regular_read_write_known(
+        &self,
+        path: &RelativePath,
+    ) -> Result<(File, std::fs::Metadata)> {
+        self.open_regular_known(path, libc::O_RDWR)
+    }
+
     pub(crate) fn open_metadata(&self, path: &RelativePath) -> Result<File> {
         if path.is_empty() {
             // The root is already selected and pinned. Reopening it through

@@ -130,15 +130,20 @@ fn sparse_updates_and_inplace_clear_old_nonzero_data() {
         // Hole punching preserves contents regardless of the filesystem's
         // record size, sharing and allocation accounting. Assert allocated
         // space for fresh outputs, where zero ranges were never written.
-        // An existing file is replaced with --inplace too, by a fresh one.
-        assert_sparse_copy(&t.path("dst"), &data);
-        assert_ne!(fs::metadata(t.path("dst")).unwrap().ino(), old_inode);
+        // `--inplace` updates the file of the receiving account's where it
+        // is.
+        if inplace {
+            assert_eq!(read(&t.path("dst")), data);
+            assert_eq!(fs::metadata(t.path("dst")).unwrap().ino(), old_inode);
+        } else {
+            assert_sparse_copy(&t.path("dst"), &data);
+        }
     }
 }
 
 /// Same-host in-place copies and small in-place puts write a new file at
-/// its name and replace an existing one: either way the result holds the
-/// source, holes included.
+/// its name, and write over an existing one before cutting it to length:
+/// zeros over its old bytes must clear them rather than be skipped.
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
 fn sparse_inplace_local_copies_and_small_puts_hold_the_source() {
@@ -187,7 +192,7 @@ fn sparse_inplace_local_copies_and_small_puts_hold_the_source() {
             assert!(read(&t.path("dst/small")) == small);
             for (name, inode) in ["large", "small"].into_iter().zip(inodes) {
                 let now = fs::metadata(t.path(&format!("dst/{name}"))).unwrap().ino();
-                assert_ne!(Some(now), inode);
+                assert_eq!(Some(now) == inode, inode.is_some(), "{name}");
             }
         }
     }

@@ -281,6 +281,8 @@ struct CopyLocalPolicy<'a> {
     inplace: bool,
     /// The group publication gives an in-place file, when it sets one.
     group: Option<u32>,
+    /// `--in-place=update` (`Request::Prepare`).
+    update: Option<&'a InPlaceUpdate>,
     replace_partial: bool,
     allow_sequential_nfs_fallback: bool,
     allow_sequential_local_fallback: bool,
@@ -992,7 +994,7 @@ struct PartialTarget<'a> {
     guard: Option<&'a ContainerGuard>,
 }
 
-struct PrepareOptions {
+struct PrepareOptions<'a> {
     size: u64,
     inplace: bool,
     mode: u32,
@@ -1000,6 +1002,8 @@ struct PrepareOptions {
     create_if_missing: bool,
     /// The group publication gives an in-place file, when it sets one.
     group: Option<u32>,
+    /// `--in-place=update` (`Request::Prepare`).
+    update: Option<&'a InPlaceUpdate>,
 }
 
 struct HashOptions {

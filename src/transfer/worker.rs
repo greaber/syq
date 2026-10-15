@@ -301,6 +301,11 @@ impl Worker {
     /// keep the per-file path, which inspects the destination before
     /// deciding what to write.
     fn replaces_in_batch(&self, job: &FileJobData, existing: &Entry) -> bool {
+        // `--in-place=update` writes the file where it is, on the per-file
+        // path.
+        if job.inplace {
+            return false;
+        }
         let inspects_destination = self.inspects_destination(job)
             || (!job.compared
                 && (self.compares_first(job, existing)
@@ -363,6 +368,9 @@ impl Worker {
             && !self.opts.has_expected_for(j)
             && !self.opts.tuning.force_ranges()
             && j.entry.size <= self.compare_group_limits().0
+            // In place, only the blocks that differ are written; that is the
+            // per-file path.
+            && !j.inplace
             && j.target_condition == TargetCondition::Any
             && !self.inspects_destination(j)
             && jobs.destination(idx).is_some_and(|existing| {
@@ -876,6 +884,7 @@ impl Worker {
             j.done.store(j.entry.size, Relaxed);
             // Already counted for tuning when the destination acknowledged it.
             self.progress.files_done.fetch_add(1, Relaxed);
+            self.note_replaced(j);
             if let Some(results) = self.progress.results_writer() {
                 results.emit_operation(&crate::results::OperationRecord {
                     action: "transfer_file",
@@ -1158,6 +1167,11 @@ impl Worker {
                 }
                 Err(e) => {
                     self.sched.ranges_ready(idx, vec![]);
+                    // `--in-place=update` found a file it will not write in
+                    // place, before copying anything.
+                    if self.replace_instead(idx, &e) {
+                        return Ok(());
+                    }
                     if self.transport_dead() {
                         // try_copy_local queues publication recovery after it
                         // has credited the completed kernel copy. Earlier
@@ -1374,17 +1388,47 @@ impl Worker {
     /// its metadata in place (`fsops::vouch`), copy it again as a file to
     /// replace, and say so. The job's scheduling has been settled.
     fn replace_instead(&self, idx: usize, error: &anyhow::Error) -> bool {
-        if !crate::fsops::vouch::is_replace_required(error) {
+        let Some(reason) = crate::fsops::vouch::replace_reason(error) else {
             return false;
-        }
+        };
         let mut jobs = self.sched.jobs.lock().unwrap();
-        if jobs[idx].replace {
+        let job = &mut jobs[idx];
+        if job.replace {
             return false;
         }
-        jobs[idx].replace = true;
+        job.replace = true;
+        // `--in-place=update` found the file one it will not update in
+        // place: it is copied to a stage instead.
+        if self.opts.inplace_update {
+            job.inplace = false;
+            job.in_place_refusal = Some(reason);
+        }
         drop(jobs);
         self.sched.requeue(idx);
         true
+    }
+
+    /// Under `--in-place=update`, the metadata a file is to be finalized
+    /// with, which decides whether the receiver writes an existing file at
+    /// its name in place (`Request::Prepare`).
+    pub(super) fn in_place_update(&self, job: &WorkerJob) -> Option<Box<InPlaceUpdate>> {
+        if !(self.opts.inplace_update && job.inplace) {
+            return None;
+        }
+        let mut meta = self.opts.metadata_for(&job.rel_bytes, &job.entry);
+        meta.mode = self.create_mode(job);
+        Some(Box::new(InPlaceUpdate {
+            meta,
+            flags: self.publication_flags(job),
+        }))
+    }
+
+    /// Count `job`, just replaced, when `--in-place=update` could not update
+    /// it in place (`Progress::in_place_refusals`).
+    pub(super) fn note_replaced(&self, job: &FileJobData) {
+        if let Some(reason) = job.in_place_refusal {
+            self.progress.in_place_refusals.add(reason);
+        }
     }
 
     /// Read-only equality probe. On a difference, discard the comparison and
@@ -1521,6 +1565,7 @@ impl Worker {
                 size: job.entry.size,
                 mode,
                 group: self.publication_group(job),
+                update: self.in_place_update(job),
             },
             &mut |total| {
                 if total < credited || total > job.entry.size {
@@ -1672,6 +1717,7 @@ impl Worker {
                 create_if_missing,
                 guard: job.container_guard.clone(),
                 group: self.publication_group(job),
+                update: self.in_place_update(job),
             })?,
             "prepare",
         )? {
@@ -2782,6 +2828,7 @@ impl Worker {
             self.progress.files_unchanged.fetch_add(1, Relaxed);
         } else {
             self.progress.add_files(1);
+            self.note_replaced(&job);
             if let Some(results) = self.progress.results_writer() {
                 results.emit_operation_expected(
                     &crate::results::OperationRecord {
@@ -2968,6 +3015,7 @@ impl Worker {
             self.opts
                 .note_directory_change(&self.progress, &job.dst, true);
             self.progress.add_files(1);
+            self.note_replaced(&job);
             self.progress.bytes_done.fetch_add(job.entry.size, Relaxed);
             (
                 Some(job.entry.size),

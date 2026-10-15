@@ -79,6 +79,32 @@ impl InodeMetadata {
                 .unwrap_or_default()
     }
 
+    /// Whether a file with `current` has an ACL beyond its mode bits other
+    /// than the one this metadata gives it (`acl_wider_than_final`), as far
+    /// as the metadata shows: a scan reads ACLs only for a copy that copies
+    /// them.
+    pub(crate) fn acl_wider_than(&self, current: Option<&Self>) -> bool {
+        let Some(current) = current else {
+            return false;
+        };
+        let posix = self.acls.as_ref().is_some_and(|wanted| {
+            current
+                .acls
+                .as_ref()
+                .and_then(|acls| acls.access.as_deref())
+                .is_some_and(|access| {
+                    posix_acl_is_extended(access) && wanted.access.as_deref() != Some(access)
+                })
+        });
+        let macos = self.macos_acl.as_ref().is_some_and(|wanted| {
+            current
+                .macos_acl
+                .as_ref()
+                .is_some_and(|acl| !acl.entries.is_empty() && acl != wanted)
+        });
+        posix || macos
+    }
+
     /// Whether giving a file with `current` (none read: nothing) this
     /// metadata would change anything but its access time, which syq
     /// restores in place on any file (`fsops::vouch`).
@@ -263,7 +289,7 @@ mod platform {
         names.sort_unstable();
         Ok(names)
     }
-    fn get(file: &File, name: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub(super) fn get(file: &File, name: &[u8]) -> Result<Option<Vec<u8>>> {
         #[cfg(test)]
         if name == ACCESS {
             ACCESS_ACL_READS.set(ACCESS_ACL_READS.get() + 1);
@@ -410,6 +436,20 @@ mod platform {
                 | (mask.or(group).context("default ACL lacks group")? << 3)
                 | other.context("default ACL lacks other")?,
         ))
+    }
+
+    /// `file`'s access ACL, when it grants more than its mode bits: it
+    /// names a user or group, or has a mask. One that only repeats the mode
+    /// counts as none.
+    pub(super) fn extended_access_acl(file: &File) -> Result<Option<Vec<u8>>> {
+        let Some(acl) = get(file, ACCESS)? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            acl.len() >= 4 && (acl.len() - 4).is_multiple_of(8) && acl[..4] == 2u32.to_le_bytes(),
+            "invalid Linux POSIX ACL encoding"
+        );
+        Ok(posix_acl_is_extended(&acl).then_some(acl))
     }
 
     pub(super) fn access_for_mode(raw: &[u8], mode: u32) -> Result<Vec<u8>> {
@@ -770,6 +810,65 @@ pub(crate) fn would_change_besides_atime(
         }
     }
     Ok(false)
+}
+
+/// Whether a Linux access ACL, as its extended attribute holds it, grants
+/// more than the mode bits: it names a user or group, or has a mask. Its
+/// owner, group and other entries are the mode bits themselves.
+pub(crate) fn posix_acl_is_extended(raw: &[u8]) -> bool {
+    raw.get(4..).is_some_and(|entries| {
+        entries
+            .chunks_exact(8)
+            .any(|entry| !matches!(u16::from_le_bytes([entry[0], entry[1]]), 0x01 | 0x04 | 0x20))
+    })
+}
+
+/// Whether `file` has a file capability (`security.capability`), which
+/// writing it takes away. Only Linux has them.
+pub(crate) fn has_file_capability(file: &File) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    return Ok(platform::get(file, b"security.capability")?.is_some());
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        Ok(false)
+    }
+}
+
+/// Whether `file` has an ACL granting more than its mode bits that the copy
+/// would not give it: unless the copy sets exactly that ACL, as `metadata`
+/// with the final `mode` says, any ACL beyond the mode counts.
+pub(crate) fn acl_wider_than_final(
+    file: &File,
+    metadata: Option<&InodeMetadata>,
+    mode: u32,
+) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(current) = platform::extended_access_acl(file)? else {
+            return Ok(false);
+        };
+        let wanted = metadata
+            .and_then(|metadata| metadata.acls.as_ref())
+            .and_then(|acls| acls.access.as_deref())
+            .map(|access| platform::access_for_mode(access, mode))
+            .transpose()?;
+        Ok(wanted.as_deref() != Some(&current[..]))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = mode;
+        let current = macos_acl::read(file)?;
+        if current.entries.is_empty() {
+            return Ok(false);
+        }
+        Ok(metadata.and_then(|metadata| metadata.macos_acl.as_ref()) != Some(&current))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (file, metadata, mode);
+        Ok(false)
+    }
 }
 
 /// Whether a Linux extended attribute's namespace grants privileges or

@@ -156,7 +156,7 @@ is off until you set a deletion limit; a copy that would delete more removes
 nothing. Change limits with
 `syq persist receive on --name laptop --max-bytes SIZE --max-entries N --max-delete N`.
 
-Most copy options work here, including `--in-place=new`; copies are refused
+Most copy options work here, including `--in-place`; copies are refused
 while syq runs as root. See
 [copy limits](persistence-reference.md#copy-limits) for details.
 
@@ -255,7 +255,7 @@ permits arbitrary commands and file access as that account. See
 approval's lifetime and how to manage it on the laptop.
 
 Uploads and downloads reuse the approved login and support `--no-tcp`, helper
-overrides, and `--in-place=new`. File data travels directly between the servers.
+overrides, and `--in-place`. File data travels directly between the servers.
 You do not need to run `persist connect` first or forward your agent.
 
 With `auto`, eligible copies can instead ask for restricted per-copy approval

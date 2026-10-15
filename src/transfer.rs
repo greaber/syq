@@ -245,6 +245,9 @@ pub struct Opts {
     /// filesystem that lacks them is known; the receiver decides for itself.
     pub destination_link_counts_trusted: AtomicBool,
     pub inplace: bool,
+    /// `--in-place=update`: existing files the receiver can vouch for are
+    /// updated in place too.
+    pub inplace_update: bool,
     /// The placement requires a new destination (`--as-new`, `--into-new`).
     pub new_target: bool,
     pub same_host: bool,
@@ -1561,6 +1564,7 @@ fn attempt_small_copy(
         deletions_planned: None,
         deletions_completed: None,
         deletions_blocked: None,
+        replaced_not_in_place: None,
     };
     let elapsed = progress.display_elapsed().as_secs_f64();
     if !args.quiet && !args.suppress_summary {
@@ -1652,6 +1656,38 @@ fn print_statistics(opts: &Opts, progress: &Progress, connections: &str, tcp_sta
 
 /// The one summary line a completed copy prints, rendered from the same
 /// record the results stream settles with.
+/// Under `--in-place=update`, what replaced or, in a dry run, would replace
+/// existing files rather than update them in place, as "N existing files
+/// ...: M with other hard links, ...", or `None` when nothing did.
+pub(crate) fn in_place_refusal_summary(
+    counts: &[(crate::proto::ReplaceReason, u64)],
+    dry_run: bool,
+) -> Option<String> {
+    let total: u64 = counts.iter().map(|(_, count)| count).sum();
+    if total == 0 {
+        return None;
+    }
+    let reasons = counts
+        .iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(reason, count)| format!("{} {}", commas(*count), reason.label()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let files = if total == 1 { "file" } else { "files" };
+    let them = if total == 1 { "it" } else { "them" };
+    Some(if dry_run {
+        format!(
+            "would replace {} existing {files} instead of updating {them} in place: {reasons}",
+            commas(total)
+        )
+    } else {
+        format!(
+            "replaced {} existing {files} instead of updating {them} in place: {reasons}",
+            commas(total)
+        )
+    })
+}
+
 fn print_transfer_summary(terminal: &crate::results::ResultRecord, elapsed: f64, deletions: &str) {
     crate::output::human_stdout!(
         "syq: transferred {} files ({}), {} unchanged ({} files), {} dirs created{}{}{}",
@@ -1672,6 +1708,13 @@ fn print_transfer_summary(terminal: &crate::results::ResultRecord, elapsed: f64,
             String::new()
         }
     );
+    if let Some(summary) = terminal
+        .replaced_not_in_place
+        .as_deref()
+        .and_then(|counts| in_place_refusal_summary(counts, false))
+    {
+        crate::output::human_stdout!("syq: {summary}");
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1821,6 +1864,13 @@ pub fn run(mut args: Args) -> Result<i32> {
     }
     let dry_run = args.dry_run;
     let prune = args.delete;
+    let in_place_update = args.in_place_update;
+    if in_place_update && !dry_run {
+        crate::output::diagnostic!(
+            "syq: warning: {}: anyone who already has an existing file open can read its new contents, and an interruption leaves a file partly updated",
+            interface_option(&args, "--in-place=update", "--inplace")
+        );
+    }
     let outcome = handoff.and_then(|()| run_transfer(args, Arc::clone(&progress)));
     if let Some(history) = progress.tuning_history.get() {
         history.complete(matches!(&outcome, Ok(0)), serde_json::json!({
@@ -1862,6 +1912,7 @@ pub fn run(mut args: Args) -> Result<i32> {
                 deletions_planned: prune.then(|| progress.deletions_planned.load(Relaxed)),
                 deletions_completed: prune.then(|| progress.deletions_completed.load(Relaxed)),
                 deletions_blocked: prune.then(|| progress.deletions_blocked.load(Relaxed)),
+                replaced_not_in_place: in_place_update.then(|| progress.in_place_refusals.counts()),
             });
         }
     }
@@ -1911,7 +1962,7 @@ fn wire_os_kind(error: &WireError) -> Option<&'static str> {
         WireIoKind::NoSpace => "no_space",
         WireIoKind::QuotaExceeded => "quota_exceeded",
         WireIoKind::ReadOnly => "read_only",
-        WireIoKind::Other | WireIoKind::ReplaceRequired => "other",
+        WireIoKind::Other | WireIoKind::ReplaceRequired(_) => "other",
     })
 }
 
@@ -2397,6 +2448,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         symlink_times: AtomicBool::new(true),
         destination_link_counts_trusted: AtomicBool::new(true),
         inplace: args.inplace,
+        inplace_update: args.in_place_update,
         new_target: args.target_existence == Existence::New,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
         allow_sequential_nfs_fallback: args.connections_default || args.connections == 1,
@@ -4113,7 +4165,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     // In-place copies of new files only are a workload of
                     // their own, apart from the earlier in-place updates.
                     "inplace={};compress={};bandwidth={};checksum={};hash={:?};integrity={};transfer_hash={:?}{}",
-                    if opts.inplace { "new" } else { "false" }, args.compress, args.bwlimit_bytes, args.checksum,
+                    match (opts.inplace, opts.inplace_update) {
+                        (_, true) => "update",
+                        (true, false) => "new",
+                        (false, false) => "false",
+                    }, args.compress, args.bwlimit_bytes, args.checksum,
                     args.hash_algorithm, args.transfer_integrity, args.transfer_hash_type,
                     opts.transfer_strategy.history_suffix(opts.same_host)
                 ), transport_activity),
@@ -4920,6 +4976,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         deletions_planned,
         deletions_completed,
         deletions_blocked,
+        replaced_not_in_place: opts
+            .inplace_update
+            .then(|| progress.in_place_refusals.counts()),
     };
 
     if let (Some(history), Some(initial)) = (

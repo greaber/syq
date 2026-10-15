@@ -64,7 +64,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 |---|---|
 | `--if-exists <POLICY>` | How to handle existing destination files; directories remain containers<br><br>Possible values:<br>- error-if-different: Reject detected content differences; trusts matching size and mtime unless --hash is set<br>- error: Report an error for every existing destination leaf<br>- keep: Leave existing entries and their metadata alone<br>- update: Update contents when they differ and apply requested metadata<br>- update-if-older: Keep newer destinations; otherwise update differing contents<br><br>[default: update] |
 | `--copy-if <EXPR>` | Update only entries satisfying a source/destination expression |
-| `--in-place <MODE>` | Write the files the copy creates directly at their final names, with no staging file; interruption can leave them incomplete<br><br>Possible values:<br>- new: Only files the copy creates; an existing file is still replaced through a staging file |
+| `--in-place <MODE>` | Write files directly at their final names, with no staging file; interruption can leave them incomplete<br><br>Possible values:<br>- new: Only files the copy creates; an existing file is still replaced through a staging file<br>- update: Also existing files syq can vouch for, writing only what changed; others are replaced. Anyone who has such a file open can read its new contents, and an interruption leaves it partly updated |
 | `--prune` | After copying, remove target-only objects in mapped directory scopes; ignored source paths remain protected |
 | `--prune-before` | Remove target-only objects before copying to free space. Implies --prune; later copy failures do not restore removed objects |
 | `--max-delete <N>` | With --prune or --prune-before, refuse all removals if more than N are planned |
@@ -180,16 +180,17 @@ files inside it. `--if-exists=keep` can add children to an existing directory; i
 makes a read-only one writable only as
 [`--widen-dirs`](../reference.md#copy-metadata) allows.
 
-`--if-exists=keep` and `update-if-older` cannot combine with `--in-place=new`:
-an interrupted copy could leave an incomplete new file that a retry skips. The
-default `update` policy repairs that file on a retry. With `--in-place=new`, a
+`--if-exists=keep` and `update-if-older` cannot combine with `--in-place`:
+an interrupted copy could leave an incomplete file that a retry skips. The
+default `update` policy repairs that file on a retry. With `--in-place`, a
 file that must be new, an `--as-new` file or a new file under
 `--if-exists=error` or `error-if-different`, is still written under a temporary
 name and then renamed into place, so an interrupted copy leaves no incomplete
 file at its name, and a retry resumes it. Every destination publishes such
 a file without replacing anything: a file put at its name in the meantime is
 kept, and that file's copy fails. S3 destinations do not support
-`--in-place=new`.
+`--in-place`. See [In-place writes](../reference.md#in-place-writes) for which
+existing files `--in-place=update` writes into.
 
 These policies do not disable requested pruning. Descriptor-specific
 restrictions are listed under [file descriptors](#file-descriptors).

@@ -1125,7 +1125,9 @@ fn run_remote(
     } else if args.delete {
         remote.push("--prune".into());
     }
-    if args.inplace {
+    if args.in_place_update {
+        remote.push("--in-place=update".into());
+    } else if args.inplace {
         remote.push("--in-place=new".into());
     }
     for line in &args.ignore_lines {

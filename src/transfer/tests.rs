@@ -467,6 +467,7 @@ fn pipeline_worker(
         operator_symlink_policy: OperatorSymlinkPolicy::Refuse,
         max_size: None,
         min_size: None,
+        inplace_update: false,
     });
     Worker {
         id: 0,

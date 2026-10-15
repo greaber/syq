@@ -817,8 +817,8 @@ def _copy_arguments(
             "files in place and replaces existing files through a staging file"
         )
     if in_place is not None:
-        if in_place != "new":
-            raise SyqInvocationError("in_place must be new")
+        if in_place not in ("new", "update"):
+            raise SyqInvocationError("in_place must be new or update")
         argv.append(f"--in-place={in_place}")
     max_delete = _nonnegative_integer(max_delete, option="--max-delete")
     if max_delete is not None:

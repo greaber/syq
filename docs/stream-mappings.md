@@ -121,7 +121,7 @@ and resource limits apply. Stream entries share limits across endpoint sessions;
 Streams run on the invoking machine. Remote coordinator placement, detached
 execution, and named receiver grants are unavailable for these entries: they
 cannot inherit the caller's live stream, and named grants authorize pathnames.
-`--in-place=new` cannot provide publication after producer success. Pruning and tree
+`--in-place` cannot provide publication after producer success. Pruning and tree
 filters require a source tree; select entries in the calling program. Source
 metadata policies require actual source attributes; generated streams have none.
 Content comparison and size filters are unavailable in a stream-mapping batch;

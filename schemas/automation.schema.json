@@ -924,6 +924,34 @@
           "type": "boolean",
           "description": "For descriptor copies, false when the source length is unknown. Dry-run byte totals then count only known bytes."
         },
+        "replaced_not_in_place": {
+          "type": "object",
+          "description": "With --in-place=update, existing files replaced instead of updated in place, by reason; planned replacements in a dry run.",
+          "properties": {
+            "not_regular": {
+              "$ref": "#/$defs/u64"
+            },
+            "other_names": {
+              "$ref": "#/$defs/u64"
+            },
+            "untrusted_filesystem": {
+              "$ref": "#/$defs/u64"
+            },
+            "owner": {
+              "$ref": "#/$defs/u64"
+            },
+            "privileges": {
+              "$ref": "#/$defs/u64"
+            },
+            "wider_permissions": {
+              "$ref": "#/$defs/u64"
+            },
+            "not_writable": {
+              "$ref": "#/$defs/u64"
+            }
+          },
+          "additionalProperties": false
+        },
         "timings": {
           "$ref": "#/$defs/timings"
         }

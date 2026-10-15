@@ -184,12 +184,22 @@ pub(crate) enum PublicationPolicy {
     /// read `InPlace` as permission to write existing files in place,
     /// refuses the grant instead.
     InPlaceNew,
+    /// `--in-place=update`: as `InPlaceNew`, and an existing file the
+    /// receiver can vouch for (`fsops::vouch::update_refusal`) is updated in
+    /// place too. A receiver from before it refuses the grant, rather than
+    /// writing existing files in place without those checks.
+    InPlaceUpdate,
 }
 
 impl PublicationPolicy {
     /// Whether new files may be written directly at their final names.
     pub(crate) fn writes_new_files_in_place(self) -> bool {
         !matches!(self, Self::AtomicStaged)
+    }
+
+    /// Whether existing files may be updated in place.
+    pub(crate) fn updates_existing_files_in_place(self) -> bool {
+        self == Self::InPlaceUpdate
     }
 }
 

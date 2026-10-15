@@ -304,7 +304,12 @@ A copy with no selected file work reports zero transfer time.
 
 Copy totals include transferred/unchanged files, excluded entries, created directories,
 symlinks and specials, transferred/unchanged bytes, and on pruning runs
-`deletions_planned`, `deletions_completed`, and `deletions_blocked`. A fatal
+`deletions_planned`, `deletions_completed`, and `deletions_blocked`. With
+`--in-place=update`, `replaced_not_in_place` counts the existing files syq
+replaced instead of updating them in place, by reason: `other_names`,
+`untrusted_filesystem`, `owner`, `privileges`, `wider_permissions`,
+`not_writable` and `not_regular`, each present only when nonzero (see
+[In-place writes](reference.md#in-place-writes)). A fatal
 failure reports what finished before it stopped. Dry-run totals describe
 planned work, not committed changes.
 

@@ -1063,6 +1063,8 @@ mod ssh_persistence;
 #[path = "local/tuning.rs"]
 mod tuning;
 
+#[path = "local/in_place_update.rs"]
+mod in_place_update;
 #[cfg(target_os = "linux")]
 #[path = "local/inode_metadata.rs"]
 mod inode_metadata;

@@ -116,6 +116,8 @@ pub(super) struct Got {
     pub(super) file: File,
     pub(super) relative: RelativePath,
     pub(super) in_use: Arc<()>,
+    /// This copy created the file, as `Held::created`.
+    pub(super) created: bool,
 }
 
 #[derive(Default)]
@@ -204,6 +206,7 @@ pub(super) fn get(target: For<'_>) -> io::Result<Option<Got>> {
         file: held.file.try_clone()?,
         relative: held.relative.clone(),
         in_use: held.in_use.clone(),
+        created: held.created,
     }))
 }
 

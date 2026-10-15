@@ -82,6 +82,9 @@ pub struct FileJobData {
     pub done: Arc<AtomicU64>,
     /// Written directly to the final path (no partial + rename).
     pub inplace: bool,
+    /// Under `--in-place=update`, why this existing file is replaced
+    /// rather than updated in place, for the copy's summary.
+    pub in_place_refusal: Option<crate::proto::ReplaceReason>,
     /// Destination-root-relative path, used in machine-readable results.
     pub rel_bytes: PathBytes,
     /// --mapping: the entry's source path relative to the source base, kept

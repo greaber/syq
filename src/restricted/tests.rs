@@ -1095,6 +1095,7 @@ fn signed_filters_bind_scans_mutations_and_prune_protection() {
         create_if_missing: true,
         guard: None,
         group: None,
+        update: None,
     };
     let mut included_prepare = prepare(included);
     authority.authorize(&mut included_prepare, false).unwrap();
@@ -1178,6 +1179,7 @@ fn mixed_filter_mappings_keep_an_explicit_named_source_root() {
         create_if_missing: true,
         guard: None,
         group: None,
+        update: None,
     };
     let mut cache_root = prepare(cache.clone());
     authority.authorize(&mut cache_root, false).unwrap();
@@ -1221,6 +1223,7 @@ fn signed_in_place_policies_admit_in_place_and_staged_file_mutations() {
             create_if_missing: true,
             guard: None,
             group: None,
+            update: None,
         };
         let mut inplace = prepare(true);
         assert_eq!(
@@ -1460,6 +1463,7 @@ fn prepare_request(path: &Path) -> Request {
         create_if_missing: true,
         guard: None,
         group: None,
+        update: None,
     }
 }
 
@@ -3234,6 +3238,7 @@ fn in_place_files_appear_in_the_receipt_before_their_final_step() {
         create_if_missing: true,
         guard: None,
         group: None,
+        update: None,
     };
     let settlement = authority.authorize(&mut prepare, false).unwrap();
     fs::write(&image, b"half").unwrap();
@@ -3289,6 +3294,7 @@ fn in_place_files_appear_in_the_receipt_before_their_final_step() {
         create_if_missing: true,
         guard: None,
         group: None,
+        update: None,
     };
     let settlement = finished.authorize(&mut prepare, false).unwrap();
     finished.settle(settlement, &proto::Response::Ok);
@@ -3366,6 +3372,7 @@ fn in_place_final_step_honors_the_fingerprint_the_receiver_takes_after_the_write
             create_if_missing: true,
             guard: None,
             group: None,
+            update: None,
         });
         assert!(
             matches!(prepared, proto::Response::Prepared(_)),
@@ -4110,6 +4117,7 @@ fn signed_file_data_rate_is_enforced_across_requests() {
         create_if_missing: true,
         guard: None,
         group: None,
+        update: None,
     };
     authority.authorize(&mut prepare, false).unwrap();
 
@@ -4544,6 +4552,7 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
         create_if_missing: true,
         guard: None,
         group: None,
+        update: None,
     };
     authority.authorize(&mut prepare("a", 10), false).unwrap();
     // A second file would take the aggregate past the ceiling.
@@ -6767,6 +6776,7 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
                 create_if_missing: true,
                 guard: None,
                 group: None,
+                update: None,
             });
             receiver.send(Request::WriteRange {
                 path: path(name),
@@ -6918,6 +6928,7 @@ fn only_an_ordinary_receiver_takes_a_senders_word_for_what_a_file_replaces() {
                 create_if_missing: true,
                 guard: None,
                 group: None,
+                update: None,
             });
             receiver.send(Request::WriteRange {
                 path: path("large"),
@@ -7032,6 +7043,7 @@ fn both_receivers_write_only_files_they_created() {
             create_if_missing: true,
             guard: None,
             group: None,
+            update: None,
         });
         receiver.send(Request::WriteRange {
             path: path.clone(),
@@ -7086,6 +7098,226 @@ fn both_receivers_write_only_files_they_created() {
         let after = fs::symlink_metadata(target.join("link")).unwrap();
         assert_ne!(after.ino(), before.ino(), "{case}");
         assert_eq!(after.mtime(), 1_600_000_000, "{case}");
+    }
+}
+
+/// Under `--in-place=update`, ordinary and command-restricted receivers
+/// alike write a file of their own with one name where it is, and refuse to
+/// write one with another name in place, so that the sender replaces it,
+/// which it then does through a stage. The restricted receiver's receipt
+/// records the replacement, and nothing of the refused preparation.
+#[test]
+fn both_receivers_update_in_place_only_files_they_vouch_for() {
+    for restricted in [false, true] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        for name in ["mine", "linked"] {
+            fs::write(target.join(name), b"old contents").unwrap();
+            fs::set_permissions(target.join(name), fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        fs::hard_link(target.join("linked"), root.join("outside")).unwrap();
+        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let (secret, policy) = encrypted_policy(true);
+        let mut receiver =
+            ParityReceiver::new(&root, restricted, true, PublicationPolicy::InPlaceUpdate);
+        if restricted {
+            let mut authority = test_authority_with_receipt(
+                &root,
+                DeletionPolicy::Forbid,
+                1 << 20,
+                0,
+                FilterPolicy::default(),
+                PublicationPolicy::InPlaceUpdate,
+                ExistingDestinationPolicy::Replace,
+                DestinationPlacement::ExactPath,
+                RootExistence::Any,
+                Some((key, policy.clone())),
+            )
+            .unwrap();
+            authority.copy.options.preserve_permissions = true;
+            authority.copy.options.preserve_times = true;
+            authority.copy.limits.max_entries = 1000;
+            receiver.authority = Some(authority);
+        }
+        let case = format!("restricted={restricted}");
+        let meta = proto::Meta {
+            mode: 0o644,
+            mtime: 1_600_000_000,
+            ..plain_meta()
+        };
+        let flags = proto::flags::MODE | proto::flags::TIMES;
+        let data = b"new contents".to_vec();
+        let path = |name: &str| path_bytes(&target.join(name));
+        let prepare = |name: &str, update: bool| Request::Prepare {
+            path: path(name),
+            size: data.len() as u64,
+            inplace: update,
+            copy_id: [8; 16],
+            mode: 0o644,
+            flags,
+            acl: false,
+            scanned: proto::ScannedDestination::Unknown,
+            attempt: 0,
+            create_if_missing: true,
+            guard: None,
+            group: None,
+            update: update.then(|| {
+                Box::new(proto::InPlaceUpdate {
+                    meta: meta.clone(),
+                    flags,
+                })
+            }),
+        };
+        let write = |name: &str, inplace: bool| Request::WriteRange {
+            path: path(name),
+            inplace,
+            copy_id: [8; 16],
+            attempt: 0,
+            off: 0,
+            hash: crate::fsops::content_digest(&data),
+            data: data.clone().into(),
+            guard: None,
+        };
+        let finalize = |name: &str, inplace: bool| Request::Finalize {
+            expected_hash: None,
+            path: path(name),
+            inplace,
+            copy_id: [8; 16],
+            meta: meta.clone(),
+            flags,
+            scanned: proto::ScannedDestination::Unknown,
+            condition: proto::TargetCondition::Any,
+            guard: None,
+        };
+
+        let mine = fs::metadata(target.join("mine")).unwrap().ino();
+        receiver.send(prepare("mine", true));
+        receiver.send(write("mine", true));
+        receiver.send(finalize("mine", true));
+        let status = fs::metadata(target.join("mine")).unwrap();
+        assert_eq!(fs::read(target.join("mine")).unwrap(), data, "{case}");
+        assert_eq!(
+            (status.ino(), status.mtime()),
+            (mine, 1_600_000_000),
+            "{case}"
+        );
+
+        let mut request = prepare("linked", true);
+        let response = match &receiver.authority {
+            Some(authority) => {
+                let settlement = authority.authorize(&mut request, false).unwrap();
+                let response = receiver.ops.handle(&request);
+                authority.settle(settlement, &response);
+                response
+            }
+            None => receiver.ops.handle(&request),
+        };
+        let proto::Response::EndpointError(error) = &response else {
+            panic!("{case}: {response:?}");
+        };
+        assert_eq!(
+            crate::fsops::vouch::replace_reason_wire(error),
+            Some(proto::ReplaceReason::OtherNames),
+            "{case}: {error:?}"
+        );
+        assert_eq!(
+            fs::read(target.join("linked")).unwrap(),
+            b"old contents",
+            "{case}"
+        );
+        receiver.send(prepare("linked", false));
+        receiver.send(write("linked", false));
+        receiver.send(finalize("linked", false));
+        assert_eq!(fs::read(target.join("linked")).unwrap(), data, "{case}");
+        assert_eq!(
+            fs::read(root.join("outside")).unwrap(),
+            b"old contents",
+            "{case}"
+        );
+
+        if let Some(authority) = &receiver.authority {
+            let mut verified = open_issued(authority, &secret, &policy);
+            assert!(verified.terminal.recording_failure.is_none(), "{case}");
+            let mut published = Vec::new();
+            verified
+                .for_each_record(|record| {
+                    if let crate::receipt::ReceiptRecord::Operation(operation) = record {
+                        if let crate::receipt::OperationAction::PublishFile { inplace, .. } =
+                            operation.action
+                        {
+                            published.push((operation.path, inplace));
+                        }
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            published.sort();
+            assert_eq!(
+                published,
+                [(b"linked".to_vec(), false), (b"mine".to_vec(), true)],
+                "{case}"
+            );
+        }
+    }
+}
+
+/// Only a grant for `--in-place=update` lets a receiver update an existing
+/// file in place, and only with metadata the grant allows.
+#[test]
+fn in_place_updates_need_a_grant_for_them() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("existing"), b"old").unwrap();
+    let prepare = |flags| Request::Prepare {
+        path: path_bytes(&target.join("existing")),
+        size: 3,
+        inplace: true,
+        copy_id: [9; 16],
+        mode: 0o644,
+        flags: proto::flags::RECEIVER_MODE,
+        acl: false,
+        scanned: proto::ScannedDestination::Unknown,
+        attempt: 0,
+        create_if_missing: true,
+        guard: None,
+        group: None,
+        update: Some(Box::new(proto::InPlaceUpdate {
+            meta: plain_meta(),
+            flags,
+        })),
+    };
+    for (publication, allowed) in [
+        (PublicationPolicy::AtomicStaged, false),
+        (PublicationPolicy::InPlace, false),
+        (PublicationPolicy::InPlaceNew, false),
+        (PublicationPolicy::InPlaceUpdate, true),
+    ] {
+        let authority = test_authority_with_policy(
+            &root,
+            DeletionPolicy::Forbid,
+            1 << 20,
+            0,
+            FilterPolicy::default(),
+            publication,
+        );
+        let result = authority.authorize(&mut prepare(proto::flags::RECEIVER_MODE), false);
+        assert_eq!(result.is_ok(), allowed, "{publication:?}");
+        if let Err(error) = result {
+            assert!(
+                error.to_string().contains("signed publication policy"),
+                "{publication:?}: {error:#}"
+            );
+        }
+        if allowed {
+            let error = authority
+                .authorize(&mut prepare(proto::flags::OWNER), false)
+                .unwrap_err();
+            assert!(error.to_string().contains("ownership"), "{error:#}");
+        }
     }
 }
 
@@ -7156,6 +7388,7 @@ fn in_place_work_needs_a_grant_that_replaces_and_creates() {
         create_if_missing: true,
         guard: None,
         group: None,
+        update: None,
     };
     let error = authority.authorize(&mut prepare, false).unwrap_err();
     assert!(
@@ -7259,6 +7492,7 @@ fn both_receivers_restore_set_id_bits_after_writing_in_place() {
             create_if_missing: true,
             guard: None,
             group: None,
+            update: None,
         });
         receiver.send(Request::WriteRange {
             path: path.clone(),
@@ -7344,6 +7578,7 @@ fn both_receivers_limit_a_new_in_place_file_by_a_narrower_default_acl() {
             create_if_missing: true,
             guard: None,
             group: None,
+            update: None,
         });
         receiver.send(Request::WriteRange {
             path: path.clone(),
@@ -7858,6 +8093,7 @@ fn a_new_file_under_an_in_place_grant_is_staged_and_published_without_replacing(
         attempt,
         create_if_missing: true,
         guard: None,
+        update: None,
     };
     let write = |inplace, attempt| {
         let data = b"hello".to_vec();
@@ -7957,6 +8193,7 @@ fn a_refused_in_place_preparation_keeps_a_new_file_staged() {
         attempt: 0,
         create_if_missing: true,
         guard: None,
+        update: None,
     };
     let response = run(prepare(false)).unwrap();
     assert!(
@@ -8039,6 +8276,7 @@ fn a_new_file_inside_an_in_place_grant_is_staged_and_replaces_nothing() {
                 attempt: 0,
                 create_if_missing: true,
                 guard: None,
+                update: None,
             },
             Request::WriteRange {
                 path: path_bytes(file),
@@ -8141,6 +8379,7 @@ fn an_in_place_as_new_root_that_exists_is_refused_and_unchanged() {
         attempt: 0,
         create_if_missing: true,
         guard: None,
+        update: None,
     };
     assert!(run(prepare(true)).is_err());
     // A stage, as without the option, is never published over it.
