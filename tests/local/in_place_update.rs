@@ -555,6 +555,55 @@ fn a_refused_file_changed_after_its_comparison_is_replaced_with_the_sources_byte
     }
 }
 
+/// A file that gains another name after it was compared, and before the
+/// receiver opens it to write, is replaced rather than written in place:
+/// the other name keeps its contents.
+#[cfg(debug_assertions)]
+#[test]
+fn a_file_linked_after_its_comparison_is_replaced() {
+    let t = Tmp::new();
+    let new = prng(16 << 20, 710);
+    let mut old = new.clone();
+    old[(9 << 20) + 5] ^= 1;
+    write(&t.path("src/file"), &new);
+    write(&t.path("dst/file"), &old);
+    set_mtime(&t.path("src/file"), 1_700_000_000);
+    let before = inode(&t.path("dst/file"));
+    let (ready, continuation) = (t.path("ready"), t.path("continue"));
+    let results = t.path("copy.jsonl");
+    let mut child = cp_update_command(
+        &t,
+        "ssh",
+        &["--results", &results.to_string_lossy()],
+        &[
+            ("SYQ_TEST_BASIS_READY_FILE", &ready.to_string_lossy()),
+            (
+                "SYQ_TEST_BASIS_CONTINUE_FILE",
+                &continuation.to_string_lossy(),
+            ),
+        ],
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .start()
+    .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "the comparison");
+    fs::hard_link(t.path("dst/file"), t.path("outside")).unwrap();
+    release_confinement_barrier(&continuation);
+    let out = child.wait_with_output().unwrap();
+    assert_output_ok(&out);
+    assert!(read(&t.path("dst/file")) == new);
+    assert!(
+        read(&t.path("outside")) == old,
+        "the other name was written"
+    );
+    assert_ne!(inode(&t.path("dst/file")), before);
+    assert_eq!(
+        terminal(&results)["replaced_not_in_place"],
+        serde_json::json!({"other_names": 1})
+    );
+}
+
 /// An unchanged file the receiver will not update in place, here because
 /// its ACL is not the one it would end with, is kept as it is, with its
 /// ACL and extended attributes, whether `--hash` compares it or

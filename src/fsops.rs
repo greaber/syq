@@ -901,8 +901,46 @@ struct HeldBasis {
     file: File,
     /// `--in-place=update`'s answer for this file, when the sender asked
     /// with the comparison: why the receiver will not update it in place,
-    /// if it will not (`vouch::update_refusal`).
-    update_check: Option<Option<vouch::Refusal>>,
+    /// if it will not (`vouch::update_refusal`), and the file as it was
+    /// then.
+    update_check: Option<UpdateCheck>,
+}
+
+/// An answer of `vouch::update_refusal`, with what it was judged from: a
+/// later answer may reuse it only while all of this is unchanged. Adding a
+/// name, a chmod, a chown, or a change to an ACL or extended attribute
+/// changes the ctime; the link count, owner, group and mode are compared as
+/// well, for filesystems whose ctime is coarse.
+#[derive(Clone, Copy)]
+struct UpdateCheck {
+    refused: Option<vouch::Refusal>,
+    judged: (i64, i64, u64, u32, u32, u32),
+}
+
+impl UpdateCheck {
+    fn judged(metadata: &fs::Metadata) -> (i64, i64, u64, u32, u32, u32) {
+        (
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+            metadata.nlink(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.mode(),
+        )
+    }
+
+    fn new(refused: Option<vouch::Refusal>, metadata: &fs::Metadata) -> Self {
+        Self {
+            refused,
+            judged: Self::judged(metadata),
+        }
+    }
+
+    /// The answer, if `metadata`, read since, shows the file as it was
+    /// judged.
+    fn still(&self, metadata: &fs::Metadata) -> Option<Option<vouch::Refusal>> {
+        (Self::judged(metadata) == self.judged).then_some(self.refused)
+    }
 }
 
 struct SourceRootHandle {

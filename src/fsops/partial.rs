@@ -299,8 +299,11 @@ impl FsOps {
                     target.label.display()
                 );
             }
-            // The comparison asked already, through this file.
-            checked = compared.update_check;
+            // The comparison asked already, through this file: its answer
+            // holds while the file is as it was then, which the metadata
+            // just read through the descriptor to write shows. Anything else
+            // is checked again before a byte is written.
+            checked = compared.update_check.and_then(|check| check.still(&opened));
         }
         let refused = match checked {
             Some(refused) => refused,
@@ -795,14 +798,15 @@ impl FsOps {
         // the answer.
         if let (Some(update), Some(target), 0) = (update, &rooted, off) {
             let current = file.metadata()?;
-            update_check = Some(vouch::update_refusal(
+            let refused = vouch::update_refusal(
                 target.into(),
                 &file,
                 &current,
                 &update.meta,
                 update.flags,
                 || self.inherited_acl(target),
-            )?);
+            )?;
+            update_check = Some(UpdateCheck::new(refused, &current));
         }
         #[cfg(debug_assertions)]
         record_test_event(
@@ -845,7 +849,9 @@ impl FsOps {
         Ok((
             hashes,
             held_len,
-            update_check.flatten().map(|(reason, _)| reason),
+            update_check
+                .and_then(|check| check.refused)
+                .map(|(reason, _)| reason),
         ))
     }
 
