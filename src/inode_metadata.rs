@@ -57,6 +57,31 @@ impl InodeMetadata {
     /// Whether giving a file with `current` (none read: nothing) this
     /// metadata would change anything but its access time, which syq
     /// restores in place on any file (`fsops::vouch`).
+    /// Whether giving a file with `current` this metadata would set, change
+    /// or remove a `security.*` or `trusted.*` attribute.
+    pub(crate) fn privileged_attributes_differ(&self, current: Option<&Self>) -> bool {
+        let Some(wanted) = self
+            .xattrs
+            .as_ref()
+            .filter(|attributes| attributes.privileged)
+        else {
+            return false;
+        };
+        let privileged = |attributes: &ExtendedAttributes| {
+            attributes
+                .values
+                .iter()
+                .filter(|(name, _)| privileged_attribute(name))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        privileged(wanted)
+            != current
+                .and_then(|current| current.xattrs.as_ref())
+                .map(privileged)
+                .unwrap_or_default()
+    }
+
     pub(crate) fn differs_besides_atime(&self, current: Option<&Self>) -> bool {
         let empty = Self::default();
         let current = current.unwrap_or(&empty);
@@ -493,18 +518,29 @@ mod platform {
 
     /// Whether `metadata` would give `file` a file capability it does not
     /// have.
-    pub(super) fn adds_capability(file: &File, metadata: &InodeMetadata) -> Result<bool> {
-        const CAPABILITY: &[u8] = b"security.capability";
-        let Some(wanted) = metadata.xattrs.as_ref().and_then(|attributes| {
-            attributes
-                .values
-                .iter()
-                .find(|(name, _)| name == CAPABILITY)
-                .map(|(_, value)| value)
-        }) else {
+    pub(super) fn changes_privileged_attributes(
+        file: &File,
+        metadata: &InodeMetadata,
+    ) -> Result<bool> {
+        let Some(attributes) = metadata.xattrs.as_ref().filter(|a| a.privileged) else {
             return Ok(false);
         };
-        Ok(get(file, CAPABILITY)?.as_ref() != Some(wanted))
+        for name in names(file)? {
+            if super::privileged_attribute(&name)
+                && attributes
+                    .values
+                    .binary_search_by(|(n, _)| n.cmp(&name))
+                    .is_err()
+            {
+                return Ok(true);
+            }
+        }
+        for (name, value) in &attributes.values {
+            if super::privileged_attribute(name) && get(file, name)?.as_deref() != Some(value) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub(super) fn apply_xattrs(file: &File, metadata: &InodeMetadata) -> Result<()> {
@@ -736,12 +772,23 @@ pub(crate) fn would_change_besides_atime(
     Ok(false)
 }
 
-/// Whether applying `metadata` would give `file` a file capability it does
-/// not already have. Only Linux has them.
-pub(crate) fn adds_capability(file: &File, metadata: Option<&InodeMetadata>) -> Result<bool> {
+/// Whether a Linux extended attribute's namespace grants privileges or
+/// access: `security.*`, which holds file capabilities and SELinux labels,
+/// and `trusted.*`.
+fn privileged_attribute(name: &[u8]) -> bool {
+    name.starts_with(b"security.") || name.starts_with(b"trusted.")
+}
+
+/// Whether applying `metadata` through `file` would set, change or remove
+/// a `security.*` or `trusted.*` attribute (`privileged_attribute`). Only
+/// Linux has them.
+pub(crate) fn changes_privileged_attributes(
+    file: &File,
+    metadata: Option<&InodeMetadata>,
+) -> Result<bool> {
     #[cfg(target_os = "linux")]
     if let Some(metadata) = metadata {
-        return platform::adds_capability(file, metadata);
+        return platform::changes_privileged_attributes(file, metadata);
     }
     let _ = (file, metadata);
     Ok(false)

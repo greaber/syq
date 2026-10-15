@@ -11,6 +11,11 @@ const ROUTES: [&str; 4] = ["local", "ranges", "ssh", "tcp"];
 
 /// `syq rsync` with `args`, from `src/` to `dst/`, by `route`.
 fn rsync(t: &Tmp, route: &str, args: &[&str]) -> Output {
+    rsync_with(t, route, args, &[])
+}
+
+/// `rsync` with `env` set for syq and its remote helper.
+fn rsync_with(t: &Tmp, route: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut command = if matches!(route, "ssh" | "tcp") {
         let rsh = fake_rsh(t);
         if !t.path("remote-bin/syq").exists() {
@@ -46,6 +51,7 @@ fn rsync(t: &Tmp, route: &str, args: &[&str]) -> Output {
         command.args(args).arg(t.s("src/")).arg(t.s("dst/"));
         command
     };
+    command.envs(env.iter().copied());
     command.arg("--no-progress").run().unwrap()
 }
 
@@ -556,4 +562,44 @@ fn times_are_set_without_empty_paths_on_older_kernels() {
         fs::metadata(t.path("outside")).unwrap().mtime(),
         1_500_000_000
     );
+}
+
+/// Where the files syq creates show an owner other than the account it runs
+/// as (SSHFS without uid mapping, NFS that squashes root, CIFS mounted with
+/// `uid=`), syq compares owners with what its own creations there show: it
+/// gives new symlinks and FIFOs their metadata, links a hard-link group's
+/// names, and changes a file's permissions in place, as anywhere else. The
+/// test stands in for such a filesystem by giving syq another account to
+/// compare owners with than the one its files show.
+#[cfg(debug_assertions)]
+#[test]
+fn owners_are_compared_with_the_owner_new_files_show() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: needs an account other than root");
+        return;
+    }
+    let other = (unsafe { libc::geteuid() } + 1).to_string();
+    let env = [("SYQ_TEST_OWN_UID", other.as_str())];
+    for route in ["local", "ranges", "ssh"] {
+        let t = Tmp::new();
+        write(&t.path("src/file"), &prng(1 << 20, 509));
+        write(&t.path("src/a"), b"linked");
+        fs::hard_link(t.path("src/a"), t.path("src/b")).unwrap();
+        std::os::unix::fs::symlink("file", t.path("src/link")).unwrap();
+        mkfifo(&t.path("src/fifo"));
+        set_mtime(&t.path("src/file"), 1_700_000_000);
+        let out = rsync_with(&t, route, &["-aHD"], &env);
+        assert_output_ok(&out);
+        assert_eq!(inode(&t.path("dst/a")), inode(&t.path("dst/b")), "{route}");
+        assert!(fs::symlink_metadata(t.path("dst/fifo"))
+            .unwrap()
+            .file_type()
+            .is_fifo());
+        let kept = inode(&t.path("dst/file"));
+        fs::set_permissions(t.path("src/file"), fs::Permissions::from_mode(0o600)).unwrap();
+        let out = rsync_with(&t, route, &["-aHD"], &env);
+        assert_output_ok(&out);
+        assert_eq!(inode(&t.path("dst/file")), kept, "{route}");
+        assert_eq!(mode(&t.path("dst/file")), 0o600, "{route}");
+    }
 }

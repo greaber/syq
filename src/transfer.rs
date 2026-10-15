@@ -4321,6 +4321,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         directory_restorations: Default::default(),
         receiver_uid: None,
         parent_groups: Default::default(),
+        new_file_owner: None,
         // The destination directory itself when its owner lacks write or
         // search permission. Whatever the placement, an existing directory
         // at the destination path belongs to the copy.

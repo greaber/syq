@@ -703,10 +703,12 @@ fn set_new_leaf_metadata(
     let handle = crate::sys::open_at(directory.as_raw_fd(), name, open, 0)
         .context("open a new entry to set its metadata")?;
     let current = handle.metadata()?;
+    // Owned as the files this process creates there show, which is not
+    // the receiving account on every filesystem (`rooted::created_owner`).
     anyhow::ensure!(
         file_type_bits(current.mode()) == file_type
             && current.nlink() == 1
-            && current.uid() == unsafe { libc::geteuid() },
+            && Some(current.uid()) == crate::rooted::created_owner(directory, current.dev()),
         "the new entry changed before its metadata was set"
     );
     let flags = if symlink && !root.sets_symlink_times(directory, current.dev()) {

@@ -2597,7 +2597,10 @@ impl FsOps {
             Request::DescriptorCopy(_) | Request::BindStream(_) => {
                 bail!("descriptor copies require a separate unrestricted control session")
             }
-            Request::Scan { root, guard, .. } => {
+            Request::Scan { root, guard, .. }
+            | Request::NewFileOwner {
+                path: root, guard, ..
+            } => {
                 if guard.is_none() {
                     map(root)?;
                 }

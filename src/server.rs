@@ -699,6 +699,7 @@ fn file_payload_request(request: &Request) -> bool {
         | Request::Canonicalize { .. }
         | Request::TransportStats
         | Request::ReceiverUser
+        | Request::NewFileOwner { .. }
         | Request::Receipt
         | Request::Shutdown
         | Request::ListDirDetails { .. }

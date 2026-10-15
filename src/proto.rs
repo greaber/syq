@@ -1418,6 +1418,19 @@ pub enum WireRequest<Data> {
     },
     /// Restore the modes PrepareDestinationPath changed. Replies Ok.
     RestoreDestinationPath,
+    /// Who the files the receiver creates in the destination would belong
+    /// to, for predicting which existing files it can change in place
+    /// (`fsops::vouch`). A receiver that has created nothing on the
+    /// destination's filesystem yet creates a file to learn the owner it
+    /// shows: with `probe`, any file; without, as a preview asks, only an
+    /// unnamed one, which changes nothing anyone can see. Replies
+    /// `NewFileOwner`.
+    NewFileOwner {
+        /// The destination directory, where a probe goes.
+        path: PathBytes,
+        probe: bool,
+        guard: Option<ContainerGuard>,
+    },
 }
 
 /// A non-fatal scan problem. `path` is where it happened, relative to the
@@ -1750,6 +1763,21 @@ pub enum Response {
     /// A scan warning with its path. Replaces ScanWarn, which carried only
     /// text.
     ScanWarnAt(ScanWarning),
+    /// Reply to NewFileOwner.
+    NewFileOwner(NewFileOwner),
+}
+
+/// Who a file the receiver creates in the destination belongs to.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NewFileOwner {
+    /// The owner the files it creates on the destination's filesystem show
+    /// (`rooted::created_owner`), if it knows.
+    pub owner: Option<u32>,
+    /// The receiving process's effective group.
+    pub group: u32,
+    /// New files take their directory's group, as on macOS, rather than
+    /// the creator's unless the directory is set-group-ID, as on Linux.
+    pub directory_group: bool,
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).

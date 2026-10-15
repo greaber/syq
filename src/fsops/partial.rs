@@ -3081,7 +3081,27 @@ impl FsOps {
             Request::CheckOperatorDirectoryAncestry { checks } => self
                 .check_operator_directory_ancestry(checks, None)
                 .map(Response::DirectoryRelations),
-            Request::ReceiverUser => Ok(Response::ReceiverUser(unsafe { libc::geteuid() })),
+            Request::ReceiverUser => Ok(Response::ReceiverUser(crate::rooted::own_uid())),
+            Request::NewFileOwner { path, probe, guard } => {
+                let owner = self
+                    .rooted_destination_target(path, guard.as_ref())
+                    .ok()
+                    .flatten()
+                    .and_then(|target| {
+                        let directory = target.root.open_directory(&target.relative).ok()?;
+                        let dev = directory.metadata().ok()?.dev();
+                        if *probe {
+                            target.root.created_owner_in(&target.relative, dev)
+                        } else {
+                            target.root.created_owner_unseen_in(&target.relative, dev)
+                        }
+                    });
+                Ok(Response::NewFileOwner(crate::proto::NewFileOwner {
+                    owner,
+                    group: unsafe { libc::getegid() },
+                    directory_group: !cfg!(target_os = "linux"),
+                }))
+            }
             Request::PrepareDestinationPath {
                 path,
                 symlink_policy,
@@ -3851,27 +3871,20 @@ pub(super) fn require_safe_partial(file: &File, target: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Devices where a file this process has just created exclusively reports
-/// another owner: sshfs without uid mapping, squashed NFS, a CIFS mount with
-/// a forced uid. Ownership cannot show there that a sidecar opened without
-/// exclusive creation is new, so sidecars are created exclusively from the
-/// start instead of after that check has failed.
-fn foreign_owner_devices() -> &'static Mutex<std::collections::HashSet<u64>> {
-    static DEVICES: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
-    DEVICES.get_or_init(Default::default)
-}
-
+/// Whether a file this process has created exclusively on `dev` showed
+/// another owner than the account it runs as: sshfs without uid mapping,
+/// squashed NFS, a CIFS mount with a forced uid. Ownership cannot show
+/// there that a sidecar opened without exclusive creation is new, so
+/// sidecars are created exclusively from the start instead of after that
+/// check has failed.
 pub(super) fn creates_foreign_owners(dev: u64) -> bool {
-    foreign_owner_devices().lock().unwrap().contains(&dev)
+    crate::rooted::known_created_owner(dev).is_some_and(|uid| uid != crate::rooted::own_uid())
 }
 
+/// Remember the owner a file this process has just created exclusively
+/// shows on its filesystem (`rooted::created_owner`).
 fn note_created_owner(metadata: &fs::Metadata) {
-    if metadata.uid() != unsafe { libc::geteuid() } {
-        foreign_owner_devices()
-            .lock()
-            .unwrap()
-            .insert(metadata.dev());
-    }
+    crate::rooted::note_created_owner(metadata.dev(), metadata.uid());
 }
 
 // Ownership is required when adopting a leftover, before chmod or writes.

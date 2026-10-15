@@ -143,10 +143,10 @@ def planted_files_are_replaced(root):
     print("A planted hard-link representative gets no new name", flush=True)
 
 
-def preview(root, name, source, destination, metadata):
+def preview(root, name, source, destination, metadata, *extra):
     """The file traces of a `syq cp` preview."""
     results = root / f"{name}.jsonl"
-    run(["syq", "cp", "--dry-run", f"--copy-metadata={metadata}", "--results", str(results),
+    run(["syq", "cp", "--dry-run", f"--copy-metadata={metadata}", *extra, "--results", str(results),
          "--srcs-in", str(source), "--into", str(destination), "--no-progress"])
     records = [json.loads(line) for line in results.read_text().splitlines()]
     return [record for record in records if record.get("action") == "transfer_file"]
@@ -178,16 +178,100 @@ def root_metadata_repairs(root):
         assert (status.st_ino, status.st_uid, status.st_mode & 0o7777) == (inode, 1000, 0o600), (size, status)
         assert os.getxattr(target, "user.keep") == b"kept", size
 
-        # Without -g, in a directory of group 0 without the set-group-ID bit.
+        # Without -g, a file's group stays as it is when only its mode changes.
         target.chmod(0o644)
         os.chown(target, 0, 1001)
         traces = preview(root, f"group-{size}", source, destination, "permissions,mtime")
-        assert [(t["reason"], t.get("bytes")) for t in traces] == [("metadata_differs", size)], traces
+        assert [(t["reason"], t.get("bytes")) for t in traces] == [("metadata_differs", None)], traces
         run(["syq", "cp", "--copy-metadata=permissions,mtime", "--srcs-in", str(source),
              "--into", str(destination), "--no-progress"])
         status = target.stat()
-        assert status.st_ino != inode and (status.st_uid, status.st_gid) == (0, 0), (size, status)
+        assert (status.st_ino, status.st_uid, status.st_gid) == (inode, 0, 1001), (size, status)
+
+    # A hard-link group's existing file gets new names only if it already
+    # has the owner and group it ends with. Without -g, that is the group a
+    # new file gets in its directory: here 0, in a directory of group 0
+    # without the set-group-ID bit, so a file of group 1001 is replaced.
+    source = root / "group-link-source"
+    destination = root / "group-link-destination"
+    source.mkdir()
+    (source / "a").write_bytes(b"linked" * 1000)
+    os.link(source / "a", source / "b")
+    os.utime(source / "a", (1_700_000_000, 1_700_000_000))
+    run(["syq", "cp", "--copy-metadata=permissions,mtime,hardlinks", "--srcs-in", str(source),
+         "--into", str(destination), "--no-progress"])
+    os.chown(destination / "a", 0, 1001)
+    os.link(source / "a", source / "c")
+    inode = (destination / "a").stat().st_ino
+    traces = preview(root, "group-link", source, destination, "permissions,mtime,hardlinks")
+    assert sorted((t["dst"]["value"], t.get("bytes")) for t in traces) == [("a", 6000), ("b", 0), ("c", 0)], traces
+    run(["syq", "cp", "--copy-metadata=permissions,mtime,hardlinks", "--srcs-in", str(source),
+         "--into", str(destination), "--no-progress"])
+    names = [(destination / name).stat() for name in "abc"]
+    assert len({status.st_ino for status in names}) == 1 and names[0].st_ino != inode, names
+    assert (names[0].st_uid, names[0].st_gid) == (0, 0), names[0]
     print("Root repairs keep correctly owned files and preview replacements", flush=True)
+
+
+def root_metadata_by_the_change(root):
+    """Root changes in place what a file's owner could change themselves,
+    its permission bits and times, also on another user's file, which keeps
+    that owner. Another owner, an added set-ID bit or a change to a
+    security attribute, here a file capability removed, replaces the file,
+    whoever owns it. A preview counts the same files as rewritten."""
+    capability = struct.pack("<IIIII", 0x02000001, 1 << 10, 0, 0, 0)
+    cases = [
+        # name, copy metadata, extra options, source mode, source time,
+        # destination owner, destination capability, kept, final owner
+        ("mode", "permissions,mtime", (), 0o600, 1_700_000_000, 1001, False, True, 1001),
+        ("time", "permissions,mtime", ("--hash",), 0o644, 1_700_000_100, 1001, False, True, 1001),
+        ("owner", "ownership,permissions,mtime", (), 0o644, 1_700_000_000, 1001, False, False, 1000),
+        ("setid", "permissions,mtime", (), 0o4755, 1_700_000_000, 1001, False, False, 0),
+        ("capability", "permissions,mtime,xattrs", (), 0o644, 1_700_000_000, 1001, True, False, 0),
+        ("root-capability", "permissions,mtime,xattrs", (), 0o644, 1_700_000_000, 0, True, False, 0),
+    ]
+    for name, metadata, extra, mode, mtime, owner, has_capability, kept, final in cases:
+        source = root / f"change-{name}-source"
+        destination = root / f"change-{name}-destination"
+        source.mkdir()
+        destination.mkdir()
+        payload = name.encode() * 1000
+        for path in (source / "file", destination / "file"):
+            path.write_bytes(payload)
+        os.chown(source / "file", 1000, 1000)
+        (source / "file").chmod(mode)
+        os.utime(source / "file", (mtime, mtime))
+        target = destination / "file"
+        os.chown(target, owner, owner)
+        target.chmod(0o644)
+        os.utime(target, (1_700_000_000, 1_700_000_000))
+        if has_capability:
+            os.setxattr(target, "security.capability", capability)
+        inode = target.stat().st_ino
+        traces = preview(root, f"change-{name}", source, destination, metadata, *extra)
+        assert [(t["reason"], t.get("bytes")) for t in traces] == [
+            ("metadata_differs", None if kept else len(payload))], (name, traces)
+        run(["syq", "cp", f"--copy-metadata={metadata}", *extra, "--srcs-in", str(source),
+             "--into", str(destination), "--no-progress"])
+        status = target.stat()
+        assert (status.st_ino == inode, status.st_uid) == (kept, final), (name, status)
+        assert (status.st_mode & 0o7777, int(status.st_mtime)) == (mode, mtime), (name, status)
+        assert "security.capability" not in os.listxattr(target), name
+    # The same through syq rsync: `-rpt` changes another user's file's mode
+    # in place and leaves it theirs.
+    source = root / "change-rsync-source"
+    destination = root / "change-rsync-destination"
+    source.mkdir()
+    (source / "file").write_bytes(b"rsync" * 1000)
+    os.utime(source / "file", (1_700_000_000, 1_700_000_000))
+    run(["syq", "rsync", "-rpt", str(source) + "/", str(destination) + "/", "--no-progress"])
+    os.chown(destination / "file", 1001, 1001)
+    inode = (destination / "file").stat().st_ino
+    (source / "file").chmod(0o600)
+    run(["syq", "rsync", "-rpt", str(source) + "/", str(destination) + "/", "--no-progress"])
+    status = (destination / "file").stat()
+    assert (status.st_ino, status.st_uid, status.st_mode & 0o7777) == (inode, 1001, 0o600), status
+    print("Root changes metadata in place by the change, not the owner", flush=True)
 
 
 def main():
@@ -201,6 +285,7 @@ def main():
         ownership_only_directories(root)
         planted_files_are_replaced(root)
         root_metadata_repairs(root)
+        root_metadata_by_the_change(root)
         for interface in ["native", "native-owner", "rsync"]:
             source = root / f"source-{interface}"
             destination = root / f"destination-{interface}"

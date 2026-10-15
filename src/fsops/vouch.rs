@@ -8,11 +8,17 @@
 //!   can be trusted (the file's own filesystem: another can be mounted
 //!   below the destination), so the change reaches no name outside the
 //!   copy;
-//! - it is owned by the receiving user, or, when the receiver runs as root,
-//!   already by the owner and group it ends with, so root never adopts a
-//!   file someone else made;
-//! - the change gives it no set-user-ID or set-group-ID bit and no file
-//!   capability it lacks.
+//! - for a receiver other than root, it is owned as the files the receiver
+//!   creates on that filesystem show (`rooted::created_owner`): mostly the
+//!   receiving account, another on SSHFS without uid mapping, NFS that
+//!   squashes root or CIFS mounted with `uid=`;
+//! - for root, the change is one the file's owner could make themselves:
+//!   its permission bits, times, ordinary extended attributes and ACLs, but
+//!   not another owner or group, so root never hands someone's file to
+//!   another account;
+//! - the change gives it no set-user-ID or set-group-ID bit, and sets or
+//!   removes no `security.*` or `trusted.*` attribute, such as a file
+//!   capability or an SELinux label.
 //!
 //! Access times are the exception: they are restored in place on any file,
 //! through the descriptor the receiver holds, so a rerun with `-U` does not
@@ -51,6 +57,17 @@ impl<'a> From<&'a RootedTarget> for Place<'a> {
 }
 
 impl Place<'_> {
+    /// The owner files the receiver creates on `dev` show, learned in this
+    /// file's directory or the root (`Root::created_owner_in`).
+    fn created_owner(&self, dev: u64) -> Option<u32> {
+        let directory = self
+            .relative
+            .leaf()
+            .ok()
+            .and_then(|(directories, _)| RelativePath::new(&directories.join(&b'/')).ok())?;
+        self.root.created_owner_in(&directory, dev)
+    }
+
     /// Whether a file created at this name might start with a group other
     /// than `group` (`apply::group_may_differ`), from its directory.
     fn new_file_group_may_differ(&self, group: u32) -> bool {
@@ -110,24 +127,28 @@ pub(super) fn changes(file: &File, current: &fs::Metadata, meta: &Meta, flags: u
     )
 }
 
-/// Whether `current` is owned as a file syq may change in place must be:
-/// by the receiving user, or, as root, already by the owner and group it
-/// ends with. Without an owner or group to set, that is the one a new file
-/// at `target` would get.
+/// Whether `current` is owned as a file a receiver other than root may
+/// change in place, or any receiver may give new names to, must be: as the
+/// files the receiver creates on its filesystem show, or, as root, already
+/// by the owner and group it ends with. Without an owner or group to set,
+/// that is the one a new file at `place` would get. Where the receiver
+/// cannot learn the owner its files show, nothing is owned.
 pub(super) fn owner_vouches(
     place: Place<'_>,
     current: &fs::Metadata,
     meta: &Meta,
     flags: u8,
 ) -> bool {
-    let euid = unsafe { libc::geteuid() };
-    if euid != 0 {
-        return current.uid() == euid;
+    let Some(created) = place.created_owner(current.dev()) else {
+        return false;
+    };
+    if !is_superuser() {
+        return current.uid() == created;
     }
     let uid = if flags & flags::OWNER != 0 {
         meta.uid
     } else {
-        0
+        created
     };
     if current.uid() != uid {
         return false;
@@ -157,16 +178,27 @@ pub(super) fn refusal(
     if !place.root.link_counts_trusted_on(current.dev(), file) {
         return Ok(Some("its filesystem's link counts cannot be trusted"));
     }
-    if !owner_vouches(place, current, meta, flags) {
+    if is_superuser() {
+        // Root decides by the change: what the file's owner could change
+        // themselves goes in place; another owner or group replaces it.
+        if flags & flags::OWNER != 0 && current.uid() != meta.uid {
+            return Ok(Some("the change gives it another owner"));
+        }
+        if flags & flags::GROUP != 0 && current.gid() != meta.gid {
+            return Ok(Some("the change gives it another group"));
+        }
+    } else if !owner_vouches(place, current, meta, flags) {
         return Ok(Some(
-            "syq did not create it and does not own it as it would",
+            "syq did not create it and does not own it as its files show",
         ));
     }
     if flags & flags::MODE != 0 && meta.mode & 0o6000 & !current.mode() != 0 {
         return Ok(Some("the change adds a set-ID bit"));
     }
-    if crate::inode_metadata::adds_capability(file, meta.inode_metadata.as_deref())? {
-        return Ok(Some("the change adds a file capability"));
+    if crate::inode_metadata::changes_privileged_attributes(file, meta.inode_metadata.as_deref())? {
+        return Ok(Some(
+            "the change sets or removes a security or trusted attribute",
+        ));
     }
     Ok(None)
 }

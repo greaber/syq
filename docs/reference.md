@@ -447,10 +447,15 @@ S3-to-S3 copies also support [content headers, user metadata, tags, and storage
 class](object-storage.md#copies-between-s3-buckets).
 
 When only an existing file's metadata differs, syq changes it in place if the
-file has no other names, belongs to the account syq runs as (as root: already
-to the owner and group it ends with), the filesystem's link counts can be
-trusted, and the change adds no set-user-ID or set-group-ID bit or file
-capability. Otherwise it replaces the file as if its contents had changed.
+file has no other names, the filesystem's link counts can be trusted, and the
+change adds no set-user-ID or set-group-ID bit and sets or removes no
+`security.*` or `trusted.*` attribute. Run as another account, syq also needs
+the file to belong to it, as the files it creates there show (on SSHFS
+without uid mapping, NFS that squashes users, or CIFS mounted with `uid=`,
+that is not the account itself). Run as root, it changes in place what the
+file's owner could change, such as its permissions, times, ordinary extended
+attributes and ACLs, and replaces the file to give it another owner or group.
+Otherwise it replaces the file as if its contents had changed.
 Access times, which `atimes` restores, are set in place on any file. A
 replaced file gets a new inode number, needs write permission on its directory
 and room for a second copy, and does not keep attributes the copy does not
@@ -560,8 +565,8 @@ including updates, reruns, and `--in-place=new`. Only names eligible under the
 overwrite policy join the group; links outside the selected sources are not
 reconstructed. Existing extra destination links are not necessarily split.
 Syq gives new names only to an existing destination file that belongs to the
-account syq runs as (as root: already to the owner and group it ends with); it
-replaces any other. A group whose metadata changes is replaced and its names
+account syq runs as, as the files it creates there show (as root: already to
+the owner and group it ends with); it replaces any other. A group whose metadata changes is replaced and its names
 linked to the new file, since its file has other names.
 
 Hardlink preservation scans all selected sources before changing the destination.

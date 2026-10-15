@@ -78,6 +78,9 @@ pub(super) struct Planner<'a> {
     /// The group and mode of destination directories, as `must_replace`
     /// read them for a root receiver; None for one that does not exist.
     pub(super) parent_groups: std::collections::HashMap<PathBytes, Option<(u32, u32)>>,
+    /// Who a file the receiver creates in the destination belongs to, once
+    /// asked (`Request::NewFileOwner`).
+    pub(super) new_file_owner: Option<crate::proto::NewFileOwner>,
     /// The destination directory's own entry when its owner lacks write or
     /// search permission, checked with the first batch.
     pub(super) root_access_check: Option<Entry>,
@@ -4596,38 +4599,87 @@ impl Planner<'_> {
         let Ok(uid) = self.receiver_uid() else {
             return false;
         };
+        let Some(new_file) = self.new_file_owner(dst) else {
+            return false;
+        };
         let meta = self.opts.metadata_for(rel, source);
         let flags = self.opts.flags_for(rel);
-        let owned = if uid != 0 {
-            destination.uid == uid
-        } else {
-            destination.uid
-                == if flags & flags::OWNER != 0 {
-                    meta.uid
-                } else {
-                    0
-                }
-                && if flags & flags::GROUP != 0 {
-                    destination.gid == meta.gid
-                } else {
-                    !self.new_file_group_may_differ(dst, destination.gid)
-                }
-        };
+        // Owned as the files the receiver creates there show, or, for root,
+        // already by the owner and group the file ends with. Where the
+        // receiver does not know whom its files show, nothing is owned.
+        // A preview, which cannot learn it by creating a file anyone could
+        // see, predicts with the receiving account instead.
+        let owner = new_file.owner.or(self.opts.dry_run.then_some(uid));
+        let owned = owner.is_some_and(|created| {
+            if uid != 0 {
+                destination.uid == created
+            } else {
+                destination.uid
+                    == if flags & flags::OWNER != 0 {
+                        meta.uid
+                    } else {
+                        created
+                    }
+                    && if flags & flags::GROUP != 0 {
+                        destination.gid == meta.gid
+                    } else {
+                        !self.new_file_group_may_differ(dst, destination.gid, new_file)
+                    }
+            }
+        });
         if representative && !owned {
             return true;
         }
+        // Root decides by the change: another owner or group replaces the
+        // file; what its owner could change themselves goes in place.
+        let refused_owner = if uid == 0 {
+            (flags & flags::OWNER != 0 && destination.uid != meta.uid)
+                || (flags & flags::GROUP != 0 && destination.gid != meta.gid)
+        } else {
+            !owned
+        };
         changes
             && (destination.nlink != 1
-                || !owned
+                || refused_owner
                 || !self.opts.destination_link_counts_trusted.load(Relaxed)
-                || (flags & flags::MODE != 0 && meta.mode & 0o6000 & !destination.mode != 0))
+                || (flags & flags::MODE != 0 && meta.mode & 0o6000 & !destination.mode != 0)
+                || meta.inode_metadata.as_deref().is_some_and(|inode| {
+                    inode.privileged_attributes_differ(destination.inode_metadata.as_deref())
+                }))
+    }
+
+    /// Who a file the receiver creates in the destination belongs to,
+    /// asked once, of the directory `dst` is in. A preview asks without
+    /// letting the receiver create anything anyone could see.
+    fn new_file_owner(&mut self, dst: &[u8]) -> Option<crate::proto::NewFileOwner> {
+        if self.new_file_owner.is_none() {
+            let directory = dst
+                .iter()
+                .rposition(|&c| c == b'/')
+                .map_or_else(|| self.dst_root.clone(), |i| dst[..i.max(1)].to_vec());
+            let request = Request::NewFileOwner {
+                path: directory,
+                probe: !self.opts.dry_run,
+                guard: self.container_guard.clone(),
+            };
+            self.new_file_owner = match ok(self.dst.call(request).ok()?, "new file owner").ok()? {
+                Response::NewFileOwner(owner) => Some(owner),
+                _ => None,
+            };
+        }
+        self.new_file_owner
     }
 
     /// Whether a file a root receiver creates at `dst` might get a group
     /// other than `group`, as `fsops::apply::group_may_differ` judges it on
-    /// Linux, taking root's group to be 0: from its directory's group and
-    /// set-group-ID bit, read once per directory.
-    fn new_file_group_may_differ(&mut self, dst: &[u8], group: u32) -> bool {
+    /// the receiver's platform: from its directory's group and, on Linux,
+    /// set-group-ID bit, read once per directory, and the receiver's group.
+    fn new_file_group_may_differ(
+        &mut self,
+        dst: &[u8],
+        group: u32,
+        new_file: crate::proto::NewFileOwner,
+    ) -> bool {
         let Some(parent) = dst
             .iter()
             .rposition(|&c| c == b'/')
@@ -4650,8 +4702,9 @@ impl Planner<'_> {
         };
         match directory {
             None => true,
+            Some((parent_group, _)) if new_file.directory_group => parent_group != group,
             Some((parent_group, parent_mode)) => {
-                parent_group != group || (parent_mode & 0o2000 == 0 && group != 0)
+                parent_group != group || (parent_mode & 0o2000 == 0 && new_file.group != group)
             }
         }
     }

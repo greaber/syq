@@ -242,6 +242,41 @@ pub(crate) struct Root {
 }
 
 impl Root {
+    /// `created_owner_in` for a preview: only unnamed files, which change
+    /// nothing anyone can see (`created_owner_unseen`).
+    pub(crate) fn created_owner_unseen_in(
+        &self,
+        directory: &RelativePath,
+        dev: u64,
+    ) -> Option<u32> {
+        if let Some(uid) = self
+            .open_directory(directory)
+            .ok()
+            .and_then(|handle| created_owner_unseen(&handle, dev))
+        {
+            return Some(uid);
+        }
+        created_owner_unseen(&self.directory, dev)
+    }
+
+    /// The owner files this process creates on `dev` show (`created_owner`),
+    /// learned in `directory` below the root or, failing that, in the root.
+    pub(crate) fn created_owner_in(&self, directory: &RelativePath, dev: u64) -> Option<u32> {
+        if let Some(uid) = known_created_owner(dev) {
+            return Some(uid);
+        }
+        if let Some(uid) = self
+            .open_directory(directory)
+            .ok()
+            .and_then(|handle| created_owner(&handle, dev))
+        {
+            return Some(uid);
+        }
+        created_owner(&self.directory, dev)
+    }
+}
+
+impl Root {
     /// Open an explicit root. Symlinks in this user-selected path are followed;
     /// symlinks in every later descendant path are rejected.
     pub(crate) fn open(path: &Path) -> Result<Self> {
@@ -1951,12 +1986,17 @@ impl Root {
                 source.label()
             );
         }
-        // New names go only to a file the receiving account owns, as the
-        // copy made or kept it (`fsops::vouch`). Root's representatives are
-        // checked against the owner and group they end with as the copy
-        // finishes them.
+        // New names go only to a file owned as the files this process
+        // creates on its filesystem show, as the copy made or kept it
+        // (`fsops::vouch`). Root's representatives are checked against the
+        // owner and group they end with as the copy finishes them.
+        // A link to another filesystem fails with EXDEV below, whoever owns
+        // the file.
         let euid = unsafe { libc::geteuid() };
-        if euid != 0 && opened.uid != euid {
+        if euid != 0
+            && parent.directory.metadata()?.dev() == opened.dev
+            && Some(opened.uid) != created_owner(&parent.directory, opened.dev)
+        {
             bail!(
                 "hard link {} would give a new name to {}, which the receiving account does not own",
                 target.label(),
@@ -3190,6 +3230,133 @@ pub(crate) fn filesystem_is(file: &File, name: &[u8]) -> io::Result<bool> {
     retry_zero(|| unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) })?;
     let stats = unsafe { stats.assume_init() };
     Ok(unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) }.to_bytes() == name)
+}
+
+/// The account this process runs as, for comparing owners with. Debug
+/// builds take another from `SYQ_TEST_OWN_UID`, so that tests can stand in
+/// for a filesystem whose files show owners other than that account.
+pub(crate) fn own_uid() -> u32 {
+    #[cfg(debug_assertions)]
+    {
+        static OVERRIDE: OnceLock<Option<u32>> = OnceLock::new();
+        if let Some(uid) = *OVERRIDE.get_or_init(|| {
+            std::env::var("SYQ_TEST_OWN_UID")
+                .ok()
+                .and_then(|uid| uid.parse().ok())
+        }) {
+            return uid;
+        }
+    }
+    unsafe { libc::geteuid() }
+}
+
+/// The owner that the files this process creates show, per device, as its
+/// own creations there showed it. Mostly the account it runs as; SSHFS
+/// without uid mapping, NFS that squashes root and CIFS mounted with `uid=`
+/// show another.
+fn created_owners() -> &'static Mutex<HashMap<u64, u32>> {
+    static OWNERS: OnceLock<Mutex<HashMap<u64, u32>>> = OnceLock::new();
+    OWNERS.get_or_init(Default::default)
+}
+
+/// Remember the owner a file this process has just created exclusively on
+/// `dev` shows.
+pub(crate) fn note_created_owner(dev: u64, uid: u32) {
+    created_owners().lock().unwrap().insert(dev, uid);
+}
+
+/// The owner files this process creates on `dev` show, if it has created
+/// one there.
+pub(crate) fn known_created_owner(dev: u64) -> Option<u32> {
+    created_owners().lock().unwrap().get(&dev).copied()
+}
+
+/// Learn the owner files this process creates in `directory` show from an
+/// unnamed file, where the filesystem can make one (Linux `O_TMPFILE`): it
+/// changes nothing a directory listing or a time shows.
+fn probe_created_owner_unnamed(directory: &File) -> Option<(u64, u32)> {
+    #[cfg(target_os = "linux")]
+    if let Ok(file) = open_at(
+        directory.as_raw_fd(),
+        c".",
+        libc::O_TMPFILE | libc::O_WRONLY | libc::O_CLOEXEC,
+        0o600,
+    ) {
+        let created = file.metadata().ok()?;
+        note_created_owner(created.dev(), created.uid());
+        return Some((created.dev(), created.uid()));
+    }
+    let _ = directory;
+    None
+}
+
+/// `created_owner` for a preview, which creates nothing anyone can see:
+/// only an unnamed file, where the filesystem can make one.
+pub(crate) fn created_owner_unseen(directory: &File, dev: u64) -> Option<u32> {
+    if let Some(uid) = known_created_owner(dev) {
+        return Some(uid);
+    }
+    probe_created_owner_unnamed(directory).and_then(|(probed, uid)| (probed == dev).then_some(uid))
+}
+
+/// The owner files this process creates on `dev` show. If it has created
+/// nothing there yet, it creates a file in `directory`, notes the owner it
+/// shows and removes it. None where that directory is on another device or
+/// nothing can be created in it: an owner is never assumed.
+pub(crate) fn created_owner(directory: &File, dev: u64) -> Option<u32> {
+    if let Some(uid) = known_created_owner(dev) {
+        return Some(uid);
+    }
+    let (probed, uid) = probe_created_owner(directory).ok()?;
+    (probed == dev).then_some(uid)
+}
+
+/// Create a file in `directory` to learn the owner files this process
+/// creates there show, and note it. Linux makes the file unnamed where the
+/// filesystem can, so that the directory does not change; elsewhere a named
+/// file is created and removed, and the directory's modification time put
+/// back where this process may.
+fn probe_created_owner(directory: &File) -> io::Result<(u64, u32)> {
+    if let Some(probed) = probe_created_owner_unnamed(directory) {
+        return Ok(probed);
+    }
+    let before = directory.metadata()?;
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).map_err(io::Error::other)?;
+    let name = format!(
+        ".syq-owner-{}",
+        random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let name = CString::new(name).expect("probe name has no NUL");
+    let file = open_at(
+        directory.as_raw_fd(),
+        &name,
+        libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o600,
+    )?;
+    let created = file.metadata()?;
+    // Remove only the file created, whatever the name holds by now.
+    if metadata_at(directory.as_raw_fd(), &name)
+        .is_ok_and(|named| (named.dev, named.ino) == (created.dev(), created.ino()))
+    {
+        let _ = retry_zero(|| unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) });
+    }
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: before.mtime() as _,
+            tv_nsec: before.mtime_nsec() as _,
+        },
+    ];
+    let _ = crate::fsops::set_handle_times(directory, &times);
+    note_created_owner(created.dev(), created.uid());
+    Ok((created.dev(), created.uid()))
 }
 
 pub(crate) fn metadata_at(parent: RawFd, name: &CStr) -> io::Result<RootMetadata> {
