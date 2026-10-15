@@ -662,6 +662,7 @@ def _copy_arguments(
     sparse: bool,
     in_place: str | None,
     max_delete: int | None,
+    inplace: None = None,
     prune_before: bool = False,
     widen_dirs: str | None = None,
     transfer_strategy: str | None = None,
@@ -810,6 +811,11 @@ def _copy_arguments(
         argv.append("--open-noatime")
     if sparse:
         argv.append("--sparse")
+    if inplace is not None:
+        raise SyqInvocationError(
+            'inplace= is no longer supported: use in_place="new", which writes only new '
+            "files in place and replaces existing files through a staging file"
+        )
     if in_place is not None:
         if in_place != "new":
             raise SyqInvocationError("in_place must be new")
@@ -1308,6 +1314,7 @@ class Client:
         open_noatime: bool = False,
         sparse: bool = False,
         in_place: str | None = None,
+        inplace: None = None,
         max_delete: int | None = None,
         on_event: Callable[[AutomationEvent], object] | None = None,
         timeout: Timeout = CLIENT_DEFAULT,
@@ -1377,6 +1384,7 @@ class Client:
             open_noatime=open_noatime,
             sparse=sparse,
             in_place=in_place,
+            inplace=inplace,
             max_delete=max_delete,
             allow_missing_placement=mapping is not None and not isinstance(mapping, (str, bytes, os.PathLike)),
             mapping=mapping is not None,

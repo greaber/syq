@@ -98,7 +98,7 @@ In addition to the shared arguments above, it accepts:
 | `copy_metadata` | Metadata string or iterable; applies even on unchanged files: `mtime`, `times` (alias for `mtime`), `permissions`, `ownership`, `specials`, `hardlinks`, `acls`, `xattrs`, `atimes`, `crtimes`; S3-to-S3 copies also accept `content-type`, `content-encoding`, `content-language`, `content-disposition`, `cache-control`, `expires`, `website-redirect`, `user-metadata`, `tags`, `storage-class`; see [S3 metadata](https://greaber.github.io/syq/object-storage.html#copies-between-s3-buckets) and [filesystem preservation](https://greaber.github.io/syq/reference.html#preserve-metadata) for platform and route support |
 | `open_noatime` | Boolean: request file reads without access-time updates; warns and continues if unavailable |
 | `sparse` | Boolean: turn written zero ranges into sparse holes on filesystem destinations |
-| `in_place` | `"new"`: write new files directly at their final names, with no staging file; existing files are still replaced |
+| `in_place` | `"new"`: write new files directly at their final names, with no staging file; existing files are still replaced. The earlier `inplace=` keyword raises `SyqInvocationError` naming `in_place="new"` |
 | `no_compress` | Boolean: disable compression |
 | `max_delete` | Nonnegative integer deletion limit; requires `prune=True` or `prune_before=True` |
 | `resource_limits` | Comma-separated ceilings that keep automatic tuning, e.g. `"bandwidth=10M,workers=4"`; a concurrency key conflicts with the same key in `performance_tuning` |

@@ -242,21 +242,17 @@ pub(crate) struct Root {
 }
 
 impl Root {
-    /// `created_owner_in` for a preview: only unnamed files, which change
-    /// nothing anyone can see (`created_owner_unseen`).
-    pub(crate) fn created_owner_unseen_in(
-        &self,
-        directory: &RelativePath,
-        dev: u64,
-    ) -> Option<u32> {
+    /// `created_owner_in` for a preview, which creates nothing: what is
+    /// known without it (`created_owner_known`).
+    pub(crate) fn created_owner_known_in(&self, directory: &RelativePath, dev: u64) -> Option<u32> {
         if let Some(uid) = self
             .open_directory(directory)
             .ok()
-            .and_then(|handle| created_owner_unseen(&handle, dev))
+            .and_then(|handle| created_owner_known(&handle, dev))
         {
             return Some(uid);
         }
-        created_owner_unseen(&self.directory, dev)
+        created_owner_known(&self.directory, dev)
     }
 
     /// The owner files this process creates on `dev` show (`created_owner`),
@@ -3303,13 +3299,11 @@ fn note_probe_for_test() {
     }
 }
 
-/// `created_owner` for a preview, which creates nothing anyone can see:
-/// only an unnamed file, where the filesystem can make one.
-pub(crate) fn created_owner_unseen(directory: &File, dev: u64) -> Option<u32> {
-    if let Some(uid) = known_created_owner(dev).or_else(|| faithful_owner(directory, dev)) {
-        return Some(uid);
-    }
-    probe_created_owner_unnamed(directory).and_then(|(probed, uid)| (probed == dev).then_some(uid))
+/// `created_owner` for a preview, which creates nothing, not even an
+/// unnamed file: what this process has learned, or a local filesystem
+/// shows faithfully.
+pub(crate) fn created_owner_known(directory: &File, dev: u64) -> Option<u32> {
+    known_created_owner(dev).or_else(|| faithful_owner(directory, dev))
 }
 
 /// The account this process runs as, where `directory` is on `dev` and on a

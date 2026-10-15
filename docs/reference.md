@@ -456,7 +456,7 @@ that is not the account itself). Off the local filesystems that show owners
 faithfully (ext4, XFS, btrfs, ZFS, tmpfs, overlayfs, f2fs, APFS and HFS+),
 syq learns that owner from a file it creates; where it has created none yet,
 it creates and removes one, which leaves that directory's modification time
-changed. Run as root, it changes in place what the
+changed. A dry run creates nothing and assumes the account itself. Run as root, it changes in place what the
 file's owner could change, such as its permissions, times, ordinary extended
 attributes and ACLs, and replaces the file to give it another owner or group.
 Otherwise it replaces the file as if its contents had changed.

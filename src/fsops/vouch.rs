@@ -44,6 +44,10 @@ pub(crate) struct Place<'a> {
     pub(crate) root: &'a Root,
     pub(crate) relative: &'a RelativePath,
     pub(crate) label: &'a Path,
+    /// The check only predicts, for a preview: it creates nothing to learn
+    /// whom the receiver's files show, and where it does not know, it takes
+    /// the receiving account, as the planner's prediction does.
+    pub(crate) preview: bool,
 }
 
 impl<'a> From<&'a RootedTarget> for Place<'a> {
@@ -52,6 +56,7 @@ impl<'a> From<&'a RootedTarget> for Place<'a> {
             root: &target.root,
             relative: &target.relative,
             label: &target.label,
+            preview: false,
         }
     }
 }
@@ -65,6 +70,13 @@ impl Place<'_> {
             .leaf()
             .ok()
             .and_then(|(directories, _)| RelativePath::new(&directories.join(&b'/')).ok())?;
+        if self.preview {
+            return Some(
+                self.root
+                    .created_owner_known_in(&directory, dev)
+                    .unwrap_or_else(crate::rooted::own_uid),
+            );
+        }
         self.root.created_owner_in(&directory, dev)
     }
 

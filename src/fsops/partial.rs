@@ -3096,7 +3096,7 @@ impl FsOps {
                         if *probe {
                             target.root.created_owner_in(&target.relative, dev)
                         } else {
-                            target.root.created_owner_unseen_in(&target.relative, dev)
+                            target.root.created_owner_known_in(&target.relative, dev)
                         }
                     });
                 Ok(Response::NewFileOwner(crate::proto::NewFileOwner {
@@ -4194,14 +4194,14 @@ pub(super) fn create_fresh_rooted_partial(
 /// read once, however many donors are weighed; each donor's is read only
 /// when the sidecar has entries. Elsewhere the owner-only mode suffices: it
 /// masks the named entries of a POSIX default ACL.
-pub(super) struct SeedAccess<'a> {
+pub(crate) struct SeedAccess<'a> {
     output: &'a File,
     #[cfg(target_os = "macos")]
     acl: std::cell::OnceCell<Option<crate::inode_metadata::MacAcl>>,
 }
 
 impl<'a> SeedAccess<'a> {
-    pub(super) fn new(output: &'a File) -> Self {
+    pub(crate) fn new(output: &'a File) -> Self {
         Self {
             output,
             #[cfg(target_os = "macos")]
@@ -4209,7 +4209,7 @@ impl<'a> SeedAccess<'a> {
         }
     }
 
-    pub(super) fn admits(&self, donor: &File) -> bool {
+    pub(crate) fn admits(&self, donor: &File) -> bool {
         #[cfg(target_os = "macos")]
         {
             use crate::inode_metadata::read_macos_acl;

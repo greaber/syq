@@ -631,3 +631,88 @@ fn matching_downloads_that_cannot_change_in_place_are_replaced_without_downloadi
         }
     }
 }
+
+/// On macOS a new file takes its directory's inheritable ACL entries
+/// whatever its mode. A file that cannot change in place is not copied into
+/// a staging file that lets someone read it whom the file does not: the
+/// object is downloaded instead.
+#[cfg(target_os = "macos")]
+#[test]
+fn replacements_stage_no_copy_that_others_can_read() {
+    let temp = test_support::tempdir().unwrap();
+    let shared = temp.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    let dest = shared.join("destination");
+    file(&dest, b"stored", 10);
+    std::fs::hard_link(&dest, temp.path().join("outside")).unwrap();
+    let status = std::process::Command::new("chmod")
+        .args(["+a", "user:nobody allow read,file_inherit"])
+        .arg(&shared)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let server = Server::start("existing-policy");
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--from",
+            "s3://bucket",
+            "object",
+            "--as",
+            "shared/destination",
+            "--copy-metadata=permissions",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(
+        server.gate.0.load(Ordering::Relaxed),
+        "the file was copied into a staging file nobody may read"
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), b"stored");
+    let replaced = std::fs::metadata(&dest).unwrap();
+    let outside = std::fs::metadata(temp.path().join("outside")).unwrap();
+    assert_ne!(replaced.ino(), outside.ino());
+    assert_eq!(replaced.mode() & 0o777, 0o640);
+}
+
+/// A preview creates nothing to learn whom the receiver's files belong to,
+/// even on a filesystem where it would have to: it predicts.
+#[cfg(debug_assertions)]
+#[test]
+fn previews_create_nothing_to_learn_file_owners() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: needs an account other than root");
+        return;
+    }
+    let temp = test_support::tempdir().unwrap();
+    let dest = temp.path().join("destination");
+    file(&dest, b"stored", 10);
+    let probes = temp.path().join("probes");
+    let other = (unsafe { libc::geteuid() } + 1).to_string();
+    let server = Server::start("existing-policy");
+    let output = server
+        .command(temp.path())
+        .args(["--s3-endpoint", &server.address])
+        .args([
+            "--from",
+            "s3://bucket",
+            "object",
+            "--as",
+            "destination",
+            "--copy-metadata=permissions",
+            "--dry-run",
+        ])
+        // A filesystem whose files show another owner than the account,
+        // where the owner would have to be learned by creating a file.
+        .env("SYQ_TEST_OWN_UID", &other)
+        .env("SYQ_TEST_PROBE_LOG", &probes)
+        .capture_output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(
+        !probes.exists(),
+        "a preview created a probe: {}",
+        std::fs::read_to_string(&probes).unwrap_or_default()
+    );
+    assert_eq!(std::fs::metadata(&dest).unwrap().mode() & 0o777, 0o600);
+}

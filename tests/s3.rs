@@ -2695,6 +2695,57 @@ fn s3_failed_seeding_keeps_the_recorded_partial_for_the_next_attempt() {
     assert!(!record.exists());
 }
 
+/// On macOS a new partial takes its directory's inheritable ACL entries
+/// whatever its mode. The recorded partial's bytes are not seeded into one
+/// that lets someone read them whom the recorded one does not: its parts are
+/// downloaded again.
+#[cfg(target_os = "macos")]
+#[test]
+fn s3_resume_seeds_no_partial_that_others_can_read() {
+    let server = Server::start("prefix-recovery-fresh");
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("download")).unwrap();
+    let args = [
+        "--from",
+        "s3://bucket",
+        "--srcs-in",
+        "data",
+        "--into",
+        "download",
+    ];
+    let first = server.cp(temp.path(), &args);
+    assert!(!first.status.success(), "{}", output_text(&first));
+    let (record, saved) = recovery_record(temp.path());
+    let partial = temp.path().join("download").join(
+        saved["partial"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap(),
+    );
+    let status = std::process::Command::new("chmod")
+        .args(["+a", "user:nobody allow read,file_inherit"])
+        .arg(temp.path().join("download"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    server.requests.store(0, Ordering::Relaxed);
+    let retry = server.cp(temp.path(), &args);
+    assert!(retry.status.success(), "{}", output_text(&retry));
+    assert_eq!(
+        std::fs::read(temp.path().join("download/file")).unwrap(),
+        vec![b'x'; SIZE]
+    );
+    // Discovery HEAD + LIST, identity HEAD, final HEAD, and the GETs.
+    assert!(
+        server.requests.load(Ordering::Relaxed) > 4,
+        "the recorded partial was seeded into one nobody may read"
+    );
+    assert!(!record.exists());
+    assert!(!partial.exists(), "the recorded partial was left behind");
+}
+
 #[test]
 fn s3_invalid_initial_ranges_never_publish_a_fresh_download() {
     for fault in ["ignore-range", "etag", "corrupt", "truncated"] {

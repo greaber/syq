@@ -653,6 +653,7 @@ pub(super) fn keep_unchanged_file(
         root,
         relative: path,
         label: &label,
+        preview,
     };
     if !crate::fsops::vouch::allows(place, &file, &current, &meta, flags)? {
         return Ok(false);

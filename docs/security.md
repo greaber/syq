@@ -92,13 +92,16 @@ filesystem's link counts can be trusted, and the change adds no set-user-ID or
 set-group-ID bit and sets or removes no `security.*` or `trusted.*` attribute,
 such as a file capability or an SELinux label. Run as another account, syq
 also needs the file to belong to it, as the files it creates on that
-filesystem show. Run as root, it changes in place only what the file's owner
-could change themselves, so the file keeps its owner and group. Otherwise syq
-replaces the file as if its contents had changed. So a hard link planted in the
-destination never takes the copy's metadata, other than the access time that
-`--copy-metadata=atimes` restores in place on any file, and root never hands a
-file another user planted there to another owner or group, or gives it
-privileges, even when its size and time match the source's. A symlink, device or named pipe
+filesystem show. Run as root, it changes in place what the file's owner could
+change themselves, its permission bits, times, ordinary extended attributes
+and ACLs, even on a file another user owns, which keeps its owner and group.
+Otherwise syq replaces the file as if its contents had changed. So a hard link
+planted in the destination never takes the copy's other metadata, and root
+never hands a file another user planted there to another owner or group, or
+gives it privileges, even when its size and time match the source's. Access
+times are the exception: `--copy-metadata=atimes` restores them in place on
+any file, and they show through all of its names, including names outside the
+copy. A symlink, device or named pipe
 whose metadata changes is created again with it. Narrowing a file's permissions in
 place does not cut off someone who already has it open, though they can read
 only the contents they could read before.

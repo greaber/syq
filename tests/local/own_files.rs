@@ -597,6 +597,16 @@ fn owners_are_compared_with_the_owner_new_files_show() {
             .is_fifo());
         let kept = inode(&t.path("dst/file"));
         fs::set_permissions(t.path("src/file"), fs::Permissions::from_mode(0o600)).unwrap();
+        // A preview creates nothing to learn the owner: it predicts.
+        let previewed = t.path("preview-probes");
+        let log = previewed.to_string_lossy().into_owned();
+        let preview = [env[0], ("SYQ_TEST_PROBE_LOG", log.as_str())];
+        assert_output_ok(&rsync_with(&t, route, &["-aHDn"], &preview));
+        assert!(
+            !previewed.exists(),
+            "{route}: a preview probed: {}",
+            fs::read_to_string(&previewed).unwrap_or_default()
+        );
         // Nothing is created on this rerun: the owner is learned by a probe.
         let probes = t.path("probes");
         let log = probes.to_string_lossy().into_owned();

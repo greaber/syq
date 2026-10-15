@@ -2691,7 +2691,7 @@ impl Engine {
                 return Ok(Some(object.size));
             }
             let mode = existing.map(|m| m.mode & 0o7777);
-            return self
+            if let Some(size) = self
                 .replace_from_local(
                     root,
                     &path,
@@ -2700,7 +2700,13 @@ impl Engine {
                     mode,
                     compared,
                 )
-                .await;
+                .await?
+            {
+                return Ok(Some(size));
+            }
+            // A staging file others could read cannot take the file's
+            // bytes: the object is downloaded instead.
+            unchanged = false;
         }
         if unchanged {
             if self.args.dry_run {
@@ -2797,7 +2803,18 @@ impl Engine {
         let (mut record, file) =
             self.new_download_state(root, &job.path, &object, &state, donor.is_none())?;
         let mut seeded = std::collections::BTreeSet::new();
-        if let Some((old, donor)) = donor {
+        // The earlier partial's bytes go only into a partial no one else
+        // can read them in, as they could not there (`fsops::SeedAccess`);
+        // otherwise its parts are downloaded again.
+        let donor = donor.map(|(old, donor)| {
+            let admitted = crate::fsops::SeedAccess::new(&file).admits(&donor);
+            (old, admitted.then_some(donor))
+        });
+        if let Some((old, None)) = &donor {
+            state.save(&record)?;
+            remove_partial(root, old)?;
+        }
+        if let Some((old, Some(donor))) = donor {
             let size = object.size;
             let (parts, algorithm) = (old.parts.clone(), old.hash_algorithm);
             let new_algorithm = record.hash_algorithm;
@@ -3207,7 +3224,9 @@ impl Engine {
     /// can, is checked against every hash known for the object (the one
     /// `compared` matched, a stored one, an expected one); where none is,
     /// the size and times that showed the file unchanged must hold through
-    /// the copy. It replaces only the file it was copied from.
+    /// the copy. It replaces only the file it was copied from. None, having
+    /// changed nothing, when the staging file would let someone read the
+    /// file's bytes whom the file does not (`fsops::SeedAccess`).
     async fn replace_from_local(
         &self,
         root: &Root,
@@ -3232,6 +3251,9 @@ impl Engine {
             path: partial_path.clone(),
             identity: (created.dev(), created.ino()),
         };
+        if !crate::fsops::SeedAccess::new(&staged).admits(&existing) {
+            return Ok(None);
+        }
         let (donor, output, size) = (existing.clone(), staged.clone(), before.len());
         tokio::task::spawn_blocking(move || crate::fsops::copy_from_donor(&donor, &output, size))
             .await??;

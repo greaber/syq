@@ -1420,11 +1420,10 @@ pub enum WireRequest<Data> {
     RestoreDestinationPath,
     /// Who the files the receiver creates in the destination would belong
     /// to, for predicting which existing files it can change in place
-    /// (`fsops::vouch`). A receiver that has created nothing on the
-    /// destination's filesystem yet creates a file to learn the owner it
-    /// shows: with `probe`, any file; without, as a preview asks, only an
-    /// unnamed one, which changes nothing anyone can see. Replies
-    /// `NewFileOwner`.
+    /// (`fsops::vouch`). With `probe`, a receiver that has created nothing
+    /// on the destination's filesystem yet creates a file to learn the
+    /// owner it shows; without, as a preview asks, it says only what it
+    /// knows without creating anything. Replies `NewFileOwner`.
     NewFileOwner {
         /// The destination directory, where a probe goes.
         path: PathBytes,

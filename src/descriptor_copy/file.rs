@@ -438,6 +438,7 @@ impl FileSession {
                                 root: &destination.root,
                                 relative: &destination.target,
                                 label: &label,
+                                preview: false,
                             };
                             if crate::fsops::vouch::allows(
                                 place, &existing, &current, &meta, flags,
