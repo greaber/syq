@@ -2690,10 +2690,72 @@ fn s3_unreadable_recorded_partial_is_reported_and_removed() {
     assert!(!partial.exists(), "the unreadable partial was left behind");
 }
 
-/// When seeding a new partial from the recorded one fails, as when there is
-/// no room for a second copy, that is reported, the recorded partial is
-/// removed, and the object is downloaded afresh, so that no retry meets the
-/// same failure.
+/// Without room to copy the recorded partial's parts into a new one, the
+/// file fails, saying how much room resuming needs and which file to remove
+/// instead. The new partial is removed, and the recorded one and its record
+/// are kept: a later run with room resumes from them.
+#[cfg(debug_assertions)]
+#[test]
+fn s3_seeding_without_room_keeps_the_recorded_partial_for_a_later_run() {
+    let server = Server::start("prefix-recovery-first");
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("download")).unwrap();
+    let args = [
+        "--from",
+        "s3://bucket",
+        "--srcs-in",
+        "data",
+        "--into",
+        "download",
+    ];
+    let first = server.cp(temp.path(), &args);
+    assert!(!first.status.success(), "{}", output_text(&first));
+    let (record, saved) = recovery_record(temp.path());
+    let partial = saved["partial"].as_str().unwrap().to_owned();
+    let names = || {
+        let mut names: Vec<_> = std::fs::read_dir(temp.path().join("download"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = names();
+    let full = server
+        .command(temp.path())
+        .args(["--s3-endpoint", &server.address])
+        .args(args)
+        .env("SYQ_TEST_FAIL_DOWNLOAD_SEED", "enospc")
+        .capture_output()
+        .unwrap();
+    assert!(!full.status.success(), "{}", output_text(&full));
+    let text = output_text(&full);
+    assert!(
+        text.contains(&format!(
+            "resuming needs room for another copy of the 6.00 MiB already downloaded into {partial} \
+             in the destination; free that much space, or remove that file to start over"
+        )),
+        "{text}"
+    );
+    let (_, kept) = recovery_record(temp.path());
+    assert_eq!(kept, saved, "the record changed");
+    assert_eq!(names(), before, "a partial was left behind or lost");
+    server.requests.store(0, Ordering::Relaxed);
+    let retry = server.cp(temp.path(), &args);
+    assert!(retry.status.success(), "{}", output_text(&retry));
+    assert_eq!(
+        std::fs::read(temp.path().join("download/file")).unwrap(),
+        vec![b'x'; SIZE]
+    );
+    // Discovery HEAD + LIST, identity HEAD, final HEAD: nothing downloaded.
+    assert_eq!(server.requests.load(Ordering::Relaxed), 4);
+    assert!(!record.exists());
+}
+
+/// When seeding a new partial from the recorded one fails for another reason
+/// than a lack of room, that is reported, the recorded partial is removed,
+/// and the object is downloaded afresh, so that no retry meets the same
+/// failure.
 #[cfg(debug_assertions)]
 #[test]
 fn s3_failed_seeding_gives_up_the_recorded_partial_and_downloads_afresh() {

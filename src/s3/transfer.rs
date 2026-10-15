@@ -2850,6 +2850,7 @@ impl Engine {
         if let Some((old, Some(donor))) = donor {
             let size = object.size;
             let (parts, algorithm) = (old.parts.clone(), old.hash_algorithm);
+            let downloaded = recorded_bytes(&parts, size, part_size);
             let new_algorithm = record.hash_algorithm;
             let output = file.try_clone()?;
             let copied = tokio::task::spawn_blocking(move || {
@@ -2864,17 +2865,33 @@ impl Engine {
             .await
             .map_err(anyhow::Error::from)
             .and_then(|copied| copied);
-            // Seeding needs room for a second copy of what the earlier run
-            // downloaded. Whatever kept it from being made, that progress is
-            // given up, rather than met again on every retry: the earlier
-            // partial is removed, and the object downloaded afresh.
-            let copied = copied.unwrap_or_else(|error| {
-                self.progress.warning(&format!(
-                    "{}: cannot reuse what an earlier download left ({error:#}); downloading it again",
-                    job.path
-                ));
-                Vec::new()
-            });
+            let copied = match copied {
+                Ok(copied) => copied,
+                // Seeding needs room for a second copy of what the earlier
+                // run downloaded. Without it the file fails, rather than
+                // filling the disk further or giving that progress up: the
+                // new partial goes, and the earlier one and its record stay
+                // for a run that has the room.
+                Err(error) if out_of_space(&error) => {
+                    remove_partial(root, &record)?;
+                    return Err(error.context(format!(
+                        "resuming needs room for another copy of the {} already downloaded into {} \
+                         in the destination; free that much space, or remove that file to start over",
+                        crate::progress::human(downloaded),
+                        old.partial,
+                    )));
+                }
+                // Any other failure gives that progress up, rather than
+                // meeting it again on every retry: the earlier partial is
+                // removed, and the object downloaded afresh.
+                Err(error) => {
+                    self.progress.warning(&format!(
+                        "{}: cannot reuse what an earlier download left ({error:#}); downloading it again",
+                        job.path
+                    ));
+                    Vec::new()
+                }
+            };
             for (index, hash) in copied {
                 record.parts.insert(index, hash);
                 seeded.insert(index);
@@ -3580,7 +3597,10 @@ fn seed_download_parts(
     (algorithm, new_algorithm): (HashAlgorithm, HashAlgorithm),
 ) -> Result<Vec<(u64, String)>> {
     #[cfg(debug_assertions)]
-    if std::env::var_os("SYQ_TEST_FAIL_DOWNLOAD_SEED").is_some() {
+    if let Some(fault) = std::env::var_os("SYQ_TEST_FAIL_DOWNLOAD_SEED") {
+        if fault == "enospc" {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOSPC).into());
+        }
         bail!("injected download seeding failure");
     }
     let cloned = crate::fsops::clone_donor(donor, output, size.min(donor.metadata()?.len()));
@@ -3648,6 +3668,27 @@ fn seed_download_parts(
     copied.sort_unstable_by_key(|(index, _)| *index);
     Ok(copied)
 }
+/// How many bytes of an object of `size` the recorded `parts` hold.
+fn recorded_bytes(parts: &BTreeMap<u64, String>, size: u64, part_size: u64) -> u64 {
+    parts
+        .keys()
+        .map(|index| {
+            let offset = index.saturating_mul(part_size);
+            part_size.min(size.saturating_sub(offset))
+        })
+        .sum()
+}
+
+/// Whether `error` says a filesystem, or the account's quota on it, is full.
+fn out_of_space(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            .is_some_and(|code| code == libc::ENOSPC || code == libc::EDQUOT)
+    })
+}
+
 /// Remove the partial `record` names if its name still leads to the file
 /// recorded; anything else there is not this download's, and is left alone.
 fn remove_partial(root: &Root, record: &DownloadState) -> Result<()> {
