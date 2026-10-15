@@ -2629,8 +2629,11 @@ fn s3_stale_recovery_record_leaves_another_file_at_its_partial_name() {
             .next()
             .unwrap(),
     );
-    std::fs::remove_file(&partial).unwrap();
-    std::fs::write(&partial, b"someone else's").unwrap();
+    // Another file, created while the recorded one still exists so that it
+    // cannot reuse its inode number, takes its name.
+    let other = temp.path().join("other");
+    std::fs::write(&other, b"someone else's").unwrap();
+    std::fs::rename(&other, &partial).unwrap();
     let retry = server.cp(temp.path(), &args);
     assert!(retry.status.success(), "{}", output_text(&retry));
     assert_eq!(
