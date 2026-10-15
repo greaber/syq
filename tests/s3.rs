@@ -2690,13 +2690,14 @@ fn s3_unreadable_recorded_partial_is_reported_and_removed() {
     assert!(!partial.exists(), "the unreadable partial was left behind");
 }
 
-/// When seeding a new partial from the recorded one fails, the record still
-/// names the recorded partial, which is kept, and the new one is removed:
-/// the next attempt resumes from it.
+/// When seeding a new partial from the recorded one fails, as when there is
+/// no room for a second copy, that is reported, the recorded partial is
+/// removed, and the object is downloaded afresh, so that no retry meets the
+/// same failure.
 #[cfg(debug_assertions)]
 #[test]
-fn s3_failed_seeding_keeps_the_recorded_partial_for_the_next_attempt() {
-    let server = Server::start("prefix-recovery-first");
+fn s3_failed_seeding_gives_up_the_recorded_partial_and_downloads_afresh() {
+    let server = Server::start("prefix-recovery-fresh");
     let temp = crate::test_support::tempdir().unwrap();
     std::fs::create_dir(temp.path().join("download")).unwrap();
     let args = [
@@ -2710,36 +2711,42 @@ fn s3_failed_seeding_keeps_the_recorded_partial_for_the_next_attempt() {
     let first = server.cp(temp.path(), &args);
     assert!(!first.status.success(), "{}", output_text(&first));
     let (record, saved) = recovery_record(temp.path());
-    let names = || {
-        let mut names: Vec<_> = std::fs::read_dir(temp.path().join("download"))
+    let partial = temp.path().join("download").join(
+        saved["partial"]
+            .as_str()
             .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        names.sort();
-        names
-    };
-    let before = names();
-    let failed = server
+            .rsplit('/')
+            .next()
+            .unwrap(),
+    );
+    assert!(partial.exists());
+    server.requests.store(0, Ordering::Relaxed);
+    let retry = server
         .command(temp.path())
         .args(["--s3-endpoint", &server.address])
         .args(args)
         .env("SYQ_TEST_FAIL_DOWNLOAD_SEED", "1")
         .capture_output()
         .unwrap();
-    assert!(!failed.status.success(), "{}", output_text(&failed));
-    let (_, kept) = recovery_record(temp.path());
-    assert_eq!(kept, saved, "the record changed");
-    assert_eq!(names(), before, "a partial was orphaned or lost");
-    server.requests.store(0, Ordering::Relaxed);
-    let retry = server.cp(temp.path(), &args);
     assert!(retry.status.success(), "{}", output_text(&retry));
+    assert!(
+        output_text(&retry).contains("cannot reuse what an earlier download left"),
+        "{}",
+        output_text(&retry)
+    );
     assert_eq!(
         std::fs::read(temp.path().join("download/file")).unwrap(),
         vec![b'x'; SIZE]
     );
-    // Discovery HEAD + LIST, identity HEAD, final HEAD: nothing downloaded.
-    assert_eq!(server.requests.load(Ordering::Relaxed), 4);
+    // Discovery HEAD + LIST, identity HEAD, final HEAD, and the GETs.
+    assert!(server.requests.load(Ordering::Relaxed) > 4);
     assert!(!record.exists());
+    assert!(!partial.exists(), "the recorded partial was left behind");
+    let names: Vec<_> = std::fs::read_dir(temp.path().join("download"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["file"]);
 }
 
 /// On macOS a new partial takes its directory's inheritable ACL entries

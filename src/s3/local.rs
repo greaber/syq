@@ -131,13 +131,18 @@ pub(super) fn hash_file_as(
 ) -> Result<String> {
     let mut hasher = algorithm.hasher();
     let mut buffer = vec![0; 1024 * 1024];
+    let mut total = 0u64;
     loop {
         let n = file.read(&mut buffer)?;
         if n == 0 {
             break;
         }
         hasher.update(&buffer[..n]);
+        total += n as u64;
     }
+    #[cfg(debug_assertions)]
+    crate::fsops::record_test_event("SYQ_TEST_LOCAL_HASHES", format_args!("hash {total}"))?;
+    let _ = total;
     Ok(crate::hashing::Digest::from_hash(algorithm, &hasher.finalize()).value)
 }
 

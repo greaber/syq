@@ -221,7 +221,7 @@ async fn copy(fault: &'static str, retries: u32, peers: bool, paced: bool) {
             &root,
             &path,
             (&metadata, None, Default::default()),
-            None,
+            (None, None),
             Some(initial),
             None,
         )

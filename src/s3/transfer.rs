@@ -2643,8 +2643,9 @@ impl Engine {
             return Ok(Some(bytes.len() as u64));
         }
         let mut unchanged = false;
-        // The digest of the existing file that matched the object's.
-        let mut compared = None;
+        // The digests the existing file was found to match, and the file
+        // as it was before they were computed.
+        let mut checked: Option<Hashed> = None;
         if let Some(m) = existing.filter(|m| m.is_file() && m.len == object.size) {
             unchanged = !self.args.checksum
                 && explicit.mtime.is_none()
@@ -2654,8 +2655,8 @@ impl Engine {
                     || self.args.protects_existing_contents()
                     || self.stored_comparison_hash(&object).is_some())
             {
-                compared = self.verify_download(root, &path, &object).await?;
-                unchanged = compared.is_some();
+                checked = self.verify_download(root, &path, &object).await?;
+                unchanged = checked.is_some();
             }
         }
         anyhow::ensure!(
@@ -2664,11 +2665,15 @@ impl Engine {
             job.path
         );
         if unchanged && expected_hash.is_some() {
-            unchanged = self
-                .verify_expected_local(root, &path, expected_hash)
-                .await
-                .is_ok();
+            match self.verify_expected_local(root, &path, expected_hash).await {
+                Ok(Some(hashed)) => Hashed::add(&mut checked, hashed),
+                Ok(None) => {}
+                Err(_) => unchanged = false,
+            }
         }
+        // The existing file a download is to replace, and only as it was
+        // when it was found to hold the object's contents.
+        let mut replaces = None;
         // A file whose metadata the receiver cannot change in place is
         // replaced by a checked copy of itself; a kept one gets its
         // metadata now.
@@ -2691,22 +2696,25 @@ impl Engine {
                 return Ok(Some(object.size));
             }
             let mode = existing.map(|m| m.mode & 0o7777);
-            if let Some(size) = self
+            match self
                 .replace_from_local(
                     root,
                     &path,
                     &object,
                     (&metadata, expected_hash, explicit),
                     mode,
-                    compared,
+                    checked,
                 )
                 .await?
             {
-                return Ok(Some(size));
+                LocalReplacement::Done(size) => return Ok(Some(size)),
+                // The file does not hold the object's contents after all:
+                // the object is downloaded as for any changed file.
+                LocalReplacement::Differs => {}
+                // It does, but a staging file others could read cannot take
+                // its bytes: the object is downloaded to replace that file.
+                LocalReplacement::Download(file) => replaces = Some(file),
             }
-            // The file does not hold the object's contents after all, or a
-            // staging file others could read cannot take its bytes: the
-            // object is downloaded instead.
             unchanged = false;
         }
         if unchanged {
@@ -2754,7 +2762,10 @@ impl Engine {
                     root,
                     &path,
                     (&metadata, expected_hash, explicit),
-                    existing.filter(|m| m.is_file()).map(|m| m.mode & 0o7777),
+                    (
+                        existing.filter(|m| m.is_file()).map(|m| m.mode & 0o7777),
+                        replaces,
+                    ),
                     initial,
                     initial_slot,
                 )
@@ -2853,13 +2864,17 @@ impl Engine {
             .await
             .map_err(anyhow::Error::from)
             .and_then(|copied| copied);
-            let copied = match copied {
-                Ok(copied) => copied,
-                Err(error) => {
-                    remove_partial(root, &record)?;
-                    return Err(error);
-                }
-            };
+            // Seeding needs room for a second copy of what the earlier run
+            // downloaded. Whatever kept it from being made, that progress is
+            // given up, rather than met again on every retry: the earlier
+            // partial is removed, and the object downloaded afresh.
+            let copied = copied.unwrap_or_else(|error| {
+                self.progress.warning(&format!(
+                    "{}: cannot reuse what an earlier download left ({error:#}); downloading it again",
+                    job.path
+                ));
+                Vec::new()
+            });
             for (index, hash) in copied {
                 record.parts.insert(index, hash);
                 seeded.insert(index);
@@ -2989,14 +3004,7 @@ impl Engine {
             || local::CreationPermissions::shared_for_file(&self.file_permissions, root, &path),
         )?;
         let m = file.metadata()?;
-        if self.args.ignore_existing
-            || self.args.target_existence == Existence::New
-            || self.args.protects_existing_contents()
-        {
-            root.publish_new_regular(&partial_path, &path, (m.dev(), m.ino()))?;
-        } else {
-            root.rename_regular_if_same(&partial_path, &path, (m.dev(), m.ino()))?;
-        }
+        self.publish_download(root, &partial_path, &path, (m.dev(), m.ino()), replaces)?;
         state.clear()?;
         Ok(Some(object.size))
     }
@@ -3015,17 +3023,54 @@ impl Engine {
         }
         digests
     }
+    /// Check the existing file at `path` against `expected`, and say what
+    /// was checked: the file as it was before it was read, and the digest.
     async fn verify_expected_local(
         &self,
         root: &Root,
         path: &RelativePath,
         expected: Option<&Digest>,
+    ) -> Result<Option<Hashed>> {
+        let Some(expected) = expected.cloned() else {
+            return Ok(None);
+        };
+        let mut file = root.open_regular_read(path)?;
+        let state = FileState::of(&file.metadata()?);
+        let digest = expected.clone();
+        tokio::task::spawn_blocking(move || expected.verify_reader(&mut file)).await??;
+        Ok(Some(Hashed {
+            state,
+            digests: vec![digest],
+        }))
+    }
+    /// Publish the downloaded `partial` at `path`: replacing exactly the
+    /// file `replaces` names, as it was, when there is one, and otherwise
+    /// as the existing-file policy says.
+    fn publish_download(
+        &self,
+        root: &Root,
+        partial: &RelativePath,
+        path: &RelativePath,
+        identity: (u64, u64),
+        replaces: Option<MatchedFile>,
     ) -> Result<()> {
-        if let Some(expected) = expected.cloned() {
-            let mut file = root.open_regular_read(path)?;
-            tokio::task::spawn_blocking(move || expected.verify_reader(&mut file)).await??;
+        match replaces {
+            Some(file) => root.replace_regular_if_same(
+                partial,
+                path,
+                identity,
+                file.dev,
+                file.ino,
+                Some(file.ctime),
+            ),
+            None if self.args.ignore_existing
+                || self.args.target_existence == Existence::New
+                || self.args.protects_existing_contents() =>
+            {
+                root.publish_new_regular(partial, path, identity)
+            }
+            None => root.rename_regular_if_same(partial, path, identity),
         }
-        Ok(())
     }
     async fn verify_expected_remote(
         &self,
@@ -3050,7 +3095,7 @@ impl Engine {
         root: &Root,
         path: &RelativePath,
         validation: (&Metadata, Option<&Digest>, crate::mapping::Metadata),
-        mode: Option<u32>,
+        (mode, replaces): (Option<u32>, Option<MatchedFile>),
         initial: Option<ByteStream>,
         initial_slot: Option<super::tuning::Permit>,
     ) -> Result<Option<u64>> {
@@ -3120,14 +3165,7 @@ impl Engine {
                 local::CreationPermissions::shared_for_file(&self.file_permissions, root, path)
             })?;
             let m = file.metadata()?;
-            if self.args.ignore_existing
-                || self.args.target_existence == Existence::New
-                || self.args.protects_existing_contents()
-            {
-                root.publish_new_regular(&partial, path, (m.dev(), m.ino()))?;
-            } else {
-                root.rename_regular_if_same(&partial, path, (m.dev(), m.ino()))?;
-            }
+            self.publish_download(root, &partial, path, (m.dev(), m.ino()), replaces)?;
             Ok(Some(object.size))
         }
         .await;
@@ -3217,14 +3255,16 @@ impl Engine {
         Ok(bytes)
     }
     /// Compare the existing file at `path` with `object` by their hashes,
-    /// and return its digest if they match.
+    /// and return its digest if they match, with the file as it was before
+    /// it was read.
     async fn verify_download(
         &self,
         root: &Root,
         path: &RelativePath,
         object: &Object,
-    ) -> Result<Option<Digest>> {
+    ) -> Result<Option<Hashed>> {
         let file = root.open_regular_read(path)?;
+        let state = FileState::of(&file.metadata()?);
         let stored = self.stored_comparison_hash(object);
         let algorithm = stored.map_or(self.args.hash_algorithm, |(algorithm, _)| algorithm);
         let expected =
@@ -3233,22 +3273,27 @@ impl Engine {
             Some((_, hash)) => hash.to_owned(),
             None => self.remote_hash_as(object, algorithm).await?,
         };
-        Ok(actual.eq_ignore_ascii_case(&expected).then(|| Digest {
-            algorithm,
-            value: expected.to_ascii_lowercase(),
+        Ok(actual.eq_ignore_ascii_case(&expected).then(|| Hashed {
+            state,
+            digests: vec![Digest {
+                algorithm,
+                value: expected.to_ascii_lowercase(),
+            }],
         }))
     }
     /// Replace the existing file at `path`, found unchanged, with a copy of
     /// itself that gets `metadata`, without downloading anything: the receiver cannot change that file's metadata
     /// in place (`fsops::vouch`). Before anything is copied, the file is
-    /// checked, in one read, against every hash known for the object (the
-    /// one `compared` matched, a stored one, an expected one), so bytes
-    /// that are not the object's are never copied anywhere. Its size and
-    /// times must then hold through the copy, cloned where the filesystem
-    /// can. It replaces only the file it was copied from. None, having
-    /// changed nothing, when the object is to be downloaded instead: the
-    /// file does not match a hash, or the staging file would let someone
-    /// read its bytes whom the file does not (`fsops::SeedAccess`).
+    /// checked, in one read, against every hash known for the object (those
+    /// `checked` matched, a stored one, an expected one), so bytes that are
+    /// not the object's are never copied anywhere. Those `checked` matched
+    /// are not computed again while the file keeps the identity, size and
+    /// times it had before they were. Its size and times must then hold through the copy,
+    /// cloned where the filesystem can. It replaces only the file it was
+    /// copied from. Having changed nothing, it says why the object is to be
+    /// downloaded instead: the file does not match a hash, or the staging
+    /// file would let someone read its bytes whom the file does not
+    /// (`fsops::SeedAccess`).
     async fn replace_from_local(
         &self,
         root: &Root,
@@ -3256,12 +3301,15 @@ impl Engine {
         object: &Object,
         (metadata, expected_hash, explicit): (&Metadata, Option<&Digest>, crate::mapping::Metadata),
         mode: Option<u32>,
-        compared: Option<Digest>,
-    ) -> Result<Option<u64>> {
+        checked: Option<Hashed>,
+    ) -> Result<LocalReplacement> {
         let existing = Arc::new(root.open_regular_read(path)?);
         let before = existing.metadata()?;
         let target = String::from_utf8_lossy(&path.to_bytes()).into_owned();
-        let mut digests: Vec<Digest> = compared.into_iter().collect();
+        let mut digests: Vec<Digest> = checked
+            .as_ref()
+            .map(|checked| checked.digests.clone())
+            .unwrap_or_default();
         if let Some((algorithm, value)) = self.stored_comparison_hash(object) {
             digests.push(Digest {
                 algorithm,
@@ -3270,6 +3318,9 @@ impl Engine {
         }
         digests.extend(self.download_digests(metadata, expected_hash));
         digests.dedup();
+        if let Some(checked) = checked.filter(|checked| checked.state == FileState::of(&before)) {
+            digests.retain(|digest| !checked.covers(digest));
+        }
         if !digests.is_empty() {
             let file = existing.clone();
             let matches =
@@ -3279,7 +3330,7 @@ impl Engine {
                     !self.args.protects_existing_contents(),
                     "destination contents differ: {target} (--if-exists=error-if-different)"
                 );
-                return Ok(None);
+                return Ok(LocalReplacement::Differs);
             }
         }
         let parent = target.rsplit_once('/').map_or("", |(parent, _)| parent);
@@ -3295,7 +3346,11 @@ impl Engine {
             identity: (created.dev(), created.ino()),
         };
         if !crate::fsops::SeedAccess::new(&staged).admits(&existing) {
-            return Ok(None);
+            return Ok(LocalReplacement::Download(MatchedFile {
+                dev: before.dev(),
+                ino: before.ino(),
+                ctime: (before.ctime(), before.ctime_nsec() as u32),
+            }));
         }
         let (donor, output, size) = (existing.clone(), staged.clone(), before.len());
         tokio::task::spawn_blocking(move || crate::fsops::copy_from_donor(&donor, &output, size))
@@ -3343,7 +3398,7 @@ impl Engine {
             Some((before.ctime(), before.ctime_nsec() as u32)),
         )?;
         self.progress.add_bytes(object.size);
-        Ok(Some(object.size))
+        Ok(LocalReplacement::Done(object.size))
     }
 
     fn stored_comparison_hash<'a>(&self, object: &'a Object) -> Option<(HashAlgorithm, &'a str)> {
@@ -3629,6 +3684,8 @@ fn holds_digests(file: &std::fs::File, digests: &[Digest]) -> Result<bool> {
         }
         offset += count as u64;
     }
+    #[cfg(debug_assertions)]
+    crate::fsops::record_test_event("SYQ_TEST_LOCAL_HASHES", format_args!("hash {offset}"))?;
     let computed: Vec<Digest> = algorithms
         .iter()
         .zip(hashers)
@@ -3639,6 +3696,73 @@ fn holds_digests(file: &std::fs::File, digests: &[Digest]) -> Result<bool> {
             actual.algorithm == digest.algorithm && actual.value.eq_ignore_ascii_case(&digest.value)
         })
     }))
+}
+
+/// An existing file found to hold an object's contents, as it was then: a
+/// download that replaces it replaces only that file, unchanged.
+#[derive(Clone, Copy, Debug)]
+struct MatchedFile {
+    dev: u64,
+    ino: u64,
+    ctime: (i64, u32),
+}
+
+/// What `replace_from_local` did.
+enum LocalReplacement {
+    /// It replaced the file, which counts this many bytes as transferred.
+    Done(u64),
+    /// The file does not hold the object's contents.
+    Differs,
+    /// The file holds them, but cannot be copied: the object is downloaded
+    /// to replace it.
+    Download(MatchedFile),
+}
+
+/// A file as it was before it was hashed: its identity, size and times.
+/// While they hold, its contents are taken to be those hashed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileState {
+    identity: (u64, u64),
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl FileState {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            identity: (metadata.dev(), metadata.ino()),
+            len: metadata.len(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+/// The digests a file was found to match, and the file as it was before
+/// they were computed.
+#[derive(Clone, Debug)]
+struct Hashed {
+    state: FileState,
+    digests: Vec<Digest>,
+}
+
+impl Hashed {
+    /// Add what a later check hashed, which counts only if the file was
+    /// then as it was for the earlier one.
+    fn add(earlier: &mut Option<Self>, later: Self) {
+        match earlier {
+            Some(earlier) if earlier.state == later.state => earlier.digests.extend(later.digests),
+            _ => *earlier = Some(later),
+        }
+    }
+
+    fn covers(&self, digest: &Digest) -> bool {
+        self.digests.iter().any(|checked| {
+            checked.algorithm == digest.algorithm
+                && checked.value.eq_ignore_ascii_case(&digest.value)
+        })
+    }
 }
 
 // Downloads without a recovery record have no reusable saved progress. Remove
