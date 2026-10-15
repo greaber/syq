@@ -116,10 +116,12 @@ connection never selects a relay through your machine; choose
 
 ## Results from the destination
 
-The destination reports each change it makes as the copy runs. Your machine
-checks that the reports come from the destination and that the source, which
-passes them on, left none out and added none. A refusal or a failed change on
-the destination decides the outcome even if the source reports success, and
+The destination reports each change it makes, refuses, or fails as the copy
+runs. Your machine checks that the reports come from the destination and that
+the source, which passes them on, left none out and added none. Where the
+destination reports a path, the source's own report of it is left out; the
+source reports what it could not read. A refusal or a failed change on the
+destination decides the outcome even if the source reports success, and
 reports cut short fail the copy. Use `-v` for the destination's totals or
 `--results FILE` for [automation](automation.md); `--dry-run --results`
 previews the copy.

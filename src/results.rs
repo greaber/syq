@@ -31,12 +31,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 pub const SCHEMA: &str = "syq.automation";
+/// The destination entry a relayed error is about, between a remote
+/// coordinator and the syq that started it.
+pub(crate) const RELAY_ENTRY: &str = "relay_entry";
 pub const SCHEMA_VERSION: u64 = 4;
 
 pub struct ResultsWriter {
     schema_version: u64,
     /// A restricted destination reports the changes it settled itself, so
-    /// this coordinator leaves those operation records to it.
+    /// this coordinator leaves its successes to it and marks each error about
+    /// a destination entry with that entry, for the invoking machine to drop
+    /// where the destination reported the same failure.
     destination_reports: bool,
     parent: Option<Arc<ResultsWriter>>,
     phase_result: Mutex<Option<serde_json::Value>>,
@@ -540,11 +545,27 @@ impl ResultsWriter {
         class: Option<&'static str>,
         os_kind: Option<&'static str>,
     ) {
+        self.emit_entry_error(message, class, os_kind, None);
+    }
+
+    /// An error about one destination entry, `dst` relative to the
+    /// destination as in `operation_result`.
+    pub(crate) fn emit_entry_error(
+        &self,
+        message: &str,
+        class: Option<&'static str>,
+        os_kind: Option<&'static str>,
+        dst: Option<&[u8]>,
+    ) {
         let mut record = serde_json::json!({
             "type": "error",
             "message": message,
         });
         let object = record.as_object_mut().expect("record is an object");
+        if let Some(dst) = dst.filter(|_| self.destination_reports) {
+            // Internal to the relay; the invoking machine removes it.
+            object.insert(RELAY_ENTRY.into(), tagged(dst));
+        }
         if let Some(class) = class {
             object.insert("class".into(), class.into());
         }
@@ -585,7 +606,7 @@ impl ResultsWriter {
         op: &OperationRecord,
         expected: Option<&crate::hashing::Digest>,
     ) {
-        if self.destination_reports && matches!(op.disposition, "succeeded" | "failed") {
+        if self.destination_reports && op.disposition == "succeeded" {
             return;
         }
         let mut record = serde_json::json!({

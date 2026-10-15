@@ -54,6 +54,11 @@ def changed(records):
                   and record["disposition"] == "succeeded")
 
 
+def refused_paths(records):
+    return [record["dst"]["value"] for record in records
+            if record["type"] == "operation_result" and record["disposition"] == "failed"]
+
+
 def main():
     ssh("source", f"from pathlib import Path; p=Path({ROOT + '/source'!r}); (p/'sub').mkdir(parents=True); "
                   "[(p/name).write_bytes(name.encode()) for name in " + repr(FILES) + "]")
@@ -87,12 +92,29 @@ def main():
         assert changed(records) == FILES, (name, records)
         assert records[-1]["status"] == "success", records[-1]
 
-    print("results: the receiver's refusals decide the outcome", flush=True)
-    _, records = copy("refused", "--receiver-max-entries=2", expected=25)
-    terminal = records[-1]
-    assert terminal["status"] == "refused" and terminal["exit_code"] == 25, terminal
-    assert any(record["type"] == "error" and record.get("class") == "safety_limit"
-               and "refused" in record["message"] for record in records), records
+    print("results: the receiver lists its refusals, which decide the outcome", flush=True)
+    # A coordinator that leaves out or rewrites its own records of the
+    # refused changes does not change what this machine reports.
+    for name, env in [("refused", None),
+                      ("refused-omit", {"SYQ_TEST_ALTER_RELAYED_FAILURES": "omit"}),
+                      ("refused-alter", {"SYQ_TEST_ALTER_RELAYED_FAILURES": "alter"})]:
+        _, records = copy(name, "--receiver-max-entries=2", expected=25, env=env)
+        terminal = records[-1]
+        assert terminal["status"] == "refused" and terminal["exit_code"] == 25, (name, terminal)
+        refused = refused_paths(records)
+        assert refused, (name, records)
+        for path in refused:
+            about = [record for record in records
+                     if record.get("dst", {}).get("value") == path
+                     or record.get("message", "").startswith(f"syq: {path}: ")]
+            # Once, from the receiver: its error record and its operation
+            # record, which has none of the coordinator's retry fields.
+            assert [(record["type"], record.get("class")) for record in about] == [
+                ("error", "safety_limit"), ("operation_result", "safety_limit")], (name, path, records)
+            assert about[1]["disposition"] == "failed" and "retryable" not in about[1], (name, records)
+        assert not any("nothing happened" in record.get("message", "") for record in records), (name, records)
+        errors = sum(record["type"] == "error" for record in records)
+        assert terminal["errors"] == errors, (name, terminal, records)
 
     print("results: a stream the coordinator cuts short fails the copy", flush=True)
     cut = {"SYQ_TEST_DROP_DESTINATION_RESULTS_END": "1"}

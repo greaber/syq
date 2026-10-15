@@ -68,8 +68,20 @@ fn sample(records: bool) -> (Reader, Vec<Vec<u8>>) {
         Some(b"dir/b"),
         Some("disk full"),
     );
-    stream.record(Change::SetMetadata, Some(b"dir"), None);
-    stream.refused();
+    stream.record(
+        Change::SetMetadata {
+            kind: crate::proto::Kind::Dir,
+        },
+        Some(b"dir"),
+        None,
+    );
+    stream.refused(
+        "refused: outside the signed destination scopes",
+        &[
+            (Some(b"x".to_vec()), Change::PublishFile { size: 2 }),
+            (None, Change::EnsureDirectory),
+        ],
+    );
     all.extend(drain(&mut stream));
     stream.record(Change::DeleteFile, Some(b"old"), None);
     stream.record(Change::LinkFile, Some(b"dir/c"), None);
@@ -96,32 +108,76 @@ fn records_and_totals_round_trip_in_ordinary_form() {
             refused: 1,
         }
     );
-    // Metadata-only changes are not listed, as in ordinary results.
+    // A successful metadata-only change is not listed, as in ordinary
+    // results; each failure and refusal is listed with its error record.
     let summary: Vec<_> = records
         .iter()
         .map(|record| {
             (
-                record["action"].as_str().unwrap(),
-                record["dst"]["value"].as_str().unwrap(),
-                record["disposition"].as_str().unwrap(),
+                record["type"].as_str().unwrap(),
+                record["action"].as_str().unwrap_or_default(),
+                record["dst"]["value"].as_str().unwrap_or_default(),
+                record["disposition"].as_str().unwrap_or_default(),
             )
         })
         .collect();
     assert_eq!(
         summary,
         [
-            ("transfer_file", "a", "succeeded"),
-            ("create_directory", "dir", "succeeded"),
-            ("transfer_file", "dir/b", "failed"),
-            ("delete", "old", "succeeded"),
-            ("transfer_file", "dir/c", "succeeded"),
+            ("operation_result", "transfer_file", "a", "succeeded"),
+            ("operation_result", "create_directory", "dir", "succeeded"),
+            ("error", "", "", ""),
+            ("operation_result", "transfer_file", "dir/b", "failed"),
+            ("error", "", "", ""),
+            ("operation_result", "transfer_file", "x", "failed"),
+            ("operation_result", "delete", "old", "succeeded"),
+            ("operation_result", "transfer_file", "dir/c", "succeeded"),
         ]
     );
     assert_eq!(records[0]["bytes"], 3);
-    assert_eq!(records[2]["message"], "disk full");
+    assert_eq!(records[2]["message"], "syq: dir/b: disk full");
     assert_eq!(records[2]["class"], "io");
-    assert!(records[2].get("bytes").is_none());
-    assert_eq!(records[4]["bytes"], 0);
+    assert_eq!(records[3]["message"], "disk full");
+    assert_eq!(records[3]["class"], "io");
+    assert!(records[3].get("bytes").is_none());
+    assert_eq!(records[4]["class"], "safety_limit");
+    assert_eq!(
+        records[5]["message"],
+        "refused: outside the signed destination scopes"
+    );
+    assert_eq!(records[5]["class"], "safety_limit");
+    assert_eq!(records[7]["bytes"], 0);
+}
+
+#[test]
+fn a_refusal_without_a_listable_path_is_still_an_error_record() {
+    let Pair {
+        mut stream,
+        mut reader,
+    } = pair(true);
+    let mut all = drain(&mut stream);
+    stream.refused("refused: scan outside the grant", &[]);
+    stream.record(
+        Change::SetMetadata {
+            kind: crate::proto::Kind::Symlink,
+        },
+        Some(b"link"),
+        Some("lchown failed"),
+    );
+    stream.finish(0).unwrap();
+    all.extend(drain(&mut stream));
+    let records = accept_all(&mut reader, &all).unwrap();
+    assert_eq!(records.len(), 3, "{records:?}");
+    assert_eq!(records[0]["type"], "error");
+    assert_eq!(
+        records[0]["message"],
+        "syq: the receiver: refused: scan outside the grant"
+    );
+    // A failed metadata change is listed as its object's failure.
+    assert_eq!(records[2]["action"], "create_symlink");
+    assert_eq!(records[2]["disposition"], "failed");
+    let totals = reader.finish().unwrap();
+    assert_eq!((totals.refused, totals.failed), (1, 1));
 }
 
 #[test]

@@ -2771,7 +2771,7 @@ impl Planner<'_> {
             let error = self.apply(ops)?.into_iter().next().flatten();
             if let Some(error) = error {
                 let os_kind = wire_os_kind(&error);
-                self.progress.error_classified(
+                self.progress.entry_error_classified(
                     &format!(
                         "syq: {}",
                         // Creating it changes the directory it goes into.
@@ -2780,6 +2780,7 @@ impl Planner<'_> {
                     ),
                     Some("io"),
                     os_kind,
+                    Some(b""),
                 );
                 if capacity_os_kind(os_kind) {
                     return Err(endpoint_error(error)).context("apply destination changes");
@@ -2846,10 +2847,11 @@ impl Planner<'_> {
                 let os_kind = err.as_ref().and_then(wire_os_kind);
                 if let Some(err) = &err {
                     failed += 1;
-                    self.progress.error_classified(
+                    self.progress.entry_error_classified(
                         &format!("syq: {}", self.opts.wire_error_message_at(err, name)),
                         Some("io"),
                         os_kind,
+                        Some(destination_entry(name, dst_root)),
                     );
                     if name == &self.dst_root && *condition != TargetCondition::Any {
                         self.collision = true;
@@ -3078,10 +3080,11 @@ impl Planner<'_> {
 
     fn report_metadata_failure(&self, dst: Option<&[u8]>, kind: DeclaredKind, error: &WireError) {
         let os_kind = wire_os_kind(error);
-        self.progress.error_classified(
+        self.progress.entry_error_classified(
             &format!("syq: {}", self.opts.wire_error_message(error)),
             Some("io"),
             os_kind,
+            dst,
         );
         if let Some(dst) = dst {
             self.emit_entry_failed(
@@ -3115,10 +3118,11 @@ impl Planner<'_> {
             let os_kind = error.as_ref().and_then(wire_os_kind);
             if let Some(e) = &error {
                 let path = join(&self.dst_root, &queued.dst_rel);
-                self.progress.error_classified(
+                self.progress.entry_error_classified(
                     &format!("syq: {}", self.opts.wire_error_message_at(e, &path)),
                     Some("io"),
                     os_kind,
+                    Some(&queued.dst_rel),
                 );
             } else {
                 // Counted only once the operation settles: a fatal
@@ -4143,10 +4147,11 @@ impl Planner<'_> {
                                 me.progress.println(&format!("deleting {rel}"));
                             }
                         }
-                        Some(e) => me.progress.error_classified(
+                        Some(e) => me.progress.entry_error_classified(
                             &format!("syq: delete {rel}: {}", opts.wire_error_message_at(&e, p)),
                             Some("io"),
                             None,
+                            Some(destination_entry(p, &me.dst_root)),
                         ),
                     }
                     if let Some(results) = me.progress.results_writer() {
@@ -4972,6 +4977,15 @@ pub(super) struct QueuedLeafOp {
 
 /// The container-relative spelling of a full destination path; None for the
 /// container itself.
+/// A destination path relative to the destination, the destination itself
+/// being the empty path.
+fn destination_entry<'p>(path: &'p [u8], dst_root: &[u8]) -> &'p [u8] {
+    if path == dst_root {
+        return b"";
+    }
+    strip_dst_root(path, dst_root).unwrap_or(path)
+}
+
 pub(super) fn strip_dst_root<'p>(path: &'p [u8], dst_root: &[u8]) -> Option<&'p [u8]> {
     if path == dst_root {
         return None;

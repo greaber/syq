@@ -35,8 +35,9 @@ Human stdout and stderr are not part of this contract.
 Results are written on the invoking machine, including for remote removal
 and for copies between two servers. When one of the servers coordinates the
 copy, its records come back over your SSH connection as it works. Through a
-command-restricted receiver, the records of what changed on the destination
-come from the receiver itself; see
+command-restricted receiver, the records of each change on the destination,
+including the ones it refused or that failed there, come from the receiver
+itself, and failures reading the source come from the coordinating server; see
 [Results from the destination](remote-reference.md#results-from-the-destination).
 
 `--results` supports native `cp` (including pruning), `rm`, and `clean-partials`.
@@ -161,7 +162,8 @@ An outcome for a completed copy change or a failed mapping entry.
 | `class`, `os_kind`, `message` | Error details where available |
 
 A command-restricted receiver's own records have no `src`, `attempts`, or
-`retryable`; a file it did not finish is `failed`.
+`retryable`; a file it did not finish is `failed`, and a change it refused is
+`failed` with `class: "safety_limit"`.
 
 Unchanged and excluded entries have totals only. Ordinary live streams do not
 emit per-operation records for metadata-only updates, though dry runs emit
@@ -242,7 +244,8 @@ OS kinds are `not_found`, `permission_denied`, `already_exists`,
 `invalid_input`, `no_space`, `quota_exceeded`, `read_only`, and `other`.
 They preserve OS error meaning across hosts without requiring matching errno
 numbers. A command-restricted receiver's refusals use
-`class: "safety_limit"`.
+`class: "safety_limit"` and name the refused path, or the receiver when the
+refused request named none.
 
 ### `result`
 

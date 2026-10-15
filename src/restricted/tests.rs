@@ -561,6 +561,7 @@ impl ReadResults {
     fn changes(&self) -> Vec<(String, Vec<u8>, String)> {
         self.records
             .iter()
+            .filter(|record| record["type"] == "operation_result")
             .map(|record| {
                 let dst = &record["dst"];
                 let path = match dst["encoding"].as_str() {
@@ -3275,10 +3276,11 @@ fn unfinished_in_place_files_are_reported_failed() {
     assert_eq!(results.totals.failed, 1);
     assert_eq!(results.totals.files_transferred, 0);
     assert_eq!(
-        results.records[0]["message"], "the file was not finished",
+        results.records[0]["message"], "syq: image: the file was not finished",
         "{:?}",
         results.records
     );
+    assert_eq!(results.records[1]["message"], "the file was not finished");
     assert!(results.has("transfer_file", b"image", "failed"));
 
     // With it, the same file is published once.
@@ -5975,6 +5977,12 @@ fn grouped_patch_results_list_published_and_failed_files() {
                 b"published".to_vec(),
                 "succeeded".to_owned()
             ),
+            // Its metadata could not be applied when keeping it.
+            (
+                "transfer_file".to_owned(),
+                b"unkept".to_vec(),
+                "failed".to_owned()
+            ),
         ]
     );
 }
@@ -6227,8 +6235,13 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
     assert_eq!(in_flight(), 0);
     assert_eq!(fs::read(&paths[2]).unwrap(), old);
 
-    // The results list each publication, as for batch patches.
-    let mut changes = finish_results(&authority, &mut reader).changes();
+    // The results list each publication, as for batch patches, and each
+    // refused begin by its path: three for `refused` (data in the begin, a
+    // short declaration, a second begin) and one for `published` (a begin
+    // while another was open). The begin outside the destination is not
+    // listed by path.
+    let results = finish_results(&authority, &mut reader);
+    let mut changes = results.changes();
     changes.sort();
     let publish = |path: &[u8], disposition: &str| {
         (
@@ -6241,10 +6254,20 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
         changes,
         [
             publish(b"dropped", "failed"),
+            publish(b"published", "failed"),
             publish(b"published", "succeeded"),
+            publish(b"refused", "failed"),
+            publish(b"refused", "failed"),
+            publish(b"refused", "failed"),
             publish(b"refused", "failed"),
         ]
     );
+    let refusals = results
+        .records
+        .iter()
+        .filter(|record| record["type"] == "error" && record["class"] == "safety_limit")
+        .count();
+    assert_eq!(refusals as u64, results.totals.refused);
 }
 
 #[test]

@@ -191,7 +191,7 @@ pub(crate) struct Totals {
     /// Changes that failed or were left unfinished, metadata-only ones
     /// included.
     pub failed: u64,
-    /// Requests the destination refused.
+    /// Requests the destination refused; it lists each change they asked for.
     pub refused: u64,
 }
 
@@ -206,10 +206,33 @@ pub(crate) enum Change {
     EnsureDirectory,
     CreateSymlink,
     CreateSpecial,
-    /// Ordinary results do not list metadata-only changes; failures count.
-    SetMetadata,
+    /// Ordinary results list a metadata-only change only when it fails, as
+    /// a failure of the object it belongs to.
+    SetMetadata {
+        kind: crate::proto::Kind,
+    },
     DeleteFile,
     DeleteDirectory,
+}
+
+impl Change {
+    /// The ordinary record's action and kind.
+    fn action(self) -> (&'static str, &'static str) {
+        match self {
+            Change::PublishFile { .. } | Change::LinkFile => ("transfer_file", "file"),
+            Change::EnsureDirectory => ("create_directory", "dir"),
+            Change::CreateSymlink => ("create_symlink", "symlink"),
+            Change::CreateSpecial => ("create_special", "special"),
+            Change::SetMetadata { kind } => match kind {
+                crate::proto::Kind::Dir => ("create_directory", "dir"),
+                crate::proto::Kind::File => ("transfer_file", "file"),
+                crate::proto::Kind::Symlink => ("create_symlink", "symlink"),
+                _ => ("create_special", "special"),
+            },
+            Change::DeleteFile => ("delete", "file"),
+            Change::DeleteDirectory => ("delete", "dir"),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -377,59 +400,107 @@ impl Stream {
     }
 
     /// Record one settled change. `dst` is the record's destination path, or
-    /// `None` when ordinary results would not list it.
+    /// `None` when ordinary results would not list it; a failure is listed
+    /// whatever its path.
     pub(crate) fn record(&mut self, change: Change, dst: Option<&[u8]>, error: Option<&str>) {
         if self.ended {
             return;
         }
         let totals = &mut self.totals;
         match (change, error) {
-            (_, Some(_)) => totals.failed += 1,
+            (_, Some(error)) => {
+                totals.failed += 1;
+                self.list_failure(change, dst, "io", error);
+                return;
+            }
             (Change::PublishFile { .. } | Change::LinkFile, None) => totals.files_transferred += 1,
             (Change::EnsureDirectory, None) => totals.directories_created += 1,
             (Change::CreateSymlink, None) => totals.symlinks_created += 1,
             (Change::CreateSpecial, None) => totals.specials_created += 1,
             (Change::DeleteFile | Change::DeleteDirectory, None) => totals.deletions_completed += 1,
-            (Change::SetMetadata, None) => {}
+            (Change::SetMetadata { .. }, None) => return,
         }
-        if !self.records {
-            return;
-        }
-        let Some(dst) = dst else {
+        let (Some(dst), true) = (dst, self.records) else {
             return;
         };
-        let (action, kind, bytes) = match change {
-            Change::PublishFile { size } => ("transfer_file", "file", Some(size)),
-            Change::LinkFile => ("transfer_file", "file", Some(0)),
-            Change::EnsureDirectory => ("create_directory", "dir", None),
-            Change::CreateSymlink => ("create_symlink", "symlink", None),
-            Change::CreateSpecial => ("create_special", "special", None),
-            Change::DeleteFile => ("delete", "file", None),
-            Change::DeleteDirectory => ("delete", "dir", None),
-            Change::SetMetadata => return,
-        };
+        let (action, kind) = change.action();
         let mut record = serde_json::json!({
             "type": "operation_result",
             "action": action,
             "dst": crate::results::tagged(dst),
             "kind": kind,
-            "disposition": if error.is_some() { "failed" } else { "succeeded" },
+            "disposition": "succeeded",
         });
-        let object = record.as_object_mut().expect("record is an object");
-        match error {
-            None => {
-                if let Some(bytes) = bytes {
-                    object.insert("bytes".into(), bytes.into());
-                }
-            }
-            Some(error) => {
-                object.insert("class".into(), "io".into());
-                if let Some(message) = bounded_diagnostic(error) {
-                    object.insert("message".into(), message.into());
-                }
+        let bytes = match change {
+            Change::PublishFile { size } => Some(size),
+            Change::LinkFile => Some(0),
+            _ => None,
+        };
+        if let Some(bytes) = bytes {
+            record["bytes"] = bytes.into();
+        }
+        self.push(&record);
+    }
+
+    /// Count a request the destination refused, and list each change it
+    /// asked for: the changes with a destination path, or the request as a
+    /// whole.
+    pub(crate) fn refused(&mut self, message: &str, changes: &[(Option<Vec<u8>>, Change)]) {
+        if self.ended {
+            return;
+        }
+        self.totals.refused += 1;
+        let mut listed = false;
+        for (dst, change) in changes {
+            if let Some(dst) = dst {
+                self.list_failure(*change, Some(dst), "safety_limit", message);
+                listed = true;
             }
         }
-        if serde_json::to_writer(&mut self.pending, &record).is_ok() {
+        if !listed {
+            self.list_failure(Change::EnsureDirectory, None, "safety_limit", message);
+        }
+    }
+
+    /// A failed or refused change as an ordinary copy reports one: an
+    /// `operation_result` for its path, and the `error` record it counts.
+    fn list_failure(&mut self, change: Change, dst: Option<&[u8]>, class: &str, error: &str) {
+        if !self.records {
+            return;
+        }
+        let message = bounded_diagnostic(error).unwrap_or_else(|| "failed".into());
+        let line = match dst {
+            Some(dst) => format!(
+                "syq: {}: {message}",
+                if dst.is_empty() {
+                    ".".into()
+                } else {
+                    String::from_utf8_lossy(dst)
+                }
+            ),
+            None => format!("syq: the receiver: {message}"),
+        };
+        self.push(&serde_json::json!({
+            "type": "error",
+            "class": class,
+            "message": line,
+        }));
+        if let Some(dst) = dst {
+            let (action, kind) = change.action();
+            self.push(&serde_json::json!({
+                "type": "operation_result",
+                "action": action,
+                "dst": crate::results::tagged(dst),
+                "kind": kind,
+                "disposition": "failed",
+                "class": class,
+                "message": message,
+            }));
+        }
+    }
+
+    fn push(&mut self, record: &serde_json::Value) {
+        if serde_json::to_writer(&mut self.pending, record).is_ok() {
             self.pending.push(b'\n');
             self.pending_since.get_or_insert_with(Instant::now);
         }
@@ -438,13 +509,6 @@ impl Stream {
     #[cfg(test)]
     pub(crate) fn totals(&self) -> Totals {
         self.totals
-    }
-
-    /// Count a request the destination refused.
-    pub(crate) fn refused(&mut self) {
-        if !self.ended {
-            self.totals.refused += 1;
-        }
     }
 
     /// Whether `take_frames` has anything to return now.
@@ -619,8 +683,10 @@ impl Reader {
                     let record: serde_json::Value = serde_json::from_slice(line)
                         .context("decode a destination result record")?;
                     anyhow::ensure!(
-                        record.get("type").and_then(serde_json::Value::as_str)
-                            == Some("operation_result"),
+                        matches!(
+                            record.get("type").and_then(serde_json::Value::as_str),
+                            Some("operation_result" | "error")
+                        ),
                         "a destination result record has an unexpected type"
                     );
                     emit(record)?;
@@ -719,15 +785,54 @@ impl Reader {
 /// relay that cuts the stream would.
 #[cfg(debug_assertions)]
 const DROP_END_ENV: &str = "SYQ_TEST_DROP_DESTINATION_RESULTS_END";
+/// Test hook: a coordinator that leaves out (`omit`) or falsifies (`alter`)
+/// its own records of failures at destination paths.
+#[cfg(debug_assertions)]
+const ALTER_FAILURES_ENV: &str = "SYQ_TEST_ALTER_RELAYED_FAILURES";
 
 #[cfg(debug_assertions)]
-pub(crate) fn drop_end_requested() -> bool {
+fn drop_end_requested() -> bool {
     std::env::var_os(DROP_END_ENV).is_some()
 }
 
+/// The test hooks a syq passes on to the remote coordinator it starts.
 #[cfg(debug_assertions)]
-pub(crate) fn drop_end_environment() -> (&'static str, String) {
-    (DROP_END_ENV, "1".into())
+pub(crate) fn test_environment() -> Vec<(&'static str, String)> {
+    [DROP_END_ENV, ALTER_FAILURES_ENV]
+        .into_iter()
+        .filter_map(|name| Some((name, std::env::var(name).ok()?)))
+        .collect()
+}
+
+/// A coordinator's own record, as the alteration test hook would relay it.
+#[cfg(debug_assertions)]
+fn altered_failure(record: &str) -> Option<String> {
+    let mode = std::env::var(ALTER_FAILURES_ENV).ok();
+    let Some(mode) = mode.as_deref() else {
+        return Some(record.to_owned());
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(record) else {
+        return Some(record.to_owned());
+    };
+    let failure = value.get(crate::results::RELAY_ENTRY).is_some()
+        || (value["type"] == "operation_result" && value["disposition"] == "failed");
+    if !failure {
+        return Some(record.to_owned());
+    }
+    match mode {
+        "omit" => None,
+        _ => {
+            let object = value.as_object_mut()?;
+            if object.get("type").and_then(serde_json::Value::as_str) == Some("operation_result") {
+                object.insert("disposition".into(), "succeeded".into());
+                object.remove("class");
+                object.remove("message");
+            } else {
+                object.insert("message".into(), "syq: nothing happened".into());
+            }
+            Some(value.to_string())
+        }
+    }
 }
 
 /// Lines carrying results from a remote coordinator to the syq that started
@@ -814,6 +919,10 @@ pub(crate) mod relay {
             let record = buf.strip_suffix(b"\n").unwrap_or(buf);
             let record = std::str::from_utf8(record)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            #[cfg(debug_assertions)]
+            let Some(record) = super::altered_failure(record) else {
+                return Ok(buf.len());
+            };
             crate::output::write_stdout(format_args!("{}{record}", self.prefix))?;
             Ok(buf.len())
         }

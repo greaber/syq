@@ -67,7 +67,11 @@ const MAX_RELAYED_LINE_BYTES: usize = 1024 * 1024;
 
 /// Results arriving on a remote coordinator's standard output: its own
 /// records and, through a restricted receiver, the destination's frames.
-/// Each is handled as it arrives; nothing accumulates.
+/// Each is handled as it arrives. Through a restricted receiver, the
+/// destination's records of its changes replace the coordinator's: of the
+/// coordinator's records about a destination path, only failures the
+/// destination did not list are kept, as source failures, so only failures
+/// are ever held.
 struct Relay {
     coordinator_prefix: Vec<u8>,
     destination_prefix: Vec<u8>,
@@ -81,8 +85,19 @@ struct Relay {
     prune: bool,
     /// Error records written to the results so far.
     errors: u64,
+    /// Paths of the failures the destination listed.
+    destination_failed: std::collections::HashSet<String>,
+    /// The coordinator's failure records for paths the destination has not
+    /// listed, with their arrival order; written before the final result.
+    held: std::collections::HashMap<String, Vec<(u64, serde_json::Value)>>,
+    arrivals: u64,
     /// The first problem with what arrived; later lines are drained unread.
     failure: Option<anyhow::Error>,
+}
+
+/// A destination path, as records tag it, compared as text.
+fn entry_key(dst: &serde_json::Value) -> String {
+    dst.to_string()
 }
 
 impl Relay {
@@ -103,6 +118,9 @@ impl Relay {
             dry_run,
             prune,
             errors: 0,
+            destination_failed: Default::default(),
+            held: Default::default(),
+            arrivals: 0,
             failure: None,
         }
     }
@@ -161,20 +179,36 @@ impl Relay {
                 );
                 self.coordinator_terminal = Some(record);
             }
-            // The destination reports the changes it settled itself.
-            "operation_result"
-                if self.destination.is_some()
-                    && matches!(
-                        object
-                            .get("disposition")
-                            .and_then(serde_json::Value::as_str),
-                        Some("succeeded" | "failed")
-                    ) => {}
             _ => {
                 anyhow::ensure!(
                     self.coordinator_terminal.is_none(),
                     "the coordinating server sent results after its final result"
                 );
+                let entry = object.remove(crate::results::RELAY_ENTRY);
+                if self.destination.is_some() {
+                    let disposition = object
+                        .get("disposition")
+                        .and_then(serde_json::Value::as_str);
+                    let failure = match kind.as_str() {
+                        // The destination reports the changes it made.
+                        "operation_result" if disposition == Some("succeeded") => return Ok(()),
+                        "operation_result" if disposition == Some("failed") => {
+                            object.get("dst").map(entry_key)
+                        }
+                        "error" => entry.as_ref().map(entry_key),
+                        _ => None,
+                    };
+                    if let Some(key) = failure {
+                        if !self.destination_failed.contains(&key) {
+                            self.arrivals += 1;
+                            self.held
+                                .entry(key)
+                                .or_default()
+                                .push((self.arrivals, record));
+                        }
+                        return Ok(());
+                    }
+                }
                 if kind == "error" {
                     self.errors += 1;
                 }
@@ -184,6 +218,24 @@ impl Relay {
         Ok(())
     }
 
+    /// Write the coordinator's failures the destination did not list, in
+    /// the order they arrived.
+    fn release_held(&mut self) {
+        let mut held: Vec<_> = std::mem::take(&mut self.held)
+            .into_values()
+            .flatten()
+            .collect();
+        held.sort_by_key(|(order, _)| *order);
+        for (_, record) in held {
+            if record.get("type").and_then(serde_json::Value::as_str) == Some("error") {
+                self.errors += 1;
+            }
+            if let Some(writer) = &self.results {
+                writer.emit_value(record);
+            }
+        }
+    }
+
     fn destination_frame(&mut self, line: &[u8]) -> Result<()> {
         let reader = self.destination.as_mut().context(
             "the coordinating server relayed destination results that were not expected",
@@ -191,8 +243,29 @@ impl Relay {
         let frame = base64::engine::general_purpose::STANDARD_NO_PAD
             .decode(line.trim_ascii())
             .context("decode a relayed destination results frame")?;
-        let results = &self.results;
+        let Self {
+            results,
+            errors,
+            destination_failed,
+            held,
+            ..
+        } = self;
         reader.accept(&frame, |record| {
+            match record.get("type").and_then(serde_json::Value::as_str) {
+                Some("error") => *errors += 1,
+                Some("operation_result")
+                    if record
+                        .get("disposition")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("failed") =>
+                {
+                    // The coordinator's own record of this failure is left out.
+                    let key = entry_key(&record["dst"]);
+                    held.remove(&key);
+                    destination_failed.insert(key);
+                }
+                _ => {}
+            }
             if let Some(writer) = results {
                 writer.emit_value(record);
             }
@@ -358,6 +431,9 @@ fn settle(mut relay: Relay, settlement: Settlement<'_>) -> Result<i32> {
         verbose,
         quiet,
     } = settlement;
+    // Everything has arrived: the coordinator's failures the destination did
+    // not list are source failures.
+    relay.release_held();
     if let Some(error) = relay.failure.take() {
         let message = format!("the results relayed by {src_host} are unusable: {error:#}");
         relay.error(&message, "integrity");
@@ -412,28 +488,18 @@ fn settle(mut relay: Relay, settlement: Settlement<'_>) -> Result<i32> {
         None
     };
     debug_assert_eq!(outcome.rejects, settlement_error.is_some());
-    if relay.results.is_some() {
-        if let Some(message) = &settlement_error {
-            let class = if totals.refused > 0 {
-                "safety_limit"
-            } else {
-                "io"
-            };
-            relay.error(message, class);
-        }
+    if let Some(writer) = &relay.results {
+        // The destination listed each refusal and failure with its error
+        // record; the complaint itself goes to stderr.
         let terminal = compose_terminal(&relay, &totals, outcome, elapsed_ms);
         // The coordinator's summary was suppressed: render it from the same
         // final result the machine reads, so the two cannot disagree.
         if !quiet && !relay.dry_run {
             print_summary(&terminal);
         }
-        relay
-            .results
-            .as_ref()
-            .expect("results requested")
-            .emit_terminal_value(terminal);
+        writer.emit_terminal_value(terminal);
         // A stream was settled: the process exits with the code it
-        // advertises. Settlement complaints reach stderr too.
+        // advertises.
         if let Some(message) = settlement_error {
             crate::output::diagnostic!("syq: {message}");
         }
@@ -1419,9 +1485,7 @@ fn run_remote(
         internal_environment.push((crate::destination_results::relay::TOKEN_ENV, token.clone()));
     }
     #[cfg(debug_assertions)]
-    if crate::destination_results::drop_end_requested() {
-        internal_environment.push(crate::destination_results::drop_end_environment());
-    }
+    internal_environment.extend(crate::destination_results::test_environment());
     if args.dry_run {
         internal_environment.push((
             "SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST",

@@ -743,7 +743,8 @@ One copy outcome. `dst` is relative to the destination container. `src` is
 present for mapping entries when available. `bytes` and `attempts` give transfer
 information. Error details are present when known; `message` is display text.
 A command-restricted receiver's own outcomes have no `src`, `attempts`, or
-`retryable`.
+`retryable`; it reports the changes it refused or that failed there as well as
+those it made.
 
 `protocol.type = "operation_result"`. Fields in addition to the common envelope:
 

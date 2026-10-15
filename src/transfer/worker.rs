@@ -856,10 +856,11 @@ impl Worker {
             if let Err(e) = res {
                 let os_kind = os_kind_of(&e);
                 let message = copy_error_message(&e, self.opts.failure_hint_at(&j.dst));
-                self.progress.error_classified(
+                self.progress.entry_error_classified(
                     &format!("syq: {}: {message}", j.rel),
                     Some("io"),
                     os_kind,
+                    Some(&j.rel_bytes),
                 );
                 self.emit_file_result_failed(j, "unknown", os_kind, &message);
                 self.sched.fail_file(*idx);
@@ -957,10 +958,11 @@ impl Worker {
             let job = self.job(idx);
             let os_kind = os_kind_of(&e);
             let message = copy_error_message(&e, self.opts.failure_hint_at(&job.dst));
-            self.progress.error_classified(
+            self.progress.entry_error_classified(
                 &format!("syq: {}: {message}", job.rel),
                 Some("io"),
                 os_kind,
+                Some(&job.rel_bytes),
             );
             self.emit_file_result_failed(&job, "unknown", os_kind, &message);
             if capacity_os_kind(os_kind) {

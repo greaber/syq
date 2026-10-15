@@ -347,10 +347,22 @@ impl Progress {
         class: Option<&'static str>,
         os_kind: Option<&'static str>,
     ) {
+        self.entry_error_classified(line, class, os_kind, None);
+    }
+
+    /// A counted error about one destination entry, `dst` relative to the
+    /// destination: a restricted destination may report the same failure.
+    pub fn entry_error_classified(
+        &self,
+        line: &str,
+        class: Option<&'static str>,
+        os_kind: Option<&'static str>,
+        dst: Option<&[u8]>,
+    ) {
         self.errors.fetch_add(1, Relaxed);
         self.eprintln(line);
         if let Some(results) = self.results.get() {
-            results.emit_error_classified(line, class, os_kind);
+            results.emit_entry_error(line, class, os_kind, dst);
         }
     }
 

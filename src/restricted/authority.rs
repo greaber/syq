@@ -880,10 +880,76 @@ impl RestrictedAuthority {
         {
             return;
         }
-        let directory = matches!(change, Change::EnsureDirectory | Change::DeleteDirectory);
+        // A failure is listed even at the destination itself.
+        let directory =
+            error.is_none() && matches!(change, Change::EnsureDirectory | Change::DeleteDirectory);
         let dst = self.result_path(path, directory);
         if let Some(stream) = self.results.lock().unwrap().as_mut() {
             stream.record(change, dst.as_deref(), error);
+        }
+    }
+
+    /// The changes a request asked for, by destination path where a record
+    /// could name one, for the results to list when it is refused.
+    fn requested_changes(&self, request: &Request) -> Vec<(Option<Vec<u8>>, Change)> {
+        let file =
+            |path: &[u8], size: u64| (self.result_path(path, false), Change::PublishFile { size });
+        match request {
+            Request::Apply { ops, .. } => ops
+                .iter()
+                .map(|op| {
+                    let (path, change) = match op {
+                        Op::Mkdir { path, .. } => (path, Change::EnsureDirectory),
+                        Op::Symlink { path, .. } => (path, Change::CreateSymlink),
+                        Op::Mknod { path, .. } => (path, Change::CreateSpecial),
+                        Op::Hardlink { path, .. } => (path, Change::LinkFile),
+                        Op::Rmdir { path } => (path, Change::DeleteDirectory),
+                        Op::Unlink { path } | Op::Remove { path } => (path, Change::DeleteFile),
+                        Op::SetMeta { path, .. } => (
+                            path,
+                            Change::SetMetadata {
+                                kind: self
+                                    .rooted_metadata(path)
+                                    .ok()
+                                    .flatten()
+                                    .map_or(proto::Kind::File, |metadata| {
+                                        kind_from_mode(metadata.mode)
+                                    }),
+                            },
+                        ),
+                        Op::SetFileMetaIfSame { path, .. } => (
+                            path,
+                            Change::SetMetadata {
+                                kind: proto::Kind::File,
+                            },
+                        ),
+                    };
+                    (self.result_path(path, false), change)
+                })
+                .collect(),
+            Request::PutSmallBatch(puts) => puts
+                .iter()
+                .map(|put| file(&put.path, put.data.len() as u64))
+                .collect(),
+            Request::PatchSmallBatch(patches) => patches
+                .iter()
+                .map(|patch| file(&patch.path, patch.len))
+                .collect(),
+            Request::PatchBegin { patch, .. } => vec![file(&patch.path, patch.len)],
+            Request::Prepare { path, size, .. } => vec![file(path, *size)],
+            Request::StageBasis { path, len, .. } | Request::SeedBasis { path, len, .. } => {
+                vec![file(path, *len)]
+            }
+            Request::WriteRange { path, .. }
+            | Request::ReuseComparedRange { path, .. }
+            | Request::Finalize { path, .. } => vec![file(path, 0)],
+            Request::FinishBasis { path, .. } => vec![(
+                self.result_path(path, false),
+                Change::SetMetadata {
+                    kind: proto::Kind::File,
+                },
+            )],
+            _ => Vec::new(),
         }
     }
 
@@ -985,7 +1051,9 @@ impl RestrictedAuthority {
                     self.record_change(
                         &path,
                         if kept {
-                            Change::SetMetadata
+                            Change::SetMetadata {
+                                kind: proto::Kind::File,
+                            }
                         } else {
                             Change::PublishFile { size }
                         },
@@ -1795,11 +1863,16 @@ impl RestrictedAuthority {
                 return Ok(());
             }
         };
-        let is_dir = match operation {
-            Op::Mkdir { .. } => true,
+        // What a metadata change applies to, for its record if it fails.
+        let metadata_kind = match operation {
             Op::SetMeta { .. } => self
                 .rooted_metadata(path)?
-                .is_some_and(|metadata| metadata.is_dir()),
+                .map_or(proto::Kind::File, |metadata| kind_from_mode(metadata.mode)),
+            _ => proto::Kind::File,
+        };
+        let is_dir = match operation {
+            Op::Mkdir { .. } => true,
+            Op::SetMeta { .. } => metadata_kind == proto::Kind::Dir,
             _ => false,
         };
         self.check_mutation_path(path, is_dir)?;
@@ -1942,7 +2015,9 @@ impl RestrictedAuthority {
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
-                    change: Change::SetMetadata,
+                    change: Change::SetMetadata {
+                        kind: metadata_kind,
+                    },
                 });
                 Ok(())
             }
@@ -1957,7 +2032,9 @@ impl RestrictedAuthority {
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
-                    change: Change::SetMetadata,
+                    change: Change::SetMetadata {
+                        kind: proto::Kind::File,
+                    },
                 });
                 Ok(())
             }
@@ -2037,11 +2114,14 @@ impl RestrictedAuthority {
                     state.in_flight = state.in_flight.saturating_sub(1);
                     self.settled.notify_all();
                 }
-                // Every refusal counts, as the coordinator could have hidden it.
+                // Every refusal counts, and lists the changes it refused, as
+                // the coordinator could have hidden it.
                 state.recorded_any = true;
+                drop(state);
                 if self.results_started.load(Ordering::Acquire) {
+                    let changes = self.requested_changes(request);
                     if let Some(stream) = self.results.lock().unwrap().as_mut() {
-                        stream.refused();
+                        stream.refused(&format!("refused: {error:#}"), &changes);
                     }
                 }
                 Err(error)
@@ -2443,7 +2523,9 @@ impl RestrictedAuthority {
                 outcomes.push(PendingOutcome::Logical {
                     index: 0,
                     path: path.clone(),
-                    change: Change::SetMetadata,
+                    change: Change::SetMetadata {
+                        kind: proto::Kind::File,
+                    },
                 });
                 *guard = Some(self.guard.clone());
             }
