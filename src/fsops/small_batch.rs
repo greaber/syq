@@ -2236,6 +2236,7 @@ mod tests {
             unchanged_flags: 0,
             condition: TargetCondition::Any,
             guard: None,
+            update_in_place: false,
         };
         CLONED_PATCHES.set(0);
         let results = ops.patch_small_batch(&[patch]).unwrap();
