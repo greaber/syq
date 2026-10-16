@@ -279,6 +279,7 @@ fn an_inplace_ranged_copy_writes_only_a_file_it_creates() {
                     attempt: 0,
                     create_if_missing: true,
                     group: None,
+                    update: None,
                 },
             )
             .unwrap()
@@ -431,6 +432,7 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
                     attempt: 0,
                     create_if_missing: true,
                     group: None,
+                    update: None,
                 },
             )
             .unwrap()
@@ -686,6 +688,7 @@ fn payload_integrity_checks_are_explicit() {
                 attempt: 0,
                 create_if_missing: true,
                 group: None,
+                update: None,
             },
         )
         .unwrap();
@@ -769,6 +772,7 @@ fn expected_hash_failure_preserves_existing_destination() {
                 attempt: 0,
                 create_if_missing: true,
                 group: None,
+                update: None,
             },
         )
         .unwrap();
@@ -909,6 +913,7 @@ fn macos_receiver_refuses_inplace_copy_without_touching_files() {
             size: 9,
             mode: 0o600,
             group: None,
+            update: None,
         });
         assert!(
             matches!(response, Response::CopyLocalUnsupported),
@@ -942,6 +947,7 @@ fn direct_copy_rejects_eof_before_the_planned_size() {
             allow_sequential_local_fallback: true,
             progress: &mut |_| Ok(()),
             group: None,
+            update: None,
         },
         &[37; 16],
         100,
@@ -1056,6 +1062,7 @@ fn guarded_inplace_updates_are_confined_and_replace_an_existing_target() {
                 attempt: 0,
                 create_if_missing: true,
                 group: None,
+                update: None,
             },
         )
         .unwrap();
@@ -1112,6 +1119,7 @@ fn guarded_inplace_updates_are_confined_and_replace_an_existing_target() {
                 attempt: 0,
                 create_if_missing: true,
                 group: None,
+                update: None,
             },
         )
         .is_err());
@@ -3021,6 +3029,7 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
                 attempt: 0,
                 create_if_missing: true,
                 group: None,
+                update: None,
             },
         )
         .unwrap();
@@ -3043,6 +3052,7 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
                 attempt: 0,
                 create_if_missing: true,
                 group: None,
+                update: None,
             },
         )
         .is_err());
@@ -3165,6 +3175,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
                 attempt: 0,
                 create_if_missing: true,
                 group: None,
+                update: None,
             },
         )
         .unwrap();
@@ -3212,6 +3223,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
                 attempt: 0,
                 create_if_missing: true,
                 group: None,
+                update: None,
             },
         )
         .unwrap();
@@ -3297,6 +3309,7 @@ fn rooted_ranged_write_does_not_follow_a_swapped_parent() {
                 attempt: 0,
                 create_if_missing: true,
                 group: None,
+                update: None,
             },
         )
         .unwrap();
@@ -3389,6 +3402,7 @@ fn rooted_finalize_rejects_replacement_of_the_opened_partial() {
                 attempt: 0,
                 create_if_missing: true,
                 group: None,
+                update: None,
             },
         )
         .unwrap();
@@ -3985,6 +3999,7 @@ fn seed_basis_without_a_usable_donor_returns_no_reusable_blocks() {
                     attempt: 0,
                     create_if_missing: true,
                     group: None,
+                    update: None,
                 },
             )
             .unwrap();
@@ -4181,6 +4196,7 @@ fn seeding_never_writes_old_bytes_into_a_leftover_someone_may_hold_open() {
                 attempt: 0,
                 create_if_missing: true,
                 group: None,
+                update: None,
             },
         );
         super::partial::FALLOCATE_ERRNO.set(None);
@@ -4299,6 +4315,7 @@ fn a_retry_never_writes_into_a_sidecar_opened_while_its_mode_was_wider() {
                         attempt: 0,
                         create_if_missing: true,
                         group: None,
+                        update: None,
                     },
                 )
                 .unwrap();
@@ -4336,6 +4353,7 @@ fn a_retry_never_writes_into_a_sidecar_opened_while_its_mode_was_wider() {
                         attempt: 1,
                         create_if_missing: true,
                         group: None,
+                        update: None,
                     },
                 )
                 .unwrap();
@@ -4451,6 +4469,7 @@ fn on_a_device_with_fixed_wide_modes_a_retry_reuses_its_sidecar() {
                             attempt,
                             create_if_missing: true,
                             group: None,
+                            update: None,
                         },
                     )
                     .unwrap()
@@ -4492,6 +4511,7 @@ fn on_a_device_with_fixed_wide_modes_a_retry_reuses_its_sidecar() {
                         attempt: 0,
                         create_if_missing: true,
                         group: None,
+                        update: None,
                     };
                     ops.prepare(other, options).unwrap();
                 }
@@ -4612,6 +4632,7 @@ fn a_refused_mode_probe_leaves_the_device_checked() {
         attempt,
         create_if_missing: true,
         group: None,
+        update: None,
     };
     ops.prepare(target(), options(0o644, 0)).unwrap();
     for (index, chunk) in old.chunks(block).enumerate() {
@@ -4815,6 +4836,7 @@ fn observation_only_prepare_does_not_create_a_sidecar() {
                 attempt: 0,
                 create_if_missing: false,
                 group: None,
+                update: None,
             },
         )
         .unwrap();
@@ -4835,6 +4857,7 @@ fn observation_only_prepare_does_not_create_a_sidecar() {
                 attempt: 0,
                 create_if_missing: true,
                 group: None,
+                update: None,
             },
         )
         .unwrap();
@@ -4867,6 +4890,7 @@ fn observation_only_prepare_preserves_unsafe_sidecars() {
                     attempt: 0,
                     create_if_missing: false,
                     group: None,
+                    update: None,
                 },
             )
             .unwrap()
@@ -4935,6 +4959,7 @@ fn observation_only_rooted_prepare_preserves_an_unsafe_sidecar() {
                 attempt: 0,
                 create_if_missing: false,
                 group: None,
+                update: None,
             },
         )
         .unwrap();
@@ -7147,6 +7172,7 @@ fn sparse_identity_conditioned_publication_keeps_holes_and_replaces_inode() {
                 attempt: 0,
                 create_if_missing: true,
                 group: None,
+                update: None,
             },
         )
         .unwrap();
@@ -7284,6 +7310,7 @@ fn inplace_prepare_rejects_replaced_hashed_basis_before_mutation() {
                 attempt: 0,
                 create_if_missing: true,
                 group: None,
+                update: None,
             },
         );
         assert!(result.is_err(), "accepted {replacement} replacement");
@@ -7675,6 +7702,7 @@ fn equality_windows_keep_the_same_destination_inode() {
         len: block,
         condition: TargetCondition::Any,
         guard: None,
+        update: None,
     };
     let first = ops.handle(&request(0));
     fs::rename(root.join("file"), root.join("original")).unwrap();
@@ -7682,8 +7710,12 @@ fn equality_windows_keep_the_same_destination_inode() {
     let second = ops.handle(&request(block));
     match (first, second) {
         (
-            Response::HeldHashes { hashes: a, len: al },
-            Response::HeldHashes { hashes: b, len: bl },
+            Response::HeldHashes {
+                hashes: a, len: al, ..
+            },
+            Response::HeldHashes {
+                hashes: b, len: bl, ..
+            },
         ) => {
             assert_eq!(a, b);
             assert_eq!(al, block * 2);
@@ -8015,6 +8047,7 @@ fn late_close_is_reported_before_identity_conditioned_publication() {
                     attempt: 0,
                     create_if_missing: true,
                     group: None,
+                    update: None,
                 },
             )
             .unwrap();
@@ -8108,6 +8141,7 @@ fn native_copy_reports_original_writer_close_error() {
                 allow_sequential_local_fallback: true,
                 progress: &mut |_| Ok(()),
                 group: None,
+                update: None,
             },
             &[84; 16],
             1 << 20,
@@ -8330,6 +8364,7 @@ fn an_in_place_retry_gives_a_file_the_scan_found_absent_a_new_files_mode() {
                 attempt: 1,
                 create_if_missing: true,
                 group: None,
+                update: None,
             },
         )
         .unwrap();
@@ -8676,6 +8711,7 @@ fn a_retry_reads_a_held_stage_whose_finalize_removed_read_permission() {
             attempt: 0,
             create_if_missing: true,
             group: None,
+            update: None,
         },
     )
     .unwrap();
@@ -8739,6 +8775,7 @@ fn finalizing_again_after_a_failed_finalize_publishes_the_held_stage() {
             attempt: 0,
             create_if_missing: true,
             group: None,
+            update: None,
         },
     )
     .unwrap();
@@ -8790,6 +8827,7 @@ fn prepare_inplace(ops: &mut FsOps, id: &CopyId, attempt: u32, size: u64) -> Res
             attempt,
             create_if_missing: true,
             group: None,
+            update: None,
         },
     )
 }
@@ -9089,6 +9127,7 @@ fn a_stage_is_opened_without_exclusive_creation_only_on_a_trusted_filesystem() {
                     attempt: 0,
                     create_if_missing: true,
                     group: None,
+                    update: None,
                 },
             )
             .unwrap()

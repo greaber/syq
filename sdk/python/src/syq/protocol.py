@@ -104,6 +104,15 @@ def _timings(record: dict[str, Any]) -> Timings:
     )
 
 
+def _optional_counts(record: dict[str, Any], key: str) -> dict[str, int] | None:
+    if key not in record:
+        return None
+    value = record[key]
+    if not isinstance(value, dict):
+        raise SyqProtocolError(f"automation field {key!r} must be an object")
+    return {name: _integer(value, name) for name in value}
+
+
 def _boolean(record: dict[str, Any], key: str) -> bool:
     value = record.get(key)
     if not isinstance(value, bool):
@@ -763,6 +772,7 @@ class AutomationDecoder:
                 deletions_planned=deletion_values[0],
                 deletions_completed=deletion_values[1],
                 deletions_blocked=deletion_values[2],
+                replaced_not_in_place=_optional_counts(record, "replaced_not_in_place"),
             )
             self.result = result
             return result

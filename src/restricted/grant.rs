@@ -212,7 +212,9 @@ pub(super) fn grant_for(
                 placement,
                 existing,
                 deletion,
-                publication: if args.inplace {
+                publication: if args.in_place_update {
+                    PublicationPolicy::InPlaceUpdate
+                } else if args.inplace {
                     PublicationPolicy::InPlaceNew
                 } else {
                     PublicationPolicy::AtomicStaged

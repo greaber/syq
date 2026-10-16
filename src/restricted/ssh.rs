@@ -281,6 +281,7 @@ mod tests {
             create_if_missing: true,
             guard: None,
             group: None,
+            update: None,
         };
         first_writer.write_msg(&prepare("target/a", 1024)).unwrap();
         assert!(matches!(

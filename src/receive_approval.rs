@@ -559,6 +559,9 @@ fn copy_notes(request: &crate::destination::CopyRequest, remote: bool) -> Vec<St
 const PERMISSIONS_WARNING: &str =
     "can make files readable by others or create programs that run as you";
 
+/// The warning for `--in-place=update`, shown first.
+const UPDATE_IN_PLACE_WARNING: &str = "can write new contents into your existing files in place, where anyone who already has one open can read them, and an interruption leaves a file partly updated";
+
 /// One short line for each requested option that lets the server do more
 /// than copy plain files, each completing "The server ...".
 fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
@@ -569,6 +572,12 @@ fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
     }
     let deletions = request.copy.limits.max_deletions;
     [
+        request
+            .copy
+            .policy
+            .publication
+            .updates_existing_files_in_place()
+            .then(|| UPDATE_IN_PLACE_WARNING.to_owned()),
         (deletions > 0).then(|| {
             format!("can delete up to {deletions} files or folders anywhere in the destination")
         }),
@@ -1718,6 +1727,43 @@ mod tests {
         assert!(released
             .description(&crate::persistence::Domain::default(), str::to_owned)
             .contains(&format!("The server {PERMISSIONS_WARNING}.")));
+    }
+
+    /// A copy that may update existing files in place says so first, and
+    /// still says that it can show new files before they are complete.
+    #[test]
+    fn copy_approvals_name_in_place_updates_first() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap().join("data");
+        let mut request = copy_request(&path);
+        request.copy.limits.max_deletions = 4;
+        request.copy.policy.publication = crate::delegation::PublicationPolicy::InPlaceNew;
+        let new = Summary::new(&requester(), &[], "~", &request, TIMEOUT, None).unwrap();
+        let details = new.description(&crate::persistence::Domain::default(), str::to_owned);
+        assert!(!details.contains(UPDATE_IN_PLACE_WARNING), "{details}");
+        request.copy.policy.publication = crate::delegation::PublicationPolicy::InPlaceUpdate;
+        let update = Summary::new(&requester(), &[], "~", &request, TIMEOUT, None).unwrap();
+        let details = update.description(&crate::persistence::Domain::default(), str::to_owned);
+        let warnings: Vec<&str> = details
+            .lines()
+            .filter_map(|line| line.strip_prefix("The server "))
+            .collect();
+        assert_eq!(
+            warnings,
+            [
+                &format!("{UPDATE_IN_PLACE_WARNING}.")[..],
+                "can delete up to 4 files or folders anywhere in the destination.",
+                "can show new files under their final names before they are complete.",
+            ],
+            "{details}"
+        );
+        assert_eq!(
+            update
+                .desktop_description(false)
+                .matches(UPDATE_IN_PLACE_WARNING)
+                .count(),
+            1
+        );
     }
 
     #[test]

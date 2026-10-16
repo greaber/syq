@@ -89,6 +89,7 @@ fn selected_seed_frames_accommodate_large_comparisons() {
         block: MIN_HASH_BLOCK_BYTES,
         attempt: 0,
         guard: None,
+        clone_final: false,
     };
     let Request::SeedBasis { len, block, .. } = &request else {
         unreachable!()

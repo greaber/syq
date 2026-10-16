@@ -679,6 +679,14 @@ impl Root {
         self.open_regular(path, libc::O_RDWR, false)
     }
 
+    /// The same, with the metadata read through the file once it is open.
+    pub(crate) fn open_regular_read_write_known(
+        &self,
+        path: &RelativePath,
+    ) -> Result<(File, std::fs::Metadata)> {
+        self.open_regular_known(path, libc::O_RDWR)
+    }
+
     pub(crate) fn open_metadata(&self, path: &RelativePath) -> Result<File> {
         if path.is_empty() {
             // The root is already selected and pinned. Reopening it through
@@ -1289,6 +1297,13 @@ impl Root {
                 Err(error).with_context(|| format!("stat confined path {}", path.label()))
             }
         }
+    }
+
+    /// The directory `path` is in.
+    pub(crate) fn parent_directory(&self, path: &RelativePath) -> Result<File> {
+        let (parents, _) = path.leaf()?;
+        open_directory_components(&self.directory, parents)
+            .with_context(|| format!("resolve confined parent for {}", path.label()))
     }
 
     /// The permission bits a file created at `path` may have: its

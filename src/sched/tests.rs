@@ -40,6 +40,7 @@ pub(crate) fn test_job(name: &[u8], size: u64) -> FileJob {
             attempt: 0,
             done: Arc::new(AtomicU64::new(0)),
             inplace: false,
+            in_place_refusal: None,
         },
         dst_entry: None,
     }
@@ -255,6 +256,7 @@ fn jobs_preserve_indexes_snapshots_retries_and_release_capacity() {
                 attempt: 0,
                 done: Arc::new(AtomicU64::new(0)),
                 inplace: false,
+                in_place_refusal: None,
                 rel_bytes: i.to_string().into_bytes(),
                 src_rel: None,
                 scanned: Default::default(),

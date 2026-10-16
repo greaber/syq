@@ -474,6 +474,9 @@ class CpResult(OperationSummary):
     deletions_completed: int | None
     deletions_blocked: int | None
     bytes_total_known: bool | None = None
+    # With in_place="update": existing files replaced instead of updated in
+    # place, by reason, such as "other_names" or "wider_permissions".
+    replaced_not_in_place: dict[str, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)

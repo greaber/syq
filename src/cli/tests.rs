@@ -576,15 +576,28 @@ fn native_copy_policies_lower_to_the_shared_engine() {
 }
 
 #[test]
-fn native_inplace_is_refused_naming_in_place_new_and_rsync_inplace_selects_it() {
+fn native_inplace_is_refused_naming_in_place_new_and_rsync_inplace_updates_in_place() {
     let argv = ["--inplace", "source", "--into", "destination"].map(std::ffi::OsString::from);
     let error = parse_native_copy(&argv).unwrap_err().to_string();
     assert!(error.contains("--in-place=new"), "{error}");
-    let argv =
-        ["--in-place=update", "source", "--into", "destination"].map(std::ffi::OsString::from);
-    assert!(parse_native_copy(&argv).is_err());
-    let args = Args::try_parse_from(["syq rsync", "--inplace", "source", "destination"]).unwrap();
-    assert!(args.inplace);
+    assert!(error.contains("--in-place=update"), "{error}");
+    for (mode, update) in [("new", false), ("update", true)] {
+        let argv = [
+            &format!("--in-place={mode}"),
+            "source",
+            "--into",
+            "destination",
+        ]
+        .map(std::ffi::OsString::from);
+        let args = parse_native_copy(&argv).unwrap();
+        assert!(args.inplace, "{mode}");
+        assert_eq!(args.in_place_update, update, "{mode}");
+    }
+    let args = Args::parse_args(
+        &["rsync", "--inplace", "source", "destination"].map(std::ffi::OsString::from),
+    )
+    .unwrap();
+    assert!(args.inplace && args.in_place_update);
 }
 
 #[test]

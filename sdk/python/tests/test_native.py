@@ -183,6 +183,8 @@ if prune:
         "deletions_completed": 0 if dry_run else 1,
         "deletions_blocked": 0,
     })
+if "--in-place=update" in args:
+    records[-1]["replaced_not_in_place"] = {"other_names": 1}
 shape = os.environ.get("SYQ_FAKE_SHAPE")
 if shape == "bad-schema":
     records[0]["schema_version"] = 99
@@ -440,6 +442,23 @@ class NativeClientTests(unittest.TestCase):
         )
         self.assertIs(removal.class_, syq.ErrorClass.IO)
         self.assertIs(removal.os_kind, syq.OsKind.PERMISSION_DENIED)
+
+    def test_cp_updates_in_place_and_reports_files_it_replaced_instead(self) -> None:
+        result = self.client.cp("source", into="target", in_place="update")
+        self.assertIn("--in-place=update", self.argv())
+        self.assertEqual(result.replaced_not_in_place, {"other_names": 1})
+        self.assertIsNone(
+            self.client.cp("source", into="target", in_place="new").replaced_not_in_place
+        )
+
+        async def copy() -> syq.CpResult:
+            return await syq.AsyncClient(executable=self.executable, env=self.env).cp(
+                "source", into="target", in_place="update"
+            )
+
+        self.assertEqual(asyncio.run(copy()).replaced_not_in_place, {"other_names": 1})
+        with self.assertRaisesRegex(syq.SyqInvocationError, "new or update"):
+            self.client.cp("source", into="target", in_place="always")
 
     def test_cp_refuses_the_old_inplace_keyword_naming_its_replacement(self) -> None:
         self.argv_log.unlink(missing_ok=True)

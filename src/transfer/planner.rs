@@ -2059,6 +2059,16 @@ impl Planner<'_> {
             if dst_entry.as_ref().is_some_and(|d| d.kind != Kind::File) {
                 self.dry_run_changes.type_replacements += 1;
             }
+            let refused = self.update_refusal_for(
+                (&dst_path, &dst_rel),
+                &e,
+                dst_entry.as_ref(),
+                replace,
+                None,
+            );
+            if let Some(reason) = refused {
+                self.progress.in_place_refusals.add(reason);
+            }
             self.emit_trace(
                 "transfer_file",
                 &dst_rel,
@@ -3130,6 +3140,7 @@ impl Planner<'_> {
                 (Some(error), Some(replacement))
                     if crate::fsops::vouch::is_replace_required_wire(&error) =>
                 {
+                    let reason = crate::fsops::vouch::replace_reason_wire(&error);
                     let Replacement {
                         source,
                         dst,
@@ -3140,7 +3151,7 @@ impl Planner<'_> {
                     } = *replacement;
                     self.progress.files_unchanged.fetch_sub(1, Relaxed);
                     self.progress.bytes_unchanged.fetch_sub(entry.size, Relaxed);
-                    self.enqueue_with(source, dst, rel, dst_rel, entry, Some(destination), true);
+                    self.enqueue_with(source, dst, rel, dst_rel, entry, Some(destination), reason);
                 }
                 (Some(error), _) => self.report_metadata_failure(Some(&dst), kind, &error),
             }
@@ -3616,12 +3627,12 @@ impl Planner<'_> {
         entry: Entry,
         dst_entry: Option<Entry>,
     ) -> usize {
-        self.enqueue_with(source_path, dst, rel, rel_bytes, entry, dst_entry, false)
+        self.enqueue_with(source_path, dst, rel, rel_bytes, entry, dst_entry, None)
     }
 
     /// `enqueue`, replacing an existing destination file whatever its
-    /// contents when `replace`, as when the receiver refused to change its
-    /// metadata in place.
+    /// contents when `refused` says why, as when the receiver refused to
+    /// change its metadata in place.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn enqueue_with(
         &mut self,
@@ -3631,25 +3642,34 @@ impl Planner<'_> {
         rel_bytes: PathBytes,
         entry: Entry,
         dst_entry: Option<Entry>,
-        replace: bool,
+        refused: Option<crate::proto::ReplaceReason>,
     ) -> usize {
         let (src, source) = source_path;
         let target_condition = self.leaf_condition_for(&dst, dst_entry.as_ref());
         // `--in-place=new` writes only a file the copy creates at its name:
         // an existing one is staged and replaces it, as without the option.
-        // A file that must be new (an --as-new file, or a new file the error
-        // policies protect) is staged too and published without replacing
-        // anything, so readers see no partial file and a retry finishes what
-        // an interrupted attempt left.
-        let inplace = self.opts.inplace
-            && dst_entry.is_none()
-            && target_condition == TargetCondition::Any
-            && !(self.opts.new_target && dst == self.dst_root)
-            && self.container_guard.is_none();
+        // `--in-place=update` also writes an existing regular file at its
+        // name, when the receiver can vouch for it.
         let src_rel = self.mapping_source_rel(&rel_bytes);
         let replace = dst_entry.as_ref().is_some_and(|destination| {
-            replace || self.must_replace((&dst, &rel_bytes), &entry, destination)
+            refused.is_some() || self.must_replace((&dst, &rel_bytes), &entry, destination)
         });
+        let in_place_refusal = self.update_refusal_for(
+            (&dst, &rel_bytes),
+            &entry,
+            dst_entry.as_ref(),
+            replace,
+            refused,
+        );
+        let inplace = self.in_place_allowed(&dst, target_condition)
+            && match dst_entry.as_ref() {
+                None => true,
+                Some(destination) => {
+                    self.opts.inplace_update
+                        && destination.kind == Kind::File
+                        && in_place_refusal.is_none()
+                }
+            };
         let scanned = match &dst_entry {
             Some(d) if d.kind == Kind::File => {
                 crate::proto::ScannedDestination::File(d.mode & 0o7777)
@@ -3678,6 +3698,7 @@ impl Planner<'_> {
                 attempt: 0,
                 done: Arc::new(AtomicU64::new(0)),
                 inplace,
+                in_place_refusal,
                 src_rel,
                 scanned,
             },
@@ -4689,6 +4710,134 @@ impl Planner<'_> {
                 || meta.inode_metadata.as_deref().is_some_and(|inode| {
                     inode.privileged_attributes_differ(destination.inode_metadata.as_deref())
                 }))
+    }
+
+    /// Whether the file at `dst`, published under `target_condition`, may
+    /// be written at its name: `--in-place` is on, and nothing requires it
+    /// to be staged. A file that must be new (an --as-new file, or a new
+    /// file the error policies protect) is staged and published without
+    /// replacing anything, so readers see no partial file and a retry
+    /// finishes what an interrupted attempt left; placement guards are
+    /// enforced by publication.
+    fn in_place_allowed(&self, dst: &[u8], target_condition: TargetCondition) -> bool {
+        self.opts.inplace
+            && target_condition == TargetCondition::Any
+            && !(self.opts.new_target && dst == self.dst_root)
+            && self.container_guard.is_none()
+    }
+
+    /// Under `--in-place=update`, why the existing regular file
+    /// `destination` at `dst` is replaced rather than updated in place:
+    /// `refused`, the receiver's reason when it refused already, or else
+    /// `in_place_update_refusal`, or else, when `replace` (`must_replace`)
+    /// says so for a hard-link representative, its owner. `None` for any
+    /// other destination, a file that must be staged anyway, or when
+    /// nothing stops it.
+    pub(super) fn update_refusal_for(
+        &mut self,
+        (dst, rel): (&[u8], &[u8]),
+        source: &Entry,
+        destination: Option<&Entry>,
+        replace: bool,
+        refused: Option<crate::proto::ReplaceReason>,
+    ) -> Option<crate::proto::ReplaceReason> {
+        let destination = destination.filter(|destination| destination.kind == Kind::File)?;
+        if !self.opts.inplace_update
+            || !self.in_place_allowed(dst, self.leaf_condition_for(dst, Some(destination)))
+        {
+            return None;
+        }
+        refused
+            .or_else(|| self.in_place_update_refusal((dst, rel), source, destination))
+            .or(replace.then_some(crate::proto::ReplaceReason::Owner))
+    }
+
+    /// Under `--in-place=update`, why the receiver would replace the
+    /// existing regular file `destination` rather than write `source` into
+    /// it in place (`fsops::vouch::update_refusal`), as far as the scan
+    /// shows; `None` when it would update it, or when the option is off.
+    /// The receiver checks again for itself, and finds what the scan cannot
+    /// show: an ACL the copy does not copy, a file capability, a file that
+    /// will not open for writing.
+    pub(super) fn in_place_update_refusal(
+        &mut self,
+        (dst, rel): (&[u8], &[u8]),
+        source: &Entry,
+        destination: &Entry,
+    ) -> Option<crate::proto::ReplaceReason> {
+        use crate::proto::ReplaceReason::*;
+        if !self.opts.inplace_update || destination.kind != Kind::File {
+            return None;
+        }
+        if destination.nlink != 1 {
+            return Some(OtherNames);
+        }
+        if !self.opts.destination_link_counts_trusted.load(Relaxed) {
+            return Some(UntrustedFilesystem);
+        }
+        let meta = self.opts.metadata_for(rel, source);
+        let flags = self.opts.flags_for(rel);
+        // The file must be owned as the files the receiver creates show, or,
+        // for root, already by the owner and group it ends with: without -o
+        // or -g, those a new file would get (`vouch::owner_vouches`). Its
+        // owner could read what is written. Without the receiving account,
+        // or whom its files show, the receiver decides alone.
+        let receiver = self.receiver_uid().ok();
+        if let Some(uid) = receiver {
+            let dry_run = self.opts.dry_run;
+            let new_file = self.new_file_owner(dst);
+            let created = new_file.and_then(|new_file| new_file.owner.or(dry_run.then_some(uid)));
+            let owner = match (created, new_file) {
+                (Some(created), Some(new_file)) if uid == 0 => {
+                    let final_owner = if flags & flags::OWNER != 0 {
+                        meta.uid
+                    } else {
+                        created
+                    };
+                    destination.uid != final_owner
+                        || if flags & flags::GROUP != 0 {
+                            destination.gid != meta.gid
+                        } else {
+                            self.new_file_group_may_differ(dst, destination.gid, new_file)
+                        }
+                }
+                (Some(created), _) => destination.uid != created,
+                (None, _) => false,
+            };
+            if owner {
+                return Some(Owner);
+            }
+        }
+        let mode = if flags & flags::MODE != 0 {
+            meta.mode
+        } else {
+            destination.mode
+        };
+        if destination.mode & 0o6000 != 0
+            || mode & 0o6000 != 0
+            || meta.inode_metadata.as_deref().is_some_and(|inode| {
+                inode.privileged_attributes_differ(destination.inode_metadata.as_deref())
+            })
+        {
+            return Some(Privileges);
+        }
+        if destination.mode & 0o777 & !mode != 0
+            || (flags & flags::GROUP != 0
+                && destination.gid != meta.gid
+                && destination.mode & 0o060 != 0)
+            || meta
+                .inode_metadata
+                .as_deref()
+                .is_some_and(|inode| inode.acl_differs(destination.inode_metadata.as_deref()))
+        {
+            return Some(WiderPermissions);
+        }
+        // Its own owner cannot open it for writing without owner write
+        // permission; root can.
+        if receiver.is_some_and(|uid| uid != 0) && destination.mode & 0o200 == 0 {
+            return Some(NotWritable);
+        }
+        None
     }
 
     /// Who a file the receiver creates in the destination belongs to,

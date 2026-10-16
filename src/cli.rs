@@ -109,6 +109,8 @@ pub enum IfExists {
 pub enum InPlace {
     /// Only files the copy creates; an existing file is still replaced through a staging file
     New,
+    /// Also existing files syq can vouch for, writing only what changed; others are replaced. Anyone who has such a file open can read its new contents, and an interruption leaves it partly updated
+    Update,
 }
 
 impl IfExists {
@@ -486,12 +488,17 @@ pub struct Args {
     pub transfer_integrity: bool,
     #[arg(skip)]
     pub transfer_hash_type: Option<crate::hashing::HashAlgorithm>,
-    /// Write new files directly at their final names instead of writing a partial and renaming.
-    /// Existing files are still replaced through a partial, unlike rsync, which updates them in
-    /// place. Cannot be combined with -u or --ignore-existing: an interrupted in-place write
-    /// leaves a newer-looking final file those filters would then skip forever
+    /// Update files in place instead of writing a partial and renaming, as syq cp
+    /// --in-place=update does: a file with other hard links, another owner or wider permissions
+    /// than the copy gives it is replaced instead. Cannot be combined with -u or --ignore-existing:
+    /// an interrupted in-place write leaves a newer-looking final file those filters would then
+    /// skip forever
     #[arg(long, conflicts_with_all = ["update", "ignore_existing"])]
     pub inplace: bool,
+    /// Existing files are updated in place too (`--in-place=update`, and
+    /// `syq rsync --inplace`), where the receiver can vouch for them.
+    #[arg(skip)]
+    pub in_place_update: bool,
     /// Remote shell command (default: ssh); controls agent forwarding when set. An ssh command keeps shared and persistent connections unless its options configure connection sharing; -v shares them only within the run
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     pub rsh: Option<String>,
@@ -810,7 +817,9 @@ impl Args {
         let matches = crate::help::filesystem(Args::command())
             .try_get_matches_from(full_argv)
             .unwrap_or_else(|error| error.exit());
-        let args = Args::from_arg_matches(&matches)?;
+        let mut args = Args::from_arg_matches(&matches)?;
+        // rsync updates existing files in place.
+        args.in_place_update = args.inplace;
         reject_remote_to_remote(&args)?;
         finish_parse(args, &matches)
     }
@@ -1387,7 +1396,7 @@ struct NativeCopyOperationalArgs {
     /// Turn written zero ranges into sparse holes
     #[arg(long)]
     sparse: bool,
-    /// Write the files the copy creates directly at their final names, with no staging file; interruption can leave them incomplete
+    /// Write files directly at their final names, with no staging file; interruption can leave them incomplete
     #[arg(long = "in-place", value_enum, value_name = "MODE")]
     in_place: Option<InPlace>,
     /// Replaced by --in-place=new
@@ -3067,9 +3076,10 @@ fn apply_native_copy_operational(
     } = operational;
     anyhow::ensure!(
         !inplace,
-        "--inplace is no longer supported: use --in-place=new, which writes only new files in place and replaces existing files through a staging file"
+        "--inplace is no longer supported: use --in-place=new, which writes only new files in place and replaces existing files through a staging file, or --in-place=update, which also updates existing files in place, as --inplace did, where syq can vouch for them"
     );
-    let inplace = in_place == Some(InPlace::New);
+    let inplace = in_place.is_some();
+    args.in_place_update = in_place == Some(InPlace::Update);
     args.expressions =
         crate::expression::Policy::compile(where_expression.as_deref(), copy_if.as_deref())?;
     args.where_expression = where_expression;

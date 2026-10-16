@@ -124,6 +124,7 @@ fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
             create_if_missing: true,
             guard: None,
             group: None,
+            update: None,
         })
         .unwrap();
     assert!(matches!(

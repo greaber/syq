@@ -1137,8 +1137,13 @@ impl RestrictedAuthority {
                     }
                     // If no sidecar existed, the observation performed no
                     // file-lifecycle mutation and must not report an
-                    // unfinished file.
-                    if absent || !streaming {
+                    // unfinished file. Nor did a preparation
+                    // `--in-place=update` refused: the sender replaces the
+                    // file instead, through a stage.
+                    let refused = stage == FileStage::Prepare
+                        && matches!(response, proto::Response::EndpointError(error)
+                            if crate::fsops::vouch::is_replace_required_wire(error));
+                    if absent || refused || !streaming {
                         continue;
                     }
                     let key = (path.clone(), copy_id);
@@ -2574,12 +2579,28 @@ impl RestrictedAuthority {
                 scanned,
                 create_if_missing,
                 guard,
+                update,
                 ..
             } => {
                 // The receiver looks for itself at what a file replaces: a
                 // sender's word could give an existing file a new mode.
                 *scanned = proto::ScannedDestination::Unknown;
                 self.require_publication_mode(*inplace, "file preparation")?;
+                // An existing file is updated in place only under a grant
+                // for it, and only with metadata the grant allows, which
+                // finalization checks again.
+                if let Some(update) = update {
+                    if !*inplace
+                        || !self
+                            .copy
+                            .policy
+                            .publication
+                            .updates_existing_files_in_place()
+                    {
+                        bail!("file preparation does not match the signed publication policy");
+                    }
+                    self.check_metadata(&update.meta, update.flags)?;
+                }
                 self.check_flags(*flags)?;
                 if *size > self.copy.limits.max_file_bytes {
                     bail!("signed grant per-file byte limit exceeded");

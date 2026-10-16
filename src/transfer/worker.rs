@@ -48,6 +48,9 @@ pub(super) struct BlockDiff {
     pub(super) ranges: Vec<(u64, u64)>,
     pub(super) held_len: Option<u64>,
     pub(super) source_hashes: Vec<ContentDigest>,
+    /// Under `--in-place=update`, why the receiver will not update the held
+    /// file in place, if it will not.
+    pub(super) refused: Option<crate::proto::ReplaceReason>,
 }
 
 impl Worker {
@@ -301,6 +304,11 @@ impl Worker {
     /// keep the per-file path, which inspects the destination before
     /// deciding what to write.
     fn replaces_in_batch(&self, job: &FileJobData, existing: &Entry) -> bool {
+        // `--in-place=update` writes the file where it is, on the per-file
+        // path.
+        if job.inplace {
+            return false;
+        }
         let inspects_destination = self.inspects_destination(job)
             || (!job.compared
                 && (self.compares_first(job, existing)
@@ -363,6 +371,9 @@ impl Worker {
             && !self.opts.has_expected_for(j)
             && !self.opts.tuning.force_ranges()
             && j.entry.size <= self.compare_group_limits().0
+            // In place, only the blocks that differ are written; that is the
+            // per-file path.
+            && !j.inplace
             && j.target_condition == TargetCondition::Any
             && !self.inspects_destination(j)
             && jobs.destination(idx).is_some_and(|existing| {
@@ -888,6 +899,7 @@ impl Worker {
             j.done.store(j.entry.size, Relaxed);
             // Already counted for tuning when the destination acknowledged it.
             self.progress.files_done.fetch_add(1, Relaxed);
+            self.note_replaced(j);
             if let Some(results) = self.progress.results_writer() {
                 results.emit_operation(&crate::results::OperationRecord {
                     action: "transfer_file",
@@ -1151,6 +1163,9 @@ impl Worker {
                         Ok(matched) => matched,
                         Err(error) => {
                             self.sched.ranges_ready(idx, vec![]);
+                            if self.replace_instead(idx, &error) {
+                                return Ok(());
+                            }
                             if self.transport_dead() {
                                 self.sched.requeue(idx);
                             }
@@ -1211,6 +1226,11 @@ impl Worker {
                 }
                 Err(e) => {
                     self.sched.ranges_ready(idx, vec![]);
+                    // `--in-place=update` found a file it will not write in
+                    // place, before copying anything.
+                    if self.replace_instead(idx, &e) {
+                        return Ok(());
+                    }
                     if self.transport_dead() {
                         // try_copy_local queues publication recovery after it
                         // has credited the completed kernel copy. Earlier
@@ -1244,14 +1264,38 @@ impl Worker {
             // below is reused rather than hashing the contents a second time.
             // A file the equality probe above found different is not compared
             // again.
-            let inplace_ranges =
+            let inplace_diff =
                 if inplace && final_is_file && (reuse_blocks || (checksum && !known_different)) {
                     let diff = self.diff_final_and_hold(&job)?;
                     if diff.ranges.is_empty() && diff.held_len == Some(size) {
                         self.finish_matched_basis(idx, &job)?;
                         return Ok((vec![], false));
                     }
-                    Some(diff.ranges)
+                    // `--in-place=update`: a differing file the receiver will
+                    // not update in place is replaced, from the file it
+                    // holds: a stage is seeded from its matching blocks, a
+                    // clone where the filesystem can make one, and hashed as
+                    // it is seeded, so neither file is compared again. The
+                    // receiver does not vouch for the file, which may have
+                    // changed since: the stage's hashes, not the
+                    // comparison's, decide what is sent.
+                    if let Some(reason) = diff.refused {
+                        self.refuse_in_place(idx, reason);
+                        let job = self.job(idx);
+                        if !reuse_blocks {
+                            self.prepare_file(idx, &job, true)?;
+                            return Ok((full(), true));
+                        }
+                        let prepared = self.prepare_file(idx, &job, false)?;
+                        if prepared.partial_size.is_some() {
+                            return Ok((self.resume_ranges(idx, &job)?, true));
+                        }
+                        return Ok((
+                            self.reuse_blocks_from(&job, diff.source_hashes, &diff.ranges, true)?,
+                            true,
+                        ));
+                    }
+                    Some(diff)
                 } else {
                     None
                 };
@@ -1264,6 +1308,7 @@ impl Worker {
                 &job,
                 inplace || !final_is_file || (!reuse_blocks && (!checksum || job.replace)),
             )?;
+            let inplace_ranges = inplace_diff.map(|diff| diff.ranges);
 
             if prepared.partial_size.is_some() || prepared.has_candidates || final_is_file {
                 self.sched.request_direct_fallback();
@@ -1432,17 +1477,52 @@ impl Worker {
     /// its metadata in place (`fsops::vouch`), copy it again as a file to
     /// replace, and say so. The job's scheduling has been settled.
     fn replace_instead(&self, idx: usize, error: &anyhow::Error) -> bool {
-        if !crate::fsops::vouch::is_replace_required(error) {
+        let Some(reason) = crate::fsops::vouch::replace_reason(error) else {
+            return false;
+        };
+        if self.sched.jobs.lock().unwrap()[idx].replace {
             return false;
         }
-        let mut jobs = self.sched.jobs.lock().unwrap();
-        if jobs[idx].replace {
-            return false;
-        }
-        jobs[idx].replace = true;
-        drop(jobs);
+        self.refuse_in_place(idx, reason);
         self.sched.requeue(idx);
         true
+    }
+
+    /// Have the file at `idx` replaced, as the receiver asked for `reason`:
+    /// under `--in-place=update`, written to a stage instead of in place,
+    /// and counted (`note_replaced`).
+    fn refuse_in_place(&self, idx: usize, reason: crate::proto::ReplaceReason) {
+        let mut jobs = self.sched.jobs.lock().unwrap();
+        let job = &mut jobs[idx];
+        job.replace = true;
+        if self.opts.inplace_update {
+            job.inplace = false;
+            job.in_place_refusal = Some(reason);
+        }
+    }
+
+    /// Under `--in-place=update`, for a file the scan found, the metadata
+    /// it is to be finalized with, which decides whether the receiver
+    /// writes it in place (`Request::Prepare`). A file the scan did not
+    /// find is created, without looking for one first.
+    pub(super) fn in_place_update(&self, job: &WorkerJob) -> Option<Box<InPlaceUpdate>> {
+        if !(self.opts.inplace_update && job.inplace && job.dst_entry.is_some()) {
+            return None;
+        }
+        let mut meta = self.opts.metadata_for(&job.rel_bytes, &job.entry);
+        meta.mode = self.create_mode(job);
+        Some(Box::new(InPlaceUpdate {
+            meta,
+            flags: self.publication_flags(job),
+        }))
+    }
+
+    /// Count `job`, just replaced, when `--in-place=update` could not update
+    /// it in place (`Progress::in_place_refusals`).
+    pub(super) fn note_replaced(&self, job: &FileJobData) {
+        if let Some(reason) = job.in_place_refusal {
+            self.progress.in_place_refusals.add(reason);
+        }
     }
 
     /// Read-only equality probe. On a difference, discard the comparison and
@@ -1466,6 +1546,11 @@ impl Worker {
                 len,
                 condition: job.target_condition,
                 guard: job.container_guard.clone(),
+                update: if off == 0 {
+                    self.in_place_update(job)
+                } else {
+                    None
+                },
             })?;
             self.src.send(Request::HashBlocks {
                 off,
@@ -1483,7 +1568,8 @@ impl Worker {
             let destination = self.dst.recv();
             let source = Self::hashes(ok(source?, "hash equality window")?)?;
             let (destination, held_len) =
-                Self::destination_hashes(ok(destination?, "hash retained equality window")?)?;
+                Self::destination_hashes(ok(destination?, "hash retained equality window")?)
+                    .map(|(hashes, len, _)| (hashes, len))?;
             if held_len != Some(job.entry.size)
                 || source.len() as u64 != len.div_ceil(block)
                 || source != destination
@@ -1581,6 +1667,7 @@ impl Worker {
                 size: job.entry.size,
                 mode,
                 group: self.publication_group(job),
+                update: self.in_place_update(job),
             },
             &mut |total| {
                 if total < credited || total > job.entry.size {
@@ -1657,6 +1744,18 @@ impl Worker {
         hashes: Vec<ContentDigest>,
         different: &[(u64, u64)],
     ) -> Result<Vec<(u64, u64)>> {
+        self.reuse_blocks_from(job, hashes, different, false)
+    }
+
+    /// `reuse_blocks`, the matching blocks cloned from the final file
+    /// where the receiver can, when `clone_final`, rather than copied.
+    pub(super) fn reuse_blocks_from(
+        &mut self,
+        job: &WorkerJob,
+        hashes: Vec<ContentDigest>,
+        different: &[(u64, u64)],
+        clone_final: bool,
+    ) -> Result<Vec<(u64, u64)>> {
         let mut matching = Vec::new();
         let mut pos = 0;
         for &(start, end) in different {
@@ -1668,9 +1767,14 @@ impl Worker {
         if pos < job.entry.size {
             matching.push((pos, job.entry.size));
         }
-        let response = self
-            .dst
-            .call(self.seed_request(job, Some(matching.clone())))?;
+        let mut request = self.seed_request(job, Some(matching.clone()));
+        if let Request::SeedBasis {
+            clone_final: clone, ..
+        } = &mut request
+        {
+            *clone = clone_final;
+        }
+        let response = self.dst.call(request)?;
         let Response::SeededBasis(reused) = change_ok(response, "reuse destination blocks")? else {
             bail!("destination did not return seeded block hashes");
         };
@@ -1733,6 +1837,7 @@ impl Worker {
                 create_if_missing,
                 guard: job.container_guard.clone(),
                 group: self.publication_group(job),
+                update: self.in_place_update(job),
             })?,
             "prepare",
         );
@@ -1768,6 +1873,7 @@ impl Worker {
             final_ranges,
             attempt: job.attempt,
             guard: job.container_guard.clone(),
+            clone_final: false,
         }
     }
 
@@ -1784,6 +1890,9 @@ impl Worker {
                 len: job.entry.size,
                 condition: job.target_condition,
                 guard: job.container_guard.clone(),
+                // The receiver refuses a file it will not update in place
+                // before reading it.
+                update: self.in_place_update(job),
             },
             "hash and retain destination basis",
         )?;
@@ -1828,11 +1937,12 @@ impl Worker {
         } else {
             ok(destination_response?, destination_label)
         };
-        let (destination, held_len) = Self::destination_hashes(destination_response?)?;
+        let (destination, held_len, refused) = Self::destination_hashes(destination_response?)?;
         Ok(BlockDiff {
             ranges: Self::different_ranges(&source, &destination, block, size),
             source_hashes: source,
             held_len,
+            refused,
         })
     }
 
@@ -1845,14 +1955,22 @@ impl Worker {
 
     pub(super) fn destination_hashes(
         response: Response,
-    ) -> Result<(Vec<ContentDigest>, Option<u64>)> {
+    ) -> Result<(
+        Vec<ContentDigest>,
+        Option<u64>,
+        Option<crate::proto::ReplaceReason>,
+    )> {
         match response {
-            Response::Hashes(hashes) => Ok((hashes, None)),
-            Response::HeldHashes { hashes, len } => Ok((hashes, Some(len))),
+            Response::Hashes(hashes) => Ok((hashes, None, None)),
+            Response::HeldHashes {
+                hashes,
+                len,
+                refused,
+            } => Ok((hashes, Some(len), refused)),
             Response::SeededBasis(SeededBasis {
                 hashes,
                 selected_final: false,
-            }) => Ok((hashes, None)),
+            }) => Ok((hashes, None, None)),
             other => bail!("unexpected response {other:?}"),
         }
     }
@@ -2864,6 +2982,7 @@ impl Worker {
             self.progress.files_unchanged.fetch_add(1, Relaxed);
         } else {
             self.progress.add_files(1);
+            self.note_replaced(&job);
             if let Some(results) = self.progress.results_writer() {
                 results.emit_operation_expected(
                     &crate::results::OperationRecord {
@@ -3054,6 +3173,7 @@ impl Worker {
             self.opts
                 .note_directory_change(&self.progress, &job.dst, true);
             self.progress.add_files(1);
+            self.note_replaced(&job);
             self.progress.bytes_done.fetch_add(job.entry.size, Relaxed);
             (
                 Some(job.entry.size),

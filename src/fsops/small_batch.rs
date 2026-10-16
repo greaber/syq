@@ -464,6 +464,11 @@ impl FsOps {
         read: &ExistingRead,
         buffer: &mut Vec<u8>,
     ) -> Result<ExistingHashes> {
+        #[cfg(debug_assertions)]
+        record_test_event(
+            "SYQ_TEST_DESTINATION_HASHES",
+            format_args!("existing {}", read.len),
+        )?;
         let blocks = block_count(read.len, block)?;
         let target = self.destination_mutation_target(&read.path, read.guard.as_ref())?;
         let partials = !self.candidate_partials(&target).is_empty();

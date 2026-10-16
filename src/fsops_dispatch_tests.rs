@@ -304,6 +304,7 @@ fn a_sidecar_with_a_short_name_serves_every_worker() {
         create_if_missing: true,
         guard: None,
         group: None,
+        update: None,
     });
     assert!(matches!(reply, Response::Prepared(_)), "{reply:?}");
     let mut reader = setup();

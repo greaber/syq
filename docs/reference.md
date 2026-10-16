@@ -327,7 +327,8 @@ been created. Partial-file resume is independent of
 [`--transfer-strategy`](#choose-a-transfer-strategy), which controls
 comparison against an existing final destination. Syq assembles each updated
 file beside the destination and replaces it when complete. With
-`--in-place=new`, a new file's interrupted bytes are in the final file itself.
+`--in-place=new`, a new file's interrupted bytes are in the final file itself,
+and with `--in-place=update` an existing file's too.
 With `--if-exists=error-if-different`, a retry rejects a differing final file:
 it cannot distinguish incomplete output from a pre-existing file that must remain
 untouched. Changing to `--if-exists=update` authorizes updates to all differing
@@ -409,11 +410,45 @@ syq checks that the name still leads to the file it created, on filesystems
 whose link counts it trusts ([Copy metadata](#copy-metadata) lists those it
 does not), and reports the file as failed if it does not.
 
-An existing file is still replaced as without the option: syq builds the new
-version beside it and renames it over the name. Syq never writes new contents
-into a file it did not create, since someone may already have it open or reach
-it through another name. Replacing a file needs write permission on its
-directory and room for a second copy. New files keep owner-write
+With `--in-place=new`, an existing file is still replaced as without the
+option: syq builds the new version beside it and renames it over the name.
+Replacing a file needs write permission on its directory and room for a
+second copy.
+
+`--in-place=update` also writes into an existing file where it is, and only
+the parts that changed, so a small change to a large file needs no second
+copy (`syq rsync --inplace` does the same):
+
+```sh
+syq cp --in-place=update disk.img --to server --into /vm
+```
+
+This has two risks:
+
+- Anyone who already has the file open, or opens it during the copy, can
+  read the new contents.
+- An interruption leaves the file partly updated, a mixture of old and new
+  contents, until a rerun finishes it.
+
+Syq updates a file in place only when it has no other names, on a filesystem
+whose link counts syq trusts (see [Copy metadata](#copy-metadata)), and
+belongs to the account syq runs as, as the files syq creates there show. Run
+as root, syq needs the file to already have the owner and group the copy
+gives it: without `--copy-metadata=ownership`, those of a file root creates
+there, so another user's file is replaced. The file must have no
+set-user-ID or set-group-ID bit or file capability, the copy must add none
+and set or remove no `security.*` or `trusted.*` attribute, and nobody may
+be able to open the file whom its final permissions would keep out: its
+permission bits must be among the final ones, its group the final one or
+unable to read or write it, and its ACL the one it ends with. That is the ACL
+the copy gives it when it copies ACLs, and otherwise the one a new file there
+would get from its folder's default ACL, or none. On macOS, without ACL
+copying, a file with an ACL, or in a folder that passes ACL entries on to new
+files, is always replaced. Syq replaces any other existing file. The summary,
+and `replaced_not_in_place` in [`--results`](automation.md), say how many
+files it replaced and why. A dry run's counts are estimates: it cannot see
+everything the copy checks, such as file capabilities, ACLs it does not copy,
+or files in use as programs. New files keep owner-write
 permission until the copy succeeds and applies their final permissions. When
 the copy gives them a different group than they start with, or sets their
 ACL, they are open only to their owner until then. On macOS, a copy that sets
@@ -565,7 +600,7 @@ and [metadata details](commands/cp.md#metadata-details).
 
 With `--copy-metadata=hardlinks`, selected names for the same source regular file
 share one destination inode. This works for local and SSH filesystem copies,
-including updates, reruns, and `--in-place=new`. Only names eligible under the
+including updates, reruns, and `--in-place`. Only names eligible under the
 overwrite policy join the group; links outside the selected sources are not
 reconstructed. Existing extra destination links are not necessarily split.
 Syq gives new names only to an existing destination file that belongs to the
@@ -640,7 +675,7 @@ Copying special files also requires `--copy-metadata=specials` or `-D` (included
 on particular attribute namespaces still apply.
 
 ACLs and xattrs work for local and SSH filesystem copies, including
-updates, unchanged-content reruns, and `--in-place=new`. macOS also supports native
+updates, unchanged-content reruns, and `--in-place`. macOS also supports native
 metadata on directories, symlinks and copied special nodes where the filesystem
 permits it.
 Descriptors, stream mappings, and S3 reject these options. Existing descriptor-backed regular-file copies support

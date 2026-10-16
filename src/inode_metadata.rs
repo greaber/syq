@@ -79,6 +79,26 @@ impl InodeMetadata {
                 .unwrap_or_default()
     }
 
+    /// Whether a file with `current` has an ACL other than the one this
+    /// metadata gives it (`acl_differs_from_final`), as far as the metadata
+    /// shows: a scan reads ACLs only for a copy that copies them, and this
+    /// leaves out the final mode, which the source's ACL already carries
+    /// when permissions are copied.
+    pub(crate) fn acl_differs(&self, current: Option<&Self>) -> bool {
+        fn posix(acls: Option<&PosixAcls>) -> Option<&[u8]> {
+            acls.and_then(|acls| acls.access.as_deref())
+                .filter(|access| posix_acl_is_extended(access))
+        }
+        fn macos(acl: Option<&MacAcl>) -> Option<&MacAcl> {
+            acl.filter(|acl| !acl.entries.is_empty())
+        }
+        let empty = Self::default();
+        let current = current.unwrap_or(&empty);
+        (self.acls.is_some() && posix(self.acls.as_ref()) != posix(current.acls.as_ref()))
+            || (self.macos_acl.is_some()
+                && macos(self.macos_acl.as_ref()) != macos(current.macos_acl.as_ref()))
+    }
+
     /// Whether giving a file with `current` (none read: nothing) this
     /// metadata would change anything but its access time, which syq
     /// restores in place on any file (`fsops::vouch`).
@@ -263,7 +283,7 @@ mod platform {
         names.sort_unstable();
         Ok(names)
     }
-    fn get(file: &File, name: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub(super) fn get(file: &File, name: &[u8]) -> Result<Option<Vec<u8>>> {
         #[cfg(test)]
         if name == ACCESS {
             ACCESS_ACL_READS.set(ACCESS_ACL_READS.get() + 1);
@@ -410,6 +430,20 @@ mod platform {
                 | (mask.or(group).context("default ACL lacks group")? << 3)
                 | other.context("default ACL lacks other")?,
         ))
+    }
+
+    /// `file`'s access ACL, when it grants more than its mode bits: it
+    /// names a user or group, or has a mask. One that only repeats the mode
+    /// counts as none.
+    pub(super) fn extended_access_acl(file: &File) -> Result<Option<Vec<u8>>> {
+        let Some(acl) = get(file, ACCESS)? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            acl.len() >= 4 && (acl.len() - 4).is_multiple_of(8) && acl[..4] == 2u32.to_le_bytes(),
+            "invalid Linux POSIX ACL encoding"
+        );
+        Ok(posix_acl_is_extended(&acl).then_some(acl))
     }
 
     pub(super) fn access_for_mode(raw: &[u8], mode: u32) -> Result<Vec<u8>> {
@@ -771,6 +805,118 @@ pub(crate) fn would_change_besides_atime(
     }
     Ok(false)
 }
+
+/// Whether a Linux access ACL, as its extended attribute holds it, grants
+/// more than the mode bits: it names a user or group, or has a mask. Its
+/// owner, group and other entries are the mode bits themselves.
+pub(crate) fn posix_acl_is_extended(raw: &[u8]) -> bool {
+    raw.get(4..).is_some_and(|entries| {
+        entries
+            .chunks_exact(8)
+            .any(|entry| !matches!(u16::from_le_bytes([entry[0], entry[1]]), 0x01 | 0x04 | 0x20))
+    })
+}
+
+/// Whether `file` has a file capability (`security.capability`), which
+/// writing it takes away. Only Linux has them.
+pub(crate) fn has_file_capability(file: &File) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    return Ok(platform::get(file, b"security.capability")?.is_some());
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        Ok(false)
+    }
+}
+
+/// What a new file in a directory gets of the directory's ACL: on Linux,
+/// its default ACL, if it has one; on macOS, whether any of its entries
+/// pass on to new files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Inherited {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Default(Option<Vec<u8>>),
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Entries(bool),
+    #[cfg_attr(any(target_os = "linux", target_os = "macos"), allow(dead_code))]
+    Nothing,
+}
+
+/// What a new file in `directory` gets of its ACL (`Inherited`).
+pub(crate) fn inherited_acl(directory: &File) -> Result<Inherited> {
+    #[cfg(target_os = "linux")]
+    return Ok(Inherited::Default(platform::get(
+        directory,
+        b"system.posix_acl_default",
+    )?));
+    #[cfg(target_os = "macos")]
+    return Ok(Inherited::Entries(
+        macos_acl::read(directory)?
+            .entries
+            .iter()
+            .any(|entry| entry.flags & MAC_FILE_INHERIT != 0),
+    ));
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = directory;
+        Ok(Inherited::Nothing)
+    }
+}
+
+/// Whether `file`'s ACL differs from the one it ends with, so that one of
+/// them may let in someone the other keeps out: the ACL the copy gives it
+/// (`metadata` selecting ACLs), or else the one a new file there inherits
+/// from its directory (`inherited`, asked only then), with the final `mode`
+/// applied either way. An ACL that only repeats the mode bits counts as
+/// none. On macOS, without ACL copying, any ACL on the file, and any entry
+/// its directory passes on to new files, counts as a difference: the
+/// inherited ACL is not worked out.
+pub(crate) fn acl_differs_from_final(
+    file: &File,
+    metadata: Option<&InodeMetadata>,
+    inherited: impl FnOnce() -> Result<Inherited>,
+    mode: u32,
+) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let current = platform::extended_access_acl(file)?;
+        let wanted = match metadata.and_then(|metadata| metadata.acls.as_ref()) {
+            Some(acls) => acls.access.clone(),
+            None => match inherited()? {
+                Inherited::Default(acl) => acl,
+                _ => None,
+            },
+        };
+        let wanted = wanted
+            .map(|acl| platform::access_for_mode(&acl, mode))
+            .transpose()?
+            .filter(|acl| posix_acl_is_extended(acl));
+        Ok(current != wanted)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = mode;
+        let current = macos_acl::read(file)?;
+        match metadata.and_then(|metadata| metadata.macos_acl.as_ref()) {
+            Some(wanted) => Ok(if current.entries.is_empty() {
+                !wanted.entries.is_empty()
+            } else {
+                &current != wanted
+            }),
+            None => Ok(!current.entries.is_empty() || inherited()? == Inherited::Entries(true)),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (file, metadata, inherited, mode);
+        Ok(false)
+    }
+}
+
+/// Darwin's `ACL_ENTRY_FILE_INHERIT`: new files in a directory take the
+/// entry.
+#[cfg(target_os = "macos")]
+const MAC_FILE_INHERIT: u32 = 1 << 5;
 
 /// Whether a Linux extended attribute's namespace grants privileges or
 /// access: `security.*`, which holds file capabilities and SELinux labels,

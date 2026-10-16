@@ -229,6 +229,106 @@ impl FsOps {
         Ok((file, created, in_use, true))
     }
 
+    /// For `--in-place=update`: open the existing regular file at `target`
+    /// for writing, and hold it for the request's file (`stages`), when the
+    /// receiver can vouch for writing it in place
+    /// (`vouch::update_refusal`). A file it cannot vouch for, or cannot open
+    /// for writing, is refused with `vouch::replace_required`, and the copy
+    /// replaces it. `None` when the name holds no regular file: a new one is
+    /// then created, and anything else is replaced, as under
+    /// `--in-place=new`. When the coordinator `compared` a file, it must be
+    /// the one opened, whose blocks it reuses.
+    fn open_inplace_update(
+        &mut self,
+        target: &RootedTarget,
+        copy_id: &CopyId,
+        update: &InPlaceUpdate,
+        compared: Option<&HeldBasis>,
+    ) -> Result<Option<(File, Arc<()>)>> {
+        const DOING: &str = "update it in place";
+        let (file, opened) = match target.root.open_regular_read_write_known(&target.relative) {
+            Ok(opened) => opened,
+            Err(error) => {
+                let raw = error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<io::Error>())
+                    .map(|error| (error.kind(), error.raw_os_error()));
+                return match raw {
+                    // A file in use as a program, or one its permissions
+                    // keep closed, can still be replaced. Where it can be
+                    // read, a reason the checks give comes first, as the
+                    // sender's scan predicts it.
+                    Some((_, Some(libc::EACCES | libc::EPERM | libc::ETXTBSY))) => {
+                        let refused = match target.root.open_regular_read(&target.relative) {
+                            Ok(file) => {
+                                let opened = file.metadata()?;
+                                vouch::update_refusal(
+                                    target.into(),
+                                    &file,
+                                    &opened,
+                                    &update.meta,
+                                    update.flags,
+                                    || self.inherited_acl(target),
+                                )?
+                            }
+                            Err(_) => None,
+                        };
+                        Err(vouch::replace_required(
+                            &target.label,
+                            DOING,
+                            refused.unwrap_or((
+                                ReplaceReason::NotWritable,
+                                "it cannot be opened for writing",
+                            )),
+                        ))
+                    }
+                    Some((io::ErrorKind::NotFound, _))
+                    | Some((_, Some(libc::ELOOP | libc::EISDIR | libc::ENXIO)))
+                    // Opened, but not a regular file.
+                    | None => Ok(None),
+                    Some(_) => Err(error),
+                };
+            }
+        };
+        let mut checked = None;
+        if let Some(compared) = compared {
+            let identity = compared.file.metadata()?;
+            if (identity.dev(), identity.ino()) != (opened.dev(), opened.ino()) {
+                bail!(
+                    "destination {} changed after it was compared",
+                    target.label.display()
+                );
+            }
+            // The comparison asked already, through this file: its answer
+            // holds while the file is as it was then, which the metadata
+            // just read through the descriptor to write shows. Anything else
+            // is checked again before a byte is written.
+            checked = compared.update_check.and_then(|check| check.still(&opened));
+        }
+        let refused = match checked {
+            Some(refused) => refused,
+            None => vouch::update_refusal(
+                target.into(),
+                &file,
+                &opened,
+                &update.meta,
+                update.flags,
+                || self.inherited_acl(target),
+            )?,
+        };
+        if let Some(refused) = refused {
+            return Err(vouch::replace_required(&target.label, DOING, refused));
+        }
+        let in_use = stages::hold(
+            stages::of(self.stage_scope, target, copy_id, true),
+            &target.relative,
+            &file,
+            Some(opened),
+            false,
+        )?;
+        Ok(Some((file, in_use)))
+    }
+
     pub(super) fn reusable_partial_permissions(&self, file: &File) -> Result<bool> {
         #[cfg(target_os = "macos")]
         if self.inode_preservation.acls {
@@ -418,6 +518,7 @@ impl FsOps {
             attempt,
             create_if_missing,
             group,
+            update,
         } = options;
         let target = self.destination_mutation_target(path, guard)?;
         // Existing finals get their equality check first. For new files,
@@ -463,6 +564,24 @@ impl FsOps {
                     CachedFile::held(held.file, held.in_use),
                 );
                 return Ok(Preparation::default());
+            }
+            // `--in-place=update` writes an existing file it can vouch for
+            // where it is.
+            if let Some(update) = update {
+                if let Some((file, in_use)) =
+                    self.open_inplace_update(&target, copy_id, update, compared.as_ref())?
+                {
+                    self.set_copy_length(&file, size).with_context(|| {
+                        format!("resize confined file {}", target.label.display())
+                    })?;
+                    self.cache_entry(
+                        target.location(),
+                        attempt,
+                        false,
+                        CachedFile::held(file, in_use),
+                    );
+                    return Ok(Preparation::default());
+                }
             }
             if compared.is_some() {
                 // Its blocks would be skipped in a file that lacks them.
@@ -619,7 +738,8 @@ impl FsOps {
         condition: TargetCondition,
         guard: Option<&ContainerGuard>,
     ) -> Result<(Vec<ContentDigest>, u64)> {
-        self.hash_and_hold_window(path, copy_id, 0, block, len, condition, guard)
+        self.hash_and_hold_window(path, copy_id, 0, block, len, condition, guard, None)
+            .map(|(hashes, len, _)| (hashes, len))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -632,7 +752,8 @@ impl FsOps {
         len: u64,
         condition: TargetCondition,
         guard: Option<&ContainerGuard>,
-    ) -> Result<(Vec<ContentDigest>, u64)> {
+        update: Option<&InPlaceUpdate>,
+    ) -> Result<(Vec<ContentDigest>, u64, Option<ReplaceReason>)> {
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_FAIL_HASH_BASIS").is_some() {
             bail!("injected retained-basis hash failure");
@@ -646,7 +767,7 @@ impl FsOps {
             .as_ref()
             .map(|target| target.location())
             .unwrap_or_else(|| FileLocation::Path(resolve(path)));
-        let (mut file, location, label) = if off > 0 {
+        let (mut file, location, label, mut update_check) = if off > 0 {
             let held = self
                 .held_basis
                 .take()
@@ -655,20 +776,38 @@ impl FsOps {
                 held.location == location && held.copy_id == *copy_id,
                 "retained comparison basis does not match requested file"
             );
-            (held.file, held.location, held.label)
+            (held.file, held.location, held.label, held.update_check)
         } else if let Some(target) = &rooted {
             (
                 target.root.open_regular_read(&target.relative)?,
                 target.location(),
                 target.label.clone(),
+                None,
             )
         } else {
             let p = resolve(path);
             open_existing_regular(&p, false)
                 .with_context(|| format!("open {} as repair basis", p.display()))
-                .map(|file| (file, FileLocation::Path(p.clone()), p))?
+                .map(|file| (file, FileLocation::Path(p.clone()), p, None))?
         };
         require_open_target(&file, &label, condition)?;
+        // `--in-place=update`: the sender learns with the hashes whether the
+        // receiver would update the file in place. It finishes a matching
+        // file through its metadata, and replaces a differing one it may not
+        // update from this held file. A preparation to update it then reuses
+        // the answer.
+        if let (Some(update), Some(target), 0) = (update, &rooted, off) {
+            let current = file.metadata()?;
+            let refused = vouch::update_refusal(
+                target.into(),
+                &file,
+                &current,
+                &update.meta,
+                update.flags,
+                || self.inherited_acl(target),
+            )?;
+            update_check = Some(UpdateCheck::new(refused, &current));
+        }
         #[cfg(debug_assertions)]
         record_test_event(
             "SYQ_TEST_BASIS_HASH_EVENTS",
@@ -687,6 +826,7 @@ impl FsOps {
             label,
             copy_id: *copy_id,
             file,
+            update_check,
         });
         #[cfg(debug_assertions)]
         if off == 0 {
@@ -706,7 +846,35 @@ impl FsOps {
             .file
             .metadata()?
             .len();
-        Ok((hashes, held_len))
+        Ok((
+            hashes,
+            held_len,
+            update_check
+                .and_then(|check| check.refused)
+                .map(|(reason, _)| reason),
+        ))
+    }
+
+    /// What a new file at `target` gets of its directory's ACL, read once
+    /// per directory and connection.
+    pub(super) fn inherited_acl(
+        &self,
+        target: &RootedTarget,
+    ) -> Result<crate::inode_metadata::Inherited> {
+        let (parents, _) = target.relative.leaf()?;
+        let identity = target.root.identity();
+        let key = (identity.dev, identity.ino, parents.to_vec());
+        if let Some(inherited) = self.inherited_acls.lock().unwrap().get(&key) {
+            return Ok(inherited.clone());
+        }
+        let inherited =
+            crate::inode_metadata::inherited_acl(&target.root.parent_directory(&target.relative)?)?;
+        let mut cache = self.inherited_acls.lock().unwrap();
+        if cache.len() >= receiver_mode::CREATION_PERMISSION_DIRECTORIES {
+            cache.clear();
+        }
+        cache.insert(key, inherited.clone());
+        Ok(inherited)
     }
 
     pub(super) fn take_held_basis(
@@ -780,6 +948,7 @@ impl FsOps {
         published_identity(&held.file, flags)
     }
 
+    #[cfg(test)]
     pub(super) fn seed_basis(
         &mut self,
         target: PartialTarget<'_>,
@@ -788,8 +957,15 @@ impl FsOps {
         final_ranges: Option<&[(u64, u64)]>,
         attempt: u32,
     ) -> Result<SeededBasis> {
-        self.seed_basis_impl(target, len, block, final_ranges, attempt, false)
-            .map(|(basis, _)| basis)
+        self.seed_basis_impl(
+            target,
+            len,
+            block,
+            final_ranges,
+            attempt,
+            SeedHow::default(),
+        )
+        .map(|(basis, _)| basis)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -800,8 +976,12 @@ impl FsOps {
         block: u64,
         final_ranges: Option<&[(u64, u64)]>,
         attempt: u32,
-        stage_only: bool,
+        how: SeedHow,
     ) -> Result<(SeededBasis, bool)> {
+        let SeedHow {
+            stage_only,
+            clone_final,
+        } = how;
         let PartialTarget {
             path,
             id: copy_id,
@@ -832,14 +1012,18 @@ impl FsOps {
             .held_basis
             .take()
             .filter(|held| held.location == expected && held.copy_id == *copy_id);
+        // On macOS a clone is a new file, made before the sidecar: then the
+        // whole sidecar is hashed, as a resumed one is.
         #[cfg(target_os = "macos")]
-        if stage_only {
+        if stage_only || (clone_final && final_ranges.is_some_and(|ranges| !ranges.is_empty())) {
             self.try_clone_basis(
                 &target,
                 copy_id,
                 final_ranges.is_none_or(|ranges| !ranges.is_empty()),
             )?;
         }
+        #[cfg(not(target_os = "macos"))]
+        let _ = clone_final;
         let creation = sidecars::begin()?;
         let (relative, label, (opened, own_donor)) =
             with_rooted_partial(&target, copy_id, |relative, label| {
@@ -1028,14 +1212,44 @@ impl FsOps {
                 compare_final,
             ));
         }
-        if basis_size.unwrap_or(0) == 0 {
+        // Where the filesystem can clone, the final file the comparison
+        // selected is cloned into the sidecar when asked, and its matching
+        // blocks are hashed from the sidecar: nothing is written for them,
+        // and the hashes show what the sidecar holds, whatever the file held
+        // when it was compared. The sidecar then holds the file's other
+        // bytes too until they are replaced, so only a file whose access the
+        // sidecar's admits is cloned.
+        #[cfg(target_os = "linux")]
+        let cloned = clone_final
+            && selected_final.is_some()
+            && !self.sparse
+            && basis_size.unwrap_or(0) == 0
+            && match input.as_ref() {
+                Some(donor) if SeedAccess::new(&output).admits(donor) => {
+                    let size = len.min(donor.metadata()?.len());
+                    let cloned = super::basis_copy::try_clone(donor, &output, size);
+                    #[cfg(debug_assertions)]
+                    if cloned {
+                        record_test_event("SYQ_TEST_SEED_CLONES", format_args!("clone {size}"))?;
+                    }
+                    cloned
+                }
+                _ => false,
+            };
+        #[cfg(not(target_os = "linux"))]
+        let cloned = false;
+        if basis_size.unwrap_or(0) == 0 && !cloned {
             self.preallocate_new_partial(&output, len)?;
         }
         // A cached donor can disappear or become unsuitable before opening.
         // Freshly allocated zeros are not old copy data worth scanning.
         // Retry bytes are read through the held sidecar's own descriptor.
         let own = input.is_none() && basis_size.unwrap_or(0) > 0;
-        let reader = input.as_ref().or(own.then_some(&output));
+        let reader = if cloned {
+            Some(&output)
+        } else {
+            input.as_ref().or(own.then_some(&output))
+        };
         let mut hashes = Vec::new();
         if let Some(reader) = reader {
             let whole = [(0, len)];
@@ -1055,7 +1269,7 @@ impl FsOps {
                         break 'ranges;
                     }
                     let hash = self.hash_policy.algorithm.hash(bytes);
-                    if input.is_some() {
+                    if input.is_some() && !cloned {
                         #[cfg(debug_assertions)]
                         test_race_barrier(
                             "SYQ_TEST_REUSE_READY_FILE",
@@ -1248,6 +1462,7 @@ impl FsOps {
         let CopyLocalPolicy {
             inplace,
             group,
+            update,
             replace_partial,
             allow_sequential_nfs_fallback,
             allow_sequential_local_fallback,
@@ -1340,18 +1555,32 @@ impl FsOps {
         // The bytes at the start of the output that hold old contents until
         // the copy writes over them: an in-place file's, within its new length.
         let mut old_len = 0;
+        // Whether this copy created the file it writes in place, rather
+        // than updating an existing one (`--in-place=update`).
+        let mut created_inplace = true;
         let d = if inplace {
-            // A retry writes the file this copy already holds.
-            let (file, fresh) = match self.held_inplace(&target, copy_id)? {
-                Some(held) => {
+            // A retry writes the file this copy already holds, and
+            // `--in-place=update` an existing one it can vouch for.
+            let held = self.held_inplace(&target, copy_id)?;
+            let updated = match (&held, update) {
+                (None, Some(update)) => self.open_inplace_update(&target, copy_id, update, None)?,
+                _ => None,
+            };
+            let (file, fresh) = match (held, updated) {
+                (Some(held), _) => {
                     // A stage, when the name held another file.
                     if held.relative != target.relative {
                         target_label = stages::label(&target, &held.relative);
                         target_relative = held.relative;
                     }
+                    created_inplace = held.created;
                     (held.file, false)
                 }
-                None => {
+                (None, Some((file, _))) => {
+                    created_inplace = false;
+                    (file, false)
+                }
+                (None, None) => {
                     // The coordinator sends the in-place creation mode
                     // (`inplace_creation_mode`).
                     let (file, _, _, staged) =
@@ -1628,7 +1857,7 @@ impl FsOps {
                 &target_relative,
                 &d,
                 None,
-                true,
+                created_inplace,
             )?;
             self.cache_entry(target.location(), 0, false, CachedFile::held(d, in_use));
         } else {
@@ -2512,6 +2741,11 @@ impl FsOps {
             let held = stages::of(self.stage_scope, &rooted, &copy_id, inplace);
             let (file, _) = self.cached_held(label, held, relative, attempt)?;
             let writing = operation.span(crate::transfer_observations::Stage::DestinationWrite);
+            #[cfg(debug_assertions)]
+            record_test_event(
+                "SYQ_TEST_DESTINATION_WRITES",
+                format_args!("write {off} {}", data.len()),
+            )?;
             let result = file.write_range_at(data, off, sparse);
             if result.is_ok() {
                 writing.bytes(data.len() as u64);
@@ -2710,7 +2944,7 @@ impl FsOps {
             // NFS client answers with a request. A file opened without that
             // read is read as before.
             self.uncache_rooted(&target.root, &target.relative);
-            let (file, opened) = (held.file, held.opened);
+            let (file, opened, created) = (held.file, held.opened, held.created);
             // The file is read at most once here. A fingerprint condition
             // holds the file's ctime as it is now, after the writes, so that
             // condition needs fresh metadata; every other condition, the
@@ -2721,12 +2955,12 @@ impl FsOps {
             // The copy created the file exclusively at its name, so a
             // condition that the name be free was met then.
             let condition = match condition {
-                TargetCondition::Absent => TargetCondition::Any,
+                TargetCondition::Absent if created => TargetCondition::Any,
                 condition => condition,
             };
             let fingerprint = matches!(condition, TargetCondition::MatchesFingerprint { .. });
             let current = match &opened {
-                Some(opened) if !fingerprint => opened.clone(),
+                Some(opened) if !fingerprint && created => opened.clone(),
                 _ => file.metadata()?,
             };
             require_open_target_known(&current, &target.label, condition)?;
@@ -2734,15 +2968,36 @@ impl FsOps {
             if let Some(expected) = expected {
                 Self::verify_expected_held(&target.root, &target.relative, &file, expected)?;
             }
-            let resolved = self.inplace_final_mode(target, meta, flags)?;
-            let (meta, flags) = resolved
-                .as_ref()
-                .map_or((meta, flags), |(meta, flags)| (meta, *flags));
-            match &opened {
-                Some(opened) => set_meta_written_file(&file, meta, flags, opened),
-                None => set_meta_file_known(&file, meta, flags, &current),
+            if !created {
+                // An existing file `--in-place=update` wrote keeps its mode
+                // unless the copy sets one, as one it replaces does. Its
+                // metadata goes through the checks for any metadata change,
+                // read now: someone may have given it another name since
+                // it was opened. Its contents are written already, so the
+                // file fails rather than being replaced.
+                let flags = flags & !flags::RECEIVER_MODE;
+                if let Err(error) = vouch::require(target, &file, &current, meta, flags) {
+                    if vouch::is_replace_required(&error) {
+                        bail!(
+                            "{} changed while this copy updated it in place: {error:#}",
+                            target.label.display()
+                        );
+                    }
+                    return Err(error);
+                }
+                set_meta_written_file(&file, meta, flags, &current)
+                    .with_context(|| format!("set metadata {}", target.label.display()))?;
+            } else {
+                let resolved = self.inplace_final_mode(target, meta, flags)?;
+                let (meta, flags) = resolved
+                    .as_ref()
+                    .map_or((meta, flags), |(meta, flags)| (meta, *flags));
+                match &opened {
+                    Some(opened) => set_meta_written_file(&file, meta, flags, opened),
+                    None => set_meta_file_known(&file, meta, flags, &current),
+                }
+                .with_context(|| format!("set metadata {}", target.label.display()))?;
             }
-            .with_context(|| format!("set metadata {}", target.label.display()))?;
             // The file is finished only while its name still leads to it:
             // a file someone renamed into its place got nothing of the
             // copy's, and the copy fails it. Where inode numbers cannot show
@@ -3303,6 +3558,7 @@ impl FsOps {
                 create_if_missing,
                 guard,
                 group,
+                update,
             } => self
                 .creation_mode(
                     path,
@@ -3327,6 +3583,7 @@ impl FsOps {
                             attempt: *attempt,
                             create_if_missing: *create_if_missing,
                             group: *group,
+                            update: update.as_deref(),
                         },
                     )
                 })
@@ -3339,8 +3596,9 @@ impl FsOps {
                 len,
                 condition,
                 guard,
-            } => self
-                .hash_and_hold_window(
+                update,
+            } => (|| {
+                let result = self.hash_and_hold_window(
                     path,
                     copy_id,
                     *off,
@@ -3348,8 +3606,19 @@ impl FsOps {
                     *len,
                     *condition,
                     guard.as_ref(),
-                )
-                .map(|(hashes, len)| Response::HeldHashes { hashes, len }),
+                    update.as_deref(),
+                );
+                #[cfg(debug_assertions)]
+                if result.is_ok() {
+                    record_test_event("SYQ_TEST_DESTINATION_HASHES", format_args!("hold {len}"))?;
+                }
+                result
+            })()
+            .map(|(hashes, len, refused)| Response::HeldHashes {
+                hashes,
+                len,
+                refused,
+            }),
             Request::FinishBasis {
                 expected_hash,
                 path,
@@ -3388,7 +3657,10 @@ impl FsOps {
                     *block,
                     if *allow_final { None } else { Some(&[]) },
                     *attempt,
-                    true,
+                    SeedHow {
+                        stage_only: true,
+                        clone_final: false,
+                    },
                 )
                 .map(|(_, compare_final)| Response::BasisStaged { compare_final }),
             Request::HashWindow {
@@ -3400,8 +3672,10 @@ impl FsOps {
                 block,
                 attempt,
                 guard,
-            } => self
-                .hash_window(
+            } => (|| {
+                #[cfg(debug_assertions)]
+                record_test_event("SYQ_TEST_DESTINATION_HASHES", format_args!("window {len}"))?;
+                self.hash_window(
                     PartialTarget {
                         path,
                         id: copy_id,
@@ -3413,7 +3687,8 @@ impl FsOps {
                     *attempt,
                     *final_basis,
                 )
-                .map(Response::Hashes),
+            })()
+            .map(Response::Hashes),
             Request::ReuseComparedRange {
                 path,
                 copy_id,
@@ -3474,8 +3749,9 @@ impl FsOps {
                 final_ranges,
                 attempt,
                 guard,
+                clone_final,
             } => self
-                .seed_basis(
+                .seed_basis_impl(
                     PartialTarget {
                         path,
                         id: copy_id,
@@ -3485,8 +3761,12 @@ impl FsOps {
                     *block,
                     final_ranges.as_deref(),
                     *attempt,
+                    SeedHow {
+                        stage_only: false,
+                        clone_final: *clone_final,
+                    },
                 )
-                .map(Response::SeededBasis),
+                .map(|(basis, _)| Response::SeededBasis(basis)),
             Request::CopyLocal {
                 source,
                 dst,
@@ -3498,6 +3778,7 @@ impl FsOps {
                 size,
                 mode,
                 group,
+                update,
             } => self
                 .copy_local(
                     source,
@@ -3505,6 +3786,7 @@ impl FsOps {
                     CopyLocalPolicy {
                         inplace: *inplace,
                         group: *group,
+                        update: update.as_deref(),
                         replace_partial: *replace_partial,
                         allow_sequential_nfs_fallback: *allow_sequential_nfs_fallback,
                         allow_sequential_local_fallback: *allow_sequential_local_fallback,

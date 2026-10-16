@@ -540,6 +540,19 @@ fn print_summary(terminal: &serde_json::Value) {
             deletions_planned: None,
             deletions_completed: None,
             deletions_blocked: None,
+            replaced_not_in_place: terminal
+                .get("replaced_not_in_place")
+                .and_then(serde_json::Value::as_object)
+                .map(|counts| {
+                    crate::proto::ReplaceReason::ALL
+                        .iter()
+                        .map(|reason| {
+                            let count =
+                                counts.get(reason.key()).and_then(serde_json::Value::as_u64);
+                            (*reason, count.unwrap_or(0))
+                        })
+                        .collect()
+                }),
         },
         elapsed_ms as f64 / 1000.0,
         &deletions,
@@ -1244,7 +1257,9 @@ fn run_remote(
     } else if args.delete {
         remote.push("--prune".into());
     }
-    if args.inplace {
+    if args.in_place_update {
+        remote.push("--in-place=update".into());
+    } else if args.inplace {
         remote.push("--in-place=new".into());
     }
     for line in &args.ignore_lines {
