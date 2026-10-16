@@ -1085,3 +1085,80 @@ fn small_files_of_another_size_are_written_whole_in_place_in_groups() {
     assert_eq!(hashed.lines().count(), 3, "{hashed}");
     assert!(hashed.lines().all(|line| line == "existing 0"), "{hashed}");
 }
+
+/// A file the receiver refuses to update in place is replaced through a
+/// stage that takes a clone or copy of it, and the receiver vouches for
+/// nothing in it: a write to a block the copy reuses, made after the
+/// group's comparison, is caught from the stage's own bytes even when it
+/// leaves the file's length and change time as they were, and the copy
+/// still publishes the source's bytes. Here the file gains another name at
+/// the same time, which is why the receiver refuses it; that name keeps
+/// the written file.
+#[cfg(debug_assertions)]
+#[test]
+fn a_refused_file_changed_unseen_after_its_group_was_compared_gets_the_sources_bytes() {
+    use std::os::unix::fs::FileExt as _;
+    let t = Tmp::new();
+    // Enough of it reused for its stage to take a clone or copy of it.
+    let new = prng(2 << 20, 790);
+    let mut old = new.clone();
+    old[(5 << 16) + 9] ^= 1;
+    write(&t.path("src/theirs"), &new);
+    write(&t.path("dst/theirs"), &old);
+    set_mtime(&t.path("src/theirs"), 1_700_000_000);
+    let (mine, _) = small_update(&t, "mine", 791, true);
+    let (theirs_inode, mine_inode) = (inode(&t.path("dst/theirs")), inode(&t.path("dst/mine")));
+    let (ready, continuation, hashes) = (t.path("ready"), t.path("continue"), t.path("hashes"));
+    let results = t.path("copy.jsonl");
+    let mut child = cp_update_command(
+        &t,
+        "ssh",
+        &["--results", &results.to_string_lossy()],
+        &[
+            ("SYQ_TEST_SMALL_UPDATE_READY_FILE", &ready.to_string_lossy()),
+            (
+                "SYQ_TEST_SMALL_UPDATE_CONTINUE_FILE",
+                &continuation.to_string_lossy(),
+            ),
+            ("SYQ_TEST_DESTINATION_HASHES", &hashes.to_string_lossy()),
+            ("SYQ_TEST_COARSE_CHANGE_TIMES", "1"),
+        ],
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .start()
+    .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "the group's first write");
+    fs::hard_link(t.path("dst/theirs"), t.path("outside")).unwrap();
+    // A block the patch reuses changes, keeping the file's length.
+    let planted_at = (20 << 16) + 3;
+    OpenOptions::new()
+        .write(true)
+        .open(t.path("dst/theirs"))
+        .unwrap()
+        .write_all_at(b"planted", planted_at)
+        .unwrap();
+    release_confinement_barrier(&continuation);
+    let out = child.wait_with_output().unwrap();
+    assert_output_ok(&out);
+    assert!(
+        hashed_in_groups(&hashes),
+        "{}",
+        fs::read_to_string(&hashes).unwrap_or_default()
+    );
+    assert!(
+        read(&t.path("dst/theirs")) == new,
+        "the planted bytes reached the published file"
+    );
+    assert_ne!(inode(&t.path("dst/theirs")), theirs_inode);
+    let mut planted = old.clone();
+    planted[planted_at as usize..planted_at as usize + 7].copy_from_slice(b"planted");
+    assert!(read(&t.path("outside")) == planted);
+    assert!(read(&t.path("dst/mine")) == mine);
+    assert_eq!(inode(&t.path("dst/mine")), mine_inode);
+    assert_eq!(
+        terminal(&results)["replaced_not_in_place"],
+        serde_json::json!({"other_names": 1})
+    );
+    assert!(partial_files(&t.0).is_empty());
+}

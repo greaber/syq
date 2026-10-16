@@ -335,6 +335,19 @@ fn chunk_blocks(block: u64) -> usize {
 }
 
 fn fingerprint(metadata: &fs::Metadata) -> FileFingerprint {
+    // Tests stand in for a filesystem whose change times are too coarse to
+    // show a write made soon after the last change: such a write leaves the
+    // fingerprint as it was.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SYQ_TEST_COARSE_CHANGE_TIMES").is_some() {
+        return FileFingerprint {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            ctime: 0,
+            ctime_nsec: 0,
+        };
+    }
     FileFingerprint {
         dev: metadata.dev(),
         ino: metadata.ino(),
@@ -822,7 +835,11 @@ impl FsOps {
         if let Some((reason, _)) = refused {
             return Ok(Updated::Refused(reason));
         }
-        if patch.basis != Some(fingerprint(&opened)) && !self.still_holds_reused(&file, patch)? {
+        if patch.basis != Some(fingerprint(&opened))
+            && !self
+                .holds_reused_runs(&file, patch)
+                .map_err(failed(false, false))?
+        {
             return Err(failed(false, false)(anyhow!(
                 "the destination {} changed after it was compared",
                 target.label.display()
@@ -834,13 +851,21 @@ impl FsOps {
             .map_err(failed(false, true))
     }
 
-    /// Whether `file` still holds each run of the blocks a patch reuses, up
-    /// to a chunk at a time, as compared.
-    fn still_holds_reused(
-        &self,
-        file: &File,
-        patch: &SmallPatch,
-    ) -> std::result::Result<bool, SmallPatchError> {
+    /// Whether `stage`, which took a clone or copy of the file a patch
+    /// replaces, holds each block the patch reuses as it hashed when
+    /// compared, read back from the stage. A copy that kept that file's
+    /// holes may end before its last reused blocks: the stage takes the
+    /// patch's length first, as it would once written.
+    fn stage_holds_reused(&self, stage: &SmallStage, patch: &SmallPatch) -> Result<bool> {
+        if stage.file.metadata()?.len() < patch.len {
+            crate::sparse::set_len(&stage.file, patch.len)?;
+        }
+        self.holds_reused_runs(&stage.file, patch)
+    }
+
+    /// Whether `file` holds each run of the blocks a patch reuses, read up to
+    /// a chunk at a time, as they hashed when compared.
+    fn holds_reused_runs(&self, file: &File, patch: &SmallPatch) -> Result<bool> {
         let run = chunk_blocks(patch.block);
         let mut buffer = Vec::new();
         let mut index = 0;
@@ -858,21 +883,13 @@ impl FsOps {
                 ((end as u64 * patch.block).min(patch.len) - off) as usize,
                 0,
             );
-            let holds = self
-                .holds_blocks(
-                    file,
-                    off,
-                    &mut buffer,
-                    patch.block,
-                    &patch.reuse[index..end],
-                )
-                .map_err(|error| SmallPatchError {
-                    error: wire_error(&error),
-                    matched: false,
-                    stale_condition: false,
-                    written: false,
-                })?;
-            if !holds {
+            if !self.holds_blocks(
+                file,
+                off,
+                &mut buffer,
+                patch.block,
+                &patch.reuse[index..end],
+            )? {
                 return Ok(false);
             }
             index = end;
@@ -1001,9 +1018,9 @@ impl FsOps {
         let reused = patch.len - patch.data.len() as u64;
         let clones = reused >= CLONE_MIN_REUSED && reused * 2 >= patch.len;
         if let (Some(old), Some(basis), true) = (&old, patch.basis, clones) {
-            // A clone keeps the reused blocks unread, so each must lie
-            // within the file it comes from. Otherwise assembling reads them
-            // and fails.
+            // The clone or copy must hold each reused block, so each must
+            // lie within the file it comes from. Otherwise assembling reads
+            // them and fails.
             if stream::reuses_within(patch, basis.len) && fingerprint(&old.metadata()?) == basis {
                 let source = PatchSource {
                     old: old.try_clone()?,
@@ -1021,9 +1038,13 @@ impl FsOps {
     /// or copied in the kernel, with the differing blocks written over it.
     /// A stage made as the clone, as on macOS, holds it already; any other
     /// stage that can take the copy was created empty for it
-    /// (`create_seeded_stage`). When the file cannot be copied so, or
-    /// changed after it was hashed, the stage holds the assembled file
-    /// instead, its reused blocks read and checked again. The write is
+    /// (`create_seeded_stage`). Nothing vouches for the file it replaces,
+    /// whose owner may change it after its blocks were hashed, and leave its
+    /// fingerprint as it was where change times are coarse: the clone or
+    /// copy is kept only when each reused block, read back from the stage,
+    /// hashes as compared. When the file cannot be copied so, or changed,
+    /// the stage holds the assembled file instead, its reused blocks read
+    /// from the file it replaces and checked there. The write is
     /// observed unless `unobserved` collects its bytes for a caller that
     /// records them, as `write_small_stage` does.
     fn write_patch_stage(
@@ -1034,11 +1055,10 @@ impl FsOps {
     ) -> Result<()> {
         let patch = source.patch;
         let file = &stage.file;
-        // Like a clone, a copy is trusted only if the file it came from
-        // still has the fingerprint it had when its blocks were hashed:
-        // nothing changed it before or while it was copied.
+        // A file whose fingerprint shows a change is not read back.
         let copied = (stage.cloned || self.copy_basis(source, stage))
-            && fingerprint(&source.old.metadata()?) == source.basis;
+            && fingerprint(&source.old.metadata()?) == source.basis
+            && self.stage_holds_reused(stage, patch)?;
         if !copied {
             file.set_len(0)?;
             self.preallocate_stage(stage, patch.len)?;
@@ -1475,7 +1495,9 @@ impl FsOps {
     /// left at the name while its mode was wider can read what is written to
     /// it. So the stage is created exclusively, replacing anything at the
     /// name, with only the owner's permissions of `mode`, and publication
-    /// sets the wanted mode. It is new whatever mode the filesystem gave it.
+    /// sets the wanted mode. It is new whatever mode the filesystem gave it,
+    /// and opened for reading too: the blocks it takes are read back and
+    /// checked before they are kept (`write_patch_stage`).
     fn create_seeded_stage(
         &mut self,
         put: &SmallPut,
@@ -1488,7 +1510,7 @@ impl FsOps {
             with_rooted_partial(&target, &put.copy_id, |relative, label| {
                 self.uncache_rooted(&target.root, relative);
                 create_fresh_rooted_partial(&target.root, relative, label, || {
-                    target.root.create_write_only_file(relative, mode)
+                    target.root.create_file(relative, mode)
                 })
             })?;
         Ok(SmallStage {
@@ -2040,6 +2062,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_seeded_stage_keeps_reused_blocks_only_as_they_read_back_from_it() {
+        // Nothing vouches for the file a patch replaces: its owner may write
+        // a block the patch reuses after it was hashed, and where change
+        // times are coarse its fingerprint stays as it was, as here, where
+        // the patch carries the fingerprint taken after the write. The stage
+        // that cloned or copied the file is then not kept, and neither a
+        // batch patch nor a streamed one publishes the written block.
+        use std::os::unix::fs::FileExt as _;
+        let block = MIN_HASH_BLOCK_BYTES;
+        for (streamed, cloning) in [(false, true), (false, false), (true, true), (true, false)] {
+            let temporary = crate::test_support::tempdir().unwrap();
+            let directory = temporary.path();
+            let old: Vec<u8> = (0..32 * block).map(|i| (i % 251) as u8 | 1).collect();
+            let mut new = old.clone();
+            new[20 * block as usize] ^= 0xff;
+            fs::write(directory.join("file"), &old).unwrap();
+            let mut ops = receiver(directory);
+            let algorithm = ops.hash_policy.algorithm;
+            let hashed = ops.hash_existing_batch(
+                block,
+                &[ExistingRead {
+                    path: b"file".to_vec(),
+                    len: new.len() as u64,
+                    condition: TargetCondition::Any,
+                    guard: None,
+                }],
+            );
+            let mut patch = patch_from("file", &new, block, hashed[0].as_ref().unwrap(), algorithm);
+            assert_eq!(patch.data.len() as u64, block);
+            File::options()
+                .write(true)
+                .open(directory.join("file"))
+                .unwrap()
+                .write_all_at(b"planted", 3 * block + 1)
+                .unwrap();
+            let planted = fs::read(directory.join("file")).unwrap();
+            let before = fs::metadata(directory.join("file")).unwrap().ino();
+            patch.basis = Some(fingerprint(&fs::metadata(directory.join("file")).unwrap()));
+            let case = format!("streamed {streamed} cloning {cloning}");
+            let outcome = refusing_clones(!cloning, || {
+                if streamed {
+                    stream_patch(&mut ops, &patch, &pieces(&patch, 1), true, |_| {}).1
+                } else {
+                    ops.patch_small_batch(std::slice::from_ref(&patch))
+                        .unwrap()
+                        .remove(0)
+                }
+            });
+            assert!(outcome.is_err(), "{case}: {outcome:?}");
+            assert!(
+                fs::read(directory.join("file")).unwrap() == planted,
+                "{case}: the file was replaced"
+            );
+            assert_eq!(
+                fs::metadata(directory.join("file")).unwrap().ino(),
+                before,
+                "{case}"
+            );
+            // A streamed patch removes its stage; a failed batch file leaves
+            // its sidecar to the next attempt, as any does.
+            if streamed {
+                assert_eq!(entries(directory), 1, "{case}: a stage was left");
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_shorter_file_copies_only_the_blocks_it_can_reuse() {
@@ -2358,10 +2447,9 @@ mod tests {
     fn a_patch_that_cannot_clone_copies_the_file_it_replaces_in_the_kernel() {
         // Where the filesystem cannot clone, the stage takes a kernel copy
         // of the file it replaces, holes included, and only the differing
-        // blocks are written over it. Like a clone, the copy is trusted for
-        // the fingerprint the file was hashed under, and its reused blocks
-        // are not read back: here hashes that do not describe them pass,
-        // where assembling the file would refuse them.
+        // blocks are written over it. Like a clone's, the copy's reused
+        // blocks are read back from the stage and checked before it is kept,
+        // the holes as the zeros they read as.
         let block = MIN_HASH_BLOCK_BYTES;
         let temporary = crate::test_support::tempdir().unwrap();
         let directory = temporary.path();
@@ -2388,7 +2476,7 @@ mod tests {
             .remove(0)
             .unwrap();
         let data = vec![9; block as usize];
-        let mut reuse = vec![Some([0; 32]); 64];
+        let mut reuse: Vec<_> = hashed.hashes.iter().copied().map(Some).collect();
         reuse[1] = None;
         let patch = SmallPatch {
             path: b"file".to_vec(),

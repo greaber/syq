@@ -1,9 +1,9 @@
 //! A patch whose new data is too large to hold for a batch is streamed:
 //! `PatchBegin` opens its stage, each `PatchData` piece is written into it as
 //! it arrives, and `PatchEnd` publishes it or abandons it. The stage is
-//! seeded from the file it replaces under the same fingerprint check as a
-//! batch patch's, or takes that file's reused blocks as the pieces around
-//! them arrive. Either way it holds that file's bytes for as long as the
+//! seeded from the file it replaces under the same checks as a batch
+//! patch's, its reused blocks read back from it and hashed, or takes that
+//! file's reused blocks as the pieces around them arrive. Either way it holds that file's bytes for as long as the
 //! stream lasts, so it is always a new file, created exclusively, and stays
 //! private until publication. A stage that will not be published, whether
 //! the patch failed, was abandoned or its connection closed, is removed at
@@ -220,12 +220,14 @@ impl FsOps {
         };
         let stage = self.create_stream_stage(&stream.put, source.as_ref(), target)?;
         let stage = &*stream.stage.insert(stage);
-        // Like a clone, a copy is trusted only if the file it came from
-        // still has the fingerprint it had when its blocks were hashed.
+        // As for a batch patch's stage (`write_patch_stage`), a clone or
+        // copy is kept only when each reused block, read back from the
+        // stage, hashes as compared.
         let seeded = match &source {
             Some(source) => {
                 (stage.cloned || self.copy_basis(source, stage))
                     && fingerprint(&source.old.metadata()?) == source.basis
+                    && self.stage_holds_reused(stage, patch)?
             }
             None => false,
         };
