@@ -489,12 +489,12 @@ fn a_file_only_the_receiver_refuses_is_read_once_there() {
     assert_eq!(hashed, 16 << 20);
 }
 
-/// A differing file the receiver refuses to update in place is replaced
-/// from the file it holds: cloned into the stage where the filesystem can,
-/// and hashed there. The receiver does not vouch for the file, which here
-/// changes after it was compared: the replacement still holds the source's
-/// bytes, since the stage's hashes, not the comparison's, decide what is
-/// sent.
+/// On the per-file path, a differing file the receiver refuses to update in
+/// place is replaced from the file it holds: cloned into the stage where
+/// the filesystem can, and hashed there. The receiver does not vouch for
+/// the file, which here changes after it was compared: the replacement
+/// still holds the source's bytes, since the stage's hashes, not the
+/// comparison's, decide what is sent.
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
 fn a_refused_file_changed_after_its_comparison_is_replaced_with_the_sources_bytes() {
@@ -531,6 +531,7 @@ fn a_refused_file_changed_after_its_comparison_is_replaced_with_the_sources_byte
                 &continuation.to_string_lossy(),
             ),
             ("SYQ_TEST_SEED_CLONES", &clones.to_string_lossy()),
+            ("SYQ_TEST_PER_FILE_COMPARISON", "1"),
         ],
     )
     .stdout(Stdio::piped())
@@ -555,9 +556,9 @@ fn a_refused_file_changed_after_its_comparison_is_replaced_with_the_sources_byte
     }
 }
 
-/// A file that gains another name after it was compared, and before the
-/// receiver opens it to write, is replaced rather than written in place:
-/// the other name keeps its contents.
+/// On the per-file path, a file that gains another name after it was
+/// compared, and before the receiver opens it to write, is replaced rather
+/// than written in place: the other name keeps its contents.
 #[cfg(debug_assertions)]
 #[test]
 fn a_file_linked_after_its_comparison_is_replaced() {
@@ -581,6 +582,7 @@ fn a_file_linked_after_its_comparison_is_replaced() {
                 "SYQ_TEST_BASIS_CONTINUE_FILE",
                 &continuation.to_string_lossy(),
             ),
+            ("SYQ_TEST_PER_FILE_COMPARISON", "1"),
         ],
     )
     .stdout(Stdio::piped())
@@ -767,4 +769,319 @@ fn files_on_untrusted_filesystems_are_replaced() {
         assert_ne!(inode(&t.path("dst/file")), before, "{route}");
         assert_eq!(read(&t.path("dst/file")), read(&t.path("src/file")));
     }
+}
+
+/// Three comparison blocks of 64 KiB.
+const SMALL: usize = 3 << 16;
+
+/// Write a small source `src/{name}`, seeded by `seed`, and an existing
+/// destination `dst/{name}` that differs from it in one byte of its middle
+/// block when `changed`, and in nothing but its time otherwise. Returns the
+/// source's contents and the destination's.
+fn small_update(t: &Tmp, name: &str, seed: u64, changed: bool) -> (Vec<u8>, Vec<u8>) {
+    let new = prng(SMALL, seed);
+    let mut old = new.clone();
+    if changed {
+        old[(1 << 16) + 7] ^= 1;
+    }
+    write(&t.path(&format!("src/{name}")), &new);
+    write(&t.path(&format!("dst/{name}")), &old);
+    for side in ["src", "dst"] {
+        fs::set_permissions(
+            t.path(&format!("{side}/{name}")),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+    }
+    set_mtime(&t.path(&format!("src/{name}")), 1_700_000_000);
+    set_mtime(&t.path(&format!("dst/{name}")), 1_600_000_000);
+    (new, old)
+}
+
+/// What the receiver hashed of existing files, as
+/// `SYQ_TEST_DESTINATION_HASHES` recorded it in `log`: whether it compared
+/// them in groups (`existing`), and not one at a time.
+fn hashed_in_groups(log: &Path) -> bool {
+    let hashed = fs::read_to_string(log).unwrap_or_default();
+    !hashed.is_empty() && hashed.lines().all(|line| line.starts_with("existing "))
+}
+
+/// Small existing files are updated in place in groups, as files the copy
+/// replaces are compared: the receiver hashes them together, and each keeps
+/// its inode and is written only where it changed, with no request of its
+/// own.
+#[cfg(debug_assertions)]
+#[test]
+fn small_files_are_updated_in_place_in_groups() {
+    for route in ["ssh", "tcp", "blocks"] {
+        let t = Tmp::new();
+        let names: Vec<String> = (0..12).map(|index| format!("file{index:02}")).collect();
+        let mut expected = Vec::new();
+        for (seed, name) in names.iter().enumerate() {
+            let (new, _) = small_update(&t, name, 720 + seed as u64, true);
+            expected.push((new, inode(&t.path(&format!("dst/{name}")))));
+        }
+        let (writes, hashes) = (t.path("writes"), t.path("hashes"));
+        let out = rsync_inplace(
+            &t,
+            route,
+            &[],
+            &[
+                ("SYQ_TEST_DESTINATION_WRITES", &writes.to_string_lossy()),
+                ("SYQ_TEST_DESTINATION_HASHES", &hashes.to_string_lossy()),
+                ("SYQ_DEBUG", "1"),
+            ],
+        );
+        assert_output_ok(&out);
+        for (name, (new, before)) in names.iter().zip(&expected) {
+            let destination = t.path(&format!("dst/{name}"));
+            assert!(read(&destination) == *new, "{route}: {name}");
+            assert_eq!(inode(&destination), *before, "{route}: {name}");
+            assert_eq!(
+                fs::metadata(&destination).unwrap().mtime(),
+                1_700_000_000,
+                "{route}: {name}"
+            );
+        }
+        // Only the changed block of each file was written.
+        assert_eq!(written_bytes(&writes), 12 * (64 << 10), "{route}");
+        assert!(
+            hashed_in_groups(&hashes),
+            "{route}: {}",
+            fs::read_to_string(&hashes).unwrap_or_default()
+        );
+        let observed = tuning_observed(&out);
+        assert_eq!(observed["compared_files"], 12, "{route}: {observed}");
+        assert_eq!(observed["patched_files"], 12, "{route}: {observed}");
+        assert_eq!(observed["range_requests"], 0, "{route}: {observed}");
+        assert!(partial_files(&t.0).is_empty(), "{route}");
+    }
+}
+
+/// Each file of a group ends on its own: one is updated in place; one with
+/// another name, and one more widely readable than the copy's mode, are
+/// replaced and counted; an unchanged one is kept, with the source's time;
+/// and one whose write fails fails, with the rest done. `--results` and the
+/// summary count each, and a preview counts what it can foresee.
+#[cfg(debug_assertions)]
+#[test]
+fn each_file_of_an_in_place_group_ends_on_its_own() {
+    let t = Tmp::new();
+    let names = ["mine", "linked", "wider", "unchanged", "failing"];
+    let mut contents = Vec::new();
+    for (seed, name) in names.into_iter().enumerate() {
+        let (new, old) = small_update(&t, name, 740 + seed as u64, name != "unchanged");
+        contents.push((new, old, inode(&t.path(&format!("dst/{name}")))));
+    }
+    fs::set_permissions(t.path("src/wider"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::hard_link(t.path("dst/linked"), t.path("outside")).unwrap();
+    let replaced = serde_json::json!({"other_names": 1, "wider_permissions": 1});
+    let summary = "existing files instead of updating them in place: 1 with other hard links, 1 with wider permissions";
+    // `--hash` lets a preview find the unchanged file as the copy does.
+    let args = ["--copy-metadata=permissions,mtime", "--hash"];
+
+    let preview = t.path("preview.jsonl");
+    let mut previewing = args.to_vec();
+    let preview_arg = preview.to_string_lossy();
+    previewing.extend(["--dry-run", "--results", &preview_arg]);
+    let out = cp_update(&t, "ssh", &previewing, &[]);
+    assert_output_ok(&out);
+    let previewed = terminal(&preview);
+    assert_eq!(previewed["replaced_not_in_place"], replaced, "{previewed}");
+    assert_eq!(previewed["files_transferred"], 4, "{previewed}");
+    assert_eq!(previewed["files_unchanged"], 1, "{previewed}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .contains(&format!("in place: would replace 2 {summary}")),
+        "{out:?}"
+    );
+
+    let (results, hashes) = (t.path("copy.jsonl"), t.path("hashes"));
+    let mut copying = args.to_vec();
+    let results_arg = results.to_string_lossy();
+    copying.extend(["--results", &results_arg]);
+    let out = cp_update(
+        &t,
+        "ssh",
+        &copying,
+        &[
+            ("SYQ_TEST_FAIL_WRITE_RANGE_NAME", "failing"),
+            ("SYQ_TEST_DESTINATION_HASHES", &hashes.to_string_lossy()),
+        ],
+    );
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        stderr_of(&out).contains("failing: ")
+            && stderr_of(&out).contains("test range write failure"),
+        "{out:?}"
+    );
+    let copied = terminal(&results);
+    assert_eq!(copied["replaced_not_in_place"], replaced, "{copied}");
+    assert_eq!(copied["files_transferred"], 3, "{copied}");
+    assert_eq!(copied["files_unchanged"], 1, "{copied}");
+    assert_eq!(copied["errors"], 1, "{copied}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(&format!("syq: replaced 2 {summary}")),
+        "{out:?}"
+    );
+    let dispositions: std::collections::BTreeMap<String, String> = fs::read_to_string(&results)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|record| {
+            record["type"] == "operation_result" && record["action"] == "transfer_file"
+        })
+        .map(|record| {
+            (
+                record["dst"]["value"].as_str().unwrap().to_owned(),
+                record["disposition"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        dispositions,
+        [
+            ("failing", "failed"),
+            ("linked", "succeeded"),
+            ("mine", "succeeded"),
+            ("wider", "succeeded"),
+        ]
+        .into_iter()
+        .map(|(name, disposition)| (name.to_owned(), disposition.to_owned()))
+        .collect(),
+    );
+    // All were compared in one group.
+    assert!(
+        hashed_in_groups(&hashes),
+        "{}",
+        fs::read_to_string(&hashes).unwrap_or_default()
+    );
+    for (name, (new, old, before)) in names.into_iter().zip(&contents) {
+        let destination = t.path(&format!("dst/{name}"));
+        let status = fs::metadata(&destination).unwrap();
+        let (holds, kept) = match name {
+            "mine" | "unchanged" => (new, true),
+            "linked" | "wider" => (new, false),
+            _ => (old, true),
+        };
+        assert!(read(&destination) == *holds, "{name}");
+        assert_eq!(status.ino() == *before, kept, "{name}");
+        if name != "failing" {
+            assert_eq!(status.mtime(), 1_700_000_000, "{name}");
+        }
+    }
+    assert_eq!(
+        fs::metadata(t.path("dst/wider")).unwrap().mode() & 0o777,
+        0o600
+    );
+    assert!(read(&t.path("outside")) == contents[1].1);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+/// Inside a group too, the receiver judges each file just before it writes
+/// it: one that gains another name after the group was compared is
+/// replaced, and the other name keeps its contents, while the rest are
+/// updated in place.
+#[cfg(debug_assertions)]
+#[test]
+fn a_file_linked_after_its_group_was_compared_is_replaced() {
+    let t = Tmp::new();
+    let names = ["a", "b", "c"];
+    let mut contents = Vec::new();
+    for (seed, name) in names.into_iter().enumerate() {
+        let (new, old) = small_update(&t, name, 760 + seed as u64, true);
+        contents.push((new, old, inode(&t.path(&format!("dst/{name}")))));
+    }
+    let (ready, continuation, hashes) = (t.path("ready"), t.path("continue"), t.path("hashes"));
+    let results = t.path("copy.jsonl");
+    let mut child = cp_update_command(
+        &t,
+        "ssh",
+        &["--results", &results.to_string_lossy()],
+        &[
+            ("SYQ_TEST_SMALL_UPDATE_READY_FILE", &ready.to_string_lossy()),
+            (
+                "SYQ_TEST_SMALL_UPDATE_CONTINUE_FILE",
+                &continuation.to_string_lossy(),
+            ),
+            ("SYQ_TEST_DESTINATION_HASHES", &hashes.to_string_lossy()),
+        ],
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .start()
+    .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "the group's first write");
+    fs::hard_link(t.path("dst/b"), t.path("outside")).unwrap();
+    release_confinement_barrier(&continuation);
+    let out = child.wait_with_output().unwrap();
+    assert_output_ok(&out);
+    assert!(
+        hashed_in_groups(&hashes),
+        "{}",
+        fs::read_to_string(&hashes).unwrap_or_default()
+    );
+    for (name, (new, _, before)) in names.into_iter().zip(&contents) {
+        let destination = t.path(&format!("dst/{name}"));
+        assert!(read(&destination) == *new, "{name}");
+        assert_eq!(inode(&destination) == *before, name != "b", "{name}");
+    }
+    assert!(
+        read(&t.path("outside")) == contents[1].1,
+        "the other name was written"
+    );
+    assert_eq!(
+        terminal(&results)["replaced_not_in_place"],
+        serde_json::json!({"other_names": 1})
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(
+            "syq: replaced 1 existing file instead of updating it in place: 1 with other hard links"
+        ),
+        "{out:?}"
+    );
+}
+
+/// A small file whose size changed is not compared, as on the per-file
+/// path without block reuse: in its group, it is sent whole and written
+/// over the existing file, which keeps its inode and takes the new length,
+/// an emptied one too.
+#[cfg(debug_assertions)]
+#[test]
+fn small_files_of_another_size_are_written_whole_in_place_in_groups() {
+    let t = Tmp::new();
+    let new = prng(SMALL, 780);
+    let files = [
+        ("grown", new.clone(), new[..SMALL - 1000].to_vec()),
+        ("shrunk", new.clone(), [&new[..], &[7u8; 5000][..]].concat()),
+        ("emptied", Vec::new(), new[..100].to_vec()),
+    ];
+    let mut inodes = Vec::new();
+    for (name, source, destination) in &files {
+        write(&t.path(&format!("src/{name}")), source);
+        write(&t.path(&format!("dst/{name}")), destination);
+        set_mtime(&t.path(&format!("src/{name}")), 1_700_000_000);
+        inodes.push(inode(&t.path(&format!("dst/{name}"))));
+    }
+    let (writes, hashes) = (t.path("writes"), t.path("hashes"));
+    let out = cp_update(
+        &t,
+        "ssh",
+        &[],
+        &[
+            ("SYQ_TEST_DESTINATION_WRITES", &writes.to_string_lossy()),
+            ("SYQ_TEST_DESTINATION_HASHES", &hashes.to_string_lossy()),
+        ],
+    );
+    assert_output_ok(&out);
+    for ((name, source, _), before) in files.iter().zip(&inodes) {
+        let destination = t.path(&format!("dst/{name}"));
+        assert!(read(&destination) == *source, "{name}");
+        assert_eq!(inode(&destination), *before, "{name}");
+    }
+    assert_eq!(written_bytes(&writes), 2 * SMALL as u64);
+    // The receiver looked at each in its group, and hashed none.
+    let hashed = fs::read_to_string(&hashes).unwrap_or_default();
+    assert_eq!(hashed.lines().count(), 3, "{hashed}");
+    assert!(hashed.lines().all(|line| line == "existing 0"), "{hashed}");
 }

@@ -244,11 +244,68 @@ const CLONE_MIN_REUSED: u64 = 1 << 20;
 /// that replaces a file with it.
 const PREALLOCATE_MIN_STAGE: u64 = 1 << 20;
 
-/// What the receiver does with one patch: keep the file it replaces, or
-/// stage it for publication.
+/// What the receiver does with one patch: keep the file it replaces,
+/// update that file in place, or stage it for publication, with the reason
+/// when the receiver would not change the file in place.
 enum PatchStep<'a> {
     Kept(Option<(u64, u64)>),
-    Staged(Box<SmallPut>, Option<PatchSource<'a>>),
+    Updated(Option<(u64, u64)>),
+    Staged(
+        Box<SmallPut>,
+        Option<PatchSource<'a>>,
+        Option<ReplaceReason>,
+    ),
+}
+
+/// What became of a patch to update in place (`SmallPatch::update_in_place`).
+enum Updated {
+    /// Its file was updated in place, with this identity when the flags ask
+    /// for it.
+    InPlace(Option<(u64, u64)>),
+    /// The receiver will not update the file in place, for this reason: the
+    /// patch is staged, as without the option.
+    Refused(ReplaceReason),
+    /// The name holds no regular file to update: the patch is staged.
+    Absent,
+}
+
+/// Write each run of a patch's new blocks into `file` at its offset, over
+/// whatever old bytes lie there, calling `each` with its offset and length
+/// once it is written. Returns the bytes written. `label` names the file.
+fn write_new_blocks(
+    file: &File,
+    patch: &SmallPatch,
+    sparse: bool,
+    label: &Path,
+    mut each: impl FnMut(u64, usize) -> Result<()>,
+) -> Result<u64> {
+    let mut taken = 0;
+    let mut index = 0;
+    while index < patch.reuse.len() {
+        if patch.reuse[index].is_some() {
+            index += 1;
+            continue;
+        }
+        let off = index as u64 * patch.block;
+        while index < patch.reuse.len() && patch.reuse[index].is_none() {
+            index += 1;
+        }
+        let len = ((index as u64 * patch.block).min(patch.len) - off) as usize;
+        let bytes = patch
+            .data
+            .get(taken..taken + len)
+            .context("patch contents end early")?;
+        // Old bytes lie under these blocks: zeros must replace them.
+        if sparse {
+            crate::sparse::write_at(file, bytes, off, true)
+        } else {
+            file.write_all_at(bytes, off)
+        }
+        .with_context(|| format!("write {} @{off}", label.display()))?;
+        each(off, len)?;
+        taken += len;
+    }
+    Ok(taken as u64)
 }
 
 /// The file a patch reuses blocks of, opened and fingerprinted when the
@@ -526,7 +583,8 @@ impl FsOps {
     /// metadata through the descriptor its contents were read from, as a
     /// content-identical per-file finish does. A writer that extended or
     /// shrank it while it was compared makes it count as changed. Returns the
-    /// kept file's identity, or None when it must be replaced.
+    /// kept file's identity, or else that it must be replaced, and why when
+    /// the receiver refused to change its metadata in place.
     #[allow(clippy::too_many_arguments)]
     fn keep_open_small(
         &mut self,
@@ -537,7 +595,7 @@ impl FsOps {
         flags: u8,
         guarded: bool,
         condition: TargetCondition,
-    ) -> Result<Option<Option<(u64, u64)>>> {
+    ) -> Result<std::result::Result<Option<(u64, u64)>, Option<ReplaceReason>>> {
         #[cfg(debug_assertions)]
         test_race_barrier(
             "SYQ_TEST_SMALL_COMPARED_READY_FILE",
@@ -546,12 +604,12 @@ impl FsOps {
         )?;
         let current = file.metadata()?;
         if current.len() != len {
-            return Ok(None);
+            return Ok(Err(None));
         }
         // A file the receiver cannot vouch for is replaced instead, by a
         // stage built from its blocks (`vouch`).
-        if !vouch::allows(target, file, &current, meta, flags)? {
-            return Ok(None);
+        if let Some(reason) = vouch::declines(target, file, &current, meta, flags)? {
+            return Ok(Err(Some(reason)));
         }
         #[cfg(debug_assertions)]
         fail_set_meta_for_test(&target.label)?;
@@ -566,14 +624,16 @@ impl FsOps {
                 condition,
             )?;
         }
-        Ok(Some(published_identity(file, flags)?))
+        Ok(Ok(published_identity(file, flags)?))
     }
 
     /// Publish each patch as `put_small_batch` publishes a whole file, from
     /// its new contents and the blocks it reuses from the file it replaces.
     /// A reused block must still hash as compared; otherwise that file fails
     /// and nothing of it is written. A patch that reuses every block of an
-    /// existing file that still holds them keeps that file instead.
+    /// existing file that still holds them keeps that file instead, and one
+    /// to update in place writes its new blocks into the existing file where
+    /// the receiver can vouch for it (`update_in_place`).
     /// Each file is built in memory until the batch is published, so a batch
     /// describing more than the protocol allows is refused whole.
     pub(super) fn patch_small_batch(
@@ -587,29 +647,38 @@ impl FsOps {
             Ok(SmallPatched {
                 kept: false,
                 identity: None,
+                replaced: None,
             });
             patches.len()
         ];
         let mut puts = Vec::new();
         let mut sources = Vec::new();
-        let mut positions = Vec::new();
+        let mut staged = Vec::new();
         for (position, patch) in patches.iter().enumerate() {
             match self.prepare_patch(patch) {
-                Ok(PatchStep::Staged(put, source)) => {
+                Ok(PatchStep::Staged(put, source, replaced)) => {
                     puts.push(*put);
                     sources.push(source);
-                    positions.push(position);
+                    staged.push((position, replaced));
                 }
                 Ok(PatchStep::Kept(identity)) => {
                     results[position] = Ok(SmallPatched {
                         kept: true,
                         identity,
+                        replaced: None,
+                    })
+                }
+                Ok(PatchStep::Updated(identity)) => {
+                    results[position] = Ok(SmallPatched {
+                        kept: false,
+                        identity,
+                        replaced: None,
                     })
                 }
                 Err(error) => results[position] = Err(error),
             }
         }
-        for (position, result) in positions
+        for ((position, replaced), result) in staged
             .into_iter()
             .zip(self.put_small_sources(&mut puts, &sources, true))
         {
@@ -617,21 +686,25 @@ impl FsOps {
                 .map(|identity| SmallPatched {
                     kept: false,
                     identity,
+                    replaced,
                 })
                 .map_err(|error| SmallPatchError {
                     error,
                     matched: false,
                     stale_condition: false,
+                    written: false,
                 });
         }
         Ok(results)
     }
 
-    /// Keep the existing file a patch reproduces whole, or stage the patch.
-    /// A file found to match whose keeping fails is reported as matched, so
-    /// the copy does not rewrite the same contents. A file whose blocks the
-    /// patch reuses but that no longer meets its target condition is
-    /// reported as stale, before anything is kept or written.
+    /// Keep the existing file a patch reproduces whole, update it in place,
+    /// or stage the patch. A file found to match whose keeping fails is
+    /// reported as matched, so the copy does not rewrite the same contents.
+    /// A file whose blocks the patch reuses but that no longer meets its
+    /// target condition is reported as stale, before anything is kept or
+    /// written. A file the receiver will not keep, or update in place, is
+    /// staged with the reason.
     fn prepare_patch<'a>(
         &mut self,
         patch: &'a SmallPatch,
@@ -641,9 +714,20 @@ impl FsOps {
                 error: wire_error(&error),
                 matched,
                 stale_condition,
+                written: false,
             }
         };
         check_patch_layout(patch).map_err(failed(false, false))?;
+        // A patch that reproduces its file whole keeps it, through the
+        // metadata step, as without in-place updates.
+        let mut replaced = None;
+        if patch.update_in_place && !reproduces_basis(patch) {
+            match self.update_patch_in_place(patch)? {
+                Updated::InPlace(identity) => return Ok(PatchStep::Updated(identity)),
+                Updated::Refused(reason) => replaced = Some(reason),
+                Updated::Absent => {}
+            }
+        }
         let old = self.open_reused(patch).map_err(failed(false, false))?;
         if let Some((target, file)) = &old {
             require_open_target(file, &target.label, patch.condition)
@@ -663,15 +747,184 @@ impl FsOps {
                         patch.condition,
                     )
                     .map_err(failed(true, false))?;
-                if let Some(identity) = kept {
-                    return Ok(PatchStep::Kept(identity));
+                match kept {
+                    Ok(identity) => return Ok(PatchStep::Kept(identity)),
+                    Err(declined) => replaced = replaced.or(declined),
                 }
             }
         }
         let (put, source) = self
             .stage_patch(patch, old.map(|(_, file)| file))
             .map_err(failed(false, false))?;
-        Ok(PatchStep::Staged(Box::new(put), source))
+        Ok(PatchStep::Staged(Box::new(put), source, replaced))
+    }
+
+    /// `--in-place=update`: write a patch's new blocks into the existing
+    /// file at its name, as the per-file path writes its ranges, when the
+    /// receiver can vouch for that (`vouch::update_refusal`), judged
+    /// through the descriptor it writes, just before writing. The blocks
+    /// the patch reuses must still be the file's: its fingerprint shows
+    /// nothing has changed it since they were hashed, or they hash as
+    /// compared again. The file is then finished as an in-place file is,
+    /// and fails if its write or finish does, as it may hold some of its
+    /// new contents by then. A file that does not meet the patch's target
+    /// condition is stale, with nothing written.
+    fn update_patch_in_place(
+        &mut self,
+        patch: &SmallPatch,
+    ) -> std::result::Result<Updated, SmallPatchError> {
+        let failed = |stale_condition, written| {
+            move |error: anyhow::Error| SmallPatchError {
+                error: wire_error(&error),
+                matched: false,
+                stale_condition,
+                written,
+            }
+        };
+        #[cfg(debug_assertions)]
+        test_race_barrier(
+            "SYQ_TEST_SMALL_UPDATE_READY_FILE",
+            "SYQ_TEST_SMALL_UPDATE_CONTINUE_FILE",
+            "small-file update in place",
+        )
+        .map_err(failed(false, false))?;
+        let target = self
+            .destination_mutation_target(&patch.path, patch.guard.as_ref())
+            .map_err(failed(false, false))?;
+        let (file, opened) = match self.open_to_update(&target, &patch.meta, patch.flags) {
+            Ok(Some(opened)) => opened,
+            Ok(None) => return Ok(Updated::Absent),
+            Err(error) => {
+                return match vouch::replace_reason(&error) {
+                    Some(reason) => Ok(Updated::Refused(reason)),
+                    None => Err(failed(false, false)(error)),
+                }
+            }
+        };
+        require_open_target_known(&opened, &target.label, patch.condition)
+            .map_err(failed(true, false))?;
+        let refused = vouch::update_refusal(
+            (&target).into(),
+            &file,
+            &opened,
+            &patch.meta,
+            patch.flags,
+            || self.inherited_acl(&target),
+        )
+        .map_err(failed(false, false))?;
+        if let Some((reason, _)) = refused {
+            return Ok(Updated::Refused(reason));
+        }
+        if patch.basis != Some(fingerprint(&opened)) && !self.still_holds_reused(&file, patch)? {
+            return Err(failed(false, false)(anyhow!(
+                "the destination {} changed after it was compared",
+                target.label.display()
+            )));
+        }
+        self.uncache_rooted(&target.root, &target.relative);
+        self.write_patch_in_place(&target, &file, patch)
+            .map(Updated::InPlace)
+            .map_err(failed(false, true))
+    }
+
+    /// Whether `file` still holds each run of the blocks a patch reuses, up
+    /// to a chunk at a time, as compared.
+    fn still_holds_reused(
+        &self,
+        file: &File,
+        patch: &SmallPatch,
+    ) -> std::result::Result<bool, SmallPatchError> {
+        let run = chunk_blocks(patch.block);
+        let mut buffer = Vec::new();
+        let mut index = 0;
+        while index < patch.reuse.len() {
+            if patch.reuse[index].is_none() {
+                index += 1;
+                continue;
+            }
+            let mut end = index + 1;
+            while end < patch.reuse.len() && end - index < run && patch.reuse[end].is_some() {
+                end += 1;
+            }
+            let off = index as u64 * patch.block;
+            buffer.resize(
+                ((end as u64 * patch.block).min(patch.len) - off) as usize,
+                0,
+            );
+            let holds = self
+                .holds_blocks(
+                    file,
+                    off,
+                    &mut buffer,
+                    patch.block,
+                    &patch.reuse[index..end],
+                )
+                .map_err(|error| SmallPatchError {
+                    error: wire_error(&error),
+                    matched: false,
+                    stale_condition: false,
+                    written: false,
+                })?;
+            if !holds {
+                return Ok(false);
+            }
+            index = end;
+        }
+        Ok(true)
+    }
+
+    /// Write a patch's new blocks into `file`, the existing file at
+    /// `target` opened to update it in place, set its length, and finish
+    /// it: its metadata through the checks for any metadata change, read
+    /// after the writes, and then only while its name still leads to it
+    /// where that can be shown, as an in-place file is finalized
+    /// (`finalize_held`). Returns its identity, when the flags ask for it.
+    fn write_patch_in_place(
+        &self,
+        target: &RootedTarget,
+        file: &File,
+        patch: &SmallPatch,
+    ) -> Result<Option<(u64, u64)>> {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_FAIL_WRITE_RANGE_NAME")
+            .is_some_and(|name| target.label.file_name() == Some(name.as_os_str()))
+        {
+            bail!("test range write failure");
+        }
+        let writing = self
+            .operation
+            .span(crate::transfer_observations::Stage::DestinationWrite);
+        let written = write_new_blocks(file, patch, self.sparse, &target.label, |_off, _len| {
+            #[cfg(debug_assertions)]
+            record_test_event(
+                "SYQ_TEST_DESTINATION_WRITES",
+                format_args!("write {_off} {_len}"),
+            )?;
+            Ok(())
+        })?;
+        writing.bytes(written);
+        drop(writing);
+        if self.sparse {
+            crate::sparse::set_len(file, patch.len)?;
+        } else {
+            file.set_len(patch.len)?;
+        }
+        check_destination_writes(file, &target.label)?;
+        let current = file.metadata()?;
+        finish_updated_metadata(target, file, &current, &patch.meta, patch.flags)?;
+        if patch.guard.is_some()
+            || patch.condition != TargetCondition::Any
+            || target.root.link_counts_trusted_on(current.dev(), file)
+        {
+            require_rooted_named_identity_known(
+                &target.root,
+                &target.relative,
+                &target.label,
+                &current,
+                patch.condition,
+            )?;
+        }
+        Ok(known_identity(&current, patch.flags))
     }
 
     /// The existing file whose blocks a patch reuses, or that it may keep,
@@ -804,27 +1057,11 @@ impl FsOps {
             self.operation
                 .span(crate::transfer_observations::Stage::DestinationWrite)
         });
-        let mut taken = 0;
-        for (index, reuse) in patch.reuse.iter().enumerate() {
-            if reuse.is_some() {
-                continue;
-            }
-            let off = index as u64 * patch.block;
-            let len = patch.block.min(patch.len - off) as usize;
-            let bytes = &patch.data[taken..taken + len];
-            // Old bytes lie under these blocks: zeros must replace them.
-            if self.sparse {
-                crate::sparse::write_at(file, bytes, off, true)
-            } else {
-                file.write_all_at(bytes, off)
-            }
-            .with_context(|| format!("write {} @{off}", stage.label.display()))?;
-            taken += len;
-        }
+        let taken = write_new_blocks(file, patch, self.sparse, &stage.label, |_, _| Ok(()))?;
         match (&writing, unobserved) {
-            (Some(writing), _) => writing.bytes(taken as u64),
+            (Some(writing), _) => writing.bytes(taken),
             (None, Some(bytes)) => {
-                bytes.fetch_add(taken as u64, Ordering::Relaxed);
+                bytes.fetch_add(taken, Ordering::Relaxed);
             }
             (None, None) => {}
         }
@@ -1581,6 +1818,7 @@ mod tests {
             unchanged_flags: 0,
             condition: TargetCondition::Any,
             guard: None,
+            update_in_place: false,
         }
     }
 
@@ -1678,6 +1916,7 @@ mod tests {
                 unchanged_flags: flags::TIMES,
                 condition: TargetCondition::Any,
                 guard: None,
+                update_in_place: false,
             };
         let reuse_all: Vec<_> = expected.iter().copied().map(Some).collect();
         let mut new_tail = vec![7u8; block as usize];
@@ -1715,7 +1954,8 @@ mod tests {
             results[0],
             Ok(SmallPatched {
                 kept: true,
-                identity: None
+                identity: None,
+                replaced: None
             })
         );
         assert_eq!(inode("same"), before.0);
@@ -1727,7 +1967,8 @@ mod tests {
             results[1],
             Ok(SmallPatched {
                 kept: false,
-                identity: None
+                identity: None,
+                replaced: None
             })
         );
         assert_ne!(inode("edited"), before.1);
@@ -2156,6 +2397,7 @@ mod tests {
             unchanged_flags: 0,
             condition: TargetCondition::Any,
             guard: None,
+            update_in_place: false,
         };
         let results = refusing_clones(true, || ops.patch_small_batch(&[patch])).unwrap();
         assert!(results[0].is_ok(), "{:?}", results[0]);
@@ -2332,6 +2574,7 @@ mod tests {
                 unchanged_flags: 0,
                 condition: TargetCondition::Any,
                 guard: None,
+                update_in_place: false,
             };
             let malformed = |change: &dyn Fn(&mut SmallPatch)| {
                 let mut patch = valid.clone();
@@ -2399,6 +2642,7 @@ mod tests {
             unchanged_flags: 0,
             condition: TargetCondition::Any,
             guard: None,
+            update_in_place: false,
         };
         let patches = [
             patch("touched", hashed[0].as_ref().unwrap()),
@@ -2428,7 +2672,8 @@ mod tests {
             results[0],
             Ok(SmallPatched {
                 kept: true,
-                identity: None
+                identity: None,
+                replaced: None
             })
         );
         assert_eq!(inode("touched"), before);
@@ -2459,6 +2704,7 @@ mod tests {
             unchanged_flags: 0,
             condition: TargetCondition::Any,
             guard: None,
+            update_in_place: false,
         };
         let mut ops = receiver(directory);
         let error = ops
@@ -2521,6 +2767,7 @@ mod tests {
             unchanged_flags: 0,
             condition: TargetCondition::Any,
             guard: None,
+            update_in_place: false,
         };
         let results = ops.patch_small_batch(&[patch]).unwrap();
         assert!(results[0].is_err(), "{:?}", results[0]);
@@ -3399,7 +3646,8 @@ mod tests {
                     outcome,
                     Ok(SmallPatched {
                         kept: false,
-                        identity: None
+                        identity: None,
+                        replaced: None
                     }),
                     "{case}"
                 );
@@ -3612,7 +3860,7 @@ mod tests {
             ops.handle(&Request::PatchEnd { commit: true }),
             Response::PatchedBatch(outcome) if outcome == vec![Ok(SmallPatched {
                 kept: false,
-                identity: None
+                identity: None, replaced: None
             })]
         ));
         assert_eq!(fs::read(directory.join("file")).unwrap(), new);

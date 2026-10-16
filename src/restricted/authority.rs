@@ -1733,6 +1733,21 @@ impl RestrictedAuthority {
                 bail!("kept and published metadata flags differ beyond times");
             }
             self.check_flags(patch.unchanged_flags)?;
+            // A patch that updates its file in place passes the rules of an
+            // in-place preparation too (`Request::Prepare` with `update`):
+            // under a grant for it, and with metadata the grant allows,
+            // which the receiver checks again as it finishes the file.
+            if patch.update_in_place {
+                if !self
+                    .copy
+                    .policy
+                    .publication
+                    .updates_existing_files_in_place()
+                {
+                    bail!("small-file patch does not match the signed publication policy");
+                }
+                self.constrain_inplace(&patch.path)?;
+            }
             self.charge_bytes(&patch.path, 0, patch.data.len())?;
             self.constrain_creation(&patch.path, &mut patch.condition, false, index, pending)?;
             self.constrain_update(&patch.path, Some(&mut patch.condition), pending)?;
@@ -2767,6 +2782,9 @@ impl RestrictedAuthority {
                 if !patch.data.is_empty() {
                     bail!("a streamed patch carries its data in pieces");
                 }
+                if patch.update_in_place {
+                    bail!("a streamed patch is staged, not written in place");
+                }
                 self.check_comparison_request(patch.block, patch.len)?;
                 let blocks = patch.len.div_ceil(patch.block);
                 if patch.reuse.len() as u64 != blocks {
@@ -2964,6 +2982,7 @@ impl PatchStreamGate {
                     error: error.to_string().into(),
                     matched: false,
                     stale_condition: false,
+                    written: false,
                 })]),
             );
         }
