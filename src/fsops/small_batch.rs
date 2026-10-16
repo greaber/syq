@@ -257,6 +257,15 @@ enum PatchStep<'a> {
     ),
 }
 
+/// What keeping a file that a patch reproduces came to (`keep_open_small`).
+enum Keep {
+    /// Kept, with this identity when the flags ask for it.
+    Kept(Option<(u64, u64)>),
+    /// It must be replaced, and why when the receiver refused to change its
+    /// metadata in place.
+    Replace(Option<ReplaceReason>),
+}
+
 /// What became of a patch to update in place (`SmallPatch::update_in_place`).
 enum Updated {
     /// Its file was updated in place, with this identity when the flags ask
@@ -582,9 +591,7 @@ impl FsOps {
     /// Keep an existing file found to hold a small file's contents: set its
     /// metadata through the descriptor its contents were read from, as a
     /// content-identical per-file finish does. A writer that extended or
-    /// shrank it while it was compared makes it count as changed. Returns the
-    /// kept file's identity, or else that it must be replaced, and why when
-    /// the receiver refused to change its metadata in place.
+    /// shrank it while it was compared makes it count as changed.
     #[allow(clippy::too_many_arguments)]
     fn keep_open_small(
         &mut self,
@@ -595,7 +602,7 @@ impl FsOps {
         flags: u8,
         guarded: bool,
         condition: TargetCondition,
-    ) -> Result<std::result::Result<Option<(u64, u64)>, Option<ReplaceReason>>> {
+    ) -> Result<Keep> {
         #[cfg(debug_assertions)]
         test_race_barrier(
             "SYQ_TEST_SMALL_COMPARED_READY_FILE",
@@ -604,12 +611,12 @@ impl FsOps {
         )?;
         let current = file.metadata()?;
         if current.len() != len {
-            return Ok(Err(None));
+            return Ok(Keep::Replace(None));
         }
         // A file the receiver cannot vouch for is replaced instead, by a
         // stage built from its blocks (`vouch`).
         if let Some(reason) = vouch::declines(target, file, &current, meta, flags)? {
-            return Ok(Err(Some(reason)));
+            return Ok(Keep::Replace(Some(reason)));
         }
         #[cfg(debug_assertions)]
         fail_set_meta_for_test(&target.label)?;
@@ -624,7 +631,7 @@ impl FsOps {
                 condition,
             )?;
         }
-        Ok(Ok(published_identity(file, flags)?))
+        Ok(Keep::Kept(published_identity(file, flags)?))
     }
 
     /// Publish each patch as `put_small_batch` publishes a whole file, from
@@ -748,8 +755,8 @@ impl FsOps {
                     )
                     .map_err(failed(true, false))?;
                 match kept {
-                    Ok(identity) => return Ok(PatchStep::Kept(identity)),
-                    Err(declined) => replaced = replaced.or(declined),
+                    Keep::Kept(identity) => return Ok(PatchStep::Kept(identity)),
+                    Keep::Replace(declined) => replaced = replaced.or(declined),
                 }
             }
         }
