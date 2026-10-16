@@ -264,6 +264,7 @@ fn a_restricted_connection_with_a_streamed_patch_open_carries_nothing_else() {
         unchanged_flags: flags::RECEIVER_MODE | flags::TIMES,
         condition: TargetCondition::Any,
         guard: None,
+        update_in_place: false,
     };
     let new_data = new[..3 * block as usize].to_vec();
     let piece = |data: &[u8]| Request::PatchData {
@@ -350,7 +351,7 @@ fn a_restricted_connection_with_a_streamed_patch_open_carries_nothing_else() {
         &Request::PatchEnd { commit: true },
     );
     assert!(
-        matches!(&reply, Response::PatchedBatch(outcome) if outcome == &vec![Ok(SmallPatched { kept: false, identity: None })]),
+        matches!(&reply, Response::PatchedBatch(outcome) if outcome == &vec![Ok(SmallPatched { kept: false, identity: None, replaced: None })]),
         "{reply:?}"
     );
     assert_eq!(authority.in_flight(), 0);
