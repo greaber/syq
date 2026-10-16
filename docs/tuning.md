@@ -230,7 +230,12 @@ its metadata is updated. Comparing a batch of files costs about one round trip,
 however many files it holds. A file of which more than 16 MiB differs sends
 its differing blocks after its batch, in pieces of about 4 MiB (or one
 comparison block, when that is larger) as they are read, and the receiving
-side writes each piece as it arrives.
+side writes each piece as it arrives. With
+[`--in-place=update`](reference.md#in-place-writes), an existing file of up to
+16 MiB that syq updates in place goes in these batches too, except in a
+same-machine copy without block reuse: the receiving side writes into the file
+where it is only the blocks that differ, or the whole file when the strategy
+does not compare it.
 
 Explicit `--hash` comparisons of files up to 64 MiB use the same batches;
 without block reuse, they only decide whether a file is unchanged, and a file
