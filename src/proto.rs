@@ -69,6 +69,12 @@ pub fn hash_response_fits(block: u64, len: u64) -> bool {
         .is_some_and(|bytes| bytes < MAX_FRAME as u64)
 }
 
+/// Most bytes, a whole number of `block`s, whose hashes fit one response
+/// (`hash_response_fits`): a larger file is compared in windows of this size.
+pub fn hash_response_window(block: u64) -> u64 {
+    (MAX_FRAME as u64 - HASH_RESPONSE_OVERHEAD - 1) / HASH_RESPONSE_BYTES_PER_ENTRY * block
+}
+
 /// Largest file one `SmallPatch` may describe: as large as a whole patch
 /// batch (`patch_batch_fits`).
 pub const MAX_PATCH_FILE_BYTES: u64 = MAX_READ_BYTES;
@@ -343,15 +349,6 @@ pub enum TargetCondition {
     },
 }
 
-/// Stable authority boundary for every descendant mutation in a guarded
-/// native placement.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-pub struct ContainerGuard {
-    pub root: PathBytes,
-    pub dev: u64,
-    pub ino: u64,
-}
-
 /// One whole-file read in the pipelined small-file path.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallRead {
@@ -378,7 +375,6 @@ pub struct SmallPut {
     /// explicit --inplace policy; the default keeps atomic sidecar publication.
     pub inplace: bool,
     pub condition: TargetCondition,
-    pub guard: Option<ContainerGuard>,
     /// The sender saw a file at this path while planning. The receiver only
     /// schedules by it: what publication does is decided by `condition`.
     pub replaces: bool,
@@ -422,7 +418,6 @@ pub struct ExistingRead {
     pub path: PathBytes,
     pub len: u64,
     pub condition: TargetCondition,
-    pub guard: Option<ContainerGuard>,
 }
 
 /// The comparison hashes of the blocks an existing file holds whole, and
@@ -484,7 +479,6 @@ pub struct SmallPatch {
     /// Metadata flags for keeping the existing file.
     pub unchanged_flags: u8,
     pub condition: TargetCondition,
-    pub guard: Option<ContainerGuard>,
 }
 
 impl SmallPatch {
@@ -940,7 +934,6 @@ pub enum WireRequest<Data> {
         follow_root: bool,
         ignore: Vec<String>,
         report_ignored: bool,
-        guard: Option<ContainerGuard>,
     },
     /// List at most one bounded page of names in a single directory. This is
     /// a read-only control-connection operation used by shell completion.
@@ -972,7 +965,6 @@ pub enum WireRequest<Data> {
         /// used only outside a source session or by `--insecure-links`.
         sources: Option<Vec<RegisteredPath>>,
         follow: bool,
-        guard: Option<ContainerGuard>,
     },
     /// Resolve an operator-supplied directory component by component. A
     /// missing suffix is accepted only when requested.
@@ -1036,11 +1028,9 @@ pub enum WireRequest<Data> {
     PartialPaths {
         paths: Vec<PathBytes>,
         copy_id: CopyId,
-        guard: Option<ContainerGuard>,
     },
     Apply {
         ops: Vec<Op>,
-        guard: Option<ContainerGuard>,
     },
     /// Resolve sidecar names and inspect an existing destination batch in one
     /// turn. Leaf stats are returned only when every directory is still a
@@ -1050,7 +1040,6 @@ pub enum WireRequest<Data> {
         copy_id: CopyId,
         directories: Vec<PathBytes>,
         others: Vec<PathBytes>,
-        guard: Option<ContainerGuard>,
         /// Fail on unreadable entries instead of treating them as absent.
         strict_metadata: bool,
     },
@@ -1059,7 +1048,6 @@ pub enum WireRequest<Data> {
     ProbePartial {
         path: PathBytes,
         copy_id: CopyId,
-        guard: Option<ContainerGuard>,
     },
     /// Inspect and, when requested, create/adjust the write target for `path`.
     /// Returns Prepared with the private size observed before adjustment and
@@ -1082,7 +1070,6 @@ pub enum WireRequest<Data> {
         scanned: ScannedDestination,
         attempt: u32,
         create_if_missing: bool,
-        guard: Option<ContainerGuard>,
         /// The group publication gives the file, when it sets one. A new
         /// in-place file that would start with another group is created
         /// owner-only.
@@ -1102,7 +1089,6 @@ pub enum WireRequest<Data> {
         block: u64,
         len: u64,
         condition: TargetCondition,
-        guard: Option<ContainerGuard>,
         /// As in `Prepare`: the receiver says, with the hashes, whether it
         /// would update the file in place (`Response::HeldHashes::refused`).
         update: Option<Box<InPlaceUpdate>>,
@@ -1117,7 +1103,6 @@ pub enum WireRequest<Data> {
         meta: Meta,
         flags: u8,
         condition: TargetCondition,
-        guard: Option<ContainerGuard>,
     },
     /// Copy one optional donor into the private sidecar and return hashes of
     /// the exact buffers written. The controller must repair differing blocks
@@ -1131,7 +1116,6 @@ pub enum WireRequest<Data> {
         final_ranges: Option<Vec<(u64, u64)>>,
         block: u64,
         attempt: u32,
-        guard: Option<ContainerGuard>,
         /// Clone the final file `final_ranges` select into the sidecar where
         /// the filesystem can, and hash those ranges from the sidecar, rather
         /// than copying them. The file may have changed since it was
@@ -1175,7 +1159,6 @@ pub enum WireRequest<Data> {
         block: u64,
         len: u64,
         attempt: u32,
-        guard: Option<ContainerGuard>,
     },
     ReadRange {
         path: PathBytes,
@@ -1197,7 +1180,6 @@ pub enum WireRequest<Data> {
         hash: ContentDigest,
         #[serde(with = "serde_bytes")]
         data: Data,
-        guard: Option<ContainerGuard>,
     },
     Finalize {
         expected_hash: Option<crate::hashing::ExpectedHashes>,
@@ -1209,7 +1191,6 @@ pub enum WireRequest<Data> {
         /// What the sender's scan found at `path`.
         scanned: ScannedDestination,
         condition: TargetCondition,
-        guard: Option<ContainerGuard>,
     },
     /// Verify and atomically publish a complete small-file batch in one frame.
     PutSmallBatch(Vec<SmallPut>),
@@ -1218,13 +1199,11 @@ pub enum WireRequest<Data> {
         /// Authoritative for source hashing when present. Destination hashing
         /// omits it; a confined source session rejects an omission.
         source: Option<RegisteredPath>,
-        guard: Option<ContainerGuard>,
     },
     /// Absolute, normalized form of a path on this endpoint (symlinks in the
     /// existing prefix resolved).
     Canonicalize {
         path: PathBytes,
-        guard: Option<ContainerGuard>,
     },
     /// Kernel TCP_INFO/TCP_CONNECTION_INFO for this end of a direct data
     /// socket. SSH data transports report None at the coordinator instead of
@@ -1283,14 +1262,12 @@ pub enum WireRequest<Data> {
     /// than a missing path fail the request rather than looking absent.
     PruneLookup {
         paths: Vec<PathBytes>,
-        guard: Option<ContainerGuard>,
     },
     // Append new variants: released completion payloads retain their indexes.
     ConfigureHashing(crate::hashing::HashPolicy),
     ValidateDigest {
         path: PathBytes,
         expected: crate::hashing::ExpectedHashes,
-        guard: Option<ContainerGuard>,
     },
     DescriptorCopy(crate::descriptor_copy::Operation),
     /// Reuse a drained stream worker within its original endpoint session.
@@ -1303,6 +1280,10 @@ pub enum WireRequest<Data> {
         /// A new directory whose mode lacks owner access, as `syq rsync`
         /// creates one, gets that mode only after its contents.
         narrow_new_directories: bool,
+        /// The copy keeps existing files and copies hard links: a hard link
+        /// gives a new name only to a file this copy created
+        /// (`fsops::owned`).
+        own_links: bool,
     },
     NativeMap(crate::native_map::Options),
     /// Configure and select a bounded small push without reading its payloads.
@@ -1315,7 +1296,6 @@ pub enum WireRequest<Data> {
         block: u64,
         allow_final: bool,
         attempt: u32,
-        guard: Option<ContainerGuard>,
     },
     /// Hash one bounded window of the prepared private output.
     HashWindow {
@@ -1326,7 +1306,6 @@ pub enum WireRequest<Data> {
         len: u32,
         block: u64,
         attempt: u32,
-        guard: Option<ContainerGuard>,
     },
     /// Commit the exact destination buffer previously hashed for this window.
     ReuseComparedRange {
@@ -1335,7 +1314,6 @@ pub enum WireRequest<Data> {
         attempt: u32,
         off: u64,
         len: u32,
-        guard: Option<ContainerGuard>,
     },
     /// Read once, returning either a match or those same bytes for writing.
     ReadComparedRange {
@@ -1399,7 +1377,6 @@ pub enum WireRequest<Data> {
     WidenDirectories {
         directories: Vec<(PathBytes, TargetCondition)>,
         remember: bool,
-        guard: Option<ContainerGuard>,
         access: u32,
     },
     /// Ancestry validation that may briefly add owner search permission to
@@ -1426,15 +1403,14 @@ pub enum WireRequest<Data> {
     /// destination `path`: give the owned directories on the way to it the
     /// owner search permission reaching it needs and, with `create_missing`,
     /// the nearest existing one write permission to create its missing part.
-    /// With `guard`, set by a restricted receiver's authority, only the
-    /// directories from the enrolled root down are walked. The connection
+    /// On a restricted receiver, whose root is installed from the start,
+    /// only the directories from that root down are walked. The connection
     /// keeps the saved modes until RestoreDestinationPath, or restores them
     /// when it ends. Replies Ok.
     PrepareDestinationPath {
         path: PathBytes,
         symlink_policy: OperatorSymlinkPolicy,
         create_missing: bool,
-        guard: Option<ContainerGuard>,
     },
     /// Restore the modes PrepareDestinationPath changed. Replies Ok.
     RestoreDestinationPath,
@@ -1448,7 +1424,6 @@ pub enum WireRequest<Data> {
         /// The destination directory, where a probe goes.
         path: PathBytes,
         probe: bool,
-        guard: Option<ContainerGuard>,
     },
 }
 
@@ -1600,6 +1575,9 @@ pub enum SmallCopyDisposition {
 pub struct SmallCopyFileResult {
     pub disposition: SmallCopyDisposition,
     pub error: Option<WireError>,
+    /// A file kept unchanged had its metadata changed in place, or tried
+    /// to when `error` says so.
+    pub repaired: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1843,7 +1821,9 @@ pub struct DestinationFilesystemInfo {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct DestinationFilesystemTarget {
-    /// Directory path relative to the retained destination root.
+    /// Directory path relative to the retained destination root: one
+    /// component of a selected directory, or any directory beneath an
+    /// installed root.
     pub relative_path: PathBytes,
     pub dev: u64,
     pub ino: u64,
@@ -1856,6 +1836,16 @@ pub struct WireError {
     /// diagnostics because their values differ between operating systems.
     pub io_kind: Option<WireIoKind>,
     pub raw_os_error: Option<i32>,
+    /// The destination did not meet the operation's condition
+    /// (`TargetCondition`): something held a name to be created without
+    /// replacing, or the object to update was gone or another. The
+    /// receiver found this before changing anything
+    /// (`fsops::condition_not_met`).
+    pub condition_not_met: bool,
+    /// The receiver changed nothing for this operation: its condition was
+    /// not met, or it found it could not be done before starting
+    /// (`fsops::unchanged`).
+    pub unchanged: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
@@ -1940,6 +1930,9 @@ impl ReplaceReason {
 pub struct InPlaceUpdate {
     pub meta: Meta,
     pub flags: u8,
+    /// Under `--only-existing`, the identity of the file the scan found:
+    /// only that file is written, and nothing is created at the name.
+    pub only: Option<(u64, u64)>,
 }
 
 impl WireError {
@@ -1954,6 +1947,8 @@ impl From<String> for WireError {
             message,
             io_kind: None,
             raw_os_error: None,
+            condition_not_met: false,
+            unchanged: false,
         }
     }
 }

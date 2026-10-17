@@ -448,6 +448,8 @@ fn pipeline_worker(
         src_remote: false,
         dst_remote: true,
         restricted_receiver: false,
+        receiver_paces_file_data: false,
+        own_links: false,
         dry_run: false,
         dry_run_metadata_files: AtomicU64::new(0),
         quiet: true,
@@ -577,7 +579,7 @@ fn prune_pipeline_timing() {
             .replies
             .extend((0..8).map(|_| Response::Stats(vec![None; 512])));
         let start = std::time::Instant::now();
-        lookup_prune_aliases(&mut PipelineConn(state.clone()), &walk, None).unwrap();
+        lookup_prune_aliases(&mut PipelineConn(state.clone()), &walk).unwrap();
         eprintln!(
             "simulated RTT=20ms paths=4096 sequential={synchronous} elapsed={:?}",
             start.elapsed()
@@ -608,7 +610,7 @@ fn prune_walk_drops_synced_entries_and_skips_empty_candidate_lookups() {
     walk.finish_scan(b"dst");
     assert_eq!(walk.unmatched.len(), 1_000);
     let state = Arc::new(Mutex::new(PipelineState::default()));
-    let aliases = lookup_prune_aliases(&mut PipelineConn(state.clone()), &walk, None).unwrap();
+    let aliases = lookup_prune_aliases(&mut PipelineConn(state.clone()), &walk).unwrap();
     assert!(aliases.is_empty());
     assert!(state.lock().unwrap().requests.is_empty());
 }
@@ -663,7 +665,7 @@ fn prune_alias_lookups_are_bounded_and_keep_only_candidate_identities() {
         Response::Stats(vec![None; 512]),
         Response::Stats(vec![Some(candidate.clone())]),
     ]);
-    let aliases = lookup_prune_aliases(&mut PipelineConn(state.clone()), &walk, None).unwrap();
+    let aliases = lookup_prune_aliases(&mut PipelineConn(state.clone()), &walk).unwrap();
     assert_eq!(aliases.len(), 1);
     assert_eq!(aliases[&(candidate.dev, candidate.ino)], Claim::Leaf);
     assert_eq!(state.lock().unwrap().requests.len(), 7);
@@ -677,7 +679,7 @@ fn prune_alias_lookups_are_bounded_and_keep_only_candidate_identities() {
         Response::Stats(vec![None; 512]),
         Response::Stats(vec![None; 512]),
     ]);
-    assert!(lookup_prune_aliases(&mut PipelineConn(malformed.clone()), &walk, None).is_err());
+    assert!(lookup_prune_aliases(&mut PipelineConn(malformed.clone()), &walk).is_err());
     assert!(malformed.lock().unwrap().replies.is_empty());
 }
 
@@ -1224,6 +1226,8 @@ fn later_batch_read_error_keeps_publications_and_requeues_unwritten_files() {
             message: "injected read denial after publishing earlier files".into(),
             io_kind: Some(crate::proto::WireIoKind::PermissionDenied),
             raw_os_error: None,
+            condition_not_met: false,
+            unchanged: false,
         }));
 
     let mut worker = pipeline_worker(&sched, &src, &dst, false);
@@ -2005,6 +2009,8 @@ fn endpoint_semantic_error_kind_wins_over_numeric_errno() {
         // belong to the receiver ABI and must never drive coordinator
         // policy.
         raw_os_error: Some(libc::ENOSPC),
+        condition_not_met: false,
+        unchanged: false,
     };
     assert_eq!(wire_os_kind(&error), Some("quota_exceeded"));
     assert!(capacity_os_kind(wire_os_kind(&error)));
@@ -2017,6 +2023,8 @@ fn mkdir_apply_error_preserves_endpoint_os_kind() {
         message: "destination is full".into(),
         io_kind: Some(WireIoKind::NoSpace),
         raw_os_error: Some(libc::ENOSPC),
+        condition_not_met: false,
+        unchanged: false,
     };
     let error = mkdir_apply_result(vec![None, Some(error)]).unwrap_err();
     assert_eq!(os_kind_of(&error), Some("no_space"));
@@ -2246,7 +2254,6 @@ fn large_small_file_batches_bound_long_path_frames_and_preserve_every_file() {
         paths: jobs.iter().map(|job| job.src.clone()).collect(),
         sources: Some(jobs.iter().map(|job| job.source.clone()).collect()),
         follow: false,
-        guard: None,
     };
     assert!(FrameWriter::new(Vec::new(), false)
         .write_msg(&oversized)
@@ -4982,7 +4989,7 @@ fn restricted_destination(
     requests: Arc<Mutex<Vec<Request>>>,
     mut before_patch: impl FnMut() + Send + 'static,
 ) -> Box<dyn Conn> {
-    let mut ops = crate::fsops::FsOps::new();
+    let mut ops = authority.test_ops();
     let mut gate = crate::restricted::PatchStreamGate::new(authority);
     Box::new(AnsweringConn {
         answer: move |mut request: Request| {
@@ -5733,6 +5740,8 @@ fn directory_access_advice_needs_evidence_and_an_available_option() {
         message: "destination permission denied".into(),
         io_kind: Some(WireIoKind::OwnedDirectoryPermissions),
         raw_os_error: Some(libc::EACCES),
+        condition_not_met: false,
+        unchanged: false,
     };
     assert_eq!(wire_os_kind(&error), Some("permission_denied"));
     let error = endpoint_error(error).context("prepare file");
@@ -5763,14 +5772,9 @@ fn strict_destination_inspection_uses_path_bytes_instead_of_a_small_count_limit(
         let requests = Arc::clone(&observed);
         let mut conn = AnsweringConn {
             answer: move |request| {
-                let Request::PruneLookup { paths, guard } = request else {
+                let Request::PruneLookup { paths } = request else {
                     panic!("wrong inspection request")
                 };
-                let guard = guard.expect("missing container guard");
-                assert_eq!(
-                    (guard.root.as_slice(), guard.dev, guard.ino),
-                    (b"root".as_slice(), 1, 2)
-                );
                 let bytes = paths
                     .iter()
                     .map(|path| source_request_bytes(path, None))
@@ -5782,17 +5786,7 @@ fn strict_destination_inspection_uses_path_bytes_instead_of_a_small_count_limit(
             },
             replies: Default::default(),
         };
-        let entries = inspect_destination_paths(
-            &mut conn,
-            paths.clone(),
-            Some(ContainerGuard {
-                root: b"root".to_vec(),
-                dev: 1,
-                ino: 2,
-            }),
-            "preview",
-        )
-        .unwrap();
+        let entries = inspect_destination_paths(&mut conn, paths.clone(), "preview").unwrap();
         assert_eq!(entries.len(), paths.len());
         let observed = observed.lock().unwrap();
         assert_eq!(observed.len(), if long { 4 } else { 1 });
@@ -5810,19 +5804,17 @@ fn strict_destination_inspection_keeps_denials_and_checks_reply_count() {
         answer: move |_| Response::EndpointError(denied.clone()),
         replies: Default::default(),
     };
-    let error = inspect_destination_paths(&mut conn, vec![b"denied".to_vec()], None, "preview")
-        .unwrap_err();
+    let error =
+        inspect_destination_paths(&mut conn, vec![b"denied".to_vec()], "preview").unwrap_err();
     assert_eq!(os_kind_of(&error), Some("permission_denied"));
     let mut conn = AnsweringConn {
         answer: |_| Response::Stats(Vec::new()),
         replies: Default::default(),
     };
-    assert!(inspect_destination_paths(&mut conn, vec![b"file".to_vec()], None, "preview").is_err());
-    assert!(
-        inspect_destination_paths(&mut conn, Vec::new(), None, "preview")
-            .unwrap()
-            .is_empty()
-    );
+    assert!(inspect_destination_paths(&mut conn, vec![b"file".to_vec()], "preview").is_err());
+    assert!(inspect_destination_paths(&mut conn, Vec::new(), "preview")
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -5858,7 +5850,6 @@ fn preview_lookups_skip_a_denied_directory_and_keep_going() {
     let entries = planner::inspect_tolerating_denials(
         &mut conn,
         &paths,
-        None,
         b"root",
         &mut blocked,
         &mut |directory, error| {
@@ -5884,7 +5875,6 @@ fn preview_lookups_skip_a_denied_directory_and_keep_going() {
     assert!(planner::inspect_tolerating_denials(
         &mut failing,
         &paths,
-        None,
         b"root",
         &mut std::collections::HashSet::new(),
         &mut |_, _| panic!("not a denial"),
@@ -5922,6 +5912,8 @@ fn a_restricted_receivers_listed_failures_are_left_to_it() {
                     message: "Permission denied (os error 13)".into(),
                     io_kind: Some(WireIoKind::PermissionDenied),
                     raw_os_error: Some(13),
+                    condition_not_met: false,
+                    unchanged: false,
                 })
             }));
         }
@@ -5961,4 +5953,28 @@ fn a_restricted_receivers_listed_failures_are_left_to_it() {
             assert_eq!(records[0]["diagnostic_for"]["value"], "file");
         }
     }
+}
+
+/// Only a receiver that paces file data itself refuses requests larger than
+/// one burst of the bandwidth limit, so only a copy to one sends its files
+/// in requests that small. An enrolled restricted receiver leaves pacing to
+/// the sender, as an ordinary one does.
+#[test]
+fn only_a_pacing_receiver_bounds_requests_by_the_bandwidth_burst() {
+    let sched = Arc::new(Sched::new(512, 8192));
+    let unused = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &unused, &unused, false);
+    let limit = BandwidthLimit::new(1 << 20);
+    let opts = Arc::get_mut(&mut worker.opts).unwrap();
+    opts.block = 4 << 20;
+    opts.restricted_receiver = true;
+    // Average pacing sizes requests for the bandwidth limit no further.
+    opts.tuning.bw_pacing = Some(crate::transfer_tuning::BwPacing::Average);
+    let enrolled = fast_file_size_limit(opts, Some(&limit));
+    assert!(enrolled > limit.burst_bytes(), "{enrolled}");
+    opts.receiver_paces_file_data = true;
+    assert_eq!(
+        fast_file_size_limit(opts, Some(&limit)),
+        limit.burst_bytes()
+    );
 }

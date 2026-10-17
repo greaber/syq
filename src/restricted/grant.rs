@@ -50,6 +50,9 @@ pub(crate) fn extra_copy_options(args: &Args) -> delegation::ExtraCopyOptions {
         sparse: args.sparse,
         open_noatime: args.open_noatime || args.atimes > 1,
         widen_dirs: args.widen_dirs.into(),
+        keep_files: args.ignore_existing && !args.only_new_native_entries(),
+        follow_dst: args.follows_native_destination_paths()
+            && args.placement == crate::cli::Placement::Into,
     }
 }
 
@@ -59,6 +62,12 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
     }
     if args.no_tcp_encryption {
         bail!("command-restricted transfers require encrypted data connections");
+    }
+    if args.follows_native_destination_paths()
+        && args.placement == crate::cli::Placement::Into
+        && args.widen_dirs == crate::cli::WidenDirs::All
+    {
+        bail!("--widen-dirs all cannot be combined with --follow-dst on a command-restricted destination");
     }
     // Range-check every ceiling here, before automatic enrollment can touch
     // hostB, rather than leaving it to grant validation after the fact.
@@ -76,16 +85,6 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
         .is_some_and(|bytes| bytes == 0 || bytes > delegation::MAX_COPY_BYTES)
     {
         bail!("--receiver-max-bytes must be at least 1 byte");
-    }
-    if let Some(maximum) = args.max_size.as_deref() {
-        if crate::cli::parse_size(maximum)? == 0 {
-            bail!("--max-size must be at least 1 byte on the command-restricted path");
-        }
-    }
-    if args.pscope_explicit {
-        bail!(
-            "--pscope is not available with the command-restricted receiver: its SSH authorization belongs to this copy"
-        );
     }
     if args.connections_opt.is_some() && args.connections > usize::from(delegation::MAX_CONNECTIONS)
     {
@@ -241,15 +240,15 @@ pub(super) fn grant_for(
                 max_total_bytes,
                 max_file_bytes,
                 hash_block_bytes: args.block_size,
-                max_connections: u16::try_from(if args.connections_opt.is_some() {
-                    args.connections
-                } else {
+                // A ceiling the copy chose (`--resource-limits workers`), not
+                // the count a benchmark fixes (`--performance-tuning workers`).
+                max_connections: u16::try_from(
                     args.resource_limits
                         .as_ref()
                         .and_then(|limits| limits.workers)
                         .unwrap_or(usize::from(delegation::MAX_CONNECTIONS))
-                        .min(usize::from(delegation::MAX_CONNECTIONS))
-                })
+                        .min(usize::from(delegation::MAX_CONNECTIONS)),
+                )
                 .context("connection maximum exceeds grant representation")?,
                 max_deletions,
             },
@@ -346,6 +345,8 @@ pub(crate) fn prepare_transfer(
                 )?,
                 Some(&jump),
                 false,
+                args.follows_native_destination_paths()
+                    && args.placement == crate::cli::Placement::Into,
             )?
         }
     };
@@ -451,7 +452,12 @@ pub(crate) fn named_request(
             },
             root_existence: root_existence_for(args.target_existence),
             receipt_policy,
-            extra_options: extra_copy_options(args),
+            // A receiving machine does not follow a symlink at the
+            // destination; the coordinator refuses one it finds there.
+            extra_options: delegation::ExtraCopyOptions {
+                follow_dst: false,
+                ..extra_copy_options(args)
+            },
         },
     })
 }
@@ -466,6 +472,9 @@ pub(crate) fn named_authority(
     std::sync::Arc<RestrictedAuthority>,
     crate::destination::Approved,
 )> {
+    if request.constraints.extra_options.follow_dst {
+        bail!("copies a receiving machine approves do not follow destination symlinks");
+    }
     let (login, home) = current_account()?;
     let parent = root;
     let metadata = fs::metadata(parent)?;

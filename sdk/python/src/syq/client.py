@@ -583,9 +583,17 @@ def _map_options(argv: list[Argument], *, include: Iterable[str] | None,
         argv.append("--no-bootstrap")
 
 
+def _s3_retries(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 100:
+        raise SyqInvocationError("s3_retries must be an integer from 0 to 100")
+    return value
+
+
 def _s3_arguments(
     argv: list[Argument], endpoint: str | None, region: str | None,
-    profile: str | None, headers: Iterable[str] | None,
+    profile: str | None, headers: Iterable[str] | None, retries: int | None,
 ) -> None:
     for option, value in (("s3_endpoint", endpoint), ("s3_region", region), ("s3_profile", profile)):
         if value is not None:
@@ -595,6 +603,9 @@ def _s3_arguments(
             raise SyqInvocationError("s3_header must be an iterable of header strings")
         for header in headers:
             argv.append("--s3-header=" + _text_arg(header, label="s3_header"))
+    retries = _s3_retries(retries)
+    if retries is not None:
+        argv.append(f"--s3-retries={retries}")
 
 
 def _s3_write_arguments(argv: list[Argument], headers: Iterable[str] | None) -> None:
@@ -837,6 +848,7 @@ def _rm_arguments(
     s3_profile: str | None = None,
     auth_from: str | None = None,
     s3_header: Iterable[str] | None = None,
+    s3_retries: int | None = None,
     s3_all_versions: bool = False,
     s3_version_id: str | None = None,
     cwd: PathArgument | None,
@@ -900,7 +912,7 @@ def _rm_arguments(
         raise SyqInvocationError("auth_from requires an SSH or S3 removal endpoint")
     if not is_s3 and (
         s3_all_versions or s3_version_id is not None
-        or any(v is not None for v in (s3_endpoint, s3_region, s3_profile, s3_header))
+        or any(v is not None for v in (s3_endpoint, s3_region, s3_profile, s3_header, s3_retries))
     ):
         raise SyqInvocationError("S3 removal options require on='s3://BUCKET'")
     if s3_all_versions and s3_version_id is not None:
@@ -910,7 +922,7 @@ def _rm_arguments(
         or src_dir is not None or srcs_in is not None
     ):
         raise SyqInvocationError("s3_version_id requires one exact key and a nonempty version ID")
-    _s3_arguments(argv, s3_endpoint, s3_region, s3_profile, s3_header)
+    _s3_arguments(argv, s3_endpoint, s3_region, s3_profile, s3_header, s3_retries)
     if auth_from is not None:
         argv.extend(("--auth-from", _text_arg(auth_from, label="auth_from")))
     if s3_all_versions:
@@ -1081,6 +1093,7 @@ class Client:
         s3_profile: str | None = None,
         auth_from: str | None = None,
         s3_header: Iterable[str] | None = None,
+        s3_retries: int | None = None,
         s3_write_header: Iterable[str] | None = None,
         performance_tuning: str | None = None,
         resource_limits: str | None = None,
@@ -1105,7 +1118,8 @@ class Client:
                          no_tcp=no_tcp, no_tcp_encryption=no_tcp_encryption,
                          tcp_ports=tcp_ports, tcp_congestion=tcp_congestion,
                          s3_endpoint=s3_endpoint, s3_region=s3_region,
-                         s3_profile=s3_profile, s3_header=s3_header, s3_write_header=s3_write_header,
+                         s3_profile=s3_profile, s3_header=s3_header, s3_retries=s3_retries,
+                         s3_write_header=s3_write_header,
                          auth_from=auth_from,
                          resource_limits=resource_limits, integrity_checking=integrity_checking,
                          stats=stats, verbose=verbose,
@@ -1139,6 +1153,7 @@ class Client:
         s3_profile: str | None = None,
         auth_from: str | None = None,
         s3_header: Iterable[str] | None = None,
+        s3_retries: int | None = None,
         performance_tuning: str | None = None,
         resource_limits: str | None = None,
         integrity_checking: str | None = None,
@@ -1162,7 +1177,8 @@ class Client:
                          no_tcp=no_tcp, no_tcp_encryption=no_tcp_encryption,
                          tcp_ports=tcp_ports, tcp_congestion=tcp_congestion,
                          s3_endpoint=s3_endpoint, s3_region=s3_region,
-                         s3_profile=s3_profile, s3_header=s3_header, auth_from=auth_from,
+                         s3_profile=s3_profile, s3_header=s3_header, s3_retries=s3_retries,
+                         auth_from=auth_from,
                          resource_limits=resource_limits, integrity_checking=integrity_checking,
                          stats=stats, verbose=verbose,
                          quiet=quiet, progress=progress, no_progress=no_progress,
@@ -1289,6 +1305,7 @@ class Client:
         s3_region: str | None = None,
         s3_profile: str | None = None,
         s3_header: Iterable[str] | None = None,
+        s3_retries: int | None = None,
         s3_write_header: Iterable[str] | None = None,
         auth_from: str | None = None,
         coordinate_at: str | None = None,
@@ -1384,7 +1401,7 @@ class Client:
             mapping=mapping is not None,
         )
         _s3_arguments(argv, connection.s3_endpoint, connection.s3_region,
-                      connection.s3_profile, connection.s3_header)
+                      connection.s3_profile, connection.s3_header, s3_retries)
         _s3_write_arguments(argv, s3_write_header)
         if connection.auth_from is not None:
             argv.extend(("--auth-from", _text_arg(connection.auth_from, label="auth_from")))
@@ -1481,6 +1498,7 @@ class Client:
         s3_profile: str | None = None,
         auth_from: str | None = None,
         s3_header: Iterable[str] | None = None,
+        s3_retries: int | None = None,
         s3_all_versions: bool = False,
         s3_version_id: str | None = None,
         cwd: PathArgument | None = None,
@@ -1510,6 +1528,7 @@ class Client:
             s3_profile=s3_profile,
             auth_from=auth_from,
             s3_header=s3_header,
+            s3_retries=s3_retries,
             s3_all_versions=s3_all_versions,
             s3_version_id=s3_version_id,
             cwd=cwd,
@@ -1556,6 +1575,7 @@ class Client:
         s3_region: str | None = None,
         s3_profile: str | None = None,
         s3_header: Iterable[str] | None = None,
+        s3_retries: int | None = None,
         cwd: PathArgument | None = None,
         root: PathArgument | None = None,
         follow: bool = False,
@@ -1617,7 +1637,7 @@ class Client:
                 raise SyqInvocationError("auth_from requires an SSH source for map")
             argv.extend(("--auth-from", _text_arg(connection.auth_from, label="auth_from")))
         _s3_arguments(argv, connection.s3_endpoint, connection.s3_region,
-                      connection.s3_profile, connection.s3_header)
+                      connection.s3_profile, connection.s3_header, s3_retries)
         if source_count == 0:
             raise SyqInvocationError("syq map needs a source selector")
         command = (self._executable_value(), *argv)

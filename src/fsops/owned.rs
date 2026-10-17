@@ -1,5 +1,5 @@
-//! A grant that keeps existing objects lets a restricted receiver replace a
-//! file or change metadata only at a name this grant created. The one step
+//! A copy that keeps existing files lets a receiver replace a file or
+//! change metadata only at a name the copy created. The one step
 //! that could bring an existing file under such a name is a hard link to
 //! it, so under such a grant a hard link may give a new name only to a file
 //! this receiver created for the grant. The receiver records those files
@@ -11,7 +11,9 @@
 //! Linux through the descriptor it opened and checked, elsewhere checking
 //! the new link before publishing it. Both checks compare inode numbers, so
 //! where a filesystem's numbers cannot show which file a name leads to
-//! (`fsops::Profile::link_counts_trusted`), the link is refused. Nor can any other step such a grant
+//! (`fsops::Profile::link_counts_trusted`), a restricted receiver refuses
+//! the link, and an ordinary receiver, which holds no grant, links as
+//! without the check. Nor can any other step such a grant
 //! permits make a name lead to an existing file: the names of existing
 //! objects are never replaced, existing objects are never renamed, and
 //! every link leads to a recorded file. A name this grant created therefore
@@ -26,22 +28,49 @@
 use super::*;
 use std::collections::HashSet;
 
+/// The files each copy that keeps existing files created in this process,
+/// by the copy's scope (`stages::new_scope`): every connection of an
+/// ordinary copy shares them, as a restricted receiver's connections share
+/// their authority's.
+fn shared() -> &'static Mutex<HashMap<u64, Arc<OwnedObjects>>> {
+    static SHARED: OnceLock<Mutex<HashMap<u64, Arc<OwnedObjects>>>> = OnceLock::new();
+    SHARED.get_or_init(Default::default)
+}
+
+/// Forget the files the copy `scope` created, when its control ends.
+pub(crate) fn release(scope: u64) {
+    shared().lock().unwrap().remove(&scope);
+}
+
 #[derive(Default)]
-pub(crate) struct OwnedObjects(Mutex<HashSet<(u64, u64)>>);
+pub(crate) struct OwnedObjects {
+    files: Mutex<HashSet<(u64, u64)>>,
+    /// An ordinary receiver's: where inode numbers cannot show which file a
+    /// link names (`fsops::Profile::link_counts_trusted`), links are made
+    /// as without the check, rather than refused. A restricted receiver,
+    /// which holds a grant to it, refuses them.
+    best_effort: bool,
+}
 
 impl OwnedObjects {
     /// Remember the file `created` describes, which this receiver created.
     pub(crate) fn record(&self, created: &fs::Metadata) {
-        self.0
+        self.files
             .lock()
             .unwrap()
             .insert((created.dev(), created.ino()));
     }
 
+    /// Whether a hard link on a filesystem that `trusted` says shows which
+    /// file a name leads to, or not, is held to these files.
+    pub(crate) fn applies(&self, trusted: bool) -> bool {
+        trusted || !self.best_effort
+    }
+
     /// Refuse the hard link `label` to the file `identity` unless this
     /// receiver created that file for this grant.
     pub(crate) fn require_link(&self, identity: (u64, u64), label: &Path) -> Result<()> {
-        if self.0.lock().unwrap().contains(&identity) {
+        if self.files.lock().unwrap().contains(&identity) {
             return Ok(());
         }
         bail!(
@@ -57,5 +86,28 @@ impl FsOps {
     /// as a grant that keeps existing objects requires.
     pub(crate) fn set_owned_objects(&mut self, owned: Option<Arc<OwnedObjects>>) {
         self.owned = owned;
+    }
+
+    /// Give new names by hard link only to the files this copy created, as
+    /// a copy that keeps existing files and copies hard links does on every
+    /// receiver, where inode numbers can show which file a link names. A
+    /// restricted receiver's authority may already have set them; that
+    /// stays, and refuses links where they cannot.
+    pub(super) fn keep_links_to_own_files(&mut self) {
+        if self.owned.is_none() {
+            self.owned = Some(
+                shared()
+                    .lock()
+                    .unwrap()
+                    .entry(self.stage_scope)
+                    .or_insert_with(|| {
+                        Arc::new(OwnedObjects {
+                            best_effort: true,
+                            ..Default::default()
+                        })
+                    })
+                    .clone(),
+            );
+        }
     }
 }

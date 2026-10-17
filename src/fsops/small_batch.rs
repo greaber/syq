@@ -398,7 +398,10 @@ impl FsOps {
                     data.resize(off as usize + len, 0);
                     let (blocks, expected) = (&mut data[off as usize..], &patch.reuse[index..end]);
                     if !self.holds_blocks(old, off, blocks, patch.block, expected)? {
-                        bail!("the destination changed after it was compared");
+                        // Built in memory: nothing was written.
+                        return Err(unchanged(
+                            "the destination changed after it was compared".into(),
+                        ));
                     }
                     index = end;
                 }
@@ -470,7 +473,7 @@ impl FsOps {
             format_args!("existing {}", read.len),
         )?;
         let blocks = block_count(read.len, block)?;
-        let target = self.destination_mutation_target(&read.path, read.guard.as_ref())?;
+        let target = self.destination_mutation_target(&read.path)?;
         let partials = !self.candidate_partials(&target).is_empty();
         let Some(file) = target
             .root
@@ -535,7 +538,6 @@ impl FsOps {
         len: u64,
         meta: &Meta,
         flags: u8,
-        guarded: bool,
         condition: TargetCondition,
     ) -> Result<Option<Option<(u64, u64)>>> {
         #[cfg(debug_assertions)]
@@ -557,7 +559,7 @@ impl FsOps {
         fail_set_meta_for_test(&target.label)?;
         set_meta_file_known(file, meta, flags, &current)
             .with_context(|| format!("set metadata {}", target.label.display()))?;
-        if guarded || condition != TargetCondition::Any {
+        if condition != TargetCondition::Any {
             require_rooted_named_identity(
                 &target.root,
                 &target.relative,
@@ -659,7 +661,6 @@ impl FsOps {
                         patch.len,
                         &patch.meta,
                         patch.unchanged_flags,
-                        patch.guard.is_some(),
                         patch.condition,
                     )
                     .map_err(failed(true, false))?;
@@ -682,7 +683,7 @@ impl FsOps {
         if !reproduces_basis(patch) && patch.reuse.iter().all(Option::is_none) {
             return Ok(None);
         }
-        let target = self.destination_mutation_target(&patch.path, patch.guard.as_ref())?;
+        let target = self.destination_mutation_target(&patch.path)?;
         let file = target
             .root
             .open_regular_read(&target.relative)
@@ -734,7 +735,6 @@ impl FsOps {
             flags: patch.flags,
             inplace: false,
             condition: patch.condition,
-            guard: patch.guard.clone(),
             replaces: true,
             scanned,
         };
@@ -940,7 +940,7 @@ impl FsOps {
                 let index = next;
                 next += 1;
                 let target = if built {
-                    self.destination_mutation_target(&puts[index].path, puts[index].guard.as_ref())
+                    self.destination_mutation_target(&puts[index].path)
                 } else {
                     self.small_target(&puts[index])
                 };
@@ -987,7 +987,7 @@ impl FsOps {
         {
             bail!("block hash mismatch on receive");
         }
-        self.destination_mutation_target(&put.path, put.guard.as_ref())
+        self.destination_mutation_target(&put.path)
     }
 
     fn put_small_run(
@@ -1162,7 +1162,7 @@ impl FsOps {
             return self.put_small(put);
         }
         let target = if built {
-            self.destination_mutation_target(&put.path, put.guard.as_ref())?
+            self.destination_mutation_target(&put.path)?
         } else {
             self.small_target(put)?
         };
@@ -1517,7 +1517,6 @@ mod tests {
             flags: 0,
             inplace: false,
             condition: TargetCondition::Any,
-            guard: None,
             replaces: false,
             scanned: ScannedDestination::Unknown,
         }
@@ -1580,7 +1579,6 @@ mod tests {
             flags: 0,
             unchanged_flags: 0,
             condition: TargetCondition::Any,
-            guard: None,
         }
     }
 
@@ -1637,7 +1635,6 @@ mod tests {
             path: name.as_bytes().to_vec(),
             len,
             condition: TargetCondition::Any,
-            guard: None,
         };
         let longer = 3 * block + 10;
         let hashed = ops.hash_existing_batch(
@@ -1677,7 +1674,6 @@ mod tests {
                 flags: 0,
                 unchanged_flags: flags::TIMES,
                 condition: TargetCondition::Any,
-                guard: None,
             };
         let reuse_all: Vec<_> = expected.iter().copied().map(Some).collect();
         let mut new_tail = vec![7u8; block as usize];
@@ -1760,7 +1756,6 @@ mod tests {
                 path: name.as_bytes().to_vec(),
                 len: new.len() as u64,
                 condition: TargetCondition::Any,
-                guard: None,
             };
             let hashed = ops.hash_existing_batch(block, &[read("file"), read("raced")]);
             let patches = [
@@ -1812,7 +1807,6 @@ mod tests {
                     path: b"file".to_vec(),
                     len: 64 * block,
                     condition: TargetCondition::Any,
-                    guard: None,
                 }],
             );
             // Enough reused blocks to copy rather than assemble the file.
@@ -1871,7 +1865,6 @@ mod tests {
                 path: b"file".to_vec(),
                 len: old.len() as u64,
                 condition: TargetCondition::Any,
-                guard: None,
             }],
         );
         let hashed = hashed[0].as_ref().unwrap();
@@ -1898,7 +1891,6 @@ mod tests {
             flags: flags::MODE | flags::TIMES,
             unchanged_flags: 0,
             condition: TargetCondition::Any,
-            guard: None,
         };
         CLONED_PATCHES.set(0);
         let results = ops.patch_small_batch(&[patch]).unwrap();
@@ -1985,7 +1977,6 @@ mod tests {
                         path: b"file".to_vec(),
                         len: new.len() as u64,
                         condition: TargetCondition::Any,
-                        guard: None,
                     }],
                 )
                 .remove(0)
@@ -1993,7 +1984,7 @@ mod tests {
             let mut patch = patch_from("file", &new, block, &hashed, algorithm);
             patch.meta.mode = wanted;
             patch.flags = flags::MODE;
-            let target = ops.destination_mutation_target(b"file", None).unwrap();
+            let target = ops.destination_mutation_target(b"file").unwrap();
             let (relative, _) = rooted_partial_target(&target, &patch.copy_id).unwrap();
             let sidecar = directory.join(relative.to_path_buf());
             let seeded = std::rc::Rc::new(std::cell::Cell::new(None));
@@ -2050,7 +2041,6 @@ mod tests {
                         path: b"file".to_vec(),
                         len: new.len() as u64,
                         condition: TargetCondition::Any,
-                        guard: None,
                     }],
                 )
                 .remove(0)
@@ -2065,7 +2055,7 @@ mod tests {
             whole.replaces = true;
             let failed = without_space(|| ops.put_small_batch(&mut [whole]));
             assert!(failed[0].is_err(), "{case}: {:?}", failed[0]);
-            let target = ops.destination_mutation_target(b"file", None).unwrap();
+            let target = ops.destination_mutation_target(b"file").unwrap();
             let (relative, _) = rooted_partial_target(&target, &patch.copy_id).unwrap();
             let sidecar = directory.join(relative.to_path_buf());
             let reader = File::open(&sidecar).unwrap();
@@ -2134,7 +2124,6 @@ mod tests {
                     path: b"file".to_vec(),
                     len,
                     condition: TargetCondition::Any,
-                    guard: None,
                 }],
             )
             .remove(0)
@@ -2155,7 +2144,6 @@ mod tests {
             flags: 0,
             unchanged_flags: 0,
             condition: TargetCondition::Any,
-            guard: None,
         };
         let results = refusing_clones(true, || ops.patch_small_batch(&[patch])).unwrap();
         assert!(results[0].is_ok(), "{:?}", results[0]);
@@ -2233,7 +2221,6 @@ mod tests {
             path: name.as_bytes().to_vec(),
             len,
             condition: TargetCondition::Any,
-            guard: None,
         };
         let hashed =
             ops.hash_existing_batch(block, &[read("assembled"), read("copied"), read("holes")]);
@@ -2302,7 +2289,6 @@ mod tests {
                         path: b"file".to_vec(),
                         len: new.len() as u64,
                         condition: TargetCondition::Any,
-                        guard: None,
                     }],
                 )
                 .remove(0)
@@ -2331,7 +2317,6 @@ mod tests {
                 flags: 0,
                 unchanged_flags: 0,
                 condition: TargetCondition::Any,
-                guard: None,
             };
             let malformed = |change: &dyn Fn(&mut SmallPatch)| {
                 let mut patch = valid.clone();
@@ -2382,7 +2367,6 @@ mod tests {
             path: name.as_bytes().to_vec(),
             len: old.len() as u64,
             condition: TargetCondition::Any,
-            guard: None,
         };
         let hashed = ops.hash_existing_batch(block, &[read("touched"), read("edited")]);
         let patch = |name: &str, hashed: &ExistingHashes| SmallPatch {
@@ -2398,7 +2382,6 @@ mod tests {
             flags: 0,
             unchanged_flags: 0,
             condition: TargetCondition::Any,
-            guard: None,
         };
         let patches = [
             patch("touched", hashed[0].as_ref().unwrap()),
@@ -2458,7 +2441,6 @@ mod tests {
             flags: 0,
             unchanged_flags: 0,
             condition: TargetCondition::Any,
-            guard: None,
         };
         let mut ops = receiver(directory);
         let error = ops
@@ -2500,7 +2482,6 @@ mod tests {
             path: b"file".to_vec(),
             len: 40 * block,
             condition: TargetCondition::Any,
-            guard: None,
         };
         let hashed = ops.hash_existing_batch(block, &[read]).remove(0).unwrap();
         // Blocks past the old end claim to be reused, which a clone would
@@ -2520,7 +2501,6 @@ mod tests {
             flags: 0,
             unchanged_flags: 0,
             condition: TargetCondition::Any,
-            guard: None,
         };
         let results = ops.patch_small_batch(&[patch]).unwrap();
         assert!(results[0].is_err(), "{:?}", results[0]);
@@ -3265,7 +3245,6 @@ mod tests {
                         path: b"file".to_vec(),
                         len: new.len() as u64,
                         condition: TargetCondition::Any,
-                        guard: None,
                     }],
                 )
                 .remove(0)
@@ -3278,7 +3257,7 @@ mod tests {
                 // seeded: it takes the reused blocks as pieces arrive.
                 patch.basis = None;
             }
-            let target = ops.destination_mutation_target(b"file", None).unwrap();
+            let target = ops.destination_mutation_target(b"file").unwrap();
             let (relative, _) = rooted_partial_target(&target, &patch.copy_id).unwrap();
             let sidecar = directory.join(relative.to_path_buf());
             fs::write(&sidecar, b"").unwrap();
@@ -3371,7 +3350,6 @@ mod tests {
                     path: name.as_bytes().to_vec(),
                     len: new.len() as u64,
                     condition: TargetCondition::Any,
-                    guard: None,
                 };
                 let hashed = ops.hash_existing_batch(block, &[read]);
                 let mut patch =
@@ -3456,7 +3434,6 @@ mod tests {
                 path: b"file".to_vec(),
                 len: new.len() as u64,
                 condition: TargetCondition::Any,
-                guard: None,
             };
             let hashed = ops.hash_existing_batch(block, &[read]);
             let mut patch = patch_from("file", &new, block, hashed[0].as_ref().unwrap(), algorithm);
@@ -3658,7 +3635,6 @@ mod tests {
                 path: b"file".to_vec(),
                 len: new.len() as u64,
                 condition,
-                guard: None,
             };
             let hashed = ops.hash_existing_batch(block, &[read]);
             let mut patch = patch_from("file", &new, block, hashed[0].as_ref().unwrap(), algorithm);

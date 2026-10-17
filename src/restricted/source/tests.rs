@@ -1,5 +1,5 @@
 use super::*;
-use crate::proto::{ContainerGuard, Op, ReadStreamRequest, SmallRead};
+use crate::proto::{Op, ReadStreamRequest, SmallRead};
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
@@ -206,16 +206,6 @@ fn exact_leaf_reads_ignore_display_paths_and_refuse_siblings_and_guards() {
     let sibling = RegisteredPath::new(fixture.source().root(), b"secret".to_vec()).unwrap();
     assert!(worker.authorize(&read(Some(sibling), 6)).is_err());
     assert!(worker.authorize(&read(None, 6)).is_err());
-    let guarded = Request::FileHash {
-        path: secret.as_os_str().as_bytes().to_vec(),
-        source: Some(fixture.source()),
-        guard: Some(ContainerGuard {
-            root: b"/".to_vec(),
-            dev: 0,
-            ino: 0,
-        }),
-    };
-    assert!(worker.authorize(&guarded).is_err());
     fs::rename(&approved, temp.path().join("old")).unwrap();
     fs::write(&approved, b"replaced").unwrap();
     // The existing read descriptor still names the approved inode. A fresh
@@ -262,7 +252,6 @@ fn directory_reads_and_scans_keep_pinned_roots_and_refuse_symlink_escapes() {
         follow_root: true,
         ignore: Vec::new(),
         report_ignored: false,
-        guard: None,
     };
     worker.authorize(&scan).unwrap();
     let source = fixture.ops.source_scan_root(Some(&root)).unwrap().unwrap();
@@ -346,11 +335,9 @@ fn approved_sources_never_admit_mutation_or_pathname_authority() {
             ops: vec![Op::Remove {
                 path: path.as_os_str().as_bytes().to_vec(),
             }],
-            guard: None,
         },
         Request::Canonicalize {
             path: b"/".to_vec(),
-            guard: None,
         },
         Request::CheckOperatorDirectory {
             path: b"/".to_vec(),
@@ -486,7 +473,6 @@ fn hashing_and_metadata_stay_within_the_approved_read_policy() {
     let hash = Request::FileHash {
         path: b"/unused".to_vec(),
         source: Some(fixture.source()),
-        guard: None,
     };
     assert!(matches!(
         fixture.control.file_hash(&mut fixture.ops, &hash).unwrap(),
@@ -499,6 +485,7 @@ fn hashing_and_metadata_stay_within_the_approved_read_policy() {
             sparse: false,
             destination: true,
             narrow_new_directories: false,
+            own_links: false,
         })
         .is_err());
     assert!(fixture
@@ -511,6 +498,7 @@ fn hashing_and_metadata_stay_within_the_approved_read_policy() {
             sparse: false,
             destination: false,
             narrow_new_directories: false,
+            own_links: false,
         })
         .is_err());
     fs::write(&file, vec![0; 1025]).unwrap();
@@ -530,16 +518,15 @@ fn checked_whole_file_hash_stops_between_chunks() {
     let mut ops = FsOps::new();
     ops.initialize_sources(&fixture.roots).unwrap();
     let mut largest = 0;
-    let result =
-        ops.file_hash_checked(b"/unused", Some(&fixture.source()), None, &mut |_, size| {
-            largest = largest.max(size);
-            if size > 0 {
-                fixture.authority.close();
-            }
-            fixture
-                .authority
-                .check_open(&fixture.authority.state.lock().unwrap())
-        });
+    let result = ops.file_hash_checked(b"/unused", Some(&fixture.source()), &mut |_, size| {
+        largest = largest.max(size);
+        if size > 0 {
+            fixture.authority.close();
+        }
+        fixture
+            .authority
+            .check_open(&fixture.authority.state.lock().unwrap())
+    });
     assert!(result.is_err());
     assert_eq!(largest, 1 << 20);
 }

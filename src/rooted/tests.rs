@@ -2528,6 +2528,9 @@ fn matched_publication_never_rolls_back_a_later_writer() {
             None,
         )
         .unwrap_err();
+    // Another program's file was moved to a recovery name: no plain
+    // condition failure, which a copy's existing-file policy would skip.
+    assert!(!crate::fsops::is_condition_not_met(&error), "{error:#}");
 
     let error = format!("{error:#}");
     assert!(error.contains("changed during publication"));
@@ -2851,4 +2854,45 @@ fn the_owner_new_files_show_is_learned_and_never_assumed() {
         );
     }
     fs::set_permissions(&read_only, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A matched replacement whose target is gone or another file before the
+/// exchange changes nothing, and says so: its condition was not met.
+#[test]
+fn a_matched_replacement_refused_before_the_exchange_is_a_condition_failure() {
+    let tree = TestDir::new("matched-precheck");
+    let root = Root::open(tree.path()).unwrap();
+    let (staged, target) = (relative(b"staged"), relative(b"target"));
+    fs::write(tree.path().join("staged"), b"new").unwrap();
+    fs::write(tree.path().join("target"), b"old").unwrap();
+    let staged_metadata = fs::metadata(tree.path().join("staged")).unwrap();
+    let old = root.metadata(&target).unwrap();
+    // The old file stays, under another name, so its number is not reused.
+    fs::rename(tree.path().join("target"), tree.path().join("aside")).unwrap();
+    for replace_with_other in [false, true] {
+        if replace_with_other {
+            fs::write(tree.path().join("target"), b"other").unwrap();
+        }
+        let error = root
+            .replace_regular_if_same(
+                &staged,
+                &target,
+                (staged_metadata.dev(), staged_metadata.ino()),
+                old.dev,
+                old.ino,
+                None,
+            )
+            .unwrap_err();
+        assert!(crate::fsops::is_condition_not_met(&error), "{error:#}");
+        assert_eq!(fs::read(tree.path().join("staged")).unwrap(), b"new");
+    }
+    let error = root
+        .publish_new_regular(
+            &staged,
+            &target,
+            (staged_metadata.dev(), staged_metadata.ino()),
+        )
+        .unwrap_err();
+    assert!(crate::fsops::is_condition_not_met(&error), "{error:#}");
+    assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"other");
 }

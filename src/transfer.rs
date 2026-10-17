@@ -169,7 +169,7 @@ fn initial_fast_workers(
 }
 
 // Keep tiny files batched, but let eligible local medium files reach the
-// guarded receiver-side copy path without shrinking ordinary range requests.
+// receiver-side copy path without shrinking ordinary range requests.
 const LOCAL_FAST_FILE_BYTES: u64 = 64 * 1024;
 
 fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
@@ -177,7 +177,7 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
     // transfer payload and batch limits, independently of hash granularity.
     let request = opts
         .tuning
-        .request_size(opts.block, bwlimit, opts.restricted_receiver);
+        .request_size(opts.block, bwlimit, opts.receiver_paces_file_data);
     let limit = opts.tuning.batch_bytes().min(request);
     if opts.copy_policy(bwlimit.is_some()).prefer_whole_files() {
         limit.min(LOCAL_FAST_FILE_BYTES)
@@ -258,6 +258,13 @@ pub struct Opts {
     pub src_remote: bool,
     pub dst_remote: bool,
     pub restricted_receiver: bool,
+    /// The receiver paces file data itself, as one a receiving machine
+    /// approved does under `--bwlimit`, and refuses a request carrying more
+    /// than one burst. An enrolled receiver leaves pacing to the sender.
+    pub receiver_paces_file_data: bool,
+    /// The copy keeps existing files and copies hard links: a new name goes
+    /// only to a file the copy created (`Request::ConfigurePreservation`).
+    pub own_links: bool,
     pub dry_run: bool,
     dry_run_metadata_files: AtomicU64,
     pub quiet: bool,
@@ -379,6 +386,16 @@ impl Opts {
                 .mapping_metadata
                 .get(path)
                 .map_or(0, |m| m.apply_flags())
+    }
+
+    /// What a copy says of a destination its existing-file policy kept
+    /// while it ran (`Worker::kept_by_policy`).
+    fn kept_note(&self) -> &'static str {
+        if self.existing {
+            "replaced or removed during the copy; skipping it"
+        } else {
+            "appeared during the copy; keeping it"
+        }
     }
 
     fn protects_existing_contents(&self) -> bool {
@@ -720,6 +737,7 @@ pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
         args.sparse,
         false,
         args.interface == Interface::Rsync,
+        false,
     )?;
     Ok(connection)
 }
@@ -730,14 +748,16 @@ fn configure_preservation(
     sparse: bool,
     destination: bool,
     narrow_new_directories: bool,
+    own_links: bool,
 ) -> Result<()> {
-    if selection.any() || selection.open_noatime || sparse || narrow_new_directories {
+    if selection.any() || selection.open_noatime || sparse || narrow_new_directories || own_links {
         connection.send_expecting_ok(
             Request::ConfigurePreservation {
                 selection,
                 sparse,
                 destination,
                 narrow_new_directories,
+                own_links,
             },
             "configure inode metadata preservation",
         )?;
@@ -1034,7 +1054,6 @@ fn small_copy_eligible(
         && dst_ep.is_remote()
         && !src_ep.is_remote()
         && !srcs.iter().any(Location::is_remote)
-        && args.restricted_grant.is_none()
         && !args.dry_run
         // The directory it writes into may need widening.
         && args.widen_dirs != WidenDirs::All
@@ -1285,10 +1304,11 @@ fn attempt_small_copy(
                 {
                     return Ok(SmallCopy::Reconnect);
                 }
-                if dst_ctl
-                    .observe(&progress.observations, actor, false, 0)
-                    .is_err()
-                {
+                if let Err(error) = dst_ctl.observe(&progress.observations, actor, false, 0) {
+                    // A restricted receiver's copy has one control connection.
+                    if args.restricted_grant.is_some() {
+                        return Err(error).context("observe the destination's control connection");
+                    }
                     // Nothing has been copied yet. Reopen the control connection before
                     // entering the ordinary transfer path; never use lost framing.
                     return Ok(SmallCopy::Reconnect);
@@ -1390,8 +1410,9 @@ fn attempt_small_copy(
         }) => {
             if debug() {
                 crate::output::diagnostic!(
-                    "syq: small copy: staging failed ({}); using the ordinary engine on a new control connection",
-                    error.message
+                    "syq: small copy: staging failed ({}); using the ordinary engine on {}",
+                    error.message,
+                    fallback_connection(args)
                 );
             }
             return Ok(SmallCopy::Reconnect);
@@ -1408,7 +1429,8 @@ fn attempt_small_copy(
                     _ => unreachable!(),
                 };
                 crate::output::diagnostic!(
-                    "syq: small copy failed ({message}); using the ordinary engine on a new control connection"
+                    "syq: small copy failed ({message}); using the ordinary engine on {}",
+                    fallback_connection(args)
                 );
             }
             return Ok(SmallCopy::Reconnect);
@@ -1453,7 +1475,14 @@ fn attempt_small_copy(
             progress.files_unchanged.fetch_add(1, Relaxed);
             progress.bytes_unchanged.fetch_add(entry.size, Relaxed);
             if let Some(error) = result.error {
-                progress.error(&format!("syq: {}", endpoint_error(error)));
+                // A restricted receiver lists a failed metadata change itself.
+                let error = endpoint_error(error);
+                progress.entry_error_classified(
+                    &format!("syq: {error}"),
+                    Some("io"),
+                    os_kind_of(&error),
+                    Some((rel_bytes, crate::results::ReceiverListing::Listed)),
+                );
             }
             continue;
         }
@@ -1461,7 +1490,14 @@ fn attempt_small_copy(
             progress.files_unchanged.fetch_add(1, Relaxed);
             progress.bytes_unchanged.fetch_add(entry.size, Relaxed);
             if let Some(error) = result.error {
-                progress.error(&format!("syq: {}", endpoint_error(error)));
+                // A restricted receiver lists a failed metadata change itself.
+                let error = endpoint_error(error);
+                progress.entry_error_classified(
+                    &format!("syq: {error}"),
+                    Some("io"),
+                    os_kind_of(&error),
+                    Some((rel_bytes, crate::results::ReceiverListing::Listed)),
+                );
             }
             continue;
         }
@@ -1484,21 +1520,33 @@ fn attempt_small_copy(
             None => None,
         };
         if let Some((retryable, os_kind, message)) = failure {
-            progress.error_classified(&format!("syq: {rel}: {message}"), Some("io"), os_kind);
+            // A restricted receiver lists the failure of a file it was
+            // asked to publish itself, as it does every change's.
+            let listing = crate::results::ReceiverListing::Listed;
+            progress.entry_error_classified(
+                &format!("syq: {rel}: {message}"),
+                Some("io"),
+                os_kind,
+                Some((rel_bytes, listing)),
+            );
             if let Some(results) = progress.results_writer() {
-                results.emit_operation(&crate::results::OperationRecord {
-                    action: "transfer_file",
-                    dst: rel_bytes,
-                    src: None,
-                    kind: "file",
-                    disposition: "failed",
-                    bytes: None,
-                    attempts: Some(1),
-                    retryable: Some(retryable),
-                    class: Some("io"),
-                    os_kind,
-                    message: Some(&message),
-                });
+                results.emit_operation_listed(
+                    &crate::results::OperationRecord {
+                        action: "transfer_file",
+                        dst: rel_bytes,
+                        src: None,
+                        kind: "file",
+                        disposition: "failed",
+                        bytes: None,
+                        attempts: Some(1),
+                        retryable: Some(retryable),
+                        class: Some("io"),
+                        os_kind,
+                        message: Some(&message),
+                    },
+                    None,
+                    listing,
+                );
             }
             continue;
         }
@@ -1524,6 +1572,16 @@ fn attempt_small_copy(
         }
     }
 
+    // Every change is settled: end the destination's results, which also
+    // ends its grant.
+    if crate::destination::reports_results(&args.restricted_grant) {
+        let finished = dst_ctl
+            .call(Request::FinishDestinationResults)
+            .and_then(|response| ok(response, "end the destination's results"));
+        if let Err(error) = finished {
+            progress.error(&format!("syq: destination results: {error:#}"));
+        }
+    }
     progress.stop();
     progress.clear();
     let errors = progress.errors.load(Relaxed);
@@ -1585,6 +1643,16 @@ fn attempt_small_copy(
         results.emit_result(&terminal);
     }
     Ok(SmallCopy::Done(exit_code))
+}
+
+/// The control connection a copy goes on over when the small-copy shortcut
+/// does not finish it: a restricted receiver's copy has only one.
+fn fallback_connection(args: &Args) -> &'static str {
+    if args.restricted_grant.is_some() {
+        "the same control connection"
+    } else {
+        "a new control connection"
+    }
 }
 
 fn show_statistics(args: &Args) -> bool {
@@ -2157,7 +2225,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         };
         let parsed = Arc::unwrap_or_clone(parsed);
         args.mapping_contents = Some(Arc::new(parsed.input));
-        Some((parsed.entries, parsed.explicit_parents))
+        Some(parsed.entries)
     } else {
         None
     };
@@ -2371,17 +2439,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
 
-    if args.restricted_grant.is_some() {
-        if let Some((entries, _)) = &mapping_entries {
-            for (_, entry) in entries {
-                if let Some(metadata) = entry.metadata {
-                    anyhow::ensure!(metadata.flags() & !args.meta_flags() == 0,
-                        "mapping metadata on a restricted receiver requires matching --copy-metadata options in the signed grant");
-                }
-            }
-        }
-    }
-
     let mut opts = Opts {
         local_copy_fd_budget: true,
         hash_policy: crate::hashing::HashPolicy {
@@ -2391,7 +2448,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         },
         mapping_metadata: mapping_entries
             .as_ref()
-            .map(|(entries, _)| {
+            .map(|entries| {
                 entries
                     .iter()
                     .filter_map(|(_, entry)| entry.metadata.map(|meta| (entry.dst.clone(), meta)))
@@ -2401,7 +2458,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         hardlink_expected_hashes: Default::default(),
         mapping_expected_hashes: mapping_entries
             .as_ref()
-            .map(|(entries, _)| {
+            .map(|entries| {
                 entries
                     .iter()
                     .filter_map(|(_, entry)| {
@@ -2457,6 +2514,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         src_remote: src_ep.is_remote(),
         dst_remote: dst_ep.is_remote(),
         restricted_receiver: args.restricted_grant.is_some(),
+        receiver_paces_file_data: args
+            .restricted_grant
+            .as_deref()
+            .is_some_and(|grant| !crate::restricted::enrolled_grant(grant)),
+        own_links: args.hardlinks
+            && args.ignore_existing
+            && crate::checks::enabled(crate::checks::Check::OwnLinks),
         dry_run: args.dry_run,
         dry_run_metadata_files: AtomicU64::new(0),
         quiet: args.quiet,
@@ -2483,10 +2547,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if opts.benchmark.is_some() {
         crate::output::diagnostic!(
             "syq: tuning before transport selection: request-size={} bytes (ordinary ceiling, after logical pacing and receiver limits), adaptive-ordinary-requests={}, streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, transfer-strategy={} (block reuse {}), batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
-            opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
+            opts.tuning.request_size(block, bwlimit.as_deref(), opts.receiver_paces_file_data),
             opts.adaptive_ranges(),
-            opts.tuning.streaming_request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
-            opts.tuning.pipeline_label(opts.same_host, opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver)), block,
+            opts.tuning.streaming_request_size(block, bwlimit.as_deref(), opts.receiver_paces_file_data),
+            opts.tuning.pipeline_label(opts.same_host, opts.tuning.request_size(block, bwlimit.as_deref(), opts.receiver_paces_file_data)), block,
             opts.tuning.copy_path.unwrap_or_default(),
             opts.transfer_strategy.as_str(),
             if opts.transfer_strategy.reuse_destination_blocks(opts.same_host) { "on" } else { "off" },
@@ -2643,13 +2707,16 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             &destination_metadata_platform,
         )?;
     }
-    if opts.inode_preservation.crtimes {
+    // A copy that keeps existing files gives new names by hard link only to
+    // files it created, on every receiver (`fsops::owned`).
+    if opts.inode_preservation.crtimes || opts.own_links {
         configure_preservation(
             &mut *dst_ctl,
             opts.inode_preservation,
             opts.sparse,
             true,
             opts.rsync_creation,
+            opts.own_links,
         )?;
     }
     if debug() {
@@ -2913,6 +2980,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         opts.sparse,
                         false,
                         false,
+                        false,
                     )?;
                     configure_preservation(
                         &mut *dst,
@@ -2920,6 +2988,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         opts.sparse,
                         true,
                         opts.rsync_creation,
+                        opts.own_links,
                     )?;
                     let fast_batch_files = opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES);
                     let transport_paced = (opts.src_remote || opts.dst_remote)
@@ -2928,8 +2997,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     if transport_paced && id == 0 && opts.verbose > 0 {
                         crate::output::diagnostic!(
                             "syq: Sender bandwidth cap counts compressed transport bytes: request-size={}, streaming-block-size={}; normal batching applies",
-                            opts.tuning.request_size(opts.block, None, opts.restricted_receiver),
-                            opts.tuning.streaming_request_size(opts.block, None, opts.restricted_receiver),
+                            opts.tuning.request_size(opts.block, None, opts.receiver_paces_file_data),
+                            opts.tuning.streaming_request_size(opts.block, None, opts.receiver_paces_file_data),
                         );
                     }
                     let mut worker = Worker {
@@ -3169,7 +3238,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // The bounded offer replaces the destination configuration turn. Its
     // selected payloads use this control connection without data workers.
     if small_copy_candidate {
-        match attempt_small_copy(
+        let outcome = attempt_small_copy(
             &args,
             &opts,
             srcs,
@@ -3184,7 +3253,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 .map(|budget| (budget.clone(), Arc::downgrade(&sched))),
             &progress,
             t0,
-        )? {
+        )?;
+        match outcome {
             SmallCopy::Done(code) => {
                 if let Some(history) = progress.tuning_history.get() {
                     history.event(
@@ -3196,15 +3266,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 dst_ctl.detach();
                 return Ok(code);
             }
-            SmallCopy::Declined => {
+            SmallCopy::Reconnect if args.restricted_grant.is_none() => {
+                let _setup = progress.clock.setup.begin();
+                dst_ctl = connect_ctl(&dst_ep, &args)?;
+            }
+            // A restricted receiver's session is as it was before the
+            // shortcut, so its copy goes on over its one control connection.
+            SmallCopy::Declined | SmallCopy::Reconnect => {
                 dst_ctl.send_expecting_ok(
                     Request::ConfigureHashing(opts.hash_policy),
                     "configure hashing",
                 )?;
-            }
-            SmallCopy::Reconnect => {
-                let _setup = progress.clock.setup.begin();
-                dst_ctl = connect_ctl(&dst_ep, &args)?;
             }
         }
     }
@@ -3264,7 +3336,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 path: operator_dst_root.clone(),
                 symlink_policy: opts.operator_symlink_policy,
                 create_missing: !args.existing,
-                guard: None,
             })?,
             "prepare the destination path",
         )? {
@@ -3282,10 +3353,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             .map_err(|error| with_failure_hint(&opts, error))?;
         // Rsync retains its destination-directory compatibility rule. Native
         // container placement follows links only under the destination policy;
-        // exact placement preserves the final directory entry.
+        // exact placement preserves the final directory entry. A restricted
+        // receiver follows them itself, and shows the directory they lead to
+        // at the signed destination.
         if args.interface == Interface::Rsync {
             follow_dir_symlink(&mut *dst_ctl, &operator_dst_root, entry)?
-        } else if args.follows_native_destination_paths() && args.placement == Placement::Into {
+        } else if args.follows_native_destination_paths()
+            && args.placement == Placement::Into
+            && args.restricted_grant.is_none()
+        {
             follow_container_symlink(
                 &mut *dst_ctl,
                 &operator_dst_root,
@@ -3345,6 +3421,21 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
     let dst_is_dir = match args.placement {
         Placement::Into => {
+            // A restricted receiver that follows a destination symlink shows
+            // the directory it leads to; one that does not, as a receiving
+            // machine, shows the link.
+            if args.interface != Interface::Rsync
+                && args.follows_native_destination_paths()
+                && args.restricted_grant.is_some()
+                && dst_root_entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.kind == Kind::Symlink)
+            {
+                bail!(
+                    "--into destination {} is a symlink, and this receiver does not follow destination symlinks; name the directory the link points to",
+                    display(&dst_root)
+                );
+            }
             if args.interface != Interface::Rsync
                 && !args.follows_native_destination_paths()
                 && dst_root_entry
@@ -3612,6 +3703,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 exact_capacity_target.clone(),
             )?,
         }
+    } else if !use_operator_anchor && !args.existing {
+        // A restricted receiver inspects the directory it approved itself.
+        destination_filesystem_info(&mut *dst_ctl, dst_entry_is_dir, None)?
     } else {
         None
     };
@@ -3681,8 +3775,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         TargetCondition::Any
     };
     let mut mutation_root_condition = TargetCondition::Any;
-    let guard_containers = false;
-    let mut container_guard = None;
 
     // Reject copying a directory into itself: if the effective destination is
     // (or is beneath) a source directory, the scanner would discover the
@@ -3889,7 +3981,16 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let root_creatable = dst_root_entry.is_none() && dst_is_dir && !args.existing;
     let mut create_root = root_creatable && !args.dry_run;
     let dry_run_creates_root = root_creatable && args.dry_run;
-    let root_create_condition = TargetCondition::Any;
+    // A directory that must be new (`--into-new`) is created without
+    // adopting one another program makes at its name first, as a restricted
+    // receiver creates it; that copy fails.
+    let root_create_condition = if args.target_existence == Existence::New
+        && crate::checks::enabled(crate::checks::Check::ExistingFileConditions)
+    {
+        TargetCondition::Absent
+    } else {
+        TargetCondition::Any
+    };
     // A directory target takes a contents source's metadata, which the
     // planner sends only once it has scanned the source root. When its
     // permissions or group are copied, create the root private until they
@@ -3995,13 +4096,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     dev: anchor.dev,
                     ino: anchor.ino,
                 };
-                if guard_containers {
-                    container_guard = Some(ContainerGuard {
-                        root: dst_root.clone(),
-                        dev: anchor.dev,
-                        ino: anchor.ino,
-                    });
-                }
             }
             destination_anchor
                 .set(anchor)
@@ -4019,9 +4113,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             },
         )?;
         mutation_root_condition = target_identity(&created);
-        if guard_containers {
-            container_guard = Some(target_container(&dst_root, &created));
-        }
     }
     if debug() {
         crate::output::diagnostic!(
@@ -4379,8 +4470,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         dst_root: dst_root.clone(),
         exact_condition,
         mutation_root_condition,
-        container_guard,
-        guard_containers,
         buffer: if defer_destination_mutations {
             Some(Vec::new())
         } else {
@@ -4389,8 +4478,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         fresh_capacity,
         src_overrides: std::collections::HashMap::new(),
         implicit_dirs: std::collections::HashSet::new(),
-        mapping_explicit_parents: std::collections::HashSet::new(),
-        blocked_mapping_parents: std::collections::HashSet::new(),
         directory_restorations: Default::default(),
         receiver_uid: None,
         parent_groups: Default::default(),
@@ -4448,20 +4535,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let mut scan_err = None;
     let mut fresh_capacity_assessment = None;
     let mut dry_run_mappings = Vec::with_capacity(srcs.len());
-    if let Some((mapping_entries, explicit_parents)) = mapping_entries {
+    if let Some(mapping_entries) = mapping_entries {
         let src = &srcs[0];
         st.active_source = Some(
             source_roots.get().expect("source roots registered")[0]
                 .selection
                 .clone(),
         );
-        match st.scan_mapping(
-            &mut *src_ctl,
-            &src.path,
-            &dst_root,
-            mapping_entries,
-            explicit_parents,
-        ) {
+        match st.scan_mapping(&mut *src_ctl, &src.path, &dst_root, mapping_entries) {
             Ok(()) => dry_run_mappings.push(DryRunMapping {
                 target: dst_root.clone(),
                 semantics: "entries selected by --mapping",
@@ -4719,7 +4800,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     let single_direct_candidate =
                         autotune && opts.copy_policy(bwlimit.is_some()).allows_receiver_copy() && {
                             let jobs = sched.jobs.lock().unwrap();
-                            jobs.len() == 1 && jobs[0].container_guard.is_none()
+                            jobs.len() == 1
                         };
                     let mut initial = if multiplex_small_files {
                         start_rule(args.connections).batched(file_jobs, file_bytes)
@@ -5120,7 +5201,6 @@ fn stat_many_registered(
             paths,
             sources,
             follow,
-            guard: None,
         })?,
         "stat",
     )? {
@@ -5134,7 +5214,6 @@ fn stat_many_registered(
 fn inspect_destination_paths(
     conn: &mut dyn Conn,
     mut paths: Vec<PathBytes>,
-    guard: Option<ContainerGuard>,
     context: &'static str,
 ) -> Result<Vec<Option<Entry>>> {
     if paths.is_empty() {
@@ -5145,12 +5224,12 @@ fn inspect_destination_paths(
     });
     if paths.len() > 1 && bytes > SOURCE_BATCH_PATH_BYTES {
         let tail = paths.split_off(paths.len() / 2);
-        let mut entries = inspect_destination_paths(conn, paths, guard.clone(), context)?;
-        entries.extend(inspect_destination_paths(conn, tail, guard, context)?);
+        let mut entries = inspect_destination_paths(conn, paths, context)?;
+        entries.extend(inspect_destination_paths(conn, tail, context)?);
         return Ok(entries);
     }
     let count = paths.len();
-    match ok(conn.call(Request::PruneLookup { paths, guard })?, context)? {
+    match ok(conn.call(Request::PruneLookup { paths })?, context)? {
         Response::Stats(entries) if entries.len() == count => Ok(entries),
         other => bail!("unexpected destination inspection response {other:?}"),
     }
@@ -5158,14 +5237,6 @@ fn inspect_destination_paths(
 
 fn target_identity(entry: &Entry) -> TargetCondition {
     TargetCondition::Matches {
-        dev: entry.dev,
-        ino: entry.ino,
-    }
-}
-
-fn target_container(root: &[u8], entry: &Entry) -> ContainerGuard {
-    ContainerGuard {
-        root: root.to_vec(),
         dev: entry.dev,
         ino: entry.ino,
     }
@@ -5199,7 +5270,7 @@ fn mkdir_root(
         mode,
         condition,
     }];
-    match ok(conn.call(Request::Apply { ops, guard: None })?, "mkdir")? {
+    match ok(conn.call(Request::Apply { ops })?, "mkdir")? {
         Response::Applied(errs) => mkdir_apply_result(errs)?,
         other => bail!("unexpected response {other:?}"),
     }
@@ -5259,7 +5330,7 @@ fn stat_one(conn: &mut dyn Conn, path: &[u8], follow: bool) -> Result<Option<Ent
 /// lookup must not let --as-new or --if-exists=keep replace an existing entry.
 fn inspect_placement_target(conn: &mut dyn Conn, path: &[u8]) -> Result<Option<Entry>> {
     Ok(
-        inspect_destination_paths(conn, vec![path.to_vec()], None, "inspect placement target")?
+        inspect_destination_paths(conn, vec![path.to_vec()], "inspect placement target")?
             .pop()
             .flatten(),
     )
@@ -5634,11 +5705,9 @@ fn stat_and_canonicalize(
         paths: vec![path.to_vec()],
         sources: None,
         follow: false,
-        guard: None,
     })?;
     conn.send(Request::Canonicalize {
         path: path.to_vec(),
-        guard: None,
     })?;
     // Consume both replies before interpreting either endpoint error so the
     // reusable control stream cannot be left one response behind.

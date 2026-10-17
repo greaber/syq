@@ -432,6 +432,18 @@ fn management_stage_is_scoped_to_one_shell_session() {
         .exists());
 }
 
+/// Execute authorized Apply operations as a connection of `authority`'s
+/// copy executes them.
+fn execute_ops(authority: &RestrictedAuthority, ops: &[Op]) -> Vec<Option<proto::WireError>> {
+    match authority
+        .test_ops()
+        .handle(&Request::Apply { ops: ops.to_vec() })
+    {
+        proto::Response::Applied(results) => results,
+        other => panic!("unexpected response {other:?}"),
+    }
+}
+
 fn test_authority(
     root: &Path,
     deletion: DeletionPolicy,
@@ -642,12 +654,43 @@ fn test_authority_with_results(
     deletion: DeletionPolicy,
     maximum_bytes: u64,
     max_file_data_bytes_per_second: u64,
+    filters: FilterPolicy,
+    publication: PublicationPolicy,
+    existing: ExistingDestinationPolicy,
+    placement: DestinationPlacement,
+    root_existence: RootExistence,
+    results: Option<(PrivateKey, crate::destination_results::ReceiptPolicy)>,
+) -> Result<RestrictedAuthority> {
+    test_authority_with_options(
+        root,
+        deletion,
+        maximum_bytes,
+        max_file_data_bytes_per_second,
+        filters,
+        publication,
+        existing,
+        placement,
+        root_existence,
+        results,
+        (Default::default(), &[]),
+    )
+}
+
+/// `test_authority_with_results` with signed extra copy options and the
+/// receiver's protected paths.
+#[allow(clippy::too_many_arguments)]
+fn test_authority_with_options(
+    root: &Path,
+    deletion: DeletionPolicy,
+    maximum_bytes: u64,
+    max_file_data_bytes_per_second: u64,
     mut filters: FilterPolicy,
     publication: PublicationPolicy,
     existing: ExistingDestinationPolicy,
     placement: DestinationPlacement,
     root_existence: RootExistence,
     results: Option<(PrivateKey, crate::destination_results::ReceiptPolicy)>,
+    (extra_options, protected): (crate::delegation::ExtraCopyOptions, &[ReceiverControlPath]),
 ) -> Result<RestrictedAuthority> {
     let opened = Root::open(root).unwrap();
     let identity = opened.identity();
@@ -730,12 +773,12 @@ fn test_authority_with_results(
             filters,
             root_existence,
             receipt_policy,
-            extra_options: Default::default(),
+            extra_options,
         },
         [0; 32],
         results_key,
         Instant::now() + std::time::Duration::from_secs(60),
-        &[],
+        protected,
     )
 }
 
@@ -958,10 +1001,9 @@ fn prune_lookup_is_confined_to_authorized_observation_paths() {
     fs::write(&target, b"data").unwrap();
     let mut request = Request::PruneLookup {
         paths: vec![target.as_os_str().as_bytes().to_vec()],
-        guard: None,
     };
     authority.authorize(&mut request, false).unwrap();
-    let response = crate::fsops::FsOps::new().handle(&request);
+    let response = authority.test_ops().handle(&request);
     let proto::Response::Stats(stats) = response else {
         panic!("prune lookup failed: {response:?}")
     };
@@ -973,13 +1015,12 @@ fn prune_lookup_is_confined_to_authorized_observation_paths() {
             .as_os_str()
             .as_bytes()
             .to_vec()],
-        guard: None,
     };
     assert!(authority.authorize(&mut outside, false).is_err());
 }
 
 #[test]
-fn authority_overwrites_client_guards_and_rejects_scope_and_option_escalation() {
+fn authority_rejects_scope_and_option_escalation() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     fs::create_dir(&root).unwrap();
@@ -996,43 +1037,22 @@ fn authority_overwrites_client_guards_and_rejects_scope_and_option_escalation() 
         paths: vec![target.clone()],
         sources: None,
         follow: false,
-        guard: Some(ContainerGuard {
-            root: outside.clone(),
-            dev: 1,
-            ino: 2,
-        }),
     };
     authority.authorize(&mut stat, false).unwrap();
-    let Request::StatMany {
-        guard: Some(guard), ..
-    } = stat
-    else {
-        panic!("authority did not install a guard")
-    };
-    assert_eq!(guard.root, root.as_os_str().as_bytes());
 
     let mut plan = Request::PlanBatch {
         partial_paths: vec![target.clone()],
         copy_id: [3; 16],
         directories: vec![target.clone()],
         others: vec![target.clone()],
-        guard: None,
         strict_metadata: false,
     };
     authority.authorize(&mut plan, false).unwrap();
-    let Request::PlanBatch {
-        guard: Some(guard), ..
-    } = plan
-    else {
-        panic!("authority did not guard the combined planning request")
-    };
-    assert_eq!(guard.root, root.as_os_str().as_bytes());
 
     let mut outside_stat = Request::StatMany {
         paths: vec![outside.clone()],
         sources: None,
         follow: false,
-        guard: None,
     };
     assert!(authority.authorize(&mut outside_stat, false).is_err());
 
@@ -1042,7 +1062,6 @@ fn authority_overwrites_client_guards_and_rejects_scope_and_option_escalation() 
             mode: 0o7777,
             condition: proto::TargetCondition::Absent,
         }],
-        guard: None,
     };
     authority.authorize(&mut mkdir, false).unwrap();
     let Request::Apply { ops, .. } = mkdir else {
@@ -1067,22 +1086,10 @@ fn authority_overwrites_client_guards_and_rejects_scope_and_option_escalation() 
         flags: proto::flags::RECEIVER_MODE,
         inplace: false,
         condition: proto::TargetCondition::Any,
-        guard: Some(ContainerGuard {
-            root: outside,
-            dev: 1,
-            ino: 2,
-        }),
         replaces: false,
         scanned: crate::proto::ScannedDestination::Unknown,
     }]);
     authority.authorize(&mut small, false).unwrap();
-    let Request::PutSmallBatch(puts) = small else {
-        unreachable!()
-    };
-    assert_eq!(
-        puts[0].guard.as_ref().unwrap().root,
-        root.as_os_str().as_bytes()
-    );
 
     let mut write = Request::WriteRange {
         path: target,
@@ -1092,7 +1099,6 @@ fn authority_overwrites_client_guards_and_rejects_scope_and_option_escalation() 
         off: 0,
         hash: [0; 32],
         data: vec![0; 5].into(),
-        guard: None,
     };
     assert!(authority.authorize(&mut write, false).is_err());
 }
@@ -1110,14 +1116,10 @@ fn exact_destination_observation_scope_excludes_its_parent() {
         paths: vec![destination],
         sources: None,
         follow: false,
-        guard: None,
     };
     authority.authorize(&mut exact, false).unwrap();
 
-    let mut parent = Request::Canonicalize {
-        path: parent,
-        guard: None,
-    };
+    let mut parent = Request::Canonicalize { path: parent };
     let error = authority.authorize(&mut parent, false).unwrap_err();
     assert!(error
         .to_string()
@@ -1156,7 +1158,6 @@ fn signed_filters_bind_scans_mutations_and_prune_protection() {
         follow_root: false,
         ignore,
         report_ignored: true,
-        guard: None,
     };
     let mut matching_scan = scan(policy.ignore.clone());
     authority.authorize(&mut matching_scan, false).unwrap();
@@ -1174,7 +1175,6 @@ fn signed_filters_bind_scans_mutations_and_prune_protection() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
-        guard: None,
         group: None,
         update: None,
     };
@@ -1186,7 +1186,6 @@ fn signed_filters_bind_scans_mutations_and_prune_protection() {
         ops: vec![Op::Unlink {
             path: ignored.clone(),
         }],
-        guard: None,
     };
     assert!(authority.authorize(&mut protected_delete, false).is_err());
 
@@ -1204,7 +1203,6 @@ fn signed_filters_bind_scans_mutations_and_prune_protection() {
     );
     let mut permitted_delete = Request::Apply {
         ops: vec![Op::Unlink { path: ignored }],
-        guard: None,
     };
     delete_excluded
         .authorize(&mut permitted_delete, false)
@@ -1258,7 +1256,6 @@ fn mixed_filter_mappings_keep_an_explicit_named_source_root() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
-        guard: None,
         group: None,
         update: None,
     };
@@ -1302,7 +1299,6 @@ fn signed_in_place_policies_admit_in_place_and_staged_file_mutations() {
             scanned: crate::proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
-            guard: None,
             group: None,
             update: None,
         };
@@ -1362,7 +1358,6 @@ fn restricted_widening_follows_the_approved_mode() {
         access,
         remember: true,
         directories: vec![(path_bytes(path), condition)],
-        guard: None,
     };
     for mode in [
         DirectoryWidening::None,
@@ -1411,7 +1406,7 @@ fn restricted_widening_follows_the_approved_mode() {
         };
         assert_eq!(directories[0].1, identity(&root));
         fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
-        let mut ops = crate::fsops::FsOps::new();
+        let mut ops = authority.test_ops();
         let response = ops.handle(&outer);
         authority.settle(settlement, &response);
         let widened = fs::metadata(&root).unwrap().mode() & 0o777;
@@ -1435,7 +1430,6 @@ fn restricted_widening_follows_the_approved_mode() {
                 condition: identity(&root),
                 directory: false,
             }],
-            guard: None,
         };
         let response = execute_authorized(&authority, &mut ops, restore);
         assert!(
@@ -1468,7 +1462,6 @@ fn restricted_all_widens_ancestors_beneath_the_enrolled_root() {
         path: path_bytes(path),
         symlink_policy: proto::OperatorSymlinkPolicy::FollowAll,
         create_missing: true,
-        guard: None,
     };
     for widen in [
         DirectoryWidening::None,
@@ -1500,7 +1493,7 @@ fn restricted_all_widens_ancestors_beneath_the_enrolled_root() {
             .is_err());
         fs::set_permissions(&middle, fs::Permissions::from_mode(0o600)).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o600)).unwrap();
-        let mut ops = crate::fsops::FsOps::new();
+        let mut ops = authority.test_ops();
         let response = ops.handle(&request);
         authority.settle(settlement, &response);
         assert!(matches!(response, proto::Response::Ok), "{response:?}");
@@ -1542,7 +1535,6 @@ fn prepare_request(path: &Path) -> Request {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
-        guard: None,
         group: None,
         update: None,
     }
@@ -1558,7 +1550,6 @@ fn finalize_request(path: &Path, condition: proto::TargetCondition) -> Request {
         flags: 0,
         scanned: crate::proto::ScannedDestination::Unknown,
         condition,
-        guard: None,
     }
 }
 
@@ -1579,7 +1570,6 @@ fn small_put(path: &Path) -> Request {
         flags: 0,
         inplace: false,
         condition: proto::TargetCondition::Any,
-        guard: None,
         replaces: false,
         scanned: crate::proto::ScannedDestination::Unknown,
     }])
@@ -1593,10 +1583,7 @@ fn small_put_condition(request: &Request) -> proto::TargetCondition {
 }
 
 fn apply(op: Op) -> Request {
-    Request::Apply {
-        ops: vec![op],
-        guard: None,
-    }
+    Request::Apply { ops: vec![op] }
 }
 
 fn op_condition(request: &Request) -> proto::TargetCondition {
@@ -1688,10 +1675,10 @@ fn signed_skip_records_directory_created_after_foreign_directory_disappears() {
     let mut create = apply(mkdir(&dir));
     let settlement = authority.authorize(&mut create, false).unwrap();
     fs::remove_dir(&dir).unwrap();
-    let Request::Apply { ops, guard } = &create else {
+    let Request::Apply { ops } = &create else {
         unreachable!()
     };
-    let results = crate::fsops::FsOps::new().apply(ops, guard.as_ref());
+    let results = execute_ops(&authority, ops);
     assert!(results.iter().all(Option::is_none), "{results:?}");
     authority.settle(settlement, &proto::Response::Applied(results));
     assert!(dir.is_dir());
@@ -1726,17 +1713,16 @@ fn signed_skip_directory_race_preserves_metadata_and_allows_siblings() {
         }
         let mut batch = Request::Apply {
             ops: vec![mkdir(&raced), mkdir(&sibling)],
-            guard: None,
         };
         let settlement = authority.authorize(&mut batch, false).unwrap();
         if !before_authorization {
             create_foreign();
         }
         let before = fs::metadata(&raced).unwrap();
-        let Request::Apply { ops, guard } = &batch else {
+        let Request::Apply { ops } = &batch else {
             unreachable!()
         };
-        let results = crate::fsops::FsOps::new().apply(ops, guard.as_ref());
+        let results = execute_ops(&authority, ops);
         assert!(results[0].is_some());
         assert!(results[1].is_none(), "{results:?}");
         authority.settle(settlement, &proto::Response::Applied(results));
@@ -1802,7 +1788,7 @@ fn mapping_parents_cannot_be_recreated_under_only_existing() {
         // may be refused up front, but an admitted request cannot create.
         fs::remove_dir(&parent).unwrap();
         if let Ok(settlement) = admitted {
-            let response = crate::fsops::FsOps::new().handle(&request);
+            let response = authority.test_ops().handle(&request);
             authority.settle(settlement, &response);
             assert!(
                 matches!(response, proto::Response::Applied(ref errors)
@@ -1848,7 +1834,7 @@ fn mapping_parent_reopening_keeps_requested_identity() {
         };
         assert!(matches!(&ops[0], Op::Mkdir { condition: actual, .. } if *actual == condition));
         fs::remove_dir(&parent).unwrap();
-        let response = crate::fsops::FsOps::new().handle(&request);
+        let response = authority.test_ops().handle(&request);
         authority.settle(settlement, &response);
         assert!(
             matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_some)),
@@ -1884,7 +1870,7 @@ fn mapping_parents_reopen_and_restore_receiver_permissions() {
             authority.extra_options.widen_dirs = DirectoryWidening::Rsync;
             admit_test_mapping(&mut authority, "parent/item");
             // The connection that widens a directory restores it.
-            let mut ops = crate::fsops::FsOps::new();
+            let mut ops = authority.test_ops();
             let mut request = apply(mkdir(&parent));
             let settlement = authority.authorize(&mut request, false).unwrap();
             let response = ops.handle(&request);
@@ -1913,7 +1899,6 @@ fn mapping_parents_reopen_and_restore_receiver_permissions() {
                             ino: original.ino(),
                         },
                     )],
-                    guard: None,
                 };
                 let settlement = authority.authorize(&mut access, false).unwrap();
                 let response = ops.handle(&access);
@@ -1992,7 +1977,7 @@ fn mapping_new_parents_have_final_modes_without_metadata_updates() {
             condition: proto::TargetCondition::Any,
         });
         let settlement = authority.authorize(&mut request, false).unwrap();
-        let response = crate::fsops::FsOps::new().handle(&request);
+        let response = authority.test_ops().handle(&request);
         authority.settle(settlement, &response);
         assert!(
             matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_none)),
@@ -2030,12 +2015,11 @@ fn mapping_pending_parent_creation_cannot_authorize_foreign_metadata() {
                 directory: false,
             },
         ],
-        guard: None,
     };
     // The metadata asks only for a mode the receiver chooses, which keeps
     // the mode of a directory it did not create.
     let settlement = authority.authorize(&mut request, false).unwrap();
-    let response = crate::fsops::FsOps::new().handle(&request);
+    let response = authority.test_ops().handle(&request);
     authority.settle(settlement, &response);
     assert!(!authority.created_by_this_grant(&path_bytes(&parent)));
     assert_eq!(fs::metadata(&parent).unwrap().mode() & 0o777, 0o550);
@@ -2058,7 +2042,7 @@ fn mapping_failed_parent_creation_cannot_authorize_foreign_metadata() {
     let settlement = authority.authorize(&mut create, false).unwrap();
     fs::create_dir(&parent).unwrap();
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o550)).unwrap();
-    let response = crate::fsops::FsOps::new().handle(&create);
+    let response = authority.test_ops().handle(&create);
     authority.settle(settlement, &response);
     assert!(
         matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_some)),
@@ -2072,7 +2056,7 @@ fn mapping_failed_parent_creation_cannot_authorize_foreign_metadata() {
         directory: false,
     });
     let settlement = authority.authorize(&mut restore, false).unwrap();
-    let response = crate::fsops::FsOps::new().handle(&restore);
+    let response = authority.test_ops().handle(&restore);
     authority.settle(settlement, &response);
     assert_eq!(fs::metadata(&parent).unwrap().mode() & 0o777, 0o550);
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
@@ -2114,7 +2098,6 @@ fn mapping_receiver_confines_entries_and_protects_existing_parents() {
                 follow_root: false,
                 ignore: vec![],
                 report_ignored: false,
-                guard: None,
             },
             true
         )
@@ -2145,7 +2128,7 @@ fn mapping_receiver_confines_entries_and_protects_existing_parents() {
         .is_err());
     let run = |mut request| {
         let settlement = authority.authorize(&mut request, false)?;
-        let response = crate::fsops::FsOps::new().handle(&request);
+        let response = authority.test_ops().handle(&request);
         authority.settle(settlement, &response);
         Ok::<_, anyhow::Error>(response)
     };
@@ -2269,7 +2252,7 @@ fn signed_skip_allows_seeding_and_retrying_a_new_file() {
         RootExistence::Any,
     )
     .unwrap();
-    let mut ops = crate::fsops::FsOps::new();
+    let mut ops = authority.test_ops();
     let mut prepare = prepare_request(&fresh);
     let settlement = authority.authorize(&mut prepare, false).unwrap();
     let response = ops.handle(&prepare);
@@ -2284,7 +2267,6 @@ fn signed_skip_allows_seeding_and_retrying_a_new_file() {
             len: 3,
             block: authority.copy.limits.hash_block_bytes,
             attempt,
-            guard: None,
             clone_final: false,
         };
         let settlement = authority.authorize(&mut seed, false).unwrap();
@@ -2396,7 +2378,6 @@ fn signed_skip_policy_retains_preexisting_objects() {
         meta: plain_meta(),
         flags: 0,
         condition: Any,
-        guard: None,
     };
     assert!(authority.authorize(&mut finish, false).is_err());
     let mut seed = Request::SeedBasis {
@@ -2406,7 +2387,6 @@ fn signed_skip_policy_retains_preexisting_objects() {
         len: 3,
         block: proto::MIN_HASH_BLOCK_BYTES,
         attempt: 0,
-        guard: None,
         clone_final: false,
     };
     assert!(authority.authorize(&mut seed, false).is_err());
@@ -2486,7 +2466,6 @@ fn signed_must_exist_policy_creates_nothing() {
         meta: plain_meta(),
         flags: 0,
         condition: Any,
-        guard: None,
     };
     authority.authorize(&mut finish, false).unwrap();
     let mut meta_present = apply(set_meta(&present));
@@ -2537,7 +2516,6 @@ fn provisional_creations_are_forgotten_when_execution_fails() {
     // Per-operation results settle a batch operation by operation.
     let mut batch = Request::Apply {
         ops: vec![mkdir(&dir_a), mkdir(&dir_b)],
-        guard: None,
     };
     let settlement = authority.authorize(&mut batch, false).unwrap();
     authority.settle(
@@ -2575,7 +2553,6 @@ fn a_refused_request_leaves_no_provisional_creations_behind() {
     // of the batch runs, so the first must not count as created.
     let mut batch = Request::Apply {
         ops: vec![mkdir(&fresh), symlink_op(&kept)],
-        guard: None,
     };
     assert!(authority.authorize(&mut batch, false).is_err());
     let mut again = apply(mkdir(&fresh));
@@ -2591,7 +2568,6 @@ fn a_refused_request_leaves_no_provisional_creations_behind() {
     // Metadata may follow a creation within the same request.
     let mut create_and_touch = Request::Apply {
         ops: vec![symlink_op(&link), set_meta(&link)],
-        guard: None,
     };
     authority.authorize(&mut create_and_touch, false).unwrap();
     let Request::Apply { ops, .. } = &create_and_touch else {
@@ -2683,7 +2659,6 @@ fn must_exist_pins_update_only_operations() {
         meta: plain_meta(),
         flags: 0,
         condition: Any,
-        guard: None,
     };
     authority.authorize(&mut finish, false).unwrap();
     let Request::FinishBasis { condition, .. } = &finish else {
@@ -2732,14 +2707,9 @@ fn must_exist_replacement_and_metadata_execute_as_one_batch() {
     }
     let mut batch = Request::Apply {
         ops: vec![with_metadata],
-        guard: None,
     };
     let settlement = authority.authorize(&mut batch, false).unwrap();
-    let Request::Apply {
-        ops,
-        guard: Some(guard),
-    } = &batch
-    else {
+    let Request::Apply { ops } = &batch else {
         unreachable!()
     };
     assert!(matches!(
@@ -2748,7 +2718,7 @@ fn must_exist_replacement_and_metadata_execute_as_one_batch() {
             if (dev, ino) == (before.dev(), before.ino())
     ));
     assert_eq!(ops.len(), 1);
-    let results = crate::fsops::FsOps::new().apply(ops, Some(guard));
+    let results = execute_ops(&authority, ops);
     assert!(results.iter().all(Option::is_none), "{results:?}");
     authority.settle(settlement, &proto::Response::Applied(results));
     assert_eq!(
@@ -2831,7 +2801,6 @@ fn results_report_confirmed_changes_and_end_the_grant() {
     let mut hash = Request::FileHash {
         path: path_bytes(&kept),
         source: None,
-        guard: None,
     };
     let settlement = authority.authorize(&mut hash, false).unwrap();
     authority.settle(
@@ -2893,7 +2862,6 @@ fn results_report_confirmed_changes_and_end_the_grant() {
         paths: vec![path_bytes(&kept)],
         sources: None,
         follow: false,
-        guard: None,
     };
     assert!(authority.authorize(&mut observe, false).is_err());
 
@@ -3195,7 +3163,6 @@ fn a_small_file_batch_with_links_reports_each_failed_write() {
         flags: 0,
         inplace: false,
         condition: proto::TargetCondition::Any,
-        guard: None,
         replaces: false,
         scanned: crate::proto::ScannedDestination::Unknown,
     };
@@ -3210,6 +3177,8 @@ fn a_small_file_batch_with_links_reports_each_failed_write() {
                 message: "No space left on device".into(),
                 io_kind: Some(proto::WireIoKind::NoSpace),
                 raw_os_error: Some(28),
+                condition_not_met: false,
+                unchanged: false,
             }),
         ]),
     );
@@ -3255,7 +3224,6 @@ fn results_list_each_settled_change_in_ordinary_form() {
         flags: 0,
         inplace: false,
         condition: proto::TargetCondition::Any,
-        guard: None,
         replaces: false,
         scanned: crate::proto::ScannedDestination::Unknown,
     };
@@ -3324,6 +3292,8 @@ fn results_report_a_declined_metadata_change_as_the_replacement() {
             proto::ReplaceReason::OtherNames,
         )),
         raw_os_error: None,
+        condition_not_met: false,
+        unchanged: false,
     };
 
     // A metadata repair the receiver declines, then the replacement.
@@ -3357,7 +3327,7 @@ fn results_report_a_declined_metadata_change_as_the_replacement() {
         files: vec![existing_read(&small, 3)],
     };
     let settlement = authority.authorize(&mut hash, false).unwrap();
-    let response = crate::fsops::FsOps::new().handle(&hash);
+    let response = authority.test_ops().handle(&hash);
     authority.settle(settlement, &response);
     let proto::Response::ExistingHashes(mut existing) = response else {
         panic!("unexpected hash response {response:?}")
@@ -3434,7 +3404,6 @@ fn unfinished_in_place_files_are_reported_failed() {
             scanned: crate::proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
-            guard: None,
             group: None,
             update: None,
         };
@@ -3449,7 +3418,6 @@ fn unfinished_in_place_files_are_reported_failed() {
             off: 0,
             hash: crate::fsops::content_digest(b"ha"),
             data: b"ha".to_vec().into(),
-            guard: None,
         };
         let settlement = authority.authorize(&mut write, false).unwrap();
         authority.settle(settlement, &proto::Response::Ok);
@@ -3463,7 +3431,6 @@ fn unfinished_in_place_files_are_reported_failed() {
                 flags: 0,
                 scanned: crate::proto::ScannedDestination::Unknown,
                 condition: proto::TargetCondition::Any,
-                guard: None,
             };
             let settlement = authority.authorize(&mut finalize, false).unwrap();
             authority.settle(settlement, &proto::Response::Ok);
@@ -3521,7 +3488,6 @@ fn refused_preparations_leave_nothing_behind() {
             scanned: crate::proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
-            guard: None,
             group: None,
             update: None,
         };
@@ -3571,26 +3537,24 @@ fn a_refused_write_to_an_unfinished_file_lists_it_once() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
-        guard: None,
         group: None,
         update: None,
     };
     let settlement = authority.authorize(&mut prepare, false).unwrap();
     fs::write(&image, b"half").unwrap();
     authority.settle(settlement, &proto::Response::Ok);
-    // A write past the size the file declared is refused.
+    // A write past the grant's per-file limit is refused.
     let mut write = Request::WriteRange {
         path: path_bytes(&image),
         inplace: true,
         copy_id: [1; 16],
         attempt: 0,
-        off: 4,
+        off: 1023,
         hash: crate::fsops::content_digest(b"ha"),
         data: b"ha".to_vec().into(),
-        guard: None,
     };
     let error = authority.authorize(&mut write, false).unwrap_err();
-    assert!(format!("{error:#}").contains("declared"), "{error:#}");
+    assert!(format!("{error:#}").contains("per-file"), "{error:#}");
     let results = finish_results(&authority, &mut reader);
     assert_eq!((results.totals.refused, results.totals.failed), (1, 0));
     // Once, as refused, and not again as unfinished.
@@ -3643,9 +3607,8 @@ fn in_place_final_step_honors_the_fingerprint_the_receiver_takes_after_the_write
             None,
         )
         .unwrap();
-        // The authority attaches its root guard to each request, which is
-        // the receiver's whole authority for them.
-        let mut receiver = crate::fsops::FsOps::new();
+        // The receiver works beneath the root the authority holds.
+        let mut receiver = authority.test_ops();
         let copy_id = [7; 16];
         let mut run = |mut request: Request| {
             let settlement = authority.authorize(&mut request, false).unwrap();
@@ -3664,7 +3627,6 @@ fn in_place_final_step_honors_the_fingerprint_the_receiver_takes_after_the_write
             scanned: crate::proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
-            guard: None,
             group: None,
             update: None,
         });
@@ -3680,7 +3642,6 @@ fn in_place_final_step_honors_the_fingerprint_the_receiver_takes_after_the_write
             off: 0,
             hash: crate::fsops::content_digest(b"contents"),
             data: b"contents".to_vec().into(),
-            guard: None,
         });
         assert!(
             matches!(written, proto::Response::Ok),
@@ -3695,7 +3656,6 @@ fn in_place_final_step_honors_the_fingerprint_the_receiver_takes_after_the_write
             flags: proto::flags::RECEIVER_MODE,
             scanned: crate::proto::ScannedDestination::Unknown,
             condition: proto::TargetCondition::Any,
-            guard: None,
         });
         assert!(
             matches!(
@@ -3709,7 +3669,7 @@ fn in_place_final_step_honors_the_fingerprint_the_receiver_takes_after_the_write
 }
 
 #[test]
-fn guarded_executor_honors_creation_conditions() {
+fn restricted_executor_honors_creation_conditions() {
     use proto::TargetCondition::{Absent, Any, Matches};
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
@@ -3721,12 +3681,7 @@ fn guarded_executor_honors_creation_conditions() {
     fs::create_dir_all(&dir).unwrap();
     fs::write(&file, b"keep").unwrap();
     std::os::unix::fs::symlink("file", &link).unwrap();
-    let root_identity = fs::metadata(&root).unwrap();
-    let guard = ContainerGuard {
-        root: path_bytes(&root),
-        dev: root_identity.dev(),
-        ino: root_identity.ino(),
-    };
+    let mut receiver = crate::fsops::FsOps::test_restricted(&root);
     let identity = |path: &Path| {
         let metadata = fs::symlink_metadata(path).unwrap();
         Matches {
@@ -3734,7 +3689,10 @@ fn guarded_executor_honors_creation_conditions() {
             ino: metadata.ino(),
         }
     };
-    let run = |op: Op| crate::fsops::FsOps::new().apply(&[op], Some(&guard))[0].clone();
+    let mut run = |op: Op| match receiver.handle(&Request::Apply { ops: vec![op] }) {
+        proto::Response::Applied(mut results) => results.remove(0),
+        other => panic!("unexpected response {other:?}"),
+    };
     let with = |op: Op, condition| match op {
         Op::Mkdir { path, mode, .. } => Op::Mkdir {
             path,
@@ -3974,7 +3932,6 @@ fn grant_distinguishes_receiver_modes_from_source_permission_preservation() {
             condition: proto::TargetCondition::Any,
             directory: false,
         }],
-        guard: None,
     };
 
     let receiver_modes = test_authority(&root, DeletionPolicy::Forbid, 1024);
@@ -3994,7 +3951,6 @@ fn grant_distinguishes_receiver_modes_from_source_permission_preservation() {
             mode: 0o750,
             condition: proto::TargetCondition::Any,
         }],
-        guard: None,
     };
     source_modes.authorize(&mut source_mkdir, false).unwrap();
     let Request::Apply { ops, .. } = source_mkdir else {
@@ -4018,21 +3974,21 @@ fn explicit_ownership_flags_require_existing_grant_authority() {
         (flags::OWNER, flags::REQUIRE_OWNER),
         (flags::GROUP, flags::REQUIRE_GROUP),
     ] {
-        assert!(authority.check_flags(required).is_err());
-        assert!(authority.check_flags(attribute | required).is_err());
+        assert!(authority.check_flags(required, 0).is_err());
+        assert!(authority.check_flags(attribute | required, 0).is_err());
     }
     authority.copy.options.preserve_owner = true;
     authority
-        .check_flags(flags::OWNER | flags::REQUIRE_OWNER)
+        .check_flags(flags::OWNER | flags::REQUIRE_OWNER, 0)
         .unwrap();
     assert!(authority
-        .check_flags(flags::GROUP | flags::REQUIRE_GROUP)
+        .check_flags(flags::GROUP | flags::REQUIRE_GROUP, 0)
         .is_err());
     authority.copy.options.preserve_group = true;
     authority
-        .check_flags(flags::GROUP | flags::REQUIRE_GROUP)
+        .check_flags(flags::GROUP | flags::REQUIRE_GROUP, 0)
         .unwrap();
-    assert!(authority.check_flags(flags::REQUIRE_GROUP).is_err());
+    assert!(authority.check_flags(flags::REQUIRE_GROUP, 0).is_err());
 }
 
 /// The mode the kernel gives a new directory or file in `parent` created
@@ -4075,7 +4031,7 @@ fn receiver_chosen_modes_keep_existing_objects_and_limit_new_ones() {
     let new_file_mode = created_mode(&target, 0o777, false);
     let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
     authority.extra_options.widen_dirs = DirectoryWidening::Rsync;
-    let mut ops = crate::fsops::FsOps::new();
+    let mut ops = authority.test_ops();
     let path = |path: &Path| path.as_os_str().as_bytes().to_vec();
     let applied = |response: proto::Response| matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_none));
 
@@ -4091,7 +4047,6 @@ fn receiver_chosen_modes_keep_existing_objects_and_limit_new_ones() {
         &mut ops,
         Request::Apply {
             ops: vec![mkdir(&existing_directory), mkdir(&new_directory)],
-            guard: None,
         },
     )));
     assert_eq!(
@@ -4119,7 +4074,6 @@ fn receiver_chosen_modes_keep_existing_objects_and_limit_new_ones() {
                     ino: observed.ino(),
                 },
             )],
-            guard: None,
         },
     );
     assert!(
@@ -4149,7 +4103,6 @@ fn receiver_chosen_modes_keep_existing_objects_and_limit_new_ones() {
                 receiver_meta(&existing_directory),
                 receiver_meta(&new_directory),
             ],
-            guard: None,
         },
     )));
     assert_eq!(
@@ -4187,7 +4140,6 @@ fn receiver_chosen_modes_keep_existing_objects_and_limit_new_ones() {
         flags: proto::flags::RECEIVER_MODE,
         inplace: false,
         condition: proto::TargetCondition::Any,
-        guard: None,
         replaces: false,
         scanned: crate::proto::ScannedDestination::Unknown,
     };
@@ -4236,7 +4188,7 @@ fn receiver_chosen_mode_opens_a_private_directory_with_its_inherited_setgid() {
     let opened = created_mode(&root, 0o777, true);
     assert_eq!(opened & 0o2000, inherited_setgid);
     let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    let mut ops = crate::fsops::FsOps::new();
+    let mut ops = authority.test_ops();
     let response = execute_authorized(
         &authority,
         &mut ops,
@@ -4269,7 +4221,7 @@ fn receiver_chosen_mode_opens_a_private_directory_with_its_inherited_setgid() {
         })
     };
     // Another connection did not create it, so its mode stays.
-    let response = execute_authorized(&authority, &mut crate::fsops::FsOps::new(), receiver_meta());
+    let response = execute_authorized(&authority, &mut authority.test_ops(), receiver_meta());
     assert!(
         matches!(response, proto::Response::Applied(_)),
         "{response:?}"
@@ -4303,7 +4255,6 @@ fn signed_hash_block_and_response_bounds_are_enforced() {
         block,
         len,
         attempt: 0,
-        guard: None,
     };
 
     let mut valid = request(4 << 20, 8 << 20);
@@ -4343,11 +4294,8 @@ fn signed_file_data_rate_is_enforced_across_requests() {
         off,
         hash: [0; 32],
         data: vec![0; 256].into(),
-        guard: None,
     };
 
-    // Writes must land in a partial this grant declared.
-    assert!(authority.authorize(&mut request(0), false).is_err());
     let mut prepare = Request::Prepare {
         path: target.clone(),
         size: 1024,
@@ -4359,7 +4307,6 @@ fn signed_file_data_rate_is_enforced_across_requests() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
-        guard: None,
         group: None,
         update: None,
     };
@@ -4463,7 +4410,6 @@ fn authority_binds_one_encrypted_listener_and_known_metadata_flags() {
             condition: proto::TargetCondition::Any,
             directory: false,
         }],
-        guard: None,
     };
     assert!(wrong_range.authorize(&mut metadata, false).is_err());
 }
@@ -4535,7 +4481,6 @@ fn receiver_enforces_authorized_hashing_and_supplies_omitted_expectation() {
         meta: plain_meta(),
         flags: 0,
         condition: proto::TargetCondition::Any,
-        guard: None,
     };
     authority.authorize(&mut finish, false).unwrap();
     assert!(
@@ -4564,7 +4509,6 @@ fn grants_that_allow_no_changes_create_no_owner_probe() {
         let mut request = Request::NewFileOwner {
             path: path_bytes(&target),
             probe: true,
-            guard: None,
         };
         let authorized = authority.authorize(&mut request, false);
         if case == "after results ended" {
@@ -4578,7 +4522,7 @@ fn grants_that_allow_no_changes_create_no_owner_probe() {
         assert_eq!(probe, case == "copy", "{case}");
         let _distrusted = crate::fsops::distrust_owners_for_test();
         let before = crate::rooted::probes_for_test();
-        let response = crate::fsops::FsOps::new().handle(&request);
+        let response = authority.test_ops().handle(&request);
         assert!(
             matches!(response, proto::Response::NewFileOwner(_)),
             "{case}: {response:?}"
@@ -4604,7 +4548,6 @@ fn signed_read_only_modes_reject_every_destination_mutation() {
             mode: 0o700,
             condition: proto::TargetCondition::Absent,
         }],
-        guard: None,
     };
     assert!(authority.authorize(&mut mutation, false).is_err());
 
@@ -4624,7 +4567,6 @@ fn signed_read_only_modes_reject_every_destination_mutation() {
         flags: 0,
         inplace: false,
         condition: proto::TargetCondition::Any,
-        guard: None,
         replaces: false,
         scanned: crate::proto::ScannedDestination::Unknown,
     }]);
@@ -4642,7 +4584,6 @@ fn signed_read_only_modes_reject_every_destination_mutation() {
             },
         )],
         remember: true,
-        guard: None,
     };
     assert!(authority.authorize(&mut widen, false).is_err());
 
@@ -4650,7 +4591,6 @@ fn signed_read_only_modes_reject_every_destination_mutation() {
         paths: vec![target],
         sources: None,
         follow: false,
-        guard: None,
     };
     authority.authorize(&mut observation, false).unwrap();
 }
@@ -4683,7 +4623,6 @@ fn directory_as_child_scope_does_not_authorize_unrelated_siblings() {
             mode: 0o700,
             condition: proto::TargetCondition::Absent,
         }],
-        guard: None,
     };
     assert!(authority.authorize(&mut request, false).is_err());
 
@@ -4691,45 +4630,8 @@ fn directory_as_child_scope_does_not_authorize_unrelated_siblings() {
         paths: vec![target],
         sources: None,
         follow: false,
-        guard: None,
     };
     authority.authorize(&mut observe_container, false).unwrap();
-}
-
-#[test]
-fn entry_ceiling_survives_resubmission_of_a_rejected_path() {
-    let temporary = crate::test_support::tempdir().unwrap();
-    let root = temporary.path().join("root");
-    fs::create_dir(&root).unwrap();
-    // The helper grant allows eight entries.
-    let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    let stat = |name: String| Request::StatMany {
-        paths: vec![root
-            .join("target")
-            .join(name)
-            .as_os_str()
-            .as_bytes()
-            .to_vec()],
-        sources: None,
-        follow: false,
-        guard: None,
-    };
-    for index in 0..8 {
-        authority
-            .authorize(&mut stat(format!("entry-{index}")), false)
-            .unwrap();
-    }
-    assert!(authority
-        .authorize(&mut stat("entry-8".into()), false)
-        .is_err());
-    // Resubmitting the rejected path must not slip through as counted.
-    assert!(authority
-        .authorize(&mut stat("entry-8".into()), false)
-        .is_err());
-    // Paths already inside the ceiling remain usable.
-    authority
-        .authorize(&mut stat("entry-0".into()), false)
-        .unwrap();
 }
 
 #[test]
@@ -4756,7 +4658,6 @@ fn forbidden_deletion_keeps_the_unfiltered_scan_but_refuses_removals() {
         follow_root: false,
         ignore: Vec::new(),
         report_ignored: true,
-        guard: None,
     };
     authority.authorize(&mut unfiltered_scan, false).unwrap();
     let ignored = root
@@ -4766,7 +4667,6 @@ fn forbidden_deletion_keeps_the_unfiltered_scan_but_refuses_removals() {
         .to_vec();
     let mut delete = Request::Apply {
         ops: vec![Op::Unlink { path: ignored }],
-        guard: None,
     };
     assert!(authority.authorize(&mut delete, false).is_err());
 }
@@ -4794,7 +4694,6 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
-        guard: None,
         group: None,
         update: None,
     };
@@ -4814,7 +4713,6 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
         len: 3,
         block: proto::MIN_HASH_BLOCK_BYTES,
         attempt: 0,
-        guard: None,
         clone_final: false,
     };
     assert!(authority.authorize(&mut seed, false).is_err());
@@ -4839,10 +4737,9 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
         flags: 0,
         scanned: crate::proto::ScannedDestination::Unknown,
         condition: proto::TargetCondition::Any,
-        guard: None,
     };
     authority.authorize(&mut publish_empty, false).unwrap();
-    // A file never declared under this grant cannot be published.
+    // A file this receiver does not hold for the grant cannot be published.
     let mut publish_foreign = Request::Finalize {
         expected_hash: None,
         path: root.join("target/foreign").as_os_str().as_bytes().to_vec(),
@@ -4859,52 +4756,86 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
         flags: 0,
         scanned: crate::proto::ScannedDestination::Unknown,
         condition: proto::TargetCondition::Any,
-        guard: None,
     };
-    assert!(authority.authorize(&mut publish_foreign, false).is_err());
+    let settlement = authority.authorize(&mut publish_foreign, false).unwrap();
+    let response = authority.test_ops().handle(&publish_foreign);
+    authority.settle(settlement, &response);
+    assert!(
+        matches!(response, proto::Response::EndpointError(ref error)
+            if error.as_str().contains("is not open in this receiver")),
+        "{response:?}"
+    );
+    assert!(!root.join("target/foreign").exists());
 }
 
+/// The entry limit counts the changes a copy makes, each time it makes
+/// one, and nothing it only looks at: scans and lookups of the destination
+/// count nothing, and a refused request counts nothing either.
 #[test]
-fn scanned_entries_count_against_the_entry_ceiling() {
+fn changes_count_against_the_entry_ceiling_and_lookups_do_not() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
-    fs::create_dir(&root).unwrap();
+    fs::create_dir_all(root.join("target")).unwrap();
     // The helper grant allows eight entries.
     let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    let target = root.join("target").as_os_str().as_bytes().to_vec();
-    let mut scan = Request::Scan {
-        root: target.clone(),
-        source: None,
-        follow_root: false,
-        ignore: Vec::new(),
-        report_ignored: false,
-        guard: None,
+    let target = root.join("target");
+    let path = |name: &str| target.join(name).as_os_str().as_bytes().to_vec();
+    for _ in 0..20 {
+        let mut scan = Request::Scan {
+            root: target.as_os_str().as_bytes().to_vec(),
+            source: None,
+            follow_root: false,
+            ignore: Vec::new(),
+            report_ignored: false,
+        };
+        authority.authorize(&mut scan, false).unwrap();
+        let mut stat = Request::StatMany {
+            paths: (0..10)
+                .map(|index| path(&format!("look-{index}")))
+                .collect(),
+            sources: None,
+            follow: false,
+        };
+        authority.authorize(&mut stat, false).unwrap();
+    }
+    let mkdirs = |names: &[&str]| Request::Apply {
+        ops: names
+            .iter()
+            .map(|name| Op::Mkdir {
+                path: path(name),
+                mode: 0o755,
+                condition: proto::TargetCondition::Any,
+            })
+            .collect(),
     };
-    authority.authorize(&mut scan, false).unwrap();
-    let names: Vec<Vec<u8>> = (0..7)
-        .map(|index| format!("entry-{index}").into_bytes())
-        .collect();
-    let mut batch: Vec<&[u8]> = vec![b""];
-    batch.extend(names.iter().map(Vec::as_slice));
-    // Root plus seven descendants fills the ceiling exactly.
-    authority.record_scanned(&target, batch).unwrap();
-    assert!(authority
-        .record_scanned(&target, [b"entry-7".as_slice()])
-        .is_err());
-    // Already counted entries may be listed again.
     authority
-        .record_scanned(&target, [b"entry-0".as_slice()])
+        .authorize(&mut mkdirs(&["a", "b", "c", "d", "e", "f"]), false)
         .unwrap();
+    // A request that would go past the limit is refused whole, and counts
+    // nothing; the same directory made again counts again.
+    assert!(authority
+        .authorize(&mut mkdirs(&["g", "h", "i"]), false)
+        .is_err());
+    authority
+        .authorize(&mut mkdirs(&["a", "g"]), false)
+        .unwrap();
+    assert_eq!(
+        authority.changes.load(std::sync::atomic::Ordering::Relaxed),
+        8
+    );
+    assert!(authority.authorize(&mut mkdirs(&["h"]), false).is_err());
 }
 
 #[test]
-fn worker_authorizations_use_128_or_a_smaller_explicit_setting() {
+fn worker_authorizations_use_128_or_a_smaller_resource_limit() {
     let source = Location::parse("host-a:source").unwrap();
+    // A worker count fixed for a benchmark leaves the approval's ceiling
+    // alone.
     for (setting, expected) in [
         (None, 128),
         (Some("--resource-limits=workers=3"), 3),
         (Some("--resource-limits=workers=1000"), 128),
-        (Some("--performance-tuning=workers=32"), 32),
+        (Some("--performance-tuning=workers=32"), 128),
         (Some("--performance-tuning=workers=128"), 128),
     ] {
         let mut argv: Vec<_> = [
@@ -4981,7 +4912,6 @@ fn ceiling_ranges_are_checked_before_any_enrollment_side_effect() {
     let mut args = parse(&[]);
     args.receiver_max_bytes = Some(0);
     assert!(validate_restricted_args(&args).is_err());
-    assert!(validate_restricted_args(&parse(&["--max-size", "0"])).is_err());
     validate_restricted_args(&parse(&["--delete"])).unwrap();
     validate_restricted_args(&parse(&["--delete", "--max-delete", "0"])).unwrap();
     // Selection options and size limits act as for an ordinary copy.
@@ -5007,6 +4937,41 @@ fn ceiling_ranges_are_checked_before_any_enrollment_side_effect() {
     let GrantOperation::Copy(copy) = &grant.operation;
     assert_eq!(copy.policy.deletion, DeletionPolicy::Forbid);
     assert_eq!(copy.limits.max_deletions, 0);
+}
+
+/// Options that work on ordinary routes work on restricted ones too:
+/// `--pscope` selects which local connections are kept, and `--max-size 0`
+/// copies only empty files, so its grant admits no file data at all.
+#[test]
+fn restricted_routes_accept_a_persistence_scope_and_a_zero_size_limit() {
+    let parse = |options: &[&str]| {
+        let mut argv = vec!["syq", "-r"];
+        argv.extend_from_slice(options);
+        argv.extend_from_slice(&["host-a:source", "host-b:/backup"]);
+        let mut args = Args::try_parse_from(argv).unwrap();
+        args.normalize();
+        args
+    };
+    let mut scoped = parse(&[]);
+    scoped.pscope = Some(PathBuf::from("/tmp/scope"));
+    scoped.pscope_explicit = true;
+    validate_restricted_args(&scoped).unwrap();
+    let empty_only = parse(&["--max-size", "0"]);
+    validate_restricted_args(&empty_only).unwrap();
+    let id = EnrollmentId::random();
+    let grant = grant_for(
+        &empty_only,
+        &[Location::parse("host-a:source").unwrap()],
+        id,
+        "backup",
+        b"/backup",
+    )
+    .unwrap();
+    let GrantOperation::Copy(copy) = &grant.operation;
+    assert_eq!(copy.limits.max_file_bytes, 0);
+    let key = generate_receipt_key(id).unwrap();
+    let signed = delegation::sign_grant(grant, GrantConstraints::default(), &key).unwrap();
+    delegation::SignedGrantEnvelope::decode(&signed).unwrap();
 }
 
 #[test]
@@ -5236,22 +5201,23 @@ fn rooted_scan_and_hash_never_follow_a_payload_symlink() {
         follow_root: false,
         ignore: Vec::new(),
         report_ignored: false,
-        guard: None,
     };
     authority.authorize(&mut scan, true).unwrap();
-    let Request::Scan {
-        guard: Some(guard), ..
-    } = scan
-    else {
-        panic!("authority did not install a scan guard")
-    };
+    // The receiver scans beneath the root the authority holds.
+    let ops = authority.test_ops();
+    let (scan_root, relative) = ops
+        .destination_scan_root(target.as_os_str().as_bytes())
+        .unwrap()
+        .unwrap();
     let mut entries = Vec::new();
-    crate::scan::scan_rooted(
-        target.as_os_str().as_bytes(),
+    crate::scan::scan_descriptor(
+        scan_root,
+        &relative,
+        None,
+        false,
         false,
         &[],
         false,
-        &guard,
         &mut |batch| {
             entries.extend(batch);
             Ok(())
@@ -5266,7 +5232,7 @@ fn rooted_scan_and_hash_never_follow_a_payload_symlink() {
         .any(|entry| { entry.path == b"escape" && entry.kind == proto::Kind::Symlink }));
     assert!(!entries.iter().any(|entry| entry.path == b"escape/secret"));
 
-    let response = crate::fsops::FsOps::new().handle(&Request::HashBlocks {
+    let response = authority.test_ops().handle(&Request::HashBlocks {
         off: 0,
         path: target.join("escape").as_os_str().as_bytes().to_vec(),
         source: None,
@@ -5275,7 +5241,6 @@ fn rooted_scan_and_hash_never_follow_a_payload_symlink() {
         block: 4096,
         len: 1,
         attempt: 0,
-        guard: Some(guard),
     });
     assert!(matches!(response, proto::Response::EndpointError(_)));
     assert_eq!(fs::metadata(outside.join("secret")).unwrap().len(), 6);
@@ -5312,7 +5277,6 @@ fn restricted_authority_rejects_caller_source_registration() {
         follow_root: false,
         ignore: Vec::new(),
         report_ignored: false,
-        guard: None,
     };
     let error = authority.authorize(&mut scan, true).unwrap_err();
     assert!(error
@@ -5323,7 +5287,6 @@ fn restricted_authority_rejects_caller_source_registration() {
         Request::FileHash {
             path: root.join("file").as_os_str().as_bytes().to_vec(),
             source: Some(source.clone()),
-            guard: None,
         },
         Request::HashBlocks {
             off: 0,
@@ -5334,7 +5297,6 @@ fn restricted_authority_rejects_caller_source_registration() {
             block: proto::MIN_HASH_BLOCK_BYTES,
             len: 1,
             attempt: 0,
-            guard: None,
         },
     ] {
         let error = authority.authorize(&mut request, true).unwrap_err();
@@ -5361,7 +5323,6 @@ fn hardlinks_need_the_signed_option_and_keep_to_the_existing_object_policy() {
             ino: 2,
             condition: proto::TargetCondition::Any,
         }],
-        guard: None,
     };
     let condition = |request: &Request| match request {
         Request::Apply { ops, .. } => match &ops[0] {
@@ -5398,11 +5359,11 @@ fn hardlinks_need_the_signed_option_and_keep_to_the_existing_object_policy() {
         "{error:#}"
     );
     assert!(authority
-        .check_flags(proto::flags::REPORT_IDENTITY)
+        .check_flags(proto::flags::REPORT_IDENTITY, 0)
         .is_err());
     authority.extra_options.hardlinks = true;
     authority
-        .check_flags(proto::flags::REPORT_IDENTITY)
+        .check_flags(proto::flags::REPORT_IDENTITY, 0)
         .unwrap();
 
     // Either name outside the signed scopes is refused.
@@ -5469,14 +5430,13 @@ fn a_name_already_linked_records_no_operation_unless_it_changes() {
                 ino: file.ino(),
                 condition: proto::TargetCondition::Any,
             }],
-            guard: None,
         };
         let settlement = authority.authorize(&mut request, false).unwrap();
         before();
-        let Request::Apply { ops, guard } = &request else {
+        let Request::Apply { ops } = &request else {
             unreachable!()
         };
-        let results = crate::fsops::FsOps::new().apply(ops, guard.as_ref());
+        let results = execute_ops(&authority, ops);
         authority.settle(settlement, &proto::Response::Applied(results));
         let totals = authority.results.lock().unwrap().as_ref().unwrap().totals();
         (totals.files_transferred, totals.failed)
@@ -5511,6 +5471,7 @@ fn signed_grants_authorize_only_their_inode_metadata() {
     };
     let configuration = |selection, sparse| Request::ConfigurePreservation {
         narrow_new_directories: false,
+        own_links: false,
         sparse,
         selection,
         destination: true,
@@ -5540,12 +5501,16 @@ fn signed_grants_authorize_only_their_inode_metadata() {
     assert!(authority
         .authorize(&mut configuration(everything, true), true)
         .is_err());
-    let error = authority.check_metadata(&acl_meta(), 0).unwrap_err();
+    let error = authority
+        .check_metadata(b"/unmapped", &acl_meta(), 0)
+        .unwrap_err();
     assert!(
         error.to_string().contains("inode metadata not authorized"),
         "{error:#}"
     );
-    assert!(authority.check_metadata(&time_meta(), 0).is_err());
+    assert!(authority
+        .check_metadata(b"/unmapped", &time_meta(), 0)
+        .is_err());
 
     authority.extra_options.acls = true;
     authority.extra_options.sparse = true;
@@ -5559,11 +5524,16 @@ fn signed_grants_authorize_only_their_inode_metadata() {
     assert!(authority
         .authorize(&mut configuration(everything, true), true)
         .is_err());
-    authority.check_metadata(&acl_meta(), 0).unwrap();
-    assert!(authority.check_metadata(&time_meta(), 0).is_err());
+    authority
+        .check_metadata(b"/unmapped", &acl_meta(), 0)
+        .unwrap();
+    assert!(authority
+        .check_metadata(b"/unmapped", &time_meta(), 0)
+        .is_err());
     // The receiver's own creation rules are not the sender's to choose.
     let mut rsync_directories = Request::ConfigurePreservation {
         narrow_new_directories: true,
+        own_links: false,
         sparse: false,
         selection: acls_only,
         destination: true,
@@ -5587,7 +5557,6 @@ fn signed_comparison_requests_enforce_scope_identity_and_bounds() {
         block: 4 << 20,
         allow_final: true,
         attempt: 0,
-        guard: None,
     };
     let hash = |path, off, len| Request::HashWindow {
         final_basis: true,
@@ -5597,7 +5566,6 @@ fn signed_comparison_requests_enforce_scope_identity_and_bounds() {
         len,
         block: 4 << 20,
         attempt: 0,
-        guard: None,
     };
     let reuse = |path, copy_id, off, len| Request::ReuseComparedRange {
         path,
@@ -5605,11 +5573,10 @@ fn signed_comparison_requests_enforce_scope_identity_and_bounds() {
         attempt: 0,
         off,
         len,
-        guard: None,
     };
-    assert!(authority
-        .authorize(&mut reuse(target.clone(), id, 0, 4 << 20), false)
-        .is_err());
+    // Blocks reused past what the file declared, or into a file this
+    // receiver does not hold, are refused as it writes them
+    // (`fsops::stages`).
     assert!(authority
         .authorize(&mut stage(outside.clone(), 8 << 20), false)
         .is_err());
@@ -5618,23 +5585,13 @@ fn signed_comparison_requests_enforce_scope_identity_and_bounds() {
         .is_err());
     let mut allowed = stage(target.clone(), 8 << 20);
     authority.authorize(&mut allowed, false).unwrap();
-    assert!(matches!(
-        allowed,
-        Request::StageBasis { guard: Some(_), .. }
-    ));
     let mut allowed = hash(target.clone(), 0, 4 << 20);
     authority.authorize(&mut allowed, false).unwrap();
-    assert!(matches!(
-        allowed,
-        Request::HashWindow { guard: Some(_), .. }
-    ));
     for mut request in [
         hash(outside.clone(), 0, 4 << 20),
         hash(target.clone(), u64::MAX, 4 << 20),
         hash(target.clone(), 0, (64 << 20) + 1),
         reuse(outside, id, 0, 4 << 20),
-        reuse(target.clone(), [105; 16], 0, 4 << 20),
-        reuse(target.clone(), id, 8 << 20, 1),
         reuse(target.clone(), id, u64::MAX, 1),
         reuse(target.clone(), id, 0, 0),
     ] {
@@ -5645,10 +5602,6 @@ fn signed_comparison_requests_enforce_scope_identity_and_bounds() {
     }
     let mut allowed = reuse(target.clone(), id, 0, 4 << 20);
     authority.authorize(&mut allowed, false).unwrap();
-    assert!(matches!(
-        allowed,
-        Request::ReuseComparedRange { guard: Some(_), .. }
-    ));
     // An in-place grant stages an existing file too, so it compares and
     // reuses blocks as a staged grant does.
     authority.copy.policy.publication = PublicationPolicy::InPlaceNew;
@@ -5665,7 +5618,6 @@ fn existing_read(path: &Path, len: u64) -> proto::ExistingRead {
         path: path_bytes(path),
         len,
         condition: proto::TargetCondition::Any,
-        guard: None,
     }
 }
 
@@ -5689,7 +5641,6 @@ fn small_patch(
         flags: 0,
         unchanged_flags: 0,
         condition: proto::TargetCondition::Any,
-        guard: None,
     }
 }
 
@@ -5715,11 +5666,7 @@ fn grouped_comparison_keeps_and_patches_files_within_the_grant() {
         files: vec![existing_read(&same, 4), existing_read(&edited, 4)],
     };
     let settlement = authority.authorize(&mut hash, false).unwrap();
-    let Request::HashExistingBatch { files, .. } = &hash else {
-        unreachable!()
-    };
-    assert!(files.iter().all(|file| file.guard.is_some()));
-    let response = crate::fsops::FsOps::new().handle(&hash);
+    let response = authority.test_ops().handle(&hash);
     authority.settle(settlement, &response);
     let proto::Response::ExistingHashes(existing) = response else {
         panic!("unexpected hash response {response:?}")
@@ -5759,16 +5706,20 @@ fn grouped_comparison_keeps_and_patches_files_within_the_grant() {
             )
         );
         assert_eq!(patch.condition, proto::TargetCondition::Any);
-        assert!(patch.guard.is_some());
     }
     {
         let state = authority.state.lock().unwrap();
         // Only the new data crossed the transport; both publications are
         // held until the reply says which file was kept.
-        assert_eq!(state.transferred_bytes, 4);
+        assert_eq!(
+            authority
+                .transferred_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            4
+        );
         assert_eq!(state.reserved_bytes, 8);
     }
-    let response = crate::fsops::FsOps::new().handle(&patch);
+    let response = authority.test_ops().handle(&patch);
     authority.settle(settlement, &response);
     let proto::Response::PatchedBatch(patched) = response else {
         panic!("unexpected patch response {response:?}")
@@ -5855,7 +5806,7 @@ fn a_linked_file_whose_times_change_is_replaced_name_by_name() {
     fs::hard_link(&a, &b).unwrap();
     let before = fs::metadata(&a).unwrap();
     let authority = time_preserving_test_authority(&root);
-    let mut ops = crate::fsops::FsOps::new();
+    let mut ops = authority.test_ops();
     let replaced = || {
         Ok(proto::SmallPatched {
             kept: false,
@@ -5941,7 +5892,7 @@ fn a_stale_patch_holds_no_bytes_and_leaves_its_record_to_the_retry() {
     .unwrap();
     authority.copy.options.preserve_times = true;
     let mut reader = start_results(&authority, secret);
-    let mut ops = crate::fsops::FsOps::new();
+    let mut ops = authority.test_ops();
     let kept = Ok(proto::SmallPatched {
         kept: true,
         identity: None,
@@ -6189,7 +6140,12 @@ fn grouped_patches_charge_their_new_data_and_hold_their_published_size() {
     let settlement = authority.authorize(&mut within, false).unwrap();
     {
         let state = authority.state.lock().unwrap();
-        assert_eq!(state.transferred_bytes, 100);
+        assert_eq!(
+            authority
+                .transferred_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            100
+        );
         assert_eq!(state.reserved_bytes, len);
     }
     authority.settle(
@@ -6425,7 +6381,7 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
     let mut reader = start_results(&authority, secret);
     let burst = authority.file_data_limit.as_ref().unwrap().burst_bytes();
     assert_eq!(burst, 1 << 20);
-    let mut ops = crate::fsops::FsOps::new();
+    let mut ops = authority.test_ops();
     let paths: Vec<_> = ["refused", "published", "dropped"]
         .iter()
         .map(|name| target.join(name))
@@ -6544,13 +6500,17 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
     );
     // A piece is charged as written data, within one rate-limit burst; a
     // refused piece fails its patch, which then publishes nothing.
-    let transferred = authority.state.lock().unwrap().transferred_bytes;
+    let transferred = authority
+        .transferred_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
     assert!(matches!(
         execute_on_connection(&mut gate, &mut ops, piece(&data[..block as usize])),
         Ok(proto::Response::Ok)
     ));
     assert_eq!(
-        authority.state.lock().unwrap().transferred_bytes,
+        authority
+            .transferred_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
         transferred + block
     );
     let oversized = vec![0; burst as usize + 1];
@@ -6595,7 +6555,7 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
     // its patch is settled as failed.
     {
         let mut gate = PatchStreamGate::new(authority.clone());
-        let mut ops = crate::fsops::FsOps::new();
+        let mut ops = authority.test_ops();
         let dropped = patch(&paths[2], &hashed[2]);
         assert!(matches!(
             execute_on_connection(&mut gate, &mut ops, begin(&dropped)),
@@ -6769,10 +6729,9 @@ impl ParityReceiver {
             authority.extra_options.widen_dirs = DirectoryWidening::Rsync;
             authority
         });
-        let ops = if restricted {
-            crate::fsops::FsOps::new()
-        } else {
-            crate::fsops::FsOps::test_destination(&target)
+        let ops = match &authority {
+            Some(authority) => authority.test_ops(),
+            None => crate::fsops::FsOps::test_destination(&target),
         };
         Self { authority, ops }
     }
@@ -6871,7 +6830,6 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
                     flags: 0,
                 },
             ],
-            guard: None,
         });
         // A directory widened for writing, and one created private, take
         // their final modes at the end.
@@ -6886,7 +6844,6 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
                     ino: observed.ino(),
                 },
             )],
-            guard: None,
         });
         let proto::Response::WidenedDirectories(outcomes) = widened else {
             unreachable!()
@@ -6922,7 +6879,6 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
                     directory: false,
                 },
             ],
-            guard: None,
         });
         // Files published whole, as small ones are, unless written in place.
         if !inplace {
@@ -6935,7 +6891,6 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
                 flags: mode_flag,
                 inplace: false,
                 condition: proto::TargetCondition::Any,
-                guard: None,
                 replaces: false,
                 scanned: crate::proto::ScannedDestination::Unknown,
             };
@@ -6964,7 +6919,6 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
                 scanned: crate::proto::ScannedDestination::Unknown,
                 attempt: 0,
                 create_if_missing: true,
-                guard: None,
                 group: None,
                 update: None,
             });
@@ -6976,7 +6930,6 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
                 off: 0,
                 hash: crate::fsops::content_digest(&data),
                 data: data.into(),
-                guard: None,
             });
             receiver.send(Request::Finalize {
                 expected_hash: None,
@@ -6987,7 +6940,6 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
                 flags: mode_flag,
                 scanned: crate::proto::ScannedDestination::Unknown,
                 condition: proto::TargetCondition::Any,
-                guard: None,
             });
         }
         let mut modes = Vec::new();
@@ -7100,7 +7052,6 @@ fn only_an_ordinary_receiver_takes_a_senders_word_for_what_a_file_replaces() {
                 flags: proto::flags::RECEIVER_MODE,
                 inplace: false,
                 condition: proto::TargetCondition::Any,
-                guard: None,
                 replaces: false,
                 scanned,
             }]));
@@ -7116,7 +7067,6 @@ fn only_an_ordinary_receiver_takes_a_senders_word_for_what_a_file_replaces() {
                 scanned,
                 attempt: 0,
                 create_if_missing: true,
-                guard: None,
                 group: None,
                 update: None,
             });
@@ -7128,7 +7078,6 @@ fn only_an_ordinary_receiver_takes_a_senders_word_for_what_a_file_replaces() {
                 off: 0,
                 hash: crate::fsops::content_digest(&data),
                 data: data.into(),
-                guard: None,
             });
             receiver.send(Request::Finalize {
                 expected_hash: None,
@@ -7139,7 +7088,6 @@ fn only_an_ordinary_receiver_takes_a_senders_word_for_what_a_file_replaces() {
                 flags: proto::flags::RECEIVER_MODE,
                 scanned,
                 condition: proto::TargetCondition::Any,
-                guard: None,
             });
             let expected = if restricted { 0o600 } else { ordinary_mode };
             for name in ["small", "large"] {
@@ -7191,7 +7139,6 @@ fn both_receivers_write_only_files_they_created() {
                 },
                 flags: proto::flags::MODE,
             }],
-            guard: None,
         };
         let response = match &receiver.authority {
             Some(authority) => {
@@ -7231,7 +7178,6 @@ fn both_receivers_write_only_files_they_created() {
             scanned: proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
-            guard: None,
             group: None,
             update: None,
         });
@@ -7243,7 +7189,6 @@ fn both_receivers_write_only_files_they_created() {
             off: 0,
             hash: crate::fsops::content_digest(&data),
             data: data.clone().into(),
-            guard: None,
         });
         assert_eq!(fs::read(target.join("existing")).unwrap(), b"old contents");
         receiver.send(Request::Finalize {
@@ -7258,7 +7203,6 @@ fn both_receivers_write_only_files_they_created() {
             flags: proto::flags::MODE,
             scanned: proto::ScannedDestination::Unknown,
             condition: Any,
-            guard: None,
         });
         assert_eq!(fs::read(target.join("existing")).unwrap(), data, "{case}");
         assert_eq!(
@@ -7283,7 +7227,6 @@ fn both_receivers_write_only_files_they_created() {
                 },
                 flags: proto::flags::TIMES,
             }],
-            guard: None,
         });
         let after = fs::symlink_metadata(target.join("link")).unwrap();
         assert_ne!(after.ino(), before.ino(), "{case}");
@@ -7353,12 +7296,12 @@ fn both_receivers_update_in_place_only_files_they_vouch_for() {
             scanned: proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
-            guard: None,
             group: None,
             update: update.then(|| {
                 Box::new(proto::InPlaceUpdate {
                     meta: meta.clone(),
                     flags,
+                    only: None,
                 })
             }),
         };
@@ -7370,7 +7313,6 @@ fn both_receivers_update_in_place_only_files_they_vouch_for() {
             off: 0,
             hash: crate::fsops::content_digest(&data),
             data: data.clone().into(),
-            guard: None,
         };
         let finalize = |name: &str, inplace: bool| Request::Finalize {
             expected_hash: None,
@@ -7381,7 +7323,6 @@ fn both_receivers_update_in_place_only_files_they_vouch_for() {
             flags,
             scanned: proto::ScannedDestination::Unknown,
             condition: proto::TargetCondition::Any,
-            guard: None,
         };
 
         let mine = fs::metadata(target.join("mine")).unwrap().ino();
@@ -7476,11 +7417,11 @@ fn in_place_updates_need_a_grant_for_them() {
         scanned: proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
-        guard: None,
         group: None,
         update: Some(Box::new(proto::InPlaceUpdate {
             meta: plain_meta(),
             flags,
+            only: None,
         })),
     };
     for (publication, allowed) in [
@@ -7579,7 +7520,6 @@ fn in_place_work_needs_a_grant_that_replaces_and_creates() {
         scanned: proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
-        guard: None,
         group: None,
         update: None,
     };
@@ -7627,7 +7567,6 @@ fn both_receivers_restore_set_id_bits_after_writing_in_place() {
             scanned: proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
-            guard: None,
             group: None,
             update: None,
         });
@@ -7639,7 +7578,6 @@ fn both_receivers_restore_set_id_bits_after_writing_in_place() {
             off: 0,
             hash: crate::fsops::content_digest(&data),
             data: data.clone().into(),
-            guard: None,
         });
         receiver.send(Request::Finalize {
             expected_hash: None,
@@ -7653,7 +7591,6 @@ fn both_receivers_restore_set_id_bits_after_writing_in_place() {
             flags: proto::flags::RECEIVER_MODE,
             scanned: proto::ScannedDestination::Unknown,
             condition: proto::TargetCondition::Any,
-            guard: None,
         });
         assert_eq!(fs::read(target.join("program")).unwrap(), data);
         let mode = fs::metadata(target.join("program")).unwrap().mode() & 0o7777;
@@ -7713,7 +7650,6 @@ fn both_receivers_limit_a_new_in_place_file_by_a_narrower_default_acl() {
             scanned,
             attempt: 0,
             create_if_missing: true,
-            guard: None,
             group: None,
             update: None,
         });
@@ -7725,7 +7661,6 @@ fn both_receivers_limit_a_new_in_place_file_by_a_narrower_default_acl() {
             off: 0,
             hash: crate::fsops::content_digest(&data),
             data: data.clone().into(),
-            guard: None,
         });
         receiver.send(Request::Finalize {
             expected_hash: None,
@@ -7739,7 +7674,6 @@ fn both_receivers_limit_a_new_in_place_file_by_a_narrower_default_acl() {
             flags: proto::flags::RECEIVER_MODE,
             scanned,
             condition: proto::TargetCondition::Any,
-            guard: None,
         });
         assert_eq!(fs::read(target.join("new")).unwrap(), data);
         let mode = fs::metadata(target.join("new")).unwrap().mode() & 0o7777;
@@ -7801,7 +7735,6 @@ fn ordinary_and_restricted_receivers_give_directories_their_groups_first() {
                 },
                 directory: false,
             }],
-            guard: None,
         });
         receiver.send(Request::Apply {
             ops: vec![
@@ -7818,7 +7751,6 @@ fn ordinary_and_restricted_receivers_give_directories_their_groups_first() {
                     directory: false,
                 },
             ],
-            guard: None,
         });
         ["existing-dir", "new-dir"].map(|name| {
             let metadata = fs::metadata(target.join(name)).unwrap();
@@ -7833,7 +7765,7 @@ fn ordinary_and_restricted_receivers_give_directories_their_groups_first() {
 /// with the authority's record of the files it created.
 fn execute(authority: &RestrictedAuthority, mut request: Request) -> Result<proto::Response> {
     let settlement = authority.authorize(&mut request, false)?;
-    let mut ops = crate::fsops::FsOps::new();
+    let mut ops = authority.test_ops();
     ops.set_owned_objects(authority.owned_objects());
     let response = ops.handle(&request);
     authority.settle(settlement, &response);
@@ -7960,7 +7892,7 @@ fn keeping_existing_files_links_only_to_files_the_copy_created() {
     assert_eq!(kept_state(&root), (0o600, 1));
 
     let mine = root.join("target/mine");
-    let mut ops = crate::fsops::FsOps::new();
+    let mut ops = authority.test_ops();
     ops.set_owned_objects(authority.owned_objects());
     let mut put = small_put(&mine);
     let settlement = authority.authorize(&mut put, false).unwrap();
@@ -7990,7 +7922,7 @@ fn keeping_existing_files_refuses_links_it_cannot_tie_to_a_created_file() {
     let root = temporary.path().join("root");
     let authority = keeping_link_authority(&root);
     let mine = root.join("target/mine");
-    let mut ops = crate::fsops::FsOps::new();
+    let mut ops = authority.test_ops();
     ops.set_owned_objects(authority.owned_objects());
     let mut put = small_put(&mine);
     let settlement = authority.authorize(&mut put, false).unwrap();
@@ -8094,7 +8026,7 @@ fn another_connections_relink_does_not_redirect_an_approved_change() {
         let response = execute(&authority, apply(link_to_kept(&root, "mine"))).unwrap();
         assert!(refused_link(&applied(&response)[0]), "{response:?}");
         // Connection 2's change then runs.
-        let mut ops = crate::fsops::FsOps::new();
+        let mut ops = authority.test_ops();
         ops.set_owned_objects(authority.owned_objects());
         let response = ops.handle(&change);
         authority.settle(pending, &response);
@@ -8127,7 +8059,6 @@ fn a_relink_in_the_same_request_does_not_redirect_its_change() {
                 Op::Unlink { path: mine },
                 link_to_kept(&root, "mine"),
             ],
-            guard: None,
         },
     )
     .unwrap();
@@ -8144,7 +8075,7 @@ fn kept_files_take_no_content() {
     let root = temporary.path().join("root");
     let authority = keeping_link_authority(&root);
     let late = root.join("target/late");
-    let mut ops = crate::fsops::FsOps::new();
+    let mut ops = authority.test_ops();
     ops.set_owned_objects(authority.owned_objects());
     let mut run = |mut request: Request| {
         let settlement = authority.authorize(&mut request, false);
@@ -8168,7 +8099,6 @@ fn kept_files_take_no_content() {
         off: 0,
         hash: crate::fsops::content_digest(&data),
         data: data.into(),
-        guard: None,
     })
     .unwrap();
     let mut publish = finalize_request(&late, proto::TargetCondition::Any);
@@ -8210,7 +8140,7 @@ fn a_new_file_under_an_in_place_grant_is_staged_and_published_without_replacing(
     )
     .unwrap();
     let target = root.join("target");
-    let mut ops = crate::fsops::FsOps::new();
+    let mut ops = authority.test_ops();
     let mut run = |mut request: Request| -> Result<(Request, proto::Response)> {
         let settlement = authority.authorize(&mut request, false)?;
         let response = ops.handle(&request);
@@ -8229,7 +8159,6 @@ fn a_new_file_under_an_in_place_grant_is_staged_and_published_without_replacing(
         group: None,
         attempt,
         create_if_missing: true,
-        guard: None,
         update: None,
     };
     let write = |inplace, attempt| {
@@ -8242,7 +8171,6 @@ fn a_new_file_under_an_in_place_grant_is_staged_and_published_without_replacing(
             off: 0,
             hash: crate::fsops::content_digest(&data),
             data: data.into(),
-            guard: None,
         }
     };
     let error = run(prepare(true, 0)).unwrap_err().to_string();
@@ -8310,7 +8238,7 @@ fn a_refused_in_place_preparation_keeps_a_new_file_staged() {
         RootExistence::New,
     )
     .unwrap();
-    let mut ops = crate::fsops::FsOps::new();
+    let mut ops = authority.test_ops();
     let mut run = |mut request: Request| -> Result<proto::Response> {
         let settlement = authority.authorize(&mut request, false)?;
         let response = ops.handle(&request);
@@ -8329,7 +8257,6 @@ fn a_refused_in_place_preparation_keeps_a_new_file_staged() {
         group: None,
         attempt: 0,
         create_if_missing: true,
-        guard: None,
         update: None,
     };
     let response = run(prepare(false)).unwrap();
@@ -8351,7 +8278,6 @@ fn a_refused_in_place_preparation_keeps_a_new_file_staged() {
         off: 0,
         hash: crate::fsops::content_digest(&data),
         data: data.into(),
-        guard: None,
     });
     assert!(
         write.as_ref().is_ok_and(|response| matches!(
@@ -8385,7 +8311,7 @@ fn a_new_file_inside_an_in_place_grant_is_staged_and_replaces_nothing() {
         RootExistence::Any,
     )
     .unwrap();
-    let mut ops = crate::fsops::FsOps::new();
+    let mut ops = authority.test_ops();
     let mut run = |mut request: Request| -> Result<(Request, proto::Response)> {
         let settlement = authority.authorize(&mut request, false)?;
         let response = ops.handle(&request);
@@ -8412,7 +8338,6 @@ fn a_new_file_inside_an_in_place_grant_is_staged_and_replaces_nothing() {
                 group: None,
                 attempt: 0,
                 create_if_missing: true,
-                guard: None,
                 update: None,
             },
             Request::WriteRange {
@@ -8423,7 +8348,6 @@ fn a_new_file_inside_an_in_place_grant_is_staged_and_replaces_nothing() {
                 off: 0,
                 hash: crate::fsops::content_digest(b"hello"),
                 data: b"hello".to_vec().into(),
-                guard: None,
             },
         ]
     };
@@ -8496,7 +8420,7 @@ fn an_in_place_as_new_root_that_exists_is_refused_and_unchanged() {
     fs::remove_file(&target).unwrap();
     let authority = grant().unwrap();
     fs::write(&target, b"theirs").unwrap();
-    let mut ops = crate::fsops::FsOps::new();
+    let mut ops = authority.test_ops();
     let mut run = |mut request: Request| -> Result<proto::Response> {
         let settlement = authority.authorize(&mut request, false)?;
         let response = ops.handle(&request);
@@ -8515,7 +8439,6 @@ fn an_in_place_as_new_root_that_exists_is_refused_and_unchanged() {
         group: None,
         attempt: 0,
         create_if_missing: true,
-        guard: None,
         update: None,
     };
     assert!(run(prepare(true)).is_err());
@@ -8529,7 +8452,6 @@ fn an_in_place_as_new_root_that_exists_is_refused_and_unchanged() {
         off: 0,
         hash: crate::fsops::content_digest(b"hello"),
         data: b"hello".to_vec().into(),
-        guard: None,
     })
     .unwrap();
     let mut finalize = finalize_request(&target, proto::TargetCondition::Any);
@@ -8607,7 +8529,7 @@ fn a_refusal_racing_the_results_end_is_still_counted() {
     }
     let other = authority.clone();
     let worker = std::thread::spawn(move || {
-        let mut request = Request::Apply { ops, guard: None };
+        let mut request = Request::Apply { ops };
         assert!(other.authorize(&mut request, false).is_err());
     });
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
@@ -8630,4 +8552,899 @@ fn a_refusal_racing_the_results_end_is_still_counted() {
         results.totals.refused, 1,
         "authenticated end omitted a refused request"
     );
+}
+
+/// A restricted receiver reports its destination's filesystem as an
+/// ordinary one does, about the directory it approved: the destination
+/// itself, checked for emptiness, or, while it is missing, the directory it
+/// goes into, never checked for emptiness. The sender cannot choose another.
+#[test]
+fn filesystem_information_describes_the_approved_destination() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir(root.join("other")).unwrap();
+    fs::write(root.join("other/file"), b"x").unwrap();
+    let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    let mut ops = authority.test_ops();
+    let mut inspect = |check_empty: bool, target: Option<proto::DestinationFilesystemTarget>| {
+        let mut request = Request::DestinationFilesystemInfo {
+            check_empty,
+            target,
+        };
+        let settlement = authority.authorize(&mut request, false).unwrap();
+        let response = ops.handle(&request);
+        authority.settle(settlement, &response);
+        let proto::Response::DestinationFilesystemInfo(info) = response else {
+            panic!("unexpected response {response:?}")
+        };
+        (request, info)
+    };
+    let other = fs::metadata(root.join("other")).unwrap();
+    let elsewhere = proto::DestinationFilesystemTarget {
+        relative_path: b"other".to_vec(),
+        dev: other.dev(),
+        ino: other.ino(),
+    };
+    let (request, info) = inspect(true, Some(elsewhere.clone()));
+    let Request::DestinationFilesystemInfo {
+        check_empty: true,
+        target: Some(chosen),
+    } = request
+    else {
+        panic!("the authority chose no target: {request:?}")
+    };
+    assert_eq!(chosen.relative_path, b"target");
+    assert_eq!(info.empty, Some(true));
+    assert_eq!(info.device, fs::metadata(&target).unwrap().dev());
+
+    fs::remove_dir(&target).unwrap();
+    let (request, info) = inspect(true, Some(elsewhere));
+    assert!(
+        matches!(
+            request,
+            Request::DestinationFilesystemInfo {
+                check_empty: false,
+                target: None,
+            }
+        ),
+        "{request:?}"
+    );
+    assert_eq!(info.empty, None);
+}
+
+/// Without filters or a mapping, a metadata change is authorized without
+/// looking up what it changes: the kind matters only to a failure's record,
+/// which looks it up then.
+#[test]
+fn metadata_changes_need_no_lookup_without_filters() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let closed = root.join("target/closed");
+    fs::create_dir_all(&closed).unwrap();
+    fs::write(closed.join("file"), b"x").unwrap();
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).unwrap();
+    let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    let mut change = Request::Apply {
+        ops: vec![Op::SetMeta {
+            path: closed.join("file").as_os_str().as_bytes().to_vec(),
+            meta: plain_meta(),
+            flags: proto::flags::RECEIVER_MODE,
+            condition: proto::TargetCondition::Any,
+            directory: false,
+        }],
+    };
+    let authorized = authority.authorize(&mut change, false);
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o755)).unwrap();
+    authorized.unwrap();
+}
+
+/// What a signed mapping entry sets explicitly, the receiver applies
+/// without the matching copy option, and only with exactly the entry's
+/// values: other values, and other entries, still need the option.
+#[test]
+fn signed_mapping_metadata_is_applied_without_its_copy_options() {
+    let root = crate::test_support::tempdir().unwrap();
+    let target = root.path().join("target");
+    fs::create_dir_all(&target).unwrap();
+    let uid = unsafe { libc::getuid() };
+    let manifest = format!(
+        concat!(
+            r#"{{"src":{{"encoding":"utf-8","value":"source"}},"dst":{{"encoding":"utf-8","value":"set"}},"metadata":{{"mode":416,"mtime":123,"mtime_nsec":456,"uid":{uid}}}}}"#,
+            "\n",
+            r#"{{"src":{{"encoding":"utf-8","value":"source"}},"dst":{{"encoding":"utf-8","value":"plain"}}}}"#,
+            "\n"
+        ),
+        uid = uid
+    )
+    .into_bytes();
+    let mut authority = test_authority(root.path(), DeletionPolicy::Forbid, 1024);
+    authority.copy.limits.max_entries = 100;
+    authority.mapping = Some(Mutex::new(crate::mapping::Admission::new(
+        crate::mapping::Authorization::from_contents(&manifest),
+        authority.copy.limits.max_entries,
+    )));
+    let settlement = authority
+        .authorize(
+            &mut Request::MappingChunk {
+                offset: 0,
+                data: manifest,
+                finish: true,
+            },
+            true,
+        )
+        .unwrap();
+    authority.settle(settlement, &proto::Response::Ok);
+    let meta = |mode, mtime, uid| proto::Meta {
+        inode_metadata: None,
+        mode,
+        uid,
+        gid: 0,
+        mtime,
+        mtime_nsec: 456,
+    };
+    let flags = proto::flags::MODE | proto::flags::TIMES | proto::flags::OWNER;
+    let set = path_bytes(&target.join("set"));
+    let plain = path_bytes(&target.join("plain"));
+    authority
+        .check_metadata(&set, &meta(0o100640, 123, uid), flags)
+        .unwrap();
+    for (path, meta) in [
+        (&set, meta(0o100644, 123, uid)),
+        (&set, meta(0o100640, 124, uid)),
+        (&set, meta(0o100640, 123, uid.wrapping_add(1))),
+        (&plain, meta(0o100640, 123, uid)),
+    ] {
+        assert!(
+            authority.check_metadata(path, &meta, flags).is_err(),
+            "{meta:?}"
+        );
+    }
+    // A preparation names the entry's mode for the file to come.
+    authority
+        .check_preparation_flags(&set, 0o640, proto::flags::MODE | proto::flags::TIMES)
+        .unwrap();
+    assert!(authority
+        .check_preparation_flags(&set, 0o644, proto::flags::MODE)
+        .is_err());
+}
+
+/// A grant that keeps existing objects keeps a file another program puts
+/// at a new file's name while the copy runs, whether the receiver finds it
+/// when it authorizes the file or when it publishes it. That is no refusal
+/// or failure: nothing changed, as the grant asks, and the results list
+/// nothing for it.
+#[test]
+fn files_the_keep_policy_keeps_are_neither_refused_nor_failed() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let (secret, policy) = results_policy();
+    let authority = test_authority_with_results(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Skip,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+        Some((key, policy)),
+    )
+    .unwrap();
+    let mut reader = start_results(&authority, secret);
+    // Found when the receiver authorizes it.
+    fs::write(target.join("early"), b"theirs").unwrap();
+    let error = authority
+        .authorize(&mut small_put(&target.join("early")), false)
+        .unwrap_err();
+    assert!(KeptExisting::is(&error), "{error:#}");
+    // Found when the receiver publishes it.
+    let mut late = small_put(&target.join("late"));
+    let settlement = authority.authorize(&mut late, false).unwrap();
+    fs::write(target.join("late"), b"theirs").unwrap();
+    let response = authority.test_ops().handle(&late);
+    authority.settle(settlement, &response);
+    assert!(
+        matches!(&response, proto::Response::Applied(errors) if errors[0].is_some())
+            || matches!(&response, proto::Response::PublishedBatch(results) if results[0].is_err()),
+        "{response:?}"
+    );
+    for name in ["early", "late"] {
+        assert_eq!(fs::read(target.join(name)).unwrap(), b"theirs", "{name}");
+    }
+    let results = finish_results(&authority, &mut reader);
+    assert_eq!((results.totals.refused, results.totals.failed), (0, 0));
+    assert!(results.changes().is_empty(), "{:?}", results.records);
+    assert_eq!(
+        authority.changes.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+/// The small-copy shortcut works on a restricted receiver: the receiver
+/// opens the directory beneath the root its authority holds, each file
+/// passes the grant's rules, payloads are held to what the preparation
+/// asked for, and the results list what it published.
+#[test]
+fn small_copies_publish_through_a_restricted_receiver() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("old"), b"stale contents").unwrap();
+    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let (secret, policy) = results_policy();
+    let authority = std::sync::Arc::new(
+        test_authority_with_results(
+            &root,
+            DeletionPolicy::Forbid,
+            1024,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::DirectoryContents,
+            RootExistence::Any,
+            Some((key, policy)),
+        )
+        .unwrap(),
+    );
+    let mut reader = start_results(&authority, secret);
+    let mut ops = authority.test_ops();
+    let mut gate = PatchStreamGate::new(authority.clone());
+    let in_flight = || authority.state.lock().unwrap().in_flight;
+    let names = ["one", "two", "old"];
+    let contents: Vec<Vec<u8>> = names
+        .iter()
+        .map(|name| name.repeat(3).into_bytes())
+        .collect();
+    let offer = |directory: &Path| proto::SmallCopyRequest {
+        reuse_block_size: None,
+        if_exists: crate::cli::IfExists::Update,
+        matching_flags: 0,
+        hash_policy: authority.hash_policy(),
+        copy_if: None,
+        directory: path_bytes(directory),
+        symlink_policy: proto::OperatorSymlinkPolicy::Refuse,
+        request_prefix: path_bytes(directory),
+        identity: proto::SmallCopyIdentity {
+            copy_id: [8; 16],
+            dst_leaf: None,
+        },
+        flags: 0,
+        files: names
+            .iter()
+            .zip(&contents)
+            .map(|(name, data)| proto::SmallCopyFile {
+                path: path_bytes(&directory.join(name)),
+                expression_source: None,
+                size: data.len() as u64,
+                meta: plain_meta(),
+            })
+            .collect(),
+    };
+    let payloads = |sizes_off_by: usize| -> Vec<proto::SmallCopyPayload> {
+        contents
+            .iter()
+            .enumerate()
+            .map(|(index, data)| {
+                let data = data[..data.len() - sizes_off_by].to_vec();
+                proto::SmallCopyPayload {
+                    index: index as u32,
+                    hash: crate::fsops::content_digest(&data),
+                    data,
+                }
+            })
+            .collect()
+    };
+
+    // Only into the signed destination.
+    let error = execute_on_connection(
+        &mut gate,
+        &mut ops,
+        Request::PrepareSmallFiles(offer(&root)),
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("other than the signed destination"),
+        "{error}"
+    );
+
+    // A preparation waits for its payloads, which must be the ones it
+    // asked for; refused payloads end it with nothing changed.
+    let prepare = || Request::PrepareSmallFiles(offer(&target));
+    assert!(matches!(
+        execute_on_connection(&mut gate, &mut ops, prepare()),
+        Ok(proto::Response::SmallFilesPrepared(needed)) if needed == [true; 3]
+    ));
+    assert_eq!(in_flight(), 1);
+    let error = execute_on_connection(&mut gate, &mut ops, Request::CopySmallFiles(payloads(1)))
+        .unwrap_err();
+    assert!(
+        error.contains("differ from what its preparation asked"),
+        "{error}"
+    );
+    assert_eq!(in_flight(), 0);
+    assert!(!target.join("one").exists());
+
+    // So does the connection's next request.
+    assert!(matches!(
+        execute_on_connection(&mut gate, &mut ops, prepare()),
+        Ok(proto::Response::SmallFilesPrepared(_))
+    ));
+    execute_on_connection(
+        &mut gate,
+        &mut ops,
+        Request::ConfigureHashing(authority.hash_policy()),
+    )
+    .unwrap();
+    assert_eq!(in_flight(), 0);
+    assert_eq!(
+        authority.changes.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+
+    // A telemetry sample in between does not.
+    assert!(matches!(
+        execute_on_connection(&mut gate, &mut ops, prepare()),
+        Ok(proto::Response::SmallFilesPrepared(_))
+    ));
+    let sample = gate.authorize(&mut Request::TransportStats, false).unwrap();
+    gate.settle(sample, &proto::Response::Ok, false);
+    let response =
+        execute_on_connection(&mut gate, &mut ops, Request::CopySmallFiles(payloads(0))).unwrap();
+    assert!(
+        matches!(
+            &response,
+            proto::Response::SmallFilesCopied(proto::SmallCopyResponse {
+                outcome: proto::SmallCopyOutcome::Published(results),
+                ..
+            }) if results.iter().all(|result| result.error.is_none()
+                && result.disposition == proto::SmallCopyDisposition::Copied)
+        ),
+        "{response:?}"
+    );
+    assert_eq!(in_flight(), 0);
+    for (name, data) in names.iter().zip(&contents) {
+        assert_eq!(&fs::read(target.join(name)).unwrap(), data, "{name}");
+    }
+    assert_eq!(
+        authority.changes.load(std::sync::atomic::Ordering::Relaxed),
+        3
+    );
+    let results = finish_results(&authority, &mut reader);
+    assert_eq!(results.totals.files_transferred, 3);
+    assert_eq!((results.totals.refused, results.totals.failed), (2, 0));
+    for name in names {
+        assert!(
+            results.has("transfer_file", name.as_bytes(), "succeeded"),
+            "{name}"
+        );
+    }
+}
+
+/// With `--follow-dst`, a destination reached through symlinks is the
+/// directory they lead to inside the enrolled root: the receiver works
+/// beneath it, under the signed destination's name. A link that leads
+/// outside the root, into the receiver's control plane, to nothing, or
+/// round in a loop is refused when the grant is redeemed.
+#[test]
+fn follow_dst_copies_into_the_directory_a_destination_link_leads_to() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let real = root.join("data/real");
+    fs::create_dir_all(&real).unwrap();
+    fs::create_dir_all(temporary.path().join("outside")).unwrap();
+    fs::create_dir_all(root.join(".ssh")).unwrap();
+    let options = crate::delegation::ExtraCopyOptions {
+        follow_dst: true,
+        ..Default::default()
+    };
+    let protected = [ReceiverControlPath {
+        path: path_bytes(&root.join(".ssh")),
+        label: "protected SSH configuration directory",
+    }];
+    let authority = |target: &[u8], options| {
+        let link = root.join("target");
+        let _ = fs::remove_file(&link);
+        symlink(OsStr::from_bytes(target), &link).unwrap();
+        test_authority_with_options(
+            &root,
+            DeletionPolicy::Forbid,
+            1024,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::DirectoryContents,
+            RootExistence::Any,
+            None,
+            (options, &protected),
+        )
+    };
+    for target in [
+        b"data/real".to_vec(),
+        b"./data/../data/real/".to_vec(),
+        path_bytes(&real),
+    ] {
+        let authority = authority(&target, options).unwrap();
+        let mut put = small_put(&root.join("target/file"));
+        let settlement = authority.authorize(&mut put, false).unwrap();
+        let response = authority.test_ops().handle(&put);
+        authority.settle(settlement, &response);
+        assert_eq!(
+            fs::read(real.join("file")).unwrap(),
+            b"new",
+            "{target:?}: {response:?}"
+        );
+        fs::remove_file(real.join("file")).unwrap();
+        assert!(fs::symlink_metadata(root.join("target"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+    // Without it, the link is the destination, and nothing follows it.
+    let plain = authority(b"data/real", Default::default()).unwrap();
+    let mut put = small_put(&root.join("target/file"));
+    assert!(
+        plain.authorize(&mut put, false).is_err()
+            || {
+                let response = plain.test_ops().handle(&put);
+                !matches!(&response, proto::Response::Applied(errors) if errors[0].is_none())
+                    && !matches!(&response, proto::Response::PublishedBatch(results) if results[0].is_ok())
+            }
+    );
+    assert!(!real.join("file").exists());
+
+    symlink("loop-b", root.join("loop-a")).unwrap();
+    symlink("loop-a", root.join("loop-b")).unwrap();
+    for (target, refusal) in [
+        (b"../outside".to_vec(), "outside the enrolled root"),
+        (
+            path_bytes(&temporary.path().join("outside")),
+            "outside the enrolled root",
+        ),
+        (b".ssh".to_vec(), "protected SSH configuration"),
+        (
+            b"missing".to_vec(),
+            "leads to missing, which does not exist",
+        ),
+        (b"loop-a".to_vec(), "too many symlinks"),
+        (b".".to_vec(), "the enrolled root itself"),
+    ] {
+        let error = format!("{:#}", authority(&target, options).err().unwrap());
+        assert!(error.contains(refusal), "{target:?}: {error}");
+    }
+}
+
+/// `--follow-dst` (or `--follow`) with `--into` is signed for the receiver
+/// to resolve; it cannot be combined with `--widen-dirs all`, whose
+/// directories on the way to the destination a link would make ambiguous.
+#[test]
+fn follow_dst_is_signed_for_into_placements() {
+    for (options, follow) in [
+        (&["--into", "/backup"][..], false),
+        (&["--into", "/backup", "--follow-dst"][..], true),
+        (&["--into", "/backup", "--follow"][..], true),
+        (&["--as", "/backup", "--follow-dst"][..], false),
+    ] {
+        let mut argv: Vec<_> = ["cp", "--from", "host-a", "source", "--to", "host-b"]
+            .map(std::ffi::OsString::from)
+            .into();
+        argv.extend(options.iter().map(std::ffi::OsString::from));
+        let args = Args::parse_args(&argv).unwrap();
+        validate_restricted_args(&args).unwrap();
+        let constraints = crate::restricted::grant::extra_copy_options(&args);
+        assert_eq!(constraints.follow_dst, follow, "{options:?}");
+    }
+    let args = Args::parse_args(
+        &[
+            "cp",
+            "--from",
+            "host-a",
+            "source",
+            "--to",
+            "host-b",
+            "--into",
+            "/backup",
+            "--follow-dst",
+            "--widen-dirs=all",
+        ]
+        .map(std::ffi::OsString::from),
+    )
+    .unwrap();
+    let error = validate_restricted_args(&args).unwrap_err().to_string();
+    assert!(error.contains("--widen-dirs all"), "{error}");
+}
+
+/// With `--follow-dst`, a destination that does not exist yet, with no
+/// symlink on the way, is created as any destination is; one whose missing
+/// part lies past a symlink is created inside the directory the link leads
+/// to.
+#[test]
+fn follow_dst_creates_a_destination_that_does_not_exist_yet() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir_all(root.join("real")).unwrap();
+    let options = crate::delegation::ExtraCopyOptions {
+        follow_dst: true,
+        ..Default::default()
+    };
+    // No symlink: the destination is the enrolled root's missing child.
+    let authority = test_authority_with_options(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+        None,
+        (options, &[]),
+    )
+    .unwrap();
+    assert!(
+        authority.root_path == path_bytes(&root),
+        "{:?}",
+        authority.root_path
+    );
+    // Missing components past a link resolve inside its target.
+    let resolved = resolve_destination_links(
+        &Root::open(&root).unwrap(),
+        &path_bytes(&root),
+        b"link/new/deeper",
+    );
+    symlink("real", root.join("link")).unwrap();
+    assert!(
+        resolved.unwrap().is_none(),
+        "nothing to follow before the link exists"
+    );
+    let found = resolve_destination_links(
+        &Root::open(&root).unwrap(),
+        &path_bytes(&root),
+        b"link/new/deeper",
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(found.existing, vec![b"real".to_vec()]);
+    assert_eq!(found.signed_components, 1);
+}
+
+/// An enrolled root of `/` names everything beneath it, so restricted
+/// lookups work there, and an absolute destination symlink resolves inside
+/// it.
+#[test]
+fn an_enrolled_root_of_slash_names_paths_beneath_it() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir_all(root.join("target")).unwrap();
+    fs::write(root.join("target/file"), b"there").unwrap();
+    let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    authority.root = std::sync::Arc::new(Root::open(Path::new("/")).unwrap());
+    authority.root_path = b"/".to_vec();
+    assert!(authority
+        .rooted_metadata(&path_bytes(&root.join("target/file")))
+        .unwrap()
+        .is_some_and(|metadata| metadata.is_file()));
+    let mut ops = authority.test_ops();
+    assert!(matches!(
+        ops.handle(&Request::StatMany {
+            paths: vec![path_bytes(&root.join("target/file"))],
+            sources: None,
+            follow: false,
+        }),
+        proto::Response::Stats(entries) if entries[0].is_some()
+    ));
+    symlink(root.join("target"), root.join("absolute-link")).unwrap();
+    let relative = path_bytes(&root.join("absolute-link"));
+    let found =
+        resolve_destination_links(&Root::open(Path::new("/")).unwrap(), b"/", &relative[1..])
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        found.existing.join(&b'/'),
+        path_bytes(&root.join("target"))[1..].to_vec()
+    );
+}
+
+/// A followed destination that reaches the receiver's control files is
+/// refused by identity, however the protected path or the destination is
+/// spelled.
+#[test]
+fn followed_destinations_reaching_control_files_are_refused_by_identity() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir_all(root.join("home/.ssh")).unwrap();
+    symlink("home/.ssh", root.join("target")).unwrap();
+    // The protected path, spelled through another name for the root.
+    symlink(&root, temporary.path().join("alias")).unwrap();
+    let protected = [ReceiverControlPath {
+        path: path_bytes(&temporary.path().join("alias/home/.ssh")),
+        label: "protected SSH configuration directory",
+    }];
+    let error = test_authority_with_options(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+        None,
+        (
+            crate::delegation::ExtraCopyOptions {
+                follow_dst: true,
+                ..Default::default()
+            },
+            &protected,
+        ),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        format!("{error:#}").contains("protected SSH configuration"),
+        "{error:#}"
+    );
+}
+
+/// Under `keep_files` (rsync `--ignore-existing`) an existing file keeps
+/// its metadata as well as its contents; an existing directory still takes
+/// the copy's metadata.
+#[test]
+fn keep_files_leaves_existing_files_metadata_alone() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(target.join("dir")).unwrap();
+    fs::write(target.join("file"), b"theirs").unwrap();
+    fs::set_permissions(target.join("file"), fs::Permissions::from_mode(0o600)).unwrap();
+    let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    authority.extra_options.keep_files = true;
+    authority.copy.options.preserve_permissions = true;
+    authority.copy.options.receiver_managed_modes = false;
+    let file = path_bytes(&target.join("file"));
+    let mut mode = plain_meta();
+    mode.mode = 0o644;
+    for mut request in [
+        Request::Apply {
+            ops: vec![Op::SetFileMetaIfSame {
+                path: file.clone(),
+                meta: mode.clone(),
+                flags: proto::flags::MODE,
+                condition: proto::TargetCondition::Any,
+            }],
+        },
+        Request::Apply {
+            ops: vec![Op::SetMeta {
+                path: file.clone(),
+                meta: mode.clone(),
+                flags: proto::flags::MODE,
+                condition: proto::TargetCondition::Any,
+                directory: false,
+            }],
+        },
+        Request::FinishBasis {
+            expected_hash: None,
+            path: file.clone(),
+            copy_id: [3; 16],
+            meta: mode.clone(),
+            flags: proto::flags::MODE,
+            condition: proto::TargetCondition::Any,
+        },
+    ] {
+        let error = authority.authorize(&mut request, false).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("may not be modified"),
+            "{error:#}"
+        );
+    }
+    assert_eq!(
+        fs::metadata(target.join("file"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let mut directory = Request::Apply {
+        ops: vec![Op::SetMeta {
+            path: path_bytes(&target.join("dir")),
+            meta: mode,
+            flags: proto::flags::MODE,
+            condition: proto::TargetCondition::Any,
+            directory: true,
+        }],
+    };
+    authority.authorize(&mut directory, false).unwrap();
+}
+
+/// A file counts against the entry limit before its first change: an
+/// in-place preparation, or a stage, even an empty one. Its publication
+/// then counts nothing more.
+#[test]
+fn files_count_against_the_entry_limit_from_their_first_change() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let changes = |authority: &RestrictedAuthority| {
+        authority.changes.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    for (inplace, size) in [(true, 4), (false, 0)] {
+        let mut authority = test_authority_with_results(
+            &root,
+            DeletionPolicy::Forbid,
+            1024,
+            0,
+            FilterPolicy::default(),
+            if inplace {
+                PublicationPolicy::InPlace
+            } else {
+                PublicationPolicy::AtomicStaged
+            },
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::DirectoryContents,
+            RootExistence::Any,
+            None,
+        )
+        .unwrap();
+        authority.copy.limits.max_entries = 2;
+        let prepare = |index: u8| {
+            let mut request = prepare_request(&target.join(format!("file-{index}")));
+            if let Request::Prepare {
+                inplace: request_inplace,
+                size: request_size,
+                copy_id,
+                ..
+            } = &mut request
+            {
+                *request_inplace = inplace;
+                *request_size = size;
+                *copy_id = [index; 16];
+            }
+            request
+        };
+        // A retried preparation of the same file counts once.
+        for index in [1, 1, 2] {
+            authority.authorize(&mut prepare(index), false).unwrap();
+        }
+        assert_eq!(changes(&authority), 2, "in place: {inplace}");
+        let error = authority.authorize(&mut prepare(3), false).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("entry limit exceeded"),
+            "{error:#}"
+        );
+        // Publishing a file counted at preparation counts nothing more.
+        let mut finalize = finalize_request(&target.join("file-1"), proto::TargetCondition::Any);
+        if let Request::Finalize {
+            inplace: finalize_inplace,
+            copy_id,
+            ..
+        } = &mut finalize
+        {
+            *finalize_inplace = inplace;
+            *copy_id = [1; 16];
+        }
+        authority.authorize(&mut finalize, false).unwrap();
+        assert_eq!(changes(&authority), 2, "in place: {inplace}");
+    }
+}
+
+/// Only changes the receiver reports it did not make are given back: one
+/// whose condition it found unmet, and one it skipped. One that failed
+/// after it may have changed something stays counted.
+#[test]
+fn only_changes_that_made_nothing_are_given_back() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(target.join("taken")).unwrap();
+    let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    let unchanged = |message: &str| proto::WireError {
+        unchanged: true,
+        ..proto::WireError::from(message)
+    };
+    let mut request = Request::Apply {
+        ops: ["taken", "partly", "fine"]
+            .iter()
+            .map(|name| Op::Mkdir {
+                path: path_bytes(&target.join(name)),
+                mode: 0o755,
+                condition: proto::TargetCondition::Any,
+            })
+            .collect(),
+    };
+    let settlement = authority.authorize(&mut request, false).unwrap();
+    assert_eq!(
+        authority.changes.load(std::sync::atomic::Ordering::Relaxed),
+        3
+    );
+    authority.settle(
+        settlement,
+        &proto::Response::Applied(vec![
+            Some(unchanged("the name was taken")),
+            Some(proto::WireError::from(
+                "set metadata: failed after creating it",
+            )),
+            None,
+        ]),
+    );
+    assert_eq!(
+        authority.changes.load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+}
+
+/// Where inode numbers cannot show which file a name leads to, the
+/// receiver holds a change to whatever it observes at the name, not to the
+/// sender's numbers; elsewhere it refuses numbers that name another file.
+#[test]
+fn changes_check_existence_only_where_numbers_mislead() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("file"), b"there").unwrap();
+    let observed = fs::metadata(target.join("file")).unwrap();
+    for trusted in [true, false] {
+        let authority = existence_authority(
+            &root,
+            ExistingDestinationPolicy::MustExist,
+            DestinationPlacement::DirectoryContents,
+            RootExistence::Any,
+        )
+        .unwrap();
+        if !trusted {
+            let mut profile = authority.root.profile();
+            profile.link_counts_trusted = false;
+            authority.root.assume_profile_for_test(profile);
+        }
+        let mut request = Request::Apply {
+            ops: vec![Op::SetMeta {
+                path: path_bytes(&target.join("file")),
+                meta: plain_meta(),
+                flags: 0,
+                // Numbers the file there does not have.
+                condition: proto::TargetCondition::Matches { dev: 1, ino: 1 },
+                directory: false,
+            }],
+        };
+        let authorized = authority.authorize(&mut request, false);
+        if trusted {
+            let Err(error) = authorized else {
+                panic!("other numbers are refused")
+            };
+            assert!(
+                format!("{error:#}").contains("does not match the object"),
+                "{error:#}"
+            );
+            continue;
+        }
+        authorized.unwrap();
+        let Request::Apply { ops } = &request else {
+            unreachable!()
+        };
+        let Op::SetMeta { condition, .. } = &ops[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            *condition,
+            proto::TargetCondition::Matches {
+                dev: observed.dev(),
+                ino: observed.ino(),
+            }
+        );
+    }
 }

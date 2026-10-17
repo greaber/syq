@@ -354,7 +354,7 @@ async fn direct_download_can_resume_after_a_long_pause_within_one_read() {
         metadata: None,
         mtime: 0,
     };
-    let engine = super::buffer_tests::planning_engine(&["--performance-tuning", "s3-retries=0"]);
+    let engine = super::buffer_tests::planning_engine(&["--s3-retries", "0"]);
     let mut delayed = Body::slow(&bytes, true);
     delayed.delay = Duration::from_secs(120);
     delayed.ready = Box::pin(tokio::time::sleep(Duration::from_secs(3600)));

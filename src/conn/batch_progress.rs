@@ -157,7 +157,6 @@ pub(super) fn test_request(sizes: &[usize]) -> Request {
                 flags: 0,
                 inplace: false,
                 condition: TargetCondition::Any,
-                guard: None,
                 replaces: false,
                 scanned: crate::proto::ScannedDestination::Unknown,
             })

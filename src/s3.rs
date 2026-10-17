@@ -91,6 +91,9 @@ pub(crate) struct Flags {
     /// Add a header before signing every S3 request (repeatable; S3-to-S3 metadata/tag overrides are refused)
     #[arg(long, value_name = "NAME: VALUE", help_heading = "Object storage")]
     s3_header: Vec<Header>,
+    /// Retry each S3 request up to N times after a transient failure or throttling, 0..100 (default 10; 0 disables retries)
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(0..=100), help_heading = "Object storage")]
+    s3_retries: Option<u32>,
 }
 
 /// Copy-only headers; removal and listing never create objects.
@@ -219,6 +222,7 @@ impl Options {
                 "s3_profile",
                 "s3_header",
                 "s3_write_header",
+                "s3_retries",
             ]
             .iter()
             .any(|id| explicit(id))
@@ -343,10 +347,13 @@ impl Options {
             automatic_part_size: tuning.s3_part_size.is_none(),
             concurrency,
             part_size,
-            retries: tuning.s3_retries.unwrap_or(10) as u32,
+            retries: flags.s3_retries.unwrap_or(DEFAULT_RETRIES),
         }))
     }
 }
+
+/// Retries of each S3 request without `--s3-retries`.
+pub(crate) const DEFAULT_RETRIES: u32 = 10;
 
 pub(crate) fn validate_endpoint(endpoint: &str) -> Result<()> {
     let url = url::Url::parse(endpoint).context("invalid S3 endpoint URL")?;

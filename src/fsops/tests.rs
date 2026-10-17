@@ -31,7 +31,7 @@ fn prune_lookup_distinguishes_missing_paths_from_inspection_errors() {
     let mut ops = FsOps::new();
     ops.destination_root = Some(Arc::new(Root::open(root).unwrap()));
     let stats = ops
-        .prune_lookup(&[b"missing/child".to_vec(), b"sub/file".to_vec()], None)
+        .prune_lookup(&[b"missing/child".to_vec(), b"sub/file".to_vec()])
         .unwrap();
     assert!(stats[0].is_none());
     assert_eq!(stats[1].as_ref().unwrap().size, 8);
@@ -40,7 +40,7 @@ fn prune_lookup_distinguishes_missing_paths_from_inspection_errors() {
         return;
     }
     fs::set_permissions(root.join("sub"), fs::Permissions::from_mode(0o000)).unwrap();
-    let denied = ops.prune_lookup(&[b"sub/file".to_vec()], None);
+    let denied = ops.prune_lookup(&[b"sub/file".to_vec()]);
     fs::set_permissions(root.join("sub"), fs::Permissions::from_mode(0o700)).unwrap();
     let error = denied.unwrap_err();
     assert_eq!(
@@ -60,7 +60,7 @@ fn prune_lookup_distinguishes_missing_paths_from_inspection_errors() {
         b"plain/child".to_vec(),
         b"link/file".to_vec(),
     ];
-    let shared = ops.prune_lookup(&paths, None);
+    let shared = ops.prune_lookup(&paths);
     // The same paths resolved one by one under the root.
     let confined = Root::open(root).unwrap();
     let separate: Vec<Result<Option<u64>>> = paths
@@ -92,7 +92,7 @@ fn prune_lookup_distinguishes_missing_paths_from_inspection_errors() {
         Err(error) => assert!(separate.iter().any(Result::is_err), "{error:#}"),
     }
     fs::set_permissions(root.join("sub"), fs::Permissions::from_mode(0o600)).unwrap();
-    let denied = ops.prune_lookup(&[b"sub/absent".to_vec(), b"sub/file".to_vec()], None);
+    let denied = ops.prune_lookup(&[b"sub/absent".to_vec(), b"sub/file".to_vec()]);
     fs::set_permissions(root.join("sub"), fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(
         denied
@@ -232,7 +232,7 @@ fn selected_hash_is_independent_of_payload_integrity() {
             .unwrap();
         assert!(matches!(response, Response::Block { hash, .. } if hash == [0;32]));
         let response = operations
-            .file_hash(path.as_os_str().as_bytes(), None, None)
+            .file_hash(path.as_os_str().as_bytes(), None)
             .unwrap();
         assert!(
             matches!(response, Response::FileHash { hash, .. } if hash == algorithm.hash(b"file contents"))
@@ -263,11 +263,7 @@ fn an_inplace_ranged_copy_writes_only_a_file_it_creates() {
     let directory = crate::test_support::tempdir().unwrap();
     let copy_id = [6; 16];
     let mut operations = destination_ops(directory.path());
-    let target = |path: &'static [u8]| PartialTarget {
-        path,
-        id: &copy_id,
-        guard: None,
-    };
+    let target = |path: &'static [u8]| PartialTarget { path, id: &copy_id };
     let prepare = |operations: &mut FsOps, path, mode| {
         operations
             .prepare(
@@ -310,10 +306,7 @@ fn an_inplace_ranged_copy_writes_only_a_file_it_creates() {
                 mtime_nsec: 123_456_789,
             },
             flags::MODE | flags::TIMES | flags::REPORT_IDENTITY,
-            TargetMutation {
-                condition: TargetCondition::Any,
-                guard: None,
-            },
+            TargetCondition::Any,
         )
     };
     let check = |path: &str, mode: u32| {
@@ -416,11 +409,7 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
     let directory = crate::test_support::tempdir().unwrap();
     let copy_id = [5; 16];
     let mut operations = destination_ops(directory.path());
-    let target = |path: &'static [u8]| PartialTarget {
-        path,
-        id: &copy_id,
-        guard: None,
-    };
+    let target = |path: &'static [u8]| PartialTarget { path, id: &copy_id };
     let prepare = |operations: &mut FsOps, path, mode| {
         operations
             .prepare(
@@ -464,10 +453,7 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
             &copy_id,
             &meta(mode),
             flags::MODE | flags::TIMES | flags::REPORT_IDENTITY,
-            TargetMutation {
-                condition: TargetCondition::Any,
-                guard: None,
-            },
+            TargetCondition::Any,
         )
     };
 
@@ -475,9 +461,7 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
     // read-write. Set-id bits are applied at publication.
     assert_eq!(prepare(&mut operations, b"plain", 0o644).partial_size, None);
     let (sidecar, _) = rooted_partial_target(
-        &operations
-            .destination_mutation_target(b"plain", None)
-            .unwrap(),
+        &operations.destination_mutation_target(b"plain").unwrap(),
         &copy_id,
     )
     .unwrap();
@@ -525,9 +509,7 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
     // A leftover this receiver does not hold is replaced, and the file it
     // was is left as it is.
     let (leftover, _) = rooted_partial_target(
-        &operations
-            .destination_mutation_target(b"left", None)
-            .unwrap(),
+        &operations.destination_mutation_target(b"left").unwrap(),
         &copy_id,
     )
     .unwrap();
@@ -554,9 +536,7 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
             None
         );
         let (partial, _) = rooted_partial_target(
-            &operations
-                .destination_mutation_target(b"readonly", None)
-                .unwrap(),
+            &operations.destination_mutation_target(b"readonly").unwrap(),
             &copy_id,
         )
         .unwrap();
@@ -585,9 +565,7 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
     prepare(&mut operations, b"swapped", 0o644);
     write(&mut operations, b"swapped");
     let (partial, _) = rooted_partial_target(
-        &operations
-            .destination_mutation_target(b"swapped", None)
-            .unwrap(),
+        &operations.destination_mutation_target(b"swapped").unwrap(),
         &copy_id,
     )
     .unwrap();
@@ -676,11 +654,7 @@ fn payload_integrity_checks_are_explicit() {
     operations.set_hash_policy(HashPolicy::default());
     operations
         .prepare(
-            PartialTarget {
-                path,
-                id: &copy_id,
-                guard: None,
-            },
+            PartialTarget { path, id: &copy_id },
             PrepareOptions {
                 size: 3,
                 inplace: false,
@@ -694,11 +668,7 @@ fn payload_integrity_checks_are_explicit() {
         .unwrap();
     operations
         .write_range(
-            PartialTarget {
-                path,
-                id: &copy_id,
-                guard: None,
-            },
+            PartialTarget { path, id: &copy_id },
             false,
             0,
             0,
@@ -719,11 +689,7 @@ fn payload_integrity_checks_are_explicit() {
         });
         assert!(operations
             .write_range(
-                PartialTarget {
-                    path,
-                    id: &copy_id,
-                    guard: None
-                },
+                PartialTarget { path, id: &copy_id },
                 false,
                 0,
                 0,
@@ -733,11 +699,7 @@ fn payload_integrity_checks_are_explicit() {
             .is_err());
         operations
             .write_range(
-                PartialTarget {
-                    path,
-                    id: &copy_id,
-                    guard: None,
-                },
+                PartialTarget { path, id: &copy_id },
                 false,
                 0,
                 0,
@@ -760,11 +722,7 @@ fn expected_hash_failure_preserves_existing_destination() {
     operations.set_hash_policy(HashPolicy::default());
     operations
         .prepare(
-            PartialTarget {
-                path,
-                id: &copy_id,
-                guard: None,
-            },
+            PartialTarget { path, id: &copy_id },
             PrepareOptions {
                 size: 3,
                 inplace: false,
@@ -778,11 +736,7 @@ fn expected_hash_failure_preserves_existing_destination() {
         .unwrap();
     operations
         .write_range(
-            PartialTarget {
-                path,
-                id: &copy_id,
-                guard: None,
-            },
+            PartialTarget { path, id: &copy_id },
             false,
             0,
             0,
@@ -808,10 +762,7 @@ fn expected_hash_failure_preserves_existing_destination() {
             &meta,
             0,
             crate::proto::ScannedDestination::Unknown,
-            TargetMutation {
-                condition: TargetCondition::Any,
-                guard: None
-            }
+            TargetCondition::Any
         )
         .is_err());
     assert_eq!(fs::read(&target).unwrap(), b"old");
@@ -825,10 +776,7 @@ fn expected_hash_failure_preserves_existing_destination() {
             &meta,
             0,
             crate::proto::ScannedDestination::Unknown,
-            TargetMutation {
-                condition: TargetCondition::Any,
-                guard: None,
-            },
+            TargetCondition::Any,
         )
         .unwrap();
     assert_eq!(fs::read(&target).unwrap(), b"new");
@@ -1025,7 +973,7 @@ fn existing_regular_open_does_not_follow_leaf_symlinks() {
 }
 
 #[test]
-fn guarded_inplace_updates_are_confined_and_replace_an_existing_target() {
+fn restricted_inplace_updates_are_confined_and_replace_an_existing_target() {
     let dir = test_dir();
     let root_path = dir.join("root");
     let outside = dir.join("outside");
@@ -1037,23 +985,16 @@ fn guarded_inplace_updates_are_confined_and_replace_an_existing_target() {
     fs::write(&sentinel, b"outside").unwrap();
     symlink(&outside, root_path.join("escape")).unwrap();
 
-    let root = Root::open(&root_path).unwrap();
-    let identity = root.identity();
-    let guard = ContainerGuard {
-        root: root_path.as_os_str().as_bytes().to_vec(),
-        dev: identity.dev,
-        ino: identity.ino,
-    };
-    let target_bytes = target.as_os_str().as_bytes();
+    // A restricted session names files relative to its root once mapped.
+    let target_bytes = b"file".as_slice();
     let copy_id = [7; 16];
     let inode = fs::metadata(&target).unwrap().ino();
-    let mut operations = FsOps::new();
+    let mut operations = FsOps::test_restricted(&root_path);
     operations
         .prepare(
             PartialTarget {
                 path: target_bytes,
                 id: &copy_id,
-                guard: Some(&guard),
             },
             PrepareOptions {
                 size: 3,
@@ -1071,7 +1012,6 @@ fn guarded_inplace_updates_are_confined_and_replace_an_existing_target() {
             PartialTarget {
                 path: target_bytes,
                 id: &copy_id,
-                guard: Some(&guard),
             },
             true,
             0,
@@ -1094,23 +1034,18 @@ fn guarded_inplace_updates_are_confined_and_replace_an_existing_target() {
                 mtime_nsec: 0,
             },
             0,
-            TargetMutation {
-                condition: TargetCondition::Any,
-                guard: Some(&guard),
-            },
+            TargetCondition::Any,
         )
         .unwrap();
 
     // Only a new file is written in place: the existing one is replaced.
     assert_eq!(fs::read(&target).unwrap(), b"new");
     assert_ne!(fs::metadata(&target).unwrap().ino(), inode);
-    let escaped = root_path.join("escape/sentinel");
     assert!(operations
         .prepare(
             PartialTarget {
-                path: escaped.as_os_str().as_bytes(),
+                path: b"escape/sentinel",
                 id: &copy_id,
-                guard: Some(&guard),
             },
             PrepareOptions {
                 size: 1,
@@ -1127,33 +1062,36 @@ fn guarded_inplace_updates_are_confined_and_replace_an_existing_target() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A restricted receiver's session holds its root open: a root renamed
+/// away and replaced by a link during a mutation leaves the mutation in the
+/// directory it opened, and a parent replaced by a link is refused. Neither
+/// reaches the link's target.
 #[test]
-fn confinement_matrix_guarded_receiver_refuses_root_and_parent_swaps() {
-    const CHILD_ENV: &str = "SYQ_TEST_GUARDED_MUTATION_CHILD";
-    const ROOT_ENV: &str = "SYQ_TEST_GUARDED_MUTATION_ROOT";
+fn confinement_matrix_restricted_receiver_survives_root_and_parent_swaps() {
+    const CHILD_ENV: &str = "SYQ_TEST_RESTRICTED_MUTATION_CHILD";
+    const ROOT_ENV: &str = "SYQ_TEST_RESTRICTED_MUTATION_ROOT";
+    const EXPECT_ENV: &str = "SYQ_TEST_RESTRICTED_MUTATION_SUCCEEDS";
     const TEST_NAME: &str =
-        "fsops::tests::confinement_matrix_guarded_receiver_refuses_root_and_parent_swaps";
+        "fsops::tests::confinement_matrix_restricted_receiver_survives_root_and_parent_swaps";
 
     if std::env::var_os(CHILD_ENV).is_some() {
         let root_path = PathBuf::from(std::env::var_os(ROOT_ENV).unwrap());
-        let identity = Root::open(&root_path).unwrap().identity();
-        let guard = ContainerGuard {
-            root: root_path.as_os_str().as_bytes().to_vec(),
-            dev: identity.dev,
-            ino: identity.ino,
-        };
+        let mut operations = FsOps::test_restricted(&root_path);
         let target = root_path.join("target/parent/escaped");
-        let errors = FsOps::new().apply(
-            &[Op::Mkdir {
+        let Response::Applied(errors) = operations.handle(&Request::Apply {
+            ops: vec![Op::Mkdir {
                 path: target.as_os_str().as_bytes().to_vec(),
                 mode: 0o755,
                 condition: TargetCondition::Any,
             }],
-            Some(&guard),
-        );
-        assert!(
-            errors[0].is_some(),
-            "guarded mutation followed a raced namespace"
+        }) else {
+            panic!("expected an Apply response")
+        };
+        assert_eq!(
+            errors[0].is_none(),
+            std::env::var_os(EXPECT_ENV).is_some(),
+            "{:?}",
+            errors[0]
         );
         return;
     }
@@ -1161,34 +1099,38 @@ fn confinement_matrix_guarded_receiver_refuses_root_and_parent_swaps() {
     for swap_root in [false, true] {
         let temporary = crate::test_support::tempdir().unwrap();
         let root_path = temporary.path().join("root");
+        let displaced = temporary.path().join("displaced-root");
         let outside = temporary.path().join("outside");
         fs::create_dir_all(root_path.join("target/parent")).unwrap();
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("sentinel"), b"outside").unwrap();
-        let ready = temporary.path().join("guarded-ready");
-        let continuation = temporary.path().join("guarded-continue");
+        let ready = temporary.path().join("mutation-ready");
+        let continuation = temporary.path().join("mutation-continue");
 
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
             .args(["--exact", TEST_NAME, "--nocapture"])
             .env(CHILD_ENV, "1")
             .env(ROOT_ENV, &root_path)
-            .env("SYQ_TEST_GUARDED_MUTATION_SUFFIX", "parent/escaped")
-            .env("SYQ_TEST_GUARDED_MUTATION_READY_FILE", &ready)
-            .env("SYQ_TEST_GUARDED_MUTATION_CONTINUE_FILE", &continuation)
-            .spawn_guarded()
-            .unwrap();
+            .env("SYQ_TEST_DESTINATION_MUTATION_SUFFIX", "parent/escaped")
+            .env("SYQ_TEST_DESTINATION_MUTATION_READY_FILE", &ready)
+            .env("SYQ_TEST_DESTINATION_MUTATION_CONTINUE_FILE", &continuation);
+        if swap_root {
+            command.env(EXPECT_ENV, "1");
+        }
+        let mut child = command.spawn_guarded().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !ready.exists() && std::time::Instant::now() < deadline {
             assert!(
                 child.try_wait().unwrap().is_none(),
-                "guarded-mutation child exited before its race window"
+                "mutation child exited before its race window"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(ready.exists(), "guarded-mutation race window timed out");
+        assert!(ready.exists(), "mutation race window timed out");
 
         if swap_root {
-            fs::rename(&root_path, temporary.path().join("displaced-root")).unwrap();
+            fs::rename(&root_path, &displaced).unwrap();
             symlink(&outside, &root_path).unwrap();
         } else {
             fs::rename(
@@ -1202,10 +1144,15 @@ fn confinement_matrix_guarded_receiver_refuses_root_and_parent_swaps() {
 
         assert!(
             child.wait().unwrap().success(),
-            "guarded-mutation child failed for swap_root={swap_root}"
+            "mutation child failed for swap_root={swap_root}"
         );
         assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"outside");
         assert!(!outside.join("escaped").exists());
+        assert_eq!(
+            displaced.join("target/parent/escaped").is_dir(),
+            swap_root,
+            "swap_root={swap_root}"
+        );
     }
 }
 
@@ -1490,44 +1437,38 @@ fn matching_condition_can_replace_a_same_type_special_file() {
 
     // Its time changes; its permissions, which the request does not
     // select, stay as they were, not the 0600 the request proposes.
-    let errors = destination_ops(&dir).apply(
-        &[Op::Mknod {
-            path: b"fifo".to_vec(),
-            mode: file_type_bits(before.mode()) | 0o600,
-            rdev: 0,
-            condition: TargetCondition::Matches {
-                dev: before.dev(),
-                ino: before.ino(),
-            },
-            meta: Meta {
-                mode: 0o600,
-                mtime: 1_600_000_000,
-                ..Default::default()
-            },
-            flags: flags::TIMES,
-        }],
-        None,
-    );
+    let errors = destination_ops(&dir).apply(&[Op::Mknod {
+        path: b"fifo".to_vec(),
+        mode: file_type_bits(before.mode()) | 0o600,
+        rdev: 0,
+        condition: TargetCondition::Matches {
+            dev: before.dev(),
+            ino: before.ino(),
+        },
+        meta: Meta {
+            mode: 0o600,
+            mtime: 1_600_000_000,
+            ..Default::default()
+        },
+        flags: flags::TIMES,
+    }]);
     let after = fs::symlink_metadata(&fifo).unwrap();
     // A request that would change nothing leaves the entry as it is.
-    let unchanged = destination_ops(&dir).apply(
-        &[Op::Mknod {
-            path: b"fifo".to_vec(),
-            mode: file_type_bits(before.mode()) | 0o600,
-            rdev: 0,
-            condition: TargetCondition::Matches {
-                dev: after.dev(),
-                ino: after.ino(),
-            },
-            meta: Meta {
-                mode: 0o600,
-                mtime: 1_600_000_000,
-                ..Default::default()
-            },
-            flags: flags::TIMES,
-        }],
-        None,
-    );
+    let unchanged = destination_ops(&dir).apply(&[Op::Mknod {
+        path: b"fifo".to_vec(),
+        mode: file_type_bits(before.mode()) | 0o600,
+        rdev: 0,
+        condition: TargetCondition::Matches {
+            dev: after.dev(),
+            ino: after.ino(),
+        },
+        meta: Meta {
+            mode: 0o600,
+            mtime: 1_600_000_000,
+            ..Default::default()
+        },
+        flags: flags::TIMES,
+    }]);
     let kept = fs::symlink_metadata(&fifo).unwrap();
     fs::remove_dir_all(&dir).unwrap();
 
@@ -1565,16 +1506,13 @@ fn unlink_never_recurses_into_a_directory() {
     fs::write(dir.join("f"), b"f").unwrap();
     let mut ops = destination_ops(&dir);
     let path = |n: &str| n.as_bytes().to_vec();
-    let errs = ops.apply(
-        &[
-            Op::Unlink { path: path("d") },
-            Op::Unlink { path: path("f") },
-            Op::Unlink {
-                path: path("missing"),
-            },
-        ],
-        None,
-    );
+    let errs = ops.apply(&[
+        Op::Unlink { path: path("d") },
+        Op::Unlink { path: path("f") },
+        Op::Unlink {
+            path: path("missing"),
+        },
+    ]);
     assert!(errs[0]
         .as_ref()
         .map(WireError::as_str)
@@ -1601,7 +1539,6 @@ fn plan_batch_only_stats_leaves_below_ready_directories() {
         copy_id: [7; 16],
         directories: vec![path_bytes(directory)],
         others: vec![path_bytes(&leaf)],
-        guard: None,
         strict_metadata: false,
     };
 
@@ -1746,7 +1683,6 @@ fn destination_activation_does_not_change_process_cwd() {
     assert_eq!(std::env::current_dir().unwrap(), before);
     let response = operations.handle(&Request::Canonicalize {
         path: b"logical".to_vec(),
-        guard: None,
     });
     assert!(
         matches!(response, Response::EndpointError(error) if error.message.contains(
@@ -1757,21 +1693,20 @@ fn destination_activation_does_not_change_process_cwd() {
 }
 
 /// A destination mutation is refused until the session holds an
-/// authority for it: a registered root or a signed receiver's guard. The
+/// authority for it: a registered root or a restricted receiver's root. The
 /// same request is served once either exists.
 #[test]
-fn destination_mutations_need_a_registered_root_or_a_guard() {
+fn destination_mutations_need_a_registered_or_restricted_root() {
     let dir = test_dir();
     fs::create_dir(&dir).unwrap();
     let target = dir.join("made");
     let target_bytes = target.as_os_str().as_bytes().to_vec();
-    let mkdir = |path: PathBytes, guard: Option<ContainerGuard>| Request::Apply {
+    let mkdir = |path: PathBytes| Request::Apply {
         ops: vec![Op::Mkdir {
             path,
             mode: 0o755,
             condition: TargetCondition::Any,
         }],
-        guard,
     };
     let put = Request::PutSmallBatch(vec![SmallPut {
         path: target_bytes.clone(),
@@ -1789,13 +1724,12 @@ fn destination_mutations_need_a_registered_root_or_a_guard() {
         flags: 0,
         inplace: false,
         condition: TargetCondition::Absent,
-        guard: None,
         replaces: false,
         scanned: crate::proto::ScannedDestination::Unknown,
     }]);
 
     let mut unrooted = FsOps::new();
-    for request in [mkdir(target_bytes.clone(), None), put] {
+    for request in [mkdir(target_bytes.clone()), put] {
         let response = unrooted.handle(&request);
         assert!(
             matches!(
@@ -1805,28 +1739,19 @@ fn destination_mutations_need_a_registered_root_or_a_guard() {
             "{response:?}"
         );
     }
-    let errors = unrooted.apply(
-        &[Op::Mkdir {
-            path: target_bytes.clone(),
-            mode: 0o755,
-            condition: TargetCondition::Any,
-        }],
-        None,
-    );
+    let errors = unrooted.apply(&[Op::Mkdir {
+        path: target_bytes.clone(),
+        mode: 0o755,
+        condition: TargetCondition::Any,
+    }]);
     assert_eq!(
         errors[0].as_ref().map(WireError::as_str),
         Some(UNROOTED_MUTATION)
     );
     assert!(!target.exists());
 
-    let root = Root::open(&dir).unwrap();
-    let identity = root.identity();
-    let guard = ContainerGuard {
-        root: dir.as_os_str().as_bytes().to_vec(),
-        dev: identity.dev,
-        ino: identity.ino,
-    };
-    let response = unrooted.handle(&mkdir(target_bytes.clone(), Some(guard)));
+    let mut restricted = FsOps::test_restricted(&dir);
+    let response = restricted.handle(&mkdir(target_bytes.clone()));
     assert!(
         matches!(&response, Response::Applied(errors) if errors == &vec![None]),
         "{response:?}"
@@ -1838,7 +1763,7 @@ fn destination_mutations_need_a_registered_root_or_a_guard() {
     rooted
         .install_destination(File::open(&dir).unwrap(), b"logical")
         .unwrap();
-    let response = rooted.handle(&mkdir(b"logical/made".to_vec(), None));
+    let response = rooted.handle(&mkdir(b"logical/made".to_vec()));
     assert!(
         matches!(&response, Response::Applied(errors) if errors == &vec![None]),
         "{response:?}"
@@ -1877,7 +1802,6 @@ fn put_small_stages_with_final_mode_and_truncates_reused_sidecar() {
         flags,
         inplace: false,
         condition: TargetCondition::Any,
-        guard: None,
         replaces: false,
         scanned: crate::proto::ScannedDestination::Unknown,
     };
@@ -2465,7 +2389,8 @@ fn small_copy_staging_failure_keeps_all_partials_for_retry() {
             vec![
                 SmallCopyFileResult {
                     disposition: SmallCopyDisposition::Copied,
-                    error: None
+                    error: None,
+                    repaired: false,
                 };
                 2
             ]
@@ -2549,7 +2474,8 @@ fn small_copy_publishes_regular_files_and_declines_other_types() {
                 vec![
                     SmallCopyFileResult {
                         disposition: SmallCopyDisposition::Copied,
-                        error: None
+                        error: None,
+                        repaired: false,
                     };
                     2
                 ]
@@ -2604,7 +2530,6 @@ fn small_copy_publishes_regular_files_and_declines_other_types() {
     assert!(declined.destination_root.is_none() && declined.operator_selection.is_none());
     let canonical = declined.handle(&Request::Canonicalize {
         path: prefix.clone(),
-        guard: None,
     });
     assert!(matches!(canonical, Response::Path(_)), "{canonical:?}");
 
@@ -2835,23 +2760,22 @@ fn destination_observation_uses_the_adopted_root_not_its_old_name() {
     fs::create_dir(&selected).unwrap();
     fs::write(selected.join("marker"), b"replacement").unwrap();
 
-    let stats = operations.stat_many(&[b"marker".to_vec()], false, None);
+    let stats = operations.stat_many(&[b"marker".to_vec()], false);
     assert_eq!(stats[0].as_ref().unwrap().size, 8);
-    let Response::FileHash { size, hash } = operations.file_hash(b"marker", None, None).unwrap()
-    else {
+    let Response::FileHash { size, hash } = operations.file_hash(b"marker", None).unwrap() else {
         panic!("unexpected hash response");
     };
     assert_eq!(size, 8);
     assert_eq!(hash, content_digest(b"original"));
 
-    let partial = operations.partial_paths(&[b"missing/deeper/marker".to_vec()], &[12; 16], None);
+    let partial = operations.partial_paths(&[b"missing/deeper/marker".to_vec()], &[12; 16]);
     assert!(partial[0]
         .as_ref()
         .unwrap()
         .starts_with(b"missing/deeper/.marker.syq-tmp."));
-    assert!(operations.partial_paths(&[b"../outside".to_vec()], &[12; 16], None)[0].is_err());
-    assert!(operations.file_hash(b"../outside", None, None).is_err());
-    assert!(operations.stat_many(&[b"../outside".to_vec()], false, None)[0].is_none());
+    assert!(operations.partial_paths(&[b"../outside".to_vec()], &[12; 16])[0].is_err());
+    assert!(operations.file_hash(b"../outside", None).is_err());
+    assert!(operations.stat_many(&[b"../outside".to_vec()], false)[0].is_none());
 
     fs::remove_dir_all(&dir).unwrap();
 }
@@ -2870,7 +2794,6 @@ fn unmatched_basis_creates_private_empty_stage_without_copying_old_bytes() {
             MIN_HASH_BLOCK_BYTES,
             12,
             TargetCondition::Any,
-            None,
         )
         .unwrap();
     operations
@@ -2878,7 +2801,6 @@ fn unmatched_basis_creates_private_empty_stage_without_copying_old_bytes() {
             PartialTarget {
                 path: b"basis",
                 id: &copy_id,
-                guard: None,
             },
             12,
             MIN_HASH_BLOCK_BYTES,
@@ -2930,7 +2852,6 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
             MIN_HASH_BLOCK_BYTES,
             4,
             TargetCondition::Any,
-            None,
         )
         .unwrap();
     assert_eq!(hashes, vec![content_digest(b"held")]);
@@ -2940,7 +2861,6 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
             PartialTarget {
                 path: b"basis",
                 id: &copy_id,
-                guard: None,
             },
             4,
             MIN_HASH_BLOCK_BYTES,
@@ -2951,8 +2871,7 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
     let basis_name = partial_path(&selected.join("basis"), &copy_id).unwrap();
     let basis_partial = moved.join(basis_name.file_name().unwrap());
     assert_eq!(fs::read(&basis_partial).unwrap(), b"held");
-    let Response::PartialSize(partial_size) =
-        operations.probe_partial(b"basis", &copy_id, None).unwrap()
+    let Response::PartialSize(partial_size) = operations.probe_partial(b"basis", &copy_id).unwrap()
     else {
         panic!("unexpected partial probe response");
     };
@@ -2963,7 +2882,6 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
                 HashTarget {
                     path: b"basis",
                     source: None,
-                    guard: None,
                 },
                 HashOptions {
                     off: 0,
@@ -2985,7 +2903,6 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
             MIN_HASH_BLOCK_BYTES,
             4,
             TargetCondition::Any,
-            None,
         )
         .unwrap();
     operations
@@ -3002,7 +2919,6 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
             },
             flags::MODE,
             TargetCondition::Any,
-            None,
         )
         .unwrap();
     assert_eq!(
@@ -3020,7 +2936,6 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
             PartialTarget {
                 path: b"inplace",
                 id: &copy_id,
-                guard: None,
             },
             PrepareOptions {
                 size: 2,
@@ -3043,7 +2958,6 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
             PartialTarget {
                 path: b"redirect/escaped",
                 id: &copy_id,
-                guard: None,
             },
             PrepareOptions {
                 size: 1,
@@ -3061,7 +2975,6 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
             HashTarget {
                 path: b"redirect/escaped",
                 source: None,
-                guard: None,
             },
             HashOptions {
                 off: 0,
@@ -3074,9 +2987,7 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
         )
         .is_err());
     assert!(!outside.join("escaped").exists());
-    assert!(operations
-        .probe_partial(b"../outside", &copy_id, None)
-        .is_err());
+    assert!(operations.probe_partial(b"../outside", &copy_id).is_err());
 
     fs::remove_dir_all(&dir).unwrap();
 }
@@ -3121,7 +3032,6 @@ fn destination_writes_publish_inside_the_adopted_root() {
             flags: 0,
             inplace: false,
             condition: TargetCondition::Absent,
-            guard: None,
             replaces: false,
             scanned: crate::proto::ScannedDestination::Unknown,
         })
@@ -3146,7 +3056,6 @@ fn destination_writes_publish_inside_the_adopted_root() {
                 dev: existing.dev(),
                 ino: existing.ino(),
             },
-            guard: None,
             replaces: false,
             scanned: crate::proto::ScannedDestination::Unknown,
         })
@@ -3166,7 +3075,6 @@ fn destination_writes_publish_inside_the_adopted_root() {
             PartialTarget {
                 path: b"ranged",
                 id: &copy_id,
-                guard: None,
             },
             PrepareOptions {
                 size: 6,
@@ -3184,7 +3092,6 @@ fn destination_writes_publish_inside_the_adopted_root() {
             PartialTarget {
                 path: b"ranged",
                 id: &copy_id,
-                guard: None,
             },
             false,
             0,
@@ -3200,10 +3107,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
             &copy_id,
             &meta,
             0,
-            TargetMutation {
-                condition: TargetCondition::Absent,
-                guard: None,
-            },
+            TargetCondition::Absent,
         )
         .unwrap();
     assert_eq!(fs::read(moved.join("ranged")).unwrap(), b"ranged");
@@ -3214,7 +3118,6 @@ fn destination_writes_publish_inside_the_adopted_root() {
             PartialTarget {
                 path: b"inplace",
                 id: &copy_id,
-                guard: None,
             },
             PrepareOptions {
                 size: 7,
@@ -3232,7 +3135,6 @@ fn destination_writes_publish_inside_the_adopted_root() {
             PartialTarget {
                 path: b"inplace",
                 id: &copy_id,
-                guard: None,
             },
             true,
             0,
@@ -3242,17 +3144,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
         )
         .unwrap();
     operations
-        .finalize(
-            b"inplace",
-            true,
-            &copy_id,
-            &meta,
-            0,
-            TargetMutation {
-                condition: TargetCondition::Any,
-                guard: None,
-            },
-        )
+        .finalize(b"inplace", true, &copy_id, &meta, 0, TargetCondition::Any)
         .unwrap();
     assert_eq!(fs::read(moved.join("inplace")).unwrap(), b"inplace");
     assert_eq!(
@@ -3271,7 +3163,6 @@ fn destination_writes_publish_inside_the_adopted_root() {
             flags: 0,
             inplace: false,
             condition: TargetCondition::Absent,
-            guard: None,
             replaces: false,
             scanned: crate::proto::ScannedDestination::Unknown,
         })
@@ -3300,7 +3191,6 @@ fn rooted_ranged_write_does_not_follow_a_swapped_parent() {
             PartialTarget {
                 path: b"parent/file",
                 id: &copy_id,
-                guard: None,
             },
             PrepareOptions {
                 size: 4,
@@ -3318,7 +3208,6 @@ fn rooted_ranged_write_does_not_follow_a_swapped_parent() {
             PartialTarget {
                 path: b"parent/file",
                 id: &copy_id,
-                guard: None,
             },
             false,
             0,
@@ -3337,7 +3226,6 @@ fn rooted_ranged_write_does_not_follow_a_swapped_parent() {
             PartialTarget {
                 path: b"parent/file",
                 id: &copy_id,
-                guard: None,
             },
             false,
             0,
@@ -3360,10 +3248,7 @@ fn rooted_ranged_write_does_not_follow_a_swapped_parent() {
                 mtime_nsec: 0,
             },
             0,
-            TargetMutation {
-                condition: TargetCondition::Absent,
-                guard: None,
-            },
+            TargetCondition::Absent,
         )
         .is_err());
     let original_partial = partial_path(&root_path.join("parent/file"), &copy_id).unwrap();
@@ -3393,7 +3278,6 @@ fn rooted_finalize_rejects_replacement_of_the_opened_partial() {
             PartialTarget {
                 path: b"file",
                 id: &copy_id,
-                guard: None,
             },
             PrepareOptions {
                 size: 4,
@@ -3411,7 +3295,6 @@ fn rooted_finalize_rejects_replacement_of_the_opened_partial() {
             PartialTarget {
                 path: b"file",
                 id: &copy_id,
-                guard: None,
             },
             false,
             0,
@@ -3439,10 +3322,7 @@ fn rooted_finalize_rejects_replacement_of_the_opened_partial() {
                 mtime_nsec: 0,
             },
             0,
-            TargetMutation {
-                condition: TargetCondition::Absent,
-                guard: None,
-            },
+            TargetCondition::Absent,
         )
         .is_err());
     assert!(!root_path.join("file").exists());
@@ -3492,7 +3372,7 @@ fn rooted_descriptor_cache_distinguishes_roots_with_the_same_relative_name() {
     };
     for (root, path) in [(&first_root, &first), (&second_root, &second)] {
         let file = File::options().write(true).open(path.join("same")).unwrap();
-        stages::hold(held(root), &relative, &file, None, false).unwrap();
+        stages::hold(held(root), &relative, &file, None, false, u64::MAX).unwrap();
     }
 
     let first_inode = operations
@@ -3542,7 +3422,6 @@ fn retained_basis_cannot_be_consumed_under_another_root() {
             MIN_HASH_BLOCK_BYTES,
             4,
             TargetCondition::Any,
-            None,
         )
         .unwrap();
     operations.destination_root = Some(second_root);
@@ -3560,7 +3439,6 @@ fn retained_basis_cannot_be_consumed_under_another_root() {
             },
             flags::MODE,
             TargetCondition::Any,
-            None,
         )
         .is_err());
     assert_ne!(
@@ -3608,61 +3486,58 @@ fn destination_apply_uses_the_adopted_root_not_its_old_name() {
         mtime: 1_700_000_000,
         mtime_nsec: 123_456_789,
     };
-    let errors = operations.apply(
-        &[
-            Op::Mkdir {
-                path: b"created".to_vec(),
-                mode: 0o755,
-                condition: TargetCondition::Any,
+    let errors = operations.apply(&[
+        Op::Mkdir {
+            path: b"created".to_vec(),
+            mode: 0o755,
+            condition: TargetCondition::Any,
+        },
+        Op::Mkdir {
+            path: b"nested/parent/created".to_vec(),
+            mode: 0o755,
+            condition: TargetCondition::Any,
+        },
+        // A symlink gets its metadata as it is created.
+        Op::Symlink {
+            path: b"link".to_vec(),
+            target: b"target".to_vec(),
+            condition: TargetCondition::Any,
+            meta: meta(0),
+            flags: flags::TIMES,
+        },
+        Op::Mknod {
+            path: b"pipe".to_vec(),
+            mode: MODE_FIFO | 0o600,
+            rdev: 0,
+            condition: TargetCondition::Any,
+            meta: Default::default(),
+            flags: 0,
+        },
+        Op::Unlink {
+            path: b"remove".to_vec(),
+        },
+        Op::Rmdir {
+            path: b"empty".to_vec(),
+        },
+        Op::SetFileMetaIfSame {
+            path: b"repair".to_vec(),
+            condition: TargetCondition::MatchesFingerprint {
+                dev: repair_before.dev(),
+                ino: repair_before.ino(),
+                ctime: repair_before.ctime(),
+                ctime_nsec: repair_before.ctime_nsec() as u32,
             },
-            Op::Mkdir {
-                path: b"nested/parent/created".to_vec(),
-                mode: 0o755,
-                condition: TargetCondition::Any,
-            },
-            // A symlink gets its metadata as it is created.
-            Op::Symlink {
-                path: b"link".to_vec(),
-                target: b"target".to_vec(),
-                condition: TargetCondition::Any,
-                meta: meta(0),
-                flags: flags::TIMES,
-            },
-            Op::Mknod {
-                path: b"pipe".to_vec(),
-                mode: MODE_FIFO | 0o600,
-                rdev: 0,
-                condition: TargetCondition::Any,
-                meta: Default::default(),
-                flags: 0,
-            },
-            Op::Unlink {
-                path: b"remove".to_vec(),
-            },
-            Op::Rmdir {
-                path: b"empty".to_vec(),
-            },
-            Op::SetFileMetaIfSame {
-                path: b"repair".to_vec(),
-                condition: TargetCondition::MatchesFingerprint {
-                    dev: repair_before.dev(),
-                    ino: repair_before.ino(),
-                    ctime: repair_before.ctime(),
-                    ctime_nsec: repair_before.ctime_nsec() as u32,
-                },
-                meta: meta(0o640),
-                flags: flags::MODE,
-            },
-            Op::SetMeta {
-                path: Vec::new(),
-                meta: meta(0o701),
-                flags: flags::MODE | flags::TIMES,
-                condition: TargetCondition::Any,
-                directory: true,
-            },
-        ],
-        None,
-    );
+            meta: meta(0o640),
+            flags: flags::MODE,
+        },
+        Op::SetMeta {
+            path: Vec::new(),
+            meta: meta(0o701),
+            flags: flags::MODE | flags::TIMES,
+            condition: TargetCondition::Any,
+            directory: true,
+        },
+    ]);
     assert_eq!(errors, vec![None; 8]);
     assert_eq!(
         fs::symlink_metadata(moved.join("link")).unwrap().mtime(),
@@ -3691,17 +3566,14 @@ fn destination_apply_uses_the_adopted_root_not_its_old_name() {
 
     let outside = dir.join("outside");
     fs::write(&outside, b"outside").unwrap();
-    let errors = operations.apply(
-        &[
-            Op::Unlink {
-                path: b"../outside".to_vec(),
-            },
-            Op::Remove {
-                path: b"created".to_vec(),
-            },
-        ],
-        None,
-    );
+    let errors = operations.apply(&[
+        Op::Unlink {
+            path: b"../outside".to_vec(),
+        },
+        Op::Remove {
+            path: b"created".to_vec(),
+        },
+    ]);
     assert!(errors.iter().all(Option::is_some));
     assert_eq!(fs::read(&outside).unwrap(), b"outside");
     assert!(moved.join("created").is_dir());
@@ -3709,14 +3581,11 @@ fn destination_apply_uses_the_adopted_root_not_its_old_name() {
     let outside_directory = dir.join("outside-directory");
     fs::create_dir(&outside_directory).unwrap();
     symlink(&outside_directory, moved.join("redirect")).unwrap();
-    let errors = operations.apply(
-        &[Op::Mkdir {
-            path: b"redirect/escaped".to_vec(),
-            mode: 0o755,
-            condition: TargetCondition::Any,
-        }],
-        None,
-    );
+    let errors = operations.apply(&[Op::Mkdir {
+        path: b"redirect/escaped".to_vec(),
+        mode: 0o755,
+        condition: TargetCondition::Any,
+    }]);
     assert!(errors[0].is_some());
     assert!(!outside_directory.join("escaped").exists());
 
@@ -3738,7 +3607,6 @@ fn rooted_mkdir_race_accepts_only_an_existing_real_directory() {
         relative: RelativePath::new(path).unwrap(),
         label: PathBuf::from(OsStr::from_bytes(path)),
         create_missing_parents: true,
-        query_partial_name_limit: false,
     };
 
     assert!(
@@ -3814,7 +3682,7 @@ fn seed_basis_copies_only_selected_final_blocks_and_hashes_current_bytes() {
         let mut data = vec![17; len as usize];
         fs::write(&path, &data).unwrap();
         let mut ops = destination_ops(temporary.path());
-        ops.hash_and_hold(b"file", &id, block, len, TargetCondition::Any, None)
+        ops.hash_and_hold(b"file", &id, block, len, TargetCondition::Any)
             .unwrap();
         // The hint is stale: hashes must describe the buffers copied now.
         data[block as usize..2 * block as usize].fill(91);
@@ -3831,7 +3699,6 @@ fn seed_basis_copies_only_selected_final_blocks_and_hashes_current_bytes() {
                 PartialTarget {
                     path: b"file",
                     id: &id,
-                    guard: None,
                 },
                 len,
                 block,
@@ -3876,7 +3743,6 @@ fn seed_basis_final_hint_does_not_limit_partial_donors() {
                 PartialTarget {
                     path: b"file",
                     id: &id,
-                    guard: None,
                 },
                 11,
                 MIN_HASH_BLOCK_BYTES,
@@ -3912,8 +3778,7 @@ fn seed_basis_rejects_invalid_ranges_before_creating_a_partial() {
             ops.seed_basis(
                 PartialTarget {
                     path: b"file",
-                    id: &id,
-                    guard: None
+                    id: &id
                 },
                 3 * block,
                 block,
@@ -3946,7 +3811,6 @@ fn seed_basis_ignores_a_previous_jobs_hold() {
         MIN_HASH_BLOCK_BYTES,
         13,
         TargetCondition::Any,
-        None,
     )
     .unwrap();
     // A source-side failure would leave this earlier hold unconsumed.
@@ -3955,7 +3819,6 @@ fn seed_basis_ignores_a_previous_jobs_hold() {
             PartialTarget {
                 path: b"later",
                 id: &id,
-                guard: None,
             },
             11,
             MIN_HASH_BLOCK_BYTES,
@@ -3990,7 +3853,6 @@ fn seed_basis_without_a_usable_donor_returns_no_reusable_blocks() {
                 PartialTarget {
                     path: &path,
                     id: &id,
-                    guard: None,
                 },
                 PrepareOptions {
                     size: len,
@@ -4013,7 +3875,6 @@ fn seed_basis_without_a_usable_donor_returns_no_reusable_blocks() {
                 PartialTarget {
                     path: &path,
                     id: &id,
-                    guard: None,
                 },
                 len,
                 MIN_HASH_BLOCK_BYTES,
@@ -4035,7 +3896,6 @@ fn seed_basis_without_a_usable_donor_returns_no_reusable_blocks() {
                 PartialTarget {
                     path: &path,
                     id: &id,
-                    guard: None,
                 },
                 len,
                 MIN_HASH_BLOCK_BYTES,
@@ -4084,7 +3944,7 @@ fn seed_basis_hashes_retry_bytes_without_rewriting_them() {
         .write(true)
         .open(&partial)
         .unwrap();
-    stages::hold(held, &relative, &file, None, true).unwrap();
+    stages::hold(held, &relative, &file, None, true, u64::MAX).unwrap();
     // Retried bytes are compared with source block hashes, independently
     // of the hash used to check transported payloads.
     ops.set_hash_policy(crate::hashing::HashPolicy {
@@ -4097,7 +3957,6 @@ fn seed_basis_hashes_retry_bytes_without_rewriting_them() {
             PartialTarget {
                 path: b"file",
                 id: &id,
-                guard: None,
             },
             11,
             MIN_HASH_BLOCK_BYTES,
@@ -4130,7 +3989,6 @@ fn a_sidecar_this_receiver_does_not_hold_is_only_a_donor() {
     let target_of = || PartialTarget {
         path: b"file",
         id: &id,
-        guard: None,
     };
     let seeded = ops
         .seed_basis(target_of(), 11, MIN_HASH_BLOCK_BYTES, None, 1)
@@ -4175,7 +4033,6 @@ fn seeding_never_writes_old_bytes_into_a_leftover_someone_may_hold_open() {
         let target = || PartialTarget {
             path: b"file",
             id: &id,
-            guard: None,
         };
         let mut old: Vec<u8> = (0..8 * block).map(|i| (i % 251) as u8 | 1).collect();
         for chunk in old[3 * block..4 * block].chunks_mut(secret.len()) {
@@ -4254,10 +4111,7 @@ fn seeding_never_writes_old_bytes_into_a_leftover_someone_may_hold_open() {
             &id,
             &meta,
             flags::MODE,
-            TargetMutation {
-                condition: TargetCondition::Any,
-                guard: None,
-            },
+            TargetCondition::Any,
         )
         .unwrap();
         assert!(!holds_secret(read_all(&reader)), "{donor}");
@@ -4302,7 +4156,6 @@ fn a_retry_never_writes_into_a_sidecar_opened_while_its_mode_was_wider() {
             let target = || PartialTarget {
                 path: b"file",
                 id: &id,
-                guard: None,
             };
             let mut ops = destination_ops(temporary.path());
             let prepared = ops
@@ -4395,10 +4248,7 @@ fn a_retry_never_writes_into_a_sidecar_opened_while_its_mode_was_wider() {
                 &id,
                 &meta,
                 flags::MODE,
-                TargetMutation {
-                    condition: TargetCondition::Any,
-                    guard: None,
-                },
+                TargetCondition::Any,
             )
             .unwrap();
             assert_eq!(fs::read(&path).unwrap(), new, "{case}");
@@ -4457,7 +4307,6 @@ fn on_a_device_with_fixed_wide_modes_a_retry_reuses_its_sidecar() {
                 let target = || PartialTarget {
                     path: b"file",
                     id: &id,
-                    guard: None,
                 };
                 let prepare = |ops: &mut FsOps, mode, attempt, len: usize| {
                     ops.prepare(
@@ -4502,7 +4351,6 @@ fn on_a_device_with_fixed_wide_modes_a_retry_reuses_its_sidecar() {
                     let other = PartialTarget {
                         path: b"other",
                         id: &id,
-                        guard: None,
                     };
                     let options = PrepareOptions {
                         size: 1,
@@ -4555,10 +4403,7 @@ fn on_a_device_with_fixed_wide_modes_a_retry_reuses_its_sidecar() {
                     &id,
                     &meta,
                     flags::MODE,
-                    TargetMutation {
-                        condition: TargetCondition::Any,
-                        guard: None,
-                    },
+                    TargetCondition::Any,
                 )
                 .unwrap();
                 FORCED_MODE.set(None);
@@ -4623,7 +4468,6 @@ fn a_refused_mode_probe_leaves_the_device_checked() {
     let target = || PartialTarget {
         path: b"file",
         id: &id,
-        guard: None,
     };
     let options = |mode, attempt| PrepareOptions {
         size: old.len() as u64,
@@ -4723,7 +4567,7 @@ fn one_connections_probe_does_not_decide_for_another() {
             copy_id: &copy_id,
             inplace: false,
         };
-        stages::hold(held, &relative, &file, None, true).unwrap();
+        stages::hold(held, &relative, &file, None, true, u64::MAX).unwrap();
         // Held open, its inode number cannot be given to a replacement.
         file
     };
@@ -4802,7 +4646,7 @@ fn partial_discovery_is_exact_and_directory_cache_is_bounded() {
         fs::write(directory.join(".file.syq-tmp.abcdefghijklmnop"), b"donor").unwrap();
         fs::write(directory.join(".syq-tmp.abcdefghijklmnop"), b"ambiguous").unwrap();
         let target = |name: &str| {
-            ops.destination_mutation_target(format!("{index}/{name}").as_bytes(), None)
+            ops.destination_mutation_target(format!("{index}/{name}").as_bytes())
                 .unwrap()
         };
         let (file, other) = (target("file"), target("file-other"));
@@ -4827,7 +4671,6 @@ fn observation_only_prepare_does_not_create_a_sidecar() {
             PartialTarget {
                 path: b"file",
                 id: &copy_id,
-                guard: None,
             },
             PrepareOptions {
                 size: 1024,
@@ -4848,7 +4691,6 @@ fn observation_only_prepare_does_not_create_a_sidecar() {
             PartialTarget {
                 path: b"file",
                 id: &copy_id,
-                guard: None,
             },
             PrepareOptions {
                 size: 1024,
@@ -4881,7 +4723,6 @@ fn observation_only_prepare_preserves_unsafe_sidecars() {
                 PartialTarget {
                     path: b"file",
                     id: &copy_id,
-                    guard: None,
                 },
                 PrepareOptions {
                     size: 1024,
@@ -4931,26 +4772,18 @@ fn observation_only_rooted_prepare_preserves_an_unsafe_sidecar() {
     let dir = test_dir();
     let root_path = dir.join("root");
     fs::create_dir_all(&root_path).unwrap();
-    let root = Root::open(&root_path).unwrap();
-    let identity = root.identity();
-    let guard = ContainerGuard {
-        root: root_path.as_os_str().as_bytes().to_vec(),
-        dev: identity.dev,
-        ino: identity.ino,
-    };
     let target = root_path.join("file");
     let copy_id = [13; 16];
     let partial = partial_path(&target, &copy_id).unwrap();
     symlink("unsafe-target", &partial).unwrap();
     let before = fs::symlink_metadata(&partial).unwrap();
-    let mut operations = FsOps::new();
+    let mut operations = FsOps::test_restricted(&root_path);
 
     let observed = operations
         .prepare(
             PartialTarget {
-                path: target.as_os_str().as_bytes(),
+                path: b"file",
                 id: &copy_id,
-                guard: Some(&guard),
             },
             PrepareOptions {
                 size: 1024,
@@ -5069,19 +4902,15 @@ fn ordinary_files_still_report_preallocation_failures() {
 }
 
 #[test]
-fn guarded_root_metadata_updates_once_then_becomes_a_noop() {
+fn rooted_root_metadata_updates_once_then_becomes_a_noop() {
     let dir = test_dir();
     fs::create_dir(&dir).unwrap();
-    let root = Root::open(&dir).unwrap();
-    let identity = root.identity();
-    let guard = ContainerGuard {
-        root: dir.as_os_str().as_bytes().to_vec(),
-        dev: identity.dev,
-        ino: identity.ino,
+    let target = RootedTarget {
+        root: Arc::new(Root::open(&dir).unwrap()),
+        relative: RelativePath::new(b"").unwrap(),
+        label: dir.clone(),
+        create_missing_parents: false,
     };
-    let target = guarded_target(dir.as_os_str().as_bytes(), &guard)
-        .unwrap()
-        .as_rooted();
     let current = fs::symlink_metadata(&dir).unwrap();
     let meta = Meta {
         inode_metadata: None,
@@ -5137,7 +4966,6 @@ fn directory_metadata_reaches_only_a_directory() {
         relative: RelativePath::new(name.as_bytes()).unwrap(),
         label: dir.join(name),
         create_missing_parents: false,
-        query_partial_name_limit: false,
     };
     let meta = Meta {
         inode_metadata: None,
@@ -5190,7 +5018,6 @@ fn directory_identity_is_checked_only_where_inode_numbers_are_kept() {
         relative: RelativePath::new(name.as_bytes()).unwrap(),
         label: dir.join(name),
         create_missing_parents: false,
-        query_partial_name_limit: false,
     };
     let meta = Meta {
         inode_metadata: None,
@@ -5307,7 +5134,6 @@ fn source_workers_adopt_registered_descriptor_after_path_replacement() {
             paths: vec![selected.join("original").as_os_str().as_bytes().to_vec()],
             sources: Some(vec![original]),
             follow: false,
-            guard: None,
         });
         assert!(matches!(response, Response::Stats(stats) if stats[0].is_some()));
         let replacement = roots[0].selection.join(b"replacement").unwrap();
@@ -5315,7 +5141,6 @@ fn source_workers_adopt_registered_descriptor_after_path_replacement() {
             paths: vec![selected.join("replacement").as_os_str().as_bytes().to_vec()],
             sources: Some(vec![replacement]),
             follow: false,
-            guard: None,
         });
         assert!(matches!(response, Response::Stats(stats) if stats[0].is_none()));
     }
@@ -5366,7 +5191,6 @@ fn destination_worker_claims_copy_sources_from_the_foreign_session() {
     let response = worker.handle(&Request::FileHash {
         path: b"file".to_vec(),
         source: None,
-        guard: None,
     });
     assert!(
         matches!(response, Response::FileHash { size: 11, hash } if hash == content_digest(b"destination"))
@@ -5517,7 +5341,6 @@ fn independent_source_worker_keeps_exact_object_after_control_and_broker_close()
         paths: vec![selected.as_os_str().as_bytes().to_vec()],
         sources: Some(vec![roots[0].selection.clone()]),
         follow: false,
-        guard: None,
     });
     assert!(matches!(
         response,
@@ -5563,7 +5386,6 @@ fn repeated_source_registration_keeps_the_original_root_and_leaf_pin() {
         paths: vec![first.as_os_str().as_bytes().to_vec()],
         sources: Some(vec![roots[0].selection.clone()]),
         follow: false,
-        guard: None,
     });
     assert!(matches!(response, Response::Stats(stats) if stats[0].is_some()));
 }
@@ -5599,7 +5421,6 @@ fn source_stat_enforces_exact_leaf_authority_and_ignores_parallel_path() {
             .to_vec()],
         sources: Some(vec![roots[0].selection.clone()]),
         follow: false,
-        guard: None,
     });
     assert!(matches!(response, Response::Stats(stats) if stats[0].is_some()));
 
@@ -5613,7 +5434,6 @@ fn source_stat_enforces_exact_leaf_authority_and_ignores_parallel_path() {
             .to_vec()],
         sources: Some(vec![sibling]),
         follow: false,
-        guard: None,
     });
     assert!(
         matches!(response, Response::EndpointError(error) if error.message.contains("does not authorize"))
@@ -5623,7 +5443,6 @@ fn source_stat_enforces_exact_leaf_authority_and_ignores_parallel_path() {
         paths: vec![selected.as_os_str().as_bytes().to_vec()],
         sources: None,
         follow: false,
-        guard: None,
     });
     assert!(
         matches!(response, Response::EndpointError(error) if error.message.contains("omitted"))
@@ -5635,7 +5454,6 @@ fn source_stat_enforces_exact_leaf_authority_and_ignores_parallel_path() {
         paths: vec![selected.as_os_str().as_bytes().to_vec()],
         sources: Some(vec![roots[0].selection.clone()]),
         follow: false,
-        guard: None,
     });
     assert!(matches!(
         response,
@@ -5818,7 +5636,7 @@ fn metadata_chunk_pins_parent_and_new_request_resolves_replacement() {
     let mut ops = FsOps::new();
     ops.destination_root = Some(root);
     let paths = vec![b"parent/file".to_vec(), b"parent/link".to_vec()];
-    let entries = ops.stat_many(&paths, false, None);
+    let entries = ops.stat_many(&paths, false);
     assert_ne!(entries[0].as_ref().unwrap().ino, original.ino);
     assert_eq!(
         entries[1].as_ref().unwrap().link.as_deref(),
@@ -5826,10 +5644,7 @@ fn metadata_chunk_pins_parent_and_new_request_resolves_replacement() {
     );
     fs::remove_dir_all(base.join("parent")).unwrap();
     symlink("moved", base.join("parent")).unwrap();
-    assert!(ops
-        .stat_many(&paths, false, None)
-        .iter()
-        .all(Option::is_none));
+    assert!(ops.stat_many(&paths, false).iter().all(Option::is_none));
 }
 
 #[test]
@@ -5883,7 +5698,7 @@ fn metadata_chunks_keep_input_order_and_do_not_reuse_a_different_parent() {
             rooted_entry(&root, &relative, Vec::new(), metadata).ok()
         })
         .collect();
-    let actual = ops.stat_many(&paths, false, None);
+    let actual = ops.stat_many(&paths, false);
     assert_eq!(
         serde_json::to_value(actual).unwrap(),
         serde_json::to_value(expected).unwrap()
@@ -5968,7 +5783,7 @@ fn partial_path_batches_preserve_names_errors_and_order() {
             .iter()
             .map(|path| {
                 (|| -> Result<PathBytes> {
-                    let target = operations.rooted_destination_target(path, None)?.unwrap();
+                    let target = operations.rooted_destination_target(path)?.unwrap();
                     let (_, label) = rooted_partial_target(&target, &id)?;
                     let parent = Path::new(OsStr::from_bytes(path))
                         .parent()
@@ -5979,14 +5794,14 @@ fn partial_path_batches_preserve_names_errors_and_order() {
             })
             .collect();
         assert_eq!(
-            operations.partial_paths(&paths, &id, None),
+            operations.partial_paths(&paths, &id),
             expected,
             "batch size {count}"
         );
     }
     // After a namespace change, use the same resolution/fallback rules as
     // an individual query (a symlink can select the nearest real ancestor).
-    assert!(operations.partial_paths(&[b"parent/a".to_vec()], &id, None)[0].is_ok());
+    assert!(operations.partial_paths(&[b"parent/a".to_vec()], &id)[0].is_ok());
     fs::rename(
         temporary.path().join("parent"),
         temporary.path().join("moved"),
@@ -5994,14 +5809,14 @@ fn partial_path_batches_preserve_names_errors_and_order() {
     .unwrap();
     std::os::unix::fs::symlink("moved", temporary.path().join("parent")).unwrap();
     let target = operations
-        .rooted_destination_target(b"parent/a", None)
+        .rooted_destination_target(b"parent/a")
         .unwrap()
         .unwrap();
     let expected = rooted_partial_target(&target, &id)
         .map(|(_, label)| path_bytes(&Path::new("parent").join(label.file_name().unwrap())))
         .map_err(|error| format!("{error:#}"));
     assert_eq!(
-        operations.partial_paths(&[b"parent/a".to_vec()], &id, None),
+        operations.partial_paths(&[b"parent/a".to_vec()], &id),
         vec![expected]
     );
 }
@@ -6104,7 +5919,7 @@ fn short_destination_batches_run_in_parallel_only_on_a_network_filesystem() {
     let paths: Vec<PathBytes> = (0..40).map(|i| format!("a/f{i}").into_bytes()).collect();
     let mut ops = FsOps::test_destination(&dir);
     let minimum = |ops: &mut FsOps, count: usize| {
-        ops.destination_parallel_minimum(None, count, paths[..count].iter().map(Vec::as_slice))
+        ops.destination_parallel_minimum(count, paths[..count].iter().map(Vec::as_slice))
     };
     // A local destination keeps short lookups and changes on one thread.
     assert_eq!(minimum(&mut ops, 3), PAR_MIN);
@@ -6180,7 +5995,6 @@ fn source_stat_batches_preserve_order_across_sizes() {
             paths: vec![b"/display/path/is/not/authority".to_vec(); count],
             sources: Some(sources),
             follow: true,
-            guard: None,
         });
         let Response::Stats(entries) = response else {
             panic!("unexpected response: {response:?}");
@@ -6247,7 +6061,7 @@ fn source_stat_batches_isolate_roots_and_refresh_parents_between_requests() {
             })
             .collect();
         let actual = worker
-            .stat_many_request(&paths, Some(&sources), true, None)
+            .stat_many_request(&paths, Some(&sources), true)
             .unwrap();
         assert_eq!(actual.len(), expected.len());
         for (index, (actual, expected)) in actual.into_iter().zip(expected).enumerate() {
@@ -6264,7 +6078,7 @@ fn source_stat_batches_isolate_roots_and_refresh_parents_between_requests() {
     fs::create_dir(roots[0].join("parent")).unwrap();
     fs::write(roots[0].join("parent/file"), b"replacement").unwrap();
     let actual = worker
-        .stat_many_request(&paths, Some(&sources), false, None)
+        .stat_many_request(&paths, Some(&sources), false)
         .unwrap();
     assert!(actual
         .iter()
@@ -6272,7 +6086,7 @@ fn source_stat_batches_isolate_roots_and_refresh_parents_between_requests() {
     fs::remove_dir_all(roots[0].join("parent")).unwrap();
     symlink("moved", roots[0].join("parent")).unwrap();
     let actual = worker
-        .stat_many_request(&paths, Some(&sources), true, None)
+        .stat_many_request(&paths, Some(&sources), true)
         .unwrap();
     assert!(actual.iter().all(Option::is_none));
 }
@@ -6292,7 +6106,7 @@ fn source_stat_grouping_reports_the_first_error_in_request_order() {
     // failure must not mask the missing-file error requested first.
     let sources = vec![selections[1].clone(), selections[0].clone()];
     let error = worker
-        .stat_many_request(&vec![b"ignored".to_vec(); 2], Some(&sources), false, None)
+        .stat_many_request(&vec![b"ignored".to_vec(); 2], Some(&sources), false)
         .unwrap_err();
     assert_eq!(error.to_string(), "inspect registered source leaf");
     assert_eq!(
@@ -6311,7 +6125,6 @@ fn source_stat_batches_report_missing_sources_and_accept_restored_files() {
         paths: vec![b"ignored".to_vec(); 64],
         sources: Some(vec![selections[0].clone(); 64]),
         follow: false,
-        guard: None,
     };
     let response = worker.handle(&request);
     assert!(
@@ -6366,7 +6179,6 @@ fn source_stat_does_not_follow_intermediate_symlinks() {
         paths: vec![selected.join("link/secret").as_os_str().as_bytes().to_vec()],
         sources: Some(vec![secret]),
         follow: true,
-        guard: None,
     });
     assert!(matches!(response, Response::Stats(stats) if stats.len() == 1 && stats[0].is_none()));
 }
@@ -6428,7 +6240,6 @@ fn source_content_uses_registered_directory_after_name_replacement() {
         block: MIN_HASH_BLOCK_BYTES,
         len: 8,
         attempt: 0,
-        guard: None,
     });
     assert!(
         matches!(response, Response::Hashes(hashes) if hashes == vec![content_digest(b"original")])
@@ -6437,7 +6248,6 @@ fn source_content_uses_registered_directory_after_name_replacement() {
     let response = worker.handle(&Request::FileHash {
         path: parallel_marker,
         source: Some(marker),
-        guard: None,
     });
     assert!(
         matches!(response, Response::FileHash { size: 8, hash } if hash == content_digest(b"original"))
@@ -6470,7 +6280,6 @@ fn registered_source_hash_rejects_short_prefixes_but_accepts_eof_tails() {
         block,
         len,
         attempt: 0,
-        guard: None,
     };
     for (off, len) in [(0, 1), (0, block + 1), (block, 1)] {
         let response = worker.handle(&request(off, len));
@@ -6534,12 +6343,10 @@ fn source_content_rejects_a_replaced_exact_leaf() {
             block: MIN_HASH_BLOCK_BYTES,
             len: 8,
             attempt: 0,
-            guard: None,
         }),
         worker.handle(&Request::FileHash {
             path: selected.as_os_str().as_bytes().to_vec(),
             source: Some(selections[0].clone()),
-            guard: None,
         }),
     ] {
         assert!(
@@ -6587,12 +6394,10 @@ fn source_content_refuses_symlink_intermediates() {
             block: MIN_HASH_BLOCK_BYTES,
             len: 6,
             attempt: 0,
-            guard: None,
         }),
         worker.handle(&Request::FileHash {
             path: label.clone(),
             source: Some(secret.clone()),
-            guard: None,
         }),
     ] {
         assert!(matches!(response, Response::EndpointError(_)));
@@ -6684,12 +6489,10 @@ fn confined_source_content_requires_exact_registered_references() {
             block: MIN_HASH_BLOCK_BYTES,
             len: 8,
             attempt: 0,
-            guard: None,
         }),
         worker.handle(&Request::FileHash {
             path: selected.as_os_str().as_bytes().to_vec(),
             source: None,
-            guard: None,
         }),
     ] {
         assert!(
@@ -6715,7 +6518,6 @@ fn confined_source_content_requires_exact_registered_references() {
         block: MIN_HASH_BLOCK_BYTES,
         len: 8,
         attempt: 0,
-        guard: None,
     });
     assert!(
         matches!(response, Response::EndpointError(error) if error.message.contains("only valid for the final source"))
@@ -6748,7 +6550,6 @@ fn unconfined_source_content_uses_only_the_explicit_legacy_path() {
         block: MIN_HASH_BLOCK_BYTES,
         len: 8,
         attempt: 0,
-        guard: None,
     });
     assert!(
         matches!(response, Response::Hashes(hashes) if hashes == vec![content_digest(b"legacy!!")])
@@ -6756,7 +6557,6 @@ fn unconfined_source_content_uses_only_the_explicit_legacy_path() {
     let response = worker.handle(&Request::FileHash {
         path: sibling.as_os_str().as_bytes().to_vec(),
         source: None,
-        guard: None,
     });
     assert!(
         matches!(response, Response::FileHash { size: 8, hash } if hash == content_digest(b"legacy!!"))
@@ -6823,7 +6623,6 @@ fn source_legacy_stat_requires_explicit_unconfined_registration() {
         paths: vec![sibling.as_os_str().as_bytes().to_vec()],
         sources: None,
         follow: false,
-        guard: None,
     });
     assert!(matches!(response, Response::Stats(stats) if stats.len() == 1 && stats[0].is_some()));
 }
@@ -7043,7 +6842,6 @@ fn registered_fifo_keeps_identity_checks_without_connecting_a_writer() {
         paths: vec![b"ignored".to_vec()],
         sources: Some(vec![roots[0].selection.clone()]),
         follow: false,
-        guard: None,
     });
     assert!(
         matches!(response, Response::EndpointError(_)),
@@ -7101,30 +6899,27 @@ fn reused_parent_errors_keep_paths_and_os_error_codes() {
     let tree = crate::test_support::tempdir().unwrap();
     let mut ops = destination_ops(tree.path());
     let long_name = vec![b'd'; 256];
-    let errors = ops.apply(
-        &[
-            Op::Mkdir {
-                path: long_name.clone(),
+    let errors = ops.apply(&[
+        Op::Mkdir {
+            path: long_name.clone(),
+            mode: 0o755,
+            condition: TargetCondition::Any,
+        },
+        Op::SetMeta {
+            path: b"missing-metadata-target".to_vec(),
+            meta: Meta {
+                inode_metadata: None,
                 mode: 0o755,
-                condition: TargetCondition::Any,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
             },
-            Op::SetMeta {
-                path: b"missing-metadata-target".to_vec(),
-                meta: Meta {
-                    inode_metadata: None,
-                    mode: 0o755,
-                    uid: 0,
-                    gid: 0,
-                    mtime: 0,
-                    mtime_nsec: 0,
-                },
-                flags: flags::TIMES,
-                condition: TargetCondition::Any,
-                directory: false,
-            },
-        ],
-        None,
-    );
+            flags: flags::TIMES,
+            condition: TargetCondition::Any,
+            directory: false,
+        },
+    ]);
     for (error, (path, code)) in errors.iter().zip([
         (&long_name[..], libc::ENAMETOOLONG),
         (&b"missing-metadata-target"[..], libc::ENOENT),
@@ -7163,7 +6958,6 @@ fn sparse_identity_conditioned_publication_keeps_holes_and_replaces_inode() {
             PartialTarget {
                 path: b"target",
                 id: &copy_id,
-                guard: None,
             },
             PrepareOptions {
                 size: data.len() as u64,
@@ -7181,7 +6975,6 @@ fn sparse_identity_conditioned_publication_keeps_holes_and_replaces_inode() {
             PartialTarget {
                 path: b"target",
                 id: &copy_id,
-                guard: None,
             },
             false,
             0,
@@ -7204,12 +6997,9 @@ fn sparse_identity_conditioned_publication_keeps_holes_and_replaces_inode() {
                 mtime_nsec: 0,
             },
             0,
-            TargetMutation {
-                condition: TargetCondition::Matches {
-                    dev: before.dev(),
-                    ino: before.ino(),
-                },
-                guard: None,
+            TargetCondition::Matches {
+                dev: before.dev(),
+                ino: before.ino(),
             },
         )
         .unwrap();
@@ -7288,7 +7078,6 @@ fn inplace_prepare_rejects_replaced_hashed_basis_before_mutation() {
             MIN_HASH_BLOCK_BYTES,
             14,
             TargetCondition::Any,
-            None,
         )
         .unwrap();
         fs::rename(root.join("file"), root.join("original")).unwrap();
@@ -7301,7 +7090,6 @@ fn inplace_prepare_rejects_replaced_hashed_basis_before_mutation() {
             PartialTarget {
                 path: b"file",
                 id: &copy_id,
-                guard: None,
             },
             PrepareOptions {
                 size: 0,
@@ -7343,7 +7131,6 @@ fn strict_plan_batch_distinguishes_missing_entries_from_read_errors() {
         copy_id: [7; 16],
         directories: Vec::new(),
         others: vec![b"missing/child".to_vec(), b"sub/file".to_vec()],
-        guard: None,
         strict_metadata: true,
     };
     let Response::BatchPlan {
@@ -7376,7 +7163,6 @@ fn partial_seeding_does_not_fall_back_to_final_when_disallowed() {
             PartialTarget {
                 path: b"file",
                 id: &copy_id,
-                guard: None,
             },
             11,
             64 << 10,
@@ -7413,7 +7199,6 @@ fn comparison_window_reads_staged_bytes_after_donor_changes() {
             block: MIN_HASH_BLOCK_BYTES,
             allow_final: false,
             attempt: 0,
-            guard: None,
         }),
         Response::BasisStaged { .. }
     ));
@@ -7426,7 +7211,6 @@ fn comparison_window_reads_staged_bytes_after_donor_changes() {
         len: MIN_HASH_BLOCK_BYTES as u32 + 7,
         block: MIN_HASH_BLOCK_BYTES,
         attempt: 0,
-        guard: None,
     });
     let Response::Hashes(hashes) = reply else {
         panic!("{reply:?}");
@@ -7449,7 +7233,6 @@ fn comparison_window_reads_staged_bytes_after_donor_changes() {
         len: 13,
         block: 8,
         attempt: 0,
-        guard: None,
     });
     assert!(
         matches!(reply, Response::Hashes(h) if h == vec![ops.hash_policy.algorithm.hash(&[17; 8]), ops.hash_policy.algorithm.hash(&[17; 5])])
@@ -7470,7 +7253,6 @@ fn comparison_window_reads_staged_bytes_after_donor_changes() {
                 len,
                 block,
                 attempt: 0,
-                guard: None,
             }),
             Response::EndpointError(_)
         ));
@@ -7561,7 +7343,6 @@ fn pipeline_requests_keep_endpoint_authority() {
         block: MIN_HASH_BLOCK_BYTES,
         allow_final: true,
         attempt: 0,
-        guard: None,
     };
     assert!(!stage.allowed_on_source_worker());
     assert!(matches!(FsOps::new().handle(&stage), Response::Err(_)));
@@ -7582,7 +7363,6 @@ fn retained_comparison_bytes_survive_donor_mutation_and_reject_replay() {
         block: MIN_HASH_BLOCK_BYTES,
         allow_final: false,
         attempt: 2,
-        guard: None,
     });
     assert!(matches!(
         stage,
@@ -7598,7 +7378,6 @@ fn retained_comparison_bytes_survive_donor_mutation_and_reject_replay() {
         len: 9,
         block: 9,
         attempt: 2,
-        guard: None,
     });
     assert!(
         matches!(hash, Response::Hashes(h) if h == vec![ops.hash_policy.algorithm.hash(b"old bytes")])
@@ -7610,7 +7389,6 @@ fn retained_comparison_bytes_survive_donor_mutation_and_reject_replay() {
         attempt,
         off,
         len,
-        guard: None,
     };
     for request in [
         reuse([98; 16], 2, 0, 9),
@@ -7645,7 +7423,6 @@ fn prefetched_comparison_window_keeps_current_bytes() {
             block: MIN_HASH_BLOCK_BYTES,
             allow_final: false,
             attempt: 2,
-            guard: None,
         }),
         Response::BasisStaged {
             compare_final: false
@@ -7660,7 +7437,6 @@ fn prefetched_comparison_window_keeps_current_bytes() {
             len: bytes.len() as u32,
             block: bytes.len() as u64,
             attempt: 2,
-            guard: None,
         });
         assert!(
             matches!(response, Response::Hashes(h) if h == vec![ops.hash_policy.algorithm.hash(bytes)])
@@ -7675,7 +7451,6 @@ fn prefetched_comparison_window_keeps_current_bytes() {
                 attempt: 2,
                 off,
                 len,
-                guard: None,
             }),
             Response::Ok
         ));
@@ -7701,7 +7476,6 @@ fn equality_windows_keep_the_same_destination_inode() {
         block,
         len: block,
         condition: TargetCondition::Any,
-        guard: None,
         update: None,
     };
     let first = ops.handle(&request(0));
@@ -7840,7 +7614,6 @@ fn comparison_workers_release_donor_descriptors_before_publication() {
             block: MIN_HASH_BLOCK_BYTES,
             allow_final: false,
             attempt: 0,
-            guard: None,
         }),
         Response::BasisStaged { .. }
     ));
@@ -7856,7 +7629,6 @@ fn comparison_workers_release_donor_descriptors_before_publication() {
                 len: 4,
                 block: 4,
                 attempt: 0,
-                guard: None,
             }),
             Response::Hashes(_)
         ));
@@ -7867,7 +7639,6 @@ fn comparison_workers_release_donor_descriptors_before_publication() {
                 attempt: 0,
                 off,
                 len: 4,
-                guard: None,
             }
         } else {
             Request::WriteRange {
@@ -7878,7 +7649,6 @@ fn comparison_workers_release_donor_descriptors_before_publication() {
                 off,
                 hash: ops.hash_policy.payload_algorithm().hash(b"WXYZ"),
                 data: b"WXYZ".to_vec().into(),
-                guard: None,
             }
         };
         assert!(matches!(ops.handle(&request), Response::Ok));
@@ -7910,7 +7680,6 @@ fn unconsumed_comparison_windows_do_not_pin_deleted_donors_after_failure() {
                 block: 4,
                 attempt: 0,
                 final_basis: true,
-                guard: None,
             }),
             Response::Hashes(_)
         ));
@@ -7923,7 +7692,6 @@ fn unconsumed_comparison_windows_do_not_pin_deleted_donors_after_failure() {
             attempt: 0,
             off: 999,
             len: 4,
-            guard: None,
         }),
         Response::Ok
     ));
@@ -7951,7 +7719,6 @@ fn staged_basis_uses_apfs_clone_and_keeps_an_independent_snapshot() {
             block: MIN_HASH_BLOCK_BYTES,
             allow_final: true,
             attempt: 0,
-            guard: None,
         });
         // With a final donor, false proves that cloning created the sidecar;
         // falling back to buffered comparison returns compare_final=true.
@@ -8027,7 +7794,6 @@ fn late_close_is_reported_before_identity_conditioned_publication() {
                 flags: flags::TIMES,
                 inplace: false,
                 condition,
-                guard: None,
                 replaces: true,
                 scanned: crate::proto::ScannedDestination::Unknown,
             })
@@ -8036,7 +7802,6 @@ fn late_close_is_reported_before_identity_conditioned_publication() {
             let partial = PartialTarget {
                 path: b"target",
                 id: &copy_id,
-                guard: None,
             };
             ops.prepare(
                 partial,
@@ -8055,7 +7820,6 @@ fn late_close_is_reported_before_identity_conditioned_publication() {
                 PartialTarget {
                     path: b"target",
                     id: &copy_id,
-                    guard: None,
                 },
                 false,
                 0,
@@ -8068,18 +7832,8 @@ fn late_close_is_reported_before_identity_conditioned_publication() {
             // cache eviction or when another worker finishes the file.
             ops.fds.clear();
             ops.fd_order.clear();
-            ops.finalize(
-                b"target",
-                false,
-                &copy_id,
-                &meta,
-                flags::TIMES,
-                TargetMutation {
-                    condition,
-                    guard: None,
-                },
-            )
-            .unwrap_err()
+            ops.finalize(b"target", false, &copy_id, &meta, flags::TIMES, condition)
+                .unwrap_err()
         };
         assert!(
             error.to_string().contains("check destination writes"),
@@ -8204,14 +7958,11 @@ fn temporary_directory_access_is_explicit_and_reports_only_changes() {
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
     let mut operations = destination_ops(temporary.path());
     assert!(operations
-        .apply(
-            &[Op::Mkdir {
-                path: b"owned".to_vec(),
-                mode: 0o777,
-                condition: TargetCondition::Any
-            }],
-            None
-        )
+        .apply(&[Op::Mkdir {
+            path: b"owned".to_vec(),
+            mode: 0o777,
+            condition: TargetCondition::Any
+        }])
         .iter()
         .all(Option::is_none));
     assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o500);
@@ -8226,7 +7977,6 @@ fn temporary_directory_access_is_explicit_and_reports_only_changes() {
                 ino: metadata.ino(),
             },
         )],
-        guard: None,
     };
     let Response::WidenedDirectories(results) = operations.handle(&request) else {
         panic!("unexpected response")
@@ -8272,7 +8022,6 @@ fn temporary_directory_access_rejects_unrooted_and_stale_requests() {
                 ino: metadata.ino() + 1,
             },
         )],
-        guard: None,
     };
     assert!(matches!(FsOps::new().handle(&request), Response::Err(_)));
     let Response::WidenedDirectories(results) = destination_ops(temporary.path()).handle(&request)
@@ -8340,22 +8089,15 @@ fn an_in_place_retry_gives_a_file_the_scan_found_absent_a_new_files_mode() {
     let target = dir.path().join("file");
     fs::write(&target, b"par").unwrap();
     fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
-    let target_bytes = target.as_os_str().as_bytes();
-    let identity = Root::open(dir.path()).unwrap().identity();
-    let guard = ContainerGuard {
-        root: dir.path().as_os_str().as_bytes().to_vec(),
-        dev: identity.dev,
-        ino: identity.ino,
-    };
+    let target_bytes = b"file".as_slice();
     let copy_id = [9; 16];
-    let mut operations = FsOps::new();
+    let mut operations = FsOps::test_restricted(dir.path());
     let source_mode = 0o100444;
     operations
         .prepare(
             PartialTarget {
                 path: target_bytes,
                 id: &copy_id,
-                guard: Some(&guard),
             },
             PrepareOptions {
                 size: 3,
@@ -8373,7 +8115,6 @@ fn an_in_place_retry_gives_a_file_the_scan_found_absent_a_new_files_mode() {
             PartialTarget {
                 path: target_bytes,
                 id: &copy_id,
-                guard: Some(&guard),
             },
             true,
             1,
@@ -8398,10 +8139,7 @@ fn an_in_place_retry_gives_a_file_the_scan_found_absent_a_new_files_mode() {
             },
             flags::RECEIVER_MODE,
             ScannedDestination::Absent,
-            TargetMutation {
-                condition: TargetCondition::Any,
-                guard: Some(&guard),
-            },
+            TargetCondition::Any,
         )
         .unwrap();
     assert_eq!(fs::read(&target).unwrap(), b"new");
@@ -8668,7 +8406,6 @@ fn removed_widened_directories_are_forgotten() {
                 ino: metadata.ino(),
             },
         )],
-        guard: None,
     }) else {
         panic!("unexpected response")
     };
@@ -8678,7 +8415,6 @@ fn removed_widened_directories_are_forgotten() {
         ops: vec![Op::Rmdir {
             path: path_bytes(&dir),
         }],
-        guard: None,
     });
     assert!(
         matches!(&removed, Response::Applied(errors) if errors.iter().all(Option::is_none)),
@@ -8700,7 +8436,6 @@ fn a_retry_reads_a_held_stage_whose_finalize_removed_read_permission() {
     let target = || PartialTarget {
         path: b"file",
         id: &id,
-        guard: None,
     };
     ops.prepare(
         target(),
@@ -8735,10 +8470,7 @@ fn a_retry_reads_a_held_stage_whose_finalize_removed_read_permission() {
             &id,
             &meta,
             flags::MODE,
-            TargetMutation {
-                condition: TargetCondition::Any,
-                guard: None
-            }
+            TargetCondition::Any
         )
         .is_err());
     fs::remove_dir(temporary.path().join("file")).unwrap();
@@ -8764,7 +8496,6 @@ fn finalizing_again_after_a_failed_finalize_publishes_the_held_stage() {
     let target = || PartialTarget {
         path: b"file",
         id: &id,
-        guard: None,
     };
     ops.prepare(
         target(),
@@ -8796,10 +8527,7 @@ fn finalizing_again_after_a_failed_finalize_publishes_the_held_stage() {
             &id,
             &meta,
             flags::MODE,
-            TargetMutation {
-                condition: TargetCondition::Any,
-                guard: None,
-            },
+            TargetCondition::Any,
         )
     };
     fs::create_dir(temporary.path().join("file")).unwrap();
@@ -8815,11 +8543,7 @@ fn finalizing_again_after_a_failed_finalize_publishes_the_held_stage() {
 /// Prepare `file` in place in `ops` for attempt `attempt`, `size` bytes.
 fn prepare_inplace(ops: &mut FsOps, id: &CopyId, attempt: u32, size: u64) -> Result<Preparation> {
     ops.prepare(
-        PartialTarget {
-            path: b"file",
-            id,
-            guard: None,
-        },
+        PartialTarget { path: b"file", id },
         PrepareOptions {
             size,
             inplace: true,
@@ -8851,7 +8575,6 @@ fn an_inplace_retry_writes_the_file_it_holds_without_opening_the_name() {
     let target = PartialTarget {
         path: b"file",
         id: &id,
-        guard: None,
     };
     other
         .write_range(target, true, 1, 0, content_digest(b"new"), b"new")
@@ -8886,10 +8609,7 @@ fn a_new_inplace_file_swapped_out_between_attempts_fails_the_file() {
             &id,
             &meta,
             flags::MODE,
-            TargetMutation {
-                condition: TargetCondition::Absent,
-                guard: None,
-            },
+            TargetCondition::Absent,
         )
         .is_err());
     for attempt in [1, 2] {
@@ -8924,7 +8644,6 @@ fn an_existing_file_under_an_inplace_request_is_never_written() {
             PartialTarget {
                 path: b"file",
                 id: &id,
-                guard: None,
             },
             true,
             1,
@@ -8948,10 +8667,7 @@ fn an_existing_file_under_an_inplace_request_is_never_written() {
                 mtime_nsec: 0,
             },
             flags::MODE,
-            TargetMutation {
-                condition: TargetCondition::Any,
-                guard: None,
-            },
+            TargetCondition::Any,
         )
         .unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"new");
@@ -8979,7 +8695,6 @@ fn finalizing_a_new_inplace_file_checks_that_its_name_still_leads_to_it() {
         PartialTarget {
             path: b"file",
             id: &id,
-            guard: None,
         },
         true,
         0,
@@ -9005,10 +8720,7 @@ fn finalizing_a_new_inplace_file_checks_that_its_name_still_leads_to_it() {
                 mtime_nsec: 0,
             },
             flags::MODE | flags::TIMES,
-            TargetMutation {
-                condition: TargetCondition::Any,
-                guard: None,
-            },
+            TargetCondition::Any,
         )
         .unwrap_err();
     assert!(
@@ -9067,7 +8779,6 @@ fn a_directorys_identity_is_judged_by_its_own_filesystem() {
             relative: RelativePath::new(&[&below[..], b"/directory"].concat()).unwrap(),
             label: path.clone(),
             create_missing_parents: false,
-            query_partial_name_limit: false,
         };
         let meta = Meta {
             inode_metadata: None,
@@ -9118,7 +8829,6 @@ fn a_stage_is_opened_without_exclusive_creation_only_on_a_trusted_filesystem() {
                 PartialTarget {
                     path: &path(name),
                     id: &id,
-                    guard: None,
                 },
                 PrepareOptions {
                     size: 8,
@@ -9143,5 +8853,263 @@ fn a_stage_is_opened_without_exclusive_creation_only_on_a_trusted_filesystem() {
         prepare(&mut ops, &name);
         let used = fs::metadata(&stage).unwrap().ino() == planted;
         assert_eq!(used, directory_trusted);
+    }
+}
+
+/// What a copy writes is bounded by the size it declared for the file, on
+/// every receiver: a write that would go past it fails and writes nothing,
+/// staged or in place, and a write within it lands.
+#[test]
+fn writes_past_the_size_declared_for_a_file_are_refused() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let mut ops = FsOps::test_destination(dir.path());
+    for (name, inplace) in [("staged", false), ("in-place", true)] {
+        let path = dir.path().join(name).as_os_str().as_bytes().to_vec();
+        let prepared = ops.handle(&Request::Prepare {
+            path: path.clone(),
+            size: 4,
+            inplace,
+            copy_id: [5; 16],
+            mode: 0o644,
+            flags: 0,
+            acl: false,
+            scanned: ScannedDestination::Absent,
+            attempt: 0,
+            create_if_missing: true,
+            group: None,
+            update: None,
+        });
+        assert!(matches!(prepared, Response::Prepared(_)), "{prepared:?}");
+        let write = |off: u64, data: &[u8]| Request::WriteRange {
+            path: path.clone(),
+            inplace,
+            copy_id: [5; 16],
+            attempt: 0,
+            off,
+            hash: content_digest(data),
+            data: data.to_vec().into(),
+        };
+        let past = ops.handle(&write(2, b"long"));
+        assert!(
+            matches!(&past, Response::EndpointError(error)
+                if error.as_str().contains("extends past the size declared")),
+            "{name}: {past:?}"
+        );
+        assert!(matches!(ops.handle(&write(0, b"four")), Response::Ok));
+        let finalized = ops.handle(&Request::Finalize {
+            expected_hash: None,
+            path: path.clone(),
+            inplace,
+            copy_id: [5; 16],
+            meta: Meta {
+                inode_metadata: None,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags: 0,
+            scanned: ScannedDestination::Absent,
+            condition: TargetCondition::Any,
+        });
+        assert!(
+            !matches!(finalized, Response::Err(_) | Response::EndpointError(_)),
+            "{name}: {finalized:?}"
+        );
+        assert_eq!(fs::read(dir.path().join(name)).unwrap(), b"four", "{name}");
+    }
+}
+
+/// A copy that keeps existing files and copies hard links gives a new name
+/// only to a file it created, on an ordinary receiver as on a restricted
+/// one: every connection of the copy shares what it created.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_keeping_copy_links_new_names_only_to_files_it_created() {
+    let dir = crate::test_support::tempdir().unwrap();
+    fs::write(dir.path().join("existing"), b"not ours").unwrap();
+    let path = |name: &str| dir.path().join(name).as_os_str().as_bytes().to_vec();
+    let configure = Request::ConfigurePreservation {
+        selection: Default::default(),
+        sparse: false,
+        destination: true,
+        narrow_new_directories: false,
+        own_links: true,
+    };
+    let mut publisher = FsOps::test_destination(dir.path());
+    publisher.set_stage_scope(crate::fsops::new_stage_scope());
+    let mut linker = FsOps::test_destination(dir.path());
+    linker.set_stage_scope(publisher.stage_scope());
+    for ops in [&mut publisher, &mut linker] {
+        assert!(matches!(ops.handle(&configure), Response::Ok));
+    }
+    let published = publisher.handle(&Request::PutSmallBatch(vec![SmallPut {
+        path: path("ours"),
+        copy_id: [6; 16],
+        data: b"ours".to_vec(),
+        hash: content_digest(b"ours"),
+        meta: Meta {
+            inode_metadata: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+        },
+        flags: 0,
+        inplace: false,
+        condition: TargetCondition::Absent,
+        replaces: false,
+        scanned: ScannedDestination::Absent,
+    }]));
+    assert!(
+        matches!(&published, Response::Applied(errors) if errors.iter().all(Option::is_none))
+            || matches!(&published, Response::PublishedBatch(results) if results.iter().all(Result::is_ok)),
+        "{published:?}"
+    );
+    let link = |source: &str, name: &str| {
+        let metadata = fs::metadata(dir.path().join(source)).unwrap();
+        Request::Apply {
+            ops: vec![Op::Hardlink {
+                path: path(name),
+                source: path(source),
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                condition: TargetCondition::Absent,
+            }],
+        }
+    };
+    let Response::Applied(errors) = linker.handle(&link("existing", "existing-link")) else {
+        panic!("expected an Apply response")
+    };
+    assert!(errors[0].is_some());
+    assert!(!dir.path().join("existing-link").exists());
+    let Response::Applied(errors) = linker.handle(&link("ours", "ours-link")) else {
+        panic!("expected an Apply response")
+    };
+    assert!(errors[0].is_none(), "{errors:?}");
+    crate::fsops::release_stages(publisher.stage_scope());
+}
+
+/// Where inode numbers cannot show which file a link names, an ordinary
+/// receiver links new names as a copy without the check does, and a
+/// restricted receiver, held to its grant, refuses them.
+#[cfg(target_os = "linux")]
+#[test]
+fn own_file_links_on_filesystems_without_trusted_numbers() {
+    let dir = crate::test_support::tempdir().unwrap();
+    fs::write(dir.path().join("existing"), b"not ours").unwrap();
+    let path = |name: &str| dir.path().join(name).as_os_str().as_bytes().to_vec();
+    let metadata = fs::metadata(dir.path().join("existing")).unwrap();
+    let link = |name: &str| Request::Apply {
+        ops: vec![Op::Hardlink {
+            path: path(name),
+            source: path("existing"),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            condition: TargetCondition::Absent,
+        }],
+    };
+    let untrusted = |ops: &FsOps| {
+        let root = ops.destination_root.as_ref().unwrap();
+        let mut profile = root.profile();
+        profile.link_counts_trusted = false;
+        root.assume_profile_for_test(profile);
+    };
+    // Ordinary: the copy keeps existing files and copies hard links.
+    let mut ordinary = FsOps::test_destination(dir.path());
+    ordinary.set_stage_scope(crate::fsops::new_stage_scope());
+    assert!(matches!(
+        ordinary.handle(&Request::ConfigurePreservation {
+            selection: Default::default(),
+            sparse: false,
+            destination: true,
+            narrow_new_directories: false,
+            own_links: true,
+        }),
+        Response::Ok
+    ));
+    untrusted(&ordinary);
+    let Response::Applied(errors) = ordinary.handle(&link("ordinary-link")) else {
+        panic!("expected an Apply response")
+    };
+    assert!(errors[0].is_none(), "{errors:?}");
+    assert!(dir.path().join("ordinary-link").exists());
+    crate::fsops::release_stages(ordinary.stage_scope());
+    // Restricted: its authority's record of the files it created.
+    let mut restricted = FsOps::test_destination(dir.path());
+    restricted.set_owned_objects(Some(Default::default()));
+    untrusted(&restricted);
+    let Response::Applied(errors) = restricted.handle(&link("restricted-link")) else {
+        panic!("expected an Apply response")
+    };
+    assert!(errors[0].is_some());
+    assert!(!dir.path().join("restricted-link").exists());
+}
+
+/// Where inode numbers cannot show which file a name leads to, a
+/// publication held to the file the copy found (`--only-existing`) checks
+/// only that a file is there: it replaces one whatever its number, and
+/// still creates nothing where none is.
+#[cfg(target_os = "linux")]
+#[test]
+fn matched_publications_check_existence_only_where_numbers_mislead() {
+    for trusted in [true, false] {
+        let dir = crate::test_support::tempdir().unwrap();
+        fs::write(dir.path().join("there"), b"old").unwrap();
+        let path = |name: &str| dir.path().join(name).as_os_str().as_bytes().to_vec();
+        let mut ops = FsOps::test_destination(dir.path());
+        if !trusted {
+            let root = ops.destination_root.as_ref().unwrap();
+            let mut profile = root.profile();
+            profile.link_counts_trusted = false;
+            root.assume_profile_for_test(profile);
+        }
+        let put = |name: &str| {
+            Request::PutSmallBatch(vec![SmallPut {
+                path: path(name),
+                copy_id: [9; 16],
+                data: b"new".to_vec(),
+                hash: content_digest(b"new"),
+                meta: Meta {
+                    inode_metadata: None,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                    mtime_nsec: 0,
+                },
+                flags: 0,
+                inplace: false,
+                // A number the file there does not have.
+                condition: TargetCondition::Matches { dev: 1, ino: 1 },
+                replaces: true,
+                scanned: ScannedDestination::Unknown,
+            }])
+        };
+        let failure = |response: &Response| -> Option<WireError> {
+            match response {
+                Response::Applied(errors) => errors[0].clone(),
+                Response::PublishedBatch(results) => results[0].clone().err(),
+                other => panic!("unexpected response {other:?}"),
+            }
+        };
+        let replaced = failure(&ops.handle(&put("there")));
+        assert_eq!(
+            replaced.is_none(),
+            !trusted,
+            "trusted: {trusted}: {replaced:?}"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("there")).unwrap(),
+            if trusted { &b"old"[..] } else { &b"new"[..] }
+        );
+        if let Some(error) = replaced {
+            assert!(error.condition_not_met, "{error:?}");
+        }
+        let gone = failure(&ops.handle(&put("gone"))).expect("nothing to replace");
+        assert!(gone.condition_not_met, "trusted: {trusted}: {gone:?}");
+        assert!(!dir.path().join("gone").exists());
     }
 }

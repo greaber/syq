@@ -127,7 +127,7 @@ impl Server {
         retries: u32,
         explicit: bool,
     ) -> Command {
-        let retry_option = format!("s3-retries={retries}");
+        let retries = retries.to_string();
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         if mode == "rm" {
             command.args([
@@ -143,8 +143,8 @@ impl Server {
                 "cp",
                 "--s3-region",
                 "us-east-1",
-                "--performance-tuning",
-                &retry_option,
+                "--s3-retries",
+                &retries,
                 "--s3-header",
                 "X-Tigris-Consistent: true",
                 "--no-progress",

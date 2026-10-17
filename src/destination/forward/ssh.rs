@@ -818,7 +818,6 @@ mod tests {
                 paths: vec![root.path().join("outside").as_os_str().as_bytes().to_vec()],
                 sources: None,
                 follow: false,
-                guard: None,
             })
             .unwrap();
         assert!(matches!(

@@ -360,8 +360,14 @@ and the [overwrite policies](reference.md#choose-which-existing-files-to-update)
 Copies are refused while syq runs as root, so ownership and special files work
 as for any copy by an ordinary account.
 Timestamp comparisons trust the source's reported modification times.
+Named copies do not follow a destination symlink: one into a link fails, even
+with `--follow-dst`; name the directory the link points to instead.
 
-Each copy is limited to 100 GiB and one million touched entries by default.
+Each copy is limited to 100 GiB and one million entries by default. Entries
+count the changes the copy makes on the laptop: each file it writes, each
+directory, link or special file it creates, each metadata change and each
+deletion; looking at what is already there does not count, and neither does a
+change that fails.
 Change these ceilings with `syq persist receive on --max-bytes 20G --max-entries 100000`.
 Lower limits requested by the sender also apply. Limits are per copy; repeated
 copies can fill the disk. Copies support at most 128 workers each.

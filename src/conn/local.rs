@@ -276,7 +276,7 @@ impl Conn for LocalConn {
     ) -> Result<u64> {
         let mut capture = |mut batch: Vec<Entry>| {
             self.ops
-                .capture_scan_metadata(root, source, follow_root, None, &mut batch)?;
+                .capture_scan_metadata(root, source, follow_root, &mut batch)?;
             sink(batch)
         };
         if let Some(source) = self.ops.source_scan_root(source)? {

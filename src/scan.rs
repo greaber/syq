@@ -6,9 +6,8 @@ use crate::fsops::{
 };
 #[cfg(test)]
 use crate::process::CommandExt as _;
-use crate::proto::ContainerGuard;
 use crate::proto::{Entry, PathBytes, ScanWarning, SourceLeafIdentity};
-use crate::rooted::{RelativePath, Root, RootIdentity, RootMetadata};
+use crate::rooted::{RelativePath, Root, RootMetadata};
 use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use jwalk::WalkDirGeneric;
@@ -792,135 +791,6 @@ pub(crate) fn scan_descriptor_selected(
     Ok(())
 }
 
-/// Descriptor-relative receiver walk used for signed grants. The enrolled root
-/// is reopened by identity and no descendant symlink is followed.
-#[allow(clippy::too_many_arguments)]
-pub fn scan_rooted(
-    requested_root: &[u8],
-    follow_root: bool,
-    ignore: &[String],
-    report_ignored: bool,
-    guard: &ContainerGuard,
-    sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
-    ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-    warn: &mut dyn FnMut(ScanWarning),
-) -> Result<u64> {
-    if follow_root {
-        anyhow::bail!("a signed receiver never follows a destination root symlink");
-    }
-    let root_path = crate::fsops::resolve(&guard.root);
-    let target = crate::fsops::resolve(requested_root);
-    let target_relative = target.strip_prefix(&root_path).with_context(|| {
-        format!(
-            "scan destination {} is outside enrolled root {}",
-            target.display(),
-            root_path.display()
-        )
-    })?;
-    let target_relative = RelativePath::new(target_relative.as_os_str().as_bytes())?;
-    let root = Root::open_verified(
-        &root_path,
-        RootIdentity {
-            dev: guard.dev,
-            ino: guard.ino,
-        },
-    )?;
-    let metadata = root.metadata(&target_relative)?;
-    let root_entry = crate::fsops::rooted_entry(&root, &target_relative, Vec::new(), metadata)?;
-    if root_entry.kind != crate::proto::Kind::Dir {
-        sink(vec![root_entry])?;
-        return Ok(0);
-    }
-
-    let matcher = build_ignore(ignore)?;
-    let mut ignored_count = 0;
-    let mut batch = vec![root_entry];
-    let mut ignored_batch = Vec::new();
-    let mut directories: Vec<PathBytes> = vec![Vec::new()];
-    while let Some(relative_to_scan) = directories.pop() {
-        let full_relative = crate::fsops::join(
-            target_relative_path_bytes(&target, &root_path)?.as_slice(),
-            &relative_to_scan,
-        );
-        let directory = RelativePath::new(&full_relative)?;
-        let mut names = match root.read_directory(&directory) {
-            Ok(names) => names,
-            Err(error) => {
-                warn(ScanWarning {
-                    path: Some(relative_to_scan.clone()),
-                    error: format!("{error:#}"),
-                    message: format!(
-                        "scan: {}: {error:#}",
-                        String::from_utf8_lossy(&relative_to_scan)
-                    ),
-                });
-                continue;
-            }
-        };
-        names.sort();
-        let mut child_directories = Vec::new();
-        for name in names {
-            let relative = crate::fsops::join(&relative_to_scan, &name);
-            let full_relative = crate::fsops::join(
-                target_relative_path_bytes(&target, &root_path)?.as_slice(),
-                &relative,
-            );
-            let child = RelativePath::new(&full_relative)?;
-            let metadata = match root.metadata(&child) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    warn(ScanWarning {
-                        path: Some(relative.clone()),
-                        error: format!("{error:#}"),
-                        message: format!("scan: {}: {error:#}", String::from_utf8_lossy(&relative)),
-                    });
-                    continue;
-                }
-            };
-            let entry = crate::fsops::rooted_entry(&root, &child, relative.clone(), metadata)?;
-            let is_directory = entry.kind == crate::proto::Kind::Dir;
-            if matcher.as_ref().is_some_and(|matcher| {
-                matcher
-                    .matched(
-                        Path::new(std::ffi::OsStr::from_bytes(&relative)),
-                        is_directory,
-                    )
-                    .is_ignore()
-            }) {
-                ignored_count += 1;
-                if report_ignored {
-                    ignored_batch.push(relative);
-                    if ignored_batch.len() >= BATCH {
-                        ignored(std::mem::take(&mut ignored_batch))?;
-                    }
-                }
-                continue;
-            }
-            if is_directory {
-                child_directories.push(relative.clone());
-            }
-            batch.push(entry);
-            if batch.len() >= BATCH {
-                sink(std::mem::replace(&mut batch, Vec::with_capacity(BATCH)))?;
-            }
-        }
-        // Reverse before pushing so byte-sorted directory order is retained.
-        child_directories.reverse();
-        directories.extend(child_directories);
-    }
-    if !batch.is_empty() {
-        sink(batch)?;
-    }
-    if !ignored_batch.is_empty() {
-        ignored(ignored_batch)?;
-    }
-    Ok(ignored_count)
-}
-
-fn target_relative_path_bytes(target: &Path, root: &Path) -> Result<PathBytes> {
-    Ok(target.strip_prefix(root)?.as_os_str().as_bytes().to_vec())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1168,15 +1038,9 @@ mod tests {
             fs::write(directory.join("file.tmp"), b"excluded").unwrap();
         }
         let root = Arc::new(Root::open(temp.path()).unwrap());
-        let identity = root.identity();
-        let guard = ContainerGuard {
-            root: temp.path().as_os_str().as_bytes().to_vec(),
-            dev: identity.dev,
-            ino: identity.ino,
-        };
         let rules = ["skip/".into(), "*.tmp".into()];
         for report_ignored in [false, true] {
-            for route in ["pathname", "descriptor", "rooted"] {
+            for route in ["pathname", "descriptor"] {
                 let mut paths = Vec::new();
                 let mut ignored_paths = Vec::new();
                 let mut sink = |batch: Vec<Entry>| {
@@ -1198,7 +1062,7 @@ mod tests {
                         &mut ignored,
                         &mut warn,
                     ),
-                    "descriptor" => scan_descriptor(
+                    _ => scan_descriptor(
                         root.clone(),
                         b"",
                         None,
@@ -1206,16 +1070,6 @@ mod tests {
                         false,
                         &rules,
                         report_ignored,
-                        &mut sink,
-                        &mut ignored,
-                        &mut warn,
-                    ),
-                    _ => scan_rooted(
-                        &guard.root,
-                        false,
-                        &rules,
-                        report_ignored,
-                        &guard,
                         &mut sink,
                         &mut ignored,
                         &mut warn,

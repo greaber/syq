@@ -13,7 +13,7 @@ const MAX_REQUEST_BYTES: u64 = 64 << 20;
 pub(crate) const DEFAULT_BATCH_BYTES: u64 = 16 << 20;
 pub(crate) const DEFAULT_SPLIT_BYTES: u64 = 32 << 20;
 
-pub(crate) const HELP: &str = "Override copy internals for performance troubleshooting and controlled benchmarks with comma-separated KEY=VALUE pairs. Normal copies tune automatically; leave these overrides unset unless investigating a performance issue. Keys:\n\nworkers=N: fixed filesystem copy-worker slots, 1..65536; may start fewer workers when there is less work. Workers process files or ranges; remote workers use data channels, SSH channels can share a TCP socket, and local workers need no network connection.\ns3-requests=N: maximum simultaneous data requests across all objects, 1..65536; excludes metadata requests and idle pooled sockets.\ns3-objects=N: maximum objects in progress, including preparation and finalization, 1..65536.\ns3-parts-per-object=N: maximum simultaneous parts or ranges for each object, 1..1024. Small objects use fewer parts; every data request also needs a shared request slot. These are nested concurrency limits, not thread counts.\ns3-part-size=SIZE: part size, 5M..5G.\ns3-retries=N: transient retry budget, 0..100; default 10.\ncomparison-block-size=SIZE: comparison and reuse granularity, 64K..64M; default 4M, and 64K for replaced files up to 64M, which are compared in batches. Smaller blocks can reuse more unchanged bytes in files with scattered edits, at the cost of more hashes. Staged updates and partial resume use bounded hash windows. At 64K, whole-file checks (--hash, protected-existing policies, in-place reuse) require files smaller than 130 GiB; exceeding the hash-response limit fails the copy. Increase comparison-block-size for larger files; doubling it doubles the limit. Filesystem copies only.\nrequest-size=SIZE: 512 bytes..64M; ordinary default is the hash block size, normally 4M; streaming defaults to at most 2M.\npipeline-depth=N: 1..64 outstanding range requests per endpoint per worker; default 4. In-process endpoints remain synchronous.\ncopy-path=auto|ranges|streaming|auto-streaming: default auto; ranges bypasses whole-file and small-file copy shortcuts. Experimental streaming also bypasses those shortcuts, streams source blocks and drains checked write replies without a block-credit window. auto-streaming keeps normal whole-file and small-file shortcuts, streaming only range transfers. Staged block reuse and partial resume use bounded comparison requests in every mode. Auto streams other remote ranges larger than one default request window, keeping ordinary requests for local or shorter ranges. An explicit pipeline-depth selects ordinary requests. The forced streaming modes are incompatible with pipeline-depth; forced streaming also rejects batch controls.\nbatch-files=N: 1..4096 files per worker batch; default ceiling 2048; smaller queues are shared across the active workers.\nbatch-bytes=SIZE: 512 bytes..64M per worker batch; default 16M, including the first file. Explicit batch controls bypass the native small-copy shortcut.\nsplit-min-size=SIZE: 1..1G bytes; default 32M, raised to at least two hash blocks; automatic ordinary remote requests may share smaller unread regions when slow.\nbw-pacing=average|INTERVAL: requires resource-limits bandwidth. Applies to logical-byte pacing; ordinary SSH and TCP copies instead pace compressed transport bytes without changing request sizes. Default 125ms. Intervals accept integer ms or s, from 1ms through 10s. Timed pacing caps request size at max(rate * interval, 512 bytes). Average pacing preserves request size and waits for each block's full byte budget before issuing its request (or its destination write in streaming mode). Neither mode guarantees a network burst ceiling. Copies that a receiving machine approves retain its signed 125ms request-size ceiling in both modes.\n\nK/M/G sizes use powers of 1024. Ordinary remote requests adapt up to their size ceiling. Explicit request-size, comparison-block-size, --block-size, pipeline-depth, or split-min-size keeps those requests fixed. Smaller request sizes also bound staged comparison blocks. A fixed count disables automatic adjustment of that count; unused slots can remain idle. Counts do not bound total sockets, CPU or memory. Overrides are not saved and bypass the remembered connection count. Use -v to report effective settings and observed paths; fix the connection count for comparisons. See the Speed guide for benchmark examples.";
+pub(crate) const HELP: &str = "Override copy internals for performance troubleshooting and controlled benchmarks with comma-separated KEY=VALUE pairs. Normal copies tune automatically; leave these overrides unset unless investigating a performance issue. Keys:\n\nworkers=N: fixed filesystem copy-worker slots, 1..65536; may start fewer workers when there is less work. Workers process files or ranges; remote workers use data channels, SSH channels can share a TCP socket, and local workers need no network connection.\ns3-requests=N: maximum simultaneous data requests across all objects, 1..65536; excludes metadata requests and idle pooled sockets.\ns3-objects=N: maximum objects in progress, including preparation and finalization, 1..65536.\ns3-parts-per-object=N: maximum simultaneous parts or ranges for each object, 1..1024. Small objects use fewer parts; every data request also needs a shared request slot. These are nested concurrency limits, not thread counts.\ns3-part-size=SIZE: upload part or download range size, 5M..5G; each part is one request.\ncomparison-block-size=SIZE: comparison and reuse granularity, 64K..64M; default 4M, and 64K for replaced files up to 64M, which are compared in batches. Smaller blocks can reuse more unchanged bytes in files with scattered edits, at the cost of more hashes. Staged updates and partial resume use bounded hash windows. Whole-file checks (--hash, protected-existing policies, in-place reuse) of files whose hashes exceed one reply (about 130G at 64K) compare in windows; such a file that differs is staged and compared in windows, or copied whole from a bandwidth-limited remote source. Filesystem copies only.\nrequest-size=SIZE: 512 bytes..64M; ordinary default is the hash block size, normally 4M; streaming defaults to at most 2M.\npipeline-depth=N: 1..64 outstanding range requests per endpoint per worker; default 4. In-process endpoints remain synchronous.\ncopy-path=auto|ranges|streaming|auto-streaming: default auto; ranges bypasses whole-file and small-file copy shortcuts. Experimental streaming also bypasses those shortcuts, streams source blocks and drains checked write replies without a block-credit window. auto-streaming keeps normal whole-file and small-file shortcuts, streaming only range transfers. Staged block reuse and partial resume use bounded comparison requests in every mode. Auto streams other remote ranges larger than one default request window, keeping ordinary requests for local or shorter ranges. An explicit pipeline-depth selects ordinary requests. The forced streaming modes are incompatible with pipeline-depth; forced streaming also rejects batch controls.\nbatch-files=N: 1..4096 files per worker batch; default ceiling 2048; smaller queues are shared across the active workers.\nbatch-bytes=SIZE: 512 bytes..64M per worker batch; default 16M, including the first file. Explicit batch controls bypass the native small-copy shortcut.\nsplit-min-size=SIZE: 1..1G bytes; default 32M, raised to at least two hash blocks; automatic ordinary remote requests may share smaller unread regions when slow.\nbw-pacing=average|INTERVAL: requires resource-limits bandwidth. Applies to logical-byte pacing; ordinary SSH and TCP copies instead pace compressed transport bytes without changing request sizes. Default 125ms. Intervals accept integer ms or s, from 1ms through 10s. Timed pacing caps request size at max(rate * interval, 512 bytes). Average pacing preserves request size and waits for each block's full byte budget before issuing its request (or its destination write in streaming mode). Neither mode guarantees a network burst ceiling. Copies that a receiving machine approves retain its signed 125ms request-size ceiling in both modes.\n\nK/M/G sizes use powers of 1024. Ordinary remote requests adapt up to their size ceiling. Explicit request-size, comparison-block-size, --block-size, pipeline-depth, or split-min-size keeps those requests fixed. Smaller request sizes also bound staged comparison blocks. A fixed count disables automatic adjustment of that count; unused slots can remain idle. Counts do not bound total sockets, CPU or memory. Overrides are not saved and bypass the remembered connection count. Use -v to report effective settings and observed paths; fix the connection count for comparisons. See the Speed guide for benchmark examples.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum CopyPath {
@@ -86,7 +86,6 @@ pub(crate) struct TransferTuning {
     pub s3_object_workers: Option<usize>,
     pub s3_part_workers: Option<usize>,
     pub s3_part_size: Option<u64>,
-    pub s3_retries: Option<usize>,
     pub comparison_block_size: Option<u64>,
     pub request_size: Option<u64>,
     pub pipeline_depth: Option<usize>,
@@ -103,7 +102,6 @@ impl TransferTuning {
             || self.s3_object_workers.is_some()
             || self.s3_part_workers.is_some()
             || self.s3_part_size.is_some()
-            || self.s3_retries.is_some()
     }
     pub fn pipeline_depth(self) -> usize {
         self.pipeline_depth.unwrap_or(DEFAULT_PIPELINE_DEPTH)
@@ -184,9 +182,9 @@ impl TransferTuning {
         self,
         hash_block: u64,
         limit: Option<&crate::bwlimit::BandwidthLimit>,
-        restricted_receiver: bool,
+        receiver_paces: bool,
     ) -> u64 {
-        let size = self.request_size(hash_block, limit, restricted_receiver);
+        let size = self.request_size(hash_block, limit, receiver_paces);
         if self.request_size.is_some() {
             size
         } else {
@@ -198,17 +196,17 @@ impl TransferTuning {
         self,
         hash_block: u64,
         limit: Option<&crate::bwlimit::BandwidthLimit>,
-        restricted_receiver: bool,
+        receiver_paces: bool,
     ) -> u64 {
         let size = self.request_size.unwrap_or(hash_block);
         let size = match (limit, self.bw_pacing.unwrap_or_default()) {
             (Some(limit), BwPacing::IntervalMs(ms)) => size.min(limit.bytes_for_interval(ms)),
             _ => size,
         };
-        // The signed receiver independently refuses larger writes. Tuning
-        // cannot enlarge that authority; retain its released request ceiling.
+        // A receiver that paces file data refuses larger writes. Tuning
+        // cannot enlarge that authority; retain its request ceiling.
         match limit {
-            Some(limit) if restricted_receiver => size.min(limit.burst_bytes()),
+            Some(limit) if receiver_paces => size.min(limit.burst_bytes()),
             _ => size,
         }
     }
@@ -276,15 +274,6 @@ impl FromStr for TransferTuning {
                     size(value, Some(key), 5 << 20, 5 << 30)?,
                     key,
                 )?,
-                "s3-retries" => set_once(
-                    &mut tuning.s3_retries,
-                    value
-                        .parse::<usize>()
-                        .ok()
-                        .filter(|n| *n <= 100)
-                        .ok_or_else(|| anyhow::anyhow!("s3-retries must be 0..100"))?,
-                    key,
-                )?,
                 "comparison-block-size" => set_once(
                     &mut tuning.comparison_block_size,
                     parse_comparison_block_size(value, Some(key))?,
@@ -323,6 +312,10 @@ impl FromStr for TransferTuning {
                     key,
                 )?,
                 "bw-pacing" => set_once(&mut tuning.bw_pacing, value.parse()?, key)?,
+                // An S3 option since it left this group.
+                "s3-retries" => {
+                    bail!("s3-retries is no longer a --performance-tuning key; use --s3-retries N")
+                }
                 _ => bail!("unknown tuning option {key:?}; see --help-all"),
             }
         }
@@ -345,7 +338,6 @@ impl std::fmt::Display for TransferTuning {
         pair!("s3-objects", self.s3_object_workers);
         pair!("s3-parts-per-object", self.s3_part_workers);
         pair!("s3-part-size", self.s3_part_size);
-        pair!("s3-retries", self.s3_retries);
         pair!("comparison-block-size", self.comparison_block_size);
         pair!("request-size", self.request_size);
         pair!("pipeline-depth", self.pipeline_depth);
@@ -404,6 +396,17 @@ impl BenchmarkStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.7.1 took S3 retries as a tuning key; the error names the option
+    /// that replaced it.
+    #[test]
+    fn the_removed_s3_retries_key_names_its_replacement() {
+        let error = "s3-retries=3".parse::<TransferTuning>().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("use --s3-retries N"),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn comparison_granularity_validates_and_survives_forwarding() {

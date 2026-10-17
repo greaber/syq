@@ -227,6 +227,7 @@ pub(crate) fn filesystem(command: Command) -> Command {
                 }
                 "include" if map => "Output fields",
                 "s3_endpoint" | "s3_region" | "s3_profile" | "s3_header" | "s3_write_header"
+                | "s3_retries"
                     if map =>
                 {
                     "Object storage"
@@ -313,9 +314,8 @@ fn copy_heading(id: &str) -> (&'static str, usize) {
         | "peer_auth"
         | "receiver_max_entries"
         | "receiver_max_bytes" => ("Connections and remote execution", 5),
-        "s3_endpoint" | "s3_region" | "s3_profile" | "s3_header" | "s3_write_header" => {
-            ("S3 connection settings", 6)
-        }
+        "s3_endpoint" | "s3_region" | "s3_profile" | "s3_header" | "s3_write_header"
+        | "s3_retries" => ("S3 connection settings", 6),
         "performance_tuning" | "resource_limits_arg" | "transfer_strategy" => {
             ("Performance and resource limits", 7)
         }

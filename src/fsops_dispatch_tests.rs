@@ -18,7 +18,6 @@ fn put(path: &[u8]) -> SmallPut {
         flags: 0,
         inplace: false,
         condition: TargetCondition::Any,
-        guard: None,
         replaces: false,
         scanned: crate::proto::ScannedDestination::Unknown,
     }
@@ -77,7 +76,6 @@ fn mapping_keeps_batch_and_range_payload_allocations() {
             off: 0,
             hash: content_digest(&data),
             data: data.into(),
-            guard: None,
         };
         ops.map_request(&mut request).unwrap();
         let Request::WriteRange { path, data, .. } = &request else {
@@ -157,35 +155,6 @@ fn mapped_batch_preserves_hash_checks_conditions_and_publication() {
     assert!(!dir.path().join(sidecar).exists());
 }
 
-#[test]
-fn guarded_batch_keeps_absolute_paths_and_rejects_mixed_authority() {
-    let dir = crate::test_support::tempdir().unwrap();
-    let root = Root::open(dir.path()).unwrap();
-    let identity = root.identity();
-    let path = dir.path().join("guarded");
-    let mut item = put(path.as_os_str().as_bytes());
-    item.guard = Some(ContainerGuard {
-        root: dir.path().as_os_str().as_bytes().to_vec(),
-        dev: identity.dev,
-        ino: identity.ino,
-    });
-    let mut request = Request::PutSmallBatch(vec![item]);
-    let Response::Applied(errors) = rooted(dir.path()).handle_in_place(&mut request) else {
-        panic!("expected batch response")
-    };
-    assert!(errors[0].is_some());
-    assert!(!path.exists());
-    let Request::PutSmallBatch(puts) = &request else {
-        unreachable!()
-    };
-    assert_eq!(puts[0].path, path.as_os_str().as_bytes());
-    let Response::Applied(errors) = FsOps::new().handle_in_place(&mut request) else {
-        panic!("expected batch response")
-    };
-    assert!(errors[0].is_none());
-    assert_eq!(fs::read(path).unwrap(), vec![42; 256 * 1024]);
-}
-
 #[cfg(target_os = "linux")]
 #[test]
 fn optimistic_partial_batch_retries_only_the_rejected_file() {
@@ -234,7 +203,7 @@ fn ordinary_partial_planning_and_copy_do_not_query_name_limits() {
         .map(|name| format!("nested/{name}").into_bytes())
         .collect();
     assert!(ops
-        .partial_paths(&paths, &[9; 16], None)
+        .partial_paths(&paths, &[9; 16])
         .iter()
         .all(Result::is_ok));
     let mut request = Request::PutSmallBatch(
@@ -287,7 +256,6 @@ fn a_sidecar_with_a_short_name_serves_every_worker() {
     let reply = first.handle_in_place(&mut Request::ProbePartial {
         path: path.clone(),
         copy_id: [9; 16],
-        guard: None,
     });
     assert!(matches!(reply, Response::PartialSize(Some(8))), "{reply:?}");
     let mut prepared = setup();
@@ -302,7 +270,6 @@ fn a_sidecar_with_a_short_name_serves_every_worker() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
-        guard: None,
         group: None,
         update: None,
     });
@@ -317,7 +284,6 @@ fn a_sidecar_with_a_short_name_serves_every_worker() {
         block: 64 * 1024,
         len: 8,
         attempt: 0,
-        guard: None,
     });
     assert!(matches!(reply, Response::Hashes(_)), "{reply:?}");
     let mut writer = setup();
@@ -329,7 +295,6 @@ fn a_sidecar_with_a_short_name_serves_every_worker() {
         off: 0,
         hash: content_digest(b"new data"),
         data: b"new data".to_vec().into(),
-        guard: None,
     });
     assert!(matches!(reply, Response::Ok), "{reply:?}");
     assert_eq!(fs::read(dir.path().join(&legacy)).unwrap(), b"new data");
@@ -342,7 +307,6 @@ fn a_sidecar_with_a_short_name_serves_every_worker() {
         flags: 0,
         scanned: crate::proto::ScannedDestination::Unknown,
         condition: TargetCondition::Absent,
-        guard: None,
         expected_hash: None,
     });
     assert!(matches!(reply, Response::Ok), "{reply:?}");
@@ -374,7 +338,7 @@ fn learned_conservative_limit_does_not_change_a_successful_partial_name() {
     let dir = crate::test_support::tempdir().unwrap();
     let ops = rooted(dir.path());
     let target = ops
-        .rooted_destination_target("x".repeat(120).as_bytes(), None)
+        .rooted_destination_target("x".repeat(120).as_bytes())
         .unwrap()
         .unwrap();
     target
@@ -397,41 +361,10 @@ fn learned_conservative_limit_does_not_change_a_successful_partial_name() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn guarded_partials_keep_the_authoritys_exact_name_selection() {
-    let dir = crate::test_support::tempdir().unwrap();
-    let root = Arc::new(Root::open(dir.path()).unwrap());
-    root.test_name_limit
-        .store(143, std::sync::atomic::Ordering::Relaxed);
-    let target = GuardedTarget {
-        root: root.clone(),
-        relative: RelativePath::new("x".repeat(120).as_bytes()).unwrap(),
-        label: PathBuf::from(format!("logical/{}", "x".repeat(120))),
-    }
-    .as_rooted();
-    // Accept any candidate, as a filesystem may accept names longer than its
-    // conservative pathconf limit. The quota checker still derives this exact
-    // pre-change spelling, so a successful optimistic open would be wrong.
-    let (relative, _, ()) = with_rooted_partial(&target, &[9; 16], |_, _| Ok(())).unwrap();
-    assert_eq!(
-        relative.to_path_buf(),
-        PathBuf::from(format!(".{}.syq-tmp.z6xlpz5jq2rgx7pp", "x".repeat(117)))
-    );
-    assert_eq!(
-        root.test_name_queries
-            .load(std::sync::atomic::Ordering::Relaxed),
-        1
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
 fn optimistic_partial_does_not_retry_unrelated_or_unchanged_names() {
     let dir = crate::test_support::tempdir().unwrap();
     let ops = rooted(dir.path());
-    let target = ops
-        .rooted_destination_target(b"short", None)
-        .unwrap()
-        .unwrap();
+    let target = ops.rooted_destination_target(b"short").unwrap().unwrap();
     target
         .root
         .test_name_limit

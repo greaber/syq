@@ -179,6 +179,7 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
                 requested,
                 via.as_ref(),
                 true,
+                false,
             )?;
             println!(
                 "enrolled {} for {}:{}",
