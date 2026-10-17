@@ -654,12 +654,43 @@ fn test_authority_with_results(
     deletion: DeletionPolicy,
     maximum_bytes: u64,
     max_file_data_bytes_per_second: u64,
+    filters: FilterPolicy,
+    publication: PublicationPolicy,
+    existing: ExistingDestinationPolicy,
+    placement: DestinationPlacement,
+    root_existence: RootExistence,
+    results: Option<(PrivateKey, crate::destination_results::ReceiptPolicy)>,
+) -> Result<RestrictedAuthority> {
+    test_authority_with_options(
+        root,
+        deletion,
+        maximum_bytes,
+        max_file_data_bytes_per_second,
+        filters,
+        publication,
+        existing,
+        placement,
+        root_existence,
+        results,
+        (Default::default(), &[]),
+    )
+}
+
+/// `test_authority_with_results` with signed extra copy options and the
+/// receiver's protected paths.
+#[allow(clippy::too_many_arguments)]
+fn test_authority_with_options(
+    root: &Path,
+    deletion: DeletionPolicy,
+    maximum_bytes: u64,
+    max_file_data_bytes_per_second: u64,
     mut filters: FilterPolicy,
     publication: PublicationPolicy,
     existing: ExistingDestinationPolicy,
     placement: DestinationPlacement,
     root_existence: RootExistence,
     results: Option<(PrivateKey, crate::destination_results::ReceiptPolicy)>,
+    (extra_options, protected): (crate::delegation::ExtraCopyOptions, &[ReceiverControlPath]),
 ) -> Result<RestrictedAuthority> {
     let opened = Root::open(root).unwrap();
     let identity = opened.identity();
@@ -742,12 +773,12 @@ fn test_authority_with_results(
             filters,
             root_existence,
             receipt_policy,
-            extra_options: Default::default(),
+            extra_options,
         },
         [0; 32],
         results_key,
         Instant::now() + std::time::Duration::from_secs(60),
-        &[],
+        protected,
     )
 }
 
@@ -8894,4 +8925,135 @@ fn small_copies_publish_through_a_restricted_receiver() {
             "{name}"
         );
     }
+}
+
+/// With `--follow-dst`, a destination reached through symlinks is the
+/// directory they lead to inside the enrolled root: the receiver works
+/// beneath it, under the signed destination's name. A link that leads
+/// outside the root, into the receiver's control plane, to nothing, or
+/// round in a loop is refused when the grant is redeemed.
+#[test]
+fn follow_dst_copies_into_the_directory_a_destination_link_leads_to() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let real = root.join("data/real");
+    fs::create_dir_all(&real).unwrap();
+    fs::create_dir_all(temporary.path().join("outside")).unwrap();
+    fs::create_dir_all(root.join(".ssh")).unwrap();
+    let options = crate::delegation::ExtraCopyOptions {
+        follow_dst: true,
+        ..Default::default()
+    };
+    let protected = [ReceiverControlPath {
+        path: path_bytes(&root.join(".ssh")),
+        label: "protected SSH configuration directory",
+    }];
+    let authority = |target: &[u8], options| {
+        let link = root.join("target");
+        let _ = fs::remove_file(&link);
+        symlink(OsStr::from_bytes(target), &link).unwrap();
+        test_authority_with_options(
+            &root,
+            DeletionPolicy::Forbid,
+            1024,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::DirectoryContents,
+            RootExistence::Any,
+            None,
+            (options, &protected),
+        )
+    };
+    for target in [
+        b"data/real".to_vec(),
+        b"./data/../data/real/".to_vec(),
+        path_bytes(&real),
+    ] {
+        let authority = authority(&target, options).unwrap();
+        let mut put = small_put(&root.join("target/file"));
+        let settlement = authority.authorize(&mut put, false).unwrap();
+        let response = authority.test_ops().handle(&put);
+        authority.settle(settlement, &response);
+        assert_eq!(
+            fs::read(real.join("file")).unwrap(),
+            b"new",
+            "{target:?}: {response:?}"
+        );
+        fs::remove_file(real.join("file")).unwrap();
+        assert!(fs::symlink_metadata(root.join("target"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+    // Without it, the link is the destination, and nothing follows it.
+    let plain = authority(b"data/real", Default::default()).unwrap();
+    let mut put = small_put(&root.join("target/file"));
+    assert!(
+        plain.authorize(&mut put, false).is_err()
+            || {
+                let response = plain.test_ops().handle(&put);
+                !matches!(&response, proto::Response::Applied(errors) if errors[0].is_none())
+                    && !matches!(&response, proto::Response::PublishedBatch(results) if results[0].is_ok())
+            }
+    );
+    assert!(!real.join("file").exists());
+
+    symlink("loop-b", root.join("loop-a")).unwrap();
+    symlink("loop-a", root.join("loop-b")).unwrap();
+    for (target, refusal) in [
+        (b"../outside".to_vec(), "outside the enrolled root"),
+        (
+            path_bytes(&temporary.path().join("outside")),
+            "outside the enrolled root",
+        ),
+        (b".ssh".to_vec(), "protected SSH configuration"),
+        (b"missing".to_vec(), "does not exist"),
+        (b"loop-a".to_vec(), "too many symlinks"),
+        (b".".to_vec(), "the enrolled root itself"),
+    ] {
+        let error = format!("{:#}", authority(&target, options).err().unwrap());
+        assert!(error.contains(refusal), "{target:?}: {error}");
+    }
+}
+
+/// `--follow-dst` (or `--follow`) with `--into` is signed for the receiver
+/// to resolve; it cannot be combined with `--widen-dirs all`, whose
+/// directories on the way to the destination a link would make ambiguous.
+#[test]
+fn follow_dst_is_signed_for_into_placements() {
+    for (options, follow) in [
+        (&["--into", "/backup"][..], false),
+        (&["--into", "/backup", "--follow-dst"][..], true),
+        (&["--into", "/backup", "--follow"][..], true),
+        (&["--as", "/backup", "--follow-dst"][..], false),
+    ] {
+        let mut argv: Vec<_> = ["cp", "--from", "host-a", "source", "--to", "host-b"]
+            .map(std::ffi::OsString::from)
+            .into();
+        argv.extend(options.iter().map(std::ffi::OsString::from));
+        let args = Args::parse_args(&argv).unwrap();
+        validate_restricted_args(&args).unwrap();
+        let constraints = crate::restricted::grant::extra_copy_options(&args);
+        assert_eq!(constraints.follow_dst, follow, "{options:?}");
+    }
+    let args = Args::parse_args(
+        &[
+            "cp",
+            "--from",
+            "host-a",
+            "source",
+            "--to",
+            "host-b",
+            "--into",
+            "/backup",
+            "--follow-dst",
+            "--widen-dirs=all",
+        ]
+        .map(std::ffi::OsString::from),
+    )
+    .unwrap();
+    let error = validate_restricted_args(&args).unwrap_err().to_string();
+    assert!(error.contains("--widen-dirs all"), "{error}");
 }

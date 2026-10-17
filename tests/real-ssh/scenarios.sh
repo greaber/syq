@@ -948,6 +948,30 @@ for small_case in new unchanged updated; do
     test "$small_expected" = "$small_actual"
 done
 
+printf 'case: --follow-dst copies into the directory a restricted destination link leads to\n'
+# The receiver resolves the link inside its enrolled root and writes into
+# the directory it leads to; the link stays a link.
+make_tree source /tmp/syq-real-ssh/follow-source follow
+ssh destination 'rm -rf /tmp/syq-real-ssh/follow-real /tmp/syq-real-ssh/follow-link &&
+    install -d /tmp/syq-real-ssh/follow-real &&
+    ln -s follow-real /tmp/syq-real-ssh/follow-link'
+syq cp --no-progress --copy-metadata=permissions --follow-dst \
+    --from source --srcs-in /tmp/syq-real-ssh/follow-source \
+    --to destination --into /tmp/syq-real-ssh/follow-link
+assert_same_tree source /tmp/syq-real-ssh/follow-source \
+    destination /tmp/syq-real-ssh/follow-real follow
+ssh destination 'test -L /tmp/syq-real-ssh/follow-link'
+if follow_output=$(syq cp --no-progress --follow-dst --widen-dirs=all \
+    --from source --srcs-in /tmp/syq-real-ssh/follow-source \
+    --to destination --into /tmp/syq-real-ssh/follow-link 2>&1); then
+    echo '--follow-dst with --widen-dirs all unexpectedly succeeded' >&2
+    exit 1
+fi
+case "$follow_output" in
+    *'--widen-dirs all cannot be combined with --follow-dst'*) ;;
+    *) printf '%s\n' "$follow_output" >&2; exit 1 ;;
+esac
+
 printf 'case: restricted enrollment refuses an SSH control-plane destination\n'
 make_tree source /tmp/syq-real-ssh/protected-source protected
 if protected_output=$(syq cp --no-progress --performance-tuning workers=2 --copy-metadata=permissions \

@@ -2239,3 +2239,31 @@ fn turning_off_the_last_profile_leaves_no_provider_after_another_build() {
     assert_eq!(old.join().unwrap(), ["Stop"]);
     assert!(local_provider(&t).is_null());
 }
+
+/// A copy to a named destination does not follow a destination symlink:
+/// `--follow-dst` with `--into` is refused before anything is asked of the
+/// receiving machine.
+#[test]
+fn named_destinations_refuse_follow_dst() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"file");
+    for follow in ["--follow-dst", "--follow"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "--no-progress"])
+            .arg(t.path("src/file"))
+            .args(["--to", "@laptop", "--into", "incoming", follow])
+            .env("HOME", &t.0)
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_DATA_HOME", t.path("data"))
+            .env("XDG_STATE_HOME", t.path("state"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("named destinations do not follow destination symlinks"),
+            "{output:?}"
+        );
+    }
+}

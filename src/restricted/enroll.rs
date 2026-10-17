@@ -336,6 +336,7 @@ pub(super) fn enroll(
     requested_destination: &str,
     jump: Option<&SshEndpoint>,
     refresh_existing: bool,
+    follows_destination: bool,
 ) -> Result<(LocalEnrollment, PathBuf, Vec<u8>)> {
     let base = local_state_base()?;
     let base_lock = open_directory(&base)?;
@@ -405,7 +406,13 @@ pub(super) fn enroll(
             (pending, directory, private_key)
         }
         (None, None) => {
-            return create_enrollment(host, port, login, requested_destination, jump);
+            return create_enrollment(
+                host,
+                port,
+                login,
+                (requested_destination, follows_destination),
+                jump,
+            );
         }
     };
     let public_key = private_key.to_openssh()?;
@@ -418,6 +425,7 @@ pub(super) fn enroll(
         target_login: login.to_owned(),
         requested_destination: requested_destination.to_owned(),
         public_key,
+        follows_destination,
     };
     let target = endpoint(login, host, port)?;
     let direct = install_over_route(&target, EnrollmentRoute::Direct, &request);
@@ -464,7 +472,7 @@ fn create_enrollment(
     host: &str,
     port: Option<u16>,
     login: &str,
-    destination: &str,
+    destination: (&str, bool),
     jump: Option<&SshEndpoint>,
 ) -> Result<(LocalEnrollment, PathBuf, Vec<u8>)> {
     let target = endpoint(login, host, port)?;
@@ -495,6 +503,8 @@ fn create_enrollment(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `destination` is the destination the copy asked for, and whether it
+/// follows a symlink there (`InstallRequest::follows_destination`).
 fn create_over_route(
     target: &SshEndpoint,
     route: EnrollmentRoute<'_>,
@@ -502,7 +512,7 @@ fn create_over_route(
     host: &str,
     port: Option<u16>,
     login: &str,
-    destination: &str,
+    (destination, follows_destination): (&str, bool),
 ) -> Result<(LocalEnrollment, PathBuf, Vec<u8>)> {
     let temporary = crate::private_broker::private_temp_dir("syq-enroll-")?;
     let trace_path = temporary.path().join("ssh.log");
@@ -617,6 +627,7 @@ fn create_over_route(
         requested_destination: destination.to_owned(),
         public_key: key.to_openssh()?,
         security_key_flags: template.security_key_flags,
+        follows_destination,
     };
     let write = (|| -> Result<()> {
         serde_json::to_writer(&mut input, &request)?;

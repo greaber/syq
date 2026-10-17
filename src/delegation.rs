@@ -454,6 +454,9 @@ pub(crate) struct ExtraCopyOptions {
     /// created without replacing anything, as under the `Skip` policy, while
     /// existing directories still take the copy's metadata.
     pub keep_files: bool,
+    /// `--follow-dst` with `--into`: when the destination is a symlink, the
+    /// copy goes into the directory it resolves to inside the enrolled root.
+    pub follow_dst: bool,
 }
 
 /// Which existing destination directories the receiver may briefly give the

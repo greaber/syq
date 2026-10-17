@@ -103,6 +103,10 @@ struct InstallRequest {
     ssh_public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     security_key_flags: Option<u8>,
+    /// The copy asking for the enrollment follows a symlink at its
+    /// destination (`--follow-dst`), so a link there is no reason to refuse.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    follows_destination: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

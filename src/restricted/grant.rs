@@ -51,6 +51,8 @@ pub(crate) fn extra_copy_options(args: &Args) -> delegation::ExtraCopyOptions {
         open_noatime: args.open_noatime || args.atimes > 1,
         widen_dirs: args.widen_dirs.into(),
         keep_files: args.ignore_existing && !args.only_new_native_entries(),
+        follow_dst: args.follows_native_destination_paths()
+            && args.placement == crate::cli::Placement::Into,
     }
 }
 
@@ -60,6 +62,12 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
     }
     if args.no_tcp_encryption {
         bail!("command-restricted transfers require encrypted data connections");
+    }
+    if args.follows_native_destination_paths()
+        && args.placement == crate::cli::Placement::Into
+        && args.widen_dirs == crate::cli::WidenDirs::All
+    {
+        bail!("--widen-dirs all cannot be combined with --follow-dst on a command-restricted destination");
     }
     // Range-check every ceiling here, before automatic enrollment can touch
     // hostB, rather than leaving it to grant validation after the fact.
@@ -337,6 +345,8 @@ pub(crate) fn prepare_transfer(
                 )?,
                 Some(&jump),
                 false,
+                args.follows_native_destination_paths()
+                    && args.placement == crate::cli::Placement::Into,
             )?
         }
     };
@@ -457,6 +467,9 @@ pub(crate) fn named_authority(
     std::sync::Arc<RestrictedAuthority>,
     crate::destination::Approved,
 )> {
+    if request.constraints.extra_options.follow_dst {
+        bail!("copies a receiving machine approves do not follow destination symlinks");
+    }
     let (login, home) = current_account()?;
     let parent = root;
     let metadata = fs::metadata(parent)?;

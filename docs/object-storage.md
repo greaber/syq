@@ -25,7 +25,9 @@ Syq uses your AWS credentials and detects AWS bucket regions automatically.
 | `--s3-write-header 'NAME: VALUE'` | Add a header only to requests that create or replace objects: uploads, multipart starts, and copies; repeatable. Use it for settings such as storage class, or a server-side encryption method or KMS key, that the service rejects or ignores on other requests. Customer-provided encryption key headers (`x-amz-server-side-encryption-customer-*`) are also required on part uploads and reads, so they cannot be write-only. A write header takes precedence over an `--s3-header` of the same name |
 | `--s3-retries N` | Retry each request up to N times (0–100, default 10) after a dropped connection, a timeout, a server error or throttling; 0 disables retries |
 
-<a id="retries"></a>
+See [S3 copies](tuning.md#s3-copies) for concurrency and part sizes.
+
+### Retries
 
 Each request has its own retries. They wait longer each time, with randomized
 delays to spread out concurrent retries. Requests keep their concurrency slots
@@ -36,8 +38,6 @@ error or throttling response, `syq cp` and `syq rm` stop instead of trying the
 remaining objects; rerun the command once the service is available. Bulk
 deletion retries only the keys that report a temporary error, up to
 `--s3-retries` times, separately from retries of the batch request itself.
-
-See [S3 copies](tuning.md#s3-copies) for concurrency and part sizes.
 
 ## Upload and download
 

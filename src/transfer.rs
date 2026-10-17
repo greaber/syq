@@ -3327,10 +3327,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             .map_err(|error| with_failure_hint(&opts, error))?;
         // Rsync retains its destination-directory compatibility rule. Native
         // container placement follows links only under the destination policy;
-        // exact placement preserves the final directory entry.
+        // exact placement preserves the final directory entry. A restricted
+        // receiver follows them itself, and shows the directory they lead to
+        // at the signed destination.
         if args.interface == Interface::Rsync {
             follow_dir_symlink(&mut *dst_ctl, &operator_dst_root, entry)?
-        } else if args.follows_native_destination_paths() && args.placement == Placement::Into {
+        } else if args.follows_native_destination_paths()
+            && args.placement == Placement::Into
+            && args.restricted_grant.is_none()
+        {
             follow_container_symlink(
                 &mut *dst_ctl,
                 &operator_dst_root,

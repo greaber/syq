@@ -180,12 +180,20 @@ contents are accepted unchanged. A content conflict leaves that file's metadata
 alone too. `--as-new` and `--into-new` constrain the placement root; `--if-exists`
 applies to individual selected entries.
 
-With `error`, `error-if-different` and `--as-new`, syq publishes a new file at a
-name only while the name is still free: if a file appears there first, syq keeps
-it and reports that file's copy as failed. On filesystems with neither an atomic
-no-replace rename nor hard links, such as FAT and exFAT on macOS and rclone
-mounts, syq checks that the name is free and then renames, so a file another
-program creates there in the instant between the two can be replaced.
+Another program can change the destination while a copy runs. Syq creates a
+new file at a name only while the name is still free when the policy forbids
+replacing what is there. With `error`, `error-if-different` and `--as-new`, a
+file that appears there first is kept and that file's copy is reported as
+failed. With `keep` (and `syq rsync --ignore-existing`), it is kept and syq
+skips the file with a note, as it skips one it found at the start. With
+`syq rsync --existing`, syq replaces a file only while it is still the one it
+found: one removed or replaced meanwhile is skipped with a note, not created
+again. `--into-new` creates its directory only while the name is free; if
+another program creates one there first, the copy fails. On filesystems with
+neither an atomic no-replace rename nor hard links, such as FAT and exFAT on
+macOS and rclone mounts, syq checks that the name is free and then renames, so
+a file another program creates there in the instant between the two can be
+replaced.
 
 See [Update policies](commands/cp.md#update-policies) for supported combinations.
 

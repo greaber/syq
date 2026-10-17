@@ -92,6 +92,84 @@ pub(super) fn reject_control_plane_path(
     Ok(())
 }
 
+/// Most symlinks `resolve_destination_links` follows, as the kernel bounds
+/// a path lookup.
+const MAX_DESTINATION_LINKS: usize = 40;
+
+/// Resolve the symlinks on the way to `destination`, a path relative to
+/// `root` (named `root_path`), to the directory they lead to inside the
+/// root: `None` when no component is a symlink. A link that leads outside
+/// the root, or to a name that does not exist, is refused.
+fn resolve_destination_links(
+    root: &Root,
+    root_path: &[u8],
+    destination: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    let components = |path: &[u8]| -> Vec<Vec<u8>> {
+        path.split(|byte| *byte == b'/')
+            .filter(|component| !component.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect()
+    };
+    let label = |path: &[Vec<u8>]| String::from_utf8_lossy(&path.join(&b'/')).into_owned();
+    let mut pending: std::collections::VecDeque<Vec<u8>> = components(destination).into();
+    let mut resolved: Vec<Vec<u8>> = Vec::new();
+    let mut links = 0;
+    while let Some(component) = pending.pop_front() {
+        match component.as_slice() {
+            b"." => continue,
+            b".." => {
+                if resolved.pop().is_none() {
+                    bail!("a destination symlink leads outside the enrolled root");
+                }
+                continue;
+            }
+            _ => {}
+        }
+        resolved.push(component);
+        let path = crate::rooted::RelativePath::new(&resolved.join(&b'/'))?;
+        let metadata = root.metadata_optional(&path)?.with_context(|| {
+            format!(
+                "{} does not exist; with --follow-dst a destination reached through a symlink must exist",
+                label(&resolved)
+            )
+        })?;
+        if !metadata.is_symlink() {
+            continue;
+        }
+        links += 1;
+        if links > MAX_DESTINATION_LINKS {
+            bail!("too many symlinks on the way to the destination");
+        }
+        let target = root.read_link(&path)?;
+        resolved.pop();
+        if target.starts_with(b"/") {
+            let inside = if target == root_path {
+                Some(&[][..])
+            } else {
+                target
+                    .strip_prefix(root_path)
+                    .and_then(|rest| rest.strip_prefix(b"/"))
+            };
+            let inside = inside.with_context(|| {
+                format!(
+                    "the destination symlink {} leads outside the enrolled root",
+                    label(&[path.to_bytes()])
+                )
+            })?;
+            resolved.clear();
+            for component in components(inside).into_iter().rev() {
+                pending.push_front(component);
+            }
+        } else {
+            for component in components(&target).into_iter().rev() {
+                pending.push_front(component);
+            }
+        }
+    }
+    Ok((links > 0).then(|| resolved.join(&b'/')))
+}
+
 pub(super) fn reject_control_plane_scopes(
     copy: &CopyOperation,
     protected: &[ReceiverControlPath],
@@ -254,13 +332,41 @@ impl RestrictedAuthority {
             bail!("signed destination must be a child of the enrolled root");
         }
         crate::rooted::RelativePath::new(relative.as_os_str().as_bytes())?;
-        let root = std::sync::Arc::new(Root::open_verified(
+        let mut root = std::sync::Arc::new(Root::open_verified(
             root_path,
             RootIdentity {
                 dev: config.root_dev,
                 ino: config.root_ino,
             },
         )?);
+        let mut held_path = config.root.as_bytes().to_vec();
+        // `--follow-dst`: a destination reached through symlinks is the
+        // directory they resolve to inside the enrolled root. That directory
+        // is the root every connection works beneath, named in requests by
+        // the signed destination, so nothing reaches past it.
+        if extra_options.follow_dst && copy.policy.placement != DestinationPlacement::ExactPath {
+            let relative = relative.as_os_str().as_bytes();
+            if let Some(resolved) = resolve_destination_links(&root, &held_path, relative)? {
+                if resolved.is_empty() {
+                    bail!("signed destination resolves to the enrolled root itself");
+                }
+                let mut resolved_path = held_path.clone();
+                resolved_path.push(b'/');
+                resolved_path.extend_from_slice(&resolved);
+                reject_control_plane_path(&resolved_path, protected)?;
+                let directory = root
+                    .open_directory(&crate::rooted::RelativePath::new(&resolved)?)
+                    .with_context(|| {
+                        format!(
+                            "signed destination {} resolves to {}, which is not a directory",
+                            destination.display(),
+                            String::from_utf8_lossy(&resolved_path)
+                        )
+                    })?;
+                root = std::sync::Arc::new(Root::from_directory(directory)?);
+                held_path = copy.destination.clone();
+            }
+        }
         let file_data_limit = (max_file_data_bytes_per_second > 0)
             .then(|| crate::bwlimit::BandwidthLimit::new(max_file_data_bytes_per_second));
         receipt_policy.validate()?;
@@ -277,7 +383,7 @@ impl RestrictedAuthority {
                 ))
             }),
             root,
-            root_path: config.root.as_bytes().to_vec(),
+            root_path: held_path,
             destination: copy.destination.clone(),
             copy,
             filters,

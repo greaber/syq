@@ -360,6 +360,8 @@ and the [overwrite policies](reference.md#choose-which-existing-files-to-update)
 Copies are refused while syq runs as root, so ownership and special files work
 as for any copy by an ordinary account.
 Timestamp comparisons trust the source's reported modification times.
+Named copies do not follow a destination symlink: `--follow-dst` with `--into`
+is refused; name the directory the link points to instead.
 
 Each copy is limited to 100 GiB and one million entries by default. Entries
 count the changes the copy makes on the laptop: each file it writes, each

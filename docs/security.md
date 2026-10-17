@@ -240,6 +240,13 @@ The protection has several parts:
    reports to your laptop, which checks that they are hostB's and that hostA
    left none out, added none, and did not cut them short.
 
+HostB's receiver opens the directory it was set up for once, when it
+verifies the grant, and does everything the copy asks beneath it, without
+following symlinks. Renaming or replacing a directory on the way to it during
+the copy does not redirect the copy. With `--follow-dst`, the receiver itself
+follows a symlink at the destination, and only to a directory inside the one
+it was set up for and outside its control files.
+
 File data travels directly from hostA to hostB, over encrypted TCP or SSH.
 Your laptop provides authorization and verifies the result without carrying
 the file data. See [Copy between servers](remote-to-remote.md) for setup and
