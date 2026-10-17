@@ -1035,6 +1035,34 @@ fn a_patch_whose_payload_fails_its_check_is_copied_whole() {
     }
 }
 
+/// Whether the test filesystem clones files, probed apart from syq.
+#[cfg(debug_assertions)]
+fn filesystem_clones() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos_clone_support::available()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let directory = test_support::tempdir().unwrap();
+        write(&directory.path().join("source"), &[1; 1 << 16]);
+        let source = File::open(directory.path().join("source")).unwrap();
+        let copy = File::create(directory.path().join("copy")).unwrap();
+        let range = libc::file_clone_range {
+            src_fd: source.as_raw_fd().into(),
+            src_offset: 0,
+            src_length: 1 << 16,
+            dest_offset: 0,
+        };
+        unsafe { libc::ioctl(copy.as_raw_fd(), libc::FICLONERANGE, &range) == 0 }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn a_file_changed_unseen_after_its_comparison_gets_the_sources_bytes() {
@@ -1046,6 +1074,7 @@ fn a_file_changed_unseen_after_its_comparison_gets_the_sources_bytes() {
     // were, does not reach the published file. A clone that is not needed
     // goes; nothing is left behind.
     use std::os::unix::fs::FileExt as _;
+    let clones = filesystem_clones();
     for (route, cloning) in [
         ("local", true),
         ("local", false),
@@ -1098,9 +1127,7 @@ fn a_file_changed_unseen_after_its_comparison_gets_the_sources_bytes() {
         );
         assert!(read(&t.path("dst/same")) == unchanged, "{case}");
         let events = fs::read_to_string(&events).unwrap_or_default();
-        if !cloning {
-            assert!(!events.contains("cloned"), "{case}: {events}");
-        } else if events.contains("cloned") {
+        if cloning && clones {
             // The changed file's patch built on its clone; the kept file's
             // clone went.
             let mut seen: Vec<&str> = events
@@ -1110,7 +1137,7 @@ fn a_file_changed_unseen_after_its_comparison_gets_the_sources_bytes() {
             seen.sort();
             assert_eq!(seen, ["cloned", "cloned", "discarded", "staged"], "{case}");
         } else {
-            eprintln!("note: {case}: this filesystem did not clone");
+            assert!(!events.contains("cloned"), "{case}: {events}");
         }
         assert!(partial_files(&t.path("dst")).is_empty(), "{case}");
     }
