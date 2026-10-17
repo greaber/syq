@@ -262,6 +262,9 @@ pub struct Opts {
     /// approved does under `--bwlimit`, and refuses a request carrying more
     /// than one burst. An enrolled receiver leaves pacing to the sender.
     pub receiver_paces_file_data: bool,
+    /// The copy keeps existing files and copies hard links: a new name goes
+    /// only to a file the copy created (`Request::ConfigurePreservation`).
+    pub own_links: bool,
     pub dry_run: bool,
     dry_run_metadata_files: AtomicU64,
     pub quiet: bool,
@@ -383,6 +386,16 @@ impl Opts {
                 .mapping_metadata
                 .get(path)
                 .map_or(0, |m| m.apply_flags())
+    }
+
+    /// What a copy says of a destination its existing-file policy kept
+    /// while it ran (`Worker::kept_by_policy`).
+    fn kept_note(&self) -> &'static str {
+        if self.existing {
+            "replaced or removed during the copy; skipping it"
+        } else {
+            "appeared during the copy; keeping it"
+        }
     }
 
     fn protects_existing_contents(&self) -> bool {
@@ -724,6 +737,7 @@ pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
         args.sparse,
         false,
         args.interface == Interface::Rsync,
+        false,
     )?;
     Ok(connection)
 }
@@ -734,14 +748,16 @@ fn configure_preservation(
     sparse: bool,
     destination: bool,
     narrow_new_directories: bool,
+    own_links: bool,
 ) -> Result<()> {
-    if selection.any() || selection.open_noatime || sparse || narrow_new_directories {
+    if selection.any() || selection.open_noatime || sparse || narrow_new_directories || own_links {
         connection.send_expecting_ok(
             Request::ConfigurePreservation {
                 selection,
                 sparse,
                 destination,
                 narrow_new_directories,
+                own_links,
             },
             "configure inode metadata preservation",
         )?;
@@ -2454,6 +2470,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             .restricted_grant
             .as_deref()
             .is_some_and(|grant| !crate::restricted::enrolled_grant(grant)),
+        own_links: args.hardlinks && args.ignore_existing,
         dry_run: args.dry_run,
         dry_run_metadata_files: AtomicU64::new(0),
         quiet: args.quiet,
@@ -2640,13 +2657,16 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             &destination_metadata_platform,
         )?;
     }
-    if opts.inode_preservation.crtimes {
+    // A copy that keeps existing files gives new names by hard link only to
+    // files it created, on every receiver (`fsops::owned`).
+    if opts.inode_preservation.crtimes || opts.own_links {
         configure_preservation(
             &mut *dst_ctl,
             opts.inode_preservation,
             opts.sparse,
             true,
             opts.rsync_creation,
+            opts.own_links,
         )?;
     }
     if debug() {
@@ -2910,6 +2930,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         opts.sparse,
                         false,
                         false,
+                        false,
                     )?;
                     configure_preservation(
                         &mut *dst,
@@ -2917,6 +2938,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         opts.sparse,
                         true,
                         opts.rsync_creation,
+                        opts.own_links,
                     )?;
                     let fast_batch_files = opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES);
                     let transport_paced = (opts.src_remote || opts.dst_remote)
@@ -3886,7 +3908,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let root_creatable = dst_root_entry.is_none() && dst_is_dir && !args.existing;
     let mut create_root = root_creatable && !args.dry_run;
     let dry_run_creates_root = root_creatable && args.dry_run;
-    let root_create_condition = TargetCondition::Any;
+    // A directory that must be new (`--into-new`) is created without
+    // adopting one another program makes at its name first, as a restricted
+    // receiver creates it; that copy fails.
+    let root_create_condition = if args.target_existence == Existence::New {
+        TargetCondition::Absent
+    } else {
+        TargetCondition::Any
+    };
     // A directory target takes a contents source's metadata, which the
     // planner sends only once it has scanned the source root. When its
     // permissions or group are copied, create the root private until they

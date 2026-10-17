@@ -1274,6 +1274,10 @@ pub enum WireRequest<Data> {
         /// A new directory whose mode lacks owner access, as `syq rsync`
         /// creates one, gets that mode only after its contents.
         narrow_new_directories: bool,
+        /// The copy keeps existing files and copies hard links: a hard link
+        /// gives a new name only to a file this copy created
+        /// (`fsops::owned`).
+        own_links: bool,
     },
     NativeMap(crate::native_map::Options),
     /// Configure and select a bounded small push without reading its payloads.
@@ -1907,6 +1911,9 @@ impl ReplaceReason {
 pub struct InPlaceUpdate {
     pub meta: Meta,
     pub flags: u8,
+    /// Under `--only-existing`, the identity of the file the scan found:
+    /// only that file is written, and nothing is created at the name.
+    pub only: Option<(u64, u64)>,
 }
 
 impl WireError {

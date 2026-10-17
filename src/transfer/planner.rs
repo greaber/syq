@@ -3152,11 +3152,25 @@ impl Planner<'_> {
             return Ok(());
         }
         let opts = self.opts;
+        let conditions: Vec<TargetCondition> = ops.iter().map(op_condition).collect();
+        let paths: Vec<PathBytes> = ops.iter().map(|op| apply_path(op).to_vec()).collect();
         let errs = self.apply(ops)?;
         let capacity_error = first_capacity_error(&errs);
+        let kept = self.kept_by_policy(&paths, &conditions, &errs)?;
         // One op per item: the creation, which carries its metadata.
         for (i, queued) in op_names.iter().enumerate() {
             let error = errs.get(i).cloned().flatten();
+            if kept[i] {
+                self.progress.files_excluded.fetch_add(1, Relaxed);
+                if !opts.quiet {
+                    self.progress.eprintln(&format!(
+                        "syq: {}: {}",
+                        display(&queued.dst_rel),
+                        opts.kept_note()
+                    ));
+                }
+                continue;
+            }
             if queued.quiet && error.is_none() {
                 continue;
             }
@@ -3214,6 +3228,52 @@ impl Planner<'_> {
             return Err(endpoint_error(error)).context("apply destination changes");
         }
         Ok(())
+    }
+
+    /// Which failed operations only show a destination their existing-file
+    /// policy keeps, as the destination looks now: under `--if-exists=keep`
+    /// a name something else took, under `--only-existing` an object that
+    /// went or changed since the scan (`Worker::kept_by_policy`).
+    pub(super) fn kept_by_policy(
+        &mut self,
+        paths: &[PathBytes],
+        conditions: &[TargetCondition],
+        errors: &[Option<WireError>],
+    ) -> Result<Vec<bool>> {
+        let keep = self.opts.ignore_existing && !self.opts.new_target;
+        let only = self.opts.existing;
+        let candidates: Vec<usize> = (0..paths.len())
+            .filter(|&i| {
+                errors.get(i).is_some_and(|error| {
+                    error.as_ref().is_some_and(|error| {
+                        wire_os_kind(error).is_none_or(|kind| !capacity_os_kind(Some(kind)))
+                    })
+                }) && match conditions[i] {
+                    TargetCondition::Absent => keep,
+                    TargetCondition::Matches { .. } => only,
+                    _ => false,
+                }
+            })
+            .collect();
+        let mut kept = vec![false; paths.len()];
+        if candidates.is_empty() {
+            return Ok(kept);
+        }
+        let now = self.stat_many(candidates.iter().map(|&i| paths[i].clone()).collect())?;
+        for (&i, now) in candidates.iter().zip(now) {
+            kept[i] = match (conditions[i], now) {
+                (TargetCondition::Absent, now) => now.is_some(),
+                (condition, Some(entry)) => {
+                    condition
+                        != TargetCondition::Matches {
+                            dev: entry.dev,
+                            ino: entry.ino,
+                        }
+                }
+                (_, None) => true,
+            };
+        }
+        Ok(kept)
     }
 
     fn inspect_destination_batch(&mut self, mapped: &mut Mapped) -> Result<()> {
@@ -3619,19 +3679,31 @@ impl Planner<'_> {
         })
     }
 
+    /// The condition a leaf at `path` is created or replaced under. A
+    /// placement condition comes first. A new leaf under the error policies
+    /// or `--if-exists=keep` is created without replacing anything: a name
+    /// that appears in the meantime is kept. An existing leaf under
+    /// `--only-existing` is replaced only while it is still the object the
+    /// scan found: nothing is created where it went. A restricted receiver
+    /// holds its grant's copies to the same conditions itself.
     pub(super) fn leaf_condition_for(
         &self,
         path: &[u8],
         destination: Option<&Entry>,
     ) -> TargetCondition {
         let placement = self.exact_condition_for(path);
-        if placement == TargetCondition::Any
-            && destination.is_none()
-            && self.opts.protects_existing_contents()
-        {
-            TargetCondition::Absent
-        } else {
-            placement
+        if placement != TargetCondition::Any {
+            return placement;
+        }
+        match destination {
+            None if self.opts.protects_existing_contents() || self.opts.ignore_existing => {
+                TargetCondition::Absent
+            }
+            Some(existing) if self.opts.existing => TargetCondition::Matches {
+                dev: existing.dev,
+                ino: existing.ino,
+            },
+            _ => TargetCondition::Any,
         }
     }
 
@@ -4621,7 +4693,14 @@ impl Planner<'_> {
     /// finishes what an interrupted attempt left.
     fn in_place_allowed(&self, dst: &[u8], target_condition: TargetCondition) -> bool {
         self.opts.inplace
-            && target_condition == TargetCondition::Any
+            && match target_condition {
+                TargetCondition::Any => true,
+                // `--in-place=update` writes only the file the scan found
+                // under `--only-existing` (`InPlaceUpdate::only`); a new
+                // file's in-place write would create one.
+                TargetCondition::Matches { .. } => self.opts.inplace_update,
+                TargetCondition::Absent | TargetCondition::MatchesFingerprint { .. } => false,
+            }
             && !(self.opts.new_target && dst == self.dst_root)
     }
 
@@ -5321,6 +5400,34 @@ pub(super) fn strip_dst_root<'p>(path: &'p [u8], dst_root: &[u8]) -> Option<&'p 
     }
     let rest = path.strip_prefix(dst_root)?;
     Some(rest.strip_prefix(b"/").unwrap_or(rest))
+}
+
+/// The condition an operation's creation or replacement is held to.
+fn op_condition(op: &Op) -> TargetCondition {
+    match op {
+        Op::Mkdir { condition, .. }
+        | Op::Symlink { condition, .. }
+        | Op::Mknod { condition, .. }
+        | Op::Hardlink { condition, .. }
+        | Op::SetMeta { condition, .. }
+        | Op::SetFileMetaIfSame { condition, .. } => *condition,
+        Op::Remove { .. } | Op::Rmdir { .. } | Op::Unlink { .. } => TargetCondition::Any,
+    }
+}
+
+/// The destination path an operation changes.
+fn apply_path(op: &Op) -> &[u8] {
+    match op {
+        Op::Mkdir { path, .. }
+        | Op::Symlink { path, .. }
+        | Op::Mknod { path, .. }
+        | Op::Hardlink { path, .. }
+        | Op::SetMeta { path, .. }
+        | Op::SetFileMetaIfSame { path, .. }
+        | Op::Remove { path }
+        | Op::Rmdir { path }
+        | Op::Unlink { path } => path,
+    }
 }
 
 #[cfg(test)]

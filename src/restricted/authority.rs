@@ -162,7 +162,7 @@ impl RestrictedAuthority {
     pub(crate) fn owned_objects(
         &self,
     ) -> Option<std::sync::Arc<crate::fsops::owned::OwnedObjects>> {
-        (self.copy.policy.existing == ExistingDestinationPolicy::Skip
+        (self.creation_policy(false) == ExistingDestinationPolicy::Skip
             && self.extra_options.hardlinks)
             .then(|| self.owned.clone())
     }
@@ -816,16 +816,10 @@ impl RestrictedAuthority {
     /// A later publication still reports it. A file not being written has
     /// nothing to mark, and a refusal adds nothing that lasts.
     fn end_refused_lifecycles(&self, state: &mut AuthorityState, request: &Request) {
-        let (path, copy_id) = match request {
-            Request::Prepare { path, copy_id, .. }
-            | Request::StageBasis { path, copy_id, .. }
-            | Request::SeedBasis { path, copy_id, .. }
-            | Request::WriteRange { path, copy_id, .. }
-            | Request::ReuseComparedRange { path, copy_id, .. }
-            | Request::Finalize { path, copy_id, .. } => (path, *copy_id),
-            _ => return,
+        let Some(key) = file_key(request) else {
+            return;
         };
-        if let Some(lifecycle) = state.file_lifecycles.get_mut(&(path.clone(), copy_id)) {
+        if let Some(lifecycle) = state.file_lifecycles.get_mut(&key) {
             lifecycle.listed = true;
         }
     }
@@ -1062,7 +1056,20 @@ impl RestrictedAuthority {
                     index,
                     path,
                     change,
-                } => self.record_change(&path, change, outcome_error(index)),
+                } => {
+                    let creation = matches!(
+                        change,
+                        Change::PublishFile { .. }
+                            | Change::CreateSymlink
+                            | Change::CreateSpecial
+                            | Change::LinkFile
+                    );
+                    let error = outcome_error(index);
+                    if creation && error.is_some() && self.kept_by_policy(&state, &path, false) {
+                        continue;
+                    }
+                    self.record_change(&path, change, error);
+                }
                 PendingOutcome::FileStage {
                     index,
                     path,
@@ -1093,9 +1100,17 @@ impl RestrictedAuthority {
                         && matches!(response, proto::Response::EndpointError(error)
                             if crate::fsops::vouch::is_replace_required_wire(error));
                     // A published file is no longer in flight; what it
-                    // occupies stays counted.
-                    if stage == FileStage::Finalize && outcome_error(index).is_none() {
+                    // occupies stays counted. Nor is one whose name the
+                    // existing-object policy keeps.
+                    if stage == FileStage::Finalize
+                        && (outcome_error(index).is_none()
+                            || self.kept_by_policy(&state, &path, false))
+                    {
                         state.reserved.remove(&(path.clone(), copy_id));
+                        if outcome_error(index).is_some() {
+                            state.file_lifecycles.remove(&(path.clone(), copy_id));
+                            continue;
+                        }
                     }
                     if absent || refused || !streaming {
                         continue;
@@ -1168,7 +1183,7 @@ impl RestrictedAuthority {
         index: usize,
         pending: &mut Vec<PendingCreation>,
     ) -> Result<()> {
-        let policy = self.copy.policy.existing;
+        let policy = self.creation_policy(directory);
         let root_must_be_new =
             self.root_existence == RootExistence::New && path == self.destination;
         let label = String::from_utf8_lossy(path);
@@ -1196,6 +1211,30 @@ impl RestrictedAuthority {
         )
     }
 
+    /// The existing-object policy a creation is held to: the grant's, or,
+    /// for anything but a directory under `keep_files` (`syq rsync
+    /// --ignore-existing`), `Skip`.
+    fn creation_policy(&self, directory: bool) -> ExistingDestinationPolicy {
+        match self.copy.policy.existing {
+            ExistingDestinationPolicy::Replace if self.extra_options.keep_files && !directory => {
+                ExistingDestinationPolicy::Skip
+            }
+            policy => policy,
+        }
+    }
+
+    /// Whether the failure of a creation at `path` only shows an object its
+    /// existing-object policy keeps: under `Skip`, or `keep_files` for
+    /// anything but a directory, the name holds something this grant did
+    /// not create. Such a creation is no failure: nothing changed, as the
+    /// policy asks. A root that must be new is never kept.
+    fn kept_by_policy(&self, state: &AuthorityState, path: &[u8], directory: bool) -> bool {
+        self.creation_policy(directory) == ExistingDestinationPolicy::Skip
+            && !(self.root_existence == RootExistence::New && path == self.destination)
+            && !state.created.contains(path)
+            && self.rooted_metadata(path).ok().flatten().is_some()
+    }
+
     pub(super) fn constrain_observed_creation(
         &self,
         path: &[u8],
@@ -1212,9 +1251,15 @@ impl RestrictedAuthority {
                 let metadata = match observed {
                     Some(metadata) if !directory || metadata.is_dir() => metadata,
                     Some(_) => {
-                        bail!("signed grant creates nothing: {label} exists but is not a directory")
+                        return Err(kept(format!(
+                            "signed grant creates nothing: {label} exists but is not a directory"
+                        )))
                     }
-                    None => bail!("signed grant creates nothing: {label} does not exist"),
+                    None => {
+                        return Err(kept(format!(
+                            "signed grant creates nothing: {label} does not exist"
+                        )))
+                    }
                 };
                 // Pin the mutation to what was observed: a signed deletion on
                 // another connection could otherwise empty the path between
@@ -1244,9 +1289,11 @@ impl RestrictedAuthority {
                             metadata.ctime,
                             metadata.ctime_nsec,
                         ) => {}
-                    Matches { .. } | MatchesFingerprint { .. } => bail!(
-                        "requested identity for {label} does not match the object the receiver observed"
-                    ),
+                    Matches { .. } | MatchesFingerprint { .. } => {
+                        return Err(kept(format!(
+                            "requested identity for {label} does not match the object the receiver observed"
+                        )))
+                    }
                 }
                 if !directory {
                     // Metadata later in this same batch lands on the new
@@ -1271,7 +1318,13 @@ impl RestrictedAuthority {
                 if observed.is_some_and(|metadata| {
                     !(directory && metadata.is_dir() && policy == ExistingDestinationPolicy::Skip)
                 }) {
-                    bail!("signed grant retains existing objects: {label} already exists")
+                    let refusal =
+                        format!("signed grant retains existing objects: {label} already exists");
+                    // A root that must be new fails; anything else is kept.
+                    if policy == ExistingDestinationPolicy::Skip {
+                        return Err(kept(refusal));
+                    }
+                    bail!(refusal)
                 }
                 match *condition {
                     Any | Absent => *condition = Absent,
@@ -1318,9 +1371,9 @@ impl RestrictedAuthority {
             // this policy allows only to the grant's own files
             // (`OwnedObjects`).
             ExistingDestinationPolicy::Skip if created_before || created_here => Ok(()),
-            ExistingDestinationPolicy::Skip => {
-                bail!("signed grant retains existing objects: {label} may not be modified")
-            }
+            ExistingDestinationPolicy::Skip => Err(kept(format!(
+                "signed grant retains existing objects: {label} may not be modified"
+            ))),
             ExistingDestinationPolicy::MustExist if created_before || created_here => Ok(()),
             // Updates are pinned to the observed object, like publications:
             // nothing hostA supplies names an inode on its own authority.
@@ -1346,7 +1399,9 @@ impl RestrictedAuthority {
     ) -> Result<()> {
         use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
         let Some(metadata) = self.rooted_metadata(path)? else {
-            bail!("signed grant creates nothing: {label} does not exist")
+            return Err(kept(format!(
+                "signed grant creates nothing: {label} does not exist"
+            )));
         };
         let Some(condition) = condition else {
             return Ok(());
@@ -1374,9 +1429,11 @@ impl RestrictedAuthority {
                     metadata.ctime,
                     metadata.ctime_nsec,
                 ) => {}
-            Matches { .. } | MatchesFingerprint { .. } => bail!(
-                "requested identity for {label} does not match the object the receiver observed"
-            ),
+            Matches { .. } | MatchesFingerprint { .. } => {
+                return Err(kept(format!(
+                    "requested identity for {label} does not match the object the receiver observed"
+                )))
+            }
         }
         Ok(())
     }
@@ -1425,11 +1482,13 @@ impl RestrictedAuthority {
         }
         let label = String::from_utf8_lossy(path);
         match self.copy.policy.existing {
-            ExistingDestinationPolicy::Skip if self.rooted_metadata(path)?.is_some() => {
-                bail!("signed grant retains existing objects: {label} already exists")
-            }
+            ExistingDestinationPolicy::Skip if self.rooted_metadata(path)?.is_some() => Err(kept(
+                format!("signed grant retains existing objects: {label} already exists"),
+            )),
             ExistingDestinationPolicy::MustExist if self.rooted_metadata(path)?.is_none() => {
-                bail!("signed grant creates nothing: {label} does not exist")
+                Err(kept(format!(
+                    "signed grant creates nothing: {label} does not exist"
+                )))
             }
             _ => Ok(()),
         }
@@ -1927,7 +1986,7 @@ impl RestrictedAuthority {
         // this grant created, as an honest copy links only new names there.
         // The receiver links to the final name, which the kernel refuses
         // when it exists.
-        let keep = self.copy.policy.existing == ExistingDestinationPolicy::Skip;
+        let keep = self.creation_policy(false) == ExistingDestinationPolicy::Skip;
         if keep {
             *condition = proto::TargetCondition::Absent;
         }
@@ -2294,7 +2353,11 @@ impl RestrictedAuthority {
                 self.release_patch_holds(outcomes.into_iter());
                 // What it asked for, classified before taking the state lock:
                 // classifying may look at the destination.
-                let changes = if self.results_started.load(Ordering::Acquire) {
+                // The existing-object policy keeping what the destination
+                // holds is no refusal: nothing changed, as the policy asks,
+                // and the file this request was for is no longer in flight.
+                let kept = KeptExisting::is(&error);
+                let changes = if self.results_started.load(Ordering::Acquire) && !kept {
                     self.requested_changes(request)
                 } else {
                     Vec::new()
@@ -2305,12 +2368,18 @@ impl RestrictedAuthority {
                 // cannot end between the two. The state lock is taken before
                 // the results lock, as everywhere.
                 let mut state = self.state.lock().unwrap();
-                state.recorded_any = true;
-                if self.results_started.load(Ordering::Acquire) {
-                    if let Some(stream) = self.results.lock().unwrap().as_mut() {
-                        stream.refused(&format!("refused: {error:#}"), &changes);
+                if kept {
+                    if let Some(key) = file_key(request) {
+                        state.file_lifecycles.remove(&key);
                     }
-                    self.end_refused_lifecycles(&mut state, request);
+                } else {
+                    state.recorded_any = true;
+                    if self.results_started.load(Ordering::Acquire) {
+                        if let Some(stream) = self.results.lock().unwrap().as_mut() {
+                            stream.refused(&format!("refused: {error:#}"), &changes);
+                        }
+                        self.end_refused_lifecycles(&mut state, request);
+                    }
                 }
                 if tracked {
                     state.in_flight = state.in_flight.saturating_sub(1);
@@ -3212,4 +3281,46 @@ pub(crate) struct PendingCreation {
     /// The name a hard link made, for a file that may already have been
     /// there: never the grant's own, even later in its own request.
     pub(super) link: bool,
+}
+
+/// The file a request writes, by destination path and partial.
+fn file_key(request: &Request) -> Option<(Vec<u8>, proto::CopyId)> {
+    match request {
+        Request::Prepare { path, copy_id, .. }
+        | Request::StageBasis { path, copy_id, .. }
+        | Request::SeedBasis { path, copy_id, .. }
+        | Request::WriteRange { path, copy_id, .. }
+        | Request::ReuseComparedRange { path, copy_id, .. }
+        | Request::Finalize { path, copy_id, .. } => Some((path.clone(), *copy_id)),
+        _ => None,
+    }
+}
+
+/// A request the grant's existing-object policy declines because of what
+/// the destination holds now: a name that is taken where only new objects
+/// are made, or an object gone or replaced where only existing ones are
+/// changed. Nothing is changed, and the existing object is kept, as the
+/// policy asks; it is not reported as a refusal.
+#[derive(Debug)]
+pub(crate) struct KeptExisting(String);
+
+impl std::fmt::Display for KeptExisting {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for KeptExisting {}
+
+fn kept(message: String) -> anyhow::Error {
+    KeptExisting(message).into()
+}
+
+impl KeptExisting {
+    /// Whether `error` is one.
+    pub(crate) fn is(error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .any(|cause| cause.downcast_ref::<KeptExisting>().is_some())
+    }
 }

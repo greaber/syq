@@ -314,8 +314,13 @@ impl Worker {
                 && (self.compares_first(job, existing)
                     || (self.reuses_blocks_for(job, Some(existing))
                         && job.entry.size > self.compare_group_limits().0)));
+        // Publication replaces only the file the scan found under
+        // `--only-existing` (`TargetCondition::Matches`), batched or not.
         existing.kind == Kind::File
-            && job.target_condition == TargetCondition::Any
+            && matches!(
+                job.target_condition,
+                TargetCondition::Any | TargetCondition::Matches { .. }
+            )
             && !inspects_destination
     }
 
@@ -374,7 +379,10 @@ impl Worker {
             // In place, only the blocks that differ are written; that is the
             // per-file path.
             && !j.inplace
-            && j.target_condition == TargetCondition::Any
+            && matches!(
+                j.target_condition,
+                TargetCondition::Any | TargetCondition::Matches { .. }
+            )
             && !self.inspects_destination(j)
             && jobs.destination(idx).is_some_and(|existing| {
                 self.compares_first(j, existing) && !self.probes_per_file(j, existing)
@@ -862,6 +870,10 @@ impl Worker {
             };
             if let Err(e) = res {
                 let os_kind = os_kind_of(&e);
+                if !capacity_os_kind(os_kind) && self.kept_by_policy(j) {
+                    self.skip_kept(*idx, j);
+                    continue;
+                }
                 let message = copy_error_message(&e, self.opts.failure_hint_at(&j.dst));
                 // The receiver lists a publication it refused or failed; a
                 // file that could not be read never reached it.
@@ -925,11 +937,8 @@ impl Worker {
     /// the source's new metadata, or report it when it vanished or has no
     /// attempts left.
     pub(super) fn retry_changed_small(&self, idx: usize, j: &WorkerJob, now: Option<Entry>) {
-        if let (Some(e), true, true) = (
-            now,
-            j.attempt + 1 < MAX_ATTEMPTS,
-            j.target_condition == TargetCondition::Any,
-        ) {
+        // Nothing was published, so the retry is held to the same condition.
+        if let (Some(e), true) = (now, j.attempt + 1 < MAX_ATTEMPTS) {
             if !self.opts.quiet {
                 self.progress.eprintln(&format!(
                     "syq: {}: changed during transfer, retrying",
@@ -970,6 +979,11 @@ impl Worker {
         if e.is::<RangeReplyMismatch>() || self.transport_dead() {
             return Err(e);
         }
+        let job = self.job(idx);
+        if !capacity_os_kind(os_kind_of(&e)) && self.kept_by_policy(&job) {
+            self.skip_kept(idx, &job);
+            return Ok(());
+        }
         if self.sched.fail_file(idx) {
             let job = self.job(idx);
             let os_kind = os_kind_of(&e);
@@ -987,6 +1001,51 @@ impl Worker {
             }
         }
         Ok(())
+    }
+
+    /// Whether `job`'s failure only shows a destination its existing-file
+    /// policy keeps, as the destination looks now: under
+    /// `--if-exists=keep` a name something else took, under
+    /// `--only-existing` a file that went or changed since the scan. Such a
+    /// file is skipped, as one the scan found would have been, not failed.
+    pub(super) fn kept_by_policy(&mut self, job: &WorkerJob) -> bool {
+        let keep = self.opts.ignore_existing
+            && !self.opts.new_target
+            && job.target_condition == TargetCondition::Absent;
+        let only =
+            self.opts.existing && matches!(job.target_condition, TargetCondition::Matches { .. });
+        if !(keep || only) {
+            return false;
+        }
+        let Ok(now) = stat_one(&mut *self.dst, &job.dst, false) else {
+            return false;
+        };
+        match now {
+            Some(_) if keep => true,
+            Some(entry) => {
+                job.target_condition
+                    != TargetCondition::Matches {
+                        dev: entry.dev,
+                        ino: entry.ino,
+                    }
+            }
+            None => only,
+        }
+    }
+
+    /// Skip `job`, whose destination its existing-file policy keeps
+    /// (`kept_by_policy`).
+    pub(super) fn skip_kept(&self, idx: usize, job: &WorkerJob) {
+        // Retired as a failure is, so that no hard link gives it a new name,
+        // but reported as skipped.
+        self.sched.fail_file(idx);
+        self.sched.take_receiver_hold(idx);
+        self.progress.files_total.fetch_sub(1, Relaxed);
+        self.progress.files_excluded.fetch_add(1, Relaxed);
+        if !self.opts.quiet {
+            self.progress
+                .eprintln(&format!("syq: {}: {}", job.rel, self.opts.kept_note()));
+        }
     }
 
     /// How a command-restricted receiver reports this file's failure: as
@@ -1508,9 +1567,14 @@ impl Worker {
         }
         let mut meta = self.opts.metadata_for(&job.rel_bytes, &job.entry);
         meta.mode = self.create_mode(job);
+        let only = match job.target_condition {
+            TargetCondition::Matches { dev, ino } => Some((dev, ino)),
+            _ => None,
+        };
         Some(Box::new(InPlaceUpdate {
             meta,
             flags: self.publication_flags(job),
+            only,
         }))
     }
 
@@ -2926,7 +2990,11 @@ impl Worker {
         let now = stat_one_registered(&mut *self.src, &job.src, &job.source, false)?;
         let changed = source_changed(&job.entry, now.as_ref());
         if changed {
-            if job.attempt + 1 < MAX_ATTEMPTS && job.target_condition == TargetCondition::Any {
+            // A retry is held to the same condition, which a file this
+            // attempt already completed at the destination would fail.
+            if job.attempt + 1 < MAX_ATTEMPTS
+                && (job.target_condition == TargetCondition::Any || !destination_completed)
+            {
                 if let Some(e) = now {
                     if !self.opts.quiet {
                         self.progress.eprintln(&format!(

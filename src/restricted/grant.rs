@@ -50,6 +50,7 @@ pub(crate) fn extra_copy_options(args: &Args) -> delegation::ExtraCopyOptions {
         sparse: args.sparse,
         open_noatime: args.open_noatime || args.atimes > 1,
         widen_dirs: args.widen_dirs.into(),
+        keep_files: args.ignore_existing && !args.only_new_native_entries(),
     }
 }
 

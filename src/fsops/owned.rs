@@ -1,5 +1,5 @@
-//! A grant that keeps existing objects lets a restricted receiver replace a
-//! file or change metadata only at a name this grant created. The one step
+//! A copy that keeps existing files lets a receiver replace a file or
+//! change metadata only at a name the copy created. The one step
 //! that could bring an existing file under such a name is a hard link to
 //! it, so under such a grant a hard link may give a new name only to a file
 //! this receiver created for the grant. The receiver records those files
@@ -25,6 +25,20 @@
 
 use super::*;
 use std::collections::HashSet;
+
+/// The files each copy that keeps existing files created in this process,
+/// by the copy's scope (`stages::new_scope`): every connection of an
+/// ordinary copy shares them, as a restricted receiver's connections share
+/// their authority's.
+fn shared() -> &'static Mutex<HashMap<u64, Arc<OwnedObjects>>> {
+    static SHARED: OnceLock<Mutex<HashMap<u64, Arc<OwnedObjects>>>> = OnceLock::new();
+    SHARED.get_or_init(Default::default)
+}
+
+/// Forget the files the copy `scope` created, when its control ends.
+pub(crate) fn release(scope: u64) {
+    shared().lock().unwrap().remove(&scope);
+}
 
 #[derive(Default)]
 pub(crate) struct OwnedObjects(Mutex<HashSet<(u64, u64)>>);
@@ -57,5 +71,22 @@ impl FsOps {
     /// as a grant that keeps existing objects requires.
     pub(crate) fn set_owned_objects(&mut self, owned: Option<Arc<OwnedObjects>>) {
         self.owned = owned;
+    }
+
+    /// Give new names by hard link only to the files this copy created, as
+    /// a copy that keeps existing files and copies hard links does on every
+    /// receiver. A restricted receiver's authority may already have set
+    /// them; that stays.
+    pub(super) fn keep_links_to_own_files(&mut self) {
+        if self.owned.is_none() {
+            self.owned = Some(
+                shared()
+                    .lock()
+                    .unwrap()
+                    .entry(self.stage_scope)
+                    .or_default()
+                    .clone(),
+            );
+        }
     }
 }

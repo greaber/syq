@@ -450,6 +450,10 @@ pub(crate) struct ExtraCopyOptions {
     pub sparse: bool,
     pub open_noatime: bool,
     pub widen_dirs: DirectoryWidening,
+    /// `syq rsync --ignore-existing`: new files, links and special files are
+    /// created without replacing anything, as under the `Skip` policy, while
+    /// existing directories still take the copy's metadata.
+    pub keep_files: bool,
 }
 
 /// Which existing destination directories the receiver may briefly give the

@@ -8918,3 +8918,74 @@ fn writes_past_the_size_declared_for_a_file_are_refused() {
         assert_eq!(fs::read(dir.path().join(name)).unwrap(), b"four", "{name}");
     }
 }
+
+/// A copy that keeps existing files and copies hard links gives a new name
+/// only to a file it created, on an ordinary receiver as on a restricted
+/// one: every connection of the copy shares what it created.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_keeping_copy_links_new_names_only_to_files_it_created() {
+    let dir = crate::test_support::tempdir().unwrap();
+    fs::write(dir.path().join("existing"), b"not ours").unwrap();
+    let path = |name: &str| dir.path().join(name).as_os_str().as_bytes().to_vec();
+    let configure = Request::ConfigurePreservation {
+        selection: Default::default(),
+        sparse: false,
+        destination: true,
+        narrow_new_directories: false,
+        own_links: true,
+    };
+    let mut publisher = FsOps::test_destination(dir.path());
+    publisher.set_stage_scope(crate::fsops::new_stage_scope());
+    let mut linker = FsOps::test_destination(dir.path());
+    linker.set_stage_scope(publisher.stage_scope());
+    for ops in [&mut publisher, &mut linker] {
+        assert!(matches!(ops.handle(&configure), Response::Ok));
+    }
+    let published = publisher.handle(&Request::PutSmallBatch(vec![SmallPut {
+        path: path("ours"),
+        copy_id: [6; 16],
+        data: b"ours".to_vec(),
+        hash: content_digest(b"ours"),
+        meta: Meta {
+            inode_metadata: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+        },
+        flags: 0,
+        inplace: false,
+        condition: TargetCondition::Absent,
+        replaces: false,
+        scanned: ScannedDestination::Absent,
+    }]));
+    assert!(
+        matches!(&published, Response::Applied(errors) if errors.iter().all(Option::is_none))
+            || matches!(&published, Response::PublishedBatch(results) if results.iter().all(Result::is_ok)),
+        "{published:?}"
+    );
+    let link = |source: &str, name: &str| {
+        let metadata = fs::metadata(dir.path().join(source)).unwrap();
+        Request::Apply {
+            ops: vec![Op::Hardlink {
+                path: path(name),
+                source: path(source),
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                condition: TargetCondition::Absent,
+            }],
+        }
+    };
+    let Response::Applied(errors) = linker.handle(&link("existing", "existing-link")) else {
+        panic!("expected an Apply response")
+    };
+    assert!(errors[0].is_some());
+    assert!(!dir.path().join("existing-link").exists());
+    let Response::Applied(errors) = linker.handle(&link("ours", "ours-link")) else {
+        panic!("expected an Apply response")
+    };
+    assert!(errors[0].is_none(), "{errors:?}");
+    crate::fsops::release_stages(publisher.stage_scope());
+}

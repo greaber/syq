@@ -285,6 +285,7 @@ impl SourceConnection {
             sparse: policy.sparse,
             destination: false,
             narrow_new_directories: false,
+            own_links: false,
         });
         match response {
             Response::Ok => Ok(()),

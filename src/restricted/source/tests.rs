@@ -485,6 +485,7 @@ fn hashing_and_metadata_stay_within_the_approved_read_policy() {
             sparse: false,
             destination: true,
             narrow_new_directories: false,
+            own_links: false,
         })
         .is_err());
     assert!(fixture
@@ -497,6 +498,7 @@ fn hashing_and_metadata_stay_within_the_approved_read_policy() {
             sparse: false,
             destination: false,
             narrow_new_directories: false,
+            own_links: false,
         })
         .is_err());
     fs::write(&file, vec![0; 1025]).unwrap();

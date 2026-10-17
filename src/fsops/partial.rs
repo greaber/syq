@@ -295,6 +295,14 @@ impl FsOps {
                 };
             }
         };
+        if let Some(only) = update.only {
+            if (opened.dev(), opened.ino()) != only {
+                bail!(
+                    "destination {} changed since it was found, and only it is updated (--only-existing)",
+                    target.label.display()
+                );
+            }
+        }
         let mut checked = None;
         if let Some(compared) = compared {
             let identity = compared.file.metadata()?;
@@ -584,6 +592,12 @@ impl FsOps {
                         CachedFile::held(file, in_use, size),
                     );
                     return Ok(Preparation::default());
+                }
+                if update.only.is_some() {
+                    bail!(
+                        "destination {} is gone, and nothing is created there (--only-existing)",
+                        target.label.display()
+                    );
                 }
             }
             if compared.is_some() {
@@ -1568,7 +1582,14 @@ impl FsOps {
             let held = self.held_inplace(&target, copy_id)?;
             let updated = match (&held, update) {
                 (None, Some(update)) => {
-                    self.open_inplace_update(&target, copy_id, update, None, size)?
+                    let opened = self.open_inplace_update(&target, copy_id, update, None, size)?;
+                    if opened.is_none() && update.only.is_some() {
+                        bail!(
+                            "destination {} is gone, and nothing is created there (--only-existing)",
+                            target.label.display()
+                        );
+                    }
+                    opened
                 }
                 _ => None,
             };
@@ -3238,6 +3259,7 @@ impl FsOps {
                 sparse,
                 destination,
                 narrow_new_directories,
+                own_links,
             } => {
                 let validation = if *destination {
                     selection.validate_destination()
@@ -3248,6 +3270,9 @@ impl FsOps {
                     self.inode_preservation = *selection;
                     self.sparse = *sparse;
                     self.narrow_new_directories = *narrow_new_directories;
+                    if *own_links {
+                        self.keep_links_to_own_files();
+                    }
                     Response::Ok
                 })
             }

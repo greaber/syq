@@ -101,7 +101,15 @@ use sidecars::Sidecar;
 pub(crate) use sidecars::{sweep as sweep_sidecars, track as track_sidecars, Swept};
 #[cfg(test)]
 pub(crate) use stages::count as held_stage_count;
-pub(crate) use stages::{new_scope as new_stage_scope, release as release_stages};
+pub(crate) use stages::new_scope as new_stage_scope;
+
+/// Let go of what the copy `scope` holds in this process when its control
+/// ends: the files it is writing, and the files it created that hard links
+/// may name.
+pub(crate) fn release_stages(scope: u64) {
+    stages::release(scope);
+    owned::release(scope);
+}
 
 /// Compare at the decimal precision suggested by the destination timestamp.
 /// Trailing zeros may reflect either filesystem truncation or a round timestamp;
@@ -3477,19 +3485,39 @@ impl FsOps {
         for (i, r) in guarded_idx.iter().zip(gres) {
             out[*i] = r;
         }
-        if guarded_idx.iter().any(|&i| out[i].is_some()) {
-            for i in create_idx.iter().chain(meta_idx.iter()) {
-                out[*i] =
-                    Some("operation skipped because the placement-root precondition failed".into());
+        // Nothing at or beneath a name whose no-replace creation failed is
+        // changed: it holds what was there, and the request's operations
+        // there were meant for the new object. Other operations go ahead.
+        let failed: Vec<&[u8]> = guarded_idx
+            .iter()
+            .filter(|&&i| out[i].is_some())
+            .map(|&i| op_path(&ops[i]))
+            .collect();
+        let under_failed = |i: usize| {
+            let path = op_path(&ops[i]);
+            failed.iter().any(|failed| {
+                path == *failed
+                    || (path.starts_with(failed) && path.get(failed.len()) == Some(&b'/'))
+            })
+        };
+        let skip = |indices: &[usize], out: &mut [Option<WireError>]| -> Vec<usize> {
+            let (skipped, run): (Vec<usize>, Vec<usize>) =
+                indices.iter().partition(|&&i| under_failed(i));
+            for i in skipped {
+                out[i] = Some(
+                    "operation skipped because the no-replace creation it depends on failed".into(),
+                );
             }
-            return out;
-        }
+            run
+        };
         for wave in waves {
+            let wave = skip(&wave, &mut out);
             let cres = parallel_by_directory(minimum, ops, &wave, create);
             for (i, r) in wave.iter().zip(cres) {
                 out[*i] = r;
             }
         }
+        let meta_idx = skip(&meta_idx, &mut out);
         let private = private.into_inner().unwrap();
         let mres = parallel_map_from(minimum, &meta_idx, |&i| {
             // A receiver-chosen mode is decided here, in parallel, once the

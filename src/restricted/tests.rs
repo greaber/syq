@@ -5434,6 +5434,7 @@ fn signed_grants_authorize_only_their_inode_metadata() {
     };
     let configuration = |selection, sparse| Request::ConfigurePreservation {
         narrow_new_directories: false,
+        own_links: false,
         sparse,
         selection,
         destination: true,
@@ -5495,6 +5496,7 @@ fn signed_grants_authorize_only_their_inode_metadata() {
     // The receiver's own creation rules are not the sender's to choose.
     let mut rsync_directories = Request::ConfigurePreservation {
         narrow_new_directories: true,
+        own_links: false,
         sparse: false,
         selection: acls_only,
         destination: true,
@@ -7262,6 +7264,7 @@ fn both_receivers_update_in_place_only_files_they_vouch_for() {
                 Box::new(proto::InPlaceUpdate {
                     meta: meta.clone(),
                     flags,
+                    only: None,
                 })
             }),
         };
@@ -7381,6 +7384,7 @@ fn in_place_updates_need_a_grant_for_them() {
         update: Some(Box::new(proto::InPlaceUpdate {
             meta: plain_meta(),
             flags,
+            only: None,
         })),
     };
     for (publication, allowed) in [
@@ -8670,4 +8674,60 @@ fn signed_mapping_metadata_is_applied_without_its_copy_options() {
     assert!(authority
         .check_preparation_flags(&set, 0o644, proto::flags::MODE)
         .is_err());
+}
+
+/// A grant that keeps existing objects keeps a file another program puts
+/// at a new file's name while the copy runs, whether the receiver finds it
+/// when it authorizes the file or when it publishes it. That is no refusal
+/// or failure: nothing changed, as the grant asks, and the results list
+/// nothing for it.
+#[test]
+fn files_the_keep_policy_keeps_are_neither_refused_nor_failed() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let (secret, policy) = results_policy();
+    let authority = test_authority_with_results(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Skip,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+        Some((key, policy)),
+    )
+    .unwrap();
+    let mut reader = start_results(&authority, secret);
+    // Found when the receiver authorizes it.
+    fs::write(target.join("early"), b"theirs").unwrap();
+    let error = authority
+        .authorize(&mut small_put(&target.join("early")), false)
+        .unwrap_err();
+    assert!(KeptExisting::is(&error), "{error:#}");
+    // Found when the receiver publishes it.
+    let mut late = small_put(&target.join("late"));
+    let settlement = authority.authorize(&mut late, false).unwrap();
+    fs::write(target.join("late"), b"theirs").unwrap();
+    let response = authority.test_ops().handle(&late);
+    authority.settle(settlement, &response);
+    assert!(
+        matches!(&response, proto::Response::Applied(errors) if errors[0].is_some())
+            || matches!(&response, proto::Response::PublishedBatch(results) if results[0].is_err()),
+        "{response:?}"
+    );
+    for name in ["early", "late"] {
+        assert_eq!(fs::read(target.join(name)).unwrap(), b"theirs", "{name}");
+    }
+    let results = finish_results(&authority, &mut reader);
+    assert_eq!((results.totals.refused, results.totals.failed), (0, 0));
+    assert!(results.changes().is_empty(), "{:?}", results.records);
+    assert_eq!(
+        authority.changes.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
 }
