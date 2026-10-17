@@ -2378,7 +2378,7 @@ impl Root {
             )
             .with_context(|| format!("atomically publish confined path {}", target.label()))?
         {
-            let aside = self.publish_over_moved_aside(
+            let (aside, moved) = self.publish_over_moved_aside_keeping_link(
                 &mut profile,
                 target,
                 &target_parent,
@@ -2391,16 +2391,33 @@ impl Root {
             )?;
             #[cfg(any(target_os = "linux", test))]
             drop(permit);
+            // A linked file still has its staged name, so it has two links
+            // here; checked before that name goes, as `publish_new_regular`
+            // checks.
             if profile.link_counts_trusted {
                 let published =
                     metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
-                if !is_safe_staged_identity(published, staged_dev, staged_ino) {
+                let expected = match moved {
+                    publication::Moved::Renamed => {
+                        is_safe_staged_identity(published, staged_dev, staged_ino)
+                    }
+                    publication::Moved::Linked => {
+                        is_safe_staged_identity_after_link(published, staged_dev, staged_ino)
+                    }
+                };
+                if !expected {
                     bail!(
                         "confined staged path {} changed during publication; kept the entry it displaced as {}",
                         source.label(),
                         sibling_label(target, &aside)
                     );
                 }
+            }
+            if moved == publication::Moved::Linked {
+                #[cfg(any(target_os = "linux", test))]
+                let _permit = self.mutation_permit(source)?;
+                unlink_at(source_parent.directory.as_raw_fd(), &source_parent.leaf, 0)
+                    .with_context(|| format!("remove staged confined path {}", source.label()))?;
             }
             return unlink_at(target_parent.directory.as_raw_fd(), &aside, 0)
                 .with_context(|| format!("remove displaced confined path {}", target.label()));
@@ -2564,6 +2581,38 @@ impl Root {
         replacement: (RawFd, &CStr, publication::Link),
         expected: impl Fn(RootMetadata) -> bool,
     ) -> Result<CString> {
+        let (aside, moved) = self.publish_over_moved_aside_keeping_link(
+            profile,
+            target,
+            target_parent,
+            replacement,
+            expected,
+        )?;
+        if moved == publication::Moved::Linked {
+            unlink_at(replacement.0, replacement.1, 0).with_context(|| {
+                format!(
+                    "remove the replacement's own name after publishing {}; kept the entry it displaced as {}",
+                    target.label(),
+                    sibling_label(target, &aside)
+                )
+            })?;
+        }
+        Ok(aside)
+    }
+
+    /// `publish_over_moved_aside`, leaving a replacement published by a hard
+    /// link under its own name too (`Moved::Linked`), for the caller to
+    /// check and remove. A file still open is checked this way: on an NFS
+    /// client, removing an open file's name only renames it, and it keeps
+    /// its second link until it is closed.
+    fn publish_over_moved_aside_keeping_link(
+        &self,
+        profile: &mut crate::fsops::Profile,
+        target: &RelativePath,
+        target_parent: &ResolvedParent<'_>,
+        replacement: (RawFd, &CStr, publication::Link),
+        expected: impl Fn(RootMetadata) -> bool,
+    ) -> Result<(CString, publication::Moved)> {
         let (replacement_directory, replacement, replacement_link) = replacement;
         let directory = target_parent.directory.as_raw_fd();
         let Some(aside) =
@@ -2613,7 +2662,7 @@ impl Root {
                 return Err(put_back(profile, link, "could not be checked").context(error));
             }
         };
-        match self.move_own_name_without_replacing(
+        match self.move_without_replacing(
             profile,
             &target_parent.directory,
             &publication::Placement {
@@ -2624,7 +2673,7 @@ impl Root {
                 link: replacement_link,
             },
         ) {
-            Ok(()) => Ok(aside),
+            Ok(moved) => Ok((aside, moved)),
             // A later writer took the name: theirs stays, and so does the
             // entry this replacement was to replace.
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
