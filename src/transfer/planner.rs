@@ -59,11 +59,6 @@ pub(super) struct Planner<'a> {
     /// --mapping: full destination paths of implicit ancestor directories no
     /// entry names, created with default metadata (no deferred stamping).
     pub(super) implicit_dirs: std::collections::HashSet<PathBytes>,
-    /// Manifest-relative parents with their own entry, even in a later batch.
-    /// The signed mapping permits replacing these, unlike implicit parents.
-    pub(super) mapping_explicit_parents: std::collections::HashSet<PathBytes>,
-    /// Observed obstructions at implicit parents fail only mapped descendants.
-    pub(super) blocked_mapping_parents: std::collections::HashSet<PathBytes>,
     /// One pending destination container, including a file-only copy's parent.
     /// The directory the copy goes into, with the owner permission it needs.
     pub(super) container_access: Option<(PathBytes, TargetCondition, u32)>,
@@ -945,15 +940,9 @@ impl Planner<'_> {
         src_root: &[u8],
         dst_root: &[u8],
         entries: Vec<(u64, ManifestEntry)>,
-        explicit_parents: std::collections::HashSet<PathBytes>,
     ) -> Result<()> {
         use std::collections::{HashMap, HashSet};
         self.mapping_mode = true;
-        if self.opts.restricted_receiver {
-            self.mapping_explicit_parents = explicit_parents;
-        } else {
-            drop(explicit_parents);
-        }
         let source_base = self
             .active_source
             .clone()
@@ -1301,8 +1290,6 @@ impl Planner<'_> {
         // alone still needs the destination claims.
         self.created_dirs = std::collections::HashSet::new();
         self.missing_dirs = std::collections::HashSet::new();
-        self.mapping_explicit_parents = std::collections::HashSet::new();
-        self.blocked_mapping_parents = std::collections::HashSet::new();
         self.blocked_directory_paths = std::collections::HashSet::new();
         // Dry-run traces need every directory identity. Live copies only need
         // identities for deferred metadata failures; retire the leaf mappings.
@@ -1395,7 +1382,7 @@ impl Planner<'_> {
             let Some(contested) = self.claim_dst(&dst, &rel, claim) else {
                 continue;
             };
-            if claim != Claim::Weak && self.fail_blocked_mapping_entry(&dst, &dst_rel, e.kind) {
+            if claim != Claim::Weak && self.under_blocked_directory(&dst) {
                 continue;
             }
             self.record_fresh_entry(&dst, &dst_rel, src_root, &e, new_capacity_object)?;
@@ -1737,8 +1724,8 @@ impl Planner<'_> {
             }
         }
 
-        if !self.blocked_mapping_parents.is_empty() || !self.blocked_directory_paths.is_empty() {
-            others.retain(|p| !self.fail_blocked_mapping_entry(&p.dst, &p.dst_rel, p.e.kind));
+        if !self.blocked_directory_paths.is_empty() {
+            others.retain(|p| !self.under_blocked_directory(&p.dst));
         }
         if others.is_empty() {
             return Ok(());
@@ -2465,7 +2452,7 @@ impl Planner<'_> {
         let opts = self.opts;
         let mut planned: Vec<PlannedDir> = Vec::new();
         for ((p, dst_rel, e), st) in dirs.into_iter().zip(stats) {
-            if self.fail_blocked_mapping_entry(&p, &dst_rel, e.kind) {
+            if self.under_blocked_directory(&p) {
                 continue;
             }
             let is_dir = matches!(st, Some(ref d) if d.kind == Kind::Dir);
@@ -2491,18 +2478,6 @@ impl Planner<'_> {
                     ));
                 }
                 self.missing_dirs.insert(p);
-                continue;
-            }
-            if opts.restricted_receiver
-                && st.is_some()
-                && !is_dir
-                && self.implicit_dirs.contains(&p)
-                && !self.mapping_explicit_parents.contains(&dst_rel)
-            {
-                // Parent creation does not grant permission to replace a
-                // file or symlink. Use the stat already in this batch to
-                // fail affected entries before sending any mkdir request.
-                self.blocked_mapping_parents.insert(p);
                 continue;
             }
             if st.as_ref().is_some_and(|d| d.kind != Kind::Dir) {
@@ -3377,51 +3352,11 @@ impl Planner<'_> {
         );
     }
 
-    /// Report only real manifest entries beneath a protected obstruction;
-    /// synthesized directories have no source object or retry record.
-    pub(super) fn fail_blocked_mapping_entry(
-        &self,
-        dst: &[u8],
-        dst_rel: &[u8],
-        kind: Kind,
-    ) -> bool {
-        // The parent conflict has already been reported. Do not schedule its
-        // descendants or report them as separate failed copies.
-        if Self::under_any(&self.blocked_directory_paths, dst, &self.dst_root) {
-            return true;
-        }
-        if !Self::under_any(&self.blocked_mapping_parents, dst, &self.dst_root) {
-            return false;
-        }
-        if !self.implicit_dirs.contains(dst) {
-            let message = format!(
-                "syq: {}: a file or symlink blocks an implicit mapping parent",
-                display(dst)
-            );
-            self.progress
-                .error_classified(&message, Some("conflict"), None);
-            self.emit_mapping_entry_failed(
-                &ManifestEntry {
-                    expected_hash: self.opts.expected_for(dst_rel).cloned(),
-                    metadata: self.opts.mapping_metadata.get(dst_rel).copied(),
-                    src: self
-                        .mapping_source_rel(dst_rel)
-                        .expect("mapping parent failure"),
-                    dst: dst_rel.to_vec(),
-                    kind: Some(match kind {
-                        Kind::Dir => DeclaredKind::Dir,
-                        Kind::File => DeclaredKind::File,
-                        Kind::Symlink => DeclaredKind::Symlink,
-                        _ => DeclaredKind::Special,
-                    }),
-                },
-                "unknown",
-                "conflict",
-                None,
-                &message,
-            );
-        }
-        true
+    /// Whether `dst` lies beneath a directory whose conflict was already
+    /// reported (`fail_directory_type_change`): it is then neither scheduled
+    /// nor reported as a separate failed copy.
+    pub(super) fn under_blocked_directory(&self, dst: &[u8]) -> bool {
+        Self::under_any(&self.blocked_directory_paths, dst, &self.dst_root)
     }
 
     /// A mapping entry that failed before any job existed (missing source,

@@ -184,9 +184,9 @@ impl TransferTuning {
         self,
         hash_block: u64,
         limit: Option<&crate::bwlimit::BandwidthLimit>,
-        restricted_receiver: bool,
+        receiver_paces: bool,
     ) -> u64 {
-        let size = self.request_size(hash_block, limit, restricted_receiver);
+        let size = self.request_size(hash_block, limit, receiver_paces);
         if self.request_size.is_some() {
             size
         } else {
@@ -198,17 +198,17 @@ impl TransferTuning {
         self,
         hash_block: u64,
         limit: Option<&crate::bwlimit::BandwidthLimit>,
-        restricted_receiver: bool,
+        receiver_paces: bool,
     ) -> u64 {
         let size = self.request_size.unwrap_or(hash_block);
         let size = match (limit, self.bw_pacing.unwrap_or_default()) {
             (Some(limit), BwPacing::IntervalMs(ms)) => size.min(limit.bytes_for_interval(ms)),
             _ => size,
         };
-        // The signed receiver independently refuses larger writes. Tuning
-        // cannot enlarge that authority; retain its released request ceiling.
+        // A receiver that paces file data refuses larger writes. Tuning
+        // cannot enlarge that authority; retain its request ceiling.
         match limit {
-            Some(limit) if restricted_receiver => size.min(limit.burst_bytes()),
+            Some(limit) if receiver_paces => size.min(limit.burst_bytes()),
             _ => size,
         }
     }

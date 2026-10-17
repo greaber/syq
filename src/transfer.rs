@@ -177,7 +177,7 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
     // transfer payload and batch limits, independently of hash granularity.
     let request = opts
         .tuning
-        .request_size(opts.block, bwlimit, opts.restricted_receiver);
+        .request_size(opts.block, bwlimit, opts.receiver_paces_file_data);
     let limit = opts.tuning.batch_bytes().min(request);
     if opts.copy_policy(bwlimit.is_some()).prefer_whole_files() {
         limit.min(LOCAL_FAST_FILE_BYTES)
@@ -258,6 +258,10 @@ pub struct Opts {
     pub src_remote: bool,
     pub dst_remote: bool,
     pub restricted_receiver: bool,
+    /// The receiver paces file data itself, as one a receiving machine
+    /// approved does under `--bwlimit`, and refuses a request carrying more
+    /// than one burst. An enrolled receiver leaves pacing to the sender.
+    pub receiver_paces_file_data: bool,
     pub dry_run: bool,
     dry_run_metadata_files: AtomicU64,
     pub quiet: bool,
@@ -2157,7 +2161,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         };
         let parsed = Arc::unwrap_or_clone(parsed);
         args.mapping_contents = Some(Arc::new(parsed.input));
-        Some((parsed.entries, parsed.explicit_parents))
+        Some(parsed.entries)
     } else {
         None
     };
@@ -2371,17 +2375,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
 
-    if args.restricted_grant.is_some() {
-        if let Some((entries, _)) = &mapping_entries {
-            for (_, entry) in entries {
-                if let Some(metadata) = entry.metadata {
-                    anyhow::ensure!(metadata.flags() & !args.meta_flags() == 0,
-                        "mapping metadata on a restricted receiver requires matching --copy-metadata options in the signed grant");
-                }
-            }
-        }
-    }
-
     let mut opts = Opts {
         local_copy_fd_budget: true,
         hash_policy: crate::hashing::HashPolicy {
@@ -2391,7 +2384,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         },
         mapping_metadata: mapping_entries
             .as_ref()
-            .map(|(entries, _)| {
+            .map(|entries| {
                 entries
                     .iter()
                     .filter_map(|(_, entry)| entry.metadata.map(|meta| (entry.dst.clone(), meta)))
@@ -2401,7 +2394,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         hardlink_expected_hashes: Default::default(),
         mapping_expected_hashes: mapping_entries
             .as_ref()
-            .map(|(entries, _)| {
+            .map(|entries| {
                 entries
                     .iter()
                     .filter_map(|(_, entry)| {
@@ -2457,6 +2450,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         src_remote: src_ep.is_remote(),
         dst_remote: dst_ep.is_remote(),
         restricted_receiver: args.restricted_grant.is_some(),
+        receiver_paces_file_data: args
+            .restricted_grant
+            .as_deref()
+            .is_some_and(|grant| !crate::restricted::enrolled_grant(grant)),
         dry_run: args.dry_run,
         dry_run_metadata_files: AtomicU64::new(0),
         quiet: args.quiet,
@@ -2483,10 +2480,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if opts.benchmark.is_some() {
         crate::output::diagnostic!(
             "syq: tuning before transport selection: request-size={} bytes (ordinary ceiling, after logical pacing and receiver limits), adaptive-ordinary-requests={}, streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, transfer-strategy={} (block reuse {}), batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
-            opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
+            opts.tuning.request_size(block, bwlimit.as_deref(), opts.receiver_paces_file_data),
             opts.adaptive_ranges(),
-            opts.tuning.streaming_request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
-            opts.tuning.pipeline_label(opts.same_host, opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver)), block,
+            opts.tuning.streaming_request_size(block, bwlimit.as_deref(), opts.receiver_paces_file_data),
+            opts.tuning.pipeline_label(opts.same_host, opts.tuning.request_size(block, bwlimit.as_deref(), opts.receiver_paces_file_data)), block,
             opts.tuning.copy_path.unwrap_or_default(),
             opts.transfer_strategy.as_str(),
             if opts.transfer_strategy.reuse_destination_blocks(opts.same_host) { "on" } else { "off" },
@@ -2928,8 +2925,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     if transport_paced && id == 0 && opts.verbose > 0 {
                         crate::output::diagnostic!(
                             "syq: Sender bandwidth cap counts compressed transport bytes: request-size={}, streaming-block-size={}; normal batching applies",
-                            opts.tuning.request_size(opts.block, None, opts.restricted_receiver),
-                            opts.tuning.streaming_request_size(opts.block, None, opts.restricted_receiver),
+                            opts.tuning.request_size(opts.block, None, opts.receiver_paces_file_data),
+                            opts.tuning.streaming_request_size(opts.block, None, opts.receiver_paces_file_data),
                         );
                     }
                     let mut worker = Worker {
@@ -4377,8 +4374,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         fresh_capacity,
         src_overrides: std::collections::HashMap::new(),
         implicit_dirs: std::collections::HashSet::new(),
-        mapping_explicit_parents: std::collections::HashSet::new(),
-        blocked_mapping_parents: std::collections::HashSet::new(),
         directory_restorations: Default::default(),
         receiver_uid: None,
         parent_groups: Default::default(),
@@ -4436,20 +4431,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let mut scan_err = None;
     let mut fresh_capacity_assessment = None;
     let mut dry_run_mappings = Vec::with_capacity(srcs.len());
-    if let Some((mapping_entries, explicit_parents)) = mapping_entries {
+    if let Some(mapping_entries) = mapping_entries {
         let src = &srcs[0];
         st.active_source = Some(
             source_roots.get().expect("source roots registered")[0]
                 .selection
                 .clone(),
         );
-        match st.scan_mapping(
-            &mut *src_ctl,
-            &src.path,
-            &dst_root,
-            mapping_entries,
-            explicit_parents,
-        ) {
+        match st.scan_mapping(&mut *src_ctl, &src.path, &dst_root, mapping_entries) {
             Ok(()) => dry_run_mappings.push(DryRunMapping {
                 target: dst_root.clone(),
                 semantics: "entries selected by --mapping",

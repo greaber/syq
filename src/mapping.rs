@@ -183,8 +183,6 @@ impl Input {
 pub(crate) struct ParsedManifest {
     pub input: Input,
     pub entries: Vec<(u64, ManifestEntry)>,
-    /// Explicit destinations also used as parents, including later entries.
-    pub explicit_parents: std::collections::HashSet<PathBytes>,
 }
 
 /// Phase-1 manifest read for `--mapping`: parse every line and run the
@@ -233,28 +231,26 @@ pub(crate) fn read_mapping_manifest(contents: Vec<u8>) -> Result<ParsedManifest>
 
 pub(crate) fn validate_destinations<'a>(
     entries: impl IntoIterator<Item = (u64, &'a [u8], Option<DeclaredKind>)>,
-) -> Result<std::collections::HashSet<PathBytes>> {
+) -> Result<()> {
     let mut declared = std::collections::HashMap::new();
     for (line, path, kind) in entries {
         if declared.insert(path, (line, kind)).is_some() {
             bail!("--mapping line {line}: duplicate destination {} (duplicate entries are errors; deduplicate in the generator)", display(path));
         }
     }
-    let mut parents = std::collections::HashSet::new();
     for (&path, &(line, _)) in &declared {
         for (i, &byte) in path.iter().enumerate() {
             if byte != b'/' {
                 continue;
             }
             if let Some((_, kind)) = declared.get(&path[..i]) {
-                parents.insert(path[..i].to_vec());
                 if let Some(kind) = kind.filter(|kind| !matches!(kind, DeclaredKind::Dir)) {
                     bail!("--mapping line {line}: destination ancestor {} of {} is mapped with kind {:?}, not dir", display(&path[..i]), display(path), kind.label());
                 }
             }
         }
     }
-    Ok(parents)
+    Ok(())
 }
 
 pub(crate) fn parsed_manifest(
@@ -262,7 +258,7 @@ pub(crate) fn parsed_manifest(
     entries: Vec<(u64, ManifestEntry)>,
     restricted_bounds_error: Option<String>,
 ) -> Result<ParsedManifest> {
-    let explicit_parents = validate_destinations(
+    validate_destinations(
         entries
             .iter()
             .map(|(line, entry)| (*line, entry.dst.as_slice(), entry.kind)),
@@ -273,7 +269,6 @@ pub(crate) fn parsed_manifest(
             restricted_bounds_error,
         },
         entries,
-        explicit_parents,
     })
 }
 
@@ -326,6 +321,9 @@ impl Authorization {
 #[derive(Debug)]
 pub(crate) struct Permissions {
     expected_hashes: std::collections::HashMap<PathBytes, crate::hashing::Digest>,
+    /// The metadata entries set explicitly, which the receiver applies when
+    /// a request carries exactly these values.
+    metadata: std::collections::HashMap<PathBytes, Metadata>,
     entries: std::collections::HashMap<PathBytes, Option<DeclaredKind>>,
     parents: std::collections::HashSet<PathBytes>,
 }
@@ -334,6 +332,7 @@ impl Permissions {
     fn new() -> Self {
         Self {
             expected_hashes: Default::default(),
+            metadata: Default::default(),
             entries: Default::default(),
             parents: [Vec::new()].into(),
         }
@@ -378,6 +377,9 @@ impl Permissions {
         if let Some(expected) = entry.expected_hash {
             self.expected_hashes.insert(entry.dst.clone(), expected);
         }
+        if let Some(metadata) = entry.metadata {
+            self.metadata.insert(entry.dst.clone(), metadata);
+        }
         self.entries.insert(entry.dst, entry.kind);
         self.check_limit(max_entries)
     }
@@ -395,6 +397,11 @@ impl Permissions {
 
     pub(crate) fn implicit_directory(&self, path: &[u8]) -> bool {
         self.parents.contains(path)
+    }
+
+    /// The metadata the entry at `path` sets explicitly.
+    pub(crate) fn metadata(&self, path: &[u8]) -> Option<&Metadata> {
+        self.metadata.get(path)
     }
 }
 
@@ -578,18 +585,6 @@ mod tests {
             admission.append(0, contents.as_bytes(), true).unwrap();
             assert_eq!(parsed.entries.len(), 1);
         }
-    }
-
-    #[test]
-    fn parsed_manifest_retains_only_explicit_parent_paths_in_either_order() {
-        let parent = entry("directory", "outer/parent");
-        let child = entry("file", "outer/parent/inner/file");
-        for contents in [parent.clone() + &child, child.clone() + &parent] {
-            let parsed = read_mapping_manifest(contents.into_bytes()).unwrap();
-            assert_eq!(parsed.explicit_parents, [b"outer/parent".to_vec()].into());
-        }
-        let parsed = read_mapping_manifest(child.into_bytes()).unwrap();
-        assert!(parsed.explicit_parents.is_empty());
     }
 
     #[test]

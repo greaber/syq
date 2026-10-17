@@ -2632,7 +2632,7 @@ impl Worker {
         let block = self.opts.tuning.streaming_request_size(
             self.opts.block,
             self.bwlimit.as_deref(),
-            self.opts.restricted_receiver,
+            self.opts.receiver_paces_file_data,
         );
         // Do not advance the scheduler's claimed position when opening the
         // stream. Other workers may still steal the unread suffix. At a split
@@ -2768,7 +2768,7 @@ impl Worker {
         self.opts.tuning.request_size(
             self.opts.block,
             self.bwlimit.as_deref(),
-            self.opts.restricted_receiver,
+            self.opts.receiver_paces_file_data,
         )
     }
 

@@ -3939,21 +3939,21 @@ fn explicit_ownership_flags_require_existing_grant_authority() {
         (flags::OWNER, flags::REQUIRE_OWNER),
         (flags::GROUP, flags::REQUIRE_GROUP),
     ] {
-        assert!(authority.check_flags(required).is_err());
-        assert!(authority.check_flags(attribute | required).is_err());
+        assert!(authority.check_flags(required, 0).is_err());
+        assert!(authority.check_flags(attribute | required, 0).is_err());
     }
     authority.copy.options.preserve_owner = true;
     authority
-        .check_flags(flags::OWNER | flags::REQUIRE_OWNER)
+        .check_flags(flags::OWNER | flags::REQUIRE_OWNER, 0)
         .unwrap();
     assert!(authority
-        .check_flags(flags::GROUP | flags::REQUIRE_GROUP)
+        .check_flags(flags::GROUP | flags::REQUIRE_GROUP, 0)
         .is_err());
     authority.copy.options.preserve_group = true;
     authority
-        .check_flags(flags::GROUP | flags::REQUIRE_GROUP)
+        .check_flags(flags::GROUP | flags::REQUIRE_GROUP, 0)
         .unwrap();
-    assert!(authority.check_flags(flags::REQUIRE_GROUP).is_err());
+    assert!(authority.check_flags(flags::REQUIRE_GROUP, 0).is_err());
 }
 
 /// The mode the kernel gives a new directory or file in `parent` created
@@ -4875,7 +4875,6 @@ fn ceiling_ranges_are_checked_before_any_enrollment_side_effect() {
     let mut args = parse(&[]);
     args.receiver_max_bytes = Some(0);
     assert!(validate_restricted_args(&args).is_err());
-    assert!(validate_restricted_args(&parse(&["--max-size", "0"])).is_err());
     validate_restricted_args(&parse(&["--delete"])).unwrap();
     validate_restricted_args(&parse(&["--delete", "--max-delete", "0"])).unwrap();
     // Selection options and size limits act as for an ordinary copy.
@@ -4901,6 +4900,41 @@ fn ceiling_ranges_are_checked_before_any_enrollment_side_effect() {
     let GrantOperation::Copy(copy) = &grant.operation;
     assert_eq!(copy.policy.deletion, DeletionPolicy::Forbid);
     assert_eq!(copy.limits.max_deletions, 0);
+}
+
+/// Options that work on ordinary routes work on restricted ones too:
+/// `--pscope` selects which local connections are kept, and `--max-size 0`
+/// copies only empty files, so its grant admits no file data at all.
+#[test]
+fn restricted_routes_accept_a_persistence_scope_and_a_zero_size_limit() {
+    let parse = |options: &[&str]| {
+        let mut argv = vec!["syq", "-r"];
+        argv.extend_from_slice(options);
+        argv.extend_from_slice(&["host-a:source", "host-b:/backup"]);
+        let mut args = Args::try_parse_from(argv).unwrap();
+        args.normalize();
+        args
+    };
+    let mut scoped = parse(&[]);
+    scoped.pscope = Some(PathBuf::from("/tmp/scope"));
+    scoped.pscope_explicit = true;
+    validate_restricted_args(&scoped).unwrap();
+    let empty_only = parse(&["--max-size", "0"]);
+    validate_restricted_args(&empty_only).unwrap();
+    let id = EnrollmentId::random();
+    let grant = grant_for(
+        &empty_only,
+        &[Location::parse("host-a:source").unwrap()],
+        id,
+        "backup",
+        b"/backup",
+    )
+    .unwrap();
+    let GrantOperation::Copy(copy) = &grant.operation;
+    assert_eq!(copy.limits.max_file_bytes, 0);
+    let key = generate_receipt_key(id).unwrap();
+    let signed = delegation::sign_grant(grant, GrantConstraints::default(), &key).unwrap();
+    delegation::SignedGrantEnvelope::decode(&signed).unwrap();
 }
 
 #[test]
@@ -5288,11 +5322,11 @@ fn hardlinks_need_the_signed_option_and_keep_to_the_existing_object_policy() {
         "{error:#}"
     );
     assert!(authority
-        .check_flags(proto::flags::REPORT_IDENTITY)
+        .check_flags(proto::flags::REPORT_IDENTITY, 0)
         .is_err());
     authority.extra_options.hardlinks = true;
     authority
-        .check_flags(proto::flags::REPORT_IDENTITY)
+        .check_flags(proto::flags::REPORT_IDENTITY, 0)
         .unwrap();
 
     // Either name outside the signed scopes is refused.
@@ -5429,12 +5463,16 @@ fn signed_grants_authorize_only_their_inode_metadata() {
     assert!(authority
         .authorize(&mut configuration(everything, true), true)
         .is_err());
-    let error = authority.check_metadata(&acl_meta(), 0).unwrap_err();
+    let error = authority
+        .check_metadata(b"/unmapped", &acl_meta(), 0)
+        .unwrap_err();
     assert!(
         error.to_string().contains("inode metadata not authorized"),
         "{error:#}"
     );
-    assert!(authority.check_metadata(&time_meta(), 0).is_err());
+    assert!(authority
+        .check_metadata(b"/unmapped", &time_meta(), 0)
+        .is_err());
 
     authority.extra_options.acls = true;
     authority.extra_options.sparse = true;
@@ -5448,8 +5486,12 @@ fn signed_grants_authorize_only_their_inode_metadata() {
     assert!(authority
         .authorize(&mut configuration(everything, true), true)
         .is_err());
-    authority.check_metadata(&acl_meta(), 0).unwrap();
-    assert!(authority.check_metadata(&time_meta(), 0).is_err());
+    authority
+        .check_metadata(b"/unmapped", &acl_meta(), 0)
+        .unwrap();
+    assert!(authority
+        .check_metadata(b"/unmapped", &time_meta(), 0)
+        .is_err());
     // The receiver's own creation rules are not the sender's to choose.
     let mut rsync_directories = Request::ConfigurePreservation {
         narrow_new_directories: true,
@@ -8529,4 +8571,103 @@ fn filesystem_information_describes_the_approved_destination() {
         "{request:?}"
     );
     assert_eq!(info.empty, None);
+}
+
+/// Without filters or a mapping, a metadata change is authorized without
+/// looking up what it changes: the kind matters only to a failure's record,
+/// which looks it up then.
+#[test]
+fn metadata_changes_need_no_lookup_without_filters() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let closed = root.join("target/closed");
+    fs::create_dir_all(&closed).unwrap();
+    fs::write(closed.join("file"), b"x").unwrap();
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).unwrap();
+    let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    let mut change = Request::Apply {
+        ops: vec![Op::SetMeta {
+            path: closed.join("file").as_os_str().as_bytes().to_vec(),
+            meta: plain_meta(),
+            flags: proto::flags::RECEIVER_MODE,
+            condition: proto::TargetCondition::Any,
+            directory: false,
+        }],
+    };
+    let authorized = authority.authorize(&mut change, false);
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o755)).unwrap();
+    authorized.unwrap();
+}
+
+/// What a signed mapping entry sets explicitly, the receiver applies
+/// without the matching copy option, and only with exactly the entry's
+/// values: other values, and other entries, still need the option.
+#[test]
+fn signed_mapping_metadata_is_applied_without_its_copy_options() {
+    let root = crate::test_support::tempdir().unwrap();
+    let target = root.path().join("target");
+    fs::create_dir_all(&target).unwrap();
+    let uid = unsafe { libc::getuid() };
+    let manifest = format!(
+        concat!(
+            r#"{{"src":{{"encoding":"utf-8","value":"source"}},"dst":{{"encoding":"utf-8","value":"set"}},"metadata":{{"mode":416,"mtime":123,"mtime_nsec":456,"uid":{uid}}}}}"#,
+            "\n",
+            r#"{{"src":{{"encoding":"utf-8","value":"source"}},"dst":{{"encoding":"utf-8","value":"plain"}}}}"#,
+            "\n"
+        ),
+        uid = uid
+    )
+    .into_bytes();
+    let mut authority = test_authority(root.path(), DeletionPolicy::Forbid, 1024);
+    authority.copy.limits.max_entries = 100;
+    authority.mapping = Some(Mutex::new(crate::mapping::Admission::new(
+        crate::mapping::Authorization::from_contents(&manifest),
+        authority.copy.limits.max_entries,
+    )));
+    let settlement = authority
+        .authorize(
+            &mut Request::MappingChunk {
+                offset: 0,
+                data: manifest,
+                finish: true,
+            },
+            true,
+        )
+        .unwrap();
+    authority.settle(settlement, &proto::Response::Ok);
+    let meta = |mode, mtime, uid| proto::Meta {
+        inode_metadata: None,
+        mode,
+        uid,
+        gid: 0,
+        mtime,
+        mtime_nsec: 456,
+    };
+    let flags = proto::flags::MODE | proto::flags::TIMES | proto::flags::OWNER;
+    let set = path_bytes(&target.join("set"));
+    let plain = path_bytes(&target.join("plain"));
+    authority
+        .check_metadata(&set, &meta(0o100640, 123, uid), flags)
+        .unwrap();
+    for (path, meta) in [
+        (&set, meta(0o100644, 123, uid)),
+        (&set, meta(0o100640, 124, uid)),
+        (&set, meta(0o100640, 123, uid.wrapping_add(1))),
+        (&plain, meta(0o100640, 123, uid)),
+    ] {
+        assert!(
+            authority.check_metadata(path, &meta, flags).is_err(),
+            "{meta:?}"
+        );
+    }
+    // A preparation names the entry's mode for the file to come.
+    authority
+        .check_preparation_flags(&set, 0o640, proto::flags::MODE | proto::flags::TIMES)
+        .unwrap();
+    assert!(authority
+        .check_preparation_flags(&set, 0o644, proto::flags::MODE)
+        .is_err());
 }

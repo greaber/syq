@@ -1036,7 +1036,19 @@ impl RestrictedAuthority {
                 }
                 PendingOutcome::LogicalIfFailed { index, .. }
                 | PendingOutcome::Logical { index, .. }
+                | PendingOutcome::Metadata { index, .. }
                     if declined(index) => {}
+                PendingOutcome::Metadata { index, path, kind } => {
+                    if let Some(error) = outcome_error(index) {
+                        let kind = kind.unwrap_or_else(|| {
+                            self.rooted_metadata(&path)
+                                .ok()
+                                .flatten()
+                                .map_or(proto::Kind::File, |metadata| kind_from_mode(metadata.mode))
+                        });
+                        self.record_change(&path, Change::SetMetadata { kind }, Some(error));
+                    }
+                }
                 PendingOutcome::LogicalIfFailed {
                     index,
                     path,
@@ -1423,7 +1435,11 @@ impl RestrictedAuthority {
         }
     }
 
-    pub(super) fn check_flags(&self, flags: u8) -> Result<()> {
+    /// Check a request's metadata flags against the grant's options, also
+    /// allowing those in `mapped`, which a signed mapping entry sets for the
+    /// path the request changes (`mapped_grants`).
+    pub(super) fn check_flags(&self, flags: u8, mapped: u8) -> Result<()> {
+        let granted = |flag: u8| mapped & flag != 0;
         let known = proto::flags::MODE_MASK
             | proto::flags::OWNER
             | proto::flags::GROUP
@@ -1448,19 +1464,31 @@ impl RestrictedAuthority {
         if flags & proto::flags::MODE_MASK == proto::flags::MODE_MASK {
             bail!("request cannot mix source and receiver-managed mode flags");
         }
-        if flags & proto::flags::MODE != 0 && !self.copy.options.preserve_permissions {
+        if flags & proto::flags::MODE != 0
+            && !self.copy.options.preserve_permissions
+            && !granted(proto::flags::MODE)
+        {
             bail!("request tries to preserve permissions not authorized by the grant");
         }
         if flags & proto::flags::RECEIVER_MODE != 0 && !self.copy.options.receiver_managed_modes {
             bail!("request tries to apply receiver-managed modes not authorized by the grant");
         }
-        if flags & proto::flags::OWNER != 0 && !self.copy.options.preserve_owner {
+        if flags & proto::flags::OWNER != 0
+            && !self.copy.options.preserve_owner
+            && !granted(proto::flags::OWNER)
+        {
             bail!("request tries to preserve ownership not authorized by the grant");
         }
-        if flags & proto::flags::GROUP != 0 && !self.copy.options.preserve_group {
+        if flags & proto::flags::GROUP != 0
+            && !self.copy.options.preserve_group
+            && !granted(proto::flags::GROUP)
+        {
             bail!("request tries to preserve group not authorized by the grant");
         }
-        if flags & proto::flags::TIMES != 0 && !self.copy.options.preserve_times {
+        if flags & proto::flags::TIMES != 0
+            && !self.copy.options.preserve_times
+            && !granted(proto::flags::TIMES)
+        {
             bail!("request tries to preserve timestamps not authorized by the grant");
         }
         Ok(())
@@ -1512,8 +1540,26 @@ impl RestrictedAuthority {
     /// inode metadata the grant selects. A receiver-chosen mode is the
     /// receiver's own to decide, as on every receiver
     /// (`fsops::receiver_mode`).
-    pub(super) fn check_metadata(&self, meta: &proto::Meta, flags: u8) -> Result<()> {
-        self.check_flags(flags)?;
+    pub(super) fn check_metadata(&self, path: &[u8], meta: &proto::Meta, flags: u8) -> Result<()> {
+        let mapped = self.mapped_grants(path, |metadata| {
+            let mut granted = 0;
+            if metadata.mode == Some(meta.mode & 0o7777) {
+                granted |= proto::flags::MODE;
+            }
+            if metadata.uid == Some(meta.uid) {
+                granted |= proto::flags::OWNER;
+            }
+            if metadata.gid == Some(meta.gid) {
+                granted |= proto::flags::GROUP;
+            }
+            if metadata.mtime == Some(meta.mtime)
+                && metadata.mtime_nsec.unwrap_or(0) == meta.mtime_nsec
+            {
+                granted |= proto::flags::TIMES;
+            }
+            granted
+        })?;
+        self.check_flags(flags, mapped)?;
         if let Some(metadata) = &meta.inode_metadata {
             let requested = crate::inode_metadata::Selection {
                 acls: metadata.acls.is_some() || metadata.macos_acl.is_some(),
@@ -1528,6 +1574,39 @@ impl RestrictedAuthority {
             );
         }
         Ok(())
+    }
+
+    /// The metadata flags the signed mapping entry for `path` grants, as
+    /// `grants` finds them in that entry's metadata: what the mapping sets
+    /// explicitly may be applied without the matching copy option, and only
+    /// with exactly its values.
+    fn mapped_grants(
+        &self,
+        path: &[u8],
+        grants: impl FnOnce(&crate::mapping::Metadata) -> u8,
+    ) -> Result<u8> {
+        let Some(mapping) = &self.mapping else {
+            return Ok(0);
+        };
+        let mapping = mapping.lock().unwrap();
+        Ok(mapping
+            .permissions()?
+            .metadata(self.mapping_relative(path)?)
+            .map_or(0, grants))
+    }
+
+    /// The flags a preparation of `path` names for the publication to come,
+    /// in `mode`: a mapping entry's explicit mode must be `mode`, and the
+    /// other values it sets are checked when the file is published.
+    pub(super) fn check_preparation_flags(&self, path: &[u8], mode: u32, flags: u8) -> Result<()> {
+        let mapped = self.mapped_grants(path, |metadata| {
+            let mut granted = metadata.flags() & !proto::flags::MODE;
+            if metadata.mode == Some(mode & 0o7777) {
+                granted |= proto::flags::MODE;
+            }
+            granted
+        })?;
+        self.check_flags(flags, mapped)
     }
 
     pub(super) fn check_hash_request(&self, block: u64, len: u64) -> Result<()> {
@@ -1796,11 +1875,11 @@ impl RestrictedAuthority {
             if (patch.flags ^ patch.unchanged_flags) & !proto::flags::TIMES != 0 {
                 bail!("kept and published metadata flags differ beyond times");
             }
-            self.check_flags(patch.unchanged_flags)?;
+            self.check_metadata(&patch.path, &patch.meta, patch.unchanged_flags)?;
             self.check_file_bytes(&patch.path, 0, patch.data.len())?;
             self.constrain_creation(&patch.path, &mut patch.condition, false, index, pending)?;
             self.constrain_update(&patch.path, Some(&mut patch.condition), pending)?;
-            self.check_metadata(&patch.meta, patch.flags)?;
+            self.check_metadata(&patch.path, &patch.meta, patch.flags)?;
             let hold = self.reserve_bytes(&patch.path, patch.copy_id, patch.len, true)?;
             outcomes.push(PendingOutcome::Patch {
                 index,
@@ -1952,16 +2031,23 @@ impl RestrictedAuthority {
                 return Ok(());
             }
         };
-        // What a metadata change applies to, for its record if it fails.
+        // What a metadata change applies to: a directory's is for nothing
+        // else (`Op::SetMeta::directory`). Otherwise it is looked up only
+        // where filters or a mapping decide by it; a failure's record looks
+        // it up when it is settled.
         let metadata_kind = match operation {
-            Op::SetMeta { .. } => self
-                .rooted_metadata(path)?
-                .map_or(proto::Kind::File, |metadata| kind_from_mode(metadata.mode)),
-            _ => proto::Kind::File,
+            Op::SetMeta {
+                directory: true, ..
+            } => Some(proto::Kind::Dir),
+            Op::SetMeta { .. } if self.filter_matcher.is_some() || self.mapping.is_some() => Some(
+                self.rooted_metadata(path)?
+                    .map_or(proto::Kind::File, |metadata| kind_from_mode(metadata.mode)),
+            ),
+            _ => None,
         };
         let is_dir = match operation {
             Op::Mkdir { .. } => true,
-            Op::SetMeta { .. } => metadata_kind == proto::Kind::Dir,
+            Op::SetMeta { .. } => metadata_kind == Some(proto::Kind::Dir),
             _ => false,
         };
         self.check_mutation_path(path, is_dir)?;
@@ -2035,7 +2121,7 @@ impl RestrictedAuthority {
                 ..
             } => {
                 self.constrain_creation(path, condition, false, index, pending)?;
-                self.check_metadata(meta, *flags)?;
+                self.check_metadata(path, meta, *flags)?;
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
@@ -2072,7 +2158,7 @@ impl RestrictedAuthority {
                 };
                 *mode = file_type | (*mode & permitted);
                 self.constrain_creation(path, condition, false, index, pending)?;
-                self.check_metadata(meta, *flags)?;
+                self.check_metadata(path, meta, *flags)?;
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
@@ -2107,14 +2193,12 @@ impl RestrictedAuthority {
                         "signed grants do not authorize additional inode metadata"
                     );
                 } else {
-                    self.check_metadata(meta, *flags)?;
+                    self.check_metadata(path, meta, *flags)?;
                 }
-                outcomes.push(PendingOutcome::Logical {
+                outcomes.push(PendingOutcome::Metadata {
                     index,
                     path: path.clone(),
-                    change: Change::SetMetadata {
-                        kind: metadata_kind,
-                    },
+                    kind: metadata_kind,
                 });
                 Ok(())
             }
@@ -2125,7 +2209,7 @@ impl RestrictedAuthority {
                 condition,
             } => {
                 self.constrain_update(path, Some(&mut *condition), pending)?;
-                self.check_metadata(meta, *flags)?;
+                self.check_metadata(path, meta, *flags)?;
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
@@ -2622,7 +2706,7 @@ impl RestrictedAuthority {
                 *expected_hash = self.expected_hash(path)?.map(Into::into);
                 self.check_mutation_path(path, false)?;
                 self.constrain_update(path, Some(&mut *condition), pending)?;
-                self.check_metadata(meta, *flags)?;
+                self.check_metadata(path, meta, *flags)?;
                 outcomes.push(PendingOutcome::Logical {
                     index: 0,
                     path: path.clone(),
@@ -2636,6 +2720,7 @@ impl RestrictedAuthority {
                 size,
                 inplace,
                 copy_id,
+                mode,
                 flags,
                 scanned,
                 create_if_missing,
@@ -2659,9 +2744,9 @@ impl RestrictedAuthority {
                     {
                         bail!("file preparation does not match the signed publication policy");
                     }
-                    self.check_metadata(&update.meta, update.flags)?;
+                    self.check_metadata(path, &update.meta, update.flags)?;
                 }
-                self.check_flags(*flags)?;
+                self.check_preparation_flags(path, *mode, *flags)?;
                 if *size > self.copy.limits.max_file_bytes {
                     bail!("signed grant per-file byte limit exceeded");
                 }
@@ -2759,7 +2844,7 @@ impl RestrictedAuthority {
                     skip_if_absent: false,
                     observation_hold: None,
                 });
-                self.check_metadata(meta, *flags)?;
+                self.check_metadata(path, meta, *flags)?;
             }
             Request::PutSmallBatch(puts) => {
                 if puts.iter().any(|put| put.inplace) {
@@ -2793,7 +2878,7 @@ impl RestrictedAuthority {
                             size: put.data.len() as u64,
                         },
                     });
-                    self.check_metadata(&put.meta, put.flags)?;
+                    self.check_metadata(&put.path, &put.meta, put.flags)?;
                 }
             }
             Request::PatchSmallBatch(patches) => {
@@ -3075,6 +3160,13 @@ pub(super) enum PendingOutcome {
         index: usize,
         path: Vec<u8>,
         change: Change,
+    },
+    /// A metadata change, whose kind is looked up if it fails and was not
+    /// known when it was authorized.
+    Metadata {
+        index: usize,
+        path: Vec<u8>,
+        kind: Option<proto::Kind>,
     },
     /// An operation expected to change nothing, recorded only if it fails.
     LogicalIfFailed {

@@ -151,8 +151,10 @@ def direct():
         metadata_manifest = (json.dumps(selected) + "\n").encode()
         destination = root + "/metadata"
         command = prefix + ["--mapping", "-", "--to", "destination", "--into", destination, "--no-tcp", "--if-exists=update"]
-        refused = run(command, data=metadata_manifest, expected=1)
-        assert b"matching --copy-metadata options" in refused.stderr, refused.stderr
+        # The signed mapping authorizes the metadata it sets itself; the
+        # copy options are not needed for it.
+        run(command, data=metadata_manifest)
+        ssh("destination", f"from pathlib import Path; p=Path({destination!r})/'file'; assert p.read_bytes()==b'mapped contents'; s=p.stat(); assert s.st_mode & 0o7777==0o640; assert s.st_mtime_ns==123000000456; p.chmod(0o600)")
         run(command + ["--copy-metadata=permissions,ownership"], data=metadata_manifest)
         ssh("destination", f"from pathlib import Path; p=Path({destination!r})/'file'; assert p.read_bytes()==b'mapped contents'; s=p.stat(); assert s.st_mode & 0o7777==0o640; assert s.st_mtime_ns==123000000456")
         local_source = Path(temporary) / "metadata-source"
@@ -254,22 +256,24 @@ def direct():
         run(prefix + ["--mapping", "-", "--to", "destination", "--into", stable, "--no-tcp"], data=manifest([("file", "parent/item", "file")]))
         after = ssh("destination", f"from pathlib import Path; print((Path({stable!r})/'parent').stat().st_ctime_ns)").stdout.strip()
         assert before == after, (before, after)
-        # A protected implicit parent blocks only its mapped descendants.
+        # A file or symlink where an implicit parent goes is not replaced:
+        # each such parent is reported once, as on an ordinary receiver, and
+        # blocks only the mapped entries beneath it.
         blocked = root + "/blocked"
         ssh("destination", f"from pathlib import Path; p=Path({blocked!r}); p.mkdir(); (p/'blocked-file').write_bytes(b'keep file'); (p/'protected').mkdir(); (p/'protected'/'sentinel').write_bytes(b'keep target'); (p/'blocked-link').symlink_to('protected')")
         blocked_entries = [("file", "blocked-file/deep/item", "file"), ("file", "blocked-link/item", "file"), ("directory", "blocked-file/directory", "dir")]
         selected = manifest(blocked_entries + [("file", "good/item", "file")])
         preview = run(prefix + ["--mapping", "-", "--to", "destination", "--into", blocked, "--no-tcp", "--dry-run"], data=selected, expected=23)
-        assert preview.stderr.count(b"blocks an implicit mapping parent") == len(blocked_entries), preview.stderr
+        assert preview.stderr.count(b"cannot replace non-directory") == 2, preview.stderr
         ssh("destination", f"from pathlib import Path; assert not (Path({blocked!r})/'good').exists()")
         results_path = Path(temporary) / "results-blocked.ndjson"
         result = run(prefix + ["--mapping", "-", "--to", "destination", "--into", blocked, "--no-tcp", "--results", str(results_path)], data=selected, expected=23)
-        assert result.stderr.count(b"blocks an implicit mapping parent") == len(blocked_entries), result.stderr
+        assert result.stderr.count(b"cannot replace non-directory") == 2, result.stderr
         records = [json.loads(line) for line in results_path.read_text().splitlines()]
         # Planner failures arrive as the coordinator's error records and make
         # the outcome partial.
         assert records[-1]["status"] == "partial", records[-1]
-        assert any(r["type"] == "error" and "blocks an implicit mapping parent" in r["message"] for r in records), records
+        assert any(r["type"] == "error" and "cannot replace non-directory" in r["message"] for r in records), records
         ssh("destination", f"from pathlib import Path; p=Path({blocked!r}); assert (p/'blocked-file').read_bytes()==b'keep file'; assert (p/'blocked-link').is_symlink(); assert list((p/'protected').iterdir())==[p/'protected'/'sentinel']; assert (p/'protected'/'sentinel').read_bytes()==b'keep target'; assert (p/'good'/'item').read_bytes()==b'mapped contents'")
         # Exceeds both the old grant scope count and one mapping protocol chunk.
         ssh("source", f"from pathlib import Path; import os; p=Path({source!r})/'directory'; p.chmod(0o750); os.utime(p,(1500000000,1500000000))")
@@ -281,18 +285,16 @@ def direct():
         print("mapping route: large SSH manifest", flush=True)
         results_path = Path(temporary) / "results-large.ndjson"
         result = run(prefix + ["--mapping", "-", "--to", "destination", "--into", root + "/large", "--no-tcp", "--copy-metadata=permissions", "--results", str(results_path)], data=large, expected=23)
-        assert result.stderr.count(b"blocks an implicit mapping parent") == 2, result.stderr
+        assert result.stderr.count(b"cannot replace non-directory") == 2, result.stderr
         records = [json.loads(line) for line in results_path.read_text().splitlines()]
         assert records[-1]["status"] == "partial", records[-1]
         ssh("destination", f"from pathlib import Path; assert Path({root + '/large/blocked'!r}).read_bytes()==b'keep implicit parent'")
-        assert b"cannot replace non-directory" in result.stderr, result.stderr
         ssh("destination", f"from pathlib import Path; p=Path({root + '/large/group'!r}); assert p.read_bytes()==b'keep explicit parent'; p.unlink()")
         # Once the fixture obstruction is removed, the late explicit entry
         # supplies directory metadata after all 10,000 mapped files are copied.
         results_path = Path(temporary) / "results-large-unblocked.ndjson"
         result = run(prefix + ["--mapping", "-", "--to", "destination", "--into", root + "/large", "--no-tcp", "--copy-metadata=permissions", "--results", str(results_path)], data=large, expected=23)
-        assert result.stderr.count(b"blocks an implicit mapping parent") == 2, result.stderr
-        assert b"cannot replace non-directory" not in result.stderr, result.stderr
+        assert result.stderr.count(b"cannot replace non-directory") == 1, result.stderr
         records = [json.loads(line) for line in results_path.read_text().splitlines()]
         assert records[-1]["status"] == "partial", records[-1]
         ssh("destination", f"from pathlib import Path; p=Path({root + '/large/group'!r}); files=list(p.iterdir()); assert len(files)==10000; assert all(f.read_bytes()==b'mapped contents' for f in files); assert p.stat().st_mode & 0o777 == 0o750; assert p.stat().st_mtime_ns == 1500000000000000000")
@@ -306,15 +308,15 @@ def named():
     run(prefix, data=contents)
     matching_preview(prefix, data=contents, files=1)
     run(prefix + ["--if-exists=update-if-older", "--only-existing"], data=contents)
-    # Here the source-side caller receives coordinator operation records, so
-    # a parent obstruction must produce a retryable per-entry failure too.
+    # A file where an implicit parent goes is reported once, as the
+    # directory that could not replace it, and blocks the entries beneath.
     blocked = manifest([("message.txt", "nested/renamed/child", "file"), ("message.txt", "nested/good", "file")])
     with tempfile.TemporaryDirectory(prefix="syq-named-mapping-") as temporary:
         results_path = Path(temporary) / "results.ndjson"
         run(prefix + ["--results", str(results_path)], data=blocked, expected=23)
         records = [json.loads(line) for line in results_path.read_text().splitlines()]
         failed = [r for r in records if r.get("disposition") == "failed"]
-        assert [(r["src"]["value"], r["dst"]["value"]) for r in failed] == [("message.txt", "nested/renamed/child")], failed
+        assert [r["dst"]["value"] for r in failed] == ["nested/renamed"], failed
         assert records[-1]["status"] == "partial", records[-1]
     matching_preview(prefix, data=contents + manifest([("message.txt", "nested/good", "file")]), files=2)
     print("Named mapping and timestamp selection passed", flush=True)

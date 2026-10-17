@@ -313,10 +313,8 @@ impl CopyOperation {
         if limits.max_entries == 0 || limits.max_entries > MAX_ENTRIES {
             bail!("copy max-entries is outside the supported range");
         }
-        if limits.max_total_bytes == 0
-            || limits.max_file_bytes == 0
-            || limits.max_total_bytes > MAX_COPY_BYTES
-        {
+        // A per-file limit of zero admits only empty files (`--max-size 0`).
+        if limits.max_total_bytes == 0 || limits.max_total_bytes > MAX_COPY_BYTES {
             bail!("copy byte limits are outside the supported range");
         }
         if limits.max_file_bytes > limits.max_total_bytes {

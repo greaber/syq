@@ -77,16 +77,6 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
     {
         bail!("--receiver-max-bytes must be at least 1 byte");
     }
-    if let Some(maximum) = args.max_size.as_deref() {
-        if crate::cli::parse_size(maximum)? == 0 {
-            bail!("--max-size must be at least 1 byte on the command-restricted path");
-        }
-    }
-    if args.pscope_explicit {
-        bail!(
-            "--pscope is not available with the command-restricted receiver: its SSH authorization belongs to this copy"
-        );
-    }
     if args.connections_opt.is_some() && args.connections > usize::from(delegation::MAX_CONNECTIONS)
     {
         bail!(
