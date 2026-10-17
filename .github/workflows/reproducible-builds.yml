@@ -44,7 +44,7 @@ jobs:
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           scripts/prepare-release-crate.py "v$version" "$RUNNER_TEMP/source-crate"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: source-crate
           overwrite: true
@@ -111,7 +111,7 @@ jobs:
           key: ${{ steps.deps.outputs.key }}
       - name: Build from locked inputs and smoke-test the executable
         run: scripts/build-reproducible.sh "$RUNNER_TEMP/dist"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: ${{ matrix.platform.name }}
           overwrite: true
