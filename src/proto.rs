@@ -1569,6 +1569,9 @@ pub enum SmallCopyDisposition {
 pub struct SmallCopyFileResult {
     pub disposition: SmallCopyDisposition,
     pub error: Option<WireError>,
+    /// A file kept unchanged had its metadata changed in place, or tried
+    /// to when `error` says so.
+    pub repaired: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

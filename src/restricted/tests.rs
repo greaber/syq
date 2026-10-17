@@ -8731,3 +8731,165 @@ fn files_the_keep_policy_keeps_are_neither_refused_nor_failed() {
         0
     );
 }
+
+/// The small-copy shortcut works on a restricted receiver: the receiver
+/// opens the directory beneath the root its authority holds, each file
+/// passes the grant's rules, payloads are held to what the preparation
+/// asked for, and the results list what it published.
+#[test]
+fn small_copies_publish_through_a_restricted_receiver() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("old"), b"stale contents").unwrap();
+    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let (secret, policy) = results_policy();
+    let authority = std::sync::Arc::new(
+        test_authority_with_results(
+            &root,
+            DeletionPolicy::Forbid,
+            1024,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::DirectoryContents,
+            RootExistence::Any,
+            Some((key, policy)),
+        )
+        .unwrap(),
+    );
+    let mut reader = start_results(&authority, secret);
+    let mut ops = authority.test_ops();
+    let mut gate = PatchStreamGate::new(authority.clone());
+    let in_flight = || authority.state.lock().unwrap().in_flight;
+    let names = ["one", "two", "old"];
+    let contents: Vec<Vec<u8>> = names
+        .iter()
+        .map(|name| name.repeat(3).into_bytes())
+        .collect();
+    let offer = |directory: &Path| proto::SmallCopyRequest {
+        reuse_block_size: None,
+        if_exists: crate::cli::IfExists::Update,
+        matching_flags: 0,
+        hash_policy: authority.hash_policy(),
+        copy_if: None,
+        directory: path_bytes(directory),
+        symlink_policy: proto::OperatorSymlinkPolicy::Refuse,
+        request_prefix: path_bytes(directory),
+        identity: proto::SmallCopyIdentity {
+            copy_id: [8; 16],
+            dst_leaf: None,
+        },
+        flags: 0,
+        files: names
+            .iter()
+            .zip(&contents)
+            .map(|(name, data)| proto::SmallCopyFile {
+                path: path_bytes(&directory.join(name)),
+                expression_source: None,
+                size: data.len() as u64,
+                meta: plain_meta(),
+            })
+            .collect(),
+    };
+    let payloads = |sizes_off_by: usize| -> Vec<proto::SmallCopyPayload> {
+        contents
+            .iter()
+            .enumerate()
+            .map(|(index, data)| {
+                let data = data[..data.len() - sizes_off_by].to_vec();
+                proto::SmallCopyPayload {
+                    index: index as u32,
+                    hash: crate::fsops::content_digest(&data),
+                    data,
+                }
+            })
+            .collect()
+    };
+
+    // Only into the signed destination.
+    let error = execute_on_connection(
+        &mut gate,
+        &mut ops,
+        Request::PrepareSmallFiles(offer(&root)),
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("other than the signed destination"),
+        "{error}"
+    );
+
+    // A preparation waits for its payloads, which must be the ones it
+    // asked for; refused payloads end it with nothing changed.
+    let prepare = || Request::PrepareSmallFiles(offer(&target));
+    assert!(matches!(
+        execute_on_connection(&mut gate, &mut ops, prepare()),
+        Ok(proto::Response::SmallFilesPrepared(needed)) if needed == [true; 3]
+    ));
+    assert_eq!(in_flight(), 1);
+    let error = execute_on_connection(&mut gate, &mut ops, Request::CopySmallFiles(payloads(1)))
+        .unwrap_err();
+    assert!(
+        error.contains("differ from what its preparation asked"),
+        "{error}"
+    );
+    assert_eq!(in_flight(), 0);
+    assert!(!target.join("one").exists());
+
+    // So does the connection's next request.
+    assert!(matches!(
+        execute_on_connection(&mut gate, &mut ops, prepare()),
+        Ok(proto::Response::SmallFilesPrepared(_))
+    ));
+    execute_on_connection(
+        &mut gate,
+        &mut ops,
+        Request::ConfigureHashing(authority.hash_policy()),
+    )
+    .unwrap();
+    assert_eq!(in_flight(), 0);
+    assert_eq!(
+        authority.changes.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+
+    // A telemetry sample in between does not.
+    assert!(matches!(
+        execute_on_connection(&mut gate, &mut ops, prepare()),
+        Ok(proto::Response::SmallFilesPrepared(_))
+    ));
+    let sample = gate.authorize(&mut Request::TransportStats, false).unwrap();
+    gate.settle(sample, &proto::Response::Ok, false);
+    let response =
+        execute_on_connection(&mut gate, &mut ops, Request::CopySmallFiles(payloads(0))).unwrap();
+    assert!(
+        matches!(
+            &response,
+            proto::Response::SmallFilesCopied(proto::SmallCopyResponse {
+                outcome: proto::SmallCopyOutcome::Published(results),
+                ..
+            }) if results.iter().all(|result| result.error.is_none()
+                && result.disposition == proto::SmallCopyDisposition::Copied)
+        ),
+        "{response:?}"
+    );
+    assert_eq!(in_flight(), 0);
+    for (name, data) in names.iter().zip(&contents) {
+        assert_eq!(&fs::read(target.join(name)).unwrap(), data, "{name}");
+    }
+    assert_eq!(
+        authority.changes.load(std::sync::atomic::Ordering::Relaxed),
+        3
+    );
+    let results = finish_results(&authority, &mut reader);
+    assert_eq!(results.totals.files_transferred, 3);
+    assert_eq!((results.totals.refused, results.totals.failed), (2, 0));
+    for name in names {
+        assert!(
+            results.has("transfer_file", name.as_bytes(), "succeeded"),
+            "{name}"
+        );
+    }
+}

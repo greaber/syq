@@ -2389,7 +2389,8 @@ fn small_copy_staging_failure_keeps_all_partials_for_retry() {
             vec![
                 SmallCopyFileResult {
                     disposition: SmallCopyDisposition::Copied,
-                    error: None
+                    error: None,
+                    repaired: false,
                 };
                 2
             ]
@@ -2473,7 +2474,8 @@ fn small_copy_publishes_regular_files_and_declines_other_types() {
                 vec![
                     SmallCopyFileResult {
                         disposition: SmallCopyDisposition::Copied,
-                        error: None
+                        error: None,
+                        repaired: false,
                     };
                     2
                 ]

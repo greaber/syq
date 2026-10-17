@@ -1054,7 +1054,6 @@ fn small_copy_eligible(
         && dst_ep.is_remote()
         && !src_ep.is_remote()
         && !srcs.iter().any(Location::is_remote)
-        && args.restricted_grant.is_none()
         && !args.dry_run
         // The directory it writes into may need widening.
         && args.widen_dirs != WidenDirs::All
@@ -1305,10 +1304,11 @@ fn attempt_small_copy(
                 {
                     return Ok(SmallCopy::Reconnect);
                 }
-                if dst_ctl
-                    .observe(&progress.observations, actor, false, 0)
-                    .is_err()
-                {
+                if let Err(error) = dst_ctl.observe(&progress.observations, actor, false, 0) {
+                    // A restricted receiver's copy has one control connection.
+                    if args.restricted_grant.is_some() {
+                        return Err(error).context("observe the destination's control connection");
+                    }
                     // Nothing has been copied yet. Reopen the control connection before
                     // entering the ordinary transfer path; never use lost framing.
                     return Ok(SmallCopy::Reconnect);
@@ -1410,8 +1410,9 @@ fn attempt_small_copy(
         }) => {
             if debug() {
                 crate::output::diagnostic!(
-                    "syq: small copy: staging failed ({}); using the ordinary engine on a new control connection",
-                    error.message
+                    "syq: small copy: staging failed ({}); using the ordinary engine on {}",
+                    error.message,
+                    fallback_connection(args)
                 );
             }
             return Ok(SmallCopy::Reconnect);
@@ -1428,7 +1429,8 @@ fn attempt_small_copy(
                     _ => unreachable!(),
                 };
                 crate::output::diagnostic!(
-                    "syq: small copy failed ({message}); using the ordinary engine on a new control connection"
+                    "syq: small copy failed ({message}); using the ordinary engine on {}",
+                    fallback_connection(args)
                 );
             }
             return Ok(SmallCopy::Reconnect);
@@ -1544,6 +1546,16 @@ fn attempt_small_copy(
         }
     }
 
+    // Every change is settled: end the destination's results, which also
+    // ends its grant.
+    if crate::destination::reports_results(&args.restricted_grant) {
+        let finished = dst_ctl
+            .call(Request::FinishDestinationResults)
+            .and_then(|response| ok(response, "end the destination's results"));
+        if let Err(error) = finished {
+            progress.error(&format!("syq: destination results: {error:#}"));
+        }
+    }
     progress.stop();
     progress.clear();
     let errors = progress.errors.load(Relaxed);
@@ -1605,6 +1617,16 @@ fn attempt_small_copy(
         results.emit_result(&terminal);
     }
     Ok(SmallCopy::Done(exit_code))
+}
+
+/// The control connection a copy goes on over when the small-copy shortcut
+/// does not finish it: a restricted receiver's copy has only one.
+fn fallback_connection(args: &Args) -> &'static str {
+    if args.restricted_grant.is_some() {
+        "the same control connection"
+    } else {
+        "a new control connection"
+    }
 }
 
 fn show_statistics(args: &Args) -> bool {
@@ -3188,7 +3210,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // The bounded offer replaces the destination configuration turn. Its
     // selected payloads use this control connection without data workers.
     if small_copy_candidate {
-        match attempt_small_copy(
+        let outcome = attempt_small_copy(
             &args,
             &opts,
             srcs,
@@ -3203,7 +3225,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 .map(|budget| (budget.clone(), Arc::downgrade(&sched))),
             &progress,
             t0,
-        )? {
+        )?;
+        match outcome {
             SmallCopy::Done(code) => {
                 if let Some(history) = progress.tuning_history.get() {
                     history.event(
@@ -3215,15 +3238,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 dst_ctl.detach();
                 return Ok(code);
             }
-            SmallCopy::Declined => {
+            SmallCopy::Reconnect if args.restricted_grant.is_none() => {
+                let _setup = progress.clock.setup.begin();
+                dst_ctl = connect_ctl(&dst_ep, &args)?;
+            }
+            // A restricted receiver's session is as it was before the
+            // shortcut, so its copy goes on over its one control connection.
+            SmallCopy::Declined | SmallCopy::Reconnect => {
                 dst_ctl.send_expecting_ok(
                     Request::ConfigureHashing(opts.hash_policy),
                     "configure hashing",
                 )?;
-            }
-            SmallCopy::Reconnect => {
-                let _setup = progress.clock.setup.begin();
-                dst_ctl = connect_ctl(&dst_ep, &args)?;
             }
         }
     }

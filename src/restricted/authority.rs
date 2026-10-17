@@ -868,6 +868,11 @@ impl RestrictedAuthority {
                 .iter()
                 .map(|put| file(&put.path, put.data.len() as u64))
                 .collect(),
+            Request::PrepareSmallFiles(request) => request
+                .files
+                .iter()
+                .map(|small| file(&small.path, small.size))
+                .collect(),
             Request::PatchSmallBatch(patches) => patches
                 .iter()
                 .map(|patch| file(&patch.path, patch.len))
@@ -1051,6 +1056,32 @@ impl RestrictedAuthority {
                     if let Some(error) = outcome_error(index) {
                         self.record_change(&path, change, Some(error));
                     }
+                }
+                PendingOutcome::SmallCopy { index, path, size } => {
+                    let proto::Response::SmallFilesCopied(proto::SmallCopyResponse {
+                        outcome: proto::SmallCopyOutcome::Published(results),
+                        ..
+                    }) = response
+                    else {
+                        continue;
+                    };
+                    let Some(result) = results.get(index) else {
+                        continue;
+                    };
+                    let error = result.error.as_ref().map(proto::WireError::as_str);
+                    let change = match result.disposition {
+                        proto::SmallCopyDisposition::Copied => Change::PublishFile { size },
+                        proto::SmallCopyDisposition::QuickChecked
+                        | proto::SmallCopyDisposition::ContentMatched
+                            if result.repaired =>
+                        {
+                            Change::SetMetadata {
+                                kind: proto::Kind::File,
+                            }
+                        }
+                        _ => continue,
+                    };
+                    self.record_change(&path, change, error);
                 }
                 PendingOutcome::Logical {
                     index,
@@ -1766,6 +1797,14 @@ impl RestrictedAuthority {
             Request::PatchBegin { .. } | Request::Finalize { .. } | Request::FinishBasis { .. } => {
                 (1, 0)
             }
+            Request::PrepareSmallFiles(request) => (request.files.len() as u64, 0),
+            Request::CopySmallFiles(payloads) => (
+                0,
+                payloads
+                    .iter()
+                    .map(|payload| payload.data.len() as u64)
+                    .sum(),
+            ),
             Request::WriteRange { data, .. } | Request::PatchData { data, .. } => {
                 (0, data.len() as u64)
             }
@@ -1819,6 +1858,33 @@ impl RestrictedAuthority {
                 .filter(|(_, result)| result.is_err())
                 .map(|(index, _)| index)
                 .collect(),
+            proto::Response::PublishedBatch(results) => results
+                .iter()
+                .enumerate()
+                .filter(|(_, result)| result.is_err())
+                .map(|(index, _)| index)
+                .collect(),
+            // A small copy changes the files it publishes and those whose
+            // metadata it changes; a preparation waiting for its payloads
+            // is settled with their reply.
+            proto::Response::SmallFilesCopied(proto::SmallCopyResponse {
+                outcome: proto::SmallCopyOutcome::Published(results),
+                ..
+            }) => results
+                .iter()
+                .enumerate()
+                .filter(|(_, result)| {
+                    result.error.is_some()
+                        || match result.disposition {
+                            proto::SmallCopyDisposition::Copied => false,
+                            proto::SmallCopyDisposition::QuickChecked
+                            | proto::SmallCopyDisposition::ContentMatched => !result.repaired,
+                            proto::SmallCopyDisposition::Excluded => true,
+                        }
+                })
+                .map(|(index, _)| index)
+                .collect(),
+            proto::Response::SmallFilesCopied(_) => (0..charged.changes as usize).collect(),
             _ => Vec::new(),
         };
         let unmade = (failed.len() as u64).min(charged.changes);
@@ -1860,9 +1926,33 @@ impl RestrictedAuthority {
         &self,
         request: &Request,
         stream: &mut Option<OpenPatchStream>,
+        small_copy: &mut Option<PreparedSmallCopy>,
         step: &mut StreamStep,
     ) -> Result<()> {
         match request {
+            Request::PrepareSmallFiles(request) => {
+                *step = StreamStep::PrepareSmallCopy {
+                    sizes: request.files.iter().map(|file| file.size).collect(),
+                };
+            }
+            // Payloads only for the files the preparation asked for, each
+            // of the size it offered.
+            Request::CopySmallFiles(payloads) => {
+                let prepared = small_copy
+                    .take()
+                    .context("no small copy is prepared on this connection")?;
+                let mut sent = vec![false; prepared.needed.len()];
+                let mismatched = payloads.iter().any(|payload| {
+                    let index = payload.index as usize;
+                    !prepared.needed.get(index).is_some_and(|needed| *needed)
+                        || std::mem::replace(&mut sent[index], true)
+                        || prepared.sizes[index] != payload.data.len() as u64
+                });
+                *step = StreamStep::CopySmallCopy(Box::new(prepared.settlement));
+                if mismatched {
+                    bail!("small copy payloads differ from what its preparation asked for");
+                }
+            }
             Request::PatchBegin { patch, data_len } => {
                 if stream.is_some() {
                     bail!("a streamed patch is already open on this connection");
@@ -1891,6 +1981,69 @@ impl RestrictedAuthority {
                 *step = StreamStep::End;
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// The small-copy shortcut (`Request::PrepareSmallFiles`) publishes
+    /// staged files at names directly inside one directory, replacing what
+    /// it finds there, or changes a kept file's metadata in place. Each file
+    /// passes the rules a `PutSmallBatch` entry does; the payloads that
+    /// follow are held to them (`authorize_stream`), and `settle` records
+    /// what the reply reports.
+    fn authorize_small_copy(
+        &self,
+        request: &proto::SmallCopyRequest,
+        outcomes: &mut Vec<PendingOutcome>,
+    ) -> Result<()> {
+        if self.creation_policy(false) != ExistingDestinationPolicy::Replace
+            || self.root_existence != RootExistence::Any
+        {
+            bail!("the small-copy shortcut replaces existing files, which this grant does not");
+        }
+        self.require_publication_mode(false, "small-copy publication")?;
+        if request.hash_policy != self.hash_policy() {
+            bail!("hash policy differs from the authorized copy");
+        }
+        let parent = |path: &[u8]| {
+            path.iter()
+                .rposition(|byte| *byte == b'/')
+                .map(|slash| path[..slash.max(1)].to_vec())
+        };
+        let in_destination = request.directory == self.destination
+            && self.copy.policy.placement != DestinationPlacement::ExactPath;
+        let at_destination = self.copy.policy.placement == DestinationPlacement::ExactPath
+            && parent(&self.destination).as_deref() == Some(request.directory.as_slice());
+        if !in_destination && !at_destination {
+            bail!("small copy writes into a directory other than the signed destination");
+        }
+        if let Some(limit) = &self.file_data_limit {
+            let bytes = request.files.iter().try_fold(0u64, |total, file| {
+                total
+                    .checked_add(file.size)
+                    .context("small copy byte count overflow")
+            })?;
+            if bytes > limit.burst_bytes() {
+                bail!("small copy exceeds the signed file-data rate-limit burst");
+            }
+        }
+        // A content match also sets times the copy compares by.
+        let flags = request.flags | (request.matching_flags & proto::flags::TIMES);
+        for (index, file) in request.files.iter().enumerate() {
+            if parent(&file.path).as_deref() != Some(request.directory.as_slice()) {
+                bail!("small copy names a file outside the directory it writes into");
+            }
+            if self.expected_hash(&file.path)?.is_some() {
+                bail!("expected-hash files require checked finalization");
+            }
+            let size = usize::try_from(file.size).context("small copy file size overflow")?;
+            self.check_file_bytes(&file.path, 0, size)?;
+            self.check_metadata(&file.path, &file.meta, flags)?;
+            outcomes.push(PendingOutcome::SmallCopy {
+                index,
+                path: file.path.clone(),
+                size: file.size,
+            });
         }
         Ok(())
     }
@@ -2287,17 +2440,32 @@ impl RestrictedAuthority {
     /// response so provisional creations are forgotten when execution fails.
     /// A streamed patch needs its connection's `PatchStreamGate`.
     pub(crate) fn authorize(&self, request: &mut Request, over_ssh: bool) -> Result<Settlement> {
-        self.authorize_streaming(request, over_ssh, &mut None)
+        self.authorize_streaming(request, over_ssh, &mut None, &mut None)
     }
 
     /// `authorize`, with the streamed patch open on the request's
-    /// connection, if any.
+    /// connection and the small copy prepared there, if any.
     fn authorize_streaming(
         &self,
         request: &mut Request,
         over_ssh: bool,
         stream: &mut Option<OpenPatchStream>,
+        small_copy: &mut Option<PreparedSmallCopy>,
     ) -> Result<Settlement> {
+        // A prepared small copy ends with its payloads or with the
+        // connection's next request but a telemetry sample: then it made
+        // no change.
+        if !matches!(
+            request,
+            Request::CopySmallFiles(_) | Request::TransportStats
+        ) {
+            if let Some(prepared) = small_copy.take() {
+                self.settle(
+                    prepared.settlement,
+                    &proto::Response::Err("the small copy ended without its payloads".into()),
+                );
+            }
+        }
         let mut pending = Vec::new();
         let mut outcomes = Vec::new();
         // Requests the server executes and then settles; the results' end
@@ -2336,7 +2504,7 @@ impl RestrictedAuthority {
         let mut step = StreamStep::None;
         let authorized = self.authorize_inner(request, over_ssh, &mut pending, &mut outcomes);
         let authorized = authorized
-            .and_then(|()| self.authorize_stream(request, stream, &mut step))
+            .and_then(|()| self.authorize_stream(request, stream, small_copy, &mut step))
             .and_then(|()| self.charge_request(request));
         match authorized {
             Ok(charged) => Ok(Settlement {
@@ -2348,7 +2516,11 @@ impl RestrictedAuthority {
             }),
             Err(error) => {
                 // Nothing of a refused request executes, including the
-                // entries authorized before the refusing one.
+                // entries authorized before the refusing one, or the small
+                // copy whose payloads it carries.
+                if let StreamStep::CopySmallCopy(prepared) = step {
+                    self.settle(*prepared, &proto::Response::Err(format!("{error:#}")));
+                }
                 self.forget_provisional(&pending);
                 self.release_patch_holds(outcomes.into_iter());
                 // What it asked for, classified before taking the state lock:
@@ -2992,11 +3164,12 @@ impl RestrictedAuthority {
             | Request::ShrinkReadStream { .. }
             | Request::StopReadStream
             | Request::ReadSmallBatch(_)
-            | Request::ReadDifferingBatch { .. }
-            | Request::PrepareSmallFiles(_)
-            | Request::CopySmallFiles(_) => {
+            | Request::ReadDifferingBatch { .. } => {
                 bail!("request is not valid on a command-restricted destination")
             }
+            Request::PrepareSmallFiles(request) => self.authorize_small_copy(request, outcomes)?,
+            // Held to its preparation in `authorize_stream`.
+            Request::CopySmallFiles(_) => {}
             Request::ListDir { .. }
             | Request::ListDirDetails { .. }
             | Request::ListDirNoFollowFinal { .. } => {
@@ -3091,6 +3264,23 @@ pub(super) enum StreamStep {
         declared: u64,
     },
     End,
+    /// Prepare a small copy of files of these sizes.
+    PrepareSmallCopy {
+        sizes: Vec<u64>,
+    },
+    /// Send the prepared small copy's payloads; its preparation settles
+    /// with their reply.
+    CopySmallCopy(Box<Settlement>),
+}
+
+/// A small copy prepared on one connection, waiting for its payloads: the
+/// files its preparation asked for, and that preparation's settlement,
+/// which the payloads' reply settles. Until then it counts as in flight.
+#[derive(Debug)]
+pub(crate) struct PreparedSmallCopy {
+    sizes: Vec<u64>,
+    needed: Vec<bool>,
+    settlement: Settlement,
 }
 
 /// A streamed patch open on one connection: the new data its pieces may
@@ -3110,6 +3300,7 @@ pub(crate) struct OpenPatchStream {
 pub(crate) struct PatchStreamGate {
     authority: std::sync::Arc<RestrictedAuthority>,
     open: Option<OpenPatchStream>,
+    small_copy: Option<PreparedSmallCopy>,
 }
 
 impl PatchStreamGate {
@@ -3117,6 +3308,7 @@ impl PatchStreamGate {
         Self {
             authority,
             open: None,
+            small_copy: None,
         }
     }
 
@@ -3131,7 +3323,7 @@ impl PatchStreamGate {
         over_ssh: bool,
     ) -> Result<Settlement> {
         self.authority
-            .authorize_streaming(request, over_ssh, &mut self.open)
+            .authorize_streaming(request, over_ssh, &mut self.open, &mut self.small_copy)
     }
 
     /// Settle an executed request. A begin whose patch the executor left
@@ -3157,6 +3349,20 @@ impl PatchStreamGate {
                     self.authority.settle(open.settlement, response);
                 }
             }
+            StreamStep::PrepareSmallCopy { sizes } => match response {
+                proto::Response::SmallFilesPrepared(needed) if needed.len() == sizes.len() => {
+                    self.small_copy = Some(PreparedSmallCopy {
+                        sizes,
+                        needed: needed.clone(),
+                        settlement,
+                    });
+                }
+                _ => self.authority.settle(settlement, response),
+            },
+            StreamStep::CopySmallCopy(prepared) => {
+                self.authority.settle(settlement, response);
+                self.authority.settle(*prepared, response);
+            }
             _ => self.authority.settle(settlement, response),
         }
     }
@@ -3180,6 +3386,14 @@ impl PatchStreamGate {
 impl Drop for PatchStreamGate {
     fn drop(&mut self) {
         self.abandon("the connection closed before its streamed patch ended");
+        if let Some(prepared) = self.small_copy.take() {
+            self.authority.settle(
+                prepared.settlement,
+                &proto::Response::Err(
+                    "the connection closed before the small copy's payloads".into(),
+                ),
+            );
+        }
     }
 }
 
@@ -3258,6 +3472,13 @@ pub(super) enum PendingOutcome {
         /// releases or retains precisely this hold without affecting a
         /// concurrent preparation for the same partial.
         observation_hold: Option<ReservationHoldId>,
+    },
+    /// A file of the small-copy shortcut, which the executor reports as
+    /// published, kept with its metadata changed or not, or excluded.
+    SmallCopy {
+        index: usize,
+        path: Vec<u8>,
+        size: u64,
     },
     /// A small-file patch, which the executor reports as kept or published.
     Patch {

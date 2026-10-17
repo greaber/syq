@@ -903,6 +903,51 @@ for small_case in unchanged updated; do
     test "$small_expected" = "$small_actual"
 done
 
+printf 'case: small server-to-server copy to a restricted destination takes one turn\n'
+# A restricted receiver serves the one-turn path too: a new file, an
+# unchanged one and an updated one, with the receiver's results.
+restricted_small=/tmp/syq-real-ssh/restricted-small-destination
+restricted_small_source=/tmp/syq-real-ssh/restricted-small.bin
+small_debug=/tmp/syq-real-ssh-restricted-small.debug
+# shellcheck disable=SC2029
+ssh source "mkdir -p /tmp/syq-real-ssh && head -c 2048 /dev/urandom >$restricted_small_source"
+# shellcheck disable=SC2029
+ssh destination "rm -rf $restricted_small && install -d $restricted_small"
+for small_case in new unchanged updated; do
+    small_results="/tmp/syq-real-ssh-restricted-small-$small_case.ndjson"
+    if [ "$small_case" = updated ]; then
+        # shellcheck disable=SC2029
+        ssh source "printf 'changed payload\\n' >>$restricted_small_source"
+    fi
+    if ! SYQ_DEBUG=1 syq cp --if-exists=update --no-progress --results "$small_results" \
+        --from source "$restricted_small_source" --to destination --into "$restricted_small" \
+        2>"$small_debug"; then
+        cat "$small_debug" >&2
+        exit 1
+    fi
+    small_status=$(tail -n 1 "$small_results")
+    case "$small_status" in
+        *'"status":"success"'*) ;;
+        *) cat "$small_results" "$small_debug" >&2; exit 1 ;;
+    esac
+    case "$small_case:$small_status" in
+        new:*'"files_transferred":1'*|unchanged:*'"files_unchanged":1'*) ;;
+        updated:*'"files_transferred":1'*) ;;
+        *) cat "$small_results" >&2; exit 1 ;;
+    esac
+    if ! grep -q 'small copy: published' "$small_debug" ||
+        ! grep -q 'syq-receiver\|restricted' "$small_debug"; then
+        echo 'small copy to a restricted destination did not use the one-turn path:' >&2
+        cat "$small_debug" >&2
+        exit 1
+    fi
+    # shellcheck disable=SC2029
+    small_expected=$(ssh source "sha256sum $restricted_small_source" | cut -d ' ' -f 1)
+    # shellcheck disable=SC2029
+    small_actual=$(ssh destination "sha256sum $restricted_small/restricted-small.bin" | cut -d ' ' -f 1)
+    test "$small_expected" = "$small_actual"
+done
+
 printf 'case: restricted enrollment refuses an SSH control-plane destination\n'
 make_tree source /tmp/syq-real-ssh/protected-source protected
 if protected_output=$(syq cp --no-progress --performance-tuning workers=2 --copy-metadata=permissions \

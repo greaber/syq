@@ -1344,15 +1344,23 @@ impl FsOps {
     /// Configure hashing and retain the destination and metadata observations.
     /// Rejected and quick-checked entries never need source payload reads.
     /// Unsupported target types decline before installing session state.
+    /// A restricted receiver opens the directory beneath the root its
+    /// authority holds and installs nothing: its session is as it was, so a
+    /// copy the shortcut does not finish goes on over the same connection.
     #[allow(clippy::unnecessary_cast)] // libc stat field widths differ on Darwin.
     fn prepare_small_files(&mut self, request: &SmallCopyRequest) -> Result<Response> {
+        let restricted = self.restricted_destination();
+        if restricted && request.request_prefix != request.directory {
+            bail!("a restricted small copy names files by the directory it writes into");
+        }
         if self.operator_selection.is_some()
-            || self.destination_root.is_some()
-            || self.destination_prefix.is_some()
+            || (!restricted
+                && (self.destination_root.is_some() || self.destination_prefix.is_some()))
             || !self.source_roots.is_empty()
         {
             bail!("small copy is valid only on a fresh control session");
         }
+        self.prepared_small_copy = None;
         if request.files.is_empty() || request.files.len() > SMALL_COPY_MAX_FILES {
             bail!(
                 "small copy carries {} files; the limit is {SMALL_COPY_MAX_FILES}",
@@ -1385,14 +1393,34 @@ impl FsOps {
             })
             .transpose()?;
 
-        let (selection, anchor) =
-            select_operator_directory(&request.directory, false, request.symlink_policy)?;
-        let anchor = anchor.context("destination directory is missing")?;
+        let (directory, anchor) = if restricted {
+            let relative = self.destination_relative(&request.directory)?;
+            let directory = self
+                .destination_root
+                .as_ref()
+                .expect("restricted destination root")
+                .open_directory(&RelativePath::new(&relative)?)?;
+            let metadata = directory.metadata()?;
+            let anchor = DirectoryAnchor {
+                path: request.directory.clone(),
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                needs_owner_access: false,
+            };
+            (directory, anchor)
+        } else {
+            let (selection, anchor) =
+                select_operator_directory(&request.directory, false, request.symlink_policy)?;
+            (
+                selection.directory,
+                anchor.context("destination directory is missing")?,
+            )
+        };
         // Inspect through the retained directory before installing state,
         // so unsupported type replacements can use the general engine.
         let mut destinations = Vec::with_capacity(names.len());
         for name in &names {
-            match operator_lstat_at(&selection.directory, name) {
+            match operator_lstat_at(&directory, name) {
                 Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFREG => {
                     destinations.push(Some(stat));
                 }
@@ -1503,9 +1531,11 @@ impl FsOps {
                 outcome: SmallCopyOutcome::NeedsBlockReuse,
             }));
         }
-        let ticket = self.descriptor_session.register(selection.directory)?;
-        let directory = self.descriptor_session.acquire(&ticket)?;
-        self.install_destination(directory, &request.request_prefix)?;
+        if !restricted {
+            let ticket = self.descriptor_session.register(directory)?;
+            let directory = self.descriptor_session.acquire(&ticket)?;
+            self.install_destination(directory, &request.request_prefix)?;
+        }
 
         // An unchanged file whose metadata the receiver cannot change in
         // place is replaced from its payload, as a changed file is, and
@@ -1766,6 +1796,7 @@ impl FsOps {
                         return SmallCopyFileResult {
                             disposition: SmallCopyDisposition::Excluded,
                             error: None,
+                            repaired: false,
                         };
                     }
                     let condition = destination
@@ -1777,6 +1808,7 @@ impl FsOps {
                     match item {
                         Some(item) => SmallCopyFileResult {
                             disposition: SmallCopyDisposition::Copied,
+                            repaired: false,
                             error: publish_partial_rooted(
                                 &item.root,
                                 &item.partial,
@@ -1854,7 +1886,11 @@ impl FsOps {
                                     Err(error) => Some(wire_error(&error)),
                                 }
                             };
-                            SmallCopyFileResult { disposition, error }
+                            SmallCopyFileResult {
+                                disposition,
+                                error,
+                                repaired: repair != 0,
+                            }
                         }
                     }
                 })
@@ -2437,6 +2473,12 @@ impl FsOps {
     /// every connection, named in requests by `request_prefix`. Missing
     /// directories are never created on the way to a path: each directory
     /// this session creates passes the authority.
+    /// Whether this session serves a command-restricted receiver's copy
+    /// (`install_restricted_destination`).
+    fn restricted_destination(&self) -> bool {
+        !self.create_missing_parents
+    }
+
     pub(crate) fn install_restricted_destination(
         &mut self,
         root: Arc<Root>,
