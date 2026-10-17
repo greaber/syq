@@ -285,7 +285,10 @@ def direct():
         print("mapping route: large SSH manifest", flush=True)
         results_path = Path(temporary) / "results-large.ndjson"
         result = run(prefix + ["--mapping", "-", "--to", "destination", "--into", root + "/large", "--no-tcp", "--copy-metadata=permissions", "--results", str(results_path)], data=large, expected=23)
-        assert result.stderr.count(b"cannot replace non-directory") == 2, result.stderr
+        # As an ordinary copy reports them: blocked once, and group once as
+        # the implicit parent of the files before it and once as the
+        # explicit directory after them.
+        assert result.stderr.count(b"cannot replace non-directory") == 3, result.stderr
         records = [json.loads(line) for line in results_path.read_text().splitlines()]
         assert records[-1]["status"] == "partial", records[-1]
         ssh("destination", f"from pathlib import Path; assert Path({root + '/large/blocked'!r}).read_bytes()==b'keep implicit parent'")

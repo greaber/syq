@@ -903,6 +903,30 @@ for small_case in unchanged updated; do
     test "$small_expected" = "$small_actual"
 done
 
+printf 'case: restricted enrollment refuses an SSH control-plane destination\n'
+make_tree source /tmp/syq-real-ssh/protected-source protected
+if protected_output=$(syq cp --no-progress --performance-tuning workers=2 --copy-metadata=permissions \
+    --from source --srcs-in /tmp/syq-real-ssh/protected-source \
+    --to destination --into /home/syq/.ssh/sender-controlled 2>&1); then
+    echo 'copy into the restricted receiver control plane unexpectedly succeeded' >&2
+    exit 1
+fi
+case "$protected_output" in
+    *"protected SSH configuration directory"*) ;;
+    *)
+        echo 'control-plane refusal did not report the protected SSH directory:' >&2
+        printf '%s\n' "$protected_output" >&2
+        exit 1
+        ;;
+esac
+ssh destination '
+    test ! -e ~/.ssh/sender-controlled
+    test ! -e ~/.local/share/syq/restricted
+    test ! -e ~/.local/libexec/syq-receiver
+'
+
+python3 /usr/local/libexec/syq-test-restricted-mapping.py
+
 printf 'case: small server-to-server copy to a restricted destination takes one turn\n'
 # A restricted receiver serves the one-turn path too: a new file, an
 # unchanged one and an updated one, with the receiver's results.
@@ -983,30 +1007,6 @@ syq cp --no-progress --pscope "$limits_scope" --copy-metadata=permissions \
 syq persist off --pscope "$limits_scope" >/dev/null
 assert_same_tree source /tmp/syq-real-ssh/pscope-source \
     destination /tmp/syq-real-ssh/pscope-destination pscope
-
-printf 'case: restricted enrollment refuses an SSH control-plane destination\n'
-make_tree source /tmp/syq-real-ssh/protected-source protected
-if protected_output=$(syq cp --no-progress --performance-tuning workers=2 --copy-metadata=permissions \
-    --from source --srcs-in /tmp/syq-real-ssh/protected-source \
-    --to destination --into /home/syq/.ssh/sender-controlled 2>&1); then
-    echo 'copy into the restricted receiver control plane unexpectedly succeeded' >&2
-    exit 1
-fi
-case "$protected_output" in
-    *"protected SSH configuration directory"*) ;;
-    *)
-        echo 'control-plane refusal did not report the protected SSH directory:' >&2
-        printf '%s\n' "$protected_output" >&2
-        exit 1
-        ;;
-esac
-ssh destination '
-    test ! -e ~/.ssh/sender-controlled
-    test ! -e ~/.local/share/syq/restricted
-    test ! -e ~/.local/libexec/syq-receiver
-'
-
-python3 /usr/local/libexec/syq-test-restricted-mapping.py
 
 printf 'case: receiver keys preserve login key protection\n'
 python3 /usr/local/libexec/syq-test-receiver-keys.py
