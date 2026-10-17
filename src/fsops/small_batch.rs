@@ -110,6 +110,9 @@ pub(super) struct SmallStage {
     reused: bool,
     /// Made as a clone of the file its patch replaces, as macOS clones.
     cloned: bool,
+    /// The clone its file's comparison hashed (`HeldClone`): it holds the
+    /// blocks the patch reuses, as compared, and needs no further check.
+    compared: bool,
     /// Read right after the sidecar was opened, when an NFS client answers
     /// from the create's reply; it decides the metadata step and gives the
     /// published identity, which a rename does not change.
@@ -264,6 +267,117 @@ enum Keep {
     /// It must be replaced, and why when the receiver refused to change its
     /// metadata in place.
     Replace(Option<ReplaceReason>),
+}
+
+/// Most clones one connection holds for patches still to come: the files
+/// of as many groups as a worker keeps in flight (16 of up to 256 files). A
+/// file beyond that is compared as it is, and its stage checked as it is
+/// built.
+const HELD_CLONES_MAX: usize = 16 * 256;
+
+/// A private stage cloned from an existing file before it was hashed
+/// (`ExistingRead::clone_for`), held for that file's patch, which builds on
+/// it.
+pub(super) struct HeldClone {
+    root: Arc<Root>,
+    partial: RelativePath,
+    label: PathBuf,
+    file: File,
+    created: fs::Metadata,
+}
+
+impl HeldClone {
+    /// The stage of the patch for the file at `target`.
+    fn into_stage(self, target: RootedTarget) -> SmallStage {
+        SmallStage {
+            target,
+            partial: self.partial,
+            label: self.label,
+            file: self.file,
+            reused: false,
+            cloned: true,
+            compared: true,
+            created: self.created,
+        }
+    }
+
+    /// Remove the stage, if its name still holds it.
+    fn discard(self) {
+        #[cfg(debug_assertions)]
+        let _ = record_test_event("SYQ_TEST_CLONE_FIRST", format_args!("discarded"));
+        let identity = (self.created.dev(), self.created.ino());
+        let _ = discard_safe_rooted_partial_if_same(
+            &self.root,
+            &self.partial,
+            identity.0,
+            identity.1,
+            &self.label,
+        );
+        sidecars::forget(identity);
+    }
+}
+
+/// The clones a connection holds for patches still to come, by path and
+/// copy. Each goes when its patch builds on it or is done without it, when
+/// the next batch begins, or when the connection ends; an interrupted or
+/// lost copy's sweep removes any left (`sidecars`).
+#[derive(Default)]
+pub(super) struct HeldClones {
+    held: HashMap<(PathBytes, CopyId), HeldClone>,
+    /// The batch the held clones belong to.
+    batch: u64,
+    /// Devices where a clone failed: files there are compared as they are.
+    no_clones: HashSet<u64>,
+}
+
+impl HeldClones {
+    fn begin_batch(&mut self, batch: u64) {
+        if batch != self.batch {
+            self.discard_all();
+            self.batch = batch;
+        }
+    }
+
+    fn may_hold(&self, dev: u64) -> bool {
+        self.held.len() < HELD_CLONES_MAX && !self.no_clones.contains(&dev)
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn cannot_clone(&mut self, dev: u64) {
+        self.no_clones.insert(dev);
+    }
+
+    fn hold(&mut self, path: &[u8], copy_id: &CopyId, clone: HeldClone) {
+        if let Some(earlier) = self.held.insert((path.to_vec(), *copy_id), clone) {
+            earlier.discard();
+        }
+    }
+
+    fn get(&self, path: &[u8], copy_id: &CopyId) -> Option<&HeldClone> {
+        self.held.get(&(path.to_vec(), *copy_id))
+    }
+
+    fn take(&mut self, path: &[u8], copy_id: &CopyId) -> Option<HeldClone> {
+        self.held.remove(&(path.to_vec(), *copy_id))
+    }
+
+    fn discard(&mut self, path: &[u8], copy_id: &CopyId) {
+        if let Some(clone) = self.take(path, copy_id) {
+            clone.discard();
+        }
+    }
+
+    fn discard_all(&mut self) {
+        for (_, clone) in self.held.drain() {
+            clone.discard();
+        }
+    }
+}
+
+impl Drop for HeldClones {
+    fn drop(&mut self) {
+        self.discard_all();
+    }
 }
 
 /// What became of a patch to update in place (`SmallPatch::update_in_place`).
@@ -526,15 +640,27 @@ impl FsOps {
         &mut self,
         block: u64,
         files: &[ExistingRead],
+        batch: u64,
     ) -> Vec<std::result::Result<ExistingHashes, WireError>> {
+        // The patches of an earlier batch have all been sent.
+        self.held_clones.begin_batch(batch);
         let mut buffer = Vec::new();
-        files
+        let hashed = files
             .iter()
             .map(|file| {
                 self.hash_existing(block, file, &mut buffer)
                     .map_err(|error| wire_error(&error))
             })
-            .collect()
+            .collect();
+        #[cfg(debug_assertions)]
+        if let Err(error) = test_race_barrier(
+            "SYQ_TEST_SMALL_HASHED_READY_FILE",
+            "SYQ_TEST_SMALL_HASHED_CONTINUE_FILE",
+            "small-file comparison hashed",
+        ) {
+            return files.iter().map(|_| Err(wire_error(&error))).collect();
+        }
+        hashed
     }
 
     fn hash_existing(
@@ -565,6 +691,17 @@ impl FsOps {
         };
         let fingerprint = fingerprint(&file.metadata()?);
         let algorithm = self.hash_policy.algorithm;
+        // A file the copy may replace from its blocks is cloned first, where
+        // it can be, and the clone hashed: the patch then builds on the bytes
+        // that were compared. A file with partials to resume from is copied
+        // on the per-file path instead.
+        let clone = match read.clone_for {
+            Some(copy_id) if !partials => {
+                self.clone_first(&target, read, &copy_id, &file, fingerprint.len)?
+            }
+            _ => None,
+        };
+        let file = clone.unwrap_or(file);
         // Only blocks the file holds whole are hashed: every block up to the
         // source's length, or those before the file ends. They are read, and
         // then hashed, a chunk at a time.
@@ -599,6 +736,122 @@ impl FsOps {
             hashes,
             partials,
         })
+    }
+
+    /// Clone `old`, the existing file at `target` of `len` bytes, into the
+    /// private stage of `copy_id` for it, hold that stage for the file's
+    /// patch, and return it opened for reading, to be hashed instead of
+    /// `old`. Only what the new file can reuse is cloned: the old file up to
+    /// the source's length, rounded up to 64 KiB. None, and `old` is hashed,
+    /// for a file under `CLONE_FIRST_MIN_BYTES`, on a filesystem that would
+    /// not clone, or once this connection holds `HELD_CLONES_MAX` clones.
+    fn clone_first(
+        &mut self,
+        target: &RootedTarget,
+        read: &ExistingRead,
+        copy_id: &CopyId,
+        old: &File,
+        len: u64,
+    ) -> Result<Option<File>> {
+        let len = len.min(
+            read.len
+                .div_ceil(MIN_HASH_BLOCK_BYTES)
+                .saturating_mul(MIN_HASH_BLOCK_BYTES),
+        );
+        let dev = target.root.identity().dev;
+        if len < CLONE_FIRST_MIN_BYTES || !self.held_clones.may_hold(dev) {
+            return Ok(None);
+        }
+        // A stage from an earlier comparison of the file goes first.
+        self.held_clones.discard(&read.path, copy_id);
+        let creation = sidecars::begin()?;
+        let Some((partial, label, file)) = self.clone_to_held_stage(old, len, copy_id, target)?
+        else {
+            return Ok(None);
+        };
+        let created = file.metadata()?;
+        creation.register(
+            &target.root,
+            &partial,
+            (created.dev(), created.ino()),
+            Sidecar::Stage,
+        );
+        #[cfg(debug_assertions)]
+        record_test_event("SYQ_TEST_CLONE_FIRST", format_args!("cloned {len}"))?;
+        let reader = file.try_clone()?;
+        self.held_clones.hold(
+            &read.path,
+            copy_id,
+            HeldClone {
+                root: target.root.clone(),
+                partial,
+                label,
+                file,
+                created,
+            },
+        );
+        Ok(Some(reader))
+    }
+
+    /// Clone `old`, `len` bytes of it, to a new private stage of `copy_id`
+    /// for `target`, opened for reading and writing; None where the
+    /// filesystem will not clone it. On Linux the stage is created first,
+    /// owner-only, as a seeded stage is (`create_seeded_stage`), and removed
+    /// again when the clone fails; a filesystem that cannot clone at all is
+    /// not asked again on this connection, while one file it cannot clone,
+    /// as one Btrfs keeps from copy-on-write, stops no other. On macOS a
+    /// clone is a new file.
+    fn clone_to_held_stage(
+        &mut self,
+        old: &File,
+        len: u64,
+        copy_id: &CopyId,
+        target: &RootedTarget,
+    ) -> Result<Option<(RelativePath, PathBuf, File)>> {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_BASIS_CLONE_UNSUPPORTED").is_some() {
+            return Ok(None);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.uncache_rooted(&target.root, &target.relative);
+            let (partial, label, (file, created)) =
+                with_rooted_partial(target, copy_id, |relative, label| {
+                    self.uncache_rooted(&target.root, relative);
+                    create_fresh_rooted_partial(&target.root, relative, label, || {
+                        target.root.create_file(relative, 0o600)
+                    })
+                })?;
+            let refused = match super::basis_copy::clone_range(old, &file, len) {
+                Ok(()) => return Ok(Some((partial, label, file))),
+                Err(error) => error,
+            };
+            let _ = discard_safe_rooted_partial_if_same(
+                &target.root,
+                &partial,
+                created.dev(),
+                created.ino(),
+                &label,
+            );
+            if matches!(
+                refused.raw_os_error(),
+                Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EXDEV | libc::ENOSYS)
+            ) {
+                self.held_clones.cannot_clone(target.root.identity().dev);
+            }
+            Ok(None)
+        }
+        // A clone is the whole file there.
+        #[cfg(target_os = "macos")]
+        {
+            let _ = len;
+            self.clone_to_stage(old, old.metadata()?.len(), copy_id, target)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (old, len, copy_id, target);
+            Ok(None)
+        }
     }
 
     /// Keep an existing file found to hold a small file's contents: set its
@@ -698,10 +951,14 @@ impl FsOps {
                 Err(error) => results[position] = Err(error),
             }
         }
-        for ((position, replaced), result) in staged
-            .into_iter()
-            .zip(self.put_small_sources(&mut puts, &sources, true))
-        {
+        let published = self.put_small_sources(&mut puts, &sources, true);
+        drop(sources);
+        // A clone a patch did not build on, as for a file kept, updated in
+        // place or failed, goes now.
+        for patch in patches {
+            self.held_clones.discard(&patch.path, &patch.copy_id);
+        }
+        for ((position, replaced), result) in staged.into_iter().zip(published) {
             results[position] = result
                 .map(|identity| SmallPatched {
                     kept: false,
@@ -1026,6 +1283,16 @@ impl FsOps {
             replaces: true,
             scanned,
         };
+        // A clone the comparison hashed becomes the stage, whatever it reuses
+        // (`create_unregistered_stage`); its blocks are not read here.
+        if let Some(held) = self.held_clones.get(&patch.path, &patch.copy_id) {
+            let source = PatchSource {
+                old: held.file.try_clone()?,
+                basis: fingerprint(&held.created),
+                patch,
+            };
+            return Ok((put(Vec::new()), Some(source)));
+        }
         let reused = patch.len - patch.data.len() as u64;
         let clones = reused >= CLONE_MIN_REUSED && reused * 2 >= patch.len;
         if let (Some(old), Some(basis), true) = (&old, patch.basis, clones) {
@@ -1066,10 +1333,13 @@ impl FsOps {
     ) -> Result<()> {
         let patch = source.patch;
         let file = &stage.file;
-        // A file whose fingerprint shows a change is not read back.
-        let copied = (stage.cloned || self.copy_basis(source, stage))
-            && fingerprint(&source.old.metadata()?) == source.basis
-            && self.stage_holds_reused(stage, patch)?;
+        // A clone the comparison hashed holds the reused blocks as
+        // compared. Another clone or copy is read back, unless the file's
+        // fingerprint already shows a change.
+        let copied = stage.compared
+            || ((stage.cloned || self.copy_basis(source, stage))
+                && fingerprint(&source.old.metadata()?) == source.basis
+                && self.stage_holds_reused(stage, patch)?);
         if !copied {
             file.set_len(0)?;
             self.preallocate_stage(stage, patch.len)?;
@@ -1478,6 +1748,11 @@ impl FsOps {
         mode: u32,
         fresh: bool,
     ) -> Result<SmallStage> {
+        if let Some(held) = self.held_clones.take(&put.path, &put.copy_id) {
+            #[cfg(debug_assertions)]
+            record_test_event("SYQ_TEST_CLONE_FIRST", format_args!("staged"))?;
+            return Ok(held.into_stage(target));
+        }
         #[cfg(target_os = "macos")]
         if let Some(source) = source {
             if let Some((partial, label, file)) = self.clone_patch_stage(put, source, &target)? {
@@ -1489,6 +1764,7 @@ impl FsOps {
                     file,
                     reused: false,
                     cloned: true,
+                    compared: false,
                     created,
                 });
             }
@@ -1531,6 +1807,7 @@ impl FsOps {
             file,
             reused: false,
             cloned: false,
+            compared: false,
             created,
         })
     }
@@ -1551,20 +1828,42 @@ impl FsOps {
         if std::env::var_os("SYQ_TEST_BASIS_CLONE_UNSUPPORTED").is_some() {
             return Ok(None);
         }
+        // A clone of a different length fails here; the stage then
+        // assembles the file, which reads its reused blocks again.
+        self.clone_to_stage(&source.old, source.basis.len, &put.copy_id, target)
+    }
+
+    /// Clone `old`, `len` bytes long, to the private stage of `copy_id` for
+    /// `target`, and return it opened for reading and writing; None when
+    /// the file cannot be cloned there, or when the clone is not fit to
+    /// stage protected data, as a reused sidecar would not be: that clone
+    /// is removed.
+    #[cfg(target_os = "macos")]
+    fn clone_to_stage(
+        &mut self,
+        old: &File,
+        len: u64,
+        copy_id: &CopyId,
+        target: &RootedTarget,
+    ) -> Result<Option<(RelativePath, PathBuf, File)>> {
         self.uncache_rooted(&target.root, &target.relative);
-        let metadata = source.old.metadata()?;
-        let (partial, label, clone) = with_rooted_partial(target, &put.copy_id, |relative, _| {
+        let metadata = old.metadata()?;
+        let (partial, label, clone) = with_rooted_partial(target, copy_id, |relative, _| {
             self.uncache_rooted(&target.root, relative);
-            // A clone of a different length fails here; the stage then
-            // assembles the file, which reads its reused blocks again.
-            target
-                .root
-                .clone_file_open(&source.old, &metadata, relative, source.basis.len)
+            target.root.clone_file_open(old, &metadata, relative, len)
         })?;
         let Some(file) = clone else {
             return Ok(None);
         };
         if !self.reusable_partial_permissions(&file)? {
+            let created = file.metadata()?;
+            let _ = discard_safe_rooted_partial_if_same(
+                &target.root,
+                &partial,
+                created.dev(),
+                created.ino(),
+                &label,
+            );
             return Ok(None);
         }
         Ok(Some((partial, label, file)))
@@ -1641,6 +1940,7 @@ impl FsOps {
             file,
             reused: basis_size.is_some(),
             cloned: false,
+            compared: false,
             created,
         })
     }
@@ -1916,6 +2216,7 @@ mod tests {
             len,
             condition: TargetCondition::Any,
             guard: None,
+            clone_for: None,
         };
         let longer = 3 * block + 10;
         let hashed = ops.hash_existing_batch(
@@ -1925,6 +2226,7 @@ mod tests {
                 read("edited", longer),
                 read("missing", 1),
             ],
+            0,
         );
         // A block the file holds only in part has no hash.
         let expected: Vec<_> = old
@@ -2042,8 +2344,9 @@ mod tests {
                 len: new.len() as u64,
                 condition: TargetCondition::Any,
                 guard: None,
+                clone_for: None,
             };
-            let hashed = ops.hash_existing_batch(block, &[read("file"), read("raced")]);
+            let hashed = ops.hash_existing_batch(block, &[read("file"), read("raced")], 0);
             let patches = [
                 patch_from("file", &new, block, hashed[0].as_ref().unwrap(), algorithm),
                 patch_from("raced", &new, block, hashed[1].as_ref().unwrap(), algorithm),
@@ -2099,7 +2402,9 @@ mod tests {
                     len: new.len() as u64,
                     condition: TargetCondition::Any,
                     guard: None,
+                    clone_for: None,
                 }],
+                0,
             );
             let mut patch = patch_from("file", &new, block, hashed[0].as_ref().unwrap(), algorithm);
             assert_eq!(patch.data.len() as u64, block);
@@ -2161,7 +2466,9 @@ mod tests {
                     len: 64 * block,
                     condition: TargetCondition::Any,
                     guard: None,
+                    clone_for: None,
                 }],
+                0,
             );
             // Enough reused blocks to copy rather than assemble the file.
             let mut new = old[..20 * block as usize].to_vec();
@@ -2221,6 +2528,7 @@ mod tests {
                 condition: TargetCondition::Any,
                 guard: None,
             }],
+            0,
         );
         let hashed = hashed[0].as_ref().unwrap();
         let mut reuse: Vec<_> = hashed.hashes.iter().copied().map(Some).collect();
@@ -2335,7 +2643,9 @@ mod tests {
                         len: new.len() as u64,
                         condition: TargetCondition::Any,
                         guard: None,
+                        clone_for: None,
                     }],
+                    0,
                 )
                 .remove(0)
                 .unwrap();
@@ -2400,7 +2710,9 @@ mod tests {
                         len: new.len() as u64,
                         condition: TargetCondition::Any,
                         guard: None,
+                        clone_for: None,
                     }],
+                    0,
                 )
                 .remove(0)
                 .unwrap();
@@ -2483,7 +2795,9 @@ mod tests {
                     len,
                     condition: TargetCondition::Any,
                     guard: None,
+                    clone_for: None,
                 }],
+                0,
             )
             .remove(0)
             .unwrap();
@@ -2583,9 +2897,13 @@ mod tests {
             len,
             condition: TargetCondition::Any,
             guard: None,
+            clone_for: None,
         };
-        let hashed =
-            ops.hash_existing_batch(block, &[read("assembled"), read("copied"), read("holes")]);
+        let hashed = ops.hash_existing_batch(
+            block,
+            &[read("assembled"), read("copied"), read("holes")],
+            0,
+        );
         let algorithm = ops.hash_policy.algorithm;
         let mut rewritten = dense.clone();
         rewritten[..20 * block as usize].fill(0);
@@ -2652,7 +2970,9 @@ mod tests {
                         len: new.len() as u64,
                         condition: TargetCondition::Any,
                         guard: None,
+                        clone_for: None,
                     }],
+                    0,
                 )
                 .remove(0)
                 .unwrap();
@@ -2733,8 +3053,9 @@ mod tests {
             len: old.len() as u64,
             condition: TargetCondition::Any,
             guard: None,
+            clone_for: None,
         };
-        let hashed = ops.hash_existing_batch(block, &[read("touched"), read("edited")]);
+        let hashed = ops.hash_existing_batch(block, &[read("touched"), read("edited")], 0);
         let patch = |name: &str, hashed: &ExistingHashes| SmallPatch {
             path: name.as_bytes().to_vec(),
             copy_id: [7; 16],
@@ -2854,8 +3175,12 @@ mod tests {
             len: 40 * block,
             condition: TargetCondition::Any,
             guard: None,
+            clone_for: None,
         };
-        let hashed = ops.hash_existing_batch(block, &[read]).remove(0).unwrap();
+        let hashed = ops
+            .hash_existing_batch(block, &[read], 0)
+            .remove(0)
+            .unwrap();
         // Blocks past the old end claim to be reused, which a clone would
         // turn into zeros without reading them.
         let mut reuse: Vec<_> = hashed.hashes.iter().copied().map(Some).collect();
@@ -3620,7 +3945,9 @@ mod tests {
                         len: new.len() as u64,
                         condition: TargetCondition::Any,
                         guard: None,
+                        clone_for: None,
                     }],
+                    0,
                 )
                 .remove(0)
                 .unwrap();
@@ -3726,8 +4053,9 @@ mod tests {
                     len: new.len() as u64,
                     condition: TargetCondition::Any,
                     guard: None,
+                    clone_for: None,
                 };
-                let hashed = ops.hash_existing_batch(block, &[read]);
+                let hashed = ops.hash_existing_batch(block, &[read], 0);
                 let mut patch =
                     patch_from(name, new, block, hashed[0].as_ref().unwrap(), algorithm);
                 // Published readable by others, but private until then.
@@ -3812,8 +4140,9 @@ mod tests {
                 len: new.len() as u64,
                 condition: TargetCondition::Any,
                 guard: None,
+                clone_for: None,
             };
-            let hashed = ops.hash_existing_batch(block, &[read]);
+            let hashed = ops.hash_existing_batch(block, &[read], 0);
             let mut patch = patch_from("file", &new, block, hashed[0].as_ref().unwrap(), algorithm);
             if !seeds {
                 // Without the old file's fingerprint the stage is not seeded.
@@ -3949,6 +4278,7 @@ mod tests {
             Request::HashExistingBatch {
                 block,
                 files: Vec::new(),
+                batch: 0,
             },
             Request::PutSmallBatch(vec![put("other", b"data")]),
         ] {
@@ -4014,8 +4344,9 @@ mod tests {
                 len: new.len() as u64,
                 condition,
                 guard: None,
+                clone_for: None,
             };
-            let hashed = ops.hash_existing_batch(block, &[read]);
+            let hashed = ops.hash_existing_batch(block, &[read], 0);
             let mut patch = patch_from("file", &new, block, hashed[0].as_ref().unwrap(), algorithm);
             patch.condition = condition;
             // A change of metadata alone, as keeping another name of the

@@ -1035,6 +1035,87 @@ fn a_patch_whose_payload_fails_its_check_is_copied_whole() {
     }
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn a_file_changed_unseen_after_its_comparison_gets_the_sources_bytes() {
+    // A file the copy replaces is cloned before it is compared, where the
+    // filesystem can clone, and its patch builds on that clone; elsewhere
+    // the stage's copy of it is read back and checked. Either way a write
+    // to a block the patch reuses, made after the comparison, leaving the
+    // file's length and, with coarse change times, its fingerprint as they
+    // were, does not reach the published file. A clone that is not needed
+    // goes; nothing is left behind.
+    use std::os::unix::fs::FileExt as _;
+    for (route, cloning) in [
+        ("local", true),
+        ("local", false),
+        ("push", true),
+        ("push", false),
+    ] {
+        let case = format!("{route} cloning={cloning}");
+        let t = Tmp::new();
+        let source = prng(4 << 20, 960);
+        let mut old = source.clone();
+        old[(3 << 20) + 9] ^= 1;
+        write(&t.path("src/file"), &source);
+        write(&t.path("dst/file"), &old);
+        // An unchanged file is compared too, and kept.
+        let unchanged = prng(2 << 20, 961);
+        write(&t.path("src/same"), &unchanged);
+        write(&t.path("dst/same"), &unchanged);
+        for name in ["file", "same"] {
+            set_mtime(&t.path(&format!("dst/{name}")), 1);
+        }
+        let (ready, continuation, events) =
+            (t.path("hashed"), t.path("continue"), t.path("clones"));
+        let mut command = reusing_copy(&t, route, &[]);
+        command
+            .env("SYQ_TEST_SMALL_HASHED_READY_FILE", &ready)
+            .env("SYQ_TEST_SMALL_HASHED_CONTINUE_FILE", &continuation)
+            .env("SYQ_TEST_CLONE_FIRST", &events)
+            .env("SYQ_TEST_COARSE_CHANGE_TIMES", "1");
+        if !cloning {
+            command.env("SYQ_TEST_BASIS_CLONE_UNSUPPORTED", "1");
+        }
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+        wait_for_confinement_marker(&mut child, &ready, "the comparison");
+        OpenOptions::new()
+            .write(true)
+            .open(t.path("dst/file"))
+            .unwrap()
+            .write_all_at(b"planted", (1 << 20) + 5)
+            .unwrap();
+        release_confinement_barrier(&continuation);
+        let out = child.wait_with_output().unwrap();
+        assert_output_ok(&out);
+        assert!(
+            read(&t.path("dst/file")) == source,
+            "{case}: planted bytes published"
+        );
+        assert!(read(&t.path("dst/same")) == unchanged, "{case}");
+        let events = fs::read_to_string(&events).unwrap_or_default();
+        if !cloning {
+            assert!(!events.contains("cloned"), "{case}: {events}");
+        } else if events.contains("cloned") {
+            // The changed file's patch built on its clone; the kept file's
+            // clone went.
+            let mut seen: Vec<&str> = events
+                .lines()
+                .map(|line| line.split(' ').next().unwrap())
+                .collect();
+            seen.sort();
+            assert_eq!(seen, ["cloned", "cloned", "discarded", "staged"], "{case}");
+        } else {
+            eprintln!("note: {case}: this filesystem did not clone");
+        }
+        assert!(partial_files(&t.path("dst")).is_empty(), "{case}");
+    }
+}
+
 #[test]
 fn a_leftover_partial_sends_a_replaced_file_to_the_resuming_path() {
     let t = Tmp::new();

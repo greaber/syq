@@ -299,7 +299,9 @@ fn a_restricted_connection_with_a_streamed_patch_open_carries_nothing_else() {
                     len,
                     condition: TargetCondition::Any,
                     guard: None,
+                    clone_for: None,
                 }],
+                batch: 0,
             };
             match exchange(reader, writer, &request) {
                 Response::ExistingHashes(mut existing) => existing.pop().unwrap().unwrap(),
@@ -329,6 +331,7 @@ fn a_restricted_connection_with_a_streamed_patch_open_carries_nothing_else() {
         Request::HashExistingBatch {
             block,
             files: Vec::new(),
+            batch: 0,
         },
         Request::WriteStreamFence,
     ] {

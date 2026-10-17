@@ -52,6 +52,11 @@ use super::*;
 use crate::proto::PATCH_PIECE_BYTES;
 use crate::transfer_tuning::COMPARE_WINDOW;
 
+/// Each worker's batches of groups are numbered apart, so that a receiver
+/// can let go of the clones it holds for an earlier batch
+/// (`Request::HashExistingBatch::batch`).
+static NEXT_COMPARE_BATCH: AtomicU64 = AtomicU64::new(1);
+
 /// Most piece data a worker reads ahead of sending it while streaming a
 /// patch: as much as a group's patches hold.
 const STREAM_BUFFER_BYTES: u64 = crate::proto::MAX_DIFFERING_FILE_BYTES;
@@ -233,6 +238,18 @@ impl Worker {
                 && existing.is_some_and(|existing| existing.size == job.entry.size))
     }
 
+    /// Whether to ask the receiver to clone `job`'s destination before
+    /// hashing it (`ExistingRead::clone_for`): a file the copy replaces from
+    /// its reused blocks, large enough to clone. A file updated in place is
+    /// staged only if the receiver refuses it as it writes, and is checked
+    /// then (`stage_holds_reused`).
+    fn clones_first(&self, job: &WorkerJob) -> bool {
+        let existing = job.dst_entry.as_deref();
+        !job.inplace
+            && self.reuses_blocks_for(job, existing)
+            && existing.is_some_and(|existing| existing.size >= crate::proto::CLONE_FIRST_MIN_BYTES)
+    }
+
     /// The largest file `--in-place=update` writes in place to compare in
     /// groups.
     pub(super) fn in_place_group_limit(&self) -> u64 {
@@ -361,6 +378,7 @@ impl Worker {
             .reply_queue()
             .map_or(COMPARE_WINDOW, |queue| queue.min(COMPARE_WINDOW));
         let source_queue = self.src.reply_queue().unwrap_or(1);
+        let compare_batch = NEXT_COMPARE_BATCH.fetch_add(1, Relaxed);
         let mut groups: Vec<Group> = Vec::new();
         // Patches to stream once the groups are done.
         let mut streams = Vec::new();
@@ -402,12 +420,14 @@ impl Worker {
                                 },
                                 condition: job.target_condition,
                                 guard: job.container_guard.clone(),
+                                clone_for: self.clones_first(job).then(|| self.copy_id()),
                             }
                         })
                         .collect();
                     self.dst.send(Request::HashExistingBatch {
                         block: self.patch_block(),
                         files: existing,
+                        batch: compare_batch,
                     })?;
                     destination.push_back((groups.len(), Stage::Hash, std::time::Instant::now()));
                     groups.push(Group {

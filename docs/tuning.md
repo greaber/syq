@@ -224,8 +224,12 @@ any of its contents are sent, together with other files. (The default
 strategy compares only files whose destination has the same size.) The receiving side
 hashes the file it would replace in 64 KiB blocks, the sending side reads the
 source and sends only the blocks that differ, and the receiving side
-builds the new file from those and its own matching blocks, which must be
-unchanged since they were hashed. A file whose contents already match is kept, and only
+builds the new file from those and its own matching blocks. Where the
+filesystem can clone files (Btrfs and APFS, and XFS and ZFS where enabled),
+the receiving side first clones a file of 1 MiB or more and hashes the clone,
+then builds the new file on that clone, so the blocks it keeps are the ones it
+compared, even if the file changes meanwhile. Elsewhere it checks each block
+it keeps again as it builds the file. A file whose contents already match is kept, and only
 its metadata is updated. Comparing a batch of files costs about one round trip,
 however many files it holds. A file of which more than 16 MiB differs sends
 its differing blocks after its batch, in pieces of about 4 MiB (or one

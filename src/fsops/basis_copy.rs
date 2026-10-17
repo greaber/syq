@@ -27,6 +27,29 @@ pub(super) fn try_clone(input: &File, output: &File, len: u64) -> bool {
     crate::local_copy::try_clone(input, output, len)
 }
 
+/// Clone the first `len` bytes of `input` into `output`, or say why the
+/// filesystem would not.
+#[cfg(target_os = "linux")]
+pub(super) fn clone_range(input: &File, output: &File, len: u64) -> io::Result<()> {
+    #[cfg(test)]
+    if REFUSE_CLONES.get() {
+        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
+    let range = libc::file_clone_range {
+        src_fd: input.as_raw_fd().into(),
+        src_offset: 0,
+        src_length: len,
+        dest_offset: 0,
+    };
+    // SAFETY: range has the UAPI layout and remains alive for the ioctl;
+    // both descriptors are live.
+    if unsafe { libc::ioctl(output.as_raw_fd(), libc::FICLONERANGE, &range) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 pub(super) fn seed(
     input: &File,
     output: &File,

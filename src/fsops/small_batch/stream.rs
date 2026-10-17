@@ -174,6 +174,8 @@ impl FsOps {
         if let Err(error) = self.open_patch_stream(&mut stream) {
             self.fail_stream(&mut stream, error);
         }
+        // A clone held for the file that the stage did not take goes.
+        self.held_clones.discard(&patch.path, &patch.copy_id);
         let reply = stream.reply();
         self.patch_stream = Some(stream);
         reply
@@ -223,14 +225,15 @@ impl FsOps {
         // As for a batch patch's stage (`write_patch_stage`), a clone or
         // copy is kept only when each reused block, read back from the
         // stage, hashes as compared.
-        let seeded = match &source {
-            Some(source) => {
-                (stage.cloned || self.copy_basis(source, stage))
-                    && fingerprint(&source.old.metadata()?) == source.basis
-                    && self.stage_holds_reused(stage, patch)?
-            }
-            None => false,
-        };
+        let seeded = stage.compared
+            || match &source {
+                Some(source) => {
+                    (stage.cloned || self.copy_basis(source, stage))
+                        && fingerprint(&source.old.metadata()?) == source.basis
+                        && self.stage_holds_reused(stage, patch)?
+                }
+                None => false,
+            };
         if !seeded {
             stage.file.set_len(0)?;
             self.preallocate_stage(stage, patch.len)?;

@@ -3799,8 +3799,12 @@ impl FsOps {
                     CopyLocalOutcome::Copied => Response::Ok,
                     CopyLocalOutcome::Unsupported => Response::CopyLocalUnsupported,
                 }),
-            Request::HashExistingBatch { block, files } => Ok(Response::ExistingHashes(
-                self.hash_existing_batch(*block, files),
+            Request::HashExistingBatch {
+                block,
+                files,
+                batch,
+            } => Ok(Response::ExistingHashes(
+                self.hash_existing_batch(*block, files, *batch),
             )),
             Request::PatchSmallBatch(patches) => {
                 self.patch_small_batch(patches).map(Response::PatchedBatch)

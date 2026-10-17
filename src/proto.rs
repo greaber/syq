@@ -423,7 +423,19 @@ pub struct ExistingRead {
     pub len: u64,
     pub condition: TargetCondition,
     pub guard: Option<ContainerGuard>,
+    /// For a file the copy replaces: where the filesystem can clone, and the
+    /// file holds at least `CLONE_FIRST_MIN_BYTES`, the receiver first
+    /// clones it into this copy's private stage for `path`, hashes the
+    /// clone, and holds it for the file's patch, which builds on it. The
+    /// blocks the patch reuses are then the bytes that were compared, and
+    /// nothing reads the file again.
+    pub clone_for: Option<CopyId>,
 }
+
+/// Smallest existing file a receiver clones before comparing it
+/// (`ExistingRead::clone_for`). A smaller one is compared as it is, and its
+/// reused blocks checked as its stage is built.
+pub const CLONE_FIRST_MIN_BYTES: u64 = 1 << 20;
 
 /// The comparison hashes of the blocks an existing file holds whole, and
 /// the fingerprint of the file they were read from, if there is one.
@@ -1372,6 +1384,11 @@ pub enum WireRequest<Data> {
     HashExistingBatch {
         block: u64,
         files: Vec<ExistingRead>,
+        /// The coordinator's batch of groups this request belongs to: the
+        /// receiver discards the clones it holds for earlier batches on this
+        /// connection (`ExistingRead::clone_for`), whose patches have all
+        /// been sent.
+        batch: u64,
     },
     /// Read source files, returning only the blocks that differ from the
     /// destination's hashes. A file stops being compared, with `matching`
