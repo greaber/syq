@@ -237,6 +237,11 @@ fn sibling_name<'a>(first: &RootedTarget, other: &'a RootedTarget) -> Option<&'a
     (first.root.identity() == other.root.identity() && directory == other_directory).then_some(name)
 }
 
+/// Bytes of a stage's kernel copy made, and then read back and checked, at
+/// once (`copy_basis_checked`): little enough that what was just copied is
+/// still in the page cache when it is read back.
+const CHECKED_COPY_CHUNK: u64 = 4 << 20;
+
 /// A patch reuses at least this much, and half its file, before its stage
 /// clones or copies the file it replaces rather than writing every block.
 const CLONE_MIN_REUSED: u64 = 1 << 20;
@@ -1134,16 +1139,26 @@ impl FsOps {
     /// Whether `file` holds each run of the blocks a patch reuses, read up to
     /// a chunk at a time, as they hashed when compared.
     fn holds_reused_runs(&self, file: &File, patch: &SmallPatch) -> Result<bool> {
+        self.holds_reused_between(file, patch, 0..patch.reuse.len())
+    }
+
+    /// `holds_reused_runs`, for the blocks a patch reuses among `blocks`.
+    fn holds_reused_between(
+        &self,
+        file: &File,
+        patch: &SmallPatch,
+        blocks: std::ops::Range<usize>,
+    ) -> Result<bool> {
         let run = chunk_blocks(patch.block);
         let mut buffer = Vec::new();
-        let mut index = 0;
-        while index < patch.reuse.len() {
+        let mut index = blocks.start;
+        while index < blocks.end {
             if patch.reuse[index].is_none() {
                 index += 1;
                 continue;
             }
             let mut end = index + 1;
-            while end < patch.reuse.len() && end - index < run && patch.reuse[end].is_some() {
+            while end < blocks.end && end - index < run && patch.reuse[end].is_some() {
                 end += 1;
             }
             let off = index as u64 * patch.block;
@@ -1334,12 +1349,15 @@ impl FsOps {
         let patch = source.patch;
         let file = &stage.file;
         // A clone the comparison hashed holds the reused blocks as
-        // compared. Another clone or copy is read back, unless the file's
-        // fingerprint already shows a change.
+        // compared. Another clone or copy is read back and checked, unless
+        // the file's fingerprint already shows a change.
         let copied = stage.compared
-            || ((stage.cloned || self.copy_basis(source, stage))
-                && fingerprint(&source.old.metadata()?) == source.basis
-                && self.stage_holds_reused(stage, patch)?);
+            || (fingerprint(&source.old.metadata()?) == source.basis
+                && if stage.cloned {
+                    self.stage_holds_reused(stage, patch)?
+                } else {
+                    self.copy_basis_checked(source, stage)?
+                });
         if !copied {
             file.set_len(0)?;
             self.preallocate_stage(stage, patch.len)?;
@@ -1381,40 +1399,67 @@ impl FsOps {
         Ok(())
     }
 
-    /// Copy the file a patch replaces into its empty stage in the kernel:
-    /// cloned where the filesystem can, or else copied with
-    /// copy_file_range, keeping the file's holes. A stage taking a copy of
-    /// a dense file is allocated first, as a partial seeded from one is.
-    /// Only what the new file can reuse is copied: the old file up to the new
-    /// length, rounded up to 64 KiB, which keeps a clone aligned whatever the
-    /// comparison block is.
-    /// False when the file could not be copied so.
-    fn copy_basis(&self, source: &PatchSource<'_>, stage: &SmallStage) -> bool {
+    /// Copy the file a patch replaces into its empty stage in the kernel,
+    /// and check each block the patch reuses as the stage holds it, read
+    /// back from the stage: nothing vouches for that file, which may have
+    /// changed since it was compared. Where the filesystem can, the file is
+    /// cloned, and the clone read back. Otherwise it is copied with
+    /// copy_file_range, keeping its holes, a chunk at a time
+    /// (`CHECKED_COPY_CHUNK`), each chunk read back as soon as it is copied,
+    /// while it is still in the page cache; a server-side copy, as NFS 4.2
+    /// makes, still stays on the server. A stage taking a copy of a dense
+    /// file is allocated first, as a partial seeded from one is. Only what
+    /// the new file can reuse is copied: the old file up to the new length,
+    /// rounded up to 64 KiB, which keeps a clone aligned whatever the
+    /// comparison block is. False when the file could not be copied so, or
+    /// the stage does not hold a reused block as compared.
+    fn copy_basis_checked(&self, source: &PatchSource<'_>, stage: &SmallStage) -> Result<bool> {
         #[cfg(target_os = "linux")]
         {
-            let reusable = source
-                .patch
+            let patch = source.patch;
+            let reusable = patch
                 .len
                 .div_ceil(MIN_HASH_BLOCK_BYTES)
                 .saturating_mul(MIN_HASH_BLOCK_BYTES);
-            super::basis_copy::seed(
-                &source.old,
-                &stage.file,
-                source.basis.len.min(reusable),
-                || {
-                    let old = source.old.metadata()?;
-                    if old.blocks().saturating_mul(512) >= old.len() {
-                        self.preallocate_stage(stage, source.patch.len)?;
-                    }
-                    Ok(())
-                },
-            )
-            .is_ok()
+            let len = source
+                .basis
+                .len
+                .min(reusable)
+                .min(source.old.metadata()?.len());
+            #[cfg(test)]
+            super::basis_copy::SEEDED.set(len);
+            if len > 0 && super::basis_copy::try_clone(&source.old, &stage.file, len) {
+                return self.stage_holds_reused(stage, patch);
+            }
+            let old = source.old.metadata()?;
+            if old.blocks().saturating_mul(512) >= old.len() {
+                self.preallocate_stage(stage, patch.len)?;
+            }
+            // Read back past the copy's end, as one that kept holes may end
+            // early, the stage holds zeros.
+            if stage.file.metadata()?.len() < patch.len {
+                crate::sparse::set_len(&stage.file, patch.len)?;
+            }
+            let chunk = (CHECKED_COPY_CHUNK / patch.block).max(1) * patch.block;
+            let mut start = 0;
+            while start < len {
+                let end = start.saturating_add(chunk).min(len);
+                if super::basis_copy::copy_data(&source.old, &stage.file, start, end).is_err() {
+                    return Ok(false);
+                }
+                let blocks = (start / patch.block) as usize
+                    ..(end.div_ceil(patch.block) as usize).min(patch.reuse.len());
+                if !self.holds_reused_between(&stage.file, patch, blocks)? {
+                    return Ok(false);
+                }
+                start = end;
+            }
+            Ok(true)
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (source, stage);
-            false
+            Ok(false)
         }
     }
 
@@ -2389,7 +2434,9 @@ mod tests {
         for (streamed, cloning) in [(false, true), (false, false), (true, true), (true, false)] {
             let temporary = crate::test_support::tempdir().unwrap();
             let directory = temporary.path();
-            let old: Vec<u8> = (0..32 * block).map(|i| (i % 251) as u8 | 1).collect();
+            // Larger than one chunk of a checked copy (`CHECKED_COPY_CHUNK`):
+            // the write lands in the second.
+            let old: Vec<u8> = (0..96 * block).map(|i| (i % 251) as u8 | 1).collect();
             let mut new = old.clone();
             new[20 * block as usize] ^= 0xff;
             fs::write(directory.join("file"), &old).unwrap();
@@ -2412,7 +2459,7 @@ mod tests {
                 .write(true)
                 .open(directory.join("file"))
                 .unwrap()
-                .write_all_at(b"planted", 3 * block + 1)
+                .write_all_at(b"planted", 70 * block + 1)
                 .unwrap();
             let planted = fs::read(directory.join("file")).unwrap();
             let before = fs::metadata(directory.join("file")).unwrap().ino();

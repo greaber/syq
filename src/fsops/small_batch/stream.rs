@@ -228,9 +228,12 @@ impl FsOps {
         let seeded = stage.compared
             || match &source {
                 Some(source) => {
-                    (stage.cloned || self.copy_basis(source, stage))
-                        && fingerprint(&source.old.metadata()?) == source.basis
-                        && self.stage_holds_reused(stage, patch)?
+                    fingerprint(&source.old.metadata()?) == source.basis
+                        && if stage.cloned {
+                            self.stage_holds_reused(stage, patch)?
+                        } else {
+                            self.copy_basis_checked(source, stage)?
+                        }
                 }
                 None => false,
             };

@@ -67,9 +67,16 @@ pub(super) fn seed(
         return Ok(());
     }
     prepare_copy()?;
+    copy_data(input, output, 0, len)
+}
+
+/// Copy the data of `input` between `start` and `end` into `output` at the
+/// same offsets, in the kernel where it can, keeping holes as holes.
+pub(super) fn copy_data(input: &File, output: &File, start: u64, end: u64) -> anyhow::Result<()> {
     // Whole-file copy_file_range can materialize holes on ext4. Discover data
     // extents first; filesystems without SEEK_DATA use bounded sparse writes.
-    let mut off = 0;
+    let len = end;
+    let mut off = start;
     while off < len {
         let data = match seek_extent(input, off, libc::SEEK_DATA) {
             Ok(data) => data.min(len),
