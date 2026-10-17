@@ -3156,7 +3156,7 @@ impl Planner<'_> {
         let paths: Vec<PathBytes> = ops.iter().map(|op| apply_path(op).to_vec()).collect();
         let errs = self.apply(ops)?;
         let capacity_error = first_capacity_error(&errs);
-        let kept = self.kept_by_policy(&paths, &conditions, &errs)?;
+        let kept = self.kept_by_policy(&paths, &conditions, &errs);
         // One op per item: the creation, which carries its metadata.
         for (i, queued) in op_names.iter().enumerate() {
             let error = errs.get(i).cloned().flatten();
@@ -3231,49 +3231,26 @@ impl Planner<'_> {
     }
 
     /// Which failed operations only show a destination their existing-file
-    /// policy keeps, as the destination looks now: under `--if-exists=keep`
-    /// a name something else took, under `--only-existing` an object that
-    /// went or changed since the scan (`Worker::kept_by_policy`).
+    /// policy keeps: the receiver found, before changing anything, that the
+    /// destination did not meet a condition the policy set
+    /// (`policy_condition`): under `--if-exists=keep` a name something else
+    /// took, under `--only-existing` an object that went or changed since
+    /// the scan.
     pub(super) fn kept_by_policy(
-        &mut self,
+        &self,
         paths: &[PathBytes],
         conditions: &[TargetCondition],
         errors: &[Option<WireError>],
-    ) -> Result<Vec<bool>> {
-        let keep = self.opts.ignore_existing && !self.opts.new_target;
-        let only = self.opts.existing;
-        let candidates: Vec<usize> = (0..paths.len())
-            .filter(|&i| {
+    ) -> Vec<bool> {
+        (0..paths.len())
+            .map(|i| {
                 errors.get(i).is_some_and(|error| {
-                    error.as_ref().is_some_and(|error| {
-                        wire_os_kind(error).is_none_or(|kind| !capacity_os_kind(Some(kind)))
-                    })
-                }) && match conditions[i] {
-                    TargetCondition::Absent => keep,
-                    TargetCondition::Matches { .. } => only,
-                    _ => false,
-                }
+                    error
+                        .as_ref()
+                        .is_some_and(crate::fsops::is_condition_not_met_wire)
+                }) && self.policy_condition(&paths[i], conditions[i])
             })
-            .collect();
-        let mut kept = vec![false; paths.len()];
-        if candidates.is_empty() {
-            return Ok(kept);
-        }
-        let now = self.stat_many(candidates.iter().map(|&i| paths[i].clone()).collect())?;
-        for (&i, now) in candidates.iter().zip(now) {
-            kept[i] = match (conditions[i], now) {
-                (TargetCondition::Absent, now) => now.is_some(),
-                (condition, Some(entry)) => {
-                    condition
-                        != TargetCondition::Matches {
-                            dev: entry.dev,
-                            ino: entry.ino,
-                        }
-                }
-                (_, None) => true,
-            };
-        }
-        Ok(kept)
+            .collect()
     }
 
     fn inspect_destination_batch(&mut self, mapped: &mut Mapped) -> Result<()> {
@@ -3621,6 +3598,7 @@ impl Planner<'_> {
     ) -> usize {
         let (src, source) = source_path;
         let target_condition = self.leaf_condition_for(&dst, dst_entry.as_ref());
+        let policy_condition = self.policy_condition(&dst, target_condition);
         // `--in-place=new` writes only a file the copy creates at its name:
         // an existing one is staged and replaces it, as without the option.
         // `--in-place=update` also writes an existing regular file at its
@@ -3668,6 +3646,7 @@ impl Planner<'_> {
                 rel,
                 rel_bytes,
                 entry,
+                policy_condition,
                 target_condition,
                 attempt: 0,
                 done: Arc::new(AtomicU64::new(0)),
@@ -3686,6 +3665,19 @@ impl Planner<'_> {
     /// `--only-existing` is replaced only while it is still the object the
     /// scan found: nothing is created where it went. A restricted receiver
     /// holds its grant's copies to the same conditions itself.
+    /// Whether `condition`, at `path`, comes from the existing-file policy
+    /// rather than the placement (`FileJobData::policy_condition`).
+    pub(super) fn policy_condition(&self, path: &[u8], condition: TargetCondition) -> bool {
+        self.exact_condition_for(path) == TargetCondition::Any
+            && match condition {
+                TargetCondition::Absent => {
+                    self.opts.ignore_existing && !self.opts.protects_existing_contents()
+                }
+                TargetCondition::Matches { .. } => self.opts.existing,
+                _ => false,
+            }
+    }
+
     pub(super) fn leaf_condition_for(
         &self,
         path: &[u8],

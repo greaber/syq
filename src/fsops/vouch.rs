@@ -117,6 +117,8 @@ pub(crate) fn replace_required(
         message: format!("{} must be replaced to {doing}: {detail}", label.display()),
         io_kind: Some(WireIoKind::ReplaceRequired(reason)),
         raw_os_error: None,
+        condition_not_met: false,
+        unchanged: true,
     })
 }
 

@@ -1475,7 +1475,14 @@ fn attempt_small_copy(
             progress.files_unchanged.fetch_add(1, Relaxed);
             progress.bytes_unchanged.fetch_add(entry.size, Relaxed);
             if let Some(error) = result.error {
-                progress.error(&format!("syq: {}", endpoint_error(error)));
+                // A restricted receiver lists a failed metadata change itself.
+                let error = endpoint_error(error);
+                progress.entry_error_classified(
+                    &format!("syq: {error}"),
+                    Some("io"),
+                    os_kind_of(&error),
+                    Some((rel_bytes, crate::results::ReceiverListing::Listed)),
+                );
             }
             continue;
         }
@@ -1483,7 +1490,14 @@ fn attempt_small_copy(
             progress.files_unchanged.fetch_add(1, Relaxed);
             progress.bytes_unchanged.fetch_add(entry.size, Relaxed);
             if let Some(error) = result.error {
-                progress.error(&format!("syq: {}", endpoint_error(error)));
+                // A restricted receiver lists a failed metadata change itself.
+                let error = endpoint_error(error);
+                progress.entry_error_classified(
+                    &format!("syq: {error}"),
+                    Some("io"),
+                    os_kind_of(&error),
+                    Some((rel_bytes, crate::results::ReceiverListing::Listed)),
+                );
             }
             continue;
         }
@@ -1506,21 +1520,33 @@ fn attempt_small_copy(
             None => None,
         };
         if let Some((retryable, os_kind, message)) = failure {
-            progress.error_classified(&format!("syq: {rel}: {message}"), Some("io"), os_kind);
+            // A restricted receiver lists the failure of a file it was
+            // asked to publish itself, as it does every change's.
+            let listing = crate::results::ReceiverListing::Listed;
+            progress.entry_error_classified(
+                &format!("syq: {rel}: {message}"),
+                Some("io"),
+                os_kind,
+                Some((rel_bytes, listing)),
+            );
             if let Some(results) = progress.results_writer() {
-                results.emit_operation(&crate::results::OperationRecord {
-                    action: "transfer_file",
-                    dst: rel_bytes,
-                    src: None,
-                    kind: "file",
-                    disposition: "failed",
-                    bytes: None,
-                    attempts: Some(1),
-                    retryable: Some(retryable),
-                    class: Some("io"),
-                    os_kind,
-                    message: Some(&message),
-                });
+                results.emit_operation_listed(
+                    &crate::results::OperationRecord {
+                        action: "transfer_file",
+                        dst: rel_bytes,
+                        src: None,
+                        kind: "file",
+                        disposition: "failed",
+                        bytes: None,
+                        attempts: Some(1),
+                        retryable: Some(retryable),
+                        class: Some("io"),
+                        os_kind,
+                        message: Some(&message),
+                    },
+                    None,
+                    listing,
+                );
             }
             continue;
         }
@@ -3955,7 +3981,16 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let root_creatable = dst_root_entry.is_none() && dst_is_dir && !args.existing;
     let mut create_root = root_creatable && !args.dry_run;
     let dry_run_creates_root = root_creatable && args.dry_run;
-    let root_create_condition = TargetCondition::Any;
+    // A directory that must be new (`--into-new`) is created without
+    // adopting one another program makes at its name first, as a restricted
+    // receiver creates it; that copy fails.
+    let root_create_condition = if args.target_existence == Existence::New
+        && crate::checks::enabled(crate::checks::Check::ExistingFileConditions)
+    {
+        TargetCondition::Absent
+    } else {
+        TargetCondition::Any
+    };
     // A directory target takes a contents source's metadata, which the
     // planner sends only once it has scanned the source root. When its
     // permissions or group are copied, create the root private until they

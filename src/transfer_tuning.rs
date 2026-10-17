@@ -312,6 +312,10 @@ impl FromStr for TransferTuning {
                     key,
                 )?,
                 "bw-pacing" => set_once(&mut tuning.bw_pacing, value.parse()?, key)?,
+                // An S3 option since it left this group.
+                "s3-retries" => {
+                    bail!("s3-retries is no longer a --performance-tuning key; use --s3-retries N")
+                }
                 _ => bail!("unknown tuning option {key:?}; see --help-all"),
             }
         }
@@ -392,6 +396,17 @@ impl BenchmarkStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.7.1 took S3 retries as a tuning key; the error names the option
+    /// that replaced it.
+    #[test]
+    fn the_removed_s3_retries_key_names_its_replacement() {
+        let error = "s3-retries=3".parse::<TransferTuning>().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("use --s3-retries N"),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn comparison_granularity_validates_and_survives_forwarding() {

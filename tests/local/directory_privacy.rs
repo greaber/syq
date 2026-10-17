@@ -980,7 +980,7 @@ fn directories_created_together_keep_their_modes(count: usize, network: bool) {
 fn an_into_new_root_another_process_creates_first_fails_the_copy() {
     let t = Tmp::new();
     source_tree(&t, 0o755, 0o755);
-    let mut command = syq_command(&["cp", "--srcs-in", "src", "--into-new", "dst"]);
+    let mut command = syq_command(&["cp", "src", "--into-new", "dst"]);
     command.current_dir(&t.0);
     let ((), output) = observe_at(&t, command, "OPERATOR_DIRECTORY", || {
         fs::create_dir(t.path("dst")).unwrap();
@@ -988,5 +988,5 @@ fn an_into_new_root_another_process_creates_first_fails_the_copy() {
     });
     assert!(!output.status.success(), "{output:?}");
     assert_eq!(read(&t.path("dst/file")), b"already there");
-    assert!(!t.path("dst/sub").exists());
+    assert!(!t.path("dst/src").exists());
 }

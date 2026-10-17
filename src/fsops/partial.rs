@@ -297,10 +297,10 @@ impl FsOps {
         };
         if let Some(only) = update.only {
             if (opened.dev(), opened.ino()) != only {
-                bail!(
+                return Err(condition_not_met(format!(
                     "destination {} changed since it was found, and only it is updated (--only-existing)",
                     target.label.display()
-                );
+                )));
             }
         }
         let mut checked = None;
@@ -594,10 +594,10 @@ impl FsOps {
                     return Ok(Preparation::default());
                 }
                 if update.only.is_some() {
-                    bail!(
+                    return Err(condition_not_met(format!(
                         "destination {} is gone, and nothing is created there (--only-existing)",
                         target.label.display()
-                    );
+                    )));
                 }
             }
             if compared.is_some() {
@@ -1584,10 +1584,10 @@ impl FsOps {
                 (None, Some(update)) => {
                     let opened = self.open_inplace_update(&target, copy_id, update, None, size)?;
                     if opened.is_none() && update.only.is_some() {
-                        bail!(
+                        return Err(condition_not_met(format!(
                             "destination {} is gone, and nothing is created there (--only-existing)",
                             target.label.display()
-                        );
+                        )));
                     }
                     opened
                 }
@@ -3220,6 +3220,7 @@ impl FsOps {
         if let Err(error) = self.map_request(req) {
             return Response::EndpointError(wire_error(&error));
         }
+        self.existence_only_where_numbers_mislead(req);
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_FAIL_BLOCK_COMPARISON").is_some()
             && matches!(

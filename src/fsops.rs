@@ -633,11 +633,15 @@ fn errstr(e: &anyhow::Error) -> String {
 }
 
 pub(crate) fn wire_error(error: &anyhow::Error) -> WireError {
+    let condition_not_met = is_condition_not_met(error);
+    let unchanged = is_unchanged(error);
     if let Some(wire) = crate::conn::wire_error_of(error) {
         return WireError {
             message: errstr(error),
             io_kind: wire.io_kind,
             raw_os_error: wire.raw_os_error,
+            condition_not_met,
+            unchanged,
         };
     }
     let io_error = error
@@ -647,6 +651,8 @@ pub(crate) fn wire_error(error: &anyhow::Error) -> WireError {
         message: errstr(error),
         io_kind: io_error.map(wire_io_kind),
         raw_os_error: io_error.and_then(io::Error::raw_os_error),
+        condition_not_met,
+        unchanged,
     }
 }
 
@@ -2605,6 +2611,21 @@ impl FsOps {
         destination_relative_to(prefix, path)
     }
 
+    /// The root a scan's inode metadata is read beneath: a destination
+    /// scan's root as the installed destination root names it, or the root
+    /// as requested.
+    pub(crate) fn scan_metadata_root(
+        &self,
+        root: &[u8],
+        source: Option<&RegisteredPath>,
+    ) -> Result<PathBytes> {
+        if source.is_none() && self.destination_root.is_some() {
+            self.destination_relative(root)
+        } else {
+            Ok(root.to_vec())
+        }
+    }
+
     fn destination_full(&self, relative: &[u8]) -> PathBytes {
         let prefix = self
             .destination_prefix
@@ -3546,9 +3567,12 @@ impl FsOps {
             let (skipped, run): (Vec<usize>, Vec<usize>) =
                 indices.iter().partition(|&&i| under_failed(i));
             for i in skipped {
-                out[i] = Some(
-                    "operation skipped because the no-replace creation it depends on failed".into(),
-                );
+                out[i] = Some(WireError {
+                    unchanged: true,
+                    ..WireError::from(
+                        "operation skipped because the no-replace creation it depends on failed",
+                    )
+                });
             }
             run
         };

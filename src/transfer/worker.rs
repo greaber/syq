@@ -870,7 +870,7 @@ impl Worker {
             };
             if let Err(e) = res {
                 let os_kind = os_kind_of(&e);
-                if !capacity_os_kind(os_kind) && self.kept_by_policy(j) {
+                if self.kept_by_policy(j, &e) {
                     self.skip_kept(*idx, j);
                     continue;
                 }
@@ -980,7 +980,7 @@ impl Worker {
             return Err(e);
         }
         let job = self.job(idx);
-        if !capacity_os_kind(os_kind_of(&e)) && self.kept_by_policy(&job) {
+        if self.kept_by_policy(&job, &e) {
             self.skip_kept(idx, &job);
             return Ok(());
         }
@@ -1004,41 +1004,25 @@ impl Worker {
     }
 
     /// Whether `job`'s failure only shows a destination its existing-file
-    /// policy keeps, as the destination looks now: under
-    /// `--if-exists=keep` a name something else took, under
-    /// `--only-existing` a file that went or changed since the scan. Such a
-    /// file is skipped, as one the scan found would have been, not failed.
-    pub(super) fn kept_by_policy(&mut self, job: &WorkerJob) -> bool {
-        let keep = self.opts.ignore_existing
-            && !self.opts.new_target
-            && job.target_condition == TargetCondition::Absent;
-        let only =
-            self.opts.existing && matches!(job.target_condition, TargetCondition::Matches { .. });
-        if !(keep || only) {
-            return false;
-        }
-        let Ok(now) = stat_one(&mut *self.dst, &job.dst, false) else {
-            return false;
-        };
-        match now {
-            Some(_) if keep => true,
-            Some(entry) => {
-                job.target_condition
-                    != TargetCondition::Matches {
-                        dev: entry.dev,
-                        ino: entry.ino,
-                    }
-            }
-            None => only,
-        }
+    /// policy keeps: the receiver found, before changing anything, that the
+    /// destination did not meet the condition the policy set
+    /// (`FileJobData::policy_condition`): under `--if-exists=keep` a name
+    /// something else took, under `--only-existing` a file that went or
+    /// changed since the scan. Such a file is skipped, as one the scan
+    /// found would have been, not failed.
+    pub(super) fn kept_by_policy(&self, job: &WorkerJob, error: &anyhow::Error) -> bool {
+        job.policy_condition && crate::fsops::is_condition_not_met(error)
     }
 
     /// Skip `job`, whose destination its existing-file policy keeps
     /// (`kept_by_policy`).
     pub(super) fn skip_kept(&self, idx: usize, job: &WorkerJob) {
         // Retired as a failure is, so that no hard link gives it a new name,
-        // but reported as skipped.
-        self.sched.fail_file(idx);
+        // but reported as skipped, once: a file split between workers can
+        // reach here from each.
+        if !self.sched.fail_file(idx) {
+            return;
+        }
         self.sched.take_receiver_hold(idx);
         self.progress.files_total.fetch_sub(1, Relaxed);
         self.progress.files_excluded.fetch_add(1, Relaxed);

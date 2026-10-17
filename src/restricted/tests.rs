@@ -3177,6 +3177,8 @@ fn a_small_file_batch_with_links_reports_each_failed_write() {
                 message: "No space left on device".into(),
                 io_kind: Some(proto::WireIoKind::NoSpace),
                 raw_os_error: Some(28),
+                condition_not_met: false,
+                unchanged: false,
             }),
         ]),
     );
@@ -3290,6 +3292,8 @@ fn results_report_a_declined_metadata_change_as_the_replacement() {
             proto::ReplaceReason::OtherNames,
         )),
         raw_os_error: None,
+        condition_not_met: false,
+        unchanged: false,
     };
 
     // A metadata repair the receiver declines, then the replacement.
@@ -9009,7 +9013,10 @@ fn follow_dst_copies_into_the_directory_a_destination_link_leads_to() {
             "outside the enrolled root",
         ),
         (b".ssh".to_vec(), "protected SSH configuration"),
-        (b"missing".to_vec(), "does not exist"),
+        (
+            b"missing".to_vec(),
+            "leads to missing, which does not exist",
+        ),
         (b"loop-a".to_vec(), "too many symlinks"),
         (b".".to_vec(), "the enrolled root itself"),
     ] {
@@ -9056,4 +9063,388 @@ fn follow_dst_is_signed_for_into_placements() {
     .unwrap();
     let error = validate_restricted_args(&args).unwrap_err().to_string();
     assert!(error.contains("--widen-dirs all"), "{error}");
+}
+
+/// With `--follow-dst`, a destination that does not exist yet, with no
+/// symlink on the way, is created as any destination is; one whose missing
+/// part lies past a symlink is created inside the directory the link leads
+/// to.
+#[test]
+fn follow_dst_creates_a_destination_that_does_not_exist_yet() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir_all(root.join("real")).unwrap();
+    let options = crate::delegation::ExtraCopyOptions {
+        follow_dst: true,
+        ..Default::default()
+    };
+    // No symlink: the destination is the enrolled root's missing child.
+    let authority = test_authority_with_options(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+        None,
+        (options, &[]),
+    )
+    .unwrap();
+    assert!(
+        authority.root_path == path_bytes(&root),
+        "{:?}",
+        authority.root_path
+    );
+    // Missing components past a link resolve inside its target.
+    let resolved = resolve_destination_links(
+        &Root::open(&root).unwrap(),
+        &path_bytes(&root),
+        b"link/new/deeper",
+    );
+    symlink("real", root.join("link")).unwrap();
+    assert!(
+        resolved.unwrap().is_none(),
+        "nothing to follow before the link exists"
+    );
+    let found = resolve_destination_links(
+        &Root::open(&root).unwrap(),
+        &path_bytes(&root),
+        b"link/new/deeper",
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(found.existing, vec![b"real".to_vec()]);
+    assert_eq!(found.signed_components, 1);
+}
+
+/// An enrolled root of `/` names everything beneath it, so restricted
+/// lookups work there, and an absolute destination symlink resolves inside
+/// it.
+#[test]
+fn an_enrolled_root_of_slash_names_paths_beneath_it() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir_all(root.join("target")).unwrap();
+    fs::write(root.join("target/file"), b"there").unwrap();
+    let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    authority.root = std::sync::Arc::new(Root::open(Path::new("/")).unwrap());
+    authority.root_path = b"/".to_vec();
+    assert!(authority
+        .rooted_metadata(&path_bytes(&root.join("target/file")))
+        .unwrap()
+        .is_some_and(|metadata| metadata.is_file()));
+    let mut ops = authority.test_ops();
+    assert!(matches!(
+        ops.handle(&Request::StatMany {
+            paths: vec![path_bytes(&root.join("target/file"))],
+            sources: None,
+            follow: false,
+        }),
+        proto::Response::Stats(entries) if entries[0].is_some()
+    ));
+    symlink(root.join("target"), root.join("absolute-link")).unwrap();
+    let relative = path_bytes(&root.join("absolute-link"));
+    let found =
+        resolve_destination_links(&Root::open(Path::new("/")).unwrap(), b"/", &relative[1..])
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        found.existing.join(&b'/'),
+        path_bytes(&root.join("target"))[1..].to_vec()
+    );
+}
+
+/// A followed destination that reaches the receiver's control files is
+/// refused by identity, however the protected path or the destination is
+/// spelled.
+#[test]
+fn followed_destinations_reaching_control_files_are_refused_by_identity() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir_all(root.join("home/.ssh")).unwrap();
+    symlink("home/.ssh", root.join("target")).unwrap();
+    // The protected path, spelled through another name for the root.
+    symlink(&root, temporary.path().join("alias")).unwrap();
+    let protected = [ReceiverControlPath {
+        path: path_bytes(&temporary.path().join("alias/home/.ssh")),
+        label: "protected SSH configuration directory",
+    }];
+    let error = test_authority_with_options(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+        None,
+        (
+            crate::delegation::ExtraCopyOptions {
+                follow_dst: true,
+                ..Default::default()
+            },
+            &protected,
+        ),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        format!("{error:#}").contains("protected SSH configuration"),
+        "{error:#}"
+    );
+}
+
+/// Under `keep_files` (rsync `--ignore-existing`) an existing file keeps
+/// its metadata as well as its contents; an existing directory still takes
+/// the copy's metadata.
+#[test]
+fn keep_files_leaves_existing_files_metadata_alone() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(target.join("dir")).unwrap();
+    fs::write(target.join("file"), b"theirs").unwrap();
+    fs::set_permissions(target.join("file"), fs::Permissions::from_mode(0o600)).unwrap();
+    let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    authority.extra_options.keep_files = true;
+    authority.copy.options.preserve_permissions = true;
+    authority.copy.options.receiver_managed_modes = false;
+    let file = path_bytes(&target.join("file"));
+    let mut mode = plain_meta();
+    mode.mode = 0o644;
+    for mut request in [
+        Request::Apply {
+            ops: vec![Op::SetFileMetaIfSame {
+                path: file.clone(),
+                meta: mode.clone(),
+                flags: proto::flags::MODE,
+                condition: proto::TargetCondition::Any,
+            }],
+        },
+        Request::Apply {
+            ops: vec![Op::SetMeta {
+                path: file.clone(),
+                meta: mode.clone(),
+                flags: proto::flags::MODE,
+                condition: proto::TargetCondition::Any,
+                directory: false,
+            }],
+        },
+        Request::FinishBasis {
+            expected_hash: None,
+            path: file.clone(),
+            copy_id: [3; 16],
+            meta: mode.clone(),
+            flags: proto::flags::MODE,
+            condition: proto::TargetCondition::Any,
+        },
+    ] {
+        let error = authority.authorize(&mut request, false).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("may not be modified"),
+            "{error:#}"
+        );
+    }
+    assert_eq!(
+        fs::metadata(target.join("file"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let mut directory = Request::Apply {
+        ops: vec![Op::SetMeta {
+            path: path_bytes(&target.join("dir")),
+            meta: mode,
+            flags: proto::flags::MODE,
+            condition: proto::TargetCondition::Any,
+            directory: true,
+        }],
+    };
+    authority.authorize(&mut directory, false).unwrap();
+}
+
+/// A file counts against the entry limit before its first change: an
+/// in-place preparation, or a stage, even an empty one. Its publication
+/// then counts nothing more.
+#[test]
+fn files_count_against_the_entry_limit_from_their_first_change() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let changes = |authority: &RestrictedAuthority| {
+        authority.changes.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    for (inplace, size) in [(true, 4), (false, 0)] {
+        let mut authority = test_authority_with_results(
+            &root,
+            DeletionPolicy::Forbid,
+            1024,
+            0,
+            FilterPolicy::default(),
+            if inplace {
+                PublicationPolicy::InPlace
+            } else {
+                PublicationPolicy::AtomicStaged
+            },
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::DirectoryContents,
+            RootExistence::Any,
+            None,
+        )
+        .unwrap();
+        authority.copy.limits.max_entries = 2;
+        let prepare = |index: u8| {
+            let mut request = prepare_request(&target.join(format!("file-{index}")));
+            if let Request::Prepare {
+                inplace: request_inplace,
+                size: request_size,
+                copy_id,
+                ..
+            } = &mut request
+            {
+                *request_inplace = inplace;
+                *request_size = size;
+                *copy_id = [index; 16];
+            }
+            request
+        };
+        // A retried preparation of the same file counts once.
+        for index in [1, 1, 2] {
+            authority.authorize(&mut prepare(index), false).unwrap();
+        }
+        assert_eq!(changes(&authority), 2, "in place: {inplace}");
+        let error = authority.authorize(&mut prepare(3), false).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("entry limit exceeded"),
+            "{error:#}"
+        );
+        // Publishing a file counted at preparation counts nothing more.
+        let mut finalize = finalize_request(&target.join("file-1"), proto::TargetCondition::Any);
+        if let Request::Finalize {
+            inplace: finalize_inplace,
+            copy_id,
+            ..
+        } = &mut finalize
+        {
+            *finalize_inplace = inplace;
+            *copy_id = [1; 16];
+        }
+        authority.authorize(&mut finalize, false).unwrap();
+        assert_eq!(changes(&authority), 2, "in place: {inplace}");
+    }
+}
+
+/// Only changes the receiver reports it did not make are given back: one
+/// whose condition it found unmet, and one it skipped. One that failed
+/// after it may have changed something stays counted.
+#[test]
+fn only_changes_that_made_nothing_are_given_back() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(target.join("taken")).unwrap();
+    let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    let unchanged = |message: &str| proto::WireError {
+        unchanged: true,
+        ..proto::WireError::from(message)
+    };
+    let mut request = Request::Apply {
+        ops: ["taken", "partly", "fine"]
+            .iter()
+            .map(|name| Op::Mkdir {
+                path: path_bytes(&target.join(name)),
+                mode: 0o755,
+                condition: proto::TargetCondition::Any,
+            })
+            .collect(),
+    };
+    let settlement = authority.authorize(&mut request, false).unwrap();
+    assert_eq!(
+        authority.changes.load(std::sync::atomic::Ordering::Relaxed),
+        3
+    );
+    authority.settle(
+        settlement,
+        &proto::Response::Applied(vec![
+            Some(unchanged("the name was taken")),
+            Some(proto::WireError::from(
+                "set metadata: failed after creating it",
+            )),
+            None,
+        ]),
+    );
+    assert_eq!(
+        authority.changes.load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+}
+
+/// Where inode numbers cannot show which file a name leads to, the
+/// receiver holds a change to whatever it observes at the name, not to the
+/// sender's numbers; elsewhere it refuses numbers that name another file.
+#[test]
+fn changes_check_existence_only_where_numbers_mislead() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("file"), b"there").unwrap();
+    let observed = fs::metadata(target.join("file")).unwrap();
+    for trusted in [true, false] {
+        let authority = existence_authority(
+            &root,
+            ExistingDestinationPolicy::MustExist,
+            DestinationPlacement::DirectoryContents,
+            RootExistence::Any,
+        )
+        .unwrap();
+        if !trusted {
+            let mut profile = authority.root.profile();
+            profile.link_counts_trusted = false;
+            authority.root.assume_profile_for_test(profile);
+        }
+        let mut request = Request::Apply {
+            ops: vec![Op::SetMeta {
+                path: path_bytes(&target.join("file")),
+                meta: plain_meta(),
+                flags: 0,
+                // Numbers the file there does not have.
+                condition: proto::TargetCondition::Matches { dev: 1, ino: 1 },
+                directory: false,
+            }],
+        };
+        let authorized = authority.authorize(&mut request, false);
+        if trusted {
+            let Err(error) = authorized else {
+                panic!("other numbers are refused")
+            };
+            assert!(
+                format!("{error:#}").contains("does not match the object"),
+                "{error:#}"
+            );
+            continue;
+        }
+        authorized.unwrap();
+        let Request::Apply { ops } = &request else {
+            unreachable!()
+        };
+        let Op::SetMeta { condition, .. } = &ops[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            *condition,
+            proto::TargetCondition::Matches {
+                dev: observed.dev(),
+                ino: observed.ino(),
+            }
+        );
+    }
 }

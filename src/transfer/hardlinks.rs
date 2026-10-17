@@ -455,7 +455,7 @@ impl Planner<'_> {
             errors.len() == pending.len(),
             "hardlink receiver returned an incomplete result batch"
         );
-        let kept = self.kept_by_policy(&paths, &conditions, &errors)?;
+        let kept = self.kept_by_policy(&paths, &conditions, &errors);
         for (((group, follower), error), kept) in pending.into_iter().zip(errors).zip(kept) {
             if kept {
                 self.progress.files_excluded.fetch_add(1, Relaxed);

@@ -75,6 +75,12 @@ pub struct FileJobData {
     pub entry: Entry,
     /// Placement-root condition enforced by the receiver at publication.
     pub target_condition: crate::proto::TargetCondition,
+    /// `target_condition` comes from the existing-file policy
+    /// (`--if-exists=keep`, `--only-existing`): a destination the receiver
+    /// finds does not meet it is kept and this file skipped, as one the
+    /// scan found would have been (`Worker::kept_by_policy`). A placement's
+    /// condition (`--as-new`) fails the file instead.
+    pub policy_condition: bool,
     pub attempt: u32,
     /// Bytes of this file in place on the destination (transferred or matched).
     pub done: Arc<AtomicU64>,

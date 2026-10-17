@@ -605,3 +605,32 @@ fn a_file_removed_under_only_existing_is_not_created_again() {
     assert!(output.status.success(), "{output:?}");
     assert!(!t.path("dst/file").exists());
 }
+
+/// `--into-new` makes only the directory new: with `--if-exists=keep`, a
+/// file another program creates inside it while the copy runs is kept and
+/// skipped, as in any directory.
+#[test]
+fn keep_inside_an_into_new_directory_skips_a_file_that_appears() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), &prng(3 << 20, 512));
+    let ready = t.path("ready");
+    let continuation = t.path("continue");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--performance-tuning", "copy-path=ranges"])
+        .arg(t.path("src"))
+        .arg("--into-new")
+        .arg(t.path("dst"))
+        .arg("--if-exists=keep")
+        .env("SYQ_TEST_SOURCE_RECHECK_READY_FILE", &ready)
+        .env("SYQ_TEST_SOURCE_RECHECK_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "source recheck before publication");
+    write(&t.path("dst/src/file"), b"theirs");
+    release_confinement_barrier(&continuation);
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(read(&t.path("dst/src/file")), b"theirs");
+}

@@ -1573,7 +1573,15 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 ignore,
                 report_ignored,
             } => {
-                let requested_root = root.clone();
+                // Inode metadata is read beneath the destination root an
+                // ordinary or restricted session installed, by its own name.
+                let requested_root = match ops.scan_metadata_root(&root, source.as_ref()) {
+                    Ok(root) => root,
+                    Err(error) => {
+                        w.write_msg(&Response::Err(format!("{error:#}")))?;
+                        continue;
+                    }
+                };
                 let source_scan = match ops.source_scan_root(source.as_ref()) {
                     Ok(scan) => scan,
                     Err(error) => {

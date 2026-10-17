@@ -8,8 +8,9 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Check {
     /// `existing-file-conditions`: a copy that keeps existing files creates
-    /// without replacing, and `--only-existing` replaces only the file its
-    /// scan found (`TargetCondition`).
+    /// without replacing, `--only-existing` replaces only the file its scan
+    /// found, and an `--into-new` directory is created without adopting one
+    /// (`TargetCondition`).
     ExistingFileConditions,
     /// `bounded-writes`: no write goes past the size declared for its file
     /// (`fsops::stages`).

@@ -52,7 +52,38 @@ pub(super) fn apply_one(
     if matches!(op, Op::SetFileMetaIfSame { .. }) {
         hold_before_quick_metadata_for_test()?;
     }
-    apply_one_rooted(op, &target, owned)
+    apply_one_rooted(op, &target, owned).map_err(|error| {
+        // A no-replace creation whose name something already holds made
+        // nothing: its condition was not met.
+        let absent = matches!(
+            op,
+            Op::Mkdir {
+                condition: TargetCondition::Absent,
+                ..
+            } | Op::Symlink {
+                condition: TargetCondition::Absent,
+                ..
+            } | Op::Mknod {
+                condition: TargetCondition::Absent,
+                ..
+            } | Op::Hardlink {
+                condition: TargetCondition::Absent,
+                ..
+            }
+        );
+        let taken = error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists)
+        });
+        if absent && taken && !is_condition_not_met(&error) {
+            error.context(ConditionNotMet(
+                "the name was taken before a no-replace creation".into(),
+            ))
+        } else {
+            error
+        }
+    })
 }
 
 /// Resolve one authorized request's root, then keep the caller's explicit
@@ -215,12 +246,10 @@ pub(super) fn observe_rooted_condition(
     match (condition, observed) {
         (TargetCondition::Any, observed) => Ok(observed),
         (TargetCondition::Absent, None) => Ok(None),
-        (TargetCondition::Absent, Some(_)) => {
-            bail!(
-                "destination {} appeared before no-replace creation",
-                label.display()
-            )
-        }
+        (TargetCondition::Absent, Some(_)) => Err(condition_not_met(format!(
+            "destination {} appeared before no-replace creation",
+            label.display()
+        ))),
         (TargetCondition::Matches { dev, ino }, Some(metadata))
             if metadata.dev == dev && metadata.ino == ino =>
         {
@@ -242,10 +271,10 @@ pub(super) fn observe_rooted_condition(
             Ok(Some(metadata))
         }
         (TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }, _) => {
-            bail!(
+            Err(condition_not_met(format!(
                 "destination {} changed before it could be replaced",
                 label.display()
-            )
+            )))
         }
     }
 }
@@ -317,7 +346,16 @@ fn apply_one_rooted(
         } => {
             // The publication links only the file with this identity, so
             // checking the identity checks the file linked (`OwnedObjects`).
-            // Where inode numbers cannot show that, the link is refused.
+            // Where inode numbers cannot show that, a restricted receiver
+            // refuses the link, and an ordinary one links as without the
+            // check.
+            let owned = match owned {
+                Some(owned) if !owned.applies(false) => {
+                    let trusted = root.link_counts_trusted_on(*dev, &root.parent_directory(path)?);
+                    trusted.then_some(owned)
+                }
+                owned => owned,
+            };
             if let Some(owned) = owned {
                 owned.require_link((*dev, *ino), &target.label)?;
             }
@@ -391,16 +429,16 @@ fn leaf_replacement(
         TargetCondition::Any => LeafReplacement::Any,
         TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
             let Some(metadata) = observe_rooted_condition(target, condition)? else {
-                bail!(
+                return Err(condition_not_met(format!(
                     "destination {} changed before it could be replaced",
                     target.label.display()
-                );
+                )));
             };
             if file_type_bits(metadata.mode) != file_type {
-                bail!(
+                return Err(condition_not_met(format!(
                     "destination {} cannot change type under a matched condition",
                     target.label.display()
-                );
+                )));
             }
             LeafReplacement::Same {
                 dev: metadata.dev,
@@ -1066,6 +1104,180 @@ pub(super) fn create_rooted_directory_or_existing(
     }
 }
 
+/// The marker of a destination that did not meet an operation's
+/// condition, found before anything was changed
+/// (`WireError::condition_not_met`).
+#[derive(Debug)]
+pub(crate) struct ConditionNotMet(pub(crate) String);
+
+impl std::fmt::Display for ConditionNotMet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConditionNotMet {}
+
+/// The error for a destination that does not meet an operation's
+/// condition, found before anything was changed. The copy's existing-file
+/// policy may keep it: under `--if-exists=keep` and `--only-existing` such
+/// a file is skipped, not failed.
+pub(crate) fn condition_not_met(message: String) -> anyhow::Error {
+    anyhow::Error::new(ConditionNotMet(message))
+}
+
+/// `condition_not_met`, keeping the operating system's error that showed
+/// it, so its kind still reaches the copy's results.
+pub(crate) fn condition_not_met_by(error: std::io::Error, message: String) -> anyhow::Error {
+    anyhow::Error::new(error).context(ConditionNotMet(message))
+}
+
+/// Whether `error` says the destination did not meet the operation's
+/// condition and nothing was changed (`condition_not_met`), here or at the
+/// receiver.
+pub(crate) fn is_condition_not_met(error: &anyhow::Error) -> bool {
+    // A context layer downcasts through the error itself, not its chain.
+    error.downcast_ref::<ConditionNotMet>().is_some()
+        || error.chain().any(|cause| cause.is::<ConditionNotMet>())
+        || crate::conn::wire_error_of(error).is_some_and(is_condition_not_met_wire)
+}
+
+/// The same for an error the receiver sent.
+pub(crate) fn is_condition_not_met_wire(error: &WireError) -> bool {
+    error.condition_not_met
+}
+
+/// The marker of an operation that changed nothing: found impossible
+/// before it started (`WireError::unchanged`).
+#[derive(Debug)]
+pub(crate) struct Unchanged(pub(crate) String);
+
+impl std::fmt::Display for Unchanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unchanged {}
+
+/// The error for an operation found impossible before it changed anything.
+pub(crate) fn unchanged(message: String) -> anyhow::Error {
+    anyhow::Error::new(Unchanged(message))
+}
+
+/// Whether `error` says nothing was changed: an unmet condition
+/// (`condition_not_met`) or another reason found before starting
+/// (`unchanged`), here or at the receiver.
+pub(crate) fn is_unchanged(error: &anyhow::Error) -> bool {
+    is_condition_not_met(error)
+        || error.downcast_ref::<Unchanged>().is_some()
+        || error.chain().any(|cause| cause.is::<Unchanged>())
+        || crate::conn::wire_error_of(error).is_some_and(is_unchanged_wire)
+}
+
+/// The same for an error the receiver sent.
+pub(crate) fn is_unchanged_wire(error: &WireError) -> bool {
+    error.unchanged || error.condition_not_met
+}
+
+impl FsOps {
+    /// On a filesystem whose inode numbers cannot show which file a name
+    /// leads to (`Profile::link_counts_trusted`), a condition that names
+    /// the object the copy found (`TargetCondition::Matches`,
+    /// `InPlaceUpdate::only`) is held to whatever is at the name now: the
+    /// receiver checks only that something is there, which is all it can
+    /// check. The destination root's filesystem decides; one mounted below
+    /// it is judged as the root's.
+    pub(super) fn existence_only_where_numbers_mislead(&self, request: &mut Request) {
+        let Some(root) = &self.destination_root else {
+            return;
+        };
+        if root.link_counts_trusted() {
+            return;
+        }
+        let now = |path: &[u8]| {
+            RelativePath::new(path)
+                .ok()
+                .and_then(|relative| root.metadata_optional(&relative).ok().flatten())
+        };
+        let observe = |path: &[u8], condition: &mut TargetCondition| {
+            if let TargetCondition::Matches { .. } = condition {
+                if let Some(now) = now(path) {
+                    *condition = TargetCondition::Matches {
+                        dev: now.dev,
+                        ino: now.ino,
+                    };
+                }
+            }
+        };
+        let observe_update =
+            |path: &[u8], update: &mut Option<Box<crate::proto::InPlaceUpdate>>| {
+                if let Some(update) = update {
+                    if update.only.is_some() {
+                        if let Some(now) = now(path) {
+                            update.only = Some((now.dev, now.ino));
+                        }
+                    }
+                }
+            };
+        match request {
+            Request::Finalize {
+                path, condition, ..
+            }
+            | Request::HashAndHold {
+                path, condition, ..
+            }
+            | Request::FinishBasis {
+                path, condition, ..
+            } => observe(path, condition),
+            Request::PutSmallBatch(puts) => {
+                for put in puts {
+                    observe(&put.path, &mut put.condition);
+                }
+            }
+            Request::PatchSmallBatch(patches) => {
+                for patch in patches {
+                    observe(&patch.path, &mut patch.condition);
+                }
+            }
+            Request::PatchBegin { patch, .. } => observe(&patch.path, &mut patch.condition),
+            Request::HashExistingBatch { files, .. } => {
+                for file in files {
+                    observe(&file.path, &mut file.condition);
+                }
+            }
+            Request::Apply { ops } => {
+                for op in ops {
+                    match op {
+                        Op::Mkdir {
+                            path, condition, ..
+                        }
+                        | Op::Symlink {
+                            path, condition, ..
+                        }
+                        | Op::Mknod {
+                            path, condition, ..
+                        }
+                        | Op::Hardlink {
+                            path, condition, ..
+                        }
+                        | Op::SetMeta {
+                            path, condition, ..
+                        }
+                        | Op::SetFileMetaIfSame {
+                            path, condition, ..
+                        } => observe(path, condition),
+                        Op::Remove { .. } | Op::Rmdir { .. } | Op::Unlink { .. } => {}
+                    }
+                }
+            }
+            Request::Prepare { path, update, .. } => observe_update(path, update),
+            Request::CopyLocal { dst, update, .. } => observe_update(dst, update),
+            _ => {}
+        }
+    }
+}
+
 pub(super) fn require_rooted_condition(
     metadata: RootMetadata,
     condition: TargetCondition,
@@ -1073,12 +1285,10 @@ pub(super) fn require_rooted_condition(
 ) -> Result<()> {
     match condition {
         TargetCondition::Any => Ok(()),
-        TargetCondition::Absent => {
-            bail!(
-                "destination {} appeared before metadata update",
-                label.display()
-            )
-        }
+        TargetCondition::Absent => Err(condition_not_met(format!(
+            "destination {} appeared before metadata update",
+            label.display()
+        ))),
         TargetCondition::Matches { dev, ino } if (metadata.dev, metadata.ino) == (dev, ino) => {
             Ok(())
         }
@@ -1097,10 +1307,10 @@ pub(super) fn require_rooted_condition(
             Ok(())
         }
         TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
-            bail!(
+            Err(condition_not_met(format!(
                 "destination {} changed before metadata update",
                 label.display()
-            )
+            )))
         }
     }
 }
@@ -1226,10 +1436,10 @@ pub(super) fn require_open_target(
 ) -> Result<()> {
     match condition {
         TargetCondition::Any => Ok(()),
-        TargetCondition::Absent => bail!(
+        TargetCondition::Absent => Err(condition_not_met(format!(
             "destination {} appeared after the new-path precondition was checked",
             path.display()
-        ),
+        ))),
         TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
             require_open_target_known(&file.metadata()?, path, condition)
         }
@@ -1243,16 +1453,16 @@ pub(super) fn require_open_target_known(
 ) -> Result<()> {
     match condition {
         TargetCondition::Any => Ok(()),
-        TargetCondition::Absent => bail!(
+        TargetCondition::Absent => Err(condition_not_met(format!(
             "destination {} appeared after the new-path precondition was checked",
             path.display()
-        ),
+        ))),
         TargetCondition::Matches { dev, ino } => {
             if metadata.dev() != dev || metadata.ino() != ino {
-                bail!(
+                return Err(condition_not_met(format!(
                     "destination {} changed after the existing-path precondition was checked",
                     path.display()
-                );
+                )));
             }
             Ok(())
         }
@@ -1267,10 +1477,10 @@ pub(super) fn require_open_target_known(
                 || metadata.ctime() != ctime
                 || metadata.ctime_nsec() as u32 != ctime_nsec
             {
-                bail!(
+                return Err(condition_not_met(format!(
                     "destination {} changed after the existing-path precondition was checked",
                     path.display()
-                );
+                )));
             }
             Ok(())
         }

@@ -2271,12 +2271,18 @@ impl Root {
                     link: publication::Link::Staged,
                 },
             )
-            .with_context(|| {
-                format!(
+            .map_err(|error| {
+                let message = format!(
                     "publish new confined path {} as {}",
                     source.label(),
                     target.label()
-                )
+                );
+                // Something holds the name: nothing was published.
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    crate::fsops::condition_not_met_by(error, message)
+                } else {
+                    anyhow::Error::new(error).context(message)
+                }
             })?;
         #[cfg(any(target_os = "linux", test))]
         drop(permit);
@@ -2328,7 +2334,17 @@ impl Root {
         let target_parent = self.resolve_publish_target(source, &source_parent, target)?;
         let staged = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
         require_safe_staged_identity(staged, staged_dev, staged_ino, source)?;
-        let before = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
+        let before = match metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf) {
+            Ok(before) => before,
+            // Gone: nothing was replaced.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(crate::fsops::condition_not_met(format!(
+                    "confined destination {} was removed before publication",
+                    target.label()
+                )))
+            }
+            Err(error) => return Err(error.into()),
+        };
         let has_expected_identity = |metadata: RootMetadata| {
             metadata.is_file() && metadata.dev == expected_dev && metadata.ino == expected_ino
         };
@@ -2337,10 +2353,10 @@ impl Root {
                 (before.ctime, before.ctime_nsec) == (ctime, ctime_nsec)
             })
         {
-            bail!(
+            return Err(crate::fsops::condition_not_met(format!(
                 "confined destination {} changed before publication",
                 target.label()
-            );
+            )));
         }
         #[cfg(test)]
         run_publication_test_hook(

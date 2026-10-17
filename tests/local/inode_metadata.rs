@@ -997,3 +997,16 @@ fn inplace_files_are_created_within_their_final_mode() {
         assert_eq!(mode, expected, "{umask:o} fail={fail}: {mode:o}");
     }
 }
+
+/// Deletions plan from a destination scan that reads inode metadata
+/// beneath the destination root it anchored, by that root's own names.
+#[test]
+fn a_scan_reading_inode_metadata_finds_the_entries_it_prunes() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"file");
+    write(&t.path("dst/extra"), b"extra");
+    let output = syq(&["-aX", "--delete", &t.s("src/"), &t.s("dst/")]);
+    assert_output_ok(&output);
+    assert!(!t.path("dst/extra").exists());
+    assert_eq!(read(&t.path("dst/file")), b"file");
+}

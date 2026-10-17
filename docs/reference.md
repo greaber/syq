@@ -184,16 +184,20 @@ Another program can change the destination while a copy runs. Syq creates a
 new file at a name only while the name is still free when the policy forbids
 replacing what is there. With `error`, `error-if-different` and `--as-new`, a
 file that appears there first is kept and that file's copy is reported as
-failed. With `keep` (and `syq rsync --ignore-existing`), it is kept and syq
-skips the file with a note, as it skips one it found at the start. With
-`syq rsync --existing`, syq replaces a file only while it is still the one it
-found: one removed or replaced meanwhile is skipped with a note, not created
-again. `--into-new` creates its directory only while the name is free; if
-another program creates one there first, the copy fails. On filesystems with
-neither an atomic no-replace rename nor hard links, such as FAT and exFAT on
-macOS and rclone mounts, syq checks that the name is free and then renames, so
-a file another program creates there in the instant between the two can be
-replaced.
+failed. With `keep` (and `syq rsync --ignore-existing`), a file that appears
+in a destination directory is kept and syq skips it with a note, as it skips
+one it found at the start; in an S3 bucket the object is kept too, but that
+file's copy is reported as failed (`S3 PUT failed`). With
+`syq rsync --existing`, syq replaces a file in a destination directory only
+while it is still the one it found: one removed or replaced meanwhile is
+skipped with a note, not created again. On filesystems whose inode numbers
+cannot show which file a name leads to, such as SSHFS, rclone mounts and FAT
+on macOS, syq checks only that a file is still there. `--into-new` creates its
+directory only while the name is free; if another program creates one there
+first, the copy fails. On filesystems with neither an atomic no-replace rename
+nor hard links, such as FAT and exFAT on macOS and rclone mounts, syq checks
+that the name is free and then renames, so a file another program creates
+there in the instant between the two can be replaced.
 
 See [Update policies](commands/cp.md#update-policies) for supported combinations.
 

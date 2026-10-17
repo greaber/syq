@@ -8991,3 +8991,125 @@ fn a_keeping_copy_links_new_names_only_to_files_it_created() {
     assert!(errors[0].is_none(), "{errors:?}");
     crate::fsops::release_stages(publisher.stage_scope());
 }
+
+/// Where inode numbers cannot show which file a link names, an ordinary
+/// receiver links new names as a copy without the check does, and a
+/// restricted receiver, held to its grant, refuses them.
+#[cfg(target_os = "linux")]
+#[test]
+fn own_file_links_on_filesystems_without_trusted_numbers() {
+    let dir = crate::test_support::tempdir().unwrap();
+    fs::write(dir.path().join("existing"), b"not ours").unwrap();
+    let path = |name: &str| dir.path().join(name).as_os_str().as_bytes().to_vec();
+    let metadata = fs::metadata(dir.path().join("existing")).unwrap();
+    let link = |name: &str| Request::Apply {
+        ops: vec![Op::Hardlink {
+            path: path(name),
+            source: path("existing"),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            condition: TargetCondition::Absent,
+        }],
+    };
+    let untrusted = |ops: &FsOps| {
+        let root = ops.destination_root.as_ref().unwrap();
+        let mut profile = root.profile();
+        profile.link_counts_trusted = false;
+        root.assume_profile_for_test(profile);
+    };
+    // Ordinary: the copy keeps existing files and copies hard links.
+    let mut ordinary = FsOps::test_destination(dir.path());
+    ordinary.set_stage_scope(crate::fsops::new_stage_scope());
+    assert!(matches!(
+        ordinary.handle(&Request::ConfigurePreservation {
+            selection: Default::default(),
+            sparse: false,
+            destination: true,
+            narrow_new_directories: false,
+            own_links: true,
+        }),
+        Response::Ok
+    ));
+    untrusted(&ordinary);
+    let Response::Applied(errors) = ordinary.handle(&link("ordinary-link")) else {
+        panic!("expected an Apply response")
+    };
+    assert!(errors[0].is_none(), "{errors:?}");
+    assert!(dir.path().join("ordinary-link").exists());
+    crate::fsops::release_stages(ordinary.stage_scope());
+    // Restricted: its authority's record of the files it created.
+    let mut restricted = FsOps::test_destination(dir.path());
+    restricted.set_owned_objects(Some(Default::default()));
+    untrusted(&restricted);
+    let Response::Applied(errors) = restricted.handle(&link("restricted-link")) else {
+        panic!("expected an Apply response")
+    };
+    assert!(errors[0].is_some());
+    assert!(!dir.path().join("restricted-link").exists());
+}
+
+/// Where inode numbers cannot show which file a name leads to, a
+/// publication held to the file the copy found (`--only-existing`) checks
+/// only that a file is there: it replaces one whatever its number, and
+/// still creates nothing where none is.
+#[cfg(target_os = "linux")]
+#[test]
+fn matched_publications_check_existence_only_where_numbers_mislead() {
+    for trusted in [true, false] {
+        let dir = crate::test_support::tempdir().unwrap();
+        fs::write(dir.path().join("there"), b"old").unwrap();
+        let path = |name: &str| dir.path().join(name).as_os_str().as_bytes().to_vec();
+        let mut ops = FsOps::test_destination(dir.path());
+        if !trusted {
+            let root = ops.destination_root.as_ref().unwrap();
+            let mut profile = root.profile();
+            profile.link_counts_trusted = false;
+            root.assume_profile_for_test(profile);
+        }
+        let put = |name: &str| {
+            Request::PutSmallBatch(vec![SmallPut {
+                path: path(name),
+                copy_id: [9; 16],
+                data: b"new".to_vec(),
+                hash: content_digest(b"new"),
+                meta: Meta {
+                    inode_metadata: None,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                    mtime_nsec: 0,
+                },
+                flags: 0,
+                inplace: false,
+                // A number the file there does not have.
+                condition: TargetCondition::Matches { dev: 1, ino: 1 },
+                replaces: true,
+                scanned: ScannedDestination::Unknown,
+            }])
+        };
+        let failure = |response: &Response| -> Option<WireError> {
+            match response {
+                Response::Applied(errors) => errors[0].clone(),
+                Response::PublishedBatch(results) => results[0].clone().err(),
+                other => panic!("unexpected response {other:?}"),
+            }
+        };
+        let replaced = failure(&ops.handle(&put("there")));
+        assert_eq!(
+            replaced.is_none(),
+            !trusted,
+            "trusted: {trusted}: {replaced:?}"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("there")).unwrap(),
+            if trusted { &b"old"[..] } else { &b"new"[..] }
+        );
+        if let Some(error) = replaced {
+            assert!(error.condition_not_met, "{error:?}");
+        }
+        let gone = failure(&ops.handle(&put("gone"))).expect("nothing to replace");
+        assert!(gone.condition_not_met, "trusted: {trusted}: {gone:?}");
+        assert!(!dir.path().join("gone").exists());
+    }
+}

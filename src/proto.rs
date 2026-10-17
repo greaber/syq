@@ -1836,6 +1836,16 @@ pub struct WireError {
     /// diagnostics because their values differ between operating systems.
     pub io_kind: Option<WireIoKind>,
     pub raw_os_error: Option<i32>,
+    /// The destination did not meet the operation's condition
+    /// (`TargetCondition`): something held a name to be created without
+    /// replacing, or the object to update was gone or another. The
+    /// receiver found this before changing anything
+    /// (`fsops::condition_not_met`).
+    pub condition_not_met: bool,
+    /// The receiver changed nothing for this operation: its condition was
+    /// not met, or it found it could not be done before starting
+    /// (`fsops::unchanged`).
+    pub unchanged: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
@@ -1937,6 +1947,8 @@ impl From<String> for WireError {
             message,
             io_kind: None,
             raw_os_error: None,
+            condition_not_met: false,
+            unchanged: false,
         }
     }
 }

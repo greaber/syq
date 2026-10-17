@@ -48,6 +48,10 @@ pub(super) struct ByteReservation {
     /// Capacity provisionally held by observation-only preparations until
     /// their individual outcomes are settled.
     pub(super) observations: HashMap<ReservationHoldId, u64>,
+    /// The file counts against the entry limit already: the request that
+    /// first created or opened it for writing was charged
+    /// (`charge_request`).
+    pub(super) entry_charged: bool,
 }
 
 impl ByteReservation {
@@ -96,15 +100,28 @@ pub(super) fn reject_control_plane_path(
 /// a path lookup.
 const MAX_DESTINATION_LINKS: usize = 40;
 
+/// Where `resolve_destination_links` found a destination reached through
+/// symlinks.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ResolvedDestination {
+    /// The deepest existing directory on the resolved path, relative to the
+    /// enrolled root, as components.
+    pub(super) existing: Vec<Vec<u8>>,
+    /// How many of the signed destination's components lead to `existing`:
+    /// the rest do not exist yet, and the copy creates them inside it.
+    pub(super) signed_components: usize,
+}
+
 /// Resolve the symlinks on the way to `destination`, a path relative to
-/// `root` (named `root_path`), to the directory they lead to inside the
-/// root: `None` when no component is a symlink. A link that leads outside
-/// the root, or to a name that does not exist, is refused.
-fn resolve_destination_links(
+/// `root` (named `root_path`), inside the root: `None` when no component is
+/// a symlink. Components of the destination itself that do not exist yet
+/// are left for the copy to create; a symlink that leads outside the root,
+/// or to a name that does not exist, is refused.
+pub(super) fn resolve_destination_links(
     root: &Root,
     root_path: &[u8],
     destination: &[u8],
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<ResolvedDestination>> {
     let components = |path: &[u8]| -> Vec<Vec<u8>> {
         path.split(|byte| *byte == b'/')
             .filter(|component| !component.is_empty())
@@ -112,10 +129,21 @@ fn resolve_destination_links(
             .collect()
     };
     let label = |path: &[Vec<u8>]| String::from_utf8_lossy(&path.join(&b'/')).into_owned();
-    let mut pending: std::collections::VecDeque<Vec<u8>> = components(destination).into();
+    // Each pending component, with the index of the destination component
+    // it is, or the link whose target it comes from.
+    enum Origin {
+        Destination(usize),
+        Link(String, Vec<u8>),
+    }
+    let mut pending: std::collections::VecDeque<(Vec<u8>, Origin)> = components(destination)
+        .into_iter()
+        .enumerate()
+        .map(|(index, component)| (component, Origin::Destination(index)))
+        .collect();
+    let signed_total = pending.len();
     let mut resolved: Vec<Vec<u8>> = Vec::new();
     let mut links = 0;
-    while let Some(component) = pending.pop_front() {
+    while let Some((component, origin)) = pending.pop_front() {
         match component.as_slice() {
             b"." => continue,
             b".." => {
@@ -128,12 +156,21 @@ fn resolve_destination_links(
         }
         resolved.push(component);
         let path = crate::rooted::RelativePath::new(&resolved.join(&b'/'))?;
-        let metadata = root.metadata_optional(&path)?.with_context(|| {
-            format!(
-                "{} does not exist; with --follow-dst a destination reached through a symlink must exist",
-                label(&resolved)
-            )
-        })?;
+        let Some(metadata) = root.metadata_optional(&path)? else {
+            resolved.pop();
+            return match origin {
+                // The rest of the destination is missing too: the copy
+                // creates it inside the directory found so far.
+                Origin::Destination(index) => Ok((links > 0).then_some(ResolvedDestination {
+                    existing: resolved,
+                    signed_components: index,
+                })),
+                Origin::Link(link, target) => bail!(
+                    "the destination symlink {link} leads to {}, which does not exist",
+                    String::from_utf8_lossy(&target)
+                ),
+            };
+        };
         if !metadata.is_symlink() {
             continue;
         }
@@ -142,32 +179,93 @@ fn resolve_destination_links(
             bail!("too many symlinks on the way to the destination");
         }
         let target = root.read_link(&path)?;
+        let link = label(&resolved);
         resolved.pop();
-        if target.starts_with(b"/") {
-            let inside = if target == root_path {
-                Some(&[][..])
-            } else {
-                target
-                    .strip_prefix(root_path)
-                    .and_then(|rest| rest.strip_prefix(b"/"))
-            };
-            let inside = inside.with_context(|| {
-                format!(
-                    "the destination symlink {} leads outside the enrolled root",
-                    label(&[path.to_bytes()])
-                )
-            })?;
+        let rest = if target.starts_with(b"/") {
+            let inside =
+                crate::fsops::destination_relative_to(root_path, &target).with_context(|| {
+                    format!("the destination symlink {link} leads outside the enrolled root")
+                })?;
             resolved.clear();
-            for component in components(inside).into_iter().rev() {
-                pending.push_front(component);
-            }
+            inside
         } else {
-            for component in components(&target).into_iter().rev() {
-                pending.push_front(component);
+            target.clone()
+        };
+        for component in components(&rest).into_iter().rev() {
+            pending.push_front((component, Origin::Link(link.clone(), target.clone())));
+        }
+    }
+    Ok((links > 0).then_some(ResolvedDestination {
+        existing: resolved,
+        signed_components: signed_total,
+    }))
+}
+
+/// Refuse a destination whose directory is, contains or lies inside one of
+/// the receiver's protected control paths, judged by identity: `existing`
+/// is the deepest existing directory of the destination, relative to
+/// `root`, and `whole` says whether it is the destination itself rather
+/// than one the copy creates the destination inside. Names a path is
+/// spelled with, through symlinks or a root of `/`, do not matter.
+pub(super) fn reject_control_plane_directory(
+    root: &Root,
+    existing: &[Vec<u8>],
+    whole: bool,
+    protected: &[ReceiverControlPath],
+) -> Result<()> {
+    // The identities from the root down to the directory.
+    let mut chain = Vec::with_capacity(existing.len() + 1);
+    for depth in 0..=existing.len() {
+        let relative = crate::rooted::RelativePath::new(&existing[..depth].join(&b'/'))?;
+        let directory = root.open_directory(&relative)?;
+        let metadata = directory.metadata()?;
+        chain.push((metadata.dev(), metadata.ino()));
+    }
+    let destination = *chain.last().expect("the root is always in the chain");
+    for control in protected {
+        let control_path = Path::new(OsStr::from_bytes(&control.path));
+        let Ok(metadata) = fs::metadata(control_path) else {
+            continue;
+        };
+        // The destination is the control path or lies beneath it.
+        let inside = chain.contains(&(metadata.dev(), metadata.ino()));
+        // The destination is the control path or one of its ancestors.
+        let contains = whole
+            && control_path.ancestors().any(|ancestor| {
+                fs::metadata(ancestor)
+                    .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == destination)
+            });
+        if inside || contains {
+            bail!(
+                "command-restricted destination overlaps the receiver's protected {} {}; choose a destination outside the receiver control plane",
+                control.label,
+                control_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The deepest existing directory of `destination` beneath `root`,
+/// following no symlink, and whether it is the destination itself.
+fn existing_directory_components(root: &Root, destination: &[u8]) -> Result<(Vec<Vec<u8>>, bool)> {
+    let mut existing = Vec::new();
+    for component in destination
+        .split(|byte| *byte == b'/')
+        .filter(|c| !c.is_empty())
+    {
+        existing.push(component.to_vec());
+        let relative = crate::rooted::RelativePath::new(&existing.join(&b'/'))?;
+        match root.metadata_optional(&relative)? {
+            Some(metadata) if metadata.is_dir() => {}
+            Some(_) => bail!("not a directory"),
+            None => {
+                existing.pop();
+                return Ok((existing, false));
             }
         }
     }
-    Ok((links > 0).then(|| resolved.join(&b'/')))
+    Ok((existing, true))
 }
 
 pub(super) fn reject_control_plane_scopes(
@@ -340,32 +438,49 @@ impl RestrictedAuthority {
             },
         )?);
         let mut held_path = config.root.as_bytes().to_vec();
+        let relative = relative.as_os_str().as_bytes();
         // `--follow-dst`: a destination reached through symlinks is the
-        // directory they resolve to inside the enrolled root. That directory
-        // is the root every connection works beneath, named in requests by
-        // the signed destination, so nothing reaches past it.
-        if extra_options.follow_dst && copy.policy.placement != DestinationPlacement::ExactPath {
-            let relative = relative.as_os_str().as_bytes();
-            if let Some(resolved) = resolve_destination_links(&root, &held_path, relative)? {
-                if resolved.is_empty() {
-                    bail!("signed destination resolves to the enrolled root itself");
-                }
-                let mut resolved_path = held_path.clone();
-                resolved_path.push(b'/');
-                resolved_path.extend_from_slice(&resolved);
-                reject_control_plane_path(&resolved_path, protected)?;
-                let directory = root
-                    .open_directory(&crate::rooted::RelativePath::new(&resolved)?)
-                    .with_context(|| {
-                        format!(
-                            "signed destination {} resolves to {}, which is not a directory",
-                            destination.display(),
-                            String::from_utf8_lossy(&resolved_path)
-                        )
-                    })?;
-                root = std::sync::Arc::new(Root::from_directory(directory)?);
-                held_path = copy.destination.clone();
+        // directory they resolve to inside the enrolled root. That
+        // directory, or the deepest existing one the copy creates the rest
+        // of the destination inside, is the root every connection works
+        // beneath, named in requests by the matching part of the signed
+        // destination, so nothing reaches past it.
+        let followed = if extra_options.follow_dst
+            && copy.policy.placement != DestinationPlacement::ExactPath
+        {
+            resolve_destination_links(&root, &held_path, relative)?
+        } else {
+            None
+        };
+        if let Some(found) = followed {
+            let signed: Vec<&[u8]> = relative
+                .split(|byte| *byte == b'/')
+                .filter(|component| !component.is_empty())
+                .collect();
+            let whole = found.signed_components == signed.len();
+            if whole && found.existing.is_empty() {
+                bail!("signed destination resolves to the enrolled root itself");
             }
+            reject_control_plane_directory(&root, &found.existing, whole, protected)?;
+            let directory = root
+                .open_directory(&crate::rooted::RelativePath::new(
+                    &found.existing.join(&b'/'),
+                )?)
+                .with_context(|| {
+                    format!(
+                        "signed destination {} resolves to {}, which is not a directory",
+                        destination.display(),
+                        String::from_utf8_lossy(&found.existing.join(&b'/'))
+                    )
+                })?;
+            root = std::sync::Arc::new(Root::from_directory(directory)?);
+            held_path =
+                crate::fsops::join(&held_path, &signed[..found.signed_components].join(&b'/'));
+        } else if let Ok(found) = existing_directory_components(&root, relative) {
+            // The destination's directory as it stands, judged by identity
+            // too: a name the strings above miss cannot reach the control
+            // plane either.
+            reject_control_plane_directory(&root, &found.0, found.1, protected)?;
         }
         let file_data_limit = (max_file_data_bytes_per_second > 0)
             .then(|| crate::bwlimit::BandwidthLimit::new(max_file_data_bytes_per_second));
@@ -1041,6 +1156,22 @@ impl RestrictedAuthority {
                 _ => None,
             }
         };
+        // The executor's typed error for an operation, where it gave one.
+        let outcome_wire = |index: usize| -> Option<&proto::WireError> {
+            match response {
+                proto::Response::EndpointError(error) => Some(error),
+                proto::Response::Applied(results) => results.get(index).and_then(Option::as_ref),
+                proto::Response::PatchedBatch(results) => match results.get(index) {
+                    Some(Err(error)) => Some(&error.error),
+                    _ => None,
+                },
+                proto::Response::PublishedBatch(results) => match results.get(index) {
+                    Some(Err(error)) => Some(error),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
         let failed = |index: usize| outcome_error(index).is_some();
         // A change the receiver declined to make in place, because only a
         // replacement may change that file's metadata (`fsops::vouch`), is
@@ -1202,7 +1333,7 @@ impl RestrictedAuthority {
                             | Change::LinkFile
                     );
                     let error = outcome_error(index);
-                    if creation && error.is_some() && self.kept_by_policy(&state, &path, false) {
+                    if creation && self.kept_by_policy(&state, &path, false, outcome_wire(index)) {
                         continue;
                     }
                     self.record_change(&path, change, error);
@@ -1241,7 +1372,7 @@ impl RestrictedAuthority {
                     // existing-object policy keeps.
                     if stage == FileStage::Finalize
                         && (outcome_error(index).is_none()
-                            || self.kept_by_policy(&state, &path, false))
+                            || self.kept_by_policy(&state, &path, false, outcome_wire(index)))
                     {
                         state.reserved.remove(&(path.clone(), copy_id));
                         if outcome_error(index).is_some() {
@@ -1360,16 +1491,27 @@ impl RestrictedAuthority {
         }
     }
 
-    /// Whether the failure of a creation at `path` only shows an object its
-    /// existing-object policy keeps: under `Skip`, or `keep_files` for
-    /// anything but a directory, the name holds something this grant did
-    /// not create. Such a creation is no failure: nothing changed, as the
-    /// policy asks. A root that must be new is never kept.
-    fn kept_by_policy(&self, state: &AuthorityState, path: &[u8], directory: bool) -> bool {
-        self.creation_policy(directory) == ExistingDestinationPolicy::Skip
+    /// Whether the failure of a change at `path` only shows an object its
+    /// existing-object policy keeps: the executor found, before changing
+    /// anything, that the destination did not meet the change's condition
+    /// (`fsops::condition_not_met`), under `Skip` (or `keep_files` for
+    /// anything but a directory) or `MustExist`. Such a change is no
+    /// failure: nothing changed, as the policy asks. A root that must be
+    /// new, and a name this grant created, are never kept.
+    fn kept_by_policy(
+        &self,
+        state: &AuthorityState,
+        path: &[u8],
+        directory: bool,
+        error: Option<&proto::WireError>,
+    ) -> bool {
+        error.is_some_and(crate::fsops::is_condition_not_met_wire)
+            && matches!(
+                self.creation_policy(directory),
+                ExistingDestinationPolicy::Skip | ExistingDestinationPolicy::MustExist
+            )
             && !(self.root_existence == RootExistence::New && path == self.destination)
             && !state.created.contains(path)
-            && self.rooted_metadata(path).ok().flatten().is_some()
     }
 
     pub(super) fn constrain_observed_creation(
@@ -1402,7 +1544,9 @@ impl RestrictedAuthority {
                 // another connection could otherwise empty the path between
                 // this check and execution, turning an update into a creation.
                 // A caller-supplied identity is accepted only when it names
-                // the observed object, never on its own authority.
+                // the observed object, never on its own authority, and only
+                // where numbers can show that.
+                self.existence_only_where_numbers_mislead(&metadata, condition);
                 match *condition {
                     Any => {
                         *condition = Matches {
@@ -1487,11 +1631,14 @@ impl RestrictedAuthority {
     /// Bind mutations at `path` to the signed existing-object policy.
     /// `Skip` protects all pre-existing objects, including directories,
     /// while permitting updates to objects created by this grant.
+    /// `directory` marks a directory's metadata: under `keep_files` only
+    /// those of existing objects may change.
     pub(super) fn constrain_update(
         &self,
         path: &[u8],
         condition: Option<&mut proto::TargetCondition>,
         pending: &[PendingCreation],
+        directory: bool,
     ) -> Result<()> {
         let label = String::from_utf8_lossy(path);
         // A creation earlier in this same request (a symlink followed by its
@@ -1501,7 +1648,7 @@ impl RestrictedAuthority {
         let created_here = pending
             .iter()
             .any(|creation| creation.path == path && !creation.link);
-        match self.copy.policy.existing {
+        match self.creation_policy(directory) {
             // A name this grant created leads only to an object it created,
             // whatever runs on other connections meanwhile: the one step
             // that could give it an existing file is a hard link, which
@@ -1519,6 +1666,25 @@ impl RestrictedAuthority {
             ExistingDestinationPolicy::UpdateIfOlder => {
                 bail!("update-if-older existing-object policy is not enforceable by the receiver")
             }
+        }
+    }
+
+    /// Where inode numbers cannot show which file a name leads to
+    /// (`fsops::Profile::link_counts_trusted`), a sender's identity for the
+    /// object observed as `observed` is set aside: the change is pinned to
+    /// what is there, as on any receiver there (`FsOps`'s
+    /// `existence_only_where_numbers_mislead`).
+    fn existence_only_where_numbers_mislead(
+        &self,
+        observed: &RootMetadata,
+        condition: &mut proto::TargetCondition,
+    ) {
+        let trusted = self.root.known_profile(observed.dev).map_or_else(
+            || self.root.link_counts_trusted(),
+            |profile| profile.link_counts_trusted,
+        );
+        if !trusted && matches!(*condition, proto::TargetCondition::Matches { .. }) {
+            *condition = proto::TargetCondition::Any;
         }
     }
 
@@ -1543,6 +1709,7 @@ impl RestrictedAuthority {
         let Some(condition) = condition else {
             return Ok(());
         };
+        self.existence_only_where_numbers_mislead(&metadata, condition);
         match *condition {
             Any => {
                 *condition = Matches {
@@ -1582,7 +1749,7 @@ impl RestrictedAuthority {
         // In place, the receiver creates the file when its name is free,
         // and the name can become free after any check here: only a grant
         // that lets the copy replace and create alike allows that.
-        if self.copy.policy.existing != ExistingDestinationPolicy::Replace {
+        if self.creation_policy(false) != ExistingDestinationPolicy::Replace {
             bail!(
                 "signed grant does not let {} be created or replaced freely: it is not written in place",
                 String::from_utf8_lossy(path)
@@ -1618,7 +1785,7 @@ impl RestrictedAuthority {
             return Ok(());
         }
         let label = String::from_utf8_lossy(path);
-        match self.copy.policy.existing {
+        match self.creation_policy(false) {
             ExistingDestinationPolicy::Skip if self.rooted_metadata(path)?.is_some() => Err(kept(
                 format!("signed grant retains existing objects: {label} already exists"),
             )),
@@ -1697,20 +1864,15 @@ impl RestrictedAuthority {
 
     /// `path` relative to the root this copy holds.
     pub(super) fn root_relative(&self, path: &[u8]) -> Result<RelativePath> {
-        let relative = if path == self.root_path {
-            &[][..]
-        } else {
-            path.strip_prefix(self.root_path.as_slice())
-                .and_then(|rest| rest.strip_prefix(b"/"))
-                .with_context(|| {
-                    format!(
-                        "receiver metadata target {} is outside enrolled root {}",
-                        String::from_utf8_lossy(path),
-                        String::from_utf8_lossy(&self.root_path)
-                    )
-                })?
-        };
-        RelativePath::new(relative)
+        let relative =
+            crate::fsops::destination_relative_to(&self.root_path, path).with_context(|| {
+                format!(
+                    "receiver metadata target {} is outside enrolled root {}",
+                    String::from_utf8_lossy(path),
+                    String::from_utf8_lossy(&self.root_path)
+                )
+            })?;
+        RelativePath::new(&relative)
     }
 
     /// Set up one connection's executor to serve this copy: its hashing,
@@ -1882,6 +2044,30 @@ impl RestrictedAuthority {
     /// is counted when any limit would be exceeded.
     pub(super) fn charge_request(&self, request: &Request) -> Result<Charged> {
         let mut deleting = Vec::new();
+        // A file the copy writes counts once, before its first change: the
+        // request that creates or opens it for writing (a stage, a
+        // sidecar, an in-place file, even an empty one) or, for one prepared
+        // only to look, the publication.
+        let file = match request {
+            Request::Prepare {
+                path,
+                copy_id,
+                create_if_missing,
+                update,
+                ..
+            } if *create_if_missing || update.is_some() => Some((path.clone(), *copy_id)),
+            Request::StageBasis { path, copy_id, .. }
+            | Request::SeedBasis { path, copy_id, .. }
+            | Request::Finalize { path, copy_id, .. } => Some((path.clone(), *copy_id)),
+            _ => None,
+        };
+        let file = file.filter(|key| {
+            let mut state = self.state.lock().unwrap();
+            match state.reserved.get_mut(key) {
+                Some(reservation) => !std::mem::replace(&mut reservation.entry_charged, true),
+                None => true,
+            }
+        });
         let (changes, bytes) = match request {
             Request::Apply { ops } => {
                 deleting = ops
@@ -1900,9 +2086,11 @@ impl RestrictedAuthority {
                 patches.len() as u64,
                 patches.iter().map(|patch| patch.data.len() as u64).sum(),
             ),
-            Request::PatchBegin { .. } | Request::Finalize { .. } | Request::FinishBasis { .. } => {
-                (1, 0)
-            }
+            Request::PatchBegin { .. } | Request::FinishBasis { .. } => (1, 0),
+            Request::Prepare { .. }
+            | Request::StageBasis { .. }
+            | Request::SeedBasis { .. }
+            | Request::Finalize { .. } => (u64::from(file.is_some()), 0),
             Request::PrepareSmallFiles(request) => (request.files.len() as u64, 0),
             Request::CopySmallFiles(payloads) => (
                 0,
@@ -1930,77 +2118,125 @@ impl RestrictedAuthority {
         let deletions = deleting.len() as u64;
         let limits = &self.copy.limits;
         if !charge(&self.changes, changes, limits.max_entries) {
+            self.uncharge_file(file.as_ref());
             bail!("signed grant entry limit exceeded");
         }
         if !charge(&self.deletions, deletions, limits.max_deletions) {
             refund(&self.changes, changes);
+            self.uncharge_file(file.as_ref());
             bail!("signed grant deletion limit exceeded");
         }
         if !charge(&self.transferred_bytes, bytes, limits.max_total_bytes) {
             refund(&self.changes, changes);
             refund(&self.deletions, deletions);
+            self.uncharge_file(file.as_ref());
             bail!("signed grant total-byte limit exceeded");
         }
-        Ok(Charged { changes, deleting })
+        Ok(Charged {
+            changes,
+            deleting,
+            file,
+        })
+    }
+
+    /// Settle a request whose execution never started, as a small copy
+    /// that ended without its payloads: nothing it was charged for
+    /// changed, and it fails with `reason`.
+    pub(super) fn settle_unexecuted(&self, mut settlement: Settlement, reason: &str) {
+        let charged = std::mem::take(&mut settlement.charged);
+        self.changes.fetch_sub(charged.changes, Ordering::AcqRel);
+        self.deletions
+            .fetch_sub(charged.deleting.len() as u64, Ordering::AcqRel);
+        self.uncharge_file(charged.file.as_ref());
+        self.settle(settlement, &proto::Response::Err(reason.into()));
+    }
+
+    /// Forget that `file` counts against the entry limit, when the request
+    /// that charged it made no change after all.
+    fn uncharge_file(&self, file: Option<&(Vec<u8>, proto::CopyId)>) {
+        let Some(key) = file else {
+            return;
+        };
+        if let Some(reservation) = self.state.lock().unwrap().reserved.get_mut(key) {
+            reservation.entry_charged = false;
+        }
     }
 
     /// Give back the changes and deletions of an authorized request that
-    /// the executor reports it did not make: those that failed, and a patch
-    /// that found its file changed since it was compared.
+    /// the executor reports it did not make, and nothing else: a change
+    /// whose condition the executor found unmet before changing anything
+    /// (`fsops::condition_not_met`), a patch that found its file changed
+    /// since it was compared, and a small-copy file that needed no change.
+    /// A change that failed after it may have changed something stays
+    /// counted.
     fn refund_unmade(&self, charged: &Charged, response: &proto::Response) {
-        let failed: Vec<usize> = match response {
-            proto::Response::Err(_) | proto::Response::EndpointError(_) => {
-                (0..charged.changes as usize).collect()
-            }
+        use crate::fsops::is_unchanged_wire as unmet;
+        let all = || (0..charged.changes as usize).collect::<Vec<usize>>();
+        let unmade: Vec<usize> = match response {
+            proto::Response::EndpointError(error) if unmet(error) => all(),
             proto::Response::Applied(results) => results
                 .iter()
                 .enumerate()
-                .filter(|(_, error)| error.is_some())
+                .filter(|(_, error)| error.as_ref().is_some_and(unmet))
                 .map(|(index, _)| index)
                 .collect(),
             proto::Response::PatchedBatch(results) => results
                 .iter()
                 .enumerate()
-                .filter(|(_, result)| result.is_err())
+                .filter(|(_, result)| {
+                    result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|error| error.stale_condition || unmet(&error.error))
+                })
                 .map(|(index, _)| index)
                 .collect(),
             proto::Response::PublishedBatch(results) => results
                 .iter()
                 .enumerate()
-                .filter(|(_, result)| result.is_err())
+                .filter(|(_, result)| result.as_ref().err().is_some_and(unmet))
                 .map(|(index, _)| index)
                 .collect(),
             // A small copy changes the files it publishes and those whose
             // metadata it changes; a preparation waiting for its payloads
-            // is settled with their reply.
+            // is settled with their reply, and one that published nothing
+            // changed nothing.
             proto::Response::SmallFilesCopied(proto::SmallCopyResponse {
                 outcome: proto::SmallCopyOutcome::Published(results),
                 ..
             }) => results
                 .iter()
                 .enumerate()
-                .filter(|(_, result)| {
-                    result.error.is_some()
-                        || match result.disposition {
-                            proto::SmallCopyDisposition::Copied => false,
-                            proto::SmallCopyDisposition::QuickChecked
-                            | proto::SmallCopyDisposition::ContentMatched => !result.repaired,
-                            proto::SmallCopyDisposition::Excluded => true,
-                        }
+                .filter(|(_, result)| match &result.error {
+                    Some(error) => unmet(error),
+                    None => match result.disposition {
+                        proto::SmallCopyDisposition::Copied => false,
+                        proto::SmallCopyDisposition::QuickChecked
+                        | proto::SmallCopyDisposition::ContentMatched => !result.repaired,
+                        proto::SmallCopyDisposition::Excluded => true,
+                    },
                 })
                 .map(|(index, _)| index)
                 .collect(),
-            proto::Response::SmallFilesCopied(_) => (0..charged.changes as usize).collect(),
+            proto::Response::SmallFilesCopied(_) => all(),
             _ => Vec::new(),
         };
-        let unmade = (failed.len() as u64).min(charged.changes);
-        if unmade > 0 {
-            self.changes.fetch_sub(unmade, Ordering::AcqRel);
+        let refunded = (unmade.len() as u64).min(charged.changes);
+        if refunded > 0 {
+            self.changes.fetch_sub(refunded, Ordering::AcqRel);
+            if charged.file.is_some() {
+                self.uncharge_file(charged.file.as_ref());
+            }
         }
+        // Both lists are in operation order.
+        let mut unmade = unmade.iter().peekable();
         let undeleted = charged
             .deleting
             .iter()
-            .filter(|index| failed.contains(index))
+            .filter(|&&index| {
+                while unmade.next_if(|&&unmade| unmade < index).is_some() {}
+                unmade.peek().is_some_and(|&&unmade| unmade == index)
+            })
             .count() as u64;
         if undeleted > 0 {
             self.deletions.fetch_sub(undeleted, Ordering::AcqRel);
@@ -2196,7 +2432,7 @@ impl RestrictedAuthority {
             self.check_metadata(&patch.path, &patch.meta, patch.unchanged_flags)?;
             self.check_file_bytes(&patch.path, 0, patch.data.len())?;
             self.constrain_creation(&patch.path, &mut patch.condition, false, index, pending)?;
-            self.constrain_update(&patch.path, Some(&mut patch.condition), pending)?;
+            self.constrain_update(&patch.path, Some(&mut patch.condition), pending, false)?;
             self.check_metadata(&patch.path, &patch.meta, patch.flags)?;
             let hold = self.reserve_bytes(&patch.path, patch.copy_id, patch.len, true)?;
             outcomes.push(PendingOutcome::Patch {
@@ -2489,7 +2725,7 @@ impl RestrictedAuthority {
                 meta,
                 flags,
                 condition,
-                ..
+                directory,
             } => {
                 let implicit = self.mapping_parent(path)?;
                 if implicit {
@@ -2504,7 +2740,7 @@ impl RestrictedAuthority {
                         *flags = proto::flags::RECEIVER_MODE;
                     }
                 }
-                self.constrain_update(path, Some(&mut *condition), pending)?;
+                self.constrain_update(path, Some(&mut *condition), pending, *directory)?;
                 if implicit {
                     anyhow::ensure!(
                         meta.inode_metadata.is_none(),
@@ -2526,7 +2762,7 @@ impl RestrictedAuthority {
                 flags,
                 condition,
             } => {
-                self.constrain_update(path, Some(&mut *condition), pending)?;
+                self.constrain_update(path, Some(&mut *condition), pending, false)?;
                 self.check_metadata(path, meta, *flags)?;
                 outcomes.push(PendingOutcome::Logical {
                     index,
@@ -2566,9 +2802,9 @@ impl RestrictedAuthority {
             Request::CopySmallFiles(_) | Request::TransportStats
         ) {
             if let Some(prepared) = small_copy.take() {
-                self.settle(
+                self.settle_unexecuted(
                     prepared.settlement,
-                    &proto::Response::Err("the small copy ended without its payloads".into()),
+                    "the small copy ended without its payloads",
                 );
             }
         }
@@ -2625,7 +2861,7 @@ impl RestrictedAuthority {
                 // entries authorized before the refusing one, or the small
                 // copy whose payloads it carries.
                 if let StreamStep::CopySmallCopy(prepared) = step {
-                    self.settle(*prepared, &proto::Response::Err(format!("{error:#}")));
+                    self.settle_unexecuted(*prepared, &format!("{error:#}"));
                 }
                 self.forget_provisional(&pending);
                 self.release_patch_holds(outcomes.into_iter());
@@ -2927,9 +3163,7 @@ impl RestrictedAuthority {
                 if path.starts_with(b"/") {
                     let root = &self.root_path;
                     anyhow::ensure!(
-                        path.len() > root.len()
-                            && path.starts_with(root)
-                            && path[root.len()] == b'/',
+                        path != root && path_is_at_or_below(path, root),
                         "the destination's ancestors outside the enrolled root are never widened"
                     );
                 }
@@ -3052,7 +3286,7 @@ impl RestrictedAuthority {
             } => {
                 *expected_hash = self.expected_hash(path)?.map(Into::into);
                 self.check_mutation_path(path, false)?;
-                self.constrain_update(path, Some(&mut *condition), pending)?;
+                self.constrain_update(path, Some(&mut *condition), pending, false)?;
                 self.check_metadata(path, meta, *flags)?;
                 outcomes.push(PendingOutcome::Logical {
                     index: 0,
@@ -3357,6 +3591,9 @@ pub(crate) struct Settlement {
 pub(super) struct Charged {
     changes: u64,
     deleting: Vec<usize>,
+    /// The file this request charged against the entry limit, if it was
+    /// the first to change it (`charge_request`).
+    file: Option<(Vec<u8>, proto::CopyId)>,
 }
 
 /// What a request does to its connection's streamed patch.
@@ -3493,11 +3730,9 @@ impl Drop for PatchStreamGate {
     fn drop(&mut self) {
         self.abandon("the connection closed before its streamed patch ended");
         if let Some(prepared) = self.small_copy.take() {
-            self.authority.settle(
+            self.authority.settle_unexecuted(
                 prepared.settlement,
-                &proto::Response::Err(
-                    "the connection closed before the small copy's payloads".into(),
-                ),
+                "the connection closed before the small copy's payloads",
             );
         }
     }
