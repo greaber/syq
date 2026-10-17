@@ -7671,14 +7671,26 @@ fn both_receivers_settle_each_file_of_an_in_place_batch_alike() {
 fn clones_in(directory: &Path) -> bool {
     let probe = directory.join("clone-probe");
     fs::write(&probe, [1; 1 << 16]).unwrap();
-    let copy = directory.join("clone-probe-copy");
+    let source = File::open(&probe).unwrap();
+    #[cfg(target_os = "linux")]
     let cloned = crate::local_copy::try_clone(
-        &File::open(&probe).unwrap(),
-        &File::create(&copy).unwrap(),
+        &source,
+        &File::create(directory.join("clone-probe-copy")).unwrap(),
         1 << 16,
     );
+    #[cfg(target_os = "macos")]
+    let cloned = unsafe {
+        libc::fclonefileat(
+            std::os::fd::AsRawFd::as_raw_fd(&source),
+            std::os::fd::AsRawFd::as_raw_fd(&File::open(directory).unwrap()),
+            c"clone-probe-copy".as_ptr(),
+            0,
+        )
+    } == 0;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let cloned = false;
+    let _ = fs::remove_file(directory.join("clone-probe-copy"));
     fs::remove_file(probe).unwrap();
-    fs::remove_file(copy).unwrap();
     cloned
 }
 

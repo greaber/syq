@@ -2527,6 +2527,7 @@ mod tests {
                 len: old.len() as u64,
                 condition: TargetCondition::Any,
                 guard: None,
+                clone_for: None,
             }],
             0,
         );
