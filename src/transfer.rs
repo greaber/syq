@@ -3940,16 +3940,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let root_creatable = dst_root_entry.is_none() && dst_is_dir && !args.existing;
     let mut create_root = root_creatable && !args.dry_run;
     let dry_run_creates_root = root_creatable && args.dry_run;
-    // A directory that must be new (`--into-new`) is created without
-    // adopting one another program makes at its name first, as a restricted
-    // receiver creates it; that copy fails.
-    let root_create_condition = if args.target_existence == Existence::New
-        && crate::checks::enabled(crate::checks::Check::ExistingFileConditions)
-    {
-        TargetCondition::Absent
-    } else {
-        TargetCondition::Any
-    };
+    let root_create_condition = TargetCondition::Any;
     // A directory target takes a contents source's metadata, which the
     // planner sends only once it has scanned the source root. When its
     // permissions or group are copied, create the root private until they
