@@ -1441,20 +1441,31 @@ impl FsOps {
                 crate::sparse::set_len(&stage.file, patch.len)?;
             }
             let chunk = (CHECKED_COPY_CHUNK / patch.block).max(1) * patch.block;
-            let mut start = 0;
-            while start < len {
-                let end = start.saturating_add(chunk).min(len);
-                if super::basis_copy::copy_data(&source.old, &stage.file, start, end).is_err() {
-                    return Ok(false);
+            // Reading a chunk back must not read ahead into the next, which
+            // is not copied yet: on NFS that would be read again once it is.
+            let advise = |advice| {
+                // SAFETY: a live descriptor; the advice only steers readahead.
+                unsafe { libc::posix_fadvise(stage.file.as_raw_fd(), 0, 0, advice) };
+            };
+            advise(libc::POSIX_FADV_RANDOM);
+            let checked = (|| -> Result<bool> {
+                let mut start = 0;
+                while start < len {
+                    let end = start.saturating_add(chunk).min(len);
+                    if super::basis_copy::copy_data(&source.old, &stage.file, start, end).is_err() {
+                        return Ok(false);
+                    }
+                    let blocks = (start / patch.block) as usize
+                        ..(end.div_ceil(patch.block) as usize).min(patch.reuse.len());
+                    if !self.holds_reused_between(&stage.file, patch, blocks)? {
+                        return Ok(false);
+                    }
+                    start = end;
                 }
-                let blocks = (start / patch.block) as usize
-                    ..(end.div_ceil(patch.block) as usize).min(patch.reuse.len());
-                if !self.holds_reused_between(&stage.file, patch, blocks)? {
-                    return Ok(false);
-                }
-                start = end;
-            }
-            Ok(true)
+                Ok(true)
+            })();
+            advise(libc::POSIX_FADV_NORMAL);
+            checked
         }
         #[cfg(not(target_os = "linux"))]
         {
