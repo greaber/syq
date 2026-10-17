@@ -729,6 +729,17 @@ impl FsOps {
         // metadata step, as without in-place updates.
         let mut replaced = None;
         if patch.update_in_place && !reproduces_basis(patch) {
+            // As a stage checks it (`stage_patch`): with transfer
+            // integrity, the new data must match the payload hash the source
+            // sent before any of it is written. A file that fails is copied
+            // again, with nothing of it written.
+            if self.hash_policy.transfer_integrity
+                && self.observed_payload_hash(&patch.data) != patch.hash
+            {
+                return Err(failed(false, false)(anyhow!(
+                    "block hash mismatch on receive"
+                )));
+            }
             match self.update_patch_in_place(patch)? {
                 Updated::InPlace(identity) => return Ok(PatchStep::Updated(identity)),
                 Updated::Refused(reason) => replaced = Some(reason),
