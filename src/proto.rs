@@ -1808,7 +1808,9 @@ pub struct DestinationFilesystemInfo {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct DestinationFilesystemTarget {
-    /// Directory path relative to the retained destination root.
+    /// Directory path relative to the retained destination root: one
+    /// component of a selected directory, or any directory beneath an
+    /// installed root.
     pub relative_path: PathBytes,
     pub dev: u64,
     pub ino: u64,

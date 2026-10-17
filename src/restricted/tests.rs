@@ -8461,3 +8461,63 @@ fn a_refusal_racing_the_results_end_is_still_counted() {
         "authenticated end omitted a refused request"
     );
 }
+
+/// A restricted receiver reports its destination's filesystem as an
+/// ordinary one does, about the directory it approved: the destination
+/// itself, checked for emptiness, or, while it is missing, the directory it
+/// goes into, never checked for emptiness. The sender cannot choose another.
+#[test]
+fn filesystem_information_describes_the_approved_destination() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir(root.join("other")).unwrap();
+    fs::write(root.join("other/file"), b"x").unwrap();
+    let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    let mut ops = authority.test_ops();
+    let mut inspect = |check_empty: bool, target: Option<proto::DestinationFilesystemTarget>| {
+        let mut request = Request::DestinationFilesystemInfo {
+            check_empty,
+            target,
+        };
+        let settlement = authority.authorize(&mut request, false).unwrap();
+        let response = ops.handle(&request);
+        authority.settle(settlement, &response);
+        let proto::Response::DestinationFilesystemInfo(info) = response else {
+            panic!("unexpected response {response:?}")
+        };
+        (request, info)
+    };
+    let other = fs::metadata(root.join("other")).unwrap();
+    let elsewhere = proto::DestinationFilesystemTarget {
+        relative_path: b"other".to_vec(),
+        dev: other.dev(),
+        ino: other.ino(),
+    };
+    let (request, info) = inspect(true, Some(elsewhere.clone()));
+    let Request::DestinationFilesystemInfo {
+        check_empty: true,
+        target: Some(chosen),
+    } = request
+    else {
+        panic!("the authority chose no target: {request:?}")
+    };
+    assert_eq!(chosen.relative_path, b"target");
+    assert_eq!(info.empty, Some(true));
+    assert_eq!(info.device, fs::metadata(&target).unwrap().dev());
+
+    fs::remove_dir(&target).unwrap();
+    let (request, info) = inspect(true, Some(elsewhere));
+    assert!(
+        matches!(
+            request,
+            Request::DestinationFilesystemInfo {
+                check_empty: false,
+                target: None,
+            }
+        ),
+        "{request:?}"
+    );
+    assert_eq!(info.empty, None);
+}

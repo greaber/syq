@@ -2444,16 +2444,19 @@ impl FsOps {
         target: Option<&DestinationFilesystemTarget>,
     ) -> Result<DestinationFilesystemInfo> {
         let target_directory = if let Some(target) = target {
-            if target.relative_path.is_empty()
-                || target.relative_path.contains(&0)
-                || target.relative_path.contains(&b'/')
-                || matches!(target.relative_path.as_slice(), b"." | b"..")
-            {
-                bail!("destination filesystem target is not one relative path component");
-            }
+            // Beneath an installed root a target may be any directory there;
+            // a restricted receiver's authority names the destination it
+            // approved. Before one, it is a child of the selected directory.
             let directory = if let Some(base) = &self.destination_root {
                 base.open_directory(&RelativePath::new(&target.relative_path)?)?
             } else {
+                if target.relative_path.is_empty()
+                    || target.relative_path.contains(&0)
+                    || target.relative_path.contains(&b'/')
+                    || matches!(target.relative_path.as_slice(), b"." | b"..")
+                {
+                    bail!("destination filesystem target is not one relative path component");
+                }
                 let selection = self
                     .operator_selection
                     .as_ref()

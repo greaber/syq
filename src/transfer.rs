@@ -3611,6 +3611,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 exact_capacity_target.clone(),
             )?,
         }
+    } else if !use_operator_anchor && !args.existing {
+        // A restricted receiver inspects the directory it approved itself.
+        destination_filesystem_info(&mut *dst_ctl, dst_entry_is_dir, None)?
     } else {
         None
     };

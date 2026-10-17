@@ -2318,8 +2318,42 @@ impl RestrictedAuthority {
                     self.check_observation_path(path)?;
                 }
             }
-            Request::DestinationFilesystemInfo { .. } => {
-                bail!("destination filesystem inspection is not authorized by the signed grant")
+            Request::DestinationFilesystemInfo {
+                check_empty,
+                target,
+            } => {
+                // What the copy learns of the destination's filesystem is
+                // about the directory it writes into, found here: the signed
+                // destination when it is a directory, or else the directory
+                // it goes into. Only the destination is checked for
+                // emptiness.
+                let (path, metadata) = match self.rooted_metadata(&self.destination)? {
+                    Some(metadata) if metadata.is_dir() => (self.destination.clone(), metadata),
+                    _ => {
+                        *check_empty = false;
+                        let end = self.destination.iter().rposition(|&byte| byte == b'/');
+                        let parent = end
+                            .map(|end| self.destination[..end].to_vec())
+                            .filter(|parent| parent.len() > self.root_path.len())
+                            .unwrap_or_else(|| self.root_path.clone());
+                        match self.rooted_metadata(&parent)? {
+                            Some(metadata) if metadata.is_dir() => (parent, metadata),
+                            _ => (
+                                self.root_path.clone(),
+                                self.rooted_metadata(&self.root_path)?
+                                    .context("the enrolled root is missing")?,
+                            ),
+                        }
+                    }
+                };
+                *target = (path != self.root_path).then(|| proto::DestinationFilesystemTarget {
+                    relative_path: self
+                        .root_relative(&path)
+                        .map(|relative| relative.to_bytes())
+                        .unwrap_or_default(),
+                    dev: metadata.dev,
+                    ino: metadata.ino,
+                });
             }
             Request::PartialPaths { paths, .. } | Request::PruneLookup { paths } => {
                 for path in paths {
