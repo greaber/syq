@@ -2,7 +2,6 @@ use super::*;
 use crate::destination_results::Change;
 
 pub(super) struct AuthorityState {
-    pub(super) paths: HashSet<Vec<u8>>,
     /// Objects this grant created and the executor confirmed. The
     /// existing-object policy is about what existed before the transfer, so
     /// later operations on these are the transfer's own business.
@@ -11,18 +10,17 @@ pub(super) struct AuthorityState {
     /// grant the shortcut above: a second creation of the same path races at
     /// the kernel instead of trusting an outcome that has not happened yet.
     pub(super) provisional: HashSet<Vec<u8>>,
-    /// Bytes each staged or in-place file may occupy on disk, keyed by the
-    /// destination path and the partial this grant declared for it:
-    /// preallocation and basis seeding are charged against the aggregate
-    /// ceiling here, once per file at its largest declared size, and every
-    /// write or publication must name a declared partial. Observation-only
+    /// Bytes each staged, in-place or patched file this copy is writing
+    /// may occupy on disk, keyed by the destination path and the partial
+    /// this grant declared for it: preallocation and basis seeding are
+    /// charged against the aggregate ceiling here, once per file at its
+    /// largest declared size, while the file is in flight. A published file
+    /// leaves the map and its bytes stay counted. Observation-only
     /// preparations own separate provisional holds so an older absent
     /// observation cannot roll back a newer preparation for the same key.
     pub(super) reserved: HashMap<(Vec<u8>, proto::CopyId), ByteReservation>,
     pub(super) reserved_bytes: u64,
     pub(super) next_reservation_hold: u64,
-    pub(super) transferred_bytes: u64,
-    pub(super) deletions: u64,
     pub(super) live_connections: u16,
     pub(super) tcp_listener_started: bool,
     /// Files this grant's results stream is writing that have not been
@@ -134,6 +132,14 @@ pub(crate) struct RestrictedAuthority {
     pub(super) file_data_limit: Option<crate::bwlimit::BandwidthLimit>,
     pub(super) deadline: Instant,
     pub(super) control_open: AtomicBool,
+    /// Changes authorized so far, against the signed entry limit: each
+    /// creation, publication, link, metadata change and deletion counts
+    /// each time it is made. Lookups count nothing.
+    pub(super) changes: std::sync::atomic::AtomicU64,
+    /// File bytes received so far, against the signed byte limit.
+    pub(super) transferred_bytes: std::sync::atomic::AtomicU64,
+    /// Deletions authorized so far, against the signed deletion limit.
+    pub(super) deletions: std::sync::atomic::AtomicU64,
     pub(super) state: Mutex<AuthorityState>,
     /// Signalled whenever an in-flight request settles.
     pub(super) settled: std::sync::Condvar,
@@ -289,15 +295,15 @@ impl RestrictedAuthority {
             deadline,
             control_open: AtomicBool::new(true),
             settled: std::sync::Condvar::new(),
+            changes: Default::default(),
+            transferred_bytes: Default::default(),
+            deletions: Default::default(),
             state: Mutex::new(AuthorityState {
-                paths: HashSet::new(),
                 created: HashSet::new(),
                 provisional: HashSet::new(),
                 reserved: HashMap::new(),
                 reserved_bytes: 0,
                 next_reservation_hold: 0,
-                transferred_bytes: 0,
-                deletions: 0,
                 live_connections: 0,
                 tcp_listener_started: false,
                 file_lifecycles: HashMap::new(),
@@ -365,7 +371,7 @@ impl RestrictedAuthority {
             state = self.settled.wait_timeout(state, remaining).unwrap().0;
         }
         let unfinished = std::mem::take(&mut state.file_lifecycles);
-        let transferred_bytes = state.transferred_bytes;
+        let transferred_bytes = self.transferred_bytes.load(Ordering::Acquire);
         let mut results = self.results.lock().unwrap();
         let stream = results
             .as_mut()
@@ -633,85 +639,6 @@ impl RestrictedAuthority {
         }
     }
 
-    /// The size this grant declared for a partial, which bounds what may be
-    /// written into it and what may be published from it. A partial left by
-    /// an earlier grant has no declaration here and cannot be used.
-    pub(super) fn declared_size(&self, path: &[u8], copy_id: proto::CopyId) -> Result<u64> {
-        self.state
-            .lock()
-            .unwrap()
-            .reserved
-            .get(&(path.to_vec(), copy_id))
-            .and_then(ByteReservation::effective_size)
-            .with_context(|| {
-                format!(
-                    "staged file {} was not declared under this grant",
-                    String::from_utf8_lossy(path)
-                )
-            })
-    }
-
-    /// Refuse to publish a staged or in-place file that is larger than the
-    /// size this grant declared for it.
-    pub(super) fn check_published_length(
-        &self,
-        path: &[u8],
-        copy_id: proto::CopyId,
-        inplace: bool,
-    ) -> Result<()> {
-        let declared = self.declared_size(path, copy_id)?;
-        let staged = crate::fsops::partial_path(Path::new(OsStr::from_bytes(path)), &copy_id)?
-            .into_os_string()
-            .into_vec();
-        // An in-place request writes the file at its name only when the
-        // receiver created it there; when the name already held a file it
-        // writes a stage instead.
-        let staged = if inplace && self.rooted_metadata(&staged)?.is_none() {
-            path.to_vec()
-        } else {
-            staged
-        };
-        if let Some(metadata) = self.rooted_metadata(&staged)? {
-            if metadata.len > declared {
-                bail!(
-                    "staged file {} exceeds its declared size",
-                    String::from_utf8_lossy(path)
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// Charge every entry a destination scan returns against the signed entry
-    /// ceiling, so enumeration is bounded like every other observation.
-    pub(crate) fn record_scanned<'a>(
-        &self,
-        root: &[u8],
-        entries: impl IntoIterator<Item = &'a [u8]>,
-    ) -> Result<()> {
-        for relative in entries {
-            if relative.is_empty() {
-                continue;
-            }
-            self.record_path(&crate::fsops::join(root, relative))?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn record_path(&self, path: &[u8]) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        if state.paths.contains(path) {
-            return Ok(());
-        }
-        // Check before inserting: a path rejected at the ceiling must not be
-        // remembered, or resubmitting it would pass as already counted.
-        if state.paths.len() as u64 >= self.copy.limits.max_entries {
-            bail!("signed grant entry limit exceeded");
-        }
-        state.paths.insert(path.to_vec());
-        Ok(())
-    }
-
     pub(super) fn mapping_relative<'a>(&self, path: &'a [u8]) -> Result<&'a [u8]> {
         if path == self.destination {
             return Ok(b"");
@@ -756,8 +683,7 @@ impl RestrictedAuthority {
         {
             bail!("receiver observation is outside the signed destination scopes");
         }
-        self.check_mapping_path(path, None)?;
-        self.record_path(path)
+        self.check_mapping_path(path, None)
     }
 
     /// The directory the copy goes into without filling it, which only an
@@ -843,7 +769,7 @@ impl RestrictedAuthority {
         if self.path_is_ignored(path, is_dir) {
             bail!("receiver mutation targets a path excluded by the signed filter policy");
         }
-        self.record_path(path)
+        Ok(())
     }
 
     pub(super) fn created_by_this_grant(&self, path: &[u8]) -> bool {
@@ -978,9 +904,11 @@ impl RestrictedAuthority {
         let Settlement {
             creations,
             outcomes,
+            charged,
             tracked,
             stream: _,
         } = settlement;
+        self.refund_unmade(&charged, response);
         if creations.is_empty() && outcomes.is_empty() && !tracked {
             return;
         }
@@ -1074,12 +1002,18 @@ impl RestrictedAuthority {
                     // it declared, as staging keeps its declaration.
                     if let Some(hold) = hold {
                         let key = (path.clone(), copy_id);
+                        let published = !kept && !stale && outcome_error(index).is_none();
                         Self::settle_observation_reservation(
                             &mut state,
                             &key,
                             hold,
                             !kept && !stale,
                         );
+                        // A published file is no longer in flight; what it
+                        // occupies stays counted.
+                        if published {
+                            state.reserved.remove(&key);
+                        }
                     }
                     // As for a staged file whose publication failed on its
                     // condition and was then retried, only the retry's
@@ -1146,26 +1080,45 @@ impl RestrictedAuthority {
                     let refused = stage == FileStage::Prepare
                         && matches!(response, proto::Response::EndpointError(error)
                             if crate::fsops::vouch::is_replace_required_wire(error));
+                    // A published file is no longer in flight; what it
+                    // occupies stays counted.
+                    if stage == FileStage::Finalize && outcome_error(index).is_none() {
+                        state.reserved.remove(&(path.clone(), copy_id));
+                    }
                     if absent || refused || !streaming {
                         continue;
                     }
                     let key = (path.clone(), copy_id);
+                    let declared = size.or_else(|| {
+                        state
+                            .reserved
+                            .get(&key)
+                            .and_then(ByteReservation::effective_size)
+                    });
                     match (stage, outcome_error(index)) {
                         // Published: reported now and no longer tracked. A
                         // repeated finalization reports nothing new.
                         (FileStage::Finalize, None) => {
-                            if state.file_lifecycles.remove(&key).is_some() {
-                                self.record_change(&path, Change::PublishFile { size }, None);
+                            if let Some(lifecycle) = state.file_lifecycles.remove(&key) {
+                                self.record_change(
+                                    &path,
+                                    Change::PublishFile {
+                                        size: lifecycle.size,
+                                    },
+                                    None,
+                                );
                             }
                         }
                         (_, error) => {
                             let lifecycle =
                                 state.file_lifecycles.entry(key).or_insert(FileLifecycle {
-                                    size,
+                                    size: declared.unwrap_or(0),
                                     last_error: None,
                                     listed: false,
                                 });
-                            lifecycle.size = size;
+                            if let Some(declared) = declared {
+                                lifecycle.size = declared;
+                            }
                             if let Some(error) = error {
                                 lifecycle.last_error =
                                     crate::destination_results::bounded_diagnostic(error);
@@ -1606,7 +1559,11 @@ impl RestrictedAuthority {
         Ok(())
     }
 
-    pub(super) fn charge_bytes(&self, path: &[u8], offset: u64, bytes: usize) -> Result<()> {
+    /// Check file data a request carries for `path` at `offset`: within the
+    /// per-file limit and one rate-limit burst, paced to the signed rate.
+    /// Its bytes count against the total once the request is authorized
+    /// (`charge_request`).
+    pub(super) fn check_file_bytes(&self, path: &[u8], offset: u64, bytes: usize) -> Result<()> {
         self.check_mutation_path(path, false)?;
         let bytes = u64::try_from(bytes).context("request byte count overflow")?;
         if self
@@ -1620,15 +1577,6 @@ impl RestrictedAuthority {
         if end > self.copy.limits.max_file_bytes {
             bail!("signed grant per-file byte limit exceeded");
         }
-        let mut state = self.state.lock().unwrap();
-        state.transferred_bytes = state
-            .transferred_bytes
-            .checked_add(bytes)
-            .context("signed transfer byte counter overflow")?;
-        if state.transferred_bytes > self.copy.limits.max_total_bytes {
-            bail!("signed grant total-byte limit exceeded");
-        }
-        drop(state);
         if let Some(limit) = &self.file_data_limit {
             limit.wait(bytes);
             self.check_deadline()?;
@@ -1636,25 +1584,117 @@ impl RestrictedAuthority {
         Ok(())
     }
 
-    pub(super) fn charge_deletion(&self, path: &[u8], is_dir: bool) -> Result<()> {
+    /// Check a deletion the grant may make. It counts against the deletion
+    /// limit once its request is authorized (`charge_request`).
+    pub(super) fn check_deletion(&self, path: &[u8], is_dir: bool) -> Result<()> {
         if path == self.destination {
             bail!("the signed destination root itself may not be deleted");
         }
         if self.filters.delete_excluded {
             self.check_mutation_authority(path)?;
-            self.record_path(path)?;
         } else {
             self.check_mutation_path(path, is_dir)?;
         }
         if self.copy.policy.deletion == DeletionPolicy::Forbid {
             bail!("deletion is not authorized by the signed grant");
         }
-        let mut state = self.state.lock().unwrap();
-        state.deletions += 1;
-        if state.deletions > self.copy.limits.max_deletions {
+        Ok(())
+    }
+
+    /// Count an authorized request against the signed limits: each change
+    /// it makes against the entry limit, each deletion against the deletion
+    /// limit, and the file bytes it carries against the byte limit. Nothing
+    /// is counted when any limit would be exceeded.
+    pub(super) fn charge_request(&self, request: &Request) -> Result<Charged> {
+        let mut deleting = Vec::new();
+        let (changes, bytes) = match request {
+            Request::Apply { ops } => {
+                deleting = ops
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, op)| matches!(op, Op::Rmdir { .. } | Op::Unlink { .. }))
+                    .map(|(index, _)| index)
+                    .collect();
+                (ops.len() as u64, 0)
+            }
+            Request::PutSmallBatch(puts) => (
+                puts.len() as u64,
+                puts.iter().map(|put| put.data.len() as u64).sum(),
+            ),
+            Request::PatchSmallBatch(patches) => (
+                patches.len() as u64,
+                patches.iter().map(|patch| patch.data.len() as u64).sum(),
+            ),
+            Request::PatchBegin { .. } | Request::Finalize { .. } | Request::FinishBasis { .. } => {
+                (1, 0)
+            }
+            Request::WriteRange { data, .. } | Request::PatchData { data, .. } => {
+                (0, data.len() as u64)
+            }
+            _ => (0, 0),
+        };
+        let charge = |counter: &std::sync::atomic::AtomicU64, amount: u64, limit: u64| {
+            amount == 0
+                || counter
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |total| {
+                        total.checked_add(amount).filter(|total| *total <= limit)
+                    })
+                    .is_ok()
+        };
+        let refund = |counter: &std::sync::atomic::AtomicU64, amount: u64| {
+            counter.fetch_sub(amount, Ordering::AcqRel);
+        };
+        let deletions = deleting.len() as u64;
+        let limits = &self.copy.limits;
+        if !charge(&self.changes, changes, limits.max_entries) {
+            bail!("signed grant entry limit exceeded");
+        }
+        if !charge(&self.deletions, deletions, limits.max_deletions) {
+            refund(&self.changes, changes);
             bail!("signed grant deletion limit exceeded");
         }
-        Ok(())
+        if !charge(&self.transferred_bytes, bytes, limits.max_total_bytes) {
+            refund(&self.changes, changes);
+            refund(&self.deletions, deletions);
+            bail!("signed grant total-byte limit exceeded");
+        }
+        Ok(Charged { changes, deleting })
+    }
+
+    /// Give back the changes and deletions of an authorized request that
+    /// the executor reports it did not make: those that failed, and a patch
+    /// that found its file changed since it was compared.
+    fn refund_unmade(&self, charged: &Charged, response: &proto::Response) {
+        let failed: Vec<usize> = match response {
+            proto::Response::Err(_) | proto::Response::EndpointError(_) => {
+                (0..charged.changes as usize).collect()
+            }
+            proto::Response::Applied(results) => results
+                .iter()
+                .enumerate()
+                .filter(|(_, error)| error.is_some())
+                .map(|(index, _)| index)
+                .collect(),
+            proto::Response::PatchedBatch(results) => results
+                .iter()
+                .enumerate()
+                .filter(|(_, result)| result.is_err())
+                .map(|(index, _)| index)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let unmade = (failed.len() as u64).min(charged.changes);
+        if unmade > 0 {
+            self.changes.fetch_sub(unmade, Ordering::AcqRel);
+        }
+        let undeleted = charged
+            .deleting
+            .iter()
+            .filter(|index| failed.contains(index))
+            .count() as u64;
+        if undeleted > 0 {
+            self.deletions.fetch_sub(undeleted, Ordering::AcqRel);
+        }
     }
 
     /// Release the sizes held by the patches of a refused request.
@@ -1703,7 +1743,7 @@ impl RestrictedAuthority {
                     .checked_add(data.len() as u64)
                     .filter(|received| *received <= open.declared)
                     .context("streamed patch data runs past the length its begin declared")?;
-                self.charge_bytes(&open.path, open.received, data.len())?;
+                self.check_file_bytes(&open.path, open.received, data.len())?;
                 open.received = received;
             }
             Request::PatchEnd { .. } => {
@@ -1757,7 +1797,7 @@ impl RestrictedAuthority {
                 bail!("kept and published metadata flags differ beyond times");
             }
             self.check_flags(patch.unchanged_flags)?;
-            self.charge_bytes(&patch.path, 0, patch.data.len())?;
+            self.check_file_bytes(&patch.path, 0, patch.data.len())?;
             self.constrain_creation(&patch.path, &mut patch.condition, false, index, pending)?;
             self.constrain_update(&patch.path, Some(&mut patch.condition), pending)?;
             self.check_metadata(&patch.meta, patch.flags)?;
@@ -1894,7 +1934,7 @@ impl RestrictedAuthority {
                 bail!("recursive remove is not supported by the root-confined receiver")
             }
             Op::Rmdir { path } => {
-                self.charge_deletion(path, true)?;
+                self.check_deletion(path, true)?;
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
@@ -1903,7 +1943,7 @@ impl RestrictedAuthority {
                 return Ok(());
             }
             Op::Unlink { path } => {
-                self.charge_deletion(path, false)?;
+                self.check_deletion(path, false)?;
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
@@ -2152,12 +2192,14 @@ impl RestrictedAuthority {
         }
         let mut step = StreamStep::None;
         let authorized = self.authorize_inner(request, over_ssh, &mut pending, &mut outcomes);
-        let authorized =
-            authorized.and_then(|()| self.authorize_stream(request, stream, &mut step));
+        let authorized = authorized
+            .and_then(|()| self.authorize_stream(request, stream, &mut step))
+            .and_then(|()| self.charge_request(request));
         match authorized {
-            Ok(()) => Ok(Settlement {
+            Ok(charged) => Ok(Settlement {
                 creations: pending,
                 outcomes,
+                charged,
                 tracked,
                 stream: step,
             }),
@@ -2563,7 +2605,7 @@ impl RestrictedAuthority {
                     index: 0,
                     path: path.clone(),
                     copy_id: *copy_id,
-                    size: *len,
+                    size: Some(*len),
                     stage: FileStage::Prepare,
                     skip_if_absent: false,
                     observation_hold: None,
@@ -2634,7 +2676,7 @@ impl RestrictedAuthority {
                     index: 0,
                     path: path.clone(),
                     copy_id: *copy_id,
-                    size: *size,
+                    size: Some(*size),
                     stage: FileStage::Prepare,
                     skip_if_absent: !*create_if_missing,
                     observation_hold,
@@ -2649,19 +2691,17 @@ impl RestrictedAuthority {
             } => {
                 self.require_publication_mode(false, "staged block reuse")?;
                 self.check_mutation_path(path, false)?;
-                let declared = self.declared_size(path, *copy_id)?;
+                // The receiver writes only within the size declared for the
+                // file it holds (`fsops::stages`).
                 anyhow::ensure!(
-                    *len > 0
-                        && off
-                            .checked_add(u64::from(*len))
-                            .is_some_and(|end| end <= declared),
-                    "reused block extends past declared file size"
+                    *len > 0 && off.checked_add(u64::from(*len)).is_some(),
+                    "invalid reused block"
                 );
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
                     copy_id: *copy_id,
-                    size: declared,
+                    size: None,
                     stage: FileStage::Write,
                     skip_if_absent: false,
                     observation_hold: None,
@@ -2677,24 +2717,19 @@ impl RestrictedAuthority {
                 data,
                 ..
             } => {
+                // The receiver writes only within the size declared for the
+                // file it holds (`fsops::stages`).
                 self.require_publication_mode(*inplace, "file write")?;
-                let declared = self.declared_size(path, *copy_id)?;
-                if off
-                    .checked_add(data.len() as u64)
-                    .is_none_or(|end| end > declared)
-                {
-                    bail!("file write extends past the size declared for it");
-                }
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
                     copy_id: *copy_id,
-                    size: declared,
+                    size: None,
                     stage: FileStage::Write,
                     skip_if_absent: false,
                     observation_hold: None,
                 });
-                self.charge_bytes(path, *off, data.len())?;
+                self.check_file_bytes(path, *off, data.len())?;
             }
             Request::Finalize {
                 expected_hash,
@@ -2714,13 +2749,12 @@ impl RestrictedAuthority {
                 *expected_hash = self.expected_hash(path)?.map(Into::into);
                 self.require_publication_mode(*inplace, "file finalization")?;
                 self.check_mutation_path(path, false)?;
-                self.check_published_length(path, *copy_id, *inplace)?;
                 self.constrain_creation(path, condition, false, 0, pending)?;
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
                     copy_id: *copy_id,
-                    size: self.declared_size(path, *copy_id)?,
+                    size: None,
                     stage: FileStage::Finalize,
                     skip_if_absent: false,
                     observation_hold: None,
@@ -2747,7 +2781,7 @@ impl RestrictedAuthority {
                     if self.expected_hash(&put.path)?.is_some() {
                         bail!("expected-hash files require checked finalization");
                     }
-                    self.charge_bytes(&put.path, 0, put.data.len())?;
+                    self.check_file_bytes(&put.path, 0, put.data.len())?;
                     if put.inplace {
                         self.constrain_inplace(&put.path)?;
                     }
@@ -2876,10 +2910,20 @@ impl RestrictedAuthority {
 pub(crate) struct Settlement {
     pub(super) creations: Vec<PendingCreation>,
     pub(super) outcomes: Vec<PendingOutcome>,
+    /// What the request counted against the signed limits.
+    pub(super) charged: Charged,
     /// The request counts as in flight until settled.
     pub(super) tracked: bool,
     /// Where the request leaves its connection's streamed patch.
     pub(super) stream: StreamStep,
+}
+
+/// The changes a request counted against the entry limit, and which of its
+/// operations, by index, counted as deletions (`charge_request`).
+#[derive(Debug, Default)]
+pub(super) struct Charged {
+    changes: u64,
+    deleting: Vec<usize>,
 }
 
 /// What a request does to its connection's streamed patch.
@@ -3042,7 +3086,9 @@ pub(super) enum PendingOutcome {
         index: usize,
         path: Vec<u8>,
         copy_id: proto::CopyId,
-        size: u64,
+        /// The size a preparation declares; writes and finalization leave
+        /// the declared size as it is.
+        size: Option<u64>,
         stage: FileStage,
         /// Ignore a successful observation-only Prepare when it found no
         /// resumable sidecar and therefore performed no lifecycle mutation.

@@ -3508,18 +3508,18 @@ fn a_refused_write_to_an_unfinished_file_lists_it_once() {
     let settlement = authority.authorize(&mut prepare, false).unwrap();
     fs::write(&image, b"half").unwrap();
     authority.settle(settlement, &proto::Response::Ok);
-    // A write past the size the file declared is refused.
+    // A write past the grant's per-file limit is refused.
     let mut write = Request::WriteRange {
         path: path_bytes(&image),
         inplace: true,
         copy_id: [1; 16],
         attempt: 0,
-        off: 4,
+        off: 1023,
         hash: crate::fsops::content_digest(b"ha"),
         data: b"ha".to_vec().into(),
     };
     let error = authority.authorize(&mut write, false).unwrap_err();
-    assert!(format!("{error:#}").contains("declared"), "{error:#}");
+    assert!(format!("{error:#}").contains("per-file"), "{error:#}");
     let results = finish_results(&authority, &mut reader);
     assert_eq!((results.totals.refused, results.totals.failed), (1, 0));
     // Once, as refused, and not again as unfinished.
@@ -4261,8 +4261,6 @@ fn signed_file_data_rate_is_enforced_across_requests() {
         data: vec![0; 256].into(),
     };
 
-    // Writes must land in a partial this grant declared.
-    assert!(authority.authorize(&mut request(0), false).is_err());
     let mut prepare = Request::Prepare {
         path: target.clone(),
         size: 1024,
@@ -4602,41 +4600,6 @@ fn directory_as_child_scope_does_not_authorize_unrelated_siblings() {
 }
 
 #[test]
-fn entry_ceiling_survives_resubmission_of_a_rejected_path() {
-    let temporary = crate::test_support::tempdir().unwrap();
-    let root = temporary.path().join("root");
-    fs::create_dir(&root).unwrap();
-    // The helper grant allows eight entries.
-    let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    let stat = |name: String| Request::StatMany {
-        paths: vec![root
-            .join("target")
-            .join(name)
-            .as_os_str()
-            .as_bytes()
-            .to_vec()],
-        sources: None,
-        follow: false,
-    };
-    for index in 0..8 {
-        authority
-            .authorize(&mut stat(format!("entry-{index}")), false)
-            .unwrap();
-    }
-    assert!(authority
-        .authorize(&mut stat("entry-8".into()), false)
-        .is_err());
-    // Resubmitting the rejected path must not slip through as counted.
-    assert!(authority
-        .authorize(&mut stat("entry-8".into()), false)
-        .is_err());
-    // Paths already inside the ceiling remain usable.
-    authority
-        .authorize(&mut stat("entry-0".into()), false)
-        .unwrap();
-}
-
-#[test]
 fn forbidden_deletion_keeps_the_unfiltered_scan_but_refuses_removals() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
@@ -4741,7 +4704,7 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
         condition: proto::TargetCondition::Any,
     };
     authority.authorize(&mut publish_empty, false).unwrap();
-    // A file never declared under this grant cannot be published.
+    // A file this receiver does not hold for the grant cannot be published.
     let mut publish_foreign = Request::Finalize {
         expected_hash: None,
         path: root.join("target/foreign").as_os_str().as_bytes().to_vec(),
@@ -4759,39 +4722,73 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
         scanned: crate::proto::ScannedDestination::Unknown,
         condition: proto::TargetCondition::Any,
     };
-    assert!(authority.authorize(&mut publish_foreign, false).is_err());
+    let settlement = authority.authorize(&mut publish_foreign, false).unwrap();
+    let response = authority.test_ops().handle(&publish_foreign);
+    authority.settle(settlement, &response);
+    assert!(
+        matches!(response, proto::Response::EndpointError(ref error)
+            if error.as_str().contains("is not open in this receiver")),
+        "{response:?}"
+    );
+    assert!(!root.join("target/foreign").exists());
 }
 
+/// The entry limit counts the changes a copy makes, each time it makes
+/// one, and nothing it only looks at: scans and lookups of the destination
+/// count nothing, and a refused request counts nothing either.
 #[test]
-fn scanned_entries_count_against_the_entry_ceiling() {
+fn changes_count_against_the_entry_ceiling_and_lookups_do_not() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
-    fs::create_dir(&root).unwrap();
+    fs::create_dir_all(root.join("target")).unwrap();
     // The helper grant allows eight entries.
     let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    let target = root.join("target").as_os_str().as_bytes().to_vec();
-    let mut scan = Request::Scan {
-        root: target.clone(),
-        source: None,
-        follow_root: false,
-        ignore: Vec::new(),
-        report_ignored: false,
+    let target = root.join("target");
+    let path = |name: &str| target.join(name).as_os_str().as_bytes().to_vec();
+    for _ in 0..20 {
+        let mut scan = Request::Scan {
+            root: target.as_os_str().as_bytes().to_vec(),
+            source: None,
+            follow_root: false,
+            ignore: Vec::new(),
+            report_ignored: false,
+        };
+        authority.authorize(&mut scan, false).unwrap();
+        let mut stat = Request::StatMany {
+            paths: (0..10)
+                .map(|index| path(&format!("look-{index}")))
+                .collect(),
+            sources: None,
+            follow: false,
+        };
+        authority.authorize(&mut stat, false).unwrap();
+    }
+    let mkdirs = |names: &[&str]| Request::Apply {
+        ops: names
+            .iter()
+            .map(|name| Op::Mkdir {
+                path: path(name),
+                mode: 0o755,
+                condition: proto::TargetCondition::Any,
+            })
+            .collect(),
     };
-    authority.authorize(&mut scan, false).unwrap();
-    let names: Vec<Vec<u8>> = (0..7)
-        .map(|index| format!("entry-{index}").into_bytes())
-        .collect();
-    let mut batch: Vec<&[u8]> = vec![b""];
-    batch.extend(names.iter().map(Vec::as_slice));
-    // Root plus seven descendants fills the ceiling exactly.
-    authority.record_scanned(&target, batch).unwrap();
-    assert!(authority
-        .record_scanned(&target, [b"entry-7".as_slice()])
-        .is_err());
-    // Already counted entries may be listed again.
     authority
-        .record_scanned(&target, [b"entry-0".as_slice()])
+        .authorize(&mut mkdirs(&["a", "b", "c", "d", "e", "f"]), false)
         .unwrap();
+    // A request that would go past the limit is refused whole, and counts
+    // nothing; the same directory made again counts again.
+    assert!(authority
+        .authorize(&mut mkdirs(&["g", "h", "i"]), false)
+        .is_err());
+    authority
+        .authorize(&mut mkdirs(&["a", "g"]), false)
+        .unwrap();
+    assert_eq!(
+        authority.changes.load(std::sync::atomic::Ordering::Relaxed),
+        8
+    );
+    assert!(authority.authorize(&mut mkdirs(&["h"]), false).is_err());
 }
 
 #[test]
@@ -5496,9 +5493,9 @@ fn signed_comparison_requests_enforce_scope_identity_and_bounds() {
         off,
         len,
     };
-    assert!(authority
-        .authorize(&mut reuse(target.clone(), id, 0, 4 << 20), false)
-        .is_err());
+    // Blocks reused past what the file declared, or into a file this
+    // receiver does not hold, are refused as it writes them
+    // (`fsops::stages`).
     assert!(authority
         .authorize(&mut stage(outside.clone(), 8 << 20), false)
         .is_err());
@@ -5514,8 +5511,6 @@ fn signed_comparison_requests_enforce_scope_identity_and_bounds() {
         hash(target.clone(), u64::MAX, 4 << 20),
         hash(target.clone(), 0, (64 << 20) + 1),
         reuse(outside, id, 0, 4 << 20),
-        reuse(target.clone(), [105; 16], 0, 4 << 20),
-        reuse(target.clone(), id, 8 << 20, 1),
         reuse(target.clone(), id, u64::MAX, 1),
         reuse(target.clone(), id, 0, 0),
     ] {
@@ -5635,7 +5630,12 @@ fn grouped_comparison_keeps_and_patches_files_within_the_grant() {
         let state = authority.state.lock().unwrap();
         // Only the new data crossed the transport; both publications are
         // held until the reply says which file was kept.
-        assert_eq!(state.transferred_bytes, 4);
+        assert_eq!(
+            authority
+                .transferred_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            4
+        );
         assert_eq!(state.reserved_bytes, 8);
     }
     let response = authority.test_ops().handle(&patch);
@@ -6059,7 +6059,12 @@ fn grouped_patches_charge_their_new_data_and_hold_their_published_size() {
     let settlement = authority.authorize(&mut within, false).unwrap();
     {
         let state = authority.state.lock().unwrap();
-        assert_eq!(state.transferred_bytes, 100);
+        assert_eq!(
+            authority
+                .transferred_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            100
+        );
         assert_eq!(state.reserved_bytes, len);
     }
     authority.settle(
@@ -6414,13 +6419,17 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
     );
     // A piece is charged as written data, within one rate-limit burst; a
     // refused piece fails its patch, which then publishes nothing.
-    let transferred = authority.state.lock().unwrap().transferred_bytes;
+    let transferred = authority
+        .transferred_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
     assert!(matches!(
         execute_on_connection(&mut gate, &mut ops, piece(&data[..block as usize])),
         Ok(proto::Response::Ok)
     ));
     assert_eq!(
-        authority.state.lock().unwrap().transferred_bytes,
+        authority
+            .transferred_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
         transferred + block
     );
     let oversized = vec![0; burst as usize + 1];

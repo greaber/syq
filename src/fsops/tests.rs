@@ -3370,7 +3370,7 @@ fn rooted_descriptor_cache_distinguishes_roots_with_the_same_relative_name() {
     };
     for (root, path) in [(&first_root, &first), (&second_root, &second)] {
         let file = File::options().write(true).open(path.join("same")).unwrap();
-        stages::hold(held(root), &relative, &file, None, false).unwrap();
+        stages::hold(held(root), &relative, &file, None, false, u64::MAX).unwrap();
     }
 
     let first_inode = operations
@@ -3942,7 +3942,7 @@ fn seed_basis_hashes_retry_bytes_without_rewriting_them() {
         .write(true)
         .open(&partial)
         .unwrap();
-    stages::hold(held, &relative, &file, None, true).unwrap();
+    stages::hold(held, &relative, &file, None, true, u64::MAX).unwrap();
     // Retried bytes are compared with source block hashes, independently
     // of the hash used to check transported payloads.
     ops.set_hash_policy(crate::hashing::HashPolicy {
@@ -4565,7 +4565,7 @@ fn one_connections_probe_does_not_decide_for_another() {
             copy_id: &copy_id,
             inplace: false,
         };
-        stages::hold(held, &relative, &file, None, true).unwrap();
+        stages::hold(held, &relative, &file, None, true, u64::MAX).unwrap();
         // Held open, its inode number cannot be given to a replacement.
         file
     };
@@ -8851,5 +8851,70 @@ fn a_stage_is_opened_without_exclusive_creation_only_on_a_trusted_filesystem() {
         prepare(&mut ops, &name);
         let used = fs::metadata(&stage).unwrap().ino() == planted;
         assert_eq!(used, directory_trusted);
+    }
+}
+
+/// What a copy writes is bounded by the size it declared for the file, on
+/// every receiver: a write that would go past it fails and writes nothing,
+/// staged or in place, and a write within it lands.
+#[test]
+fn writes_past_the_size_declared_for_a_file_are_refused() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let mut ops = FsOps::test_destination(dir.path());
+    for (name, inplace) in [("staged", false), ("in-place", true)] {
+        let path = dir.path().join(name).as_os_str().as_bytes().to_vec();
+        let prepared = ops.handle(&Request::Prepare {
+            path: path.clone(),
+            size: 4,
+            inplace,
+            copy_id: [5; 16],
+            mode: 0o644,
+            flags: 0,
+            acl: false,
+            scanned: ScannedDestination::Absent,
+            attempt: 0,
+            create_if_missing: true,
+            group: None,
+            update: None,
+        });
+        assert!(matches!(prepared, Response::Prepared(_)), "{prepared:?}");
+        let write = |off: u64, data: &[u8]| Request::WriteRange {
+            path: path.clone(),
+            inplace,
+            copy_id: [5; 16],
+            attempt: 0,
+            off,
+            hash: content_digest(data),
+            data: data.to_vec().into(),
+        };
+        let past = ops.handle(&write(2, b"long"));
+        assert!(
+            matches!(&past, Response::EndpointError(error)
+                if error.as_str().contains("extends past the size declared")),
+            "{name}: {past:?}"
+        );
+        assert!(matches!(ops.handle(&write(0, b"four")), Response::Ok));
+        let finalized = ops.handle(&Request::Finalize {
+            expected_hash: None,
+            path: path.clone(),
+            inplace,
+            copy_id: [5; 16],
+            meta: Meta {
+                inode_metadata: None,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags: 0,
+            scanned: ScannedDestination::Absent,
+            condition: TargetCondition::Any,
+        });
+        assert!(
+            !matches!(finalized, Response::Err(_) | Response::EndpointError(_)),
+            "{name}: {finalized:?}"
+        );
+        assert_eq!(fs::read(dir.path().join(name)).unwrap(), b"four", "{name}");
     }
 }

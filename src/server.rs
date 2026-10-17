@@ -1614,12 +1614,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         follow_root,
                         &mut batch,
                     )?;
-                    if let Some(authority) = &authority {
-                        authority.record_scanned(
-                            &requested_root,
-                            batch.iter().map(|entry| entry.path.as_slice()),
-                        )?;
-                    }
                     let mut w = wref.borrow_mut();
                     for m in warns.borrow_mut().drain(..) {
                         w.write_msg(&Response::ScanWarnAt(m))?;
@@ -1645,10 +1639,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
                                 .context("approved source scan omitted its reference")?,
                             paths.iter().map(Vec::as_slice),
                         )?;
-                    }
-                    if let Some(authority) = &authority {
-                        authority
-                            .record_scanned(&requested_root, paths.iter().map(Vec::as_slice))?;
                     }
                     Ok(wref.borrow_mut().write_msg(&Response::ScanIgnored(paths))?)
                 };

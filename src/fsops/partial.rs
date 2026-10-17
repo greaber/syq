@@ -181,6 +181,7 @@ impl FsOps {
         copy_id: &CopyId,
         mode: u32,
         group: Option<u32>,
+        declared: u64,
     ) -> Result<(File, fs::Metadata, Arc<()>, bool)> {
         let held_for = stages::of(self.stage_scope, target, copy_id, true);
         match self.create_inplace_file(
@@ -197,6 +198,7 @@ impl FsOps {
                     &file,
                     Some(created.clone()),
                     true,
+                    declared,
                 )?;
                 return Ok((file, created, in_use, false));
             }
@@ -220,7 +222,14 @@ impl FsOps {
             identity_of(&created),
             Sidecar::Partial,
         );
-        let in_use = stages::hold(held_for, &relative, &file, Some(created.clone()), true)?;
+        let in_use = stages::hold(
+            held_for,
+            &relative,
+            &file,
+            Some(created.clone()),
+            true,
+            declared,
+        )?;
         Ok((file, created, in_use, true))
     }
 
@@ -239,6 +248,7 @@ impl FsOps {
         copy_id: &CopyId,
         update: &InPlaceUpdate,
         compared: Option<&HeldBasis>,
+        declared: u64,
     ) -> Result<Option<(File, Arc<()>)>> {
         const DOING: &str = "update it in place";
         let (file, opened) = match target.root.open_regular_read_write_known(&target.relative) {
@@ -320,6 +330,7 @@ impl FsOps {
             &file,
             Some(opened),
             false,
+            declared,
         )?;
         Ok(Some((file, in_use)))
     }
@@ -548,11 +559,12 @@ impl FsOps {
                 }
                 self.set_copy_length(&held.file, size)
                     .with_context(|| format!("resize confined file {}", target.label.display()))?;
+                stages::declare(stages::of(self.stage_scope, &target, copy_id, true), size);
                 self.cache_entry(
                     target.location(),
                     attempt,
                     false,
-                    CachedFile::held(held.file, held.in_use),
+                    CachedFile::held(held.file, held.in_use, size),
                 );
                 return Ok(Preparation::default());
             }
@@ -560,7 +572,7 @@ impl FsOps {
             // where it is.
             if let Some(update) = update {
                 if let Some((file, in_use)) =
-                    self.open_inplace_update(&target, copy_id, update, compared.as_ref())?
+                    self.open_inplace_update(&target, copy_id, update, compared.as_ref(), size)?
                 {
                     self.set_copy_length(&file, size).with_context(|| {
                         format!("resize confined file {}", target.label.display())
@@ -569,7 +581,7 @@ impl FsOps {
                         target.location(),
                         attempt,
                         false,
-                        CachedFile::held(file, in_use),
+                        CachedFile::held(file, in_use, size),
                     );
                     return Ok(Preparation::default());
                 }
@@ -582,7 +594,7 @@ impl FsOps {
                 );
             }
             let (file, _, in_use, staged) =
-                self.create_inplace_output(&target, copy_id, mode, group)?;
+                self.create_inplace_output(&target, copy_id, mode, group, size)?;
             if staged {
                 self.preallocate_new_partial(&file, size)?;
             } else {
@@ -599,7 +611,7 @@ impl FsOps {
                 target.location(),
                 attempt,
                 false,
-                CachedFile::held(file, in_use),
+                CachedFile::held(file, in_use, size),
             );
             return Ok(Preparation::default());
         }
@@ -707,12 +719,18 @@ impl FsOps {
             &file,
             created.clone(),
             true,
+            size,
         )?;
         let location = FileLocation::Rooted {
             root: target.root.identity(),
             relative,
         };
-        self.cache_entry(location, attempt, true, CachedFile::held(file, in_use));
+        self.cache_entry(
+            location,
+            attempt,
+            true,
+            CachedFile::held(file, in_use, size),
+        );
         Ok(Preparation {
             partial_size: basis_size,
             has_candidates: false,
@@ -1174,8 +1192,14 @@ impl FsOps {
                 &output,
                 None,
                 true,
+                len,
             )?;
-            self.cache_entry(location, attempt, true, CachedFile::held(output, in_use));
+            self.cache_entry(
+                location,
+                attempt,
+                true,
+                CachedFile::held(output, in_use, len),
+            );
             return Ok((
                 SeededBasis {
                     hashes: Vec::new(),
@@ -1268,8 +1292,14 @@ impl FsOps {
             &output,
             None,
             true,
+            len,
         )?;
-        self.cache_entry(location, attempt, true, CachedFile::held(output, in_use));
+        self.cache_entry(
+            location,
+            attempt,
+            true,
+            CachedFile::held(output, in_use, len),
+        );
         Ok((
             SeededBasis {
                 hashes,
@@ -1328,12 +1358,15 @@ impl FsOps {
             creation.register_with(&target.root, &relative, Sidecar::Partial, || {
                 clone.metadata().map(|metadata| identity_of(&metadata))
             })?;
+            // Preparation resizes the clone and declares its size.
+            let cloned = clone.metadata()?.len();
             stages::hold(
                 stages::of(self.stage_scope, target, copy_id, false),
                 &relative,
                 &clone,
                 None,
                 true,
+                cloned,
             )?;
         }
         Ok(())
@@ -1534,7 +1567,9 @@ impl FsOps {
             // `--in-place=update` an existing one it can vouch for.
             let held = self.held_inplace(&target, copy_id)?;
             let updated = match (&held, update) {
-                (None, Some(update)) => self.open_inplace_update(&target, copy_id, update, None)?,
+                (None, Some(update)) => {
+                    self.open_inplace_update(&target, copy_id, update, None, size)?
+                }
                 _ => None,
             };
             let (file, fresh) = match (held, updated) {
@@ -1555,7 +1590,7 @@ impl FsOps {
                     // The coordinator sends the in-place creation mode
                     // (`inplace_creation_mode`).
                     let (file, _, _, staged) =
-                        self.create_inplace_output(&target, copy_id, mode, group)?;
+                        self.create_inplace_output(&target, copy_id, mode, group, size)?;
                     if staged {
                         let held =
                             stages::get(stages::of(self.stage_scope, &target, copy_id, true))?
@@ -1829,8 +1864,14 @@ impl FsOps {
                 &d,
                 None,
                 created_inplace,
+                size,
             )?;
-            self.cache_entry(target.location(), 0, false, CachedFile::held(d, in_use));
+            self.cache_entry(
+                target.location(),
+                0,
+                false,
+                CachedFile::held(d, in_use, size),
+            );
         } else {
             // Finalize takes the held duplicate. Collect errors on this
             // descriptor now: closing it flushes, as an NFS client does at
@@ -1841,6 +1882,7 @@ impl FsOps {
                 &d,
                 None,
                 true,
+                size,
             )?;
             close_writer(d, &target_label)?;
         }
@@ -1913,6 +1955,7 @@ impl FsOps {
                     &clone,
                     None,
                     true,
+                    size,
                 )?;
                 _copy.bytes(size);
                 #[cfg(debug_assertions)]
@@ -2702,6 +2745,16 @@ impl FsOps {
         let mut write = |relative: &RelativePath, label: &Path| {
             let held = stages::of(self.stage_scope, &rooted, &copy_id, inplace);
             let (file, _) = self.cached_held(label, held, relative, attempt)?;
+            // No write goes past the size declared for the file.
+            if file.declared().is_some_and(|declared| {
+                off.checked_add(data.len() as u64)
+                    .is_none_or(|end| end > declared)
+            }) {
+                return Ok(Err(anyhow!(
+                    "write {} @{off} extends past the size declared for it",
+                    label.display()
+                )));
+            }
             let writing = operation.span(crate::transfer_observations::Stage::DestinationWrite);
             #[cfg(debug_assertions)]
             record_test_event(
@@ -2860,6 +2913,7 @@ impl FsOps {
             held.opened.clone(),
             held.relative.clone(),
             held.created,
+            held.declared,
         );
         let result = self.finalize_held(
             target, held, in_place, meta, flags, scanned, condition, expected,
@@ -2868,7 +2922,7 @@ impl FsOps {
             // A stage that publication removed is let go. An in-place file
             // stays held whatever its name holds now: a retry then finds a
             // new file that moved away, and fails it.
-            let (file, opened, relative, created) = kept;
+            let (file, opened, relative, created, declared) = kept;
             let at_name = || -> Result<bool> {
                 let held = file.metadata()?;
                 Ok(target
@@ -2877,7 +2931,7 @@ impl FsOps {
                     .is_some_and(|named| (named.dev, named.ino) == (held.dev(), held.ino())))
             };
             if in_place || at_name().unwrap_or(false) {
-                stages::hold(held_for, &relative, &file, opened, created)?;
+                stages::hold(held_for, &relative, &file, opened, created, declared)?;
             }
         }
         result

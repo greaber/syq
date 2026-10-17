@@ -81,6 +81,8 @@ pub(crate) struct CachedFile {
     /// For a file the receiver holds for a copy, a share of its use count,
     /// which keeps it held while this descriptor is cached.
     _in_use: Option<std::sync::Arc<()>>,
+    /// For such a file, the size declared for it (`fsops::stages`).
+    declared: Option<u64>,
 }
 
 impl CachedFile {
@@ -90,16 +92,23 @@ impl CachedFile {
             #[cfg(any(target_os = "linux", test))]
             gate: OnceLock::new(),
             _in_use: None,
+            declared: None,
         }
     }
 
-    /// A descriptor of a file the receiver holds, with a share of its use
-    /// count.
-    pub(crate) fn held(file: File, in_use: std::sync::Arc<()>) -> Self {
+    /// A descriptor of a file the receiver holds, `declared` bytes long,
+    /// with a share of its use count.
+    pub(crate) fn held(file: File, in_use: std::sync::Arc<()>, declared: u64) -> Self {
         Self {
             _in_use: Some(in_use),
+            declared: Some(declared),
             ..Self::new(file)
         }
+    }
+
+    /// The size declared for a held file, which no write may go past.
+    pub(crate) fn declared(&self) -> Option<u64> {
+        self.declared
     }
 
     pub(crate) fn file(&self) -> &File {

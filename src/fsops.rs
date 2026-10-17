@@ -2981,8 +2981,10 @@ impl FsOps {
                     let victim = self.fd_order.remove(0);
                     self.fds.remove(&victim);
                 }
-                self.fds
-                    .insert(key(&got.relative), CachedFile::held(got.file, got.in_use));
+                self.fds.insert(
+                    key(&got.relative),
+                    CachedFile::held(got.file, got.in_use, got.declared),
+                );
                 self.fd_order.push(key(&got.relative));
             }
             found = got.relative;
