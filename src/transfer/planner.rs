@@ -4584,9 +4584,19 @@ impl Planner<'_> {
             results.extend(self.apply(tail)?);
             return Ok(results);
         }
-        match ok(self.dst.call(Request::Apply { ops })?, "apply")? {
-            Response::Applied(v) => Ok(v),
-            other => bail!("unexpected response {other:?}"),
+        let count = ops.len();
+        match self.dst.call(Request::Apply { ops })? {
+            // A restricted receiver refuses a request whole when it would
+            // break the grant, a limit say, and lists that refusal itself:
+            // its operations fail as one, and the copy goes on to end its
+            // results.
+            Response::Err(error) if self.opts.restricted_receiver => {
+                Ok(vec![Some(WireError::from(error)); count])
+            }
+            response => match ok(response, "apply")? {
+                Response::Applied(v) => Ok(v),
+                other => bail!("unexpected response {other:?}"),
+            },
         }
     }
 
