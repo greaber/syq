@@ -1,9 +1,9 @@
 //! A patch whose new data is too large to hold for a batch is streamed:
 //! `PatchBegin` opens its stage, each `PatchData` piece is written into it as
 //! it arrives, and `PatchEnd` publishes it or abandons it. The stage is
-//! seeded from the file it replaces under the same fingerprint check as a
-//! batch patch's, or takes that file's reused blocks as the pieces around
-//! them arrive. Either way it holds that file's bytes for as long as the
+//! seeded from the file it replaces under the same checks as a batch
+//! patch's, its reused blocks read back from it and hashed, or takes that
+//! file's reused blocks as the pieces around them arrive. Either way it holds that file's bytes for as long as the
 //! stream lasts, so it is always a new file, created exclusively, and stays
 //! private until publication. A stage that will not be published, whether
 //! the patch failed, was abandoned or its connection closed, is removed at
@@ -77,6 +77,9 @@ fn check_stream_layout(patch: &SmallPatch, data_len: u64) -> Result<()> {
     if !patch.data.is_empty() {
         bail!("a streamed patch carries its data in pieces");
     }
+    if patch.update_in_place {
+        bail!("a streamed patch is staged, not written in place");
+    }
     if patch.len > MAX_PATCH_FILE_BYTES {
         bail!("invalid patch of {} bytes", patch.len);
     }
@@ -125,6 +128,7 @@ impl FsOps {
                 error: wire_error(&error),
                 matched: false,
                 stale_condition: stream.stale,
+                written: false,
             });
         }
         stream.old = None;
@@ -170,6 +174,8 @@ impl FsOps {
         if let Err(error) = self.open_patch_stream(&mut stream) {
             self.fail_stream(&mut stream, error);
         }
+        // A clone held for the file that the stage did not take goes.
+        self.held_clones.discard(&patch.path, &patch.copy_id);
         let reply = stream.reply();
         self.patch_stream = Some(stream);
         reply
@@ -199,7 +205,21 @@ impl FsOps {
             stream.old = Some(old);
         }
         let reused = patch.len - stream.data_len;
+        // The clone the comparison hashed is the stage, whatever the patch
+        // reuses (`create_unregistered_stage`).
+        let held = self
+            .held_clones
+            .get(&patch.path, &patch.copy_id)
+            .map(|held| -> Result<PatchSource<'_>> {
+                Ok(PatchSource {
+                    old: held.file.try_clone()?,
+                    basis: fingerprint(&held.created),
+                    patch,
+                })
+            })
+            .transpose()?;
         let source = match (&stream.old, patch.basis) {
+            _ if held.is_some() => held,
             (Some(old), Some(basis))
                 if reused >= CLONE_MIN_REUSED
                     && reused * 2 >= patch.len
@@ -216,15 +236,21 @@ impl FsOps {
         };
         let stage = self.create_stream_stage(&stream.put, source.as_ref(), target)?;
         let stage = &*stream.stage.insert(stage);
-        // Like a clone, a copy is trusted only if the file it came from
-        // still has the fingerprint it had when its blocks were hashed.
-        let seeded = match &source {
-            Some(source) => {
-                (stage.cloned || self.copy_basis(source, stage))
-                    && fingerprint(&source.old.metadata()?) == source.basis
-            }
-            None => false,
-        };
+        // As for a batch patch's stage (`write_patch_stage`), a clone or
+        // copy is kept only when each reused block, read back from the
+        // stage, hashes as compared.
+        let seeded = stage.compared
+            || match &source {
+                Some(source) => {
+                    fingerprint(&source.old.metadata()?) == source.basis
+                        && if stage.cloned {
+                            self.stage_holds_reused(stage, patch)?
+                        } else {
+                            self.copy_basis_checked(source, stage)?
+                        }
+                }
+                None => false,
+            };
         if !seeded {
             stage.file.set_len(0)?;
             self.preallocate_stage(stage, patch.len)?;
@@ -423,6 +449,7 @@ impl FsOps {
                 Ok(identity) => Ok(SmallPatched {
                     kept: false,
                     identity,
+                    replaced: None,
                 }),
                 Err(error) => {
                     self.fail_stream(&mut stream, error);

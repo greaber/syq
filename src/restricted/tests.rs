@@ -481,6 +481,23 @@ pub(crate) fn time_preserving_test_authority_for(
     authority
 }
 
+/// A signed-grant authority over `root/target` that lets the copy update
+/// existing files in place (`--in-place=update`), preserving times, for up
+/// to `entries` paths, for other modules' tests.
+pub(crate) fn in_place_update_test_authority_for(root: &Path, entries: u64) -> RestrictedAuthority {
+    let mut authority = test_authority_with_policy(
+        root,
+        DeletionPolicy::Forbid,
+        64 << 20,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::InPlaceUpdate,
+    );
+    authority.copy.options.preserve_times = true;
+    authority.copy.limits.max_entries = entries;
+    authority
+}
+
 fn test_authority_with_rate(
     root: &Path,
     deletion: DeletionPolicy,
@@ -3355,6 +3372,7 @@ fn results_report_a_declined_metadata_change_as_the_replacement() {
     let mut hash = Request::HashExistingBatch {
         block,
         files: vec![existing_read(&small, 3)],
+        batch: 0,
     };
     let settlement = authority.authorize(&mut hash, false).unwrap();
     let response = crate::fsops::FsOps::new().handle(&hash);
@@ -3373,6 +3391,7 @@ fn results_report_a_declined_metadata_change_as_the_replacement() {
             error: declined(),
             matched: true,
             stale_condition: false,
+            written: false,
         })]),
     );
     let mut put = small_put(&small);
@@ -5666,6 +5685,7 @@ fn existing_read(path: &Path, len: u64) -> proto::ExistingRead {
         len,
         condition: proto::TargetCondition::Any,
         guard: None,
+        clone_for: None,
     }
 }
 
@@ -5690,6 +5710,7 @@ fn small_patch(
         unchanged_flags: 0,
         condition: proto::TargetCondition::Any,
         guard: None,
+        update_in_place: false,
     }
 }
 
@@ -5713,6 +5734,7 @@ fn grouped_comparison_keeps_and_patches_files_within_the_grant() {
     let mut hash = Request::HashExistingBatch {
         block,
         files: vec![existing_read(&same, 4), existing_read(&edited, 4)],
+        batch: 0,
     };
     let settlement = authority.authorize(&mut hash, false).unwrap();
     let Request::HashExistingBatch { files, .. } = &hash else {
@@ -5778,11 +5800,13 @@ fn grouped_comparison_keeps_and_patches_files_within_the_grant() {
         vec![
             Ok(proto::SmallPatched {
                 kept: true,
-                identity: None
+                identity: None,
+                replaced: None
             }),
             Ok(proto::SmallPatched {
                 kept: false,
-                identity: None
+                identity: None,
+                replaced: None
             }),
         ]
     );
@@ -5818,6 +5842,7 @@ fn compare_and_keep(
     let hash = Request::HashExistingBatch {
         block,
         files: paths.iter().map(|path| existing_read(path, 4)).collect(),
+        batch: 0,
     };
     let proto::Response::ExistingHashes(existing) = execute_authorized(authority, ops, hash) else {
         panic!("unexpected hash response")
@@ -5845,7 +5870,8 @@ fn compare_and_keep(
 fn a_linked_file_whose_times_change_is_replaced_name_by_name() {
     // A file with other names is never changed in place: each name whose
     // contents match gets a new file built from those contents, with the
-    // times the copy sets, and the old file keeps its own.
+    // times the copy sets, and the old file keeps its own. The receiver
+    // says why it replaced each.
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     let target = root.join("target");
@@ -5860,6 +5886,7 @@ fn a_linked_file_whose_times_change_is_replaced_name_by_name() {
         Ok(proto::SmallPatched {
             kept: false,
             identity: None,
+            replaced: Some(proto::ReplaceReason::OtherNames),
         })
     };
     let results = compare_and_keep(&authority, &mut ops, &[&a, &b]);
@@ -5882,6 +5909,7 @@ fn a_linked_file_whose_times_change_is_replaced_name_by_name() {
     let hash = Request::HashExistingBatch {
         block,
         files: vec![existing_read(&a, 4)],
+        batch: 0,
     };
     let proto::Response::ExistingHashes(mut existing) =
         execute_authorized(&authority, &mut ops, hash)
@@ -5945,6 +5973,7 @@ fn a_stale_patch_holds_no_bytes_and_leaves_its_record_to_the_retry() {
     let kept = Ok(proto::SmallPatched {
         kept: true,
         identity: None,
+        replaced: None,
     });
     // Both names are hashed, and the second is then replaced by another
     // file. A patch pinned to the file it hashed, as an exact destination
@@ -5953,6 +5982,7 @@ fn a_stale_patch_holds_no_bytes_and_leaves_its_record_to_the_retry() {
     let hash = Request::HashExistingBatch {
         block,
         files: vec![existing_read(&a, 4), existing_read(&b, 4)],
+        batch: 0,
     };
     let proto::Response::ExistingHashes(existing) = execute_authorized(&authority, &mut ops, hash)
     else {
@@ -6021,7 +6051,11 @@ fn grouped_comparison_refuses_what_the_grant_does_not_authorize() {
     fs::write(&file, b"data").unwrap();
     let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
     let block = authority.copy.limits.hash_block_bytes;
-    let hash = |files| Request::HashExistingBatch { block, files };
+    let hash = |files| Request::HashExistingBatch {
+        block,
+        files,
+        batch: 0,
+    };
     let patch = |patch| Request::PatchSmallBatch(vec![patch]);
     let reused = |path: &Path| small_patch(path, 4, block, vec![Some([0; 32])], b"");
 
@@ -6036,6 +6070,7 @@ fn grouped_comparison_refuses_what_the_grant_does_not_authorize() {
     let mut allowed = Request::HashExistingBatch {
         block: small,
         files: vec![existing_read(&file, 4)],
+        batch: 0,
     };
     authority.authorize(&mut allowed, false).unwrap();
     let mut allowed = patch(small_patch(&file, 4, small, vec![Some([0; 32])], b""));
@@ -6054,6 +6089,7 @@ fn grouped_comparison_refuses_what_the_grant_does_not_authorize() {
             Request::HashExistingBatch {
                 block: 4096,
                 files: vec![existing_read(&file, 4)],
+                batch: 0,
             },
             "comparison block size is outside protocol limits",
         ),
@@ -6098,6 +6134,7 @@ fn grouped_comparison_refuses_what_the_grant_does_not_authorize() {
     let mut excessive = Request::HashExistingBatch {
         block: proto::MIN_HASH_BLOCK_BYTES,
         files: vec![existing_read(&file, half), existing_read(&file, half)],
+        batch: 0,
     };
     assert_eq!(
         authority
@@ -6197,6 +6234,7 @@ fn grouped_patches_charge_their_new_data_and_hold_their_published_size() {
         &proto::Response::PatchedBatch(vec![Ok(proto::SmallPatched {
             kept: false,
             identity: None,
+            replaced: None,
         })]),
     );
     assert_eq!(authority.state.lock().unwrap().reserved_bytes, len);
@@ -6210,6 +6248,7 @@ fn grouped_patches_charge_their_new_data_and_hold_their_published_size() {
         &proto::Response::PatchedBatch(vec![Ok(proto::SmallPatched {
             kept: true,
             identity: None,
+            replaced: None,
         })]),
     );
     assert_eq!(authority.state.lock().unwrap().reserved_bytes, len);
@@ -6310,20 +6349,24 @@ fn grouped_patch_results_list_published_and_failed_files() {
             Ok(proto::SmallPatched {
                 kept: true,
                 identity: None,
+                replaced: None,
             }),
             Ok(proto::SmallPatched {
                 kept: false,
                 identity: None,
+                replaced: None,
             }),
             Err(proto::SmallPatchError {
                 error: "executor rejected it".into(),
                 matched: false,
                 stale_condition: false,
+                written: false,
             }),
             Err(proto::SmallPatchError {
                 error: "keeping it failed".into(),
                 matched: true,
                 stale_condition: false,
+                written: false,
             }),
         ]),
     );
@@ -6433,6 +6476,7 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
     let hash = Request::HashExistingBatch {
         block,
         files: paths.iter().map(|path| existing_read(path, len)).collect(),
+        batch: 0,
     };
     let proto::Response::ExistingHashes(existing) = execute_authorized(&authority, &mut ops, hash)
     else {
@@ -7456,6 +7500,407 @@ fn both_receivers_update_in_place_only_files_they_vouch_for() {
     }
 }
 
+/// Under `--in-place=update`, ordinary and command-restricted receivers
+/// settle each file of a patch batch alike: a file of their own is updated
+/// in place, with only its new block written; one with another name is
+/// replaced through a stage, and the reason returned; an unchanged one is
+/// kept; and one changed since its comparison, in a block the patch
+/// reuses, fails with nothing written. The rest of the batch is done
+/// either way, and the restricted receiver's results list each.
+#[test]
+fn both_receivers_settle_each_file_of_an_in_place_batch_alike() {
+    let block = proto::MIN_HASH_BLOCK_BYTES as usize;
+    let old: Vec<u8> = (0..3 * block).map(|index| (index % 251) as u8).collect();
+    let mut new = old.clone();
+    new[block + 5] ^= 1;
+    let names = ["mine", "linked", "unchanged", "changed"];
+    for restricted in [false, true] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        for name in names {
+            fs::write(target.join(name), &old).unwrap();
+            fs::set_permissions(target.join(name), fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        fs::hard_link(target.join("linked"), root.join("outside")).unwrap();
+        let inodes: Vec<u64> = names
+            .iter()
+            .map(|name| fs::metadata(target.join(name)).unwrap().ino())
+            .collect();
+        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let (secret, policy) = results_policy();
+        let mut receiver =
+            ParityReceiver::new(&root, restricted, true, PublicationPolicy::InPlaceUpdate);
+        let mut reader = None;
+        if restricted {
+            let mut authority = test_authority_with_results(
+                &root,
+                DeletionPolicy::Forbid,
+                4 << 20,
+                0,
+                FilterPolicy::default(),
+                PublicationPolicy::InPlaceUpdate,
+                ExistingDestinationPolicy::Replace,
+                DestinationPlacement::ExactPath,
+                RootExistence::Any,
+                Some((key, policy)),
+            )
+            .unwrap();
+            authority.copy.options.preserve_permissions = true;
+            authority.copy.options.preserve_times = true;
+            authority.copy.limits.max_entries = 1000;
+            reader = Some(start_results(&authority, secret));
+            receiver.authority = Some(authority);
+        }
+        let case = format!("restricted={restricted}");
+        let proto::Response::ExistingHashes(hashed) = receiver.send(Request::HashExistingBatch {
+            block: block as u64,
+            files: names
+                .iter()
+                .map(|name| existing_read(&target.join(name), new.len() as u64))
+                .collect(),
+            batch: 0,
+        }) else {
+            panic!("{case}: unexpected hash response");
+        };
+        // After its comparison, "changed" changes in a block the patch
+        // reuses, and grows, so that its fingerprint shows the change
+        // however coarse its change time.
+        let planted = [&old[..10], b"planted", &old[17..], b"!"].concat();
+        fs::write(target.join("changed"), &planted).unwrap();
+        let flags = proto::flags::MODE | proto::flags::TIMES;
+        let patches = names
+            .iter()
+            .zip(hashed)
+            .map(|(name, hashed)| {
+                let hashed = hashed.unwrap();
+                let (reuse, data) = if *name == "unchanged" {
+                    (hashed.hashes.iter().copied().map(Some).collect(), &[][..])
+                } else {
+                    (
+                        vec![Some(hashed.hashes[0]), None, Some(hashed.hashes[2])],
+                        &new[block..2 * block],
+                    )
+                };
+                let mut patch = small_patch(
+                    &target.join(name),
+                    new.len() as u64,
+                    block as u64,
+                    reuse,
+                    data,
+                );
+                patch.basis = hashed.fingerprint;
+                patch.meta.mtime = 1_600_000_000;
+                patch.flags = flags;
+                patch.unchanged_flags = flags;
+                patch.update_in_place = true;
+                patch
+            })
+            .collect();
+        let proto::Response::PatchedBatch(patched) =
+            receiver.send(Request::PatchSmallBatch(patches))
+        else {
+            panic!("{case}: unexpected patch response");
+        };
+        let settled = |replaced, kept| {
+            Ok(proto::SmallPatched {
+                kept,
+                identity: None,
+                replaced,
+            })
+        };
+        assert_eq!(
+            patched[..3],
+            [
+                settled(None, false),
+                settled(Some(proto::ReplaceReason::OtherNames), false),
+                settled(None, true),
+            ],
+            "{case}"
+        );
+        let Err(failed) = &patched[3] else {
+            panic!("{case}: {:?}", patched[3]);
+        };
+        assert!(
+            !failed.written && !failed.matched && !failed.stale_condition,
+            "{case}: {failed:?}"
+        );
+        for ((name, before), contents) in
+            names.iter().zip(&inodes).zip([&new, &new, &old, &planted])
+        {
+            let status = fs::metadata(target.join(name)).unwrap();
+            assert!(
+                fs::read(target.join(name)).unwrap() == *contents,
+                "{case}: {name}"
+            );
+            assert_eq!(status.ino() == *before, *name != "linked", "{case}: {name}");
+            if *name != "changed" {
+                assert_eq!(status.mtime(), 1_600_000_000, "{case}: {name}");
+            }
+        }
+        assert!(fs::read(root.join("outside")).unwrap() == old, "{case}");
+
+        if let (Some(authority), Some(reader)) = (&receiver.authority, reader.as_mut()) {
+            let results = finish_results(authority, reader);
+            for (name, disposition) in [
+                ("mine", "succeeded"),
+                ("linked", "succeeded"),
+                ("changed", "failed"),
+            ] {
+                assert!(
+                    results.has("transfer_file", name.as_bytes(), disposition),
+                    "{case}: {name}: {:?}",
+                    results.records
+                );
+            }
+            assert!(
+                !results
+                    .changes()
+                    .iter()
+                    .any(|(action, path, _)| action == "transfer_file" && path == b"unchanged"),
+                "{case}: {:?}",
+                results.records
+            );
+        }
+    }
+}
+
+/// Whether the filesystem holding `directory` clones files, probed apart
+/// from the code under test.
+fn clones_in(directory: &Path) -> bool {
+    let probe = directory.join("clone-probe");
+    fs::write(&probe, [1; 1 << 16]).unwrap();
+    let source = File::open(&probe).unwrap();
+    #[cfg(target_os = "linux")]
+    let cloned = crate::local_copy::try_clone(
+        &source,
+        &File::create(directory.join("clone-probe-copy")).unwrap(),
+        1 << 16,
+    );
+    #[cfg(target_os = "macos")]
+    let cloned = unsafe {
+        libc::fclonefileat(
+            std::os::fd::AsRawFd::as_raw_fd(&source),
+            std::os::fd::AsRawFd::as_raw_fd(&File::open(directory).unwrap()),
+            c"clone-probe-copy".as_ptr(),
+            0,
+        )
+    } == 0;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let cloned = false;
+    let _ = fs::remove_file(directory.join("clone-probe-copy"));
+    fs::remove_file(probe).unwrap();
+    cloned
+}
+
+/// The sidecars in `directory`.
+fn sidecars_in(directory: &Path) -> usize {
+    fs::read_dir(directory)
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".syq-tmp.")
+        })
+        .count()
+}
+
+/// Both receivers clone a file the copy may replace from its blocks before
+/// hashing it, where the filesystem can clone, and build its patch on the
+/// clone: a write to a block the patch reuses, made after the comparison,
+/// does not reach the published file. Where the filesystem cannot clone,
+/// the stage's copy is checked instead, and that patch fails, for the file
+/// to be copied again. The clone of a kept file goes with its patch, and
+/// that of a file no patch comes for when the next batch begins or the
+/// connection ends.
+#[test]
+fn both_receivers_build_patches_on_the_clones_they_compared() {
+    use std::os::unix::fs::FileExt as _;
+    let block = proto::MIN_HASH_BLOCK_BYTES as usize;
+    let old: Vec<u8> = (0..32 * block)
+        .map(|index| (index % 253) as u8 | 1)
+        .collect();
+    let mut new = old.clone();
+    new[20 * block] ^= 0xff;
+    let copy_id = [7; 16];
+    for restricted in [false, true] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let clones = clones_in(&target);
+        for (name, contents) in [("changed", &old), ("kept", &new), ("unpatched", &old)] {
+            fs::write(target.join(name), contents).unwrap();
+        }
+        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let (secret, policy) = results_policy();
+        let mut receiver =
+            ParityReceiver::new(&root, restricted, true, PublicationPolicy::AtomicStaged);
+        let mut reader = None;
+        if restricted {
+            let mut authority = test_authority_with_results(
+                &root,
+                DeletionPolicy::Forbid,
+                64 << 20,
+                0,
+                FilterPolicy::default(),
+                PublicationPolicy::AtomicStaged,
+                ExistingDestinationPolicy::Replace,
+                DestinationPlacement::ExactPath,
+                RootExistence::Any,
+                Some((key, policy)),
+            )
+            .unwrap();
+            authority.copy.options.preserve_times = true;
+            authority.copy.limits.max_entries = 1000;
+            reader = Some(start_results(&authority, secret));
+            receiver.authority = Some(authority);
+        }
+        let case = format!("restricted={restricted} clones={clones}");
+        let hash = |names: &[&str], batch| Request::HashExistingBatch {
+            block: block as u64,
+            files: names
+                .iter()
+                .map(|name| proto::ExistingRead {
+                    clone_for: Some(copy_id),
+                    ..existing_read(&target.join(name), new.len() as u64)
+                })
+                .collect(),
+            batch,
+        };
+        let proto::Response::ExistingHashes(hashed) =
+            receiver.send(hash(&["changed", "kept", "unpatched"], 1))
+        else {
+            panic!("{case}: unexpected hash response");
+        };
+        assert_eq!(sidecars_in(&target), if clones { 3 } else { 0 }, "{case}");
+        // A block the patch reuses changes after the comparison.
+        File::options()
+            .write(true)
+            .open(target.join("changed"))
+            .unwrap()
+            .write_all_at(b"planted", 3 * block as u64 + 1)
+            .unwrap();
+        let planted = fs::read(target.join("changed")).unwrap();
+        let mut hashed = hashed.into_iter().map(Result::unwrap);
+        let (changed, kept) = (hashed.next().unwrap(), hashed.next().unwrap());
+        let patch = |name: &str, hashed: &proto::ExistingHashes, data: &[u8], reuse| {
+            let mut patch = small_patch(
+                &target.join(name),
+                new.len() as u64,
+                block as u64,
+                reuse,
+                data,
+            );
+            patch.copy_id = copy_id;
+            patch.basis = hashed.fingerprint;
+            patch.meta.mtime = 1_600_000_000;
+            patch.flags = proto::flags::TIMES;
+            patch.unchanged_flags = patch.flags;
+            patch
+        };
+        let mut reuse: Vec<_> = changed.hashes.iter().copied().map(Some).collect();
+        reuse[20] = None;
+        let patches = vec![
+            patch("changed", &changed, &new[20 * block..21 * block], reuse),
+            patch(
+                "kept",
+                &kept,
+                b"",
+                kept.hashes.iter().copied().map(Some).collect(),
+            ),
+        ];
+        let proto::Response::PatchedBatch(patched) =
+            receiver.send(Request::PatchSmallBatch(patches))
+        else {
+            panic!("{case}: unexpected patch response");
+        };
+        if clones {
+            assert!(patched[0].is_ok(), "{case}: {:?}", patched[0]);
+            assert!(fs::read(target.join("changed")).unwrap() == new, "{case}");
+        } else {
+            assert!(patched[0].is_err(), "{case}: {:?}", patched[0]);
+            assert!(
+                fs::read(target.join("changed")).unwrap() == planted,
+                "{case}"
+            );
+        }
+        assert!(
+            matches!(patched[1], Ok(proto::SmallPatched { kept: true, .. })),
+            "{case}: {:?}",
+            patched[1]
+        );
+        // The unpatched file's clone waits for its patch, until the next
+        // batch begins.
+        assert_eq!(sidecars_in(&target), usize::from(clones), "{case}");
+        receiver.send(hash(&[], 2));
+        assert_eq!(sidecars_in(&target), 0, "{case}");
+        receiver.send(hash(&["unpatched"], 3));
+        assert_eq!(sidecars_in(&target), usize::from(clones), "{case}");
+        if let (Some(authority), Some(reader)) = (&receiver.authority, reader.as_mut()) {
+            let results = finish_results(authority, reader);
+            let disposition = if clones { "succeeded" } else { "failed" };
+            assert!(
+                results.has("transfer_file", b"changed", disposition),
+                "{case}: {:?}",
+                results.records
+            );
+        }
+        drop(receiver);
+        assert_eq!(
+            sidecars_in(&target),
+            0,
+            "{case}: a clone outlived its connection"
+        );
+    }
+}
+
+/// A receiver clones a file before comparing it only where it may stage
+/// one: a restricted receiver whose grant keeps existing files drops the
+/// request, and the file is compared as it is.
+#[test]
+fn a_clone_before_comparing_needs_what_a_stage_needs() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("existing"), vec![1; 2 << 20]).unwrap();
+    for (existing, cloned) in [
+        (ExistingDestinationPolicy::Replace, true),
+        (ExistingDestinationPolicy::Skip, false),
+    ] {
+        let authority = test_authority_with_existence(
+            &root,
+            DeletionPolicy::Forbid,
+            64 << 20,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            existing,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+        )
+        .unwrap();
+        let mut request = Request::HashExistingBatch {
+            block: proto::MIN_HASH_BLOCK_BYTES,
+            files: vec![proto::ExistingRead {
+                clone_for: Some([7; 16]),
+                ..existing_read(&target.join("existing"), 2 << 20)
+            }],
+            batch: 1,
+        };
+        authority.authorize(&mut request, false).unwrap();
+        let Request::HashExistingBatch { files, .. } = &request else {
+            unreachable!()
+        };
+        assert_eq!(files[0].clone_for.is_some(), cloned, "{existing:?}");
+    }
+}
+
 /// Only a grant for `--in-place=update` lets a receiver update an existing
 /// file in place, and only with metadata the grant allows.
 #[test]
@@ -7511,6 +7956,39 @@ fn in_place_updates_need_a_grant_for_them() {
                 .unwrap_err();
             assert!(error.to_string().contains("ownership"), "{error:#}");
         }
+        // So too for a batch's patch, and never for a streamed one.
+        let mut patch = small_patch(
+            &target.join("existing"),
+            3,
+            proto::MIN_HASH_BLOCK_BYTES,
+            vec![None],
+            b"new",
+        );
+        patch.flags = proto::flags::RECEIVER_MODE;
+        patch.unchanged_flags = patch.flags;
+        patch.update_in_place = true;
+        let result = authority.authorize(&mut Request::PatchSmallBatch(vec![patch.clone()]), false);
+        assert_eq!(result.is_ok(), allowed, "{publication:?}");
+        if let Err(error) = result {
+            assert!(
+                error.to_string().contains("signed publication policy"),
+                "{publication:?}: {error:#}"
+            );
+        }
+        patch.data.clear();
+        let error = authority
+            .authorize(
+                &mut Request::PatchBegin {
+                    patch: Box::new(patch),
+                    data_len: 3,
+                },
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("not written in place"),
+            "{publication:?}: {error:#}"
+        );
     }
 }
 

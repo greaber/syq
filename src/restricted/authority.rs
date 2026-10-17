@@ -1449,6 +1449,22 @@ impl RestrictedAuthority {
         Ok(())
     }
 
+    /// Whether the receiver may clone `file` into a private stage before
+    /// hashing it (`ExistingRead::clone_for`): the stage passes the rules
+    /// any stage does, of its path and of the existing-object policy for
+    /// replacing the file, and of the file's size as the copy declares it.
+    /// The clone adds no data until its patch writes over it; that patch
+    /// reserves the file's bytes as any patch does, and a clone no patch
+    /// builds on is removed.
+    fn authorize_clone_first(&self, file: &proto::ExistingRead) -> Result<()> {
+        self.require_publication_mode(false, "staged clone")?;
+        if file.len > self.copy.limits.max_file_bytes {
+            bail!("signed grant per-file byte limit exceeded");
+        }
+        self.check_mutation_path(&file.path, false)?;
+        self.constrain_prepare(&file.path)
+    }
+
     /// Refuse staging work whose eventual publication the existing-object
     /// policy would reject, so the transfer fails before moving bytes.
     pub(super) fn constrain_prepare(&self, path: &[u8]) -> Result<()> {
@@ -1733,6 +1749,21 @@ impl RestrictedAuthority {
                 bail!("kept and published metadata flags differ beyond times");
             }
             self.check_flags(patch.unchanged_flags)?;
+            // A patch that updates its file in place passes the rules of an
+            // in-place preparation too (`Request::Prepare` with `update`):
+            // under a grant for it, and with metadata the grant allows,
+            // which the receiver checks again as it finishes the file.
+            if patch.update_in_place {
+                if !self
+                    .copy
+                    .policy
+                    .publication
+                    .updates_existing_files_in_place()
+                {
+                    bail!("small-file patch does not match the signed publication policy");
+                }
+                self.constrain_inplace(&patch.path)?;
+            }
             self.charge_bytes(&patch.path, 0, patch.data.len())?;
             self.constrain_creation(&patch.path, &mut patch.condition, false, index, pending)?;
             self.constrain_update(&patch.path, Some(&mut patch.condition), pending)?;
@@ -2500,8 +2531,10 @@ impl RestrictedAuthority {
                 *guard = Some(self.guard.clone());
             }
             // Each file is observed as HashAndHold observes one, and the
-            // hashes of the whole batch share one response.
-            Request::HashExistingBatch { block, files } => {
+            // hashes of the whole batch share one response. A file to clone
+            // first gets a private stage, which must pass the rules a stage
+            // does; one that does not is compared as it is.
+            Request::HashExistingBatch { block, files, .. } => {
                 for file in files.iter() {
                     self.check_comparison_request(*block, file.len)?;
                 }
@@ -2510,6 +2543,9 @@ impl RestrictedAuthority {
                 }
                 for file in files.iter_mut() {
                     self.check_observation_path(&file.path)?;
+                    if file.clone_for.is_some() && self.authorize_clone_first(file).is_err() {
+                        file.clone_for = None;
+                    }
                     file.guard = Some(self.guard.clone());
                 }
             }
@@ -2767,6 +2803,9 @@ impl RestrictedAuthority {
                 if !patch.data.is_empty() {
                     bail!("a streamed patch carries its data in pieces");
                 }
+                if patch.update_in_place {
+                    bail!("a streamed patch is staged, not written in place");
+                }
                 self.check_comparison_request(patch.block, patch.len)?;
                 let blocks = patch.len.div_ceil(patch.block);
                 if patch.reuse.len() as u64 != blocks {
@@ -2964,6 +3003,7 @@ impl PatchStreamGate {
                     error: error.to_string().into(),
                     matched: false,
                     stale_condition: false,
+                    written: false,
                 })]),
             );
         }

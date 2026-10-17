@@ -357,6 +357,9 @@ impl Worker {
     /// destination keeps a file that already matches and is sent only the
     /// blocks it lacks. Under a bandwidth limit this costs only hashes for
     /// unchanged files, and elsewhere it saves sending and rewriting them.
+    /// An existing file `--in-place=update` writes in place goes in the same
+    /// groups, where the receiver writes only the blocks that differ, so
+    /// that it costs no round trips of its own.
     pub(super) fn compare_candidate(&self, idx: usize) -> bool {
         // Tests of the per-file comparison path select it with this.
         #[cfg(debug_assertions)]
@@ -370,14 +373,20 @@ impl Worker {
             && j.attempt == 0
             && !self.opts.has_expected_for(j)
             && !self.opts.tuning.force_ranges()
-            && j.entry.size <= self.compare_group_limits().0
-            // In place, only the blocks that differ are written; that is the
-            // per-file path.
-            && !j.inplace
+            && j.entry.size
+                <= if j.inplace {
+                    self.in_place_group_limit()
+                } else {
+                    self.compare_group_limits().0
+                }
             && j.target_condition == TargetCondition::Any
             && !self.inspects_destination(j)
             && jobs.destination(idx).is_some_and(|existing| {
-                self.compares_first(j, existing) && !self.probes_per_file(j, existing)
+                // An in-place file is written whether or not it is worth
+                // comparing first. On the same host without block reuse,
+                // the per-file path copies it in the kernel.
+                (j.inplace || self.compares_first(j, existing))
+                    && !self.probes_per_file(j, existing)
             })
     }
 
@@ -1491,7 +1500,7 @@ impl Worker {
     /// Have the file at `idx` replaced, as the receiver asked for `reason`:
     /// under `--in-place=update`, written to a stage instead of in place,
     /// and counted (`note_replaced`).
-    fn refuse_in_place(&self, idx: usize, reason: crate::proto::ReplaceReason) {
+    pub(super) fn refuse_in_place(&self, idx: usize, reason: crate::proto::ReplaceReason) {
         let mut jobs = self.sched.jobs.lock().unwrap();
         let job = &mut jobs[idx];
         job.replace = true;

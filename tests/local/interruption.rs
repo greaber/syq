@@ -292,6 +292,111 @@ fn an_interrupted_push_removes_the_remote_staged_small_files() {
     }
 }
 
+/// Interrupt a copy while its receiver holds the clones of files it has
+/// just compared, before their patches arrive. A receiver that can clone
+/// clones each file it may replace from its blocks first, and holds the
+/// clone for the file's patch: the clones go with the rest of its stages.
+#[cfg(debug_assertions)]
+fn interrupt_held_clones(route: &str, signal: i32) {
+    let case = format!("{route} signal {signal}");
+    let t = Tmp::new();
+    let mut olds = Vec::new();
+    for index in 0..3 {
+        let source = prng(2 << 20, 40 + index);
+        let mut old = source.clone();
+        old[1 << 20] ^= 1;
+        write(&t.path(&format!("src/many/f{index}")), &source);
+        write(&t.path(&format!("dst/many/f{index}")), &old);
+        set_mtime(&t.path(&format!("dst/many/f{index}")), 1);
+        olds.push(old);
+    }
+    write(
+        &t.path(&format!("dst/many/{FOREIGN}")),
+        b"another run's data",
+    );
+    let copy = |t: &Tmp| {
+        let mut command = match route {
+            "local" => local_copy(t, "workers=1"),
+            _ => remote_copy(t, route, "workers=1"),
+        };
+        command.args(["--transfer-strategy", "aligned-block"]);
+        command
+    };
+    let (ready, continuation, events) = (t.path("hashed"), t.path("continue"), t.path("clones"));
+    let mut command = copy(&t);
+    command
+        .env("SYQ_TEST_SMALL_HASHED_READY_FILE", &ready)
+        .env("SYQ_TEST_SMALL_HASHED_CONTINUE_FILE", &continuation)
+        .env("SYQ_TEST_CLONE_FIRST", &events);
+    let mut child = start_job(&mut command);
+    wait_for_confinement_marker(&mut child, &ready, "compared files");
+    if fs::read_to_string(&events)
+        .unwrap_or_default()
+        .contains("cloned")
+    {
+        // The first group's clones.
+        assert!(
+            !own_sidecars(&t.path("dst")).is_empty(),
+            "{case}: no held clones"
+        );
+    } else {
+        eprintln!("note: {case}: this filesystem did not clone");
+    }
+    let pushed = route.starts_with("push");
+    if pushed {
+        signal_process(&child, signal);
+        // The connection holding the clones waits in the barrier; they go
+        // as soon as the copy's control connection closes.
+        wait_until("the remote clones to be removed", || {
+            own_sidecars(&t.path("dst")).is_empty()
+        });
+        release_confinement_barrier(&continuation);
+    } else {
+        signal_group(&child, signal);
+    }
+    let (status, stderr, _) = finish(child, Duration::from_secs(20));
+    assert_eq!(status.signal(), Some(signal), "{case}: {stderr}");
+    assert_eq!(
+        own_sidecars(&t.path("dst")),
+        Vec::<PathBuf>::new(),
+        "{case}: {stderr}"
+    );
+    for (index, old) in olds.iter().enumerate() {
+        assert!(
+            read(&t.path(&format!("dst/many/f{index}"))) == *old,
+            "{case}"
+        );
+    }
+    let out = copy(&t).run().unwrap();
+    assert_output_ok(&out);
+    for index in 0..3 {
+        let name = format!("many/f{index}");
+        assert!(
+            read(&t.path(&format!("dst/{name}"))) == read(&t.path(&format!("src/{name}"))),
+            "{case}"
+        );
+    }
+    assert_eq!(
+        own_sidecars(&t.path("dst")),
+        Vec::<PathBuf>::new(),
+        "{case}"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn an_interrupted_copy_removes_the_clones_it_compared() {
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        interrupt_held_clones("local", signal);
+    }
+    // A killed coordinator drops the remote receiver's connection.
+    for signal in [libc::SIGINT, libc::SIGKILL] {
+        for route in ["push", "push-ssh"] {
+            interrupt_held_clones(route, signal);
+        }
+    }
+}
+
 #[test]
 fn an_interrupted_copy_keeps_partials_worth_resuming() {
     // Copied one at a time, a file's partial is kept for a rerun to reuse

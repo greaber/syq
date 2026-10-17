@@ -821,6 +821,9 @@ pub struct FsOps {
     /// The patch whose new data is arriving in pieces, between `PatchBegin`
     /// and `PatchEnd`.
     patch_stream: Option<Box<small_batch::PatchStream>>,
+    /// Stages cloned from existing files before they were compared, held
+    /// for their patches (`ExistingRead::clone_for`).
+    held_clones: small_batch::HeldClones,
     inode_preservation: crate::inode_metadata::Selection,
     sparse: bool,
     descriptor_copy: crate::descriptor_copy::Session,
@@ -1154,6 +1157,7 @@ impl FsOps {
             inherited_acls: Default::default(),
             prepared_small_copy: None,
             patch_stream: None,
+            held_clones: Default::default(),
             operator_selection: None,
             destination_path_access: Default::default(),
             descriptor_session,

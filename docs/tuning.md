@@ -224,13 +224,25 @@ any of its contents are sent, together with other files. (The default
 strategy compares only files whose destination has the same size.) The receiving side
 hashes the file it would replace in 64 KiB blocks, the sending side reads the
 source and sends only the blocks that differ, and the receiving side
-builds the new file from those and its own matching blocks, which must be
-unchanged since they were hashed. A file whose contents already match is kept, and only
+builds the new file from those and its own matching blocks. Where the
+filesystem can clone files (Btrfs and APFS, and XFS and ZFS where enabled),
+the receiving side first clones a file of 1 MiB or more and hashes the clone,
+then builds the new file on that clone, so the blocks it keeps are the ones it
+compared, even if the file changes meanwhile. A file compared only because of
+`--hash`, whose size and modification time already match, is hashed without a
+clone, as it is probably unchanged. Elsewhere, and for such a file that
+differs after all, the receiving side checks each block it keeps again as it
+builds the file. A file whose contents already match is kept, and only
 its metadata is updated. Comparing a batch of files costs about one round trip,
 however many files it holds. A file of which more than 16 MiB differs sends
 its differing blocks after its batch, in pieces of about 4 MiB (or one
 comparison block, when that is larger) as they are read, and the receiving
-side writes each piece as it arrives.
+side writes each piece as it arrives. With
+[`--in-place=update`](reference.md#in-place-writes), an existing file of up to
+16 MiB that syq updates in place goes in these batches too, except in a
+same-machine copy without block reuse: the receiving side writes into the file
+where it is only the blocks that differ, or the whole file when the strategy
+does not compare it.
 
 Explicit `--hash` comparisons of files up to 64 MiB use the same batches;
 without block reuse, they only decide whether a file is unchanged, and a file

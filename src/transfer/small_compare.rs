@@ -34,10 +34,28 @@
 //! pieces count as they are acknowledged, and no longer count if the patch is
 //! not published. Once the copy is aborted, nothing further is sent for the
 //! groups in flight, as the per-file path publishes nothing after an abort.
+//!
+//! Under `--in-place=update`, an existing file the copy updates in place
+//! goes through the same groups, up to `IN_PLACE_MAX_FILE`, so that its
+//! patch is never streamed. Its patch asks the receiver to write the new
+//! blocks into the file where it can vouch for it, judged as it writes
+//! (`SmallPatch::update_in_place`). The receiver otherwise publishes the
+//! patch through a stage, as for any replaced file, and says why; the file
+//! is counted as replaced for that reason. A file whose write fails once the
+//! receiver began it fails, as on the per-file path. As there, only the
+//! blocks that differ are written with block reuse; `--hash` alone only
+//! decides whether the file is unchanged, and one that differs is copied
+//! whole on the per-file path; without either, the file is not compared,
+//! and its whole contents are sent in its group and written over it.
 
 use super::*;
 use crate::proto::PATCH_PIECE_BYTES;
 use crate::transfer_tuning::COMPARE_WINDOW;
+
+/// Each worker's batches of groups are numbered apart, so that a receiver
+/// can let go of the clones it holds for an earlier batch
+/// (`Request::HashExistingBatch::batch`).
+static NEXT_COMPARE_BATCH: AtomicU64 = AtomicU64::new(1);
 
 /// Most piece data a worker reads ahead of sending it while streaming a
 /// patch: as much as a group's patches hold.
@@ -57,6 +75,11 @@ const _: () = assert!(COMPARE_GROUP_BYTES <= crate::proto::MAX_READ_BYTES);
 /// Comparison block of the grouped path unless one is configured. A small
 /// edit then costs this much, not a whole default comparison block.
 const PATCH_BLOCK: u64 = crate::proto::MIN_HASH_BLOCK_BYTES;
+/// Files up to this size that `--in-place=update` updates in place are
+/// compared and patched in groups: no more of one differs than a patch of
+/// a batch carries, so it is never streamed. A larger one takes the
+/// per-file path.
+const IN_PLACE_MAX_FILE: u64 = crate::proto::MAX_DIFFERING_FILE_BYTES;
 
 /// What comparing one file decided.
 pub(super) enum Compared {
@@ -64,12 +87,15 @@ pub(super) enum Compared {
     /// the kept inode when the publication flags asked for it.
     Kept(Option<(u64, u64)>),
     /// Published from `sent` new bytes and `reused` bytes of the file it
-    /// replaced, the new bytes `streamed` in pieces.
+    /// replaced, the new bytes `streamed` in pieces, or, under
+    /// `--in-place=update`, written into that file. `replaced` says why the
+    /// receiver replaced the file rather than change it in place.
     Published {
         identity: Option<(u64, u64)>,
         sent: u64,
         reused: u64,
         streamed: bool,
+        replaced: Option<crate::proto::ReplaceReason>,
     },
     /// The source changed after it was planned, to this or nothing.
     SourceChanged(Option<Entry>),
@@ -84,6 +110,10 @@ pub(super) enum Compared {
     /// The destination already held the source's contents, but keeping it
     /// failed: a file error, as for a content-identical per-file finish.
     KeepFailed(WireError),
+    /// The receiver began updating the file in place, and that failed: a
+    /// file error, as when an in-place file's write fails on the per-file
+    /// path.
+    UpdateFailed(WireError),
     /// Kept or published, and completed when the reply that did so arrived.
     Completed,
 }
@@ -193,6 +223,48 @@ impl Worker {
         } else {
             self.opts.block.min(PATCH_BLOCK)
         }
+    }
+
+    /// Whether the grouped comparison hashes `job`'s destination: always for
+    /// a file it replaces, and for one `--in-place=update` writes in place
+    /// when the per-file path would compare it, with block reuse or with
+    /// `--hash` at the same size. Another such file is sent whole, in its
+    /// group, and written over.
+    fn hashes_destination(&self, job: &WorkerJob) -> bool {
+        let existing = job.dst_entry.as_deref();
+        !job.inplace
+            || self.reuses_blocks_for(job, existing)
+            || (self.opts.checksum
+                && existing.is_some_and(|existing| existing.size == job.entry.size))
+    }
+
+    /// Whether to ask the receiver to clone `job`'s destination before
+    /// hashing it (`ExistingRead::clone_for`): a file the copy replaces from
+    /// its reused blocks, large enough to clone. A file updated in place is
+    /// staged only if the receiver refuses it as it writes, and is checked
+    /// then (`stage_holds_reused`).
+    /// A file whose size and modification time already match its source's,
+    /// compared only because of `--hash`, is probably unchanged: it is
+    /// hashed where it is, and kept, without a clone that its filesystem
+    /// may have to read from disk where the file itself is cached. If it
+    /// differs after all, the blocks its patch reuses are checked as its
+    /// stage is built.
+    fn clones_first(&self, job: &WorkerJob) -> bool {
+        let existing = job.dst_entry.as_deref();
+        !job.inplace
+            && self.reuses_blocks_for(job, existing)
+            && existing.is_some_and(|existing| {
+                existing.size >= crate::proto::CLONE_FIRST_MIN_BYTES
+                    && !self
+                        .opts
+                        .metadata_matches(&job.rel_bytes, &job.entry, existing)
+            })
+    }
+
+    /// The largest file `--in-place=update` writes in place to compare in
+    /// groups.
+    pub(super) fn in_place_group_limit(&self) -> u64 {
+        self.compare_group_limits().0.min(IN_PLACE_MAX_FILE)
     }
 
     /// The largest file, and the most source bytes of one group, to compare
@@ -317,6 +389,7 @@ impl Worker {
             .reply_queue()
             .map_or(COMPARE_WINDOW, |queue| queue.min(COMPARE_WINDOW));
         let source_queue = self.src.reply_queue().unwrap_or(1);
+        let compare_batch = NEXT_COMPARE_BATCH.fetch_add(1, Relaxed);
         let mut groups: Vec<Group> = Vec::new();
         // Patches to stream once the groups are done.
         let mut streams = Vec::new();
@@ -349,15 +422,23 @@ impl Worker {
                             let job = &jobs[i];
                             ExistingRead {
                                 path: job.dst.clone(),
-                                len: job.entry.size,
+                                // A file updated in place without comparing
+                                // its blocks is only looked at.
+                                len: if self.hashes_destination(job) {
+                                    job.entry.size
+                                } else {
+                                    0
+                                },
                                 condition: job.target_condition,
                                 guard: job.container_guard.clone(),
+                                clone_for: self.clones_first(job).then(|| self.copy_id()),
                             }
                         })
                         .collect();
                     self.dst.send(Request::HashExistingBatch {
                         block: self.patch_block(),
                         files: existing,
+                        batch: compare_batch,
                     })?;
                     destination.push_back((groups.len(), Stage::Hash, std::time::Instant::now()));
                     groups.push(Group {
@@ -825,12 +906,14 @@ impl Worker {
                         Some(Ok(SmallPatched {
                             kept: false,
                             identity,
+                            replaced,
                         })),
                     ) if !states[index].failed => Compared::Published {
                         identity,
                         sent,
                         reused,
                         streamed: true,
+                        replaced,
                     },
                     (
                         None,
@@ -901,8 +984,10 @@ impl Worker {
                         _ => continue,
                     };
                     // Without block reuse (--hash alone), a comparison only
-                    // decides whether the file is unchanged.
-                    let compare_only = !self.reuses_blocks_for(job, job.dst_entry.as_deref());
+                    // decides whether the file is unchanged. A file updated
+                    // in place without comparing it is sent whole.
+                    let compare_only = !self.reuses_blocks_for(job, job.dst_entry.as_deref())
+                        && self.hashes_destination(job);
                     reads.push(DifferingRead {
                         path: job.src.clone(),
                         source: self.source_reference(job),
@@ -957,10 +1042,12 @@ impl Worker {
                         continue;
                     }
                     // The source sends none of a file of which more differs
-                    // than one patch carries: its patch is streamed.
+                    // than one patch carries: its patch is streamed. A file
+                    // updated in place is never that large.
                     let streamed = !compare_only && data.is_empty() && matching.contains(&false);
                     if matching.len() as u64 != job.entry.size.div_ceil(block)
                         || (compare_only && matching.iter().any(|same| !same))
+                        || (streamed && job.inplace)
                     {
                         continue;
                     }
@@ -1004,6 +1091,9 @@ impl Worker {
                         unchanged_flags: self.unchanged_flags(job),
                         condition: job.target_condition,
                         guard: job.container_guard.clone(),
+                        // An existing file the planner found it could
+                        // update in place (`Planner::enqueue_with`).
+                        update_in_place: job.inplace,
                     };
                     if streamed {
                         streams.push(Streamed {
@@ -1052,18 +1142,27 @@ impl Worker {
                 Ok(SmallPatched {
                     kept: true,
                     identity,
+                    ..
                 }) => Compared::Kept(identity),
-                Ok(SmallPatched { identity, .. }) => Compared::Published {
+                Ok(SmallPatched {
+                    identity, replaced, ..
+                }) => Compared::Published {
                     identity,
                     sent,
                     reused,
                     streamed: false,
+                    replaced,
                 },
                 Err(SmallPatchError {
                     error,
                     matched: true,
                     ..
                 }) => Compared::KeepFailed(error),
+                Err(SmallPatchError {
+                    error,
+                    written: true,
+                    ..
+                }) => Compared::UpdateFailed(error),
                 Err(SmallPatchError {
                     stale_condition: true,
                     ..
@@ -1074,6 +1173,15 @@ impl Worker {
     }
 
     fn complete_compared(&mut self, idx: usize, outcome: Compared) -> Result<()> {
+        // A file the receiver replaced rather than change in place is
+        // counted for why (`note_replaced`).
+        if let Compared::Published {
+            replaced: Some(reason),
+            ..
+        } = outcome
+        {
+            self.refuse_in_place(idx, reason);
+        }
         let job = self.job(idx);
         match outcome {
             Compared::Kept(identity) => {
@@ -1085,6 +1193,7 @@ impl Worker {
                 sent,
                 reused,
                 streamed,
+                ..
             } => {
                 self.benchmark.patched_files += 1;
                 self.benchmark.streamed_patches += u64::from(streamed);
@@ -1109,6 +1218,10 @@ impl Worker {
                 idx,
                 ChangeFailed::replying("finish content-identical destination", error),
             ),
+            // So too updating it in place.
+            Compared::UpdateFailed(error) => {
+                self.file_error(idx, ChangeFailed::replying("update in place", error))
+            }
             Compared::SourceChanged(_)
             | Compared::ResumePartial
             | Compared::Differs

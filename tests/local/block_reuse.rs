@@ -263,15 +263,15 @@ fn local_default_replaces_blocks_and_on_overrides_whole_file_copy() {
             let out = cmd.run().unwrap();
             assert_output_ok(&out);
             assert_eq!(read(&t.path("dst")), source);
-            // With block reuse, a file this size is patched in a group, or
-            // updated in place on the per-file path.
+            // With block reuse, a file this size is patched in a group, and
+            // with --inplace updated in place there.
             let observed = tuning_observed(&out);
-            let grouped = reuse == Some("aligned-block") && !inplace;
+            let grouped = reuse == Some("aligned-block");
             assert_eq!(observed["patched_files"], u64::from(grouped));
             assert_eq!(
                 observed["range_requests"],
                 match reuse {
-                    Some("aligned-block") => u64::from(inplace),
+                    Some("aligned-block") => 0,
                     _ => 2,
                 }
             );
@@ -965,8 +965,16 @@ fn a_patch_whose_payload_fails_its_check_is_copied_whole() {
     // With transfer integrity, the receiver checks the differing blocks a
     // patch carries against the payload hash the source sent. Here one
     // payload check fails, as for data corrupted in transit: the patch is
-    // refused and the file is copied whole instead.
-    for (remote, cloning) in [(false, true), (false, false), (true, true)] {
+    // refused and the file is copied whole instead. With --inplace, nothing
+    // of the patch is written into the file, which is then updated in place
+    // on the per-file path and keeps its inode.
+    for (remote, cloning, inplace) in [
+        (false, true, false),
+        (false, false, false),
+        (true, true, false),
+        (false, true, true),
+        (true, true, true),
+    ] {
         let t = Tmp::new();
         let source = prng(8 << 20, 874);
         let mut old = source.clone();
@@ -974,6 +982,7 @@ fn a_patch_whose_payload_fails_its_check_is_copied_whole() {
         write(&t.path("src/file"), &source);
         write(&t.path("dst/file"), &old);
         set_mtime(&t.path("dst/file"), 1);
+        let before = fs::metadata(t.path("dst/file")).unwrap().ino();
         let marker = t.path("corrupted-once");
         let (source_dir, destination_dir) = (t.s("src/"), t.s("dst/"));
         let remote_destination = format!("fake:{destination_dir}");
@@ -982,6 +991,9 @@ fn a_patch_whose_payload_fails_its_check_is_copied_whole() {
             "--no-whole-file",
             "--integrity-checking=transfer=blake3",
         ];
+        if inplace {
+            args.push("--inplace");
+        }
         let mut command = if remote {
             let rsh = fake_rsh(&t);
             args.extend([
@@ -1006,14 +1018,197 @@ fn a_patch_whose_payload_fails_its_check_is_copied_whole() {
         }
         let out = command.run().unwrap();
         assert_output_ok(&out);
-        let case = format!("remote={remote} cloning={cloning}");
+        let case = format!("remote={remote} cloning={cloning} inplace={inplace}");
         assert!(marker.exists(), "{case}: the payload check never ran");
         assert_eq!(read(&t.path("dst/file")), source, "{case}");
+        if inplace {
+            assert_eq!(
+                fs::metadata(t.path("dst/file")).unwrap().ino(),
+                before,
+                "{case}"
+            );
+        }
         let observed = tuning_observed(&out);
         assert_eq!(observed["compared_files"], 1, "{case}");
         assert_eq!(observed["patched_files"], 0, "{case}");
         assert!(partial_files(&t.path("dst")).is_empty(), "{case}");
     }
+}
+
+/// Whether the test filesystem clones files, probed apart from syq.
+#[cfg(debug_assertions)]
+fn filesystem_clones() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos_clone_support::available()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let directory = test_support::tempdir().unwrap();
+        write(&directory.path().join("source"), &[1; 1 << 16]);
+        let source = File::open(directory.path().join("source")).unwrap();
+        let copy = File::create(directory.path().join("copy")).unwrap();
+        let range = libc::file_clone_range {
+            src_fd: source.as_raw_fd().into(),
+            src_offset: 0,
+            src_length: 1 << 16,
+            dest_offset: 0,
+        };
+        unsafe { libc::ioctl(copy.as_raw_fd(), libc::FICLONERANGE, &range) == 0 }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_file_changed_unseen_after_its_comparison_gets_the_sources_bytes() {
+    // A file the copy replaces is cloned before it is compared, where the
+    // filesystem can clone, and its patch builds on that clone; elsewhere
+    // the stage's copy of it is read back and checked. Either way a write
+    // to a block the patch reuses, made after the comparison, leaving the
+    // file's length and, with coarse change times, its fingerprint as they
+    // were, does not reach the published file. A clone that is not needed
+    // goes; nothing is left behind.
+    use std::os::unix::fs::FileExt as _;
+    let clones = filesystem_clones();
+    for (route, cloning) in [
+        ("local", true),
+        ("local", false),
+        ("push", true),
+        ("push", false),
+    ] {
+        let case = format!("{route} cloning={cloning}");
+        let t = Tmp::new();
+        let source = prng(4 << 20, 960);
+        let mut old = source.clone();
+        old[(3 << 20) + 9] ^= 1;
+        write(&t.path("src/file"), &source);
+        write(&t.path("dst/file"), &old);
+        // An unchanged file is compared too, and kept.
+        let unchanged = prng(2 << 20, 961);
+        write(&t.path("src/same"), &unchanged);
+        write(&t.path("dst/same"), &unchanged);
+        for name in ["file", "same"] {
+            set_mtime(&t.path(&format!("dst/{name}")), 1);
+        }
+        let (ready, continuation, events) =
+            (t.path("hashed"), t.path("continue"), t.path("clones"));
+        let mut command = reusing_copy(&t, route, &[]);
+        command
+            .env("SYQ_TEST_SMALL_HASHED_READY_FILE", &ready)
+            .env("SYQ_TEST_SMALL_HASHED_CONTINUE_FILE", &continuation)
+            .env("SYQ_TEST_CLONE_FIRST", &events)
+            .env("SYQ_TEST_COARSE_CHANGE_TIMES", "1");
+        if !cloning {
+            command.env("SYQ_TEST_BASIS_CLONE_UNSUPPORTED", "1");
+        }
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+        wait_for_confinement_marker(&mut child, &ready, "the comparison");
+        OpenOptions::new()
+            .write(true)
+            .open(t.path("dst/file"))
+            .unwrap()
+            .write_all_at(b"planted", (1 << 20) + 5)
+            .unwrap();
+        release_confinement_barrier(&continuation);
+        let out = child.wait_with_output().unwrap();
+        assert_output_ok(&out);
+        assert!(
+            read(&t.path("dst/file")) == source,
+            "{case}: planted bytes published"
+        );
+        assert!(read(&t.path("dst/same")) == unchanged, "{case}");
+        let events = fs::read_to_string(&events).unwrap_or_default();
+        if cloning && clones {
+            // The changed file's patch built on its clone; the kept file's
+            // clone went.
+            let mut seen: Vec<&str> = events
+                .lines()
+                .map(|line| line.split(' ').next().unwrap())
+                .collect();
+            seen.sort();
+            assert_eq!(seen, ["cloned", "cloned", "discarded", "staged"], "{case}");
+        } else {
+            assert!(!events.contains("cloned"), "{case}: {events}");
+        }
+        assert!(partial_files(&t.path("dst")).is_empty(), "{case}");
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_file_copied_whole_after_its_comparison_failed_has_its_own_length() {
+    // A file cloned before its comparison, whose comparison then fails, is
+    // copied whole instead. That copy writes a stage from its start, so the
+    // clone, longer than the new file, must not be that stage: the new file
+    // has the source's length, and nothing is left behind.
+    let clones = filesystem_clones();
+    for route in ["local", "push"] {
+        let t = Tmp::new();
+        let old = prng(1_179_648, 970);
+        let source = prng(1_114_113, 971);
+        write(&t.path("src/file"), &source);
+        write(&t.path("dst/file"), &old);
+        set_mtime(&t.path("dst/file"), 1);
+        let events = t.path("clones");
+        let out = reusing_copy(&t, route, &[])
+            .env("SYQ_TEST_FAIL_DIFFERING_READ_NAME", "file")
+            .env("SYQ_TEST_CLONE_FIRST", &events)
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        let copied = read(&t.path("dst/file"));
+        assert_eq!(copied.len(), source.len(), "{route}");
+        assert!(copied == source, "{route}");
+        let events = fs::read_to_string(&events).unwrap_or_default();
+        if clones {
+            assert!(events.contains("cloned"), "{route}: {events}");
+            assert!(!events.contains("staged"), "{route}: {events}");
+        }
+        assert!(partial_files(&t.path("dst")).is_empty(), "{route}");
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_file_compared_only_because_of_hash_is_not_cloned() {
+    // With --hash, a file whose size and modification time match its
+    // source's is compared although it is probably unchanged: it is hashed
+    // where it is, without a clone. One that differs after all is patched
+    // from blocks checked as its stage is built.
+    let t = Tmp::new();
+    let same = prng(2 << 20, 980);
+    write(&t.path("src/same"), &same);
+    write(&t.path("dst/same"), &same);
+    let source = prng(2 << 20, 981);
+    let mut old = source.clone();
+    old[(1 << 20) + 3] ^= 1;
+    write(&t.path("src/edited"), &source);
+    write(&t.path("dst/edited"), &old);
+    for side in ["src", "dst"] {
+        for name in ["same", "edited"] {
+            set_mtime(&t.path(&format!("{side}/{name}")), 1_700_000_000);
+        }
+    }
+    let events = t.path("clones");
+    let out = reusing_copy(&t, "local", &["--checksum"])
+        .env("SYQ_TEST_CLONE_FIRST", &events)
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert!(read(&t.path("dst/same")) == same);
+    assert!(read(&t.path("dst/edited")) == source);
+    let events = fs::read_to_string(&events).unwrap_or_default();
+    assert!(!events.contains("cloned"), "{events}");
+    assert!(partial_files(&t.path("dst")).is_empty());
 }
 
 #[test]
