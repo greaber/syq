@@ -89,11 +89,15 @@ for testing source builds.
 Default limits are 100 million entries and 8 TiB of file data. Override them
 for one transfer with `--receiver-max-entries N` and
 `--receiver-max-bytes SIZE`. Values can raise or lower the defaults within the
-allowed ranges. The transfer must start within 24 hours of authorization and
-finish within seven days of authorization. New authorizations allow up to
-128 worker connections, including for named destinations; a smaller worker
-setting or resource limit lowers that allowance. Existing authorizations keep
-their original limits.
+allowed ranges. Entries count the changes the destination makes: each file it
+writes, each directory, link or special file it creates, each metadata change
+and each deletion. Looking at what is already there does not count, and
+neither does a change that fails. The transfer must start within 24 hours of
+authorization and finish within seven days of authorization. New
+authorizations allow up to 128 worker connections, including for named
+destinations; a smaller `--resource-limits workers` ceiling lowers that
+allowance, while a worker count fixed with `--performance-tuning` does not.
+Existing authorizations keep their original limits.
 
 | Option or combination | Restricted receiver |
 |---|---|

@@ -2118,6 +2118,7 @@ fn parse_descriptor_copy(
                 | "s3_profile"
                 | "s3_header"
                 | "s3_write_header"
+                | "s3_retries"
                 | "auth_from"
                 | "performance_tuning"
                 | "rsh"

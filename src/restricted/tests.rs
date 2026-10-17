@@ -4792,13 +4792,15 @@ fn changes_count_against_the_entry_ceiling_and_lookups_do_not() {
 }
 
 #[test]
-fn worker_authorizations_use_128_or_a_smaller_explicit_setting() {
+fn worker_authorizations_use_128_or_a_smaller_resource_limit() {
     let source = Location::parse("host-a:source").unwrap();
+    // A worker count fixed for a benchmark leaves the approval's ceiling
+    // alone.
     for (setting, expected) in [
         (None, 128),
         (Some("--resource-limits=workers=3"), 3),
         (Some("--resource-limits=workers=1000"), 128),
-        (Some("--performance-tuning=workers=32"), 32),
+        (Some("--performance-tuning=workers=32"), 128),
         (Some("--performance-tuning=workers=128"), 128),
     ] {
         let mut argv: Vec<_> = [

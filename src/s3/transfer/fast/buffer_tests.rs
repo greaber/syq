@@ -211,7 +211,7 @@ async fn fragmented_downloads_release_receive_buffers_and_preserve_bytes() {
         metadata: None,
         mtime: 0,
     };
-    let engine = planning_engine(&["--performance-tuning", "s3-retries=0"]);
+    let engine = planning_engine(&["--s3-retries", "0"]);
     let hash = engine
         .download_fast_range(
             &object,

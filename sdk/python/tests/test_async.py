@@ -300,17 +300,17 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         await self.client.cp("source", to="s3://bucket", into="prefix",
                        s3_endpoint="https://storage.example", s3_region="auto",
                        s3_profile="archive", auth_from="@laptop", s3_header=["X-Policy: a:b", "X-Other: yes"],
-                       s3_write_header=["x-amz-storage-class: STANDARD_IA"],
-                       performance_tuning="s3-parts-per-object=7,s3-part-size=64M,s3-retries=2",
+                       s3_retries=2, s3_write_header=["x-amz-storage-class: STANDARD_IA"],
+                       performance_tuning="s3-parts-per-object=7,s3-part-size=64M",
                        resource_limits="s3-requests=16,s3-objects=4")
         argv = self.argv()
         self.assertEqual(argv[argv.index("--auth-from") + 1], "@laptop")
         for expected in ["--s3-endpoint=https://storage.example", "--s3-region=auto",
                          "--s3-profile=archive", "--s3-header=X-Policy: a:b",
-                         "--s3-header=X-Other: yes",
+                         "--s3-header=X-Other: yes", "--s3-retries=2",
                          "--s3-write-header=x-amz-storage-class: STANDARD_IA", "--resource-limits",
                          "s3-requests=16,s3-objects=4", "--performance-tuning",
-                         "s3-parts-per-object=7,s3-part-size=64M,s3-retries=2"]:
+                         "s3-parts-per-object=7,s3-part-size=64M"]:
             self.assertIn(expected, argv)
         with self.assertRaises(syq.SyqInvocationError):
             await self.client.cp("source", to="s3://bucket", into="prefix", s3_header="X: value")
@@ -318,6 +318,26 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             await self.client.cp("source", to="s3://bucket", into="prefix", s3_write_header="X: value")
         with self.assertRaises(syq.SyqInvocationError):
             await self.client.cp("source", to="s3://bucket", into="prefix", performance_tuning=True)
+
+    async def test_s3_retries_are_validated_and_forwarded(self) -> None:
+        await self.client.cp("source", to="s3://bucket", into="prefix", s3_retries=0)
+        self.assertIn("--s3-retries=0", self.argv())
+        await self.client.rm("key", on="s3://bucket", s3_retries=100)
+        self.assertIn("--s3-retries=100", self.argv())
+        async with self.client.map("key", from_="s3://bucket", s3_retries=3) as stream:
+            [entry async for entry in stream]
+        self.assertEqual(self.argv()[0], "map")
+        self.assertIn("--s3-retries=3", self.argv())
+        for value in (101, -1, True, 2.0, "2"):
+            with self.subTest(value=value), self.assertRaisesRegex(syq.SyqInvocationError, "s3_retries"):
+                await self.client.cp("source", to="s3://bucket", into="prefix", s3_retries=value)
+            with self.subTest(value=value), self.assertRaisesRegex(syq.SyqInvocationError, "s3_retries"):
+                await self.client.rm("key", on="s3://bucket", s3_retries=value)
+            with self.subTest(value=value), self.assertRaisesRegex(syq.SyqInvocationError, "s3_retries"):
+                self.client.map("key", from_="s3://bucket", s3_retries=value)
+        for on in (None, "server"):
+            with self.subTest(on=on), self.assertRaisesRegex(syq.SyqInvocationError, "on='s3://BUCKET'"):
+                await self.client.rm("key", on=on, s3_retries=2)
 
     async def test_cp_selects_an_authorizer_and_rejects_conflicting_selectors(self) -> None:
         await self.client.cp("source", to="backup", auth_from="@laptop", into="out")

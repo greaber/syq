@@ -58,7 +58,7 @@ pub(crate) fn run(args: &[OsString]) -> Result<i32> {
         write_headers: vec![],
         concurrency: 1,
         part_size: 0,
-        retries: 10,
+        retries: command.storage.s3_retries.unwrap_or(super::DEFAULT_RETRIES),
         automatic_concurrency: false,
         automatic_part_size: false,
     };

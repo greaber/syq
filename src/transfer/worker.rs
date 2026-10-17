@@ -1346,6 +1346,9 @@ impl Worker {
                         if prepared.partial_size.is_some() {
                             return Ok((self.resume_ranges(idx, &job)?, true));
                         }
+                        if !self.whole_file_hashes(size) {
+                            return Ok((self.stage_large_file(idx, &job, true)?, true));
+                        }
                         return Ok((
                             self.reuse_blocks_from(&job, diff.source_hashes, &diff.ranges, true)?,
                             true,
@@ -1451,6 +1454,9 @@ impl Worker {
                 if diff.ranges.is_empty() && diff.held_len == Some(size) && !job.replace {
                     self.finish_matched_basis(idx, &job)?;
                     return Ok((vec![], false));
+                }
+                if !self.whole_file_hashes(size) {
+                    return Ok((self.stage_large_file(idx, &job, true)?, true));
                 }
                 return Ok((
                     {
@@ -1644,7 +1650,32 @@ impl Worker {
         self.bwlimit.is_some() && self.opts.src_remote
     }
 
+    /// The ranges of a file too large to seed from one response's hashes
+    /// (`whole_file_hashes`): it is staged and compared in windows, or,
+    /// from a bandwidth-limited remote source, which pays before it sends,
+    /// copied whole.
+    fn stage_large_file(
+        &mut self,
+        idx: usize,
+        job: &WorkerJob,
+        allow_final: bool,
+    ) -> Result<Vec<(u64, u64)>> {
+        if self.bandwidth_limited_remote_source() {
+            self.prepare_file(idx, job, true)?;
+        } else {
+            self.stage_comparison(idx, job, allow_final)?;
+        }
+        Ok(if job.entry.size == 0 {
+            vec![]
+        } else {
+            vec![(0, job.entry.size)]
+        })
+    }
+
     fn resume_ranges(&mut self, idx: usize, job: &WorkerJob) -> Result<Vec<(u64, u64)>> {
+        if !self.whole_file_hashes(job.entry.size) {
+            return self.stage_large_file(idx, job, false);
+        }
         if self.bandwidth_limited_remote_source() {
             // Conditional source reads may return data immediately. Compare
             // first so only differing bytes consume bandwidth, and the normal
@@ -1933,9 +1964,35 @@ impl Worker {
         }
     }
 
+    /// Whether one response carries all of a file's block hashes, as
+    /// seeding a basis from them needs (`reuse_blocks`). A larger file is
+    /// compared in windows and staged for reuse (`stage_comparison`).
+    pub(super) fn whole_file_hashes(&self, size: u64) -> bool {
+        size <= self.hash_window()
+    }
+
+    /// Most bytes whose block hashes one response carries
+    /// (`proto::hash_response_window`); debug builds can lower it to test
+    /// windowed comparison on small files.
+    fn hash_window(&self) -> u64 {
+        #[cfg(debug_assertions)]
+        if let Some(blocks) = std::env::var("SYQ_TEST_HASH_WINDOW_BLOCKS")
+            .ok()
+            .and_then(|blocks| blocks.parse::<u64>().ok())
+        {
+            return blocks.max(1) * self.opts.block;
+        }
+        crate::proto::hash_response_window(self.opts.block)
+    }
+
     /// Compare the source with one opened final-file inode retained by the
     /// receiver for either metadata-only completion or sidecar seeding.
+    /// A file whose hashes do not fit one response is compared in windows,
+    /// and its diff keeps no source hashes.
     pub(super) fn diff_final_and_hold(&mut self, job: &WorkerJob) -> Result<BlockDiff> {
+        if !self.whole_file_hashes(job.entry.size) {
+            return self.diff_final_windows(job);
+        }
         let diff = self.diff_with(
             job,
             Request::HashAndHold {
@@ -1951,6 +2008,69 @@ impl Worker {
             },
             "hash and retain destination basis",
         )?;
+        diff.held_len
+            .context("destination did not report its retained basis length")?;
+        Ok(diff)
+    }
+
+    /// `diff_final_and_hold` in windows of as many blocks as one response
+    /// carries; the receiver holds the file from the first window on.
+    fn diff_final_windows(&mut self, job: &WorkerJob) -> Result<BlockDiff> {
+        let block = self.opts.block;
+        let size = job.entry.size;
+        let window = self.hash_window();
+        let mut diff = BlockDiff {
+            ranges: Vec::new(),
+            held_len: None,
+            source_hashes: Vec::new(),
+            refused: None,
+        };
+        let mut off = 0;
+        while off < size {
+            let len = window.min(size - off);
+            // As in `diff_with`, the destination first, and both replies
+            // consumed before either is interpreted.
+            self.dst.send(Request::HashAndHold {
+                off,
+                path: job.dst.clone(),
+                copy_id: self.copy_id(),
+                block,
+                len,
+                condition: job.target_condition,
+                update: if off == 0 {
+                    self.in_place_update(job)
+                } else {
+                    None
+                },
+            })?;
+            self.src.send(Request::HashBlocks {
+                off,
+                path: job.src.clone(),
+                source: self.source_reference(job),
+                which: Which::Final,
+                copy_id: self.copy_id(),
+                block,
+                len,
+                attempt: job.attempt,
+            })?;
+            let source = self.src.recv();
+            let destination = self.dst.recv();
+            let source = Self::hashes(ok(source?, "hash source")?)?;
+            let (destination, held_len, refused) =
+                Self::destination_hashes(ok(destination?, "hash and retain destination basis")?)?;
+            if off == 0 {
+                diff.refused = refused;
+            }
+            diff.held_len = held_len;
+            for (start, end) in Self::different_ranges(&source, &destination, block, len) {
+                let (start, end) = (off + start, off + end);
+                match diff.ranges.last_mut() {
+                    Some(last) if last.1 == start => last.1 = end,
+                    _ => diff.ranges.push((start, end)),
+                }
+            }
+            off += len;
+        }
         diff.held_len
             .context("destination did not report its retained basis length")?;
         Ok(diff)

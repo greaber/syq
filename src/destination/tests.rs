@@ -308,10 +308,10 @@ pub(super) fn args(source: &Path, destination: &str) -> Args {
 /// Unless `options` choose otherwise, it uses two workers.
 pub(super) fn command(source: &Path, options: &[&str]) -> Vec<Vec<u8>> {
     let source = source.as_os_str().as_bytes().to_vec();
-    let workers: &[&str] = if options.contains(&"--performance-tuning") {
+    let workers: &[&str] = if options.contains(&"--resource-limits") {
         &[]
     } else {
-        &["--performance-tuning", "workers=2"]
+        &["--resource-limits", "workers=2"]
     };
     [b"cp".to_vec(), b"--src".to_vec(), source]
         .into_iter()
@@ -1519,7 +1519,7 @@ fn named_tcp_workers_obey_limits_and_revocation() {
         let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
         let (command, request, _) = requested(
             Path::new("source"),
-            &["--no-compress", "--performance-tuning", "workers=1"],
+            &["--no-compress", "--resource-limits", "workers=1"],
         );
         let approved = approve(&registration, command, request);
         let mut spec = crate::conn::RemoteSpec::local_receiver(true);
@@ -1645,7 +1645,7 @@ fn named_tcp_workers_connect_concurrently() {
     let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
     let (command, request, _) = requested(
         Path::new("source"),
-        &["--no-compress", "--performance-tuning", "workers=8"],
+        &["--no-compress", "--resource-limits", "workers=8"],
     );
     let approved = approve(&registration, command, request);
     let mut spec = crate::conn::RemoteSpec::local_receiver(true);
@@ -1695,7 +1695,7 @@ fn named_tcp_idle_and_partial_arrivals_do_not_block_worker() {
     let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
     let (command, request, _) = requested(
         Path::new("source"),
-        &["--no-compress", "--performance-tuning", "workers=1"],
+        &["--no-compress", "--resource-limits", "workers=1"],
     );
     let approved = approve(&registration, command, request);
     let mut spec = crate::conn::RemoteSpec::local_receiver(true);

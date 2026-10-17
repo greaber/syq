@@ -21,7 +21,9 @@ Argument = str | bytes
 
 def arguments(*, executable: str, writing: bool, path: PathArgument | None,
               endpoint: str | None, options: Mapping[str, object]) -> list[Argument]:
-    from .client import _append_path_option, _argument, _text_arg, _warn_unsupported_copy_options
+    from .client import (
+        _append_path_option, _argument, _s3_retries, _text_arg, _warn_unsupported_copy_options,
+    )
     argv: list[Argument] = [executable, "cp"]
     if writing:
         argv += ["--src-fd", "0"]
@@ -46,6 +48,12 @@ def arguments(*, executable: str, writing: bool, path: PathArgument | None,
         argv += ["--as-fd", "1"]
     for name, value in options.items():
         if name in {"as_new", "as_existing", "cwd", "root"}:
+            continue
+        if name == "s3_retries":
+            # Validate before the generic skip, which would drop False silently.
+            retries = _s3_retries(value)
+            if retries is not None:
+                argv.append(f"--s3-retries={retries}")
             continue
         if value is None or value is False:
             continue

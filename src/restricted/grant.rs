@@ -232,15 +232,15 @@ pub(super) fn grant_for(
                 max_total_bytes,
                 max_file_bytes,
                 hash_block_bytes: args.block_size,
-                max_connections: u16::try_from(if args.connections_opt.is_some() {
-                    args.connections
-                } else {
+                // A ceiling the copy chose (`--resource-limits workers`), not
+                // the count a benchmark fixes (`--performance-tuning workers`).
+                max_connections: u16::try_from(
                     args.resource_limits
                         .as_ref()
                         .and_then(|limits| limits.workers)
                         .unwrap_or(usize::from(delegation::MAX_CONNECTIONS))
-                        .min(usize::from(delegation::MAX_CONNECTIONS))
-                })
+                        .min(usize::from(delegation::MAX_CONNECTIONS)),
+                )
                 .context("connection maximum exceeds grant representation")?,
                 max_deletions,
             },

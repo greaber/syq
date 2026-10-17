@@ -69,6 +69,12 @@ pub fn hash_response_fits(block: u64, len: u64) -> bool {
         .is_some_and(|bytes| bytes < MAX_FRAME as u64)
 }
 
+/// Most bytes, a whole number of `block`s, whose hashes fit one response
+/// (`hash_response_fits`): a larger file is compared in windows of this size.
+pub fn hash_response_window(block: u64) -> u64 {
+    (MAX_FRAME as u64 - HASH_RESPONSE_OVERHEAD - 1) / HASH_RESPONSE_BYTES_PER_ENTRY * block
+}
+
 /// Largest file one `SmallPatch` may describe: as large as a whole patch
 /// batch (`patch_batch_fits`).
 pub const MAX_PATCH_FILE_BYTES: u64 = MAX_READ_BYTES;

@@ -480,6 +480,22 @@ class StreamTests(unittest.TestCase):
         finally:
             stream.abort()
 
+    def test_storage_streams_forward_s3_retries(self):
+        fake = self.root / 'stream-syq'
+        fake.write_text(ready_stub())
+        fake.chmod(0o700)
+        client = syq.Client(executable=fake, timeout=5)
+        for method, args, options in [(client.open_writer, (), dict(to='s3://bucket', as_='key')),
+                                      (client.open_reader, ('key',), dict(from_='s3://bucket'))]:
+            stream = method(*args, s3_retries=0, **options)
+            try:
+                self.assertIn('--s3-retries=0', stream._process.process.args)
+            finally:
+                stream.abort()
+            for value in (101, -1, False, '2'):
+                with self.subTest(value=value), self.assertRaisesRegex(syq.SyqInvocationError, 's3_retries'):
+                    method(*args, s3_retries=value, **options)
+
     def test_timeout_interrupts_blocking_write_and_reaps_child(self):
         fake = self.root / 'slow-syq'
         fake.write_text(ready_stub())
@@ -507,6 +523,23 @@ class AsyncStreamTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(argv[argv.index('--auth-from') + 1], '@laptop')
                 finally:
                     await stream.abort()
+
+    async def test_storage_streams_forward_s3_retries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fake = Path(temporary) / 'stream-syq'
+            fake.write_text(ready_stub())
+            fake.chmod(0o700)
+            client = syq.AsyncClient(executable=fake, timeout=5)
+            for method, args, options in [(client.open_writer, (), dict(to='s3://bucket', as_='key')),
+                                          (client.open_reader, ('key',), dict(from_='s3://bucket'))]:
+                stream = method(*args, s3_retries=7, **options)
+                await stream.__aenter__()
+                try:
+                    self.assertIn('--s3-retries=7', stream._stream._process.process.args)
+                finally:
+                    await stream.abort()
+                with self.assertRaisesRegex(syq.SyqInvocationError, 's3_retries'):
+                    await method(*args, s3_retries=True, **options).__aenter__()
 
     async def test_placement_and_confined_reader(self):
         with tempfile.TemporaryDirectory() as temporary:
