@@ -108,7 +108,13 @@ pub(super) fn reject_control_plane_scopes(
 /// of its token-authenticated TCP workers. HostA may choose protocol messages,
 /// but it cannot remove or replace this receiver-side authority.
 pub(crate) struct RestrictedAuthority {
-    pub(super) guard: ContainerGuard,
+    /// The enrolled root (or a receiving machine's container), opened once
+    /// and verified by identity when the grant is redeemed. Every
+    /// connection of the copy uses it as its destination root, and every
+    /// lookup here resolves beneath it.
+    pub(super) root: std::sync::Arc<Root>,
+    /// The path requests name `root` by.
+    pub(super) root_path: Vec<u8>,
     pub(super) destination: Vec<u8>,
     pub(super) copy: CopyOperation,
     pub(super) filters: FilterPolicy,
@@ -242,13 +248,13 @@ impl RestrictedAuthority {
             bail!("signed destination must be a child of the enrolled root");
         }
         crate::rooted::RelativePath::new(relative.as_os_str().as_bytes())?;
-        Root::open_verified(
+        let root = std::sync::Arc::new(Root::open_verified(
             root_path,
             RootIdentity {
                 dev: config.root_dev,
                 ino: config.root_ino,
             },
-        )?;
+        )?);
         let file_data_limit = (max_file_data_bytes_per_second > 0)
             .then(|| crate::bwlimit::BandwidthLimit::new(max_file_data_bytes_per_second));
         receipt_policy.validate()?;
@@ -264,11 +270,8 @@ impl RestrictedAuthority {
                     copy.limits.max_entries,
                 ))
             }),
-            guard: ContainerGuard {
-                root: config.root.as_bytes().to_vec(),
-                dev: config.root_dev,
-                ino: config.root_ino,
-            },
+            root,
+            root_path: config.root.as_bytes().to_vec(),
             destination: copy.destination.clone(),
             copy,
             filters,
@@ -1510,25 +1513,46 @@ impl RestrictedAuthority {
         Ok(())
     }
 
+    /// What is at `path` now, looked up beneath the root this copy holds.
     pub(super) fn rooted_metadata(&self, path: &[u8]) -> Result<Option<RootMetadata>> {
-        let root_path = Path::new(OsStr::from_bytes(&self.guard.root));
-        let target = Path::new(OsStr::from_bytes(path));
-        let relative = target.strip_prefix(root_path).with_context(|| {
-            format!(
-                "receiver metadata target {} is outside enrolled root {}",
-                target.display(),
-                root_path.display()
-            )
-        })?;
-        let relative = RelativePath::new(relative.as_os_str().as_bytes())?;
-        let root = Root::open_verified(
-            root_path,
-            RootIdentity {
-                dev: self.guard.dev,
-                ino: self.guard.ino,
-            },
-        )?;
-        root.metadata_optional(&relative)
+        self.root.metadata_optional(&self.root_relative(path)?)
+    }
+
+    /// `path` relative to the root this copy holds.
+    pub(super) fn root_relative(&self, path: &[u8]) -> Result<RelativePath> {
+        let relative = if path == self.root_path {
+            &[][..]
+        } else {
+            path.strip_prefix(self.root_path.as_slice())
+                .and_then(|rest| rest.strip_prefix(b"/"))
+                .with_context(|| {
+                    format!(
+                        "receiver metadata target {} is outside enrolled root {}",
+                        String::from_utf8_lossy(path),
+                        String::from_utf8_lossy(&self.root_path)
+                    )
+                })?
+        };
+        RelativePath::new(relative)
+    }
+
+    /// Set up one connection's executor to serve this copy: its hashing,
+    /// the files it gives new names to, the scope of the files it writes,
+    /// and the root it works beneath, which every connection shares, as an
+    /// ordinary receiver works beneath the directory its sender anchored.
+    pub(crate) fn configure_session(&self, ops: &mut crate::fsops::FsOps) {
+        ops.set_hash_policy(self.hash_policy());
+        ops.set_owned_objects(self.owned_objects());
+        ops.set_stage_scope(self.stage_scope());
+        ops.install_restricted_destination(self.root.clone(), &self.root_path);
+    }
+
+    /// An executor set up as one of this copy's connections, for tests.
+    #[cfg(test)]
+    pub(crate) fn test_ops(&self) -> crate::fsops::FsOps {
+        let mut ops = crate::fsops::FsOps::new();
+        self.configure_session(&mut ops);
+        ops
     }
 
     /// Check metadata a request applies: the grant's flags, and only the
@@ -1745,7 +1769,6 @@ impl RestrictedAuthority {
                 size: patch.len,
                 hold,
             });
-            patch.guard = Some(self.guard.clone());
         }
         Ok(())
     }
@@ -2190,18 +2213,13 @@ impl RestrictedAuthority {
                     bail!("hash policy differs from the authorized copy");
                 }
             }
-            Request::ValidateDigest {
-                path,
-                expected,
-                guard,
-            } => {
+            Request::ValidateDigest { path, expected } => {
                 self.check_observation_path(path)?;
                 if let Some(authorized) = self.expected_hash(path)? {
                     if *expected != crate::hashing::ExpectedHashes::Single(authorized) {
                         bail!("expected hash differs from the authorized copy");
                     }
                 }
-                *guard = Some(self.guard.clone());
             }
 
             Request::MappingChunk {
@@ -2261,7 +2279,6 @@ impl RestrictedAuthority {
                 source,
                 follow_root,
                 ignore,
-                guard,
                 ..
             } => {
                 if source.is_some() {
@@ -2284,13 +2301,11 @@ impl RestrictedAuthority {
                         bail!("destination scan filters do not match the signed filter policy");
                     }
                 }
-                *guard = Some(self.guard.clone());
             }
             Request::StatMany {
                 paths,
                 sources,
                 follow,
-                guard,
                 ..
             } => {
                 if sources.is_some() {
@@ -2302,22 +2317,19 @@ impl RestrictedAuthority {
                 for path in paths {
                     self.check_observation_path(path)?;
                 }
-                *guard = Some(self.guard.clone());
             }
             Request::DestinationFilesystemInfo { .. } => {
                 bail!("destination filesystem inspection is not authorized by the signed grant")
             }
-            Request::PartialPaths { paths, guard, .. } | Request::PruneLookup { paths, guard } => {
+            Request::PartialPaths { paths, .. } | Request::PruneLookup { paths } => {
                 for path in paths {
                     self.check_observation_path(path)?;
                 }
-                *guard = Some(self.guard.clone());
             }
             Request::PlanBatch {
                 partial_paths,
                 directories,
                 others,
-                guard,
                 ..
             } => {
                 for path in partial_paths
@@ -2327,12 +2339,10 @@ impl RestrictedAuthority {
                 {
                     self.check_observation_path(path)?;
                 }
-                *guard = Some(self.guard.clone());
             }
             Request::WidenDirectories {
                 directories,
                 remember,
-                guard,
                 access,
             } => {
                 // The approved mode bounds what is widened, and how: `rsync`
@@ -2392,12 +2402,10 @@ impl RestrictedAuthority {
                     };
                     *condition = authorized;
                 }
-                *guard = Some(self.guard.clone());
             }
             Request::PrepareDestinationPath {
                 path,
                 symlink_policy,
-                guard,
                 ..
             } => {
                 // Only an approved `all` widens the directories on the way to
@@ -2410,7 +2418,7 @@ impl RestrictedAuthority {
                 );
                 self.check_mutation_allowed()?;
                 if path.starts_with(b"/") {
-                    let root = &self.guard.root;
+                    let root = &self.root_path;
                     anyhow::ensure!(
                         path.len() > root.len()
                             && path.starts_with(root)
@@ -2420,11 +2428,10 @@ impl RestrictedAuthority {
                 }
                 *path = self.destination.clone();
                 *symlink_policy = proto::OperatorSymlinkPolicy::Refuse;
-                *guard = Some(self.guard.clone());
             }
             // It restores only what the request above changed.
             Request::RestoreDestinationPath => {}
-            Request::Apply { ops, guard } => {
+            Request::Apply { ops } => {
                 let outer = (self.extra_options.widen_dirs == DirectoryWidening::All)
                     .then(|| self.outer_directory())
                     .flatten();
@@ -2441,29 +2448,21 @@ impl RestrictedAuthority {
                     }
                     self.authorize_op(operation, index, pending, outcomes)?;
                 }
-                *guard = Some(self.guard.clone());
             }
-            Request::ProbePartial { path, guard, .. } | Request::Canonicalize { path, guard } => {
+            Request::ProbePartial { path, .. } | Request::Canonicalize { path } => {
                 self.check_observation_path(path)?;
-                *guard = Some(self.guard.clone());
             }
-            Request::FileHash {
-                path,
-                source,
-                guard,
-            } => {
+            Request::FileHash { path, source } => {
                 if source.is_some() {
                     bail!("source references are not valid on a command-restricted destination");
                 }
                 self.check_observation_path(path)?;
-                *guard = Some(self.guard.clone());
             }
             Request::HashBlocks {
                 path,
                 source,
                 block,
                 len,
-                guard,
                 ..
             } => {
                 if source.is_some() {
@@ -2471,14 +2470,12 @@ impl RestrictedAuthority {
                 }
                 self.check_hash_request(*block, *len)?;
                 self.check_observation_path(path)?;
-                *guard = Some(self.guard.clone());
             }
             Request::HashWindow {
                 path,
                 off,
                 len,
                 block,
-                guard,
                 ..
             } => {
                 anyhow::ensure!(
@@ -2486,18 +2483,12 @@ impl RestrictedAuthority {
                     "invalid hash window"
                 );
                 self.check_observation_path(path)?;
-                *guard = Some(self.guard.clone());
             }
             Request::HashAndHold {
-                path,
-                block,
-                len,
-                guard,
-                ..
+                path, block, len, ..
             } => {
                 self.check_hash_request(*block, *len)?;
                 self.check_observation_path(path)?;
-                *guard = Some(self.guard.clone());
             }
             // Each file is observed as HashAndHold observes one, and the
             // hashes of the whole batch share one response.
@@ -2510,7 +2501,6 @@ impl RestrictedAuthority {
                 }
                 for file in files.iter_mut() {
                     self.check_observation_path(&file.path)?;
-                    file.guard = Some(self.guard.clone());
                 }
             }
             Request::StageBasis {
@@ -2518,7 +2508,6 @@ impl RestrictedAuthority {
                 copy_id,
                 len,
                 block,
-                guard,
                 ..
             }
             | Request::SeedBasis {
@@ -2526,7 +2515,6 @@ impl RestrictedAuthority {
                 copy_id,
                 len,
                 block,
-                guard,
                 ..
             } => {
                 self.check_hash_request(*block, if bounded_basis { 0 } else { *len })?;
@@ -2546,7 +2534,6 @@ impl RestrictedAuthority {
                     skip_if_absent: false,
                     observation_hold: None,
                 });
-                *guard = Some(self.guard.clone());
             }
             Request::FinishBasis {
                 expected_hash,
@@ -2554,7 +2541,6 @@ impl RestrictedAuthority {
                 meta,
                 flags,
                 condition,
-                guard,
                 ..
             } => {
                 *expected_hash = self.expected_hash(path)?.map(Into::into);
@@ -2568,7 +2554,6 @@ impl RestrictedAuthority {
                         kind: proto::Kind::File,
                     },
                 });
-                *guard = Some(self.guard.clone());
             }
             Request::Prepare {
                 path,
@@ -2578,7 +2563,6 @@ impl RestrictedAuthority {
                 flags,
                 scanned,
                 create_if_missing,
-                guard,
                 update,
                 ..
             } => {
@@ -2621,14 +2605,12 @@ impl RestrictedAuthority {
                     skip_if_absent: !*create_if_missing,
                     observation_hold,
                 });
-                *guard = Some(self.guard.clone());
             }
             Request::ReuseComparedRange {
                 path,
                 copy_id,
                 off,
                 len,
-                guard,
                 ..
             } => {
                 self.require_publication_mode(false, "staged block reuse")?;
@@ -2652,7 +2634,6 @@ impl RestrictedAuthority {
                 });
                 // No payload crossed the transport. Logical file capacity was
                 // reserved by StageBasis, just as for a native cloned basis.
-                *guard = Some(self.guard.clone());
             }
             Request::WriteRange {
                 path,
@@ -2660,7 +2641,6 @@ impl RestrictedAuthority {
                 copy_id,
                 off,
                 data,
-                guard,
                 ..
             } => {
                 self.require_publication_mode(*inplace, "file write")?;
@@ -2681,7 +2661,6 @@ impl RestrictedAuthority {
                     observation_hold: None,
                 });
                 self.charge_bytes(path, *off, data.len())?;
-                *guard = Some(self.guard.clone());
             }
             Request::Finalize {
                 expected_hash,
@@ -2692,7 +2671,6 @@ impl RestrictedAuthority {
                 flags,
                 scanned,
                 condition,
-                guard,
                 ..
             } => {
                 // The receiver looks for itself, and knows the in-place
@@ -2714,7 +2692,6 @@ impl RestrictedAuthority {
                     observation_hold: None,
                 });
                 self.check_metadata(meta, *flags)?;
-                *guard = Some(self.guard.clone());
             }
             Request::PutSmallBatch(puts) => {
                 if puts.iter().any(|put| put.inplace) {
@@ -2749,7 +2726,6 @@ impl RestrictedAuthority {
                         },
                     });
                     self.check_metadata(&put.meta, put.flags)?;
-                    put.guard = Some(self.guard.clone());
                 }
             }
             Request::PatchSmallBatch(patches) => {
@@ -2841,7 +2817,7 @@ impl RestrictedAuthority {
                     bail!("destination results run only on the signed control connection");
                 }
             }
-            Request::NewFileOwner { path, probe, guard } => {
+            Request::NewFileOwner { path, probe } => {
                 // A probe the receiver creates to learn whom its files show
                 // stays inside the destination and is removed at once, and
                 // is made only while the grant allows changes.
@@ -2849,7 +2825,6 @@ impl RestrictedAuthority {
                 if self.check_mutation_allowed().is_err() {
                     *probe = false;
                 }
-                *guard = Some(self.guard.clone());
             }
             Request::TransportStats
             | Request::ReceiverUser

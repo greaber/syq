@@ -401,7 +401,6 @@ fn remote_vector_replies_must_match_request_counts() {
                     paths: vec![b"file".to_vec()],
                     sources: None,
                     follow: false,
-                    guard: None,
                 },
                 Response::Stats(vec![None; count]),
             ),
@@ -410,7 +409,6 @@ fn remote_vector_replies_must_match_request_counts() {
                     ops: vec![Op::Unlink {
                         path: b"file".to_vec(),
                     }],
-                    guard: None,
                 },
                 Response::Applied(vec![None; count]),
             ),
@@ -418,7 +416,6 @@ fn remote_vector_replies_must_match_request_counts() {
                 Request::PartialPaths {
                     paths: vec![b"file".to_vec()],
                     copy_id: [0; 16],
-                    guard: None,
                 },
                 Response::PathResults(vec![Ok(b"partial".to_vec()); count]),
             ),
@@ -608,7 +605,6 @@ fn local_source_worker_rejects_destination_mutation_requests() {
             ops: vec![Op::Unlink {
                 path: marker.as_os_str().as_bytes().to_vec(),
             }],
-            guard: None,
         })
         .unwrap();
     assert!(
@@ -2471,7 +2467,6 @@ fn fragmented_metadata_replies_preserve_counts_and_errors() {
         paths: vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()],
         sources: None,
         follow: false,
-        guard: None,
     };
     let mut conn = connection_replaying(&[
         Response::StatsMore(vec![None]),
@@ -2540,7 +2535,6 @@ fn pending_replies_are_kept_while_later_replies_are_returned() {
         paths: vec![b"x".to_vec(); count],
         sources: None,
         follow: false,
-        guard: None,
     };
     let mut conn = connection_replaying(&[
         Response::StatsMore(vec![None]),

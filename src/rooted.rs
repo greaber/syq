@@ -1,4 +1,4 @@
-//! Root-anchored filesystem primitives for guarded receivers.
+//! Root-anchored filesystem primitives for destination receivers.
 //!
 //! `Root` follows the explicitly selected root path once, opens that directory,
 //! and uses only the resulting descriptor afterward. Descendant paths are raw
@@ -7,9 +7,9 @@
 //! are performed relative to a held parent descriptor. There is no pathname
 //! fallback.
 //!
-//! Native guarded placements and signed receivers use these operations for
-//! descendant mutation and inspection; the unrestricted implementation remains
-//! separate. Existing roots, directory scans, regular-file I/O, leaf
+//! Ordinary and command-restricted receivers use these operations for
+//! descendant mutation and inspection beneath their destination root.
+//! Existing roots, directory scans, regular-file I/O, leaf
 //! creation/replacement, metadata, and non-recursive unlink/rmdir are supported.
 //! Recursive removal and missing-root creation stay outside this layer.
 //! Traversal uses search-only descriptors where the platform provides them;

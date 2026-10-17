@@ -199,7 +199,6 @@ impl FsOps {
         root: &[u8],
         source: Option<&RegisteredPath>,
         follow_root: bool,
-        guard: Option<&ContainerGuard>,
         entries: &mut [Entry],
     ) -> Result<()> {
         if !self.inode_preservation.any() {
@@ -212,7 +211,6 @@ impl FsOps {
                 &path,
                 reference.as_ref(),
                 follow_root && entry.path.is_empty(),
-                guard,
                 entry,
             )?;
         }
@@ -224,7 +222,6 @@ impl FsOps {
         path: &[u8],
         source: Option<&RegisteredPath>,
         follow: bool,
-        guard: Option<&ContainerGuard>,
         entry: &mut Entry,
     ) -> Result<()> {
         if !self.inode_preservation.any() {
@@ -245,12 +242,7 @@ impl FsOps {
         let file = if let Some(source) = source {
             let target = self.registered_source_target(source)?;
             target.root.open_metadata(&target.relative)?
-        } else if let Some(guard) = guard {
-            // A confined receiver reads what it was asked about beneath its
-            // root, never through a link to a name elsewhere.
-            let target = super::apply::guarded_target_unheld(path, guard)?;
-            target.root.open_metadata(&target.relative)?
-        } else if let Some(target) = self.rooted_destination_target(path, None)? {
+        } else if let Some(target) = self.rooted_destination_target(path)? {
             target.root.open_metadata(&target.relative)?
         } else {
             #[cfg(target_os = "linux")]
@@ -296,7 +288,6 @@ impl FsOps {
         paths: &[PathBytes],
         sources: Option<&[RegisteredPath]>,
         follow: bool,
-        guard: Option<&ContainerGuard>,
     ) -> Result<Vec<Option<Entry>>> {
         #[cfg(debug_assertions)]
         if sources.is_none() {
@@ -305,7 +296,7 @@ impl FsOps {
                 format_args!("stat {}", paths.len()),
             )?;
         }
-        let mut entries = self.stat_many_unadorned_request(paths, sources, follow, guard)?;
+        let mut entries = self.stat_many_unadorned_request(paths, sources, follow)?;
         if self.inode_preservation.any() {
             for (index, entry) in entries.iter_mut().enumerate() {
                 if let Some(entry) = entry {
@@ -313,7 +304,6 @@ impl FsOps {
                         &paths[index],
                         sources.map(|s| &s[index]),
                         follow,
-                        guard,
                         entry,
                     )?;
                 }

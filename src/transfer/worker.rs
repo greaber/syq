@@ -683,7 +683,6 @@ impl Worker {
                         flags: self.publication_flags(job),
                         inplace: job.inplace,
                         condition: job.target_condition,
-                        guard: job.container_guard.clone(),
                         replaces: job.dst_entry.is_some(),
                         scanned: job.scanned,
                     });
@@ -1136,9 +1135,7 @@ impl Worker {
             }
         }
 
-        // Only a new file is written in place (`--in-place=new`). Placement
-        // guards must be enforced by the final mutation, so a guarded file
-        // is staged even then.
+        // Only a new file is written in place (`--in-place=new`).
         let inplace = job.inplace;
         // A file a grouped comparison already found different, or could not
         // patch, is copied whole without comparing it again.
@@ -1210,7 +1207,7 @@ impl Worker {
             && self
                 .opts
                 .copy_policy(self.bwlimit.is_some())
-                .file_operation(job.entry.size, job.container_guard.is_some())
+                .file_operation(job.entry.size)
                 == crate::copy_policy::FileOperation::ReceiverCopy
         {
             match self.try_copy_local(idx, &job) {
@@ -1545,7 +1542,6 @@ impl Worker {
                 block,
                 len,
                 condition: job.target_condition,
-                guard: job.container_guard.clone(),
                 update: if off == 0 {
                     self.in_place_update(job)
                 } else {
@@ -1561,7 +1557,6 @@ impl Worker {
                 block,
                 len,
                 attempt: job.attempt,
-                guard: None,
             })?;
             // Drain both endpoints even when one reports an ordinary file error.
             let source = self.src.recv();
@@ -1619,7 +1614,6 @@ impl Worker {
                 block: self.opts.block,
                 allow_final,
                 attempt: job.attempt,
-                guard: job.container_guard.clone(),
             })?,
             "stage comparison basis",
         )? {
@@ -1835,7 +1829,6 @@ impl Worker {
                 scanned: job.scanned,
                 attempt: job.attempt,
                 create_if_missing,
-                guard: job.container_guard.clone(),
                 group: self.publication_group(job),
                 update: self.in_place_update(job),
             })?,
@@ -1872,7 +1865,6 @@ impl Worker {
             block: self.opts.block,
             final_ranges,
             attempt: job.attempt,
-            guard: job.container_guard.clone(),
             clone_final: false,
         }
     }
@@ -1889,7 +1881,6 @@ impl Worker {
                 block: self.opts.block,
                 len: job.entry.size,
                 condition: job.target_condition,
-                guard: job.container_guard.clone(),
                 // The receiver refuses a file it will not update in place
                 // before reading it.
                 update: self.in_place_update(job),
@@ -1923,7 +1914,6 @@ impl Worker {
             block,
             len: size,
             attempt: job.attempt,
-            guard: None,
         })?;
         // Both requests are in flight. Always consume both responses before
         // interpreting either one so an ordinary endpoint error cannot leave
@@ -2154,7 +2144,6 @@ impl Worker {
                                     attempt: job.attempt,
                                     off,
                                     len,
-                                    guard: job.container_guard.clone(),
                                 })?;
                                 writes.push_back((expected_len, true));
                             } else {
@@ -2180,7 +2169,6 @@ impl Worker {
                                 off,
                                 hash,
                                 data: data.into(),
-                                guard: job.container_guard.clone(),
                             })?;
                             writes.push_back((expected_len, false));
                         }
@@ -2278,7 +2266,6 @@ impl Worker {
             len: (end - start) as u32,
             block,
             attempt: job.attempt,
-            guard: job.container_guard.clone(),
         }
     }
 
@@ -2571,7 +2558,6 @@ impl Worker {
                     off,
                     hash,
                     data: data.into(),
-                    guard: job.container_guard.clone(),
                 })?;
                 pending_writes.push_back((slot, n, started));
                 if pending_writes.len() >= write_window {
@@ -2732,7 +2718,6 @@ impl Worker {
                     off,
                     hash,
                     data: data.into(),
-                    guard: job.container_guard.clone(),
                 })?;
                 sent += 1;
                 self.benchmark.streamed_blocks += 1;
@@ -2830,7 +2815,6 @@ impl Worker {
                 flags: self.publication_flags(&job),
                 scanned: job.scanned,
                 condition: job.target_condition,
-                guard: job.container_guard.clone(),
             })?,
             "finalize destination",
         );
@@ -2848,7 +2832,6 @@ impl Worker {
                     self.dst.call(Request::ProbePartial {
                         path: job.dst.clone(),
                         copy_id: self.copy_id(),
-                        guard: None,
                     })?,
                     "probe partial after finalize",
                 )? {
@@ -2891,12 +2874,10 @@ impl Worker {
         self.dst.send(Request::FileHash {
             path: job.dst.clone(),
             source: None,
-            guard: None,
         })?;
         self.src.send(Request::FileHash {
             path: job.src.clone(),
             source: self.source_reference(job),
-            guard: None,
         })?;
         // Drain both replies even when one endpoint reports a per-file error.
         let source = self.src.recv();
@@ -3038,7 +3019,6 @@ impl Worker {
             match self.dst.call(Request::ValidateDigest {
                 path: job.dst.clone(),
                 expected,
-                guard: job.container_guard.clone(),
             })? {
                 Response::Ok => {}
                 Response::Err(_) | Response::EndpointError(_) => return Ok(false),
@@ -3064,7 +3044,6 @@ impl Worker {
                         | self.opts.ownership_flags(&job.rel_bytes)
                         | (self.publication_flags(job) & flags::REPORT_IDENTITY),
                 }],
-                guard: job.container_guard.clone(),
             })?,
             "update metadata after expected digest match",
         )?;
@@ -3091,7 +3070,6 @@ impl Worker {
                 self.dst.call(Request::ValidateDigest {
                     path: job.dst.clone(),
                     expected,
-                    guard: job.container_guard.clone(),
                 })?,
                 "validate expected digest",
             )?;

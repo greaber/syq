@@ -262,7 +262,6 @@ impl Workers {
                     off: job.off,
                     hash,
                     data: job.data.into(),
-                    guard: None,
                 })?;
                 if let Some(buffer) = buffer {
                     self.session.recycle(buffer);

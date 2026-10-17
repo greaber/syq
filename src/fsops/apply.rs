@@ -16,73 +16,42 @@ pub(super) fn op_path(op: &Op) -> &[u8] {
 }
 
 /// Carry out `op`. What it creates is limited as creating it limits it: by
-/// its directory's default ACL, or else by the umask.
+/// its directory's default ACL, or else by the umask. A restricted
+/// receiver's session never creates missing parents on the way
+/// (`create_missing_parents`): each directory it creates passes its
+/// authority.
 pub(super) fn apply_one(
     op: &Op,
-    guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
+    create_missing_parents: bool,
     owned: Option<&owned::OwnedObjects>,
 ) -> Result<()> {
-    let registered_target = if let Some(root) = destination_root {
-        let path = op_path(op);
-        let relative = RelativePath::new(path)?;
-        let label = PathBuf::from(OsStr::from_bytes(
-            &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
-        ));
-        Some(RootedTarget {
-            root,
-            relative,
-            label,
-            create_missing_parents: true,
-            query_partial_name_limit: false,
-        })
-    } else {
-        None
+    let Some(root) = destination_root else {
+        bail!("{UNROOTED_MUTATION}");
+    };
+    let path = op_path(op);
+    let relative = RelativePath::new(path)?;
+    let label = PathBuf::from(OsStr::from_bytes(
+        &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
+    ));
+    hold_before_destination_mutation_for_test(&label)?;
+    let target = RootedTarget {
+        root,
+        relative,
+        label,
+        create_missing_parents,
     };
     #[cfg(debug_assertions)]
-    fail_apply_capacity_for_test(
-        registered_target
-            .as_ref()
-            .map_or_else(|| resolve(op_path(op)), |target| target.label.clone())
-            .as_path(),
-    )?;
+    fail_apply_capacity_for_test(&target.label)?;
     #[cfg(debug_assertions)]
     if matches!(op, Op::SetMeta { .. } | Op::SetFileMetaIfSame { .. }) {
-        let label = registered_target
-            .as_ref()
-            .map_or_else(|| resolve(op_path(op)), |target| target.label.clone());
-        fail_set_meta_for_test(&label)?;
-        meet_concurrent_set_meta_for_test(&label)?;
+        fail_set_meta_for_test(&target.label)?;
+        meet_concurrent_set_meta_for_test(&target.label)?;
     }
     if matches!(op, Op::SetFileMetaIfSame { .. }) {
         hold_before_quick_metadata_for_test()?;
     }
-    if let Some(guard) = guard {
-        let target = guarded_target(op_path(op), guard)?;
-        if let Op::Hardlink {
-            path,
-            source,
-            dev,
-            ino,
-            condition,
-        } = op
-        {
-            let source = guarded_target(source, guard)?;
-            let operation = Op::Hardlink {
-                path: path.clone(),
-                source: source.relative.to_path_buf().into_os_string().into_vec(),
-                dev: *dev,
-                ino: *ino,
-                condition: *condition,
-            };
-            return apply_one_rooted(&operation, &target.as_rooted(), owned);
-        }
-        return apply_one_rooted(op, &target.as_rooted(), owned);
-    }
-    let Some(target) = registered_target else {
-        bail!("{UNROOTED_MUTATION}");
-    };
     apply_one_rooted(op, &target, owned)
 }
 
@@ -90,17 +59,10 @@ pub(super) fn apply_one(
 /// names. No Selected operation permits traversal or recursive discovery.
 pub(super) fn selected_removals(
     ops: &[Op],
-    guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
 ) -> Vec<Result<crate::deletion::Selected>> {
-    let root = if let Some(guard) = guard {
-        ops.first()
-            .map(|op| guarded_target(op_path(op), guard).map(|target| target.root))
-            .unwrap_or_else(|| Err(anyhow::anyhow!("empty deletion request")))
-    } else {
-        destination_root.context(UNROOTED_MUTATION)
-    };
+    let root = destination_root.context(UNROOTED_MUTATION);
     ops.iter()
         .map(|op| {
             let root = root
@@ -108,23 +70,14 @@ pub(super) fn selected_removals(
                 .map_err(|error| anyhow::Error::new(wire_error(error)))?
                 .clone();
             let path = op_path(op);
-            let label = if guard.is_some() {
-                resolve(path)
-            } else {
-                PathBuf::from(OsStr::from_bytes(
-                    &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
-                ))
-            };
+            let label = PathBuf::from(OsStr::from_bytes(
+                &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
+            ));
             #[cfg(debug_assertions)]
             fail_apply_capacity_for_test(&label)?;
-            let relative = if let Some(guard) = guard {
-                relative_under(&resolve(&guard.root), &resolve(path))?
-            } else {
-                RelativePath::new(path)?
-            };
             Ok(crate::deletion::Selected {
                 root,
-                path: relative,
+                path: RelativePath::new(path)?,
                 label,
                 directory: matches!(op, Op::Rmdir { .. }),
                 size: None,
@@ -140,20 +93,11 @@ pub(super) fn error_is_kind(error: &anyhow::Error, kind: io::ErrorKind) -> bool 
         .is_some_and(|error| error.kind() == kind)
 }
 
-pub(super) struct GuardedTarget {
-    pub(super) root: Arc<Root>,
-    pub(super) relative: RelativePath,
-    pub(super) label: PathBuf,
-}
-
 pub(super) struct RootedTarget {
     pub(super) root: Arc<Root>,
     pub(super) relative: RelativePath,
     pub(super) label: PathBuf,
     pub(super) create_missing_parents: bool,
-    // Signed receivers independently derive the partial name for quota checks.
-    // Keep their exact limit selection in sync with that authority.
-    pub(super) query_partial_name_limit: bool,
 }
 
 // One filename-limit observation for adjacent siblings in a read-only batch
@@ -188,29 +132,13 @@ impl PartialNameLimits {
 
 impl RootedTarget {
     pub(super) fn partial_name_max(&self) -> Result<usize> {
-        if self.query_partial_name_limit {
-            self.root.name_max_for_parent(&self.relative)
-        } else {
-            self.root.partial_name_max(&self.relative)
-        }
+        self.root.partial_name_max(&self.relative)
     }
 
     pub(super) fn location(&self) -> FileLocation {
         FileLocation::Rooted {
             root: self.root.identity(),
             relative: self.relative.clone(),
-        }
-    }
-}
-
-impl GuardedTarget {
-    pub(super) fn as_rooted(&self) -> RootedTarget {
-        RootedTarget {
-            root: self.root.clone(),
-            relative: self.relative.clone(),
-            label: self.label.clone(),
-            create_missing_parents: false,
-            query_partial_name_limit: true,
         }
     }
 }
@@ -260,7 +188,7 @@ pub(super) fn with_rooted_partial<T>(
             let too_long = error
                 .downcast_ref::<io::Error>()
                 .is_some_and(|error| error.raw_os_error() == Some(libc::ENAMETOOLONG));
-            if !too_long || target.query_partial_name_limit {
+            if !too_long {
                 return Err(error);
             }
             let limit = target.root.rejected_partial_name_max(&target.relative)?;
@@ -274,41 +202,7 @@ pub(super) fn with_rooted_partial<T>(
     }
 }
 
-pub(super) fn guarded_target(path: &[u8], guard: &ContainerGuard) -> Result<GuardedTarget> {
-    hold_before_guarded_mutation_for_test(path)?;
-    guarded_target_unheld(path, guard)
-}
-
-pub(super) fn guarded_target_unheld(path: &[u8], guard: &ContainerGuard) -> Result<GuardedTarget> {
-    let root_path = resolve(&guard.root);
-    let target = resolve(path);
-    let relative = relative_under(&root_path, &target)?;
-    let root = Arc::new(Root::open_verified(
-        &root_path,
-        RootIdentity {
-            dev: guard.dev,
-            ino: guard.ino,
-        },
-    )?);
-    Ok(GuardedTarget {
-        root,
-        relative,
-        label: target,
-    })
-}
-
-pub(super) fn relative_under(root: &Path, target: &Path) -> Result<RelativePath> {
-    let relative = target.strip_prefix(root).with_context(|| {
-        format!(
-            "destination {} is outside guarded root {}",
-            target.display(),
-            root.display()
-        )
-    })?;
-    RelativePath::new(relative.as_os_str().as_bytes())
-}
-
-/// Observe the object at a guarded path and hold it to the planner's
+/// Observe the object at a destination path and hold it to the planner's
 /// condition. `Absent` requires nothing there (the following `*at` creation
 /// then fails atomically if something appears); the matching conditions
 /// require the observed identity. `Any` accepts whatever is found.
@@ -902,13 +796,10 @@ pub(super) fn set_meta_rooted(
 /// The target an operation on `path` resolves to, as `apply_one` resolves it.
 pub(super) fn operation_target(
     path: &[u8],
-    guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
+    create_missing_parents: bool,
 ) -> Result<RootedTarget> {
-    if let Some(guard) = guard {
-        return guarded_target_unheld(path, guard).map(|target| target.as_rooted());
-    }
     let Some(root) = destination_root else {
         bail!("{UNROOTED_MUTATION}");
     };
@@ -918,8 +809,7 @@ pub(super) fn operation_target(
         label: PathBuf::from(OsStr::from_bytes(
             &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
         )),
-        create_missing_parents: true,
-        query_partial_name_limit: false,
+        create_missing_parents,
     })
 }
 
@@ -936,7 +826,6 @@ pub(super) fn starting_group_may_differ(
     path: &[u8],
     group: u32,
     parents: &CreationParents,
-    guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
 ) -> bool {
@@ -944,7 +833,7 @@ pub(super) fn starting_group_may_differ(
     let cached = parents.lock().unwrap().get(&parent_path).copied();
     let parent = cached.unwrap_or_else(|| {
         let observed = (|| -> Result<(u32, u32)> {
-            let target = operation_target(path, guard, destination_root, destination_prefix)?;
+            let target = operation_target(path, destination_root, destination_prefix, false)?;
             let (parents, _) = target.relative.leaf()?;
             let parent = target
                 .root
@@ -1013,9 +902,9 @@ pub(super) type CreatedDirectory = (u64, u64, u32);
 /// rather than finding one already there.
 pub(super) fn create_identified_directory(
     op: &Op,
-    guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
+    create_missing_parents: bool,
     private: bool,
 ) -> Result<Option<CreatedDirectory>> {
     let Op::Mkdir {
@@ -1026,10 +915,13 @@ pub(super) fn create_identified_directory(
     else {
         bail!("identified creation requires a Mkdir");
     };
-    let target = match guard {
-        Some(guard) => guarded_target(path, guard)?.as_rooted(),
-        None => operation_target(path, None, destination_root, destination_prefix)?,
-    };
+    let target = operation_target(
+        path,
+        destination_root,
+        destination_prefix,
+        create_missing_parents,
+    )?;
+    hold_before_destination_mutation_for_test(&target.label)?;
     #[cfg(debug_assertions)]
     fail_apply_capacity_for_test(&target.label)?;
     let mode = if private { 0o700 } else { *mode };
@@ -1046,11 +938,10 @@ pub(super) fn open_created_directory(
     path: &[u8],
     proposed: u32,
     created: (u64, u64),
-    guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
 ) -> Result<()> {
-    let target = operation_target(path, guard, destination_root, destination_prefix)?;
+    let target = operation_target(path, destination_root, destination_prefix, false)?;
     let directory = target.root.open_metadata(&target.relative)?;
     let current = directory.metadata()?;
     if (current.dev(), current.ino()) != created || !current.is_dir() {
@@ -1270,23 +1161,25 @@ pub(super) fn file_type_bits(mode: u32) -> u32 {
     mode & libc::S_IFMT as u32
 }
 
+/// Pause before an Apply operation on a destination path ending with
+/// `SYQ_TEST_DESTINATION_MUTATION_SUFFIX` resolves it beneath the root.
 #[cfg(any(test, debug_assertions))]
-pub(super) fn hold_before_guarded_mutation_for_test(path: &[u8]) -> Result<()> {
-    let Some(suffix) = std::env::var_os("SYQ_TEST_GUARDED_MUTATION_SUFFIX") else {
+pub(super) fn hold_before_destination_mutation_for_test(label: &Path) -> Result<()> {
+    let Some(suffix) = std::env::var_os("SYQ_TEST_DESTINATION_MUTATION_SUFFIX") else {
         return Ok(());
     };
-    if !path.ends_with(suffix.as_bytes()) {
+    if !label.as_os_str().as_bytes().ends_with(suffix.as_bytes()) {
         return Ok(());
     }
     test_race_barrier(
-        "SYQ_TEST_GUARDED_MUTATION_READY_FILE",
-        "SYQ_TEST_GUARDED_MUTATION_CONTINUE_FILE",
-        "guarded-mutation-ready",
+        "SYQ_TEST_DESTINATION_MUTATION_READY_FILE",
+        "SYQ_TEST_DESTINATION_MUTATION_CONTINUE_FILE",
+        "destination-mutation-ready",
     )
 }
 
 #[cfg(not(any(test, debug_assertions)))]
-pub(super) fn hold_before_guarded_mutation_for_test(_path: &[u8]) -> Result<()> {
+pub(super) fn hold_before_destination_mutation_for_test(_label: &Path) -> Result<()> {
     Ok(())
 }
 

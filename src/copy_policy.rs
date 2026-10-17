@@ -29,8 +29,8 @@ impl CopyPolicy {
             && !self.bandwidth_limited
     }
 
-    pub(crate) fn file_operation(self, size: u64, guarded: bool) -> FileOperation {
-        if self.allows_receiver_copy() && size > 0 && !guarded {
+    pub(crate) fn file_operation(self, size: u64) -> FileOperation {
+        if self.allows_receiver_copy() && size > 0 {
             FileOperation::ReceiverCopy
         } else {
             FileOperation::TransferRanges
@@ -76,7 +76,7 @@ mod tests {
             bandwidth_limited: false,
             receiver_copy_disabled: false,
         };
-        assert_eq!(direct.file_operation(1, false), FileOperation::ReceiverCopy);
+        assert_eq!(direct.file_operation(1), FileOperation::ReceiverCopy);
         for policy in [
             CopyPolicy {
                 receiver_copy_disabled: true,
@@ -95,18 +95,8 @@ mod tests {
                 ..direct
             },
         ] {
-            assert_eq!(
-                policy.file_operation(1, false),
-                FileOperation::TransferRanges
-            );
+            assert_eq!(policy.file_operation(1), FileOperation::TransferRanges);
         }
-        assert_eq!(
-            direct.file_operation(0, false),
-            FileOperation::TransferRanges
-        );
-        assert_eq!(
-            direct.file_operation(1, true),
-            FileOperation::TransferRanges
-        );
+        assert_eq!(direct.file_operation(0), FileOperation::TransferRanges);
     }
 }

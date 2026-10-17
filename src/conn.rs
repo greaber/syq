@@ -1365,7 +1365,6 @@ impl Conn for RemoteConn {
             follow_root,
             ignore: ignore.to_vec(),
             report_ignored,
-            guard: None,
         })?;
         let matcher = crate::scan::build_ignore(ignore)?;
         let mut saw_root = false;

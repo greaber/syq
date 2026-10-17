@@ -701,7 +701,6 @@ fn named_control_closure_revokes_connected_workers() {
             mode: 0o755,
             condition: crate::proto::TargetCondition::Any,
         }],
-        guard: None,
     };
     assert!(authority
         .authorize(&mut request, false)
@@ -1466,7 +1465,6 @@ fn named_workers_refuse_mutations_before_transport_shutdown() {
                     mode: 0o700,
                     condition: crate::proto::TargetCondition::Absent,
                 }],
-                guard: None,
             };
             assert!(matches!(
                 worker.call(mkdir("source")).unwrap(),

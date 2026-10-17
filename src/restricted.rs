@@ -10,7 +10,7 @@ use crate::enrollment::{
     self, AuthorizedKeyEntry, AuthorizedKeysChange, EnrollmentId, EnrollmentPublicKey,
     EnrollmentRoute, SshEndpoint,
 };
-use crate::proto::{self, ContainerGuard, Op, Request};
+use crate::proto::{self, Op, Request};
 use crate::rooted::{RelativePath, Root, RootIdentity, RootMetadata};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;

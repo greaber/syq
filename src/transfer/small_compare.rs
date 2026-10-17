@@ -351,7 +351,6 @@ impl Worker {
                                 path: job.dst.clone(),
                                 len: job.entry.size,
                                 condition: job.target_condition,
-                                guard: job.container_guard.clone(),
                             }
                         })
                         .collect();
@@ -610,7 +609,6 @@ impl Worker {
                     paths: vec![job.src.clone()],
                     sources: Some(vec![job.source.clone()]),
                     follow: false,
-                    guard: None,
                 })?;
                 source.push_back((StreamStep::Recheck(reading), std::time::Instant::now()));
                 reading += 1;
@@ -1003,7 +1001,6 @@ impl Worker {
                         flags: self.publication_flags(job),
                         unchanged_flags: self.unchanged_flags(job),
                         condition: job.target_condition,
-                        guard: job.container_guard.clone(),
                     };
                     if streamed {
                         streams.push(Streamed {

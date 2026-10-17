@@ -135,7 +135,7 @@ const SOURCE_UNCACHED_FILE_FDS: usize = 1;
 const SOURCE_SHARED_WORKER_FD_RESERVE: usize =
     FD_CACHE_MAX + SOURCE_TCP_TRANSPORT_FDS + SOURCE_UNCACHED_FILE_FDS;
 /// A destination mutation names a path only relative to an authority: a
-/// registered destination root or a receiver's guard.
+/// registered or installed destination root.
 const UNROOTED_MUTATION: &str = "destination mutation before a destination root was registered";
 /// The refusal of any request but the open streamed patch's data and end.
 pub(crate) const OPEN_PATCH_STREAM: &str =
@@ -872,6 +872,10 @@ pub struct FsOps {
     allow_unconfined_source_paths: bool,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<PathBytes>,
+    /// Whether an Apply operation creates the missing directories on its
+    /// way. A restricted receiver's session never does: each directory it
+    /// creates passes its authority.
+    create_missing_parents: bool,
     /// Whether each destination root, and each directory directly beneath
     /// one, lies on a network filesystem; the root itself has an empty name.
     network_entries: HashMap<(RootIdentity, Vec<u8>), bool>,
@@ -1037,7 +1041,6 @@ struct FdKey {
 struct PartialTarget<'a> {
     path: &'a [u8],
     id: &'a CopyId,
-    guard: Option<&'a ContainerGuard>,
 }
 
 /// How a sidecar is seeded (`FsOps::seed_basis_impl`): only staged, for a
@@ -1072,12 +1075,6 @@ struct HashOptions {
 struct HashTarget<'a> {
     path: &'a [u8],
     source: Option<&'a RegisteredPath>,
-    guard: Option<&'a ContainerGuard>,
-}
-
-struct TargetMutation<'a> {
-    condition: TargetCondition,
-    guard: Option<&'a ContainerGuard>,
 }
 
 impl Default for FsOps {
@@ -1160,6 +1157,7 @@ impl FsOps {
             source_roots: HashMap::new(),
             allow_unconfined_source_paths: false,
             destination_root: None,
+            create_missing_parents: true,
             destination_prefix: None,
             network_entries: HashMap::new(),
             #[cfg(target_os = "linux")]
@@ -1520,7 +1518,7 @@ impl FsOps {
             }
             let path = self.destination_relative(&file.path)?;
             let target = self
-                .rooted_destination_target(&path, None)?
+                .rooted_destination_target(&path)?
                 .context("small copy requires a destination root")?;
             let handle = target.root.open_metadata(&target.relative)?;
             let current = handle.metadata()?;
@@ -1638,7 +1636,7 @@ impl FsOps {
             let check = (|| -> Result<Option<(RootedTarget, File)>> {
                 let path = self.destination_relative(&file.path)?;
                 let target = self
-                    .rooted_destination_target(&path, None)?
+                    .rooted_destination_target(&path)?
                     .context("small copy requires a destination root")?;
                 let mut opened = target.root.open_regular_read(&target.relative)?;
                 let stat = destinations[i].as_ref().unwrap();
@@ -1837,15 +1835,12 @@ impl FsOps {
                             } else {
                                 match self.destination_relative(&file.path) {
                                     Ok(path) => self
-                                        .apply(
-                                            &[Op::SetFileMetaIfSame {
-                                                path,
-                                                condition,
-                                                meta: file.meta.clone(),
-                                                flags: checked,
-                                            }],
-                                            None,
-                                        )
+                                        .apply(&[Op::SetFileMetaIfSame {
+                                            path,
+                                            condition,
+                                            meta: file.meta.clone(),
+                                            flags: checked,
+                                        }])
                                         .pop()
                                         .flatten(),
                                     Err(error) => Some(wire_error(&error)),
@@ -1875,7 +1870,7 @@ impl FsOps {
     ) -> Result<StagedSmallFile> {
         let path = self.destination_relative(path)?;
         let rooted = self
-            .rooted_destination_target(&path, None)?
+            .rooted_destination_target(&path)?
             .context("small copy requires the destination root")?;
         self.resolve_publication(&rooted, &mut meta, &mut flags, &mut None, replaced)?;
         let meta = &meta;
@@ -2333,80 +2328,33 @@ impl FsOps {
         bail!("source scan omitted its registered source reference")
     }
 
-    /// A source worker never accepts destination-style caller guards. Those
-    /// guards carry a fresh pathname root and would otherwise bypass the
-    /// endpoint-session source capabilities, even on request variants whose
-    /// source-reference cutover has not landed yet.
-    pub(crate) fn validate_source_session_request(&self, request: &Request) -> Result<()> {
-        if self.source_roots.is_empty() || self.destination_root.is_some() {
-            return Ok(());
-        }
-        let has_guard = match request {
-            Request::Scan { guard, .. }
-            | Request::StatMany { guard, .. }
-            | Request::PartialPaths { guard, .. }
-            | Request::PruneLookup { guard, .. }
-            | Request::WidenDirectories { guard, .. }
-            | Request::Apply { guard, .. }
-            | Request::PlanBatch { guard, .. }
-            | Request::ProbePartial { guard, .. }
-            | Request::Prepare { guard, .. }
-            | Request::HashAndHold { guard, .. }
-            | Request::FinishBasis { guard, .. }
-            | Request::SeedBasis { guard, .. }
-            | Request::StageBasis { guard, .. }
-            | Request::ReuseComparedRange { guard, .. }
-            | Request::HashBlocks { guard, .. }
-            | Request::HashWindow { guard, .. }
-            | Request::WriteRange { guard, .. }
-            | Request::Finalize { guard, .. }
-            | Request::FileHash { guard, .. }
-            | Request::ValidateDigest { guard, .. }
-            | Request::Canonicalize { guard, .. } => guard.is_some(),
-            Request::PutSmallBatch(puts) => puts.iter().any(|put| put.guard.is_some()),
-            Request::HashExistingBatch { files, .. } => {
-                files.iter().any(|file| file.guard.is_some())
-            }
-            Request::PatchSmallBatch(patches) => patches.iter().any(|patch| patch.guard.is_some()),
-            Request::PatchBegin { patch, .. } => patch.guard.is_some(),
-            _ => false,
-        };
-        if has_guard {
-            bail!("an initialized source session rejects caller-supplied guards");
-        }
-        Ok(())
-    }
-
     /// A destination mutation needs an authority before it may touch the
     /// filesystem: the directory a control connection registered with
     /// `AnchorDestination`, the registered root a destination worker was
-    /// initialized with, or the guard a command-restricted receiver attaches
-    /// from its signed grant. Until one of those exists, a request naming an
+    /// initialized with, or the root a command-restricted receiver installs
+    /// from its grant. Until one of those exists, a request naming an
     /// arbitrary pathname is refused.
     pub(crate) fn validate_destination_session_request(&self, request: &Request) -> Result<()> {
         if self.destination_root.is_some() {
             return Ok(());
         }
-        let unrooted = match request {
-            Request::Apply { guard, .. }
-            | Request::WidenDirectories { guard, .. }
-            | Request::Prepare { guard, .. }
-            | Request::SeedBasis { guard, .. }
-            | Request::StageBasis { guard, .. }
-            | Request::ReuseComparedRange { guard, .. }
-            | Request::FinishBasis { guard, .. }
-            | Request::WriteRange { guard, .. }
-            | Request::Finalize { guard, .. } => guard.is_none(),
-            Request::PutSmallBatch(puts) => puts.iter().any(|put| put.guard.is_none()),
-            Request::HashExistingBatch { files, .. } => {
-                files.iter().any(|file| file.guard.is_none())
-            }
-            Request::PatchSmallBatch(patches) => patches.iter().any(|patch| patch.guard.is_none()),
-            Request::PatchBegin { patch, .. } => patch.guard.is_none(),
-            Request::CopyLocal { .. } => true,
-            _ => false,
-        };
-        if unrooted {
+        if matches!(
+            request,
+            Request::Apply { .. }
+                | Request::WidenDirectories { .. }
+                | Request::Prepare { .. }
+                | Request::SeedBasis { .. }
+                | Request::StageBasis { .. }
+                | Request::ReuseComparedRange { .. }
+                | Request::FinishBasis { .. }
+                | Request::WriteRange { .. }
+                | Request::Finalize { .. }
+                | Request::PutSmallBatch(_)
+                | Request::HashExistingBatch { .. }
+                | Request::PatchSmallBatch(_)
+                | Request::PatchBegin { .. }
+                | Request::CopyLocal { .. }
+        ) {
             bail!("{UNROOTED_MUTATION}");
         }
         Ok(())
@@ -2448,8 +2396,25 @@ impl FsOps {
         ops
     }
 
+    /// A command-restricted receiver's session rooted at `directory`, whose
+    /// requests name files by their paths there, for other modules' tests.
+    #[cfg(test)]
+    pub(crate) fn test_restricted(directory: &Path) -> Self {
+        let mut ops = Self::new();
+        ops.install_restricted_destination(
+            Arc::new(Root::open(directory).unwrap()),
+            directory.as_os_str().as_bytes(),
+        );
+        ops
+    }
+
     fn install_destination(&mut self, directory: File, request_prefix: &[u8]) -> Result<()> {
         let root = Arc::new(Root::from_directory(directory)?);
+        self.install_destination_root(root, request_prefix);
+        Ok(())
+    }
+
+    fn install_destination_root(&mut self, root: Arc<Root>, request_prefix: &[u8]) {
         self.fds.clear();
         self.fd_order.clear();
         self.held_basis.take();
@@ -2457,7 +2422,20 @@ impl FsOps {
         self.destination_root = Some(root);
         #[cfg(target_os = "linux")]
         self.listing_requests.clear();
-        Ok(())
+    }
+
+    /// Serve a command-restricted receiver's copy: `root`, which its
+    /// authority opened once for the whole copy, is the destination root of
+    /// every connection, named in requests by `request_prefix`. Missing
+    /// directories are never created on the way to a path: each directory
+    /// this session creates passes the authority.
+    pub(crate) fn install_restricted_destination(
+        &mut self,
+        root: Arc<Root>,
+        request_prefix: &[u8],
+    ) {
+        self.install_destination_root(root, request_prefix);
+        self.create_missing_parents = false;
     }
 
     fn destination_filesystem_info(
@@ -2610,17 +2588,7 @@ impl FsOps {
         }
     }
 
-    fn rooted_destination_target(
-        &self,
-        path: &[u8],
-        guard: Option<&ContainerGuard>,
-    ) -> Result<Option<RootedTarget>> {
-        if guard.is_some() && self.destination_root.is_some() {
-            bail!("destination request mixes registered and guarded root authorities");
-        }
-        if let Some(guard) = guard {
-            return guarded_target(path, guard).map(|target| Some(target.as_rooted()));
-        }
+    fn rooted_destination_target(&self, path: &[u8]) -> Result<Option<RootedTarget>> {
         let Some(root) = &self.destination_root else {
             return Ok(None);
         };
@@ -2633,17 +2601,12 @@ impl FsOps {
             // requests must not silently expand either a registered root or a
             // signed receiver's mutation authority.
             create_missing_parents: false,
-            query_partial_name_limit: false,
         }))
     }
 
     /// Resolve the authority a destination mutation acts under.
-    fn destination_mutation_target(
-        &self,
-        path: &[u8],
-        guard: Option<&ContainerGuard>,
-    ) -> Result<RootedTarget> {
-        let Some(target) = self.rooted_destination_target(path, guard)? else {
+    fn destination_mutation_target(&self, path: &[u8]) -> Result<RootedTarget> {
+        let Some(target) = self.rooted_destination_target(path)? else {
             bail!("{UNROOTED_MUTATION}");
         };
         Ok(target)
@@ -2661,84 +2624,62 @@ impl FsOps {
             Request::DescriptorCopy(_) | Request::BindStream(_) => {
                 bail!("descriptor copies require a separate unrestricted control session")
             }
-            Request::Scan { root, guard, .. }
-            | Request::NewFileOwner {
-                path: root, guard, ..
-            } => {
-                if guard.is_none() {
-                    map(root)?;
-                }
-            }
-            Request::StatMany { paths, guard, .. }
-            | Request::PartialPaths { paths, guard, .. }
-            | Request::PruneLookup { paths, guard } => {
-                if guard.is_none() {
-                    for path in paths {
-                        map(path)?;
-                    }
+            Request::Scan { root, .. } | Request::NewFileOwner { path: root, .. } => map(root)?,
+            Request::StatMany { paths, .. }
+            | Request::PartialPaths { paths, .. }
+            | Request::PruneLookup { paths } => {
+                for path in paths {
+                    map(path)?;
                 }
             }
             Request::PlanBatch {
                 partial_paths,
                 directories,
                 others,
-                guard,
                 ..
             } => {
-                if guard.is_none() {
-                    for path in partial_paths.iter_mut().chain(directories).chain(others) {
-                        map(path)?;
-                    }
-                }
-            }
-            Request::WidenDirectories {
-                directories, guard, ..
-            } => {
-                if guard.is_none() {
-                    for (path, _) in directories {
-                        map(path)?;
-                    }
-                }
-            }
-            Request::Apply { ops, guard } => {
-                if guard.is_none() {
-                    for op in ops {
-                        if let Op::Hardlink { source, .. } = op {
-                            map(source)?;
-                        }
-                        let path = match op {
-                            Op::Mkdir { path, .. }
-                            | Op::Symlink { path, .. }
-                            | Op::Mknod { path, .. }
-                            | Op::Hardlink { path, .. }
-                            | Op::SetMeta { path, .. }
-                            | Op::SetFileMetaIfSame { path, .. }
-                            | Op::Remove { path }
-                            | Op::Rmdir { path }
-                            | Op::Unlink { path } => path,
-                        };
-                        map(path)?;
-                    }
-                }
-            }
-            Request::ProbePartial { path, guard, .. }
-            | Request::Prepare { path, guard, .. }
-            | Request::HashAndHold { path, guard, .. }
-            | Request::FinishBasis { path, guard, .. }
-            | Request::SeedBasis { path, guard, .. }
-            | Request::StageBasis { path, guard, .. }
-            | Request::ReuseComparedRange { path, guard, .. }
-            | Request::HashWindow { path, guard, .. }
-            | Request::HashBlocks { path, guard, .. }
-            | Request::WriteRange { path, guard, .. }
-            | Request::Finalize { path, guard, .. }
-            | Request::FileHash { path, guard, .. }
-            | Request::ValidateDigest { path, guard, .. }
-            | Request::Canonicalize { path, guard } => {
-                if guard.is_none() {
+                for path in partial_paths.iter_mut().chain(directories).chain(others) {
                     map(path)?;
                 }
             }
+            Request::WidenDirectories { directories, .. } => {
+                for (path, _) in directories {
+                    map(path)?;
+                }
+            }
+            Request::Apply { ops } => {
+                for op in ops {
+                    if let Op::Hardlink { source, .. } = op {
+                        map(source)?;
+                    }
+                    let path = match op {
+                        Op::Mkdir { path, .. }
+                        | Op::Symlink { path, .. }
+                        | Op::Mknod { path, .. }
+                        | Op::Hardlink { path, .. }
+                        | Op::SetMeta { path, .. }
+                        | Op::SetFileMetaIfSame { path, .. }
+                        | Op::Remove { path }
+                        | Op::Rmdir { path }
+                        | Op::Unlink { path } => path,
+                    };
+                    map(path)?;
+                }
+            }
+            Request::ProbePartial { path, .. }
+            | Request::Prepare { path, .. }
+            | Request::HashAndHold { path, .. }
+            | Request::FinishBasis { path, .. }
+            | Request::SeedBasis { path, .. }
+            | Request::StageBasis { path, .. }
+            | Request::ReuseComparedRange { path, .. }
+            | Request::HashWindow { path, .. }
+            | Request::HashBlocks { path, .. }
+            | Request::WriteRange { path, .. }
+            | Request::Finalize { path, .. }
+            | Request::FileHash { path, .. }
+            | Request::ValidateDigest { path, .. }
+            | Request::Canonicalize { path } => map(path)?,
             Request::ReadRange { path, .. } | Request::ReadComparedRange { path, .. } => map(path)?,
             Request::CopyLocal { dst, .. } => map(dst)?,
             Request::ReadSmallBatch(reads) => {
@@ -2753,28 +2694,18 @@ impl FsOps {
             }
             Request::PatchSmallBatch(patches) => {
                 for patch in patches {
-                    if patch.guard.is_none() {
-                        map(&mut patch.path)?;
-                    }
-                }
-            }
-            Request::PatchBegin { patch, .. } => {
-                if patch.guard.is_none() {
                     map(&mut patch.path)?;
                 }
             }
+            Request::PatchBegin { patch, .. } => map(&mut patch.path)?,
             Request::HashExistingBatch { files, .. } => {
                 for file in files {
-                    if file.guard.is_none() {
-                        map(&mut file.path)?;
-                    }
+                    map(&mut file.path)?;
                 }
             }
             Request::PutSmallBatch(puts) => {
                 for put in puts {
-                    if put.guard.is_none() {
-                        map(&mut put.path)?;
-                    }
+                    map(&mut put.path)?;
                 }
             }
             Request::ConfigureHashing(_)
@@ -3090,38 +3021,15 @@ impl FsOps {
 
     /// Batches are statted on several threads: on network filesystems each
     /// lstat is a round trip and the planner would otherwise starve the workers.
-    pub fn stat_many(
-        &mut self,
-        paths: &[PathBytes],
-        follow: bool,
-        guard: Option<&ContainerGuard>,
-    ) -> Vec<Option<Entry>> {
-        if let Some(guard) = guard {
-            if follow {
-                return vec![None; paths.len()];
-            }
-            let minimum = self.destination_parallel_minimum(
-                Some(guard),
-                paths.len(),
-                paths.iter().map(Vec::as_slice),
-            );
-            return parallel_map_from(minimum, paths, |path| {
-                let target = guarded_target(path, guard).ok()?;
-                let metadata = target.root.metadata(&target.relative).ok()?;
-                rooted_entry(&target.root, &target.relative, Vec::new(), metadata).ok()
-            });
-        }
+    pub fn stat_many(&mut self, paths: &[PathBytes], follow: bool) -> Vec<Option<Entry>> {
         if let Some(root) = self.destination_root.clone() {
             if follow {
                 return vec![None; paths.len()];
             }
             #[cfg(target_os = "linux")]
             list_nfs_directories_before_stats(&root, paths, &mut self.listing_requests);
-            let minimum = self.destination_parallel_minimum(
-                None,
-                paths.len(),
-                paths.iter().map(Vec::as_slice),
-            );
+            let minimum =
+                self.destination_parallel_minimum(paths.len(), paths.iter().map(Vec::as_slice));
             return parallel_map_init_from(
                 minimum,
                 paths,
@@ -3140,26 +3048,19 @@ impl FsOps {
         })
     }
 
-    fn prune_lookup(
-        &mut self,
-        paths: &[PathBytes],
-        guard: Option<&ContainerGuard>,
-    ) -> Result<Vec<Option<Entry>>> {
+    fn prune_lookup(&mut self, paths: &[PathBytes]) -> Result<Vec<Option<Entry>>> {
         // An anchored destination takes the ordinary lookups' fast path: NFS
         // directories listed first, and each parent opened once for its
         // names. Only a missing entry still reads as absent.
         if let Some(root) = self
             .destination_root
             .clone()
-            .filter(|_| guard.is_none() && !paths.iter().any(|path| path.starts_with(b"/")))
+            .filter(|_| !paths.iter().any(|path| path.starts_with(b"/")))
         {
             #[cfg(target_os = "linux")]
             list_nfs_directories_before_stats(&root, paths, &mut self.listing_requests);
-            let minimum = self.destination_parallel_minimum(
-                None,
-                paths.len(),
-                paths.iter().map(Vec::as_slice),
-            );
+            let minimum =
+                self.destination_parallel_minimum(paths.len(), paths.iter().map(Vec::as_slice));
             return parallel_map_init_from(
                 minimum,
                 paths,
@@ -3173,11 +3074,11 @@ impl FsOps {
             .collect();
         }
         let minimum =
-            self.destination_parallel_minimum(guard, paths.len(), paths.iter().map(Vec::as_slice));
+            self.destination_parallel_minimum(paths.len(), paths.iter().map(Vec::as_slice));
         parallel_map_from(minimum, paths, |path| {
             // Resolve authority before classifying missing paths. An invalid
-            // root/guard must never be mistaken for a missing child.
-            let target = self.rooted_destination_target(path, guard)?;
+            // root must never be mistaken for a missing child.
+            let target = self.rooted_destination_target(path)?;
             let result: Result<Entry> = (|| {
                 if let Some(target) = target {
                     let metadata = target.root.metadata(&target.relative)?;
@@ -3212,11 +3113,7 @@ impl FsOps {
         paths: &[PathBytes],
         sources: Option<&[RegisteredPath]>,
         follow: bool,
-        guard: Option<&ContainerGuard>,
     ) -> Result<Vec<Option<Entry>>> {
-        if guard.is_some() && sources.is_some() {
-            bail!("a guarded destination stat cannot carry source references");
-        }
         if let Some(sources) = sources {
             if self.destination_root.is_some() {
                 bail!("source stat is not valid on a destination worker");
@@ -3288,18 +3185,17 @@ impl FsOps {
         {
             bail!("source stat omitted its registered source references");
         }
-        Ok(self.stat_many(paths, follow, guard))
+        Ok(self.stat_many(paths, follow))
     }
 
     pub fn partial_paths(
         &mut self,
         paths: &[PathBytes],
         copy_id: &CopyId,
-        guard: Option<&ContainerGuard>,
     ) -> Vec<std::result::Result<PathBytes, String>> {
         parallel_map_init(paths, PartialNameLimits::default, |limits, path| {
             let requested = Path::new(OsStr::from_bytes(path));
-            let resolved = if let Some(target) = self.rooted_destination_target(path, guard)? {
+            let resolved = if let Some(target) = self.rooted_destination_target(path)? {
                 let relative = target.relative.to_path_buf();
                 // Validate the leaf even on a cache hit: an empty relative path
                 // names the root, not a file for which we can make a sidecar.
@@ -3321,17 +3217,11 @@ impl FsOps {
         .collect()
     }
 
-    fn annotate_permission_failure(
-        &self,
-        path: &[u8],
-        guard: Option<&ContainerGuard>,
-        access: u32,
-        error: &mut WireError,
-    ) {
+    fn annotate_permission_failure(&self, path: &[u8], access: u32, error: &mut WireError) {
         if error.io_kind != Some(WireIoKind::PermissionDenied) {
             return;
         }
-        let Ok(Some(target)) = self.rooted_destination_target(path, guard) else {
+        let Ok(Some(target)) = self.rooted_destination_target(path) else {
             return;
         };
         if let Some(hint) = directory_permission_hint(&target.root, &target.relative, access) {
@@ -3362,33 +3252,17 @@ impl FsOps {
     }
 
     /// Whether operations on `paths` reach a network filesystem: the one the
-    /// destination root that `guard`, or else the registered root, lies on,
-    /// or one mounted on a directory directly beneath it, such as the target
-    /// of an exact placement. Mounts deeper in the tree are not looked for.
-    fn destination_on_network_file_system(
-        &mut self,
-        guard: Option<&ContainerGuard>,
-        paths: &[&[u8]],
-    ) -> bool {
-        let (identity, guard_root) = match guard {
-            Some(guard) => (
-                RootIdentity {
-                    dev: guard.dev,
-                    ino: guard.ino,
-                },
-                Some(resolve(&guard.root)),
-            ),
-            None => match &self.destination_root {
-                Some(root) => (root.identity(), None),
-                None => return false,
-            },
+    /// destination root lies on, or one mounted on a directory directly
+    /// beneath it, such as the target of an exact placement. Mounts deeper in
+    /// the tree are not looked for.
+    fn destination_on_network_file_system(&mut self, paths: &[&[u8]]) -> bool {
+        let Some(root) = self.destination_root.clone() else {
+            return false;
         };
+        let identity = root.identity();
         let mut entries: Vec<Vec<u8>> = paths
             .iter()
-            .filter_map(|path| match &guard_root {
-                Some(root) => relative_under(root, &resolve(path)).ok(),
-                None => RelativePath::new(path).ok(),
-            })
+            .filter_map(|path| RelativePath::new(path).ok())
             .map(|relative| relative.first().unwrap_or_default().to_vec())
             .collect();
         entries.sort_unstable();
@@ -3396,23 +3270,11 @@ impl FsOps {
         if self.network_entries.len() > NETWORK_ENTRIES_MAX {
             self.network_entries.clear();
         }
-        let mut opened: Option<Option<Arc<Root>>> = None;
         for entry in std::iter::once(Vec::new()).chain(entries) {
             let key = (identity, entry);
             let network = match self.network_entries.get(&key) {
                 Some(&network) => network,
                 None => {
-                    let root = match &guard_root {
-                        None => self.destination_root.clone(),
-                        Some(path) => opened
-                            .get_or_insert_with(|| {
-                                Root::open_verified(path, identity).ok().map(Arc::new)
-                            })
-                            .clone(),
-                    };
-                    let Some(root) = root else {
-                        return false;
-                    };
                     let network = if key.1.is_empty() {
                         root.on_network_file_system()
                     } else {
@@ -3433,13 +3295,12 @@ impl FsOps {
     /// run in parallel (see `parallel_minimum`).
     fn destination_parallel_minimum<'a>(
         &mut self,
-        guard: Option<&ContainerGuard>,
         count: usize,
         paths: impl Iterator<Item = &'a [u8]>,
     ) -> usize {
         let short = (2..PAR_MIN).contains(&count);
         parallel_minimum(
-            short && self.destination_on_network_file_system(guard, &paths.collect::<Vec<_>>()),
+            short && self.destination_on_network_file_system(&paths.collect::<Vec<_>>()),
         )
     }
 
@@ -3447,7 +3308,7 @@ impl FsOps {
     /// its parent's Mkdir in the same batch. Creations in a wave share each
     /// directory between at most two threads. A short phase runs on this
     /// thread unless its operations reach a network filesystem.
-    pub fn apply(&mut self, ops: &[Op], guard: Option<&ContainerGuard>) -> Vec<Option<WireError>> {
+    pub fn apply(&mut self, ops: &[Op]) -> Vec<Option<WireError>> {
         if ops
             .iter()
             .all(|op| matches!(op, Op::Unlink { .. } | Op::Rmdir { .. }))
@@ -3459,7 +3320,7 @@ impl FsOps {
                     ops.iter()
                         .map(|op| match op {
                             Op::Rmdir { path } => self
-                                .destination_mutation_target(path, guard)
+                                .destination_mutation_target(path)
                                 .ok()
                                 .and_then(|target| target.root.metadata(&target.relative).ok())
                                 .map(|metadata| (metadata.dev, metadata.ino)),
@@ -3471,7 +3332,6 @@ impl FsOps {
                 };
             let selected = apply::selected_removals(
                 ops,
-                guard,
                 self.destination_root.clone(),
                 self.destination_prefix.as_deref(),
             );
@@ -3519,13 +3379,13 @@ impl FsOps {
             .flatten()
             .map(|&index| op_path(&ops[index]))
             .collect();
-        let minimum = parallel_minimum(
-            !short.is_empty() && self.destination_on_network_file_system(guard, &short),
-        );
+        let minimum =
+            parallel_minimum(!short.is_empty() && self.destination_on_network_file_system(&short));
         let directories = &self.receiver_directories;
         let owned = self.owned.as_deref();
         let destination_root = self.destination_root.clone();
         let destination_prefix = self.destination_prefix.as_deref();
+        let create_missing_parents = self.create_missing_parents;
         let mut out: Vec<Option<WireError>> = vec![None; ops.len()];
         // A directory this request creates and then gives a group starts
         // private when its starting group may differ, so that group cannot
@@ -3552,7 +3412,6 @@ impl FsOps {
                             path,
                             group,
                             &parents,
-                            guard,
                             destination_root.clone(),
                             destination_prefix,
                         )
@@ -3560,9 +3419,9 @@ impl FsOps {
                 {
                     apply::create_identified_directory(
                         op,
-                        guard,
                         destination_root.clone(),
                         destination_prefix,
+                        create_missing_parents,
                         true,
                     )
                     .map(|created| {
@@ -3588,9 +3447,9 @@ impl FsOps {
                     let narrowing = mode & 0o700 != 0o700;
                     apply::create_identified_directory(
                         op,
-                        guard,
                         destination_root.clone(),
                         destination_prefix,
+                        create_missing_parents,
                         !narrowing,
                     )
                     .map(|created| {
@@ -3601,9 +3460,9 @@ impl FsOps {
                 }
                 _ => apply_one(
                     op,
-                    guard,
                     destination_root.clone(),
                     destination_prefix,
+                    create_missing_parents,
                     owned,
                 ),
             };
@@ -3630,17 +3489,12 @@ impl FsOps {
         let mres = parallel_map_from(minimum, &meta_idx, |&i| {
             // A receiver-chosen mode is decided here, in parallel, once the
             // request's creations are done.
-            let op = directories.resolve_op(
-                &ops[i],
-                guard,
-                destination_root.clone(),
-                destination_prefix,
-            );
+            let op = directories.resolve_op(&ops[i], destination_root.clone(), destination_prefix);
             let result = apply_one(
                 &op,
-                guard,
                 destination_root.clone(),
                 destination_prefix,
+                create_missing_parents,
                 owned,
             );
             // After its group change, even a refused one, as creating it
@@ -3651,7 +3505,6 @@ impl FsOps {
                         path,
                         proposed,
                         created,
-                        guard,
                         destination_root.clone(),
                         destination_prefix,
                     )

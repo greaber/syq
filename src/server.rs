@@ -1041,9 +1041,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
     let _sweep = sweep_on_loss.clone();
     let mut ops = FsOps::with_descriptor_session(descriptor_session.clone());
     if let Some(authority) = &authority {
-        ops.set_hash_policy(authority.hash_policy());
-        ops.set_owned_objects(authority.owned_objects());
-        ops.set_stage_scope(authority.stage_scope());
+        authority.configure_session(&mut ops);
     }
     // The files a copy is writing are let go when its control ends; a
     // receiver that serves many copies would otherwise keep those that never
@@ -1336,10 +1334,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
             },
             None => None,
         };
-        if let Err(error) = ops.validate_source_session_request(&req) {
-            w.write_msg(&Response::Err(format!("{error:#}")))?;
-            continue;
-        }
         match &req {
             Request::WriteRange { data, .. } => {
                 blocks += 1;
@@ -1578,30 +1572,21 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 follow_root,
                 ignore,
                 report_ignored,
-                guard,
             } => {
                 let requested_root = root.clone();
-                let source_scan = if guard.is_none() {
-                    match ops.source_scan_root(source.as_ref()) {
-                        Ok(scan) => scan,
-                        Err(error) => {
-                            w.write_msg(&Response::Err(format!("{error:#}")))?;
-                            continue;
-                        }
+                let source_scan = match ops.source_scan_root(source.as_ref()) {
+                    Ok(scan) => scan,
+                    Err(error) => {
+                        w.write_msg(&Response::Err(format!("{error:#}")))?;
+                        continue;
                     }
-                } else {
-                    None
                 };
-                let destination_scan = if guard.is_none() {
-                    match ops.destination_scan_root(&root) {
-                        Ok(scan) => scan,
-                        Err(error) => {
-                            w.write_msg(&Response::Err(format!("{error:#}")))?;
-                            continue;
-                        }
+                let destination_scan = match ops.destination_scan_root(&root) {
+                    Ok(scan) => scan,
+                    Err(error) => {
+                        w.write_msg(&Response::Err(format!("{error:#}")))?;
+                        continue;
                     }
-                } else {
-                    None
                 };
                 let root = match ops.scan_root(&root) {
                     Ok(root) => root,
@@ -1627,7 +1612,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         &requested_root,
                         source.as_ref(),
                         follow_root,
-                        guard.as_ref(),
                         &mut batch,
                     )?;
                     if let Some(authority) = &authority {
@@ -1668,18 +1652,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     }
                     Ok(wref.borrow_mut().write_msg(&Response::ScanIgnored(paths))?)
                 };
-                let res = if let Some(guard) = &guard {
-                    crate::scan::scan_rooted(
-                        &root,
-                        follow_root,
-                        &ignore,
-                        report_ignored,
-                        guard,
-                        &mut sink,
-                        &mut ignored,
-                        &mut |msg| warns.borrow_mut().push(msg),
-                    )
-                } else if let Some(source) = source_scan {
+                let res = if let Some(source) = source_scan {
                     crate::scan::scan_descriptor(
                         source.root,
                         &source.relative,

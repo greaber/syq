@@ -169,7 +169,7 @@ fn initial_fast_workers(
 }
 
 // Keep tiny files batched, but let eligible local medium files reach the
-// guarded receiver-side copy path without shrinking ordinary range requests.
+// receiver-side copy path without shrinking ordinary range requests.
 const LOCAL_FAST_FILE_BYTES: u64 = 64 * 1024;
 
 fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
@@ -3264,7 +3264,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 path: operator_dst_root.clone(),
                 symlink_policy: opts.operator_symlink_policy,
                 create_missing: !args.existing,
-                guard: None,
             })?,
             "prepare the destination path",
         )? {
@@ -3681,8 +3680,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         TargetCondition::Any
     };
     let mut mutation_root_condition = TargetCondition::Any;
-    let guard_containers = false;
-    let mut container_guard = None;
 
     // Reject copying a directory into itself: if the effective destination is
     // (or is beneath) a source directory, the scanner would discover the
@@ -3995,13 +3992,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     dev: anchor.dev,
                     ino: anchor.ino,
                 };
-                if guard_containers {
-                    container_guard = Some(ContainerGuard {
-                        root: dst_root.clone(),
-                        dev: anchor.dev,
-                        ino: anchor.ino,
-                    });
-                }
             }
             destination_anchor
                 .set(anchor)
@@ -4019,9 +4009,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             },
         )?;
         mutation_root_condition = target_identity(&created);
-        if guard_containers {
-            container_guard = Some(target_container(&dst_root, &created));
-        }
     }
     if debug() {
         crate::output::diagnostic!(
@@ -4379,8 +4366,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         dst_root: dst_root.clone(),
         exact_condition,
         mutation_root_condition,
-        container_guard,
-        guard_containers,
         buffer: if defer_destination_mutations {
             Some(Vec::new())
         } else {
@@ -4719,7 +4704,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     let single_direct_candidate =
                         autotune && opts.copy_policy(bwlimit.is_some()).allows_receiver_copy() && {
                             let jobs = sched.jobs.lock().unwrap();
-                            jobs.len() == 1 && jobs[0].container_guard.is_none()
+                            jobs.len() == 1
                         };
                     let mut initial = if multiplex_small_files {
                         start_rule(args.connections).batched(file_jobs, file_bytes)
@@ -5120,7 +5105,6 @@ fn stat_many_registered(
             paths,
             sources,
             follow,
-            guard: None,
         })?,
         "stat",
     )? {
@@ -5134,7 +5118,6 @@ fn stat_many_registered(
 fn inspect_destination_paths(
     conn: &mut dyn Conn,
     mut paths: Vec<PathBytes>,
-    guard: Option<ContainerGuard>,
     context: &'static str,
 ) -> Result<Vec<Option<Entry>>> {
     if paths.is_empty() {
@@ -5145,12 +5128,12 @@ fn inspect_destination_paths(
     });
     if paths.len() > 1 && bytes > SOURCE_BATCH_PATH_BYTES {
         let tail = paths.split_off(paths.len() / 2);
-        let mut entries = inspect_destination_paths(conn, paths, guard.clone(), context)?;
-        entries.extend(inspect_destination_paths(conn, tail, guard, context)?);
+        let mut entries = inspect_destination_paths(conn, paths, context)?;
+        entries.extend(inspect_destination_paths(conn, tail, context)?);
         return Ok(entries);
     }
     let count = paths.len();
-    match ok(conn.call(Request::PruneLookup { paths, guard })?, context)? {
+    match ok(conn.call(Request::PruneLookup { paths })?, context)? {
         Response::Stats(entries) if entries.len() == count => Ok(entries),
         other => bail!("unexpected destination inspection response {other:?}"),
     }
@@ -5158,14 +5141,6 @@ fn inspect_destination_paths(
 
 fn target_identity(entry: &Entry) -> TargetCondition {
     TargetCondition::Matches {
-        dev: entry.dev,
-        ino: entry.ino,
-    }
-}
-
-fn target_container(root: &[u8], entry: &Entry) -> ContainerGuard {
-    ContainerGuard {
-        root: root.to_vec(),
         dev: entry.dev,
         ino: entry.ino,
     }
@@ -5199,7 +5174,7 @@ fn mkdir_root(
         mode,
         condition,
     }];
-    match ok(conn.call(Request::Apply { ops, guard: None })?, "mkdir")? {
+    match ok(conn.call(Request::Apply { ops })?, "mkdir")? {
         Response::Applied(errs) => mkdir_apply_result(errs)?,
         other => bail!("unexpected response {other:?}"),
     }
@@ -5259,7 +5234,7 @@ fn stat_one(conn: &mut dyn Conn, path: &[u8], follow: bool) -> Result<Option<Ent
 /// lookup must not let --as-new or --if-exists=keep replace an existing entry.
 fn inspect_placement_target(conn: &mut dyn Conn, path: &[u8]) -> Result<Option<Entry>> {
     Ok(
-        inspect_destination_paths(conn, vec![path.to_vec()], None, "inspect placement target")?
+        inspect_destination_paths(conn, vec![path.to_vec()], "inspect placement target")?
             .pop()
             .flatten(),
     )
@@ -5634,11 +5609,9 @@ fn stat_and_canonicalize(
         paths: vec![path.to_vec()],
         sources: None,
         follow: false,
-        guard: None,
     })?;
     conn.send(Request::Canonicalize {
         path: path.to_vec(),
-        guard: None,
     })?;
     // Consume both replies before interpreting either endpoint error so the
     // reusable control stream cannot be left one response behind.

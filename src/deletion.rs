@@ -177,8 +177,7 @@ impl DirectoryBatch {
             .is_some_and(|parent| Arc::ptr_eq(&parent.root, root) && parent.parents == parents);
         if !reuse {
             // Release the previous directory before resolving or waiting on
-            // another one. Root object identity also separates mount views and
-            // roots revalidated by guarded requests.
+            // another one. Root object identity also separates mount views.
             #[cfg(target_os = "linux")]
             {
                 self.held = None;

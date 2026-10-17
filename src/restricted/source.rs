@@ -401,13 +401,6 @@ impl SourceConnection {
                 .clone()
                 .context("approved source request omitted its registered reference")
         };
-        let no_guard = |guard: &Option<crate::proto::ContainerGuard>| -> Result<()> {
-            ensure!(
-                guard.is_none(),
-                "approved source rejects caller-supplied guards"
-            );
-            Ok(())
-        };
         let range = |off: u64, len: u64| -> Result<()> {
             ensure!(
                 off.checked_add(len).is_some_and(
@@ -476,20 +469,15 @@ impl SourceConnection {
                 );
             }
             Request::Scan {
-                source: reference,
-                guard,
-                ..
+                source: reference, ..
             } => {
-                no_guard(guard)?;
                 paths.push(source(reference)?);
             }
             Request::StatMany {
                 paths: labels,
                 sources,
-                guard,
                 ..
             } => {
-                no_guard(guard)?;
                 paths = sources
                     .clone()
                     .context("source stat omitted registered references")?;
@@ -544,10 +532,8 @@ impl SourceConnection {
                 len,
                 block,
                 which,
-                guard,
                 ..
             } => {
-                no_guard(guard)?;
                 ensure!(
                     matches!(which, Which::Final),
                     "approved source cannot hash a partial"
@@ -561,11 +547,8 @@ impl SourceConnection {
                 paths.push(source(reference)?);
             }
             Request::FileHash {
-                source: reference,
-                guard,
-                ..
+                source: reference, ..
             } => {
-                no_guard(guard)?;
                 paths.push(source(reference)?);
             }
             Request::TransportStats => {}
@@ -605,16 +588,11 @@ impl SourceConnection {
     /// reading, rather than learning that it exceeded approval after EOF.
     pub(crate) fn file_hash(&self, ops: &mut FsOps, request: &Request) -> Result<Response> {
         self.authorize(request)?;
-        let Request::FileHash {
-            path,
-            source,
-            guard,
-        } = request
-        else {
+        let Request::FileHash { path, source } = request else {
             bail!("expected an approved source file hash")
         };
         let mut first = true;
-        ops.file_hash_checked(path, source.as_ref(), guard.as_ref(), &mut |file, size| {
+        ops.file_hash_checked(path, source.as_ref(), &mut |file, size| {
             let state = self.authority.state.lock().unwrap();
             self.authority.check_open(&state)?;
             drop(state);

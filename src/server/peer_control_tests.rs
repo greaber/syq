@@ -145,7 +145,6 @@ fn bridged_control_accepts_metadata_but_refuses_file_payloads() {
             scanned: crate::proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
-            guard: None,
             group: None,
             update: None,
         }),
@@ -161,7 +160,6 @@ fn bridged_control_accepts_metadata_but_refuses_file_payloads() {
             off: 0,
             hash: fsops::content_digest(b"data"),
             data: b"data".to_vec().into(),
-            guard: None,
         },
         Request::PutSmallBatch(Vec::new()),
         Request::CopySmallFiles(vec![SmallCopyPayload {
@@ -239,7 +237,6 @@ fn ordinary_ssh_control_keeps_its_existing_payload_support() {
             scanned: crate::proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
-            guard: None,
             group: None,
             update: None,
         }),
@@ -254,7 +251,6 @@ fn ordinary_ssh_control_keeps_its_existing_payload_support() {
             off: 0,
             hash: fsops::content_digest(b"data"),
             data: b"data".to_vec().into(),
-            guard: None,
         }),
         Response::Ok
     ));
@@ -342,7 +338,6 @@ fn a_copys_files_are_let_go_when_its_control_ends() {
             scanned: crate::proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
-            guard: None,
             group: None,
             update: None,
         }),

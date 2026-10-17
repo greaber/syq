@@ -67,7 +67,6 @@ impl ReceiverDirectories {
     pub(super) fn resolve_op<'a>(
         &self,
         op: &'a Op,
-        guard: Option<&ContainerGuard>,
         destination_root: Option<Arc<Root>>,
         destination_prefix: Option<&[u8]>,
     ) -> Cow<'a, Op> {
@@ -92,7 +91,7 @@ impl ReceiverDirectories {
                 // A failed decision keeps the mode; the operation itself
                 // reports what is wrong with its path.
                 let target =
-                    apply::operation_target(path, guard, destination_root, destination_prefix);
+                    apply::operation_target(path, destination_root, destination_prefix, false);
                 if let Ok(Some((mode, identity))) =
                     target.and_then(|target| self.directory_mode(&target, meta.mode))
                 {
@@ -256,7 +255,6 @@ impl FsOps {
     pub(super) fn creation_mode(
         &mut self,
         path: &[u8],
-        guard: Option<&ContainerGuard>,
         inplace: bool,
         mode: u32,
         mut flags: u8,
@@ -276,7 +274,7 @@ impl FsOps {
         let final_mode = match scanned {
             ScannedDestination::File(found) => found & 0o7777,
             _ => {
-                let target = self.destination_mutation_target(path, guard)?;
+                let target = self.destination_mutation_target(path)?;
                 let mut meta = Meta {
                     mode,
                     uid: 0,

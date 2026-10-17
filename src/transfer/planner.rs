@@ -105,8 +105,6 @@ pub(super) struct Planner<'a> {
     pub(super) dst_root: PathBytes,
     pub(super) exact_condition: TargetCondition,
     pub(super) mutation_root_condition: TargetCondition,
-    pub(super) container_guard: Option<ContainerGuard>,
-    pub(super) guard_containers: bool,
     /// A missing retained operator directory: (request prefix, creation
     /// condition, whether it is the destination root). Create it only after
     /// final-destination conflict checks. Restricted transfers use the
@@ -239,7 +237,6 @@ impl<'a> PruneWalk<'a> {
 pub(super) fn lookup_prune_aliases(
     conn: &mut dyn Conn,
     walk: &PruneWalk<'_>,
-    guard: Option<&ContainerGuard>,
 ) -> Result<std::collections::HashMap<(u64, u64), Claim>> {
     let mut aliases = std::collections::HashMap::new();
     if walk.entries.is_empty() {
@@ -273,7 +270,6 @@ pub(super) fn lookup_prune_aliases(
             }
             if let Err(error) = conn.send(Request::PruneLookup {
                 paths: paths.clone(),
-                guard: guard.cloned(),
             }) {
                 if !conn.is_dead() {
                     crate::conn::drain_range_replies(conn, pending.len(), "inspect prune aliases")?;
@@ -558,7 +554,6 @@ impl Planner<'_> {
         let current = match ok(
             self.dst.call(Request::PruneLookup {
                 paths: vec![self.dst_root.clone()],
-                guard: None,
             })?,
             "inspect destination root",
         )? {
@@ -1597,13 +1592,6 @@ impl Planner<'_> {
                         dev: anchor.dev,
                         ino: anchor.ino,
                     };
-                    if self.guard_containers {
-                        self.container_guard = Some(ContainerGuard {
-                            root,
-                            dev: anchor.dev,
-                            ino: anchor.ino,
-                        });
-                    }
                 }
                 self.destination_anchor
                     .set(anchor)
@@ -1617,9 +1605,6 @@ impl Planner<'_> {
                 };
                 let created = mkdir_root(self.dst, &root, condition, mode)?;
                 self.mutation_root_condition = target_identity(&created);
-                if self.guard_containers {
-                    self.container_guard = Some(target_container(&root, &created));
-                }
             }
         }
         // Validated: from here on they are ordinary entries (the one that is
@@ -2854,9 +2839,6 @@ impl Planner<'_> {
                 .context("new exact target was not a directory after creation")?;
             self.exact_condition = target_identity(&created);
             self.mutation_root_condition = target_identity(&created);
-            if self.guard_containers {
-                self.container_guard = Some(target_container(&self.dst_root, &created));
-            }
         }
         // A receiver applies a request's metadata after all of its
         // creations, so new directories take their group with the last ones.
@@ -3269,7 +3251,6 @@ impl Planner<'_> {
             || self.opts.dry_run
             || self.container_access.is_some()
             || self.destination_children_known_missing
-            || self.container_guard.is_some()
         {
             return Ok(());
         }
@@ -3292,7 +3273,6 @@ impl Planner<'_> {
                 copy_id: self.opts.copy_id,
                 directories: directories.clone(),
                 others: others.clone(),
-                guard: None,
                 strict_metadata: self.opts.expressions.update.is_some(),
             })?,
             "plan destination batch",
@@ -3694,7 +3674,6 @@ impl Planner<'_> {
                 rel_bytes,
                 entry,
                 target_condition,
-                container_guard: self.container_guard.clone(),
                 attempt: 0,
                 done: Arc::new(AtomicU64::new(0)),
                 inplace,
@@ -3876,7 +3855,6 @@ impl Planner<'_> {
                         self.dst,
                         self.opts,
                         self.progress,
-                        self.container_guard.clone(),
                         &mut self.directory_restorations,
                         unreadable,
                         0o500,
@@ -3988,7 +3966,7 @@ impl Planner<'_> {
                 } else {
                     std::collections::HashMap::new()
                 };
-            let aliases = lookup_prune_aliases(self.dst, &walk, self.container_guard.as_ref())?;
+            let aliases = lookup_prune_aliases(self.dst, &walk)?;
             let mut shielded = walk.shielded;
             let recovery_parents = walk.recovery_parents;
             for entry in walk.entries {
@@ -4382,12 +4360,7 @@ impl Planner<'_> {
             let inspected = if strict_preview {
                 self.inspect_preview(lookup)?
             } else {
-                inspect_destination_paths(
-                    self.dst,
-                    lookup,
-                    self.container_guard.clone(),
-                    "inspect destination for --copy-if",
-                )?
+                inspect_destination_paths(self.dst, lookup, "inspect destination for --copy-if")?
             };
             if preserve && inspected.iter().any(Option::is_some) {
                 // Strict lookup supplies expression fields. Rich preservation
@@ -4473,7 +4446,6 @@ impl Planner<'_> {
         let entries = inspect_tolerating_denials(
             self.dst,
             &lookups,
-            self.container_guard.clone(),
             &self.dst_root,
             &mut self.blocked_directory_paths,
             &mut |directory, error| {
@@ -4605,13 +4577,7 @@ impl Planner<'_> {
             results.extend(self.apply(tail)?);
             return Ok(results);
         }
-        match ok(
-            self.dst.call(Request::Apply {
-                ops,
-                guard: self.container_guard.clone(),
-            })?,
-            "apply",
-        )? {
+        match ok(self.dst.call(Request::Apply { ops })?, "apply")? {
             Response::Applied(v) => Ok(v),
             other => bail!("unexpected response {other:?}"),
         }
@@ -4717,13 +4683,11 @@ impl Planner<'_> {
     /// to be staged. A file that must be new (an --as-new file, or a new
     /// file the error policies protect) is staged and published without
     /// replacing anything, so readers see no partial file and a retry
-    /// finishes what an interrupted attempt left; placement guards are
-    /// enforced by publication.
+    /// finishes what an interrupted attempt left.
     fn in_place_allowed(&self, dst: &[u8], target_condition: TargetCondition) -> bool {
         self.opts.inplace
             && target_condition == TargetCondition::Any
             && !(self.opts.new_target && dst == self.dst_root)
-            && self.container_guard.is_none()
     }
 
     /// Under `--in-place=update`, why the existing regular file
@@ -4852,7 +4816,6 @@ impl Planner<'_> {
             let request = Request::NewFileOwner {
                 path: directory,
                 probe: !self.opts.dry_run,
-                guard: self.container_guard.clone(),
             };
             self.new_file_owner = match ok(self.dst.call(request).ok()?, "new file owner").ok()? {
                 Response::NewFileOwner(owner) => Some(owner),
@@ -5025,7 +4988,6 @@ impl Planner<'_> {
             self.dst,
             self.opts,
             self.progress,
-            self.container_guard.clone(),
             &mut self.directory_restorations,
             directories,
             access,
@@ -5159,7 +5121,6 @@ fn ignore_pattern_is_unanchored(pattern: &str) -> bool {
 pub(super) fn inspect_tolerating_denials(
     conn: &mut dyn Conn,
     paths: &[PathBytes],
-    guard: Option<ContainerGuard>,
     dst_root: &[u8],
     blocked: &mut std::collections::HashSet<PathBytes>,
     report: &mut dyn FnMut(&[u8], &anyhow::Error),
@@ -5172,12 +5133,7 @@ pub(super) fn inspect_tolerating_denials(
         return Ok(results);
     }
     let batch = visible.iter().map(|&index| paths[index].clone()).collect();
-    match inspect_destination_paths(
-        conn,
-        batch,
-        guard.clone(),
-        "inspect destination for preview",
-    ) {
+    match inspect_destination_paths(conn, batch, "inspect destination for preview") {
         Ok(entries) => {
             for (&index, entry) in visible.iter().zip(entries) {
                 results[index] = entry;
@@ -5193,14 +5149,8 @@ pub(super) fn inspect_tolerating_denials(
                 for half in [first, second] {
                     let subset: Vec<PathBytes> =
                         half.iter().map(|&index| paths[index].clone()).collect();
-                    let entries = inspect_tolerating_denials(
-                        conn,
-                        &subset,
-                        guard.clone(),
-                        dst_root,
-                        blocked,
-                        report,
-                    )?;
+                    let entries =
+                        inspect_tolerating_denials(conn, &subset, dst_root, blocked, report)?;
                     for (&index, entry) in half.iter().zip(entries) {
                         results[index] = entry;
                     }
@@ -5239,7 +5189,6 @@ fn widen_directory_batch(
     dst: &mut dyn Conn,
     opts: &Opts,
     progress: &Progress,
-    guard: Option<ContainerGuard>,
     restorations: &mut std::collections::HashMap<PathBytes, crate::proto::DirectoryMode>,
     directories: Vec<(PathBytes, TargetCondition)>,
     access: u32,
@@ -5254,7 +5203,6 @@ fn widen_directory_batch(
                 directories: batch,
                 // Without -p the receiver restores the modes it saves.
                 remember: !opts.perms,
-                guard: guard.clone(),
                 access,
             })?,
             "prepare directory permissions",

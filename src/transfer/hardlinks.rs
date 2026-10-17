@@ -358,7 +358,6 @@ impl Planner<'_> {
             source.call(Request::FileHash {
                 path: follower.src.clone(),
                 source: Some(follower.source.clone()),
-                guard: None,
             })?,
             "hash hardlink source",
         )?;
@@ -366,7 +365,6 @@ impl Planner<'_> {
             self.dst.call(Request::FileHash {
                 path: follower.dst.clone(),
                 source: None,
-                guard: self.container_guard.clone(),
             })?,
             "hash hardlink destination",
         )?;
@@ -593,7 +591,6 @@ impl Worker {
                 meta,
                 flags: self.unchanged_flags(job),
                 condition: job.target_condition,
-                guard: job.container_guard.clone(),
             })?,
             "finish content-identical destination",
         )?;
