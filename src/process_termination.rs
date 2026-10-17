@@ -379,12 +379,14 @@ mod tests {
             ("refused", Signal(libc::SIGTERM), None, Some(60_000), true),
             ("watchdog", Code(STALLED), None, Some(200), false),
             // A stalled process still removes what must not outlive it,
-            // such as its socket directory, but nothing slower.
+            // such as its socket directory, but nothing slower. The quick
+            // cleanup gets only the last tenth of the cap; this cap leaves a
+            // busy runner 200 ms to create the marker.
             (
                 "watchdog-first",
                 Code(STALLED),
                 Some("first"),
-                Some(200),
+                Some(2_000),
                 false,
             ),
             // That quick cleanup cannot hold the process either.
@@ -448,7 +450,7 @@ mod tests {
             assert_eq!(
                 std::fs::read_to_string(&marker).ok().as_deref(),
                 marked,
-                "{mode}"
+                "{context}"
             );
         }
     }
