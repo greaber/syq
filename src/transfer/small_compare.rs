@@ -243,11 +243,22 @@ impl Worker {
     /// its reused blocks, large enough to clone. A file updated in place is
     /// staged only if the receiver refuses it as it writes, and is checked
     /// then (`stage_holds_reused`).
+    /// A file whose size and modification time already match its source's,
+    /// compared only because of `--hash`, is probably unchanged: it is
+    /// hashed where it is, and kept, without a clone that its filesystem
+    /// may have to read from disk where the file itself is cached. If it
+    /// differs after all, the blocks its patch reuses are checked as its
+    /// stage is built.
     fn clones_first(&self, job: &WorkerJob) -> bool {
         let existing = job.dst_entry.as_deref();
         !job.inplace
             && self.reuses_blocks_for(job, existing)
-            && existing.is_some_and(|existing| existing.size >= crate::proto::CLONE_FIRST_MIN_BYTES)
+            && existing.is_some_and(|existing| {
+                existing.size >= crate::proto::CLONE_FIRST_MIN_BYTES
+                    && !self
+                        .opts
+                        .metadata_matches(&job.rel_bytes, &job.entry, existing)
+            })
     }
 
     /// The largest file `--in-place=update` writes in place to compare in

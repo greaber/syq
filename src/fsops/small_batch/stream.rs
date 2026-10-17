@@ -205,7 +205,21 @@ impl FsOps {
             stream.old = Some(old);
         }
         let reused = patch.len - stream.data_len;
+        // The clone the comparison hashed is the stage, whatever the patch
+        // reuses (`create_unregistered_stage`).
+        let held = self
+            .held_clones
+            .get(&patch.path, &patch.copy_id)
+            .map(|held| -> Result<PatchSource<'_>> {
+                Ok(PatchSource {
+                    old: held.file.try_clone()?,
+                    basis: fingerprint(&held.created),
+                    patch,
+                })
+            })
+            .transpose()?;
         let source = match (&stream.old, patch.basis) {
+            _ if held.is_some() => held,
             (Some(old), Some(basis))
                 if reused >= CLONE_MIN_REUSED
                     && reused * 2 >= patch.len

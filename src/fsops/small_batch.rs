@@ -180,6 +180,10 @@ thread_local! {
     /// replaces, before the differing blocks are written over it.
     static AFTER_SEEDING: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
+    /// Runs when a stage begins its checked copy, once the fingerprint of
+    /// the file it copies has been checked.
+    static BEFORE_CHECKED_COPY: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Start `work` on a thread of `scope`, unless the system refuses one.
@@ -763,14 +767,16 @@ impl FsOps {
                 .div_ceil(MIN_HASH_BLOCK_BYTES)
                 .saturating_mul(MIN_HASH_BLOCK_BYTES),
         );
-        let dev = target.root.identity().dev;
+        // A filesystem mounted below the root is judged on its own.
+        let dev = old.metadata()?.dev();
         if len < CLONE_FIRST_MIN_BYTES || !self.held_clones.may_hold(dev) {
             return Ok(None);
         }
         // A stage from an earlier comparison of the file goes first.
         self.held_clones.discard(&read.path, copy_id);
         let creation = sidecars::begin()?;
-        let Some((partial, label, file)) = self.clone_to_held_stage(old, len, copy_id, target)?
+        let Some((partial, label, file)) =
+            self.clone_to_held_stage(old, len, dev, copy_id, target)?
         else {
             return Ok(None);
         };
@@ -810,6 +816,7 @@ impl FsOps {
         &mut self,
         old: &File,
         len: u64,
+        dev: u64,
         copy_id: &CopyId,
         target: &RootedTarget,
     ) -> Result<Option<(RelativePath, PathBuf, File)>> {
@@ -842,19 +849,19 @@ impl FsOps {
                 refused.raw_os_error(),
                 Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EXDEV | libc::ENOSYS)
             ) {
-                self.held_clones.cannot_clone(target.root.identity().dev);
+                self.held_clones.cannot_clone(dev);
             }
             Ok(None)
         }
         // A clone is the whole file there.
         #[cfg(target_os = "macos")]
         {
-            let _ = len;
+            let _ = (len, dev);
             self.clone_to_stage(old, old.metadata()?.len(), copy_id, target)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            let _ = (old, len, copy_id, target);
+            let _ = (old, len, dev, copy_id, target);
             Ok(None)
         }
     }
@@ -1421,13 +1428,19 @@ impl FsOps {
                 .len
                 .div_ceil(MIN_HASH_BLOCK_BYTES)
                 .saturating_mul(MIN_HASH_BLOCK_BYTES);
-            let len = source
-                .basis
-                .len
-                .min(reusable)
-                .min(source.old.metadata()?.len());
+            // Every reused block lies within the file as compared (`basis`).
+            // A file that has shrunk since copies short, and the blocks it
+            // no longer holds fail the check below.
+            let len = source.basis.len.min(reusable);
             #[cfg(test)]
-            super::basis_copy::SEEDED.set(len);
+            {
+                super::basis_copy::SEEDED.set(len);
+                BEFORE_CHECKED_COPY.with_borrow_mut(|hook| {
+                    if let Some(hook) = hook {
+                        hook()
+                    }
+                });
+            }
             if len > 0 && super::basis_copy::try_clone(&source.old, &stage.file, len) {
                 return self.stage_holds_reused(stage, patch);
             }
@@ -1793,10 +1806,19 @@ impl FsOps {
         mode: u32,
         fresh: bool,
     ) -> Result<SmallStage> {
-        if let Some(held) = self.held_clones.take(&put.path, &put.copy_id) {
-            #[cfg(debug_assertions)]
-            record_test_event("SYQ_TEST_CLONE_FIRST", format_args!("staged"))?;
-            return Ok(held.into_stage(target));
+        // Only a patch builds on the clone its comparison hashed (its
+        // source is that clone, `stage_patch`): it writes the blocks that
+        // differ over it and gives it the patch's length. Any other stage is
+        // written whole from the start, and must not find old bytes past the
+        // data, so the clone goes first.
+        if source.is_some() {
+            if let Some(held) = self.held_clones.take(&put.path, &put.copy_id) {
+                #[cfg(debug_assertions)]
+                record_test_event("SYQ_TEST_CLONE_FIRST", format_args!("staged"))?;
+                return Ok(held.into_stage(target));
+            }
+        } else {
+            self.held_clones.discard(&put.path, &put.copy_id);
         }
         #[cfg(target_os = "macos")]
         if let Some(source) = source {
@@ -2489,6 +2511,77 @@ mod tests {
             if streamed {
                 assert_eq!(entries(directory), 1, "{case}: a stage was left");
             }
+        }
+    }
+
+    /// Run `f` with `hook` run as each stage begins its checked copy.
+    fn before_checked_copy<R>(hook: impl FnMut() + 'static, f: impl FnOnce() -> R) -> R {
+        BEFORE_CHECKED_COPY.set(Some(Box::new(hook)));
+        let result = f();
+        BEFORE_CHECKED_COPY.set(None);
+        result
+    }
+
+    #[test]
+    fn a_file_that_shrinks_during_its_stages_copy_fails_its_patch() {
+        // The file a patch replaces shrinks, or is emptied, once its
+        // fingerprint has been checked and before its stage clones or copies
+        // it: the blocks the patch reuses that it no longer holds fail the
+        // check, and neither a batch patch nor a streamed one is published.
+        let block = MIN_HASH_BLOCK_BYTES;
+        let cases = [false, true].into_iter().flat_map(|streamed| {
+            [40 * block, 0]
+                .into_iter()
+                .flat_map(move |keep| [true, false].map(|refuse| (streamed, keep, refuse)))
+        });
+        for (streamed, keep, refuse) in cases {
+            let temporary = crate::test_support::tempdir().unwrap();
+            let directory = temporary.path();
+            let old: Vec<u8> = (0..96 * block).map(|i| (i % 251) as u8 | 1).collect();
+            let mut new = old.clone();
+            new[20 * block as usize] ^= 0xff;
+            fs::write(directory.join("file"), &old).unwrap();
+            let before = fs::metadata(directory.join("file")).unwrap().ino();
+            let mut ops = receiver(directory);
+            let algorithm = ops.hash_policy.algorithm;
+            let hashed = ops.hash_existing_batch(
+                block,
+                &[ExistingRead {
+                    path: b"file".to_vec(),
+                    len: new.len() as u64,
+                    condition: TargetCondition::Any,
+                    guard: None,
+                    clone_for: None,
+                }],
+                0,
+            );
+            let patch = patch_from("file", &new, block, hashed[0].as_ref().unwrap(), algorithm);
+            let shrink = directory.join("file");
+            let case = format!("streamed {streamed} keeping {keep} refusing clones {refuse}");
+            let outcome = refusing_clones(refuse, || {
+                before_checked_copy(
+                    move || {
+                        File::options()
+                            .write(true)
+                            .open(&shrink)
+                            .unwrap()
+                            .set_len(keep)
+                            .unwrap()
+                    },
+                    || {
+                        if streamed {
+                            stream_patch(&mut ops, &patch, &pieces(&patch, 1), true, |_| {}).1
+                        } else {
+                            ops.patch_small_batch(std::slice::from_ref(&patch))
+                                .unwrap()
+                                .remove(0)
+                        }
+                    },
+                )
+            });
+            assert!(outcome.is_err(), "{case}: {outcome:?}");
+            let status = fs::metadata(directory.join("file")).unwrap();
+            assert_eq!((status.ino(), status.len()), (before, keep), "{case}");
         }
     }
 

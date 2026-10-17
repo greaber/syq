@@ -1143,6 +1143,74 @@ fn a_file_changed_unseen_after_its_comparison_gets_the_sources_bytes() {
     }
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn a_file_copied_whole_after_its_comparison_failed_has_its_own_length() {
+    // A file cloned before its comparison, whose comparison then fails, is
+    // copied whole instead. That copy writes a stage from its start, so the
+    // clone, longer than the new file, must not be that stage: the new file
+    // has the source's length, and nothing is left behind.
+    let clones = filesystem_clones();
+    for route in ["local", "push"] {
+        let t = Tmp::new();
+        let old = prng(1_179_648, 970);
+        let source = prng(1_114_113, 971);
+        write(&t.path("src/file"), &source);
+        write(&t.path("dst/file"), &old);
+        set_mtime(&t.path("dst/file"), 1);
+        let events = t.path("clones");
+        let out = reusing_copy(&t, route, &[])
+            .env("SYQ_TEST_FAIL_DIFFERING_READ_NAME", "file")
+            .env("SYQ_TEST_CLONE_FIRST", &events)
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        let copied = read(&t.path("dst/file"));
+        assert_eq!(copied.len(), source.len(), "{route}");
+        assert!(copied == source, "{route}");
+        let events = fs::read_to_string(&events).unwrap_or_default();
+        if clones {
+            assert!(events.contains("cloned"), "{route}: {events}");
+            assert!(!events.contains("staged"), "{route}: {events}");
+        }
+        assert!(partial_files(&t.path("dst")).is_empty(), "{route}");
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_file_compared_only_because_of_hash_is_not_cloned() {
+    // With --hash, a file whose size and modification time match its
+    // source's is compared although it is probably unchanged: it is hashed
+    // where it is, without a clone. One that differs after all is patched
+    // from blocks checked as its stage is built.
+    let t = Tmp::new();
+    let same = prng(2 << 20, 980);
+    write(&t.path("src/same"), &same);
+    write(&t.path("dst/same"), &same);
+    let source = prng(2 << 20, 981);
+    let mut old = source.clone();
+    old[(1 << 20) + 3] ^= 1;
+    write(&t.path("src/edited"), &source);
+    write(&t.path("dst/edited"), &old);
+    for side in ["src", "dst"] {
+        for name in ["same", "edited"] {
+            set_mtime(&t.path(&format!("{side}/{name}")), 1_700_000_000);
+        }
+    }
+    let events = t.path("clones");
+    let out = reusing_copy(&t, "local", &["--checksum"])
+        .env("SYQ_TEST_CLONE_FIRST", &events)
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert!(read(&t.path("dst/same")) == same);
+    assert!(read(&t.path("dst/edited")) == source);
+    let events = fs::read_to_string(&events).unwrap_or_default();
+    assert!(!events.contains("cloned"), "{events}");
+    assert!(partial_files(&t.path("dst")).is_empty());
+}
+
 #[test]
 fn a_leftover_partial_sends_a_replaced_file_to_the_resuming_path() {
     let t = Tmp::new();

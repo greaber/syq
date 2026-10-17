@@ -2034,6 +2034,14 @@ impl FsOps {
         block: u64,
         chunk: u64,
     ) -> Result<DifferingBlocks> {
+        // Tests fail the grouped comparison's read of one file, and no other
+        // read of it.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_FAIL_DIFFERING_READ_NAME")
+            .is_some_and(|name| resolve(&read.path).file_name() == Some(name.as_os_str()))
+        {
+            bail!("test comparison read failure");
+        }
         let len = u64::from(read.len);
         let algorithm = self.hash_policy.algorithm;
         let mut matching = Vec::with_capacity(len.div_ceil(block) as usize);
