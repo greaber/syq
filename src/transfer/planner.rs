@@ -3695,11 +3695,11 @@ impl Planner<'_> {
         if placement != TargetCondition::Any {
             return placement;
         }
+        let conditions = crate::checks::enabled(crate::checks::Check::ExistingFileConditions);
         match destination {
-            None if self.opts.protects_existing_contents() || self.opts.ignore_existing => {
-                TargetCondition::Absent
-            }
-            Some(existing) if self.opts.existing => TargetCondition::Matches {
+            None if self.opts.protects_existing_contents() => TargetCondition::Absent,
+            None if self.opts.ignore_existing && conditions => TargetCondition::Absent,
+            Some(existing) if self.opts.existing && conditions => TargetCondition::Matches {
                 dev: existing.dev,
                 ino: existing.ino,
             },

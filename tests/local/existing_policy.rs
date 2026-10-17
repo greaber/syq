@@ -532,36 +532,48 @@ fn hard_links_meet_the_existing_file_policy_of_their_names() {
 
 /// Under `--if-exists=keep` a file is created without replacing anything:
 /// one another program creates at its name while the copy runs is kept, and
-/// the copy skips it, as it skips one it found, on every receiver.
+/// the copy skips it, as it skips one it found, on every receiver. A debug
+/// build with the check switched off replaces it, as copies did before it.
 #[test]
 fn a_file_that_appears_under_keep_is_kept_and_skipped() {
-    let t = Tmp::new();
-    write(&t.path("src/file"), &prng(3 << 20, 508));
-    fs::create_dir_all(t.path("dst")).unwrap();
-    let ready = t.path("ready");
-    let continuation = t.path("continue");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args(["cp", "--performance-tuning", "copy-path=ranges"])
-        .arg(t.path("src/file"))
-        .arg("--into")
-        .arg(t.path("dst"))
-        .arg("--if-exists=keep")
-        .env("SYQ_TEST_SOURCE_RECHECK_READY_FILE", &ready)
-        .env("SYQ_TEST_SOURCE_RECHECK_CONTINUE_FILE", &continuation)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    wait_for_confinement_marker(&mut child, &ready, "source recheck before publication");
-    write(&t.path("dst/file"), b"theirs");
-    release_confinement_barrier(&continuation);
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success(), "{output:?}");
-    assert_eq!(read(&t.path("dst/file")), b"theirs");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("appeared during the copy; keeping it"),
-        "{output:?}"
-    );
+    let source = prng(3 << 20, 508);
+    for checked in [true, false] {
+        let t = Tmp::new();
+        write(&t.path("src/file"), &source);
+        fs::create_dir_all(t.path("dst")).unwrap();
+        let ready = t.path("ready");
+        let continuation = t.path("continue");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(["cp", "--performance-tuning", "copy-path=ranges"])
+            .arg(t.path("src/file"))
+            .arg("--into")
+            .arg(t.path("dst"))
+            .arg("--if-exists=keep")
+            .env("SYQ_TEST_SOURCE_RECHECK_READY_FILE", &ready)
+            .env("SYQ_TEST_SOURCE_RECHECK_CONTINUE_FILE", &continuation)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if !checked {
+            command.env("SYQ_TEST_DISABLE_CHECKS", "existing-file-conditions");
+        }
+        let mut child = command.spawn().unwrap();
+        wait_for_confinement_marker(&mut child, &ready, "source recheck before publication");
+        write(&t.path("dst/file"), b"theirs");
+        release_confinement_barrier(&continuation);
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        if checked {
+            assert_eq!(read(&t.path("dst/file")), b"theirs");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("appeared during the copy; keeping it"),
+                "{output:?}"
+            );
+        } else if cfg!(debug_assertions) {
+            assert_eq!(read(&t.path("dst/file")), source);
+        }
+    }
 }
 
 /// Under `--only-existing` a file is replaced only while it is the one the

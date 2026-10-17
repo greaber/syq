@@ -2492,7 +2492,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             .restricted_grant
             .as_deref()
             .is_some_and(|grant| !crate::restricted::enrolled_grant(grant)),
-        own_links: args.hardlinks && args.ignore_existing,
+        own_links: args.hardlinks
+            && args.ignore_existing
+            && crate::checks::enabled(crate::checks::Check::OwnLinks),
         dry_run: args.dry_run,
         dry_run_metadata_files: AtomicU64::new(0),
         quiet: args.quiet,
@@ -3936,7 +3938,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // A directory that must be new (`--into-new`) is created without
     // adopting one another program makes at its name first, as a restricted
     // receiver creates it; that copy fails.
-    let root_create_condition = if args.target_existence == Existence::New {
+    let root_create_condition = if args.target_existence == Existence::New
+        && crate::checks::enabled(crate::checks::Check::ExistingFileConditions)
+    {
         TargetCondition::Absent
     } else {
         TargetCondition::Any

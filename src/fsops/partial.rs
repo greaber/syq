@@ -2767,10 +2767,12 @@ impl FsOps {
             let held = stages::of(self.stage_scope, &rooted, &copy_id, inplace);
             let (file, _) = self.cached_held(label, held, relative, attempt)?;
             // No write goes past the size declared for the file.
-            if file.declared().is_some_and(|declared| {
-                off.checked_add(data.len() as u64)
-                    .is_none_or(|end| end > declared)
-            }) {
+            if crate::checks::enabled(crate::checks::Check::BoundedWrites)
+                && file.declared().is_some_and(|declared| {
+                    off.checked_add(data.len() as u64)
+                        .is_none_or(|end| end > declared)
+                })
+            {
                 return Ok(Err(anyhow!(
                     "write {} @{off} extends past the size declared for it",
                     label.display()
