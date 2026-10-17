@@ -972,6 +972,18 @@ case "$follow_output" in
     *) printf '%s\n' "$follow_output" >&2; exit 1 ;;
 esac
 
+printf 'case: restricted copies accept --pscope\n'
+# --pscope selects which local connections are kept; the receiver's own
+# connection stays private to the copy.
+make_tree source /tmp/syq-real-ssh/pscope-source pscope
+limits_scope=$(syq persist on --ephemeral)
+syq cp --no-progress --pscope "$limits_scope" --copy-metadata=permissions \
+    --from source --srcs-in /tmp/syq-real-ssh/pscope-source \
+    --to destination --into /tmp/syq-real-ssh/pscope-destination
+syq persist off --pscope "$limits_scope" >/dev/null
+assert_same_tree source /tmp/syq-real-ssh/pscope-source \
+    destination /tmp/syq-real-ssh/pscope-destination pscope
+
 printf 'case: restricted enrollment refuses an SSH control-plane destination\n'
 make_tree source /tmp/syq-real-ssh/protected-source protected
 if protected_output=$(syq cp --no-progress --performance-tuning workers=2 --copy-metadata=permissions \
