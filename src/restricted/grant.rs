@@ -452,7 +452,12 @@ pub(crate) fn named_request(
             },
             root_existence: root_existence_for(args.target_existence),
             receipt_policy,
-            extra_options: extra_copy_options(args),
+            // A receiving machine does not follow a symlink at the
+            // destination; the coordinator refuses one it finds there.
+            extra_options: delegation::ExtraCopyOptions {
+                follow_dst: false,
+                ..extra_copy_options(args)
+            },
         },
     })
 }

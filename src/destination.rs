@@ -986,9 +986,6 @@ fn select_copy(
         return forward::select(args, progress);
     };
     let name = name.to_owned();
-    if args.follows_native_destination_paths() && args.placement == crate::cli::Placement::Into {
-        bail!("named destinations do not follow destination symlinks; name the directory the link points to instead of using --follow-dst");
-    }
     let registration = load_registration(&name)?;
     if args.interface != crate::cli::Interface::NativeCp
         || args.locations[..args.locations.len() - 1]

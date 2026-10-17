@@ -3395,6 +3395,21 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
     let dst_is_dir = match args.placement {
         Placement::Into => {
+            // A restricted receiver that follows a destination symlink shows
+            // the directory it leads to; one that does not, as a receiving
+            // machine, shows the link.
+            if args.interface != Interface::Rsync
+                && args.follows_native_destination_paths()
+                && args.restricted_grant.is_some()
+                && dst_root_entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.kind == Kind::Symlink)
+            {
+                bail!(
+                    "--into destination {} is a symlink, and this receiver does not follow destination symlinks; name the directory the link points to",
+                    display(&dst_root)
+                );
+            }
             if args.interface != Interface::Rsync
                 && !args.follows_native_destination_paths()
                 && dst_root_entry

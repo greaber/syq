@@ -1769,3 +1769,14 @@ fn source_data_hostname_rejects_options_paths_and_config_syntax() {
         assert!(validate_data_hostname(hostname).is_err(), "{hostname}");
     }
 }
+
+/// A copy to a named destination does not follow a destination symlink:
+/// its request never signs following one, even with `--follow-dst` (or
+/// `--follow`, whose source following stays the sender's).
+#[test]
+fn named_requests_never_sign_following_the_destination() {
+    for follow in ["--follow-dst", "--follow"] {
+        let (_, request, _) = requested(Path::new("source"), &[follow]);
+        assert!(!request.constraints.extra_options.follow_dst, "{follow}");
+    }
+}
