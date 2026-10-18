@@ -1039,6 +1039,20 @@ impl Args {
         )
     }
 
+    /// Whether an ordinary receiver may check, then rename, the files this
+    /// copy keeps existing files around (`--if-exists=keep`) or replaces
+    /// only as found (`--only-existing`), where the filesystem cannot
+    /// publish them atomically (`Request::ConfigurePreservation`). Not for
+    /// the placement root of `--as-new` or `--into-new`, whose condition is
+    /// its own, nor on a restricted receiver, which holds every condition
+    /// atomically.
+    pub(crate) fn checks_then_renames(&self) -> bool {
+        self.restricted_grant.is_none()
+            && !self.protects_existing_contents()
+            && (self.ignore_existing || self.existing)
+            && self.target_existence != Existence::New
+    }
+
     pub(crate) fn matching_meta_flags(&self) -> u8 {
         let flags = self.meta_flags();
         if self.interface == Interface::NativeCp && !self.copy_mtime_metadata {

@@ -2335,13 +2335,13 @@ impl FsOps {
             )?;
             let stage = self.create_small_stage(&put, rooted)?;
             self.write_small_stage(&put, None, &stage, None)?;
-            self.publish_small_stage(&put, &stage)?;
-            return self.finish_small_stage(&put, stage);
+            let published = self.publish_small_stage(&put, &stage)?;
+            return self.finish_small_stage(&put, stage, published);
         }
         let stage = self.create_small_stage(put, rooted)?;
         self.write_small_stage(put, None, &stage, None)?;
-        self.publish_small_stage(put, &stage)?;
-        self.finish_small_stage(put, stage)
+        let published = self.publish_small_stage(put, &stage)?;
+        self.finish_small_stage(put, stage, published)
     }
 
     pub(super) fn hash_blocks(
@@ -3093,13 +3093,13 @@ impl FsOps {
         require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
         // A directory at the target name fails the rename; looking the name
         // up first cost an NFS client a request for every file.
-        publish_partial_rooted(
+        let published = publish_partial_rooted(
             &target.root,
             &src_relative,
             &target.relative,
             &file,
             condition,
-            self.owned.as_deref(),
+            (self.owned.as_deref(), self.check_then_rename),
         )
         .map_err(|error| {
             if error
@@ -3116,10 +3116,13 @@ impl FsOps {
             meta.inode_metadata.as_deref(),
             meta.mode,
         )?;
-        match &created {
+        let identity = match &created {
             Some(created) => Ok(known_identity(created, flags)),
             None => published_identity(&file, flags),
-        }
+        };
+        drop(file);
+        published.remove()?;
+        identity
     }
 
     pub fn file_hash(&mut self, path: &[u8], source: Option<&RegisteredPath>) -> Result<Response> {
@@ -3263,6 +3266,7 @@ impl FsOps {
                 destination,
                 narrow_new_directories,
                 own_links,
+                check_then_rename,
             } => {
                 let validation = if *destination {
                     selection.validate_destination()
@@ -3273,6 +3277,7 @@ impl FsOps {
                     self.inode_preservation = *selection;
                     self.sparse = *sparse;
                     self.narrow_new_directories = *narrow_new_directories;
+                    self.check_then_rename = *check_then_rename;
                     if *own_links {
                         self.keep_links_to_own_files();
                     }
@@ -3961,17 +3966,45 @@ impl Read for ReadAt<'_> {
     }
 }
 
+/// A published file's staged name, where a hard link published it, to
+/// remove once the caller has closed the file (`Root::remove_staged_link`):
+/// an NFS client only renames an open file's removed name. Dropped, it
+/// removes the name anyway, ignoring a failure.
+#[must_use = "remove the staged name once the file is closed"]
+pub(super) struct PublishedStage(Option<(Arc<Root>, crate::rooted::StagedLink)>);
+
+impl PublishedStage {
+    /// Remove the staged name, if one is left.
+    pub(super) fn remove(mut self) -> Result<()> {
+        match self.0.take() {
+            Some((root, link)) => root.remove_staged_link(link),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for PublishedStage {
+    fn drop(&mut self) {
+        if let Some((root, link)) = self.0.take() {
+            let _ = root.remove_staged_link(link);
+        }
+    }
+}
+
 /// Publish the private partial `staged` at `source` as `target`. With
 /// `owned`, the published file, which this receiver wrote, is recorded as
-/// its own.
+/// its own. With `checked`, a condition that keeps existing files or
+/// replaces only the file found may be checked and then renamed
+/// (`Root::publish_new_staged`). The caller removes what is left of the
+/// staged name once it has closed `staged`.
 pub(super) fn publish_partial_rooted(
-    root: &Root,
+    root: &Arc<Root>,
     source: &RelativePath,
     target: &RelativePath,
     staged: &File,
     condition: TargetCondition,
-    owned: Option<&owned::OwnedObjects>,
-) -> Result<()> {
+    (owned, checked): (Option<&owned::OwnedObjects>, bool),
+) -> Result<PublishedStage> {
     let metadata = staged.metadata()?;
     if !is_safe_partial(&metadata) {
         bail!("confined partial is not a private regular file");
@@ -3980,43 +4013,51 @@ pub(super) fn publish_partial_rooted(
     let staged_ino = metadata.ino();
     let staged_identity = (staged_dev, staged_ino);
     let published = match condition {
-        TargetCondition::Any => root.rename_regular_if_same(source, target, staged_identity),
-        TargetCondition::Absent => root.publish_new_regular(source, target, staged_identity),
-        TargetCondition::Matches { dev, ino } => {
-            root.replace_regular_if_same(source, target, staged_identity, dev, ino, None)
+        TargetCondition::Any => root
+            .rename_regular_if_same(source, target, staged_identity)
+            .map(|()| None),
+        TargetCondition::Absent => {
+            root.publish_new_staged(source, target, staged_identity, checked)
         }
+        TargetCondition::Matches { dev, ino } => {
+            root.replace_staged_if_same(source, target, staged_identity, (dev, ino, None), checked)
+        }
+        // A patch's own condition, which the receiver set when it compared
+        // the file.
         TargetCondition::MatchesFingerprint {
             dev,
             ino,
             ctime,
             ctime_nsec,
-        } => root.replace_regular_if_same(
+        } => root.replace_staged_if_same(
             source,
             target,
             staged_identity,
-            dev,
-            ino,
-            Some((ctime, ctime_nsec)),
+            (dev, ino, Some((ctime, ctime_nsec))),
+            false,
         ),
     };
-    if let Err(error) = published {
-        // What could not be published goes as an interrupted receiver's
-        // sweep would remove it; a partial worth resuming stays for a later
-        // copy. Only the staged file itself is removed: a name that now
-        // holds another entry, such as one a failed replacement kept, is
-        // left alone.
-        if sidecars::discard_unpublished(staged_identity, metadata.len())
-            && root.unlink_if_same_regular(source, staged_identity)
-        {
-            sidecars::forget(staged_identity);
+    let published = match published {
+        Ok(link) => link,
+        Err(error) => {
+            // What could not be published goes as an interrupted receiver's
+            // sweep would remove it; a partial worth resuming stays for a later
+            // copy. Only the staged file itself is removed: a name that now
+            // holds another entry, such as one a failed replacement kept, is
+            // left alone.
+            if sidecars::discard_unpublished(staged_identity, metadata.len())
+                && root.unlink_if_same_regular(source, staged_identity)
+            {
+                sidecars::forget(staged_identity);
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
+    };
     sidecars::forget(staged_identity);
     if let Some(owned) = owned {
         owned.record(&metadata);
     }
-    Ok(())
+    Ok(PublishedStage(published.map(|link| (root.clone(), link))))
 }
 
 /// Open an existing leaf without following a last-component symlink. Parent

@@ -3534,8 +3534,13 @@ impl RestrictedAuthority {
                 selection,
                 sparse,
                 narrow_new_directories,
+                check_then_rename,
                 ..
             } => {
+                // Every condition a grant sets is held atomically.
+                if *check_then_rename {
+                    bail!("a command-restricted receiver does not check, then rename");
+                }
                 if *narrow_new_directories
                     || (*sparse && !self.extra_options.sparse)
                     || !self.extra_options.allows(*selection)

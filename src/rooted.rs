@@ -448,6 +448,13 @@ impl Root {
         self.profile().link_counts_trusted
     }
 
+    /// How many names this thread published by checking that they were
+    /// absent and then renaming, since it last asked.
+    #[cfg(test)]
+    pub(crate) fn take_checked_renames_for_test() -> usize {
+        publication::CHECKED_RENAMES.replace(0)
+    }
+
     /// Stand in for a filesystem with `profile`.
     #[cfg(test)]
     pub(crate) fn assume_profile_for_test(&self, profile: crate::fsops::Profile) {
@@ -2249,6 +2256,27 @@ impl Root {
         target: &RelativePath,
         staged_identity: (u64, u64),
     ) -> Result<()> {
+        match self.publish_new_staged(source, target, staged_identity, false)? {
+            Some(link) => self.remove_staged_link(link),
+            None => Ok(()),
+        }
+    }
+
+    /// `publish_new_regular`, leaving the staged name of a file published by
+    /// a hard link for `remove_staged_link` once the caller has closed the
+    /// file: an NFS client only renames an open file's removed name, and
+    /// removes it when the file is closed, with the lookups that takes.
+    /// With `checked`, where the filesystem has no no-replace rename, the
+    /// name is checked to be absent and the file then renamed, as where it
+    /// has no hard links either: one another program creates in between is
+    /// replaced.
+    pub(crate) fn publish_new_staged(
+        &self,
+        source: &RelativePath,
+        target: &RelativePath,
+        staged_identity: (u64, u64),
+        checked: bool,
+    ) -> Result<Option<StagedLink>> {
         let (staged_dev, staged_ino) = staged_identity;
         let source_parent = self.resolve_parent(source)?;
         let target_parent = self.resolve_publish_target(source, &source_parent, target)?;
@@ -2257,6 +2285,9 @@ impl Root {
         // A staged file is published by renaming or linking it, which stays
         // on its filesystem.
         let mut profile = self.profile_on(staged_dev, &source_parent.directory);
+        if checked {
+            profile.hard_links = false;
+        }
         #[cfg(any(target_os = "linux", test))]
         let permit = self.mutation_permit(target)?;
         let moved = self
@@ -2307,12 +2338,30 @@ impl Root {
                 );
             }
         }
-        if moved == publication::Moved::Renamed {
-            return Ok(());
+        (moved == publication::Moved::Linked)
+            .then(|| StagedLink::new(source, source_parent, staged_identity))
+            .transpose()
+    }
+
+    /// Remove the staged name a publication by hard link left
+    /// (`publish_new_staged`), if it still names the published file.
+    pub(crate) fn remove_staged_link(&self, link: StagedLink) -> Result<()> {
+        let StagedLink {
+            source,
+            directory,
+            leaf,
+            identity,
+        } = link;
+        match metadata_at(directory.as_raw_fd(), &leaf) {
+            Ok(entry) if entry.is_file() && (entry.dev, entry.ino) == identity => {}
+            // Gone, or not the published file: nothing of this copy's to remove.
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
         }
         #[cfg(any(target_os = "linux", test))]
-        let _permit = self.mutation_permit(source)?;
-        unlink_at(source_parent.directory.as_raw_fd(), &source_parent.leaf, 0)
+        let _permit = self.mutation_permit(&source)?;
+        unlink_at(directory.as_raw_fd(), &leaf, 0)
             .with_context(|| format!("remove staged confined path {}", source.label()))
     }
 
@@ -2329,6 +2378,26 @@ impl Root {
         expected_ino: u64,
         expected_ctime: Option<(i64, u32)>,
     ) -> Result<()> {
+        let expected = (expected_dev, expected_ino, expected_ctime);
+        match self.replace_staged_if_same(source, target, staged_identity, expected, false)? {
+            Some(link) => self.remove_staged_link(link),
+            None => Ok(()),
+        }
+    }
+
+    /// `replace_regular_if_same`, leaving the staged name of a file
+    /// published by a hard link for `remove_staged_link`, as
+    /// `publish_new_staged` does. With `checked`, where the filesystem has
+    /// no exchange, the file found is checked and then replaced by a plain
+    /// rename: a file another program puts there in between is replaced.
+    pub(crate) fn replace_staged_if_same(
+        &self,
+        source: &RelativePath,
+        target: &RelativePath,
+        staged_identity: (u64, u64),
+        (expected_dev, expected_ino, expected_ctime): (u64, u64, Option<(i64, u32)>),
+        checked: bool,
+    ) -> Result<Option<StagedLink>> {
         let (staged_dev, staged_ino) = staged_identity;
         let source_parent = self.resolve_parent(source)?;
         let target_parent = self.resolve_publish_target(source, &source_parent, target)?;
@@ -2378,6 +2447,30 @@ impl Root {
             )
             .with_context(|| format!("atomically publish confined path {}", target.label()))?
         {
+            if checked {
+                retry_zero(|| unsafe {
+                    libc::renameat(
+                        source_parent.directory.as_raw_fd(),
+                        source_parent.leaf.as_ptr(),
+                        target_parent.directory.as_raw_fd(),
+                        target_parent.leaf.as_ptr(),
+                    )
+                })
+                .with_context(|| format!("publish confined path {}", target.label()))?;
+                #[cfg(any(target_os = "linux", test))]
+                drop(permit);
+                if profile.link_counts_trusted {
+                    let published =
+                        metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
+                    if !is_safe_staged_identity(published, staged_dev, staged_ino) {
+                        bail!(
+                            "confined staged path {} changed during publication",
+                            source.label()
+                        );
+                    }
+                }
+                return Ok(None);
+            }
             let (aside, moved) = self.publish_over_moved_aside_keeping_link(
                 &mut profile,
                 target,
@@ -2413,14 +2506,11 @@ impl Root {
                     );
                 }
             }
-            if moved == publication::Moved::Linked {
-                #[cfg(any(target_os = "linux", test))]
-                let _permit = self.mutation_permit(source)?;
-                unlink_at(source_parent.directory.as_raw_fd(), &source_parent.leaf, 0)
-                    .with_context(|| format!("remove staged confined path {}", source.label()))?;
-            }
-            return unlink_at(target_parent.directory.as_raw_fd(), &aside, 0)
-                .with_context(|| format!("remove displaced confined path {}", target.label()));
+            unlink_at(target_parent.directory.as_raw_fd(), &aside, 0)
+                .with_context(|| format!("remove displaced confined path {}", target.label()))?;
+            return (moved == publication::Moved::Linked)
+                .then(|| StagedLink::new(source, source_parent, staged_identity))
+                .transpose();
         }
         #[cfg(any(target_os = "linux", test))]
         drop(permit);
@@ -2433,14 +2523,14 @@ impl Root {
         // A check that cannot be made, as when another program removes the
         // published file first, counts as failed: the staged name must not
         // keep whatever the exchange put there.
-        let checked = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)
+        let observed = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)
             .and_then(|published| {
                 let displaced =
                     metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
                 Ok((published, displaced))
             });
-        let (published, displaced) = match checked {
-            Ok(checked) => checked,
+        let (published, displaced) = match observed {
+            Ok(observed) => observed,
             Err(error) => {
                 let race = format!(
                     "confined destination {} could not be checked after publication: {error}",
@@ -2478,7 +2568,8 @@ impl Root {
         #[cfg(any(target_os = "linux", test))]
         let _permit = self.mutation_permit(source)?;
         unlink_at(source_parent.directory.as_raw_fd(), &source_parent.leaf, 0)
-            .with_context(|| format!("remove displaced confined path {}", target.label()))
+            .with_context(|| format!("remove displaced confined path {}", target.label()))?;
+        Ok(None)
     }
 
     /// After an exchange whose result failed its checks, the staged name
@@ -2773,6 +2864,37 @@ impl Root {
 
 // A leaf directly under the retained root needs no new descriptor. Borrowing
 // keeps that root alive for the operation; descendants still resolve afresh.
+/// The staged name of a file published by a hard link, to remove once the
+/// file is closed (`Root::remove_staged_link`). The directory it is in stays
+/// open, so the removal looks nothing up again.
+#[must_use = "the staged name stays until it is removed"]
+pub(crate) struct StagedLink {
+    source: RelativePath,
+    directory: File,
+    leaf: CString,
+    identity: (u64, u64),
+}
+
+impl StagedLink {
+    fn new(
+        source: &RelativePath,
+        parent: ResolvedParent<'_>,
+        identity: (u64, u64),
+    ) -> Result<Self> {
+        let ResolvedParent { directory, leaf } = parent;
+        let directory = match directory {
+            DirectoryHandle::Owned(directory) => directory,
+            DirectoryHandle::Borrowed(directory) => directory.try_clone()?,
+        };
+        Ok(Self {
+            source: source.clone(),
+            directory,
+            leaf,
+            identity,
+        })
+    }
+}
+
 enum DirectoryHandle<'a> {
     Borrowed(&'a File),
     Owned(File),

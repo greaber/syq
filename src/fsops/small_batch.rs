@@ -1110,16 +1110,16 @@ impl FsOps {
             let _turn = root.mutation_turn(&directory).ok();
             for (index, stage) in stages {
                 match self.publish_small_stage(&puts[index], &stage) {
-                    Ok(()) => published.push((index, stage)),
+                    Ok(staged) => published.push((index, stage, staged)),
                     Err(error) => results[index] = Err(wire_error(&error)),
                 }
             }
         }
         // Closing a file is a round trip on NFS too, so on a network
         // filesystem the files are finished and closed on threads as well.
-        let finish = |(index, stage): (usize, SmallStage)| {
+        let finish = |(index, stage, staged): (usize, SmallStage, PublishedStage)| {
             let result = self
-                .finish_small_stage(&puts[index], stage)
+                .finish_small_stage(&puts[index], stage, staged)
                 .map_err(|error| wire_error(&error));
             (index, result)
         };
@@ -1169,8 +1169,8 @@ impl FsOps {
         let mode = staged_file_mode(&put.meta, put.flags);
         let stage = self.create_stage(put, source, target, mode, false)?;
         self.write_small_stage(put, source, &stage, None)?;
-        self.publish_small_stage(put, &stage)?;
-        self.finish_small_stage(put, stage)
+        let published = self.publish_small_stage(put, &stage)?;
+        self.finish_small_stage(put, stage, published)
     }
 
     /// Create the stage of a put, or of a patch with the file it reuses
@@ -1428,28 +1428,38 @@ impl FsOps {
 
     /// Publication re-resolves both names from the root and checks the staged
     /// name against the held inode immediately before the rename.
-    pub(super) fn publish_small_stage(&self, put: &SmallPut, stage: &SmallStage) -> Result<()> {
+    pub(super) fn publish_small_stage(
+        &self,
+        put: &SmallPut,
+        stage: &SmallStage,
+    ) -> Result<PublishedStage> {
         publish_partial_rooted(
             &stage.target.root,
             &stage.partial,
             &stage.target.relative,
             &stage.file,
             put.condition,
-            self.owned.as_deref(),
+            (self.owned.as_deref(), self.check_then_rename),
         )
     }
 
+    /// Finish a published stage and close its file, then remove what is
+    /// left of its staged name.
     pub(super) fn finish_small_stage(
         &self,
         put: &SmallPut,
         stage: SmallStage,
+        published: PublishedStage,
     ) -> Result<Option<(u64, u64)>> {
         crate::inode_metadata::finish_publication(
             &stage.file,
             put.meta.inode_metadata.as_deref(),
             put.meta.mode,
         )?;
-        Ok(known_identity(&stage.created, put.flags))
+        let identity = known_identity(&stage.created, put.flags);
+        drop(stage);
+        published.remove()?;
+        Ok(identity)
     }
 }
 
@@ -2840,8 +2850,11 @@ mod tests {
         let stage = ops.create_small_stage(&file, target).unwrap();
         assert!(!stage.reused);
         ops.write_small_stage(&file, None, &stage, None).unwrap();
-        ops.publish_small_stage(&file, &stage).unwrap();
-        assert_eq!(ops.finish_small_stage(&file, stage).unwrap(), None);
+        let published = ops.publish_small_stage(&file, &stage).unwrap();
+        assert_eq!(
+            ops.finish_small_stage(&file, stage, published).unwrap(),
+            None
+        );
         assert_eq!(
             fs::read(temporary.path().join("file")).unwrap(),
             b"contents"

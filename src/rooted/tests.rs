@@ -2896,3 +2896,91 @@ fn a_matched_replacement_refused_before_the_exchange_is_a_condition_failure() {
     assert!(crate::fsops::is_condition_not_met(&error), "{error:#}");
     assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"other");
 }
+
+/// Where a filesystem has hard links but neither a no-replace rename nor
+/// exchange, as NFS, a strict publication links the staged file and leaves
+/// its staged name for the caller to remove once it has closed the file. A
+/// checked one, an ordinary receiver's under keep or `--only-existing`,
+/// checks the name and then renames, and leaves nothing: a file another
+/// program puts there in between is replaced, where a strict replacement
+/// keeps it and fails.
+#[test]
+fn checked_publications_rename_where_strict_ones_link() {
+    use super::publication::CHECKED_RENAMES;
+    for checked in [false, true] {
+        let tree = TestDir::new("checked-publication");
+        let root = Root::open(tree.path()).unwrap();
+        assume_missing(&root, true, true, false);
+        CHECKED_RENAMES.set(0);
+        let staged = relative(b"staged");
+        let stage = |contents: &[u8]| {
+            fs::write(tree.path().join("staged"), contents).unwrap();
+            let metadata = fs::metadata(tree.path().join("staged")).unwrap();
+            (metadata.dev(), metadata.ino())
+        };
+
+        let identity = stage(b"new");
+        let link = root
+            .publish_new_staged(&staged, &relative(b"fresh"), identity, checked)
+            .unwrap();
+        assert_eq!(link.is_some(), !checked, "checked {checked}");
+        assert_eq!(tree.path().join("staged").exists(), !checked);
+        if let Some(link) = link {
+            root.remove_staged_link(link).unwrap();
+        }
+        let fresh = fs::metadata(tree.path().join("fresh")).unwrap();
+        assert_eq!((fresh.nlink(), fresh.ino()), (1, identity.1));
+
+        fs::write(tree.path().join("target"), b"old").unwrap();
+        let identity = stage(b"newer");
+        let old = root.metadata(&relative(b"target")).unwrap();
+        let link = root
+            .replace_staged_if_same(
+                &staged,
+                &relative(b"target"),
+                identity,
+                (old.dev, old.ino, None),
+                checked,
+            )
+            .unwrap();
+        assert_eq!(link.is_some(), !checked, "checked {checked}");
+        if let Some(link) = link {
+            root.remove_staged_link(link).unwrap();
+        }
+        assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"newer");
+        assert_eq!(sorted_names(tree.path()), ["fresh", "target"]);
+        assert_eq!(CHECKED_RENAMES.get(), usize::from(checked));
+
+        // Another program's file, put there after the check.
+        let identity = stage(b"newest");
+        let old = root.metadata(&relative(b"target")).unwrap();
+        let target_path = tree.path().join("target");
+        let moved_path = tree.path().join("moved");
+        let hook = install_publication_test_hook(
+            root.identity(),
+            &relative(b"target"),
+            PublicationTestPoint::BeforeMatchedExchange,
+            move || {
+                fs::rename(&target_path, &moved_path).unwrap();
+                fs::write(&target_path, b"other writer").unwrap();
+            },
+        );
+        let replaced = root.replace_staged_if_same(
+            &staged,
+            &relative(b"target"),
+            identity,
+            (old.dev, old.ino, None),
+            checked,
+        );
+        drop(hook);
+        let contents = fs::read(tree.path().join("target")).unwrap();
+        if checked {
+            assert!(replaced.unwrap().is_none());
+            assert_eq!(contents, b"newest");
+        } else {
+            let error = replaced.err().expect("a strict replacement keeps the file");
+            assert!(format!("{error:#}").contains("changed"), "{error:#}");
+            assert_eq!(contents, b"other writer");
+        }
+    }
+}

@@ -8936,6 +8936,7 @@ fn a_keeping_copy_links_new_names_only_to_files_it_created() {
         destination: true,
         narrow_new_directories: false,
         own_links: true,
+        check_then_rename: false,
     };
     let mut publisher = FsOps::test_destination(dir.path());
     publisher.set_stage_scope(crate::fsops::new_stage_scope());
@@ -9027,6 +9028,7 @@ fn own_file_links_on_filesystems_without_trusted_numbers() {
             destination: true,
             narrow_new_directories: false,
             own_links: true,
+            check_then_rename: false,
         }),
         Response::Ok
     ));
@@ -9111,5 +9113,87 @@ fn matched_publications_check_existence_only_where_numbers_mislead() {
         let gone = failure(&ops.handle(&put("gone"))).expect("nothing to replace");
         assert!(gone.condition_not_met, "trusted: {trusted}: {gone:?}");
         assert!(!dir.path().join("gone").exists());
+    }
+}
+
+/// An ordinary receiver told it may check, then rename (keep and
+/// `--only-existing` copies) publishes by a rename where the filesystem has
+/// neither a no-replace rename nor exchange, as NFS. Without it, as for
+/// `--if-exists=error`, it links the file, and removes the staged name
+/// before it replies, once the file is closed.
+#[cfg(target_os = "linux")]
+#[test]
+fn ordinary_receivers_check_then_rename_only_when_told() {
+    for checked in [false, true] {
+        let dir = crate::test_support::tempdir().unwrap();
+        fs::write(dir.path().join("there"), b"old").unwrap();
+        let there = fs::metadata(dir.path().join("there")).unwrap();
+        let path = |name: &str| dir.path().join(name).as_os_str().as_bytes().to_vec();
+        let mut ops = FsOps::test_destination(dir.path());
+        assert!(matches!(
+            ops.handle(&Request::ConfigurePreservation {
+                selection: Default::default(),
+                sparse: false,
+                destination: true,
+                narrow_new_directories: false,
+                own_links: false,
+                check_then_rename: checked,
+            }),
+            Response::Ok
+        ));
+        let root = ops.destination_root.as_ref().unwrap();
+        let mut profile = root.profile();
+        profile.exchange = false;
+        profile.atomic_no_replace_rename = false;
+        root.assume_profile_for_test(profile);
+        let put = |name: &str, condition| SmallPut {
+            path: path(name),
+            copy_id: [7; 16],
+            data: b"new".to_vec(),
+            hash: content_digest(b"new"),
+            meta: Meta {
+                inode_metadata: None,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags: 0,
+            inplace: false,
+            condition,
+            replaces: matches!(condition, TargetCondition::Matches { .. }),
+            scanned: ScannedDestination::Unknown,
+        };
+        crate::rooted::Root::take_checked_renames_for_test();
+        let response = ops.handle(&Request::PutSmallBatch(vec![
+            put("new", TargetCondition::Absent),
+            put(
+                "there",
+                TargetCondition::Matches {
+                    dev: there.dev(),
+                    ino: there.ino(),
+                },
+            ),
+        ]));
+        match response {
+            Response::Applied(errors) => assert!(errors.iter().all(Option::is_none), "{errors:?}"),
+            other => panic!("unexpected response {other:?}"),
+        }
+        assert_eq!(
+            crate::rooted::Root::take_checked_renames_for_test(),
+            usize::from(checked)
+        );
+        let mut names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["new", "there"], "checked {checked}");
+        for name in ["new", "there"] {
+            let metadata = fs::metadata(dir.path().join(name)).unwrap();
+            assert_eq!(metadata.nlink(), 1);
+            assert_eq!(fs::read(dir.path().join(name)).unwrap(), b"new");
+        }
     }
 }

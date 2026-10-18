@@ -501,15 +501,15 @@ impl FsOps {
                 return Err(error);
             }
         }
-        {
+        let published = {
             let root = stage.target.root.clone();
             let _replacement = root.replacement_turn();
             let _turn = root.mutation_turn(&stage.target.relative).ok();
-            self.publish_small_stage(&stream.put, stage)?;
-        }
+            self.publish_small_stage(&stream.put, stage)?
+        };
         stream.old = None;
         let stage = stream.stage.take().expect("the stage was just published");
-        self.finish_small_stage(&stream.put, stage)
+        self.finish_small_stage(&stream.put, stage, published)
     }
 }
 

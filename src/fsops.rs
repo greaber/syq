@@ -871,6 +871,11 @@ pub struct FsOps {
     /// A new directory whose mode lacks owner access, as `syq rsync` creates
     /// one, gets that mode only after its contents.
     narrow_new_directories: bool,
+    /// This copy's conditions on files keep existing files or replace only
+    /// the files it found, and where the filesystem cannot publish a file
+    /// under one atomically, the name is checked and the file then renamed
+    /// (`Request::ConfigurePreservation::check_then_rename`).
+    check_then_rename: bool,
     /// The permission bits each directory's default ACL lets new files
     /// have, by root and directory, read once per connection.
     creation_permissions: Mutex<receiver_mode::CreationPermissions>,
@@ -1161,6 +1166,7 @@ impl FsOps {
             receiver_directories: Default::default(),
             inplace_parents: Default::default(),
             narrow_new_directories: false,
+            check_then_rename: false,
             creation_permissions: Default::default(),
             inherited_acls: Default::default(),
             prepared_small_copy: None,
@@ -1812,10 +1818,8 @@ impl FsOps {
                             ino: stat.st_ino as u64,
                         });
                     match item {
-                        Some(item) => SmallCopyFileResult {
-                            disposition: SmallCopyDisposition::Copied,
-                            repaired: false,
-                            error: publish_partial_rooted(
+                        Some(item) => {
+                            let published = publish_partial_rooted(
                                 &item.root,
                                 &item.partial,
                                 &item.target,
@@ -1831,11 +1835,19 @@ impl FsOps {
                                 } else {
                                     TargetCondition::Any
                                 },
-                                None,
-                            )
-                            .err()
-                            .map(|error| wire_error(&error)),
-                        },
+                                (None, self.check_then_rename),
+                            );
+                            // Closed before its staged name goes.
+                            drop(item);
+                            SmallCopyFileResult {
+                                disposition: SmallCopyDisposition::Copied,
+                                repaired: false,
+                                error: published
+                                    .and_then(partial::PublishedStage::remove)
+                                    .err()
+                                    .map(|error| wire_error(&error)),
+                            }
+                        }
                         None => {
                             let stat = destination.expect("unchanged file has a destination");
                             let repair = if matched_content.is_some() {

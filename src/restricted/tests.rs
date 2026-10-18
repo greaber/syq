@@ -5472,6 +5472,7 @@ fn signed_grants_authorize_only_their_inode_metadata() {
     let configuration = |selection, sparse| Request::ConfigurePreservation {
         narrow_new_directories: false,
         own_links: false,
+        check_then_rename: false,
         sparse,
         selection,
         destination: true,
@@ -5534,6 +5535,7 @@ fn signed_grants_authorize_only_their_inode_metadata() {
     let mut rsync_directories = Request::ConfigurePreservation {
         narrow_new_directories: true,
         own_links: false,
+        check_then_rename: false,
         sparse: false,
         selection: acls_only,
         destination: true,
@@ -9447,4 +9449,29 @@ fn changes_check_existence_only_where_numbers_mislead() {
             }
         );
     }
+}
+
+/// A restricted receiver holds every condition atomically: it refuses to
+/// be told it may check, then rename.
+#[test]
+fn restricted_receivers_refuse_to_check_then_rename() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir_all(root.join("target")).unwrap();
+    let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    let mut request = Request::ConfigurePreservation {
+        selection: Default::default(),
+        sparse: false,
+        destination: true,
+        narrow_new_directories: false,
+        own_links: false,
+        check_then_rename: true,
+    };
+    let Err(error) = authority.authorize(&mut request, false) else {
+        panic!("check-then-rename was authorized")
+    };
+    assert!(
+        format!("{error:#}").contains("does not check, then rename"),
+        "{error:#}"
+    );
 }
