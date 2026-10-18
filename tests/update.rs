@@ -726,6 +726,11 @@ fn use_version_repairs_corrupt_cached_binary_from_verified_release() {
     let out = run();
     assert_success(&out);
     assert_eq!(out.stdout, b"syq 0.7.0\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cached syq release failed integrity verification"),
+        "{stderr}"
+    );
 }
 
 #[test]

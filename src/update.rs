@@ -333,8 +333,7 @@ pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<V
     let cache_path = helper_cache_path(helper).ok();
     if let Some(binary) = cache_path
         .as_deref()
-        .filter(|path| cached_helper_matches(path, helper))
-        .and_then(|path| fs::read(path).ok())
+        .and_then(|path| cached_helper(path, helper))
     {
         return Ok(binary);
     }
@@ -349,20 +348,51 @@ pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<V
     Ok(binary)
 }
 
-/// Whether a cached helper exists and still matches the signed manifest. A
-/// cached helper that does not match is discarded.
+/// A cached helper to upload, read once within its signed size and verified in
+/// memory, so the bytes sent are the bytes checked.
+fn cached_helper(path: &Path, helper: &TrustedCurrentHelper) -> Option<Vec<u8>> {
+    let description = "cached remote helper";
+    checked_cache(path, description, || {
+        let expected = &helper.binary;
+        let mut binary = Vec::with_capacity(expected.size as usize + 1);
+        File::open(path)
+            .with_context(|| format!("open {description}"))?
+            .take(expected.size + 1)
+            .read_to_end(&mut binary)
+            .with_context(|| format!("read {description}"))?;
+        verify_bytes_as(&binary, expected, description)?;
+        Ok(binary)
+    })
+}
+
+/// Whether the cached release that `--use-version` runs still matches the
+/// signed manifest.
 fn cached_helper_matches(path: &Path, helper: &TrustedCurrentHelper) -> bool {
+    let description = "cached syq release";
+    checked_cache(path, description, || {
+        verify_file_as(path, &helper.binary, description)
+    })
+    .is_some()
+}
+
+/// Check a cached file against the signed manifest. A missing file is simply
+/// absent; one that fails the check is discarded so it is downloaded again.
+fn checked_cache<T>(
+    path: &Path,
+    description: &str,
+    check: impl FnOnce() -> Result<T>,
+) -> Option<T> {
     if !path.is_file() {
-        return false;
+        return None;
     }
-    match verify_file_as(path, &helper.binary, "cached remote helper") {
-        Ok(()) => true,
+    match check() {
+        Ok(value) => Some(value),
         Err(error) => {
             crate::output::diagnostic!(
-                "syq: warning: cached remote helper failed integrity verification ({error}); discarding it"
+                "syq: warning: {description} failed integrity verification ({error}); discarding it"
             );
             let _ = fs::remove_file(path);
-            false
+            None
         }
     }
 }
@@ -1427,7 +1457,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_helper_check_keeps_a_match_and_discards_a_mismatch() {
+    fn cached_helper_checks_keep_a_match_and_discard_a_mismatch() {
         let dir = crate::test_support::tempdir().unwrap();
         let path = dir.path().join("syq");
         let contents = b"cached helper";
@@ -1445,12 +1475,19 @@ mod tests {
             archive: manifest().artifacts["linux-x86_64"].archive.clone(),
         };
         assert!(!cached_helper_matches(&path, &helper));
+        assert_eq!(cached_helper(&path, &helper), None);
         fs::write(&path, contents).unwrap();
         assert!(cached_helper_matches(&path, &helper));
+        assert_eq!(cached_helper(&path, &helper).unwrap(), contents);
         assert_eq!(fs::read(&path).unwrap(), contents);
-        fs::write(&path, b"cached helpe!").unwrap();
-        assert!(!cached_helper_matches(&path, &helper));
-        assert!(!path.exists());
+        for corrupt in [&b"cached helpe!"[..], b"cached helper!"] {
+            fs::write(&path, corrupt).unwrap();
+            assert!(!cached_helper_matches(&path, &helper));
+            assert!(!path.exists());
+            fs::write(&path, corrupt).unwrap();
+            assert_eq!(cached_helper(&path, &helper), None);
+            assert!(!path.exists());
+        }
     }
 
     #[test]
