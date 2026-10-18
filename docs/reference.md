@@ -430,6 +430,9 @@ This has two risks:
 - An interruption leaves the file partly updated, a mixture of old and new
   contents, until a rerun finishes it.
 
+Updating in place also assumes that nothing else writes to the file during the
+copy.
+
 Syq updates a file in place only when it has no other names, on a filesystem
 whose link counts syq trusts (see [Copy metadata](#copy-metadata)), and
 belongs to the account syq runs as, as the files syq creates there show. Run
