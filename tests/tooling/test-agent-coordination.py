@@ -298,10 +298,26 @@ class CoordinationTests(unittest.TestCase):
             subprocess.run([tmux, '-S', socket, 'set-environment', key, self.env[key]], check=True)
         return tmux, socket
 
+    @staticmethod
+    def running_processes(groups):
+        # An exited process stays in its group as a zombie until its parent
+        # reaps it, and os.killpg(group, 0) still finds it. A zombie writes
+        # nothing more, and tmux may not reap it: when built with libutempter,
+        # as on Ubuntu, tmux misses SIGCHLD for a pane that exits while it
+        # removes another pane's utmp record.
+        result = subprocess.run(['ps', '-A', '-o', 'pgid=,stat=,pid=,command='],
+                                capture_output=True, text=True, check=True, timeout=5)
+        running = {}
+        for line in result.stdout.splitlines():
+            pgid, stat, process = line.split(None, 2)
+            if int(pgid) in groups and not stat.startswith('Z'):
+                running.setdefault(int(pgid), []).append(f'{process} ({stat})')
+        return running
+
     def stop_tmux(self, tmux, socket):
         # kill-server returns before workers finish their final state writes.
-        # Stop and wait for every owned pane's process group while tmux can
-        # still reap the pane leaders, then remove the server and fixture files.
+        # Stop every owned pane's process group and wait until none of its
+        # processes is still running, then remove the server and fixture files.
         result = subprocess.run([tmux, '-S', socket, 'list-panes', '-a', '-F',
                                  '#{pane_pid} #{pane_dead}'],
                                 capture_output=True, text=True, timeout=5)
@@ -309,6 +325,7 @@ class CoordinationTests(unittest.TestCase):
             return  # Already stopped by a test.
         groups = {int(pid) for pid, dead in (line.split() for line in result.stdout.splitlines())
                   if dead == '0'}
+        running = {}
         try:
             for signum in (signal.SIGTERM, signal.SIGKILL):
                 for group in groups:
@@ -319,11 +336,8 @@ class CoordinationTests(unittest.TestCase):
                 deadline = time.monotonic() + 5
                 next_progress = 0
                 while groups and time.monotonic() < deadline:
-                    for group in groups.copy():
-                        try:
-                            os.killpg(group, 0)
-                        except ProcessLookupError:
-                            groups.remove(group)
+                    running = self.running_processes(groups)
+                    groups = set(running)
                     if groups:
                         now = time.monotonic()
                         if now >= next_progress:
@@ -332,7 +346,7 @@ class CoordinationTests(unittest.TestCase):
                         time.sleep(0.05)
                 if not groups:
                     break
-            self.assertFalse(groups, f'Fixture process groups did not exit: {sorted(groups)}')
+            self.assertFalse(groups, f'Fixture processes did not exit: {running}')
         finally:
             subprocess.run([tmux, '-S', socket, 'kill-server'], capture_output=True, timeout=5)
 
