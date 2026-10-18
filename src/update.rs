@@ -333,7 +333,8 @@ pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<V
     let cache_path = helper_cache_path(helper).ok();
     if let Some(binary) = cache_path
         .as_deref()
-        .and_then(|path| cached_helper(path, helper))
+        .filter(|path| cached_helper_matches(path, helper))
+        .and_then(|path| fs::read(path).ok())
     {
         return Ok(binary);
     }
@@ -348,19 +349,20 @@ pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<V
     Ok(binary)
 }
 
-/// A cached helper that still matches the signed manifest.
-fn cached_helper(path: &Path, helper: &TrustedCurrentHelper) -> Option<Vec<u8>> {
+/// Whether a cached helper exists and still matches the signed manifest. A
+/// cached helper that does not match is discarded.
+fn cached_helper_matches(path: &Path, helper: &TrustedCurrentHelper) -> bool {
     if !path.is_file() {
-        return None;
+        return false;
     }
     match verify_file_as(path, &helper.binary, "cached remote helper") {
-        Ok(()) => fs::read(path).ok(),
+        Ok(()) => true,
         Err(error) => {
             crate::output::diagnostic!(
                 "syq: warning: cached remote helper failed integrity verification ({error}); discarding it"
             );
             let _ = fs::remove_file(path);
-            None
+            false
         }
     }
 }
@@ -368,7 +370,7 @@ fn cached_helper(path: &Path, helper: &TrustedCurrentHelper) -> Option<Vec<u8>> 
 /// `--use-version` runs the helper from the cache, so it needs the cache.
 fn verified_helper_path(helper: &TrustedCurrentHelper) -> Result<PathBuf> {
     let cache_path = helper_cache_path(helper)?;
-    if cached_helper(&cache_path, helper).is_some() {
+    if cached_helper_matches(&cache_path, helper) {
         return Ok(cache_path);
     }
     let binary = download_helper(helper)?;
@@ -1422,6 +1424,33 @@ mod tests {
             error.downcast_ref::<DownloadTooLarge>().is_some(),
             "{error}"
         );
+    }
+
+    #[test]
+    fn cached_helper_check_keeps_a_match_and_discards_a_mismatch() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("syq");
+        let contents = b"cached helper";
+        let helper = TrustedCurrentHelper {
+            tag: "v1.2.3".into(),
+            target: Target::from_uname("Linux", "x86_64").unwrap(),
+            binary: ReleaseFile {
+                name: "syq-linux-x86_64".into(),
+                sha256: Sha256::digest(contents)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+                size: contents.len() as u64,
+            },
+            archive: manifest().artifacts["linux-x86_64"].archive.clone(),
+        };
+        assert!(!cached_helper_matches(&path, &helper));
+        fs::write(&path, contents).unwrap();
+        assert!(cached_helper_matches(&path, &helper));
+        assert_eq!(fs::read(&path).unwrap(), contents);
+        fs::write(&path, b"cached helpe!").unwrap();
+        assert!(!cached_helper_matches(&path, &helper));
+        assert!(!path.exists());
     }
 
     #[test]
