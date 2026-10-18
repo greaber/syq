@@ -857,7 +857,11 @@ impl FsOps {
         if let Some((reason, _)) = refused {
             return Ok(Updated::Refused(reason));
         }
-        if patch.basis != Some(fingerprint(&opened)) && !self.still_holds_reused(&file, patch)? {
+        if patch.basis != Some(fingerprint(&opened))
+            && !self
+                .holds_reused_between(&file, patch, 0..patch.reuse.len())
+                .map_err(failed(false, false))?
+        {
             return Err(failed(false, false)(anyhow!(
                 "the destination {} changed after it was compared",
                 target.label.display()
@@ -867,52 +871,6 @@ impl FsOps {
         self.write_patch_in_place(&target, &file, patch)
             .map(Updated::InPlace)
             .map_err(failed(false, true))
-    }
-
-    /// Whether `file` still holds each run of the blocks a patch reuses, up
-    /// to a chunk at a time, as compared.
-    fn still_holds_reused(
-        &self,
-        file: &File,
-        patch: &SmallPatch,
-    ) -> std::result::Result<bool, SmallPatchError> {
-        let run = chunk_blocks(patch.block);
-        let mut buffer = Vec::new();
-        let mut index = 0;
-        while index < patch.reuse.len() {
-            if patch.reuse[index].is_none() {
-                index += 1;
-                continue;
-            }
-            let mut end = index + 1;
-            while end < patch.reuse.len() && end - index < run && patch.reuse[end].is_some() {
-                end += 1;
-            }
-            let off = index as u64 * patch.block;
-            buffer.resize(
-                ((end as u64 * patch.block).min(patch.len) - off) as usize,
-                0,
-            );
-            let holds = self
-                .holds_blocks(
-                    file,
-                    off,
-                    &mut buffer,
-                    patch.block,
-                    &patch.reuse[index..end],
-                )
-                .map_err(|error| SmallPatchError {
-                    error: wire_error(&error),
-                    matched: false,
-                    stale_condition: false,
-                    written: false,
-                })?;
-            if !holds {
-                return Ok(false);
-            }
-            index = end;
-        }
-        Ok(true)
     }
 
     /// Write a patch's new blocks into `file`, the existing file at

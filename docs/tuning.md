@@ -233,9 +233,9 @@ comparison block, when that is larger) as they are read, and the receiving
 side writes each piece as it arrives. With
 [`--in-place=update`](reference.md#in-place-writes), an existing file of up to
 16 MiB that syq updates in place goes in these batches too, except in a
-same-machine copy without block reuse: the receiving side writes into the file
-where it is only the blocks that differ, or the whole file when the strategy
-does not compare it.
+same-machine copy without block reuse. The receiving side writes only the
+blocks that differ into the existing file, or the whole file when it isn't
+compared.
 
 Explicit `--hash` comparisons of files up to 64 MiB use the same batches;
 without block reuse, they only decide whether a file is unchanged, and a file
