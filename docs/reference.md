@@ -195,8 +195,9 @@ again. On filesystems that can't do the check and the rename in one step,
 such as NFS, SMB and FUSE filesystems like SSHFS, syq checks the name and then
 renames its file into place, so a file another program puts there in the
 instant between the two is replaced. rsync doesn't guard against that either.
-A restricted receiver closes that gap too, by linking the new file or moving
-the old one aside first, which costs extra requests on those filesystems. In
+Copies with `--as-new` or `--into-new`, and copies to a restricted receiver,
+leave no such instant: there syq links the new file into place, or moves the
+old one aside first, which takes extra requests on those filesystems. In
 an S3 bucket, an object that appears under `keep` is kept, but that file's
 copy is reported as failed (`S3 PUT failed`). On filesystems whose inode
 numbers can't show which file a name leads to, such as SSHFS, rclone mounts

@@ -48,10 +48,20 @@ pub(super) struct ByteReservation {
     /// Capacity provisionally held by observation-only preparations until
     /// their individual outcomes are settled.
     pub(super) observations: HashMap<ReservationHoldId, u64>,
-    /// The file counts against the entry limit already: the request that
-    /// first created or opened it for writing was charged
-    /// (`charge_request`).
-    pub(super) entry_charged: bool,
+    /// The file counts against the entry limit (`charge_request`), and
+    /// how many requests still to settle share that count.
+    pub(super) entry: Option<EntryCharge>,
+}
+
+/// One file's count against the entry limit, which every request that may
+/// create or open it for writing shares: it is given back only once all of
+/// them have settled and none changed anything.
+#[derive(Debug, Default)]
+pub(super) struct EntryCharge {
+    /// Requests that rely on the count and have not settled.
+    holders: usize,
+    /// One of them reported a change.
+    made: bool,
 }
 
 impl ByteReservation {
@@ -206,7 +216,10 @@ pub(super) fn resolve_destination_links(
 /// is the deepest existing directory of the destination, relative to
 /// `root`, and `whole` says whether it is the destination itself rather
 /// than one the copy creates the destination inside. Names a path is
-/// spelled with, through symlinks or a root of `/`, do not matter.
+/// spelled with, through symlinks or a root of `/`, do not matter, and a
+/// control path that is a symlink is judged where it really is. A control
+/// path that does not exist yet is protected by its ancestors: a
+/// destination that contains where it would be is refused.
 pub(super) fn reject_control_plane_directory(
     root: &Root,
     existing: &[Vec<u8>],
@@ -224,17 +237,20 @@ pub(super) fn reject_control_plane_directory(
     let destination = *chain.last().expect("the root is always in the chain");
     for control in protected {
         let control_path = Path::new(OsStr::from_bytes(&control.path));
-        let Ok(metadata) = fs::metadata(control_path) else {
-            continue;
-        };
         // The destination is the control path or lies beneath it.
-        let inside = chain.contains(&(metadata.dev(), metadata.ino()));
-        // The destination is the control path or one of its ancestors.
+        let inside = fs::metadata(control_path)
+            .is_ok_and(|metadata| chain.contains(&(metadata.dev(), metadata.ino())));
+        // The destination is the control path or one of its ancestors,
+        // spelled as configured or where the path really is.
+        let real = real_location(control_path);
         let contains = whole
-            && control_path.ancestors().any(|ancestor| {
-                fs::metadata(ancestor)
-                    .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == destination)
-            });
+            && control_path
+                .ancestors()
+                .chain(real.iter().flat_map(|real| real.ancestors()))
+                .any(|ancestor| {
+                    fs::metadata(ancestor)
+                        .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == destination)
+                });
         if inside || contains {
             bail!(
                 "command-restricted destination overlaps the receiver's protected {} {}; choose a destination outside the receiver control plane",
@@ -244,6 +260,25 @@ pub(super) fn reject_control_plane_directory(
         }
     }
     Ok(())
+}
+
+/// Where `path` really is: its deepest existing ancestor with every symlink
+/// resolved, and the rest of it as spelled.
+fn real_location(path: &Path) -> Option<std::path::PathBuf> {
+    let mut missing = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(real) = fs::canonicalize(existing) {
+            return Some(
+                missing
+                    .iter()
+                    .rev()
+                    .fold(real, |path, name| path.join(name)),
+            );
+        }
+        missing.push(existing.file_name()?);
+        existing = existing.parent()?;
+    }
 }
 
 /// The deepest existing directory of `destination` beneath `root`,
@@ -461,6 +496,14 @@ impl RestrictedAuthority {
             if whole && found.existing.is_empty() {
                 bail!("signed destination resolves to the enrolled root itself");
             }
+            // The path the links resolve to, with the directories the copy
+            // creates, by its names as well as by identity: a control
+            // directory that does not exist yet has no identity.
+            let resolved = signed[found.signed_components..].iter().fold(
+                crate::fsops::join(config.root.as_bytes(), &found.existing.join(&b'/')),
+                |path, component| crate::fsops::join(&path, component),
+            );
+            reject_control_plane_path(&resolved, protected)?;
             reject_control_plane_directory(&root, &found.existing, whole, protected)?;
             let directory = root
                 .open_directory(&crate::rooted::RelativePath::new(
@@ -2061,13 +2104,21 @@ impl RestrictedAuthority {
             | Request::Finalize { path, copy_id, .. } => Some((path.clone(), *copy_id)),
             _ => None,
         };
-        let file = file.filter(|key| {
-            let mut state = self.state.lock().unwrap();
-            match state.reserved.get_mut(key) {
-                Some(reservation) => !std::mem::replace(&mut reservation.entry_charged, true),
-                None => true,
-            }
-        });
+        // The file's count is shared through its reservation; without one,
+        // the request counts the file as an ordinary change of its own.
+        // The state stays locked until the request holds its share, so two
+        // requests never both count the file.
+        let mut state = self.state.lock().unwrap();
+        let (file, file_charge, own_file_change) = match file {
+            Some(key) => match state.reserved.get(&key) {
+                Some(reservation) => {
+                    let charge = reservation.entry.is_none();
+                    (Some(key), charge, false)
+                }
+                None => (None, false, true),
+            },
+            None => (None, false, false),
+        };
         let (changes, bytes) = match request {
             Request::Apply { ops } => {
                 deleting = ops
@@ -2090,7 +2141,7 @@ impl RestrictedAuthority {
             Request::Prepare { .. }
             | Request::StageBasis { .. }
             | Request::SeedBasis { .. }
-            | Request::Finalize { .. } => (u64::from(file.is_some()), 0),
+            | Request::Finalize { .. } => (u64::from(own_file_change), 0),
             Request::PrepareSmallFiles(request) => (request.files.len() as u64, 0),
             Request::CopySmallFiles(payloads) => (
                 0,
@@ -2117,20 +2168,28 @@ impl RestrictedAuthority {
         };
         let deletions = deleting.len() as u64;
         let limits = &self.copy.limits;
-        if !charge(&self.changes, changes, limits.max_entries) {
-            self.uncharge_file(file.as_ref());
+        let counted = changes + u64::from(file_charge);
+        if !charge(&self.changes, counted, limits.max_entries) {
             bail!("signed grant entry limit exceeded");
         }
         if !charge(&self.deletions, deletions, limits.max_deletions) {
-            refund(&self.changes, changes);
-            self.uncharge_file(file.as_ref());
+            refund(&self.changes, counted);
             bail!("signed grant deletion limit exceeded");
         }
         if !charge(&self.transferred_bytes, bytes, limits.max_total_bytes) {
-            refund(&self.changes, changes);
+            refund(&self.changes, counted);
             refund(&self.deletions, deletions);
-            self.uncharge_file(file.as_ref());
             bail!("signed grant total-byte limit exceeded");
+        }
+        if let Some(key) = &file {
+            let reservation = state
+                .reserved
+                .get_mut(key)
+                .expect("the reservation was found under the same lock");
+            reservation
+                .entry
+                .get_or_insert_with(Default::default)
+                .holders += 1;
         }
         Ok(Charged {
             changes,
@@ -2147,18 +2206,31 @@ impl RestrictedAuthority {
         self.changes.fetch_sub(charged.changes, Ordering::AcqRel);
         self.deletions
             .fetch_sub(charged.deleting.len() as u64, Ordering::AcqRel);
-        self.uncharge_file(charged.file.as_ref());
+        self.release_file(charged.file.as_ref(), false);
         self.settle(settlement, &proto::Response::Err(reason.into()));
     }
 
-    /// Forget that `file` counts against the entry limit, when the request
-    /// that charged it made no change after all.
-    fn uncharge_file(&self, file: Option<&(Vec<u8>, proto::CopyId)>) {
+    /// Release a settled request's share of `file`'s count against the
+    /// entry limit, noting whether it `made` a change. The count is given
+    /// back when the last share goes and no request changed the file.
+    fn release_file(&self, file: Option<&(Vec<u8>, proto::CopyId)>, made: bool) {
         let Some(key) = file else {
             return;
         };
-        if let Some(reservation) = self.state.lock().unwrap().reserved.get_mut(key) {
-            reservation.entry_charged = false;
+        let mut state = self.state.lock().unwrap();
+        // A reservation settled away meanwhile was published or failed
+        // after a change: the count stays.
+        let Some(reservation) = state.reserved.get_mut(key) else {
+            return;
+        };
+        let Some(entry) = &mut reservation.entry else {
+            return;
+        };
+        entry.holders = entry.holders.saturating_sub(1);
+        entry.made |= made;
+        if entry.holders == 0 && !entry.made {
+            reservation.entry = None;
+            self.changes.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
@@ -2224,10 +2296,11 @@ impl RestrictedAuthority {
         let refunded = (unmade.len() as u64).min(charged.changes);
         if refunded > 0 {
             self.changes.fetch_sub(refunded, Ordering::AcqRel);
-            if charged.file.is_some() {
-                self.uncharge_file(charged.file.as_ref());
-            }
         }
+        // A file request changes nothing only when its condition was unmet
+        // before it started.
+        let file_unmade = matches!(response, proto::Response::EndpointError(error) if unmet(error));
+        self.release_file(charged.file.as_ref(), !file_unmade);
         // Both lists are in operation order.
         let mut unmade = unmade.iter().peekable();
         let undeleted = charged
@@ -3596,8 +3669,8 @@ pub(crate) struct Settlement {
 pub(super) struct Charged {
     changes: u64,
     deleting: Vec<usize>,
-    /// The file this request charged against the entry limit, if it was
-    /// the first to change it (`charge_request`).
+    /// The file whose shared count against the entry limit this request
+    /// holds until it settles (`EntryCharge`).
     file: Option<(Vec<u8>, proto::CopyId)>,
 }
 

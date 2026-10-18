@@ -1043,9 +1043,9 @@ impl Args {
     /// copy keeps existing files around (`--if-exists=keep`) or replaces
     /// only as found (`--only-existing`), where the filesystem cannot
     /// publish them atomically (`Request::ConfigurePreservation`). Not for
-    /// the placement root of `--as-new` or `--into-new`, whose condition is
-    /// its own, nor on a restricted receiver, which holds every condition
-    /// atomically.
+    /// a copy with `--as-new` or `--into-new`, whose files keep the strict
+    /// path along with their placement root, nor on a restricted receiver,
+    /// which holds every condition atomically.
     pub(crate) fn checks_then_renames(&self) -> bool {
         self.restricted_grant.is_none()
             && !self.protects_existing_contents()

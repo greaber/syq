@@ -2941,11 +2941,31 @@ impl FsOps {
         let result = self.finalize_held(
             target, held, in_place, meta, flags, scanned, condition, expected,
         );
-        if result.is_err() {
+        if let Err(error) = &result {
+            let (file, opened, relative, created, declared) = kept;
+            // A stage whose file the copy skips, its name taken under keep
+            // or its file gone under `--only-existing`, is no use to a later
+            // copy either: it goes, as `publish_partial_rooted` removes one.
+            if !in_place
+                && self.skips_unmet_conditions
+                && matches!(
+                    condition,
+                    TargetCondition::Absent | TargetCondition::Matches { .. }
+                )
+                && is_condition_not_met(error)
+            {
+                if let Ok(staged) = file.metadata() {
+                    let identity = (staged.dev(), staged.ino());
+                    drop(file);
+                    if target.root.unlink_if_same_regular(&relative, identity) {
+                        sidecars::forget(identity);
+                    }
+                }
+                return result;
+            }
             // A stage that publication removed is let go. An in-place file
             // stays held whatever its name holds now: a retry then finds a
             // new file that moved away, and fails it.
-            let (file, opened, relative, created, declared) = kept;
             let at_name = || -> Result<bool> {
                 let held = file.metadata()?;
                 Ok(target
@@ -3099,7 +3119,11 @@ impl FsOps {
             &target.relative,
             &file,
             condition,
-            (self.owned.as_deref(), self.check_then_rename),
+            (
+                self.owned.as_deref(),
+                self.check_then_rename,
+                self.skips_unmet_conditions,
+            ),
         )
         .map_err(|error| {
             if error
@@ -3267,6 +3291,7 @@ impl FsOps {
                 narrow_new_directories,
                 own_links,
                 check_then_rename,
+                skips_unmet_conditions,
             } => {
                 let validation = if *destination {
                     selection.validate_destination()
@@ -3278,6 +3303,7 @@ impl FsOps {
                     self.sparse = *sparse;
                     self.narrow_new_directories = *narrow_new_directories;
                     self.check_then_rename = *check_then_rename;
+                    self.skips_unmet_conditions = *skips_unmet_conditions;
                     if *own_links {
                         self.keep_links_to_own_files();
                     }
@@ -3995,15 +4021,16 @@ impl Drop for PublishedStage {
 /// `owned`, the published file, which this receiver wrote, is recorded as
 /// its own. With `checked`, a condition that keeps existing files or
 /// replaces only the file found may be checked and then renamed
-/// (`Root::publish_new_staged`). The caller removes what is left of the
-/// staged name once it has closed `staged`.
+/// (`Root::publish_new_staged`). With `skips`, a file whose condition is
+/// unmet is skipped by the copy, and its partial goes. The caller removes
+/// what is left of the staged name once it has closed `staged`.
 pub(super) fn publish_partial_rooted(
     root: &Arc<Root>,
     source: &RelativePath,
     target: &RelativePath,
     staged: &File,
     condition: TargetCondition,
-    (owned, checked): (Option<&owned::OwnedObjects>, bool),
+    (owned, checked, skips): (Option<&owned::OwnedObjects>, bool, bool),
 ) -> Result<PublishedStage> {
     let metadata = staged.metadata()?;
     if !is_safe_partial(&metadata) {
@@ -4042,10 +4069,17 @@ pub(super) fn publish_partial_rooted(
         Err(error) => {
             // What could not be published goes as an interrupted receiver's
             // sweep would remove it; a partial worth resuming stays for a later
-            // copy. Only the staged file itself is removed: a name that now
-            // holds another entry, such as one a failed replacement kept, is
-            // left alone.
-            if sidecars::discard_unpublished(staged_identity, metadata.len())
+            // copy, unless the copy skips its file: under keep or
+            // `--only-existing`, a name taken or a file gone. Only the staged
+            // file itself is removed: a name that now holds another entry,
+            // such as one a failed replacement kept, is left alone.
+            let skipped = skips
+                && matches!(
+                    condition,
+                    TargetCondition::Absent | TargetCondition::Matches { .. }
+                )
+                && is_condition_not_met(&error);
+            if (skipped || sidecars::discard_unpublished(staged_identity, metadata.len()))
                 && root.unlink_if_same_regular(source, staged_identity)
             {
                 sidecars::forget(staged_identity);

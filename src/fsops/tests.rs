@@ -8937,6 +8937,7 @@ fn a_keeping_copy_links_new_names_only_to_files_it_created() {
         narrow_new_directories: false,
         own_links: true,
         check_then_rename: false,
+        skips_unmet_conditions: false,
     };
     let mut publisher = FsOps::test_destination(dir.path());
     publisher.set_stage_scope(crate::fsops::new_stage_scope());
@@ -9029,6 +9030,7 @@ fn own_file_links_on_filesystems_without_trusted_numbers() {
             narrow_new_directories: false,
             own_links: true,
             check_then_rename: false,
+            skips_unmet_conditions: false,
         }),
         Response::Ok
     ));
@@ -9138,6 +9140,7 @@ fn ordinary_receivers_check_then_rename_only_when_told() {
                 narrow_new_directories: false,
                 own_links: false,
                 check_then_rename: checked,
+                skips_unmet_conditions: false,
             }),
             Response::Ok
         ));
@@ -9196,4 +9199,58 @@ fn ordinary_receivers_check_then_rename_only_when_told() {
             assert_eq!(fs::read(dir.path().join(name)).unwrap(), b"new");
         }
     }
+}
+
+/// A restricted receiver's destination scan reads inode metadata beneath
+/// the root it holds, by the name the root gives each entry, as an
+/// ordinary receiver's does: the scan of a copy with `-X` or ACLs succeeds.
+#[test]
+fn a_restricted_scan_reads_inode_metadata_beneath_its_root() {
+    let dir = crate::test_support::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("target")).unwrap();
+    fs::write(dir.path().join("target/file"), b"there").unwrap();
+    let mut ops = FsOps::test_restricted(dir.path());
+    assert!(matches!(
+        ops.handle(&Request::ConfigurePreservation {
+            selection: crate::inode_metadata::Selection {
+                xattrs: true,
+                ..Default::default()
+            },
+            sparse: false,
+            destination: true,
+            narrow_new_directories: false,
+            own_links: false,
+            check_then_rename: false,
+            skips_unmet_conditions: false,
+        }),
+        Response::Ok
+    ));
+    let requested = dir.path().join("target").as_os_str().as_bytes().to_vec();
+    let root = ops.scan_metadata_root(&requested, None).unwrap();
+    let metadata = fs::symlink_metadata(dir.path().join("target/file")).unwrap();
+    let mut entries = vec![Entry {
+        path: b"file".to_vec(),
+        kind: Kind::File,
+        size: metadata.len(),
+        mtime: metadata.mtime(),
+        mtime_nsec: metadata.mtime_nsec() as u32,
+        mode: metadata.mode(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        rdev: 0,
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        nlink: metadata.nlink(),
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec() as u32,
+        link: None,
+        atime: Default::default(),
+        inode_metadata: None,
+    }];
+    ops.capture_scan_metadata(&root, None, false, &mut entries)
+        .unwrap();
+    // The request names the root by its full path; the read does not.
+    assert!(ops
+        .capture_scan_metadata(&requested, None, false, &mut entries)
+        .is_err());
 }

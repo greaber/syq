@@ -2984,3 +2984,62 @@ fn checked_publications_rename_where_strict_ones_link() {
         }
     }
 }
+
+/// A matched replacement by moving the old file aside and linking the
+/// staged file, as on NFS: one that fails its final check leaves no staged
+/// name behind, and one that was published is not failed because the old
+/// file could not be removed.
+#[test]
+fn moved_aside_replacements_clean_up_and_report_what_happened() {
+    for case in ["extra link", "aside not removable"] {
+        let tree = TestDir::new("moved-aside");
+        let root = Root::open(tree.path()).unwrap();
+        assume_missing(&root, true, true, false);
+        fs::write(tree.path().join("target"), b"old").unwrap();
+        fs::write(tree.path().join("staged"), b"new").unwrap();
+        let staged = fs::metadata(tree.path().join("staged")).unwrap();
+        let old = root.metadata(&relative(b"target")).unwrap();
+        let path = tree.path().to_path_buf();
+        let _hook = install_publication_test_hook(
+            root.identity(),
+            &relative(b"target"),
+            PublicationTestPoint::AfterMovedAsidePublication,
+            move || match case {
+                "extra link" => fs::hard_link(path.join("target"), path.join("other")).unwrap(),
+                _ => {
+                    // The displaced file, under its recovery name, becomes a
+                    // directory that cannot be unlinked.
+                    let aside = fs::read_dir(&path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().file_name())
+                        .find(|name| crate::fsops::is_recovery_name(name))
+                        .unwrap();
+                    fs::rename(path.join(&aside), path.join("old")).unwrap();
+                    fs::create_dir(path.join(&aside)).unwrap();
+                }
+            },
+        );
+        let replaced = root.replace_staged_if_same(
+            &relative(b"staged"),
+            &relative(b"target"),
+            (staged.dev(), staged.ino()),
+            (old.dev, old.ino, None),
+            false,
+        );
+        match case {
+            "extra link" => {
+                let Err(error) = replaced else {
+                    panic!("a file with another name was taken as published")
+                };
+                assert!(format!("{error:#}").contains("changed during publication"));
+                assert!(!tree.path().join("staged").exists(), "{case}");
+            }
+            _ => {
+                let link = replaced.unwrap().expect("published by a link");
+                root.remove_staged_link(link).unwrap();
+                assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"new");
+                assert!(!tree.path().join("staged").exists(), "{case}");
+            }
+        }
+    }
+}

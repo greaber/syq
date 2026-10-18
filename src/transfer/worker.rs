@@ -2989,7 +2989,12 @@ impl Worker {
         match finalized {
             Ok(response) => self.accept_hardlink_reply(idx, &job, response)?,
             Err(error) => {
-                if self.transport_dead() || job.inplace {
+                // A condition the receiver found unmet changed nothing, and
+                // the receiver let its sidecar go.
+                if self.transport_dead()
+                    || job.inplace
+                    || crate::fsops::is_condition_not_met(&error)
+                {
                     return Err(error);
                 }
                 // If the response to a previous Finalize was lost, its sidecar is

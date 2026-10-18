@@ -565,6 +565,8 @@ fn a_file_that_appears_under_keep_is_kept_and_skipped() {
         assert!(output.status.success(), "{output:?}");
         if checked {
             assert_eq!(read(&t.path("dst/file")), b"theirs");
+            // Nothing of the skipped copy is left behind.
+            assert_eq!(partial_files(&t.path("dst")), Vec::<PathBuf>::new());
             assert!(
                 String::from_utf8_lossy(&output.stderr)
                     .contains("appeared during the copy; keeping it"),
@@ -604,6 +606,8 @@ fn a_file_removed_under_only_existing_is_not_created_again() {
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success(), "{output:?}");
     assert!(!t.path("dst/file").exists());
+    // Nothing of the skipped copy is left behind.
+    assert_eq!(partial_files(&t.path("dst")), Vec::<PathBuf>::new());
 }
 
 /// `--into-new` makes only the directory new: with `--if-exists=keep`, a
@@ -633,4 +637,47 @@ fn keep_inside_an_into_new_directory_skips_a_file_that_appears() {
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success(), "{output:?}");
     assert_eq!(read(&t.path("dst/src/file")), b"theirs");
+}
+
+/// Under `rsync --ignore-existing` a symlink, FIFO or hard link is created
+/// without replacing anything: an entry another program puts at its name
+/// first is kept and skipped with a note, as a file is.
+#[test]
+fn a_link_or_special_whose_name_is_taken_under_keep_is_skipped() {
+    for name in ["link", "fifo", "second"] {
+        let t = Tmp::new();
+        write(&t.path("src/first"), b"ours");
+        std::os::unix::fs::symlink("first", t.path("src/link")).unwrap();
+        mkfifo(&t.path("src/fifo"));
+        fs::hard_link(t.path("src/first"), t.path("src/second")).unwrap();
+        fs::create_dir_all(t.path("dst")).unwrap();
+        let ready = t.path("ready");
+        let continuation = t.path("continue");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["rsync", "-aH", "--ignore-existing"])
+            .arg(format!("{}/", t.path("src").display()))
+            .arg(format!("{}/", t.path("dst").display()))
+            .env(
+                "SYQ_TEST_DESTINATION_MUTATION_SUFFIX",
+                format!("dst/{name}"),
+            )
+            .env("SYQ_TEST_DESTINATION_MUTATION_READY_FILE", &ready)
+            .env("SYQ_TEST_DESTINATION_MUTATION_CONTINUE_FILE", &continuation)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_for_confinement_marker(&mut child, &ready, "destination mutation");
+        write(&t.path(&format!("dst/{name}")), b"theirs");
+        release_confinement_barrier(&continuation);
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{name}: {output:?}");
+        let theirs = t.path(&format!("dst/{name}"));
+        assert!(fs::symlink_metadata(&theirs).unwrap().is_file(), "{name}");
+        assert_eq!(read(&theirs), b"theirs", "{name}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("keeping it"),
+            "{name}: {output:?}"
+        );
+    }
 }

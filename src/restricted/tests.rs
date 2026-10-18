@@ -5473,6 +5473,7 @@ fn signed_grants_authorize_only_their_inode_metadata() {
         narrow_new_directories: false,
         own_links: false,
         check_then_rename: false,
+        skips_unmet_conditions: false,
         sparse,
         selection,
         destination: true,
@@ -5536,6 +5537,7 @@ fn signed_grants_authorize_only_their_inode_metadata() {
         narrow_new_directories: true,
         own_links: false,
         check_then_rename: false,
+        skips_unmet_conditions: false,
         sparse: false,
         selection: acls_only,
         destination: true,
@@ -9466,6 +9468,7 @@ fn restricted_receivers_refuse_to_check_then_rename() {
         narrow_new_directories: false,
         own_links: false,
         check_then_rename: true,
+        skips_unmet_conditions: false,
     };
     let Err(error) = authority.authorize(&mut request, false) else {
         panic!("check-then-rename was authorized")
@@ -9474,4 +9477,159 @@ fn restricted_receivers_refuse_to_check_then_rename() {
         format!("{error:#}").contains("does not check, then rename"),
         "{error:#}"
     );
+}
+
+/// Two requests that may create the same file share its count against the
+/// entry limit: one that finds its condition unmet gives nothing back
+/// while the other may still create the file.
+#[test]
+fn a_refused_preparation_keeps_the_count_another_still_shares() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let mut authority = test_authority_with_policy(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::InPlaceUpdate,
+    );
+    authority.copy.limits.max_entries = 1;
+    let mut ops = authority.test_ops();
+    for index in 0..2 {
+        let path = target.join(format!("file-{index}"));
+        // In place, held to a file that is not there, and so refused.
+        let mut stale = prepare_request(&path);
+        if let Request::Prepare {
+            inplace,
+            size,
+            update,
+            ..
+        } = &mut stale
+        {
+            *inplace = true;
+            *size = 0;
+            *update = Some(Box::new(proto::InPlaceUpdate {
+                meta: plain_meta(),
+                flags: 0,
+                only: Some((0, 0)),
+            }));
+        }
+        let mut create = stale.clone();
+        if let Request::Prepare { update, .. } = &mut create {
+            *update = None;
+        }
+        // The second file is past the limit.
+        if index == 1 {
+            let Err(error) = authority.authorize(&mut stale, false) else {
+                panic!("a second file was authorized past the limit")
+            };
+            assert!(format!("{error:#}").contains("entry limit"), "{error:#}");
+            continue;
+        }
+        let stale_settlement = authority.authorize(&mut stale, false).unwrap();
+        let create_settlement = authority.authorize(&mut create, false);
+        let stale_response = ops.handle(&stale);
+        assert!(
+            matches!(&stale_response, proto::Response::EndpointError(error) if error.condition_not_met),
+            "{stale_response:?}"
+        );
+        authority.settle(stale_settlement, &stale_response);
+        let create_settlement = create_settlement.unwrap();
+        let create_response = ops.handle(&create);
+        assert!(
+            matches!(&create_response, proto::Response::Prepared(_)),
+            "{create_response:?}"
+        );
+        authority.settle(create_settlement, &create_response);
+        assert!(path.exists());
+    }
+    assert_eq!(
+        authority.changes.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert!(!target.join("file-1").exists());
+}
+
+/// A destination reached through a symlink may not contain where a control
+/// directory that does not exist yet would be: the copy would create it.
+#[test]
+fn followed_destinations_may_not_create_a_missing_control_directory() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir_all(root.join("home")).unwrap();
+    symlink("home", root.join("target")).unwrap();
+    let protected = [ReceiverControlPath {
+        path: path_bytes(&root.join("home/.ssh")),
+        label: "protected SSH configuration directory",
+    }];
+    let error = test_authority_with_options(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+        None,
+        (
+            crate::delegation::ExtraCopyOptions {
+                follow_dst: true,
+                ..Default::default()
+            },
+            &protected,
+        ),
+    )
+    .err()
+    .expect("a destination that would hold the missing control directory");
+    assert!(
+        format!("{error:#}").contains("protected SSH configuration"),
+        "{error:#}"
+    );
+}
+
+/// A control path that is a symlink is protected where it really is: a
+/// destination containing its target is refused, followed or not.
+#[test]
+fn a_symlinked_control_path_is_protected_where_it_leads() {
+    for follow_dst in [false, true] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir_all(root.join("target/keys")).unwrap();
+        fs::create_dir_all(temporary.path().join("home")).unwrap();
+        symlink(root.join("target/keys"), temporary.path().join("home/.ssh")).unwrap();
+        let protected = [ReceiverControlPath {
+            path: path_bytes(&temporary.path().join("home/.ssh")),
+            label: "protected SSH configuration directory",
+        }];
+        let error = test_authority_with_options(
+            &root,
+            DeletionPolicy::Forbid,
+            1024,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::DirectoryContents,
+            RootExistence::Any,
+            None,
+            (
+                crate::delegation::ExtraCopyOptions {
+                    follow_dst,
+                    ..Default::default()
+                },
+                &protected,
+            ),
+        )
+        .err()
+        .expect("a destination containing the control directory's target");
+        assert!(
+            format!("{error:#}").contains("protected SSH configuration"),
+            "follow {follow_dst}: {error:#}"
+        );
+    }
 }

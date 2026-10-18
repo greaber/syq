@@ -1439,7 +1439,11 @@ impl FsOps {
             &stage.target.relative,
             &stage.file,
             put.condition,
-            (self.owned.as_deref(), self.check_then_rename),
+            (
+                self.owned.as_deref(),
+                self.check_then_rename,
+                self.skips_unmet_conditions,
+            ),
         )
     }
 

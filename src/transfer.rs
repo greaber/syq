@@ -269,6 +269,9 @@ pub struct Opts {
     /// keep or `--only-existing` conditions hold where the filesystem
     /// cannot publish them atomically (`Request::ConfigurePreservation`).
     pub check_then_rename: bool,
+    /// The copy skips files whose conditions the receiver finds unmet
+    /// (`Request::ConfigurePreservation`).
+    pub skips_unmet_conditions: bool,
     pub dry_run: bool,
     dry_run_metadata_files: AtomicU64,
     pub quiet: bool,
@@ -741,7 +744,7 @@ pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
         args.sparse,
         false,
         args.interface == Interface::Rsync,
-        (false, false),
+        (false, false, false),
     )?;
     Ok(connection)
 }
@@ -752,7 +755,7 @@ fn configure_preservation(
     sparse: bool,
     destination: bool,
     narrow_new_directories: bool,
-    (own_links, check_then_rename): (bool, bool),
+    (own_links, check_then_rename, skips_unmet_conditions): (bool, bool, bool),
 ) -> Result<()> {
     if selection.any()
         || selection.open_noatime
@@ -760,6 +763,7 @@ fn configure_preservation(
         || narrow_new_directories
         || own_links
         || check_then_rename
+        || skips_unmet_conditions
     {
         connection.send_expecting_ok(
             Request::ConfigurePreservation {
@@ -769,11 +773,26 @@ fn configure_preservation(
                 narrow_new_directories,
                 own_links,
                 check_then_rename,
+                skips_unmet_conditions,
             },
             "configure inode metadata preservation",
         )?;
     }
     Ok(())
+}
+
+/// Who lists a small-copy file the receiver kept, when keeping it failed:
+/// a restricted receiver lists the metadata change it attempted
+/// (`SmallCopyFileResult::repaired`), and the coordinator lists any other
+/// failure.
+fn kept_small_file_listing(
+    result: &crate::proto::SmallCopyFileResult,
+) -> crate::results::ReceiverListing {
+    if result.repaired {
+        crate::results::ReceiverListing::Listed
+    } else {
+        crate::results::ReceiverListing::Unlisted
+    }
 }
 
 fn configure_hashing(connection: &mut dyn Conn, policy: crate::hashing::HashPolicy) -> Result<()> {
@@ -1482,32 +1501,20 @@ fn attempt_small_copy(
             progress.files_excluded.fetch_add(1, Relaxed);
             continue;
         }
-        if result.disposition == SmallCopyDisposition::QuickChecked {
+        if matches!(
+            result.disposition,
+            SmallCopyDisposition::QuickChecked | SmallCopyDisposition::ContentMatched
+        ) {
             progress.files_unchanged.fetch_add(1, Relaxed);
             progress.bytes_unchanged.fetch_add(entry.size, Relaxed);
+            let listing = kept_small_file_listing(&result);
             if let Some(error) = result.error {
-                // A restricted receiver lists a failed metadata change itself.
                 let error = endpoint_error(error);
                 progress.entry_error_classified(
                     &format!("syq: {error}"),
                     Some("io"),
                     os_kind_of(&error),
-                    Some((rel_bytes, crate::results::ReceiverListing::Listed)),
-                );
-            }
-            continue;
-        }
-        if result.disposition == SmallCopyDisposition::ContentMatched {
-            progress.files_unchanged.fetch_add(1, Relaxed);
-            progress.bytes_unchanged.fetch_add(entry.size, Relaxed);
-            if let Some(error) = result.error {
-                // A restricted receiver lists a failed metadata change itself.
-                let error = endpoint_error(error);
-                progress.entry_error_classified(
-                    &format!("syq: {error}"),
-                    Some("io"),
-                    os_kind_of(&error),
-                    Some((rel_bytes, crate::results::ReceiverListing::Listed)),
+                    Some((rel_bytes, listing)),
                 );
             }
             continue;
@@ -2533,6 +2540,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             && args.ignore_existing
             && crate::checks::enabled(crate::checks::Check::OwnLinks),
         check_then_rename: args.checks_then_renames(),
+        skips_unmet_conditions: (args.ignore_existing && !args.protects_existing_contents())
+            || args.existing,
         dry_run: args.dry_run,
         dry_run_metadata_files: AtomicU64::new(0),
         quiet: args.quiet,
@@ -2721,14 +2730,22 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
     // A copy that keeps existing files gives new names by hard link only to
     // files it created, on every receiver (`fsops::owned`).
-    if opts.inode_preservation.crtimes || opts.own_links || opts.check_then_rename {
+    if opts.inode_preservation.crtimes
+        || opts.own_links
+        || opts.check_then_rename
+        || opts.skips_unmet_conditions
+    {
         configure_preservation(
             &mut *dst_ctl,
             opts.inode_preservation,
             opts.sparse,
             true,
             opts.rsync_creation,
-            (opts.own_links, opts.check_then_rename),
+            (
+                opts.own_links,
+                opts.check_then_rename,
+                opts.skips_unmet_conditions,
+            ),
         )?;
     }
     if debug() {
@@ -2992,7 +3009,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         opts.sparse,
                         false,
                         false,
-                        (false, false),
+                        (false, false, false),
                     )?;
                     configure_preservation(
                         &mut *dst,
@@ -3000,7 +3017,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         opts.sparse,
                         true,
                         opts.rsync_creation,
-                        (opts.own_links, opts.check_then_rename),
+                        (
+                            opts.own_links,
+                            opts.check_then_rename,
+                            opts.skips_unmet_conditions,
+                        ),
                     )?;
                     let fast_batch_files = opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES);
                     let transport_paced = (opts.src_remote || opts.dst_remote)

@@ -450,7 +450,7 @@ impl Root {
 
     /// How many names this thread published by checking that they were
     /// absent and then renaming, since it last asked.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn take_checked_renames_for_test() -> usize {
         publication::CHECKED_RENAMES.replace(0)
     }
@@ -1708,10 +1708,14 @@ impl Root {
                 },
             )
             .map_err(|error| {
+                // Something holds the name: nothing was published.
                 if error.kind() == io::ErrorKind::AlreadyExists {
-                    anyhow::anyhow!(
-                        "destination {} appeared before no-replace creation",
-                        path.label()
+                    crate::fsops::condition_not_met_by(
+                        error,
+                        format!(
+                            "destination {} appeared before no-replace creation",
+                            path.label()
+                        ),
                     )
                 } else {
                     anyhow::Error::new(error)
@@ -2026,20 +2030,28 @@ impl Root {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
+        // A condition found unmet here changed nothing.
         match (condition, existing) {
-            (Absent, Some(_)) => bail!("hardlink destination {} already exists", target.label()),
+            (Absent, Some(_)) => {
+                return Err(crate::fsops::condition_not_met(format!(
+                    "hardlink destination {} already exists",
+                    target.label()
+                )))
+            }
             (Matches { dev, ino }, Some(existing))
                 if (existing.dev, existing.ino) != (dev, ino) =>
             {
-                bail!(
+                return Err(crate::fsops::condition_not_met(format!(
                     "hardlink destination {} changed before publication",
                     target.label()
-                )
+                )))
             }
-            (Matches { .. }, None) => bail!(
-                "hardlink destination {} disappeared before publication",
-                target.label()
-            ),
+            (Matches { .. }, None) => {
+                return Err(crate::fsops::condition_not_met(format!(
+                    "hardlink destination {} disappeared before publication",
+                    target.label()
+                )))
+            }
             (MatchesFingerprint { .. }, _) => {
                 bail!("hardlink publication accepts no fingerprint condition")
             }
@@ -2484,31 +2496,43 @@ impl Root {
             )?;
             #[cfg(any(target_os = "linux", test))]
             drop(permit);
+            #[cfg(test)]
+            run_publication_test_hook(
+                self.identity,
+                target,
+                PublicationTestPoint::AfterMovedAsidePublication,
+            );
             // A linked file still has its staged name, so it has two links
             // here; checked before that name goes, as `publish_new_regular`
-            // checks.
-            if profile.link_counts_trusted {
-                let published =
-                    metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
-                let expected = match moved {
-                    publication::Moved::Renamed => {
-                        is_safe_staged_identity(published, staged_dev, staged_ino)
-                    }
-                    publication::Moved::Linked => {
-                        is_safe_staged_identity_after_link(published, staged_dev, staged_ino)
-                    }
-                };
-                if !expected {
-                    bail!(
-                        "confined staged path {} changed during publication; kept the entry it displaced as {}",
-                        source.label(),
-                        sibling_label(target, &aside)
-                    );
+            // checks. A check that cannot be made counts as failed.
+            let linked = moved == publication::Moved::Linked;
+            let verified = !profile.link_counts_trusted
+                || metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf).is_ok_and(
+                    |published| {
+                        if linked {
+                            is_safe_staged_identity_after_link(published, staged_dev, staged_ino)
+                        } else {
+                            is_safe_staged_identity(published, staged_dev, staged_ino)
+                        }
+                    },
+                );
+            if !verified {
+                // The staged name is this copy's own, whatever the target
+                // name holds now.
+                if linked {
+                    let _ = unlink_at(source_parent.directory.as_raw_fd(), &source_parent.leaf, 0);
                 }
+                bail!(
+                    "confined staged path {} changed during publication; kept the entry it displaced as {}",
+                    source.label(),
+                    sibling_label(target, &aside)
+                );
             }
-            unlink_at(target_parent.directory.as_raw_fd(), &aside, 0)
-                .with_context(|| format!("remove displaced confined path {}", target.label()))?;
-            return (moved == publication::Moved::Linked)
+            // The replacement is published. A displaced file that cannot be
+            // removed stays under its recovery name, as an interrupted
+            // replacement leaves one.
+            let _ = unlink_at(target_parent.directory.as_raw_fd(), &aside, 0);
+            return linked
                 .then(|| StagedLink::new(source, source_parent, staged_identity))
                 .transpose();
         }
@@ -2565,10 +2589,12 @@ impl Root {
                 ),
             ));
         }
+        // The replacement is published: a displaced file that cannot be
+        // removed stays under the staged name, which a later copy's sweep
+        // removes.
         #[cfg(any(target_os = "linux", test))]
         let _permit = self.mutation_permit(source)?;
-        unlink_at(source_parent.directory.as_raw_fd(), &source_parent.leaf, 0)
-            .with_context(|| format!("remove displaced confined path {}", target.label()))?;
+        let _ = unlink_at(source_parent.directory.as_raw_fd(), &source_parent.leaf, 0);
         Ok(None)
     }
 
@@ -3864,6 +3890,7 @@ pub(crate) enum PublicationTestPoint {
     BeforeMatchedExchange,
     AfterMatchedExchange,
     AfterMovedAside,
+    AfterMovedAsidePublication,
     AfterHardlinkTemporary,
 }
 

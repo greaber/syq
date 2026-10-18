@@ -1293,6 +1293,10 @@ pub enum WireRequest<Data> {
         /// then renaming, not by a hard link or by moving the file found
         /// aside. Only ordinary receivers accept it.
         check_then_rename: bool,
+        /// The copy skips a file whose condition the receiver finds unmet
+        /// (`--if-exists=keep`, `--only-existing`), so the receiver lets
+        /// such a file's partial go rather than keep it for a later copy.
+        skips_unmet_conditions: bool,
     },
     NativeMap(crate::native_map::Options),
     /// Configure and select a bounded small push without reading its payloads.

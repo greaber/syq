@@ -3658,13 +3658,6 @@ impl Planner<'_> {
         })
     }
 
-    /// The condition a leaf at `path` is created or replaced under. A
-    /// placement condition comes first. A new leaf under the error policies
-    /// or `--if-exists=keep` is created without replacing anything: a name
-    /// that appears in the meantime is kept. An existing leaf under
-    /// `--only-existing` is replaced only while it is still the object the
-    /// scan found: nothing is created where it went. A restricted receiver
-    /// holds its grant's copies to the same conditions itself.
     /// Whether `condition`, at `path`, comes from the existing-file policy
     /// rather than the placement (`FileJobData::policy_condition`).
     pub(super) fn policy_condition(&self, path: &[u8], condition: TargetCondition) -> bool {
@@ -3678,6 +3671,13 @@ impl Planner<'_> {
             }
     }
 
+    /// The condition a leaf at `path` is created or replaced under. A
+    /// placement condition comes first. A new leaf under the error policies
+    /// or `--if-exists=keep` is created without replacing anything: a name
+    /// that appears in the meantime is kept. An existing leaf under
+    /// `--only-existing` is replaced only while it is still the object the
+    /// scan found: nothing is created where it went. A restricted receiver
+    /// holds its grant's copies to the same conditions itself.
     pub(super) fn leaf_condition_for(
         &self,
         path: &[u8],

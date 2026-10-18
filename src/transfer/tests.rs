@@ -451,6 +451,7 @@ fn pipeline_worker(
         receiver_paces_file_data: false,
         own_links: false,
         check_then_rename: false,
+        skips_unmet_conditions: false,
         dry_run: false,
         dry_run_metadata_files: AtomicU64::new(0),
         quiet: true,
@@ -5978,4 +5979,32 @@ fn only_a_pacing_receiver_bounds_requests_by_the_bandwidth_burst() {
         fast_file_size_limit(opts, Some(&limit)),
         limit.burst_bytes()
     );
+}
+
+/// A restricted receiver lists the failure of a kept small-copy file only
+/// when it attempted the metadata change; the coordinator lists the rest,
+/// so every failure has a record.
+#[test]
+fn kept_small_files_are_listed_by_whoever_saw_them_fail() {
+    for disposition in [
+        crate::proto::SmallCopyDisposition::QuickChecked,
+        crate::proto::SmallCopyDisposition::ContentMatched,
+    ] {
+        for repaired in [false, true] {
+            let result = crate::proto::SmallCopyFileResult {
+                disposition,
+                error: Some("failed".into()),
+                repaired,
+            };
+            assert_eq!(
+                super::kept_small_file_listing(&result),
+                if repaired {
+                    crate::results::ReceiverListing::Listed
+                } else {
+                    crate::results::ReceiverListing::Unlisted
+                },
+                "{disposition:?} repaired {repaired}"
+            );
+        }
+    }
 }
