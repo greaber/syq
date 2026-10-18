@@ -161,14 +161,15 @@ pub(super) struct Placement<'a> {
 ///    name exists, when `link` allows and the filesystem may have links;
 /// 3. a check that `to` is absent, then a plain rename.
 ///
-/// Steps 1 and 2 never replace anything. Step 3 runs only where neither is
+/// Steps 1 and 2 never replace anything. Step 3 runs where neither is
 /// available, as on rclone mounts and on FAT and exFAT volumes on macOS,
-/// and there a name another writer creates between the check and the
-/// rename is replaced. A name that existed before is always refused, so a
-/// policy that keeps existing files keeps them, and every receiver uses
-/// this same order: a sender cannot move an existing file onto the name,
-/// because no operation it may request renames an existing destination
-/// entry to another name.
+/// and where an ordinary receiver's copy accepts it in place of a link
+/// (`Root::publish_new_staged`); there a name another writer creates
+/// between the check and the rename is replaced. A name that existed
+/// before is always refused, so a policy that keeps existing files keeps
+/// them, and a restricted receiver always uses this same order: a sender
+/// cannot move an existing file onto the name, because no operation it may
+/// request renames an existing destination entry to another name.
 ///
 /// A refusal of a step the profile allowed is passed to `record_refusal`
 /// and taken out of `profile`, so the rest of a publication skips it too:
