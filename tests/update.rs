@@ -493,6 +493,37 @@ fn self_update_accepts_the_released_v052_receipt() {
 }
 
 #[test]
+fn self_update_ignores_a_receipt_under_a_relative_config_home() {
+    let version = next_release_version();
+    let fixture = UpdateFixture::new(&version, &format!("v{version}"));
+    // A directory the command runs in could supply a legacy receipt for the
+    // installed executable, which a relative config root would accept.
+    let work = fixture.temp.path("work");
+    let planted = work.join("config/syq/install.json");
+    fs::create_dir_all(planted.parent().unwrap()).unwrap();
+    let mut receipt: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/standalone-install-v0.5.2.json")).unwrap();
+    receipt["binary"] = fixture.installed.to_str().unwrap().into();
+    let saved = serde_json::to_vec(&receipt).unwrap();
+    fs::write(&planted, &saved).unwrap();
+    let home = fixture.temp.path("home");
+    fs::create_dir_all(&home).unwrap();
+    let out = fixture
+        .command_builder(&fixture.installed, &["--self-update"])
+        .current_dir(&work)
+        .env("XDG_CONFIG_HOME", "config")
+        .env("HOME", &home)
+        .capture_output()
+        .unwrap();
+    assert_failure_contains(
+        &out,
+        "self-update is only available for installs made by the standalone installer",
+    );
+    assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.original);
+    assert_eq!(fs::read(&planted).unwrap(), saved);
+}
+
+#[test]
 fn registration_needs_no_config_and_does_not_change_bin_permissions() {
     let version = next_release_version();
     let fixture = UpdateFixture::new(&version, &format!("v{version}"));

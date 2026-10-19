@@ -1097,15 +1097,10 @@ fn check_stamp_path() -> Result<PathBuf> {
 }
 
 fn config_dir() -> Result<PathBuf> {
-    if let Some(base) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(base).join("syq"));
-    }
-    let home = std::env::var_os("HOME")
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| {
-            anyhow!("HOME is not set, so the standalone install receipt cannot be located")
-        })?;
-    Ok(PathBuf::from(home).join(".config/syq"))
+    let base = crate::user_dirs::config_dir().ok_or_else(|| {
+        anyhow!("cannot locate the standalone install receipt: no home directory or absolute XDG_CONFIG_HOME")
+    })?;
+    Ok(base.join("syq"))
 }
 
 /// The executable's name in its release cache directory.
