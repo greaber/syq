@@ -80,7 +80,7 @@ impl Domain {
     pub(crate) fn config_file(&self, name: &str) -> Result<PathBuf> {
         match self {
             Self::Global => Ok(super::config_path()
-                .context("HOME and XDG_CONFIG_HOME are unset")?
+                .context("no home directory or absolute XDG_CONFIG_HOME")?
                 .with_file_name(name)),
             Self::Explicit(path) => {
                 self.ensure_runtime()?;

@@ -591,15 +591,7 @@ pub(crate) fn prepare_endpoint(
 }
 
 pub(crate) fn config_path() -> Option<PathBuf> {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|path| !path.is_empty())
-                .map(|home| PathBuf::from(home).join(".config"))
-        })
-        .map(|root| root.join("syq").join(CONFIG_FILE))
+    crate::user_dirs::config_dir().map(|root| root.join("syq").join(CONFIG_FILE))
 }
 
 fn read_global_config() -> Result<Option<PersistenceConfig>> {
@@ -644,7 +636,7 @@ pub(crate) fn global_enabled() -> Result<bool> {
 
 fn write_global_config(enabled: bool) -> Result<()> {
     let path = config_path()
-        .context("cannot change persistence: both XDG_CONFIG_HOME and HOME are unset")?;
+        .context("cannot change persistence: no home directory or absolute XDG_CONFIG_HOME")?;
     let parent = path.parent().expect("configuration path has a parent");
     std::fs::create_dir_all(parent)
         .with_context(|| format!("create configuration directory {}", parent.display()))?;
@@ -661,19 +653,16 @@ fn write_global_config(enabled: bool) -> Result<()> {
 }
 
 pub(crate) fn runtime_parent_path() -> PathBuf {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            // Darwin's default TMPDIR is long enough that even the global
-            // endpoint socket exceeds sun_path once OpenSSH adds its suffix.
-            // This parent is still checked for ownership, mode and symlinks.
-            if cfg!(target_os = "macos") {
-                PathBuf::from("/tmp")
-            } else {
-                std::env::temp_dir()
-            }
-        });
+    let base = crate::user_dirs::runtime_dir().unwrap_or_else(|| {
+        // Darwin's default TMPDIR is long enough that even the global
+        // endpoint socket exceeds sun_path once OpenSSH adds its suffix.
+        // This parent is still checked for ownership, mode and symlinks.
+        if cfg!(target_os = "macos") {
+            PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        }
+    });
     base.join(format!("syq-persist-{}", unsafe { libc::geteuid() }))
 }
 
