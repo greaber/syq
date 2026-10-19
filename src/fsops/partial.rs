@@ -5,6 +5,10 @@ use std::borrow::Cow;
 /// whole comparison blocks, or one block when blocks are larger.
 const DIFFERING_READ_CHUNK: u64 = 1 << 20;
 
+/// What `--in-place=update` would have done to a file it refuses
+/// (`vouch::replace_required`).
+const UPDATE_IN_PLACE: &str = "update it in place";
+
 impl FsOps {
     pub fn probe_partial(
         &mut self,
@@ -245,50 +249,8 @@ impl FsOps {
         update: &InPlaceUpdate,
         compared: Option<&HeldBasis>,
     ) -> Result<Option<(File, Arc<()>)>> {
-        const DOING: &str = "update it in place";
-        let (file, opened) = match target.root.open_regular_read_write_known(&target.relative) {
-            Ok(opened) => opened,
-            Err(error) => {
-                let raw = error
-                    .chain()
-                    .find_map(|cause| cause.downcast_ref::<io::Error>())
-                    .map(|error| (error.kind(), error.raw_os_error()));
-                return match raw {
-                    // A file in use as a program, or one its permissions
-                    // keep closed, can still be replaced. Where it can be
-                    // read, a reason the checks give comes first, as the
-                    // sender's scan predicts it.
-                    Some((_, Some(libc::EACCES | libc::EPERM | libc::ETXTBSY))) => {
-                        let refused = match target.root.open_regular_read(&target.relative) {
-                            Ok(file) => {
-                                let opened = file.metadata()?;
-                                vouch::update_refusal(
-                                    target.into(),
-                                    &file,
-                                    &opened,
-                                    &update.meta,
-                                    update.flags,
-                                    || self.inherited_acl(target),
-                                )?
-                            }
-                            Err(_) => None,
-                        };
-                        Err(vouch::replace_required(
-                            &target.label,
-                            DOING,
-                            refused.unwrap_or((
-                                ReplaceReason::NotWritable,
-                                "it cannot be opened for writing",
-                            )),
-                        ))
-                    }
-                    Some((io::ErrorKind::NotFound, _))
-                    | Some((_, Some(libc::ELOOP | libc::EISDIR | libc::ENXIO)))
-                    // Opened, but not a regular file.
-                    | None => Ok(None),
-                    Some(_) => Err(error),
-                };
-            }
+        let Some((file, opened)) = self.open_to_update(target, &update.meta, update.flags)? else {
+            return Ok(None);
         };
         let mut checked = None;
         if let Some(compared) = compared {
@@ -317,7 +279,11 @@ impl FsOps {
             )?,
         };
         if let Some(refused) = refused {
-            return Err(vouch::replace_required(&target.label, DOING, refused));
+            return Err(vouch::replace_required(
+                &target.label,
+                UPDATE_IN_PLACE,
+                refused,
+            ));
         }
         let in_use = stages::hold(
             stages::of(self.stage_scope, target, copy_id, true),
@@ -327,6 +293,56 @@ impl FsOps {
             false,
         )?;
         Ok(Some((file, in_use)))
+    }
+
+    /// For `--in-place=update`: open the existing regular file at `target`
+    /// for writing, with its metadata read through the descriptor, to be
+    /// finished with `meta` under `flags`. One that will not open for
+    /// writing, as a file in use as a program or one its permissions keep
+    /// closed, is refused with `vouch::replace_required`: where it can be
+    /// read, for a reason the checks give (`vouch::update_refusal`), as the
+    /// sender's scan predicts it, and otherwise as not writable. `None`
+    /// when the name holds no regular file.
+    pub(super) fn open_to_update(
+        &self,
+        target: &RootedTarget,
+        meta: &Meta,
+        flags: u8,
+    ) -> Result<Option<(File, fs::Metadata)>> {
+        let error = match target.root.open_regular_read_write_known(&target.relative) {
+            Ok(opened) => return Ok(Some(opened)),
+            Err(error) => error,
+        };
+        let raw = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<io::Error>())
+            .map(|error| (error.kind(), error.raw_os_error()));
+        match raw {
+            Some((_, Some(libc::EACCES | libc::EPERM | libc::ETXTBSY))) => {
+                let refused = match target.root.open_regular_read(&target.relative) {
+                    Ok(file) => {
+                        let opened = file.metadata()?;
+                        vouch::update_refusal(target.into(), &file, &opened, meta, flags, || {
+                            self.inherited_acl(target)
+                        })?
+                    }
+                    Err(_) => None,
+                };
+                Err(vouch::replace_required(
+                    &target.label,
+                    UPDATE_IN_PLACE,
+                    refused.unwrap_or((
+                        ReplaceReason::NotWritable,
+                        "it cannot be opened for writing",
+                    )),
+                ))
+            }
+            Some((io::ErrorKind::NotFound, _))
+            | Some((_, Some(libc::ELOOP | libc::EISDIR | libc::ENXIO)))
+            // Opened, but not a regular file.
+            | None => Ok(None),
+            Some(_) => Err(error),
+        }
     }
 
     pub(super) fn reusable_partial_permissions(&self, file: &File) -> Result<bool> {
@@ -2969,24 +2985,7 @@ impl FsOps {
                 Self::verify_expected_held(&target.root, &target.relative, &file, expected)?;
             }
             if !created {
-                // An existing file `--in-place=update` wrote keeps its mode
-                // unless the copy sets one, as one it replaces does. Its
-                // metadata goes through the checks for any metadata change,
-                // read now: someone may have given it another name since
-                // it was opened. Its contents are written already, so the
-                // file fails rather than being replaced.
-                let flags = flags & !flags::RECEIVER_MODE;
-                if let Err(error) = vouch::require(target, &file, &current, meta, flags) {
-                    if vouch::is_replace_required(&error) {
-                        bail!(
-                            "{} changed while this copy updated it in place: {error:#}",
-                            target.label.display()
-                        );
-                    }
-                    return Err(error);
-                }
-                set_meta_written_file(&file, meta, flags, &current)
-                    .with_context(|| format!("set metadata {}", target.label.display()))?;
+                finish_updated_metadata(target, &file, &current, meta, flags)?;
             } else {
                 let resolved = self.inplace_final_mode(target, meta, flags)?;
                 let (meta, flags) = resolved
@@ -4707,6 +4706,33 @@ pub(super) fn set_meta_written_file(
     created: &fs::Metadata,
 ) -> Result<()> {
     set_meta_file_inner(f, meta, flags, created, false, false)
+}
+
+/// Give an existing file `--in-place=update` wrote its final metadata,
+/// `meta` under `flags`. It keeps its mode unless the copy sets one, as one
+/// it replaces does. The metadata goes through the checks for any metadata
+/// change, on `current`, read through `file` after the writes: someone may
+/// have given it another name since it was opened. Its contents are
+/// written already, so the file fails rather than being replaced.
+pub(super) fn finish_updated_metadata(
+    target: &RootedTarget,
+    file: &File,
+    current: &fs::Metadata,
+    meta: &Meta,
+    flags: u8,
+) -> Result<()> {
+    let flags = flags & !flags::RECEIVER_MODE;
+    if let Err(error) = vouch::require(target, file, current, meta, flags) {
+        if vouch::is_replace_required(&error) {
+            bail!(
+                "{} changed while this copy updated it in place: {error:#}",
+                target.label.display()
+            );
+        }
+        return Err(error);
+    }
+    set_meta_written_file(file, meta, flags, current)
+        .with_context(|| format!("set metadata {}", target.label.display()))
 }
 
 pub(super) fn set_meta_file_for_publication(f: &File, meta: &Meta, flags: u8) -> Result<()> {

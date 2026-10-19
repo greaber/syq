@@ -368,9 +368,23 @@ pub(crate) fn allows<'a>(
     meta: &Meta,
     flags: u8,
 ) -> Result<bool> {
+    declines(place, file, current, meta, flags).map(|declined| declined.is_none())
+}
+
+/// Why `require` would refuse the change, if it would, for a caller that
+/// replaces the file instead and says why.
+pub(crate) fn declines<'a>(
+    place: impl Into<Place<'a>>,
+    file: &File,
+    current: &fs::Metadata,
+    meta: &Meta,
+    flags: u8,
+) -> Result<Option<ReplaceReason>> {
     match require(place, file, current, meta, flags) {
-        Ok(()) => Ok(true),
-        Err(error) if is_replace_required(&error) => Ok(false),
-        Err(error) => Err(error),
+        Ok(()) => Ok(None),
+        Err(error) => match replace_reason(&error) {
+            Some(reason) => Ok(Some(reason)),
+            None => Err(error),
+        },
     }
 }

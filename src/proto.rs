@@ -466,7 +466,8 @@ pub struct DifferingBlocks {
 /// holds its comparison hash, and otherwise from the next bytes of `data`.
 /// When every block is reused and the existing file still has the `basis`
 /// fingerprint, or hashes as `reuse` again, that file is kept and only its
-/// metadata is set.
+/// metadata is set. With `update_in_place`, the new blocks are written into
+/// the existing file instead, where the receiver can vouch for it.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallPatch {
     pub path: PathBytes,
@@ -485,6 +486,13 @@ pub struct SmallPatch {
     pub unchanged_flags: u8,
     pub condition: TargetCondition,
     pub guard: Option<ContainerGuard>,
+    /// `--in-place=update`: write the new blocks into the existing file at
+    /// `path`, and finish it with `meta` under `flags`, when the receiver
+    /// can vouch for that (`fsops::vouch::update_refusal`). Otherwise the
+    /// patch is published through a stage, and the outcome says why
+    /// (`SmallPatched::replaced`). A batch patch only: a streamed one is
+    /// always staged.
+    pub update_in_place: bool,
 }
 
 impl SmallPatch {
@@ -511,6 +519,10 @@ pub struct SmallPatched {
     pub kept: bool,
     /// The kept or published inode, when the flags asked for it.
     pub identity: Option<(u64, u64)>,
+    /// The receiver would not change the existing file in place, for this
+    /// reason, and replaced it: it would not update it in place
+    /// (`SmallPatch::update_in_place`), or keep it with new metadata.
+    pub replaced: Option<ReplaceReason>,
 }
 
 /// Why one file of a patch batch failed.
@@ -525,6 +537,11 @@ pub struct SmallPatchError {
     /// kept or written. Compared again, under a fresh condition, it may
     /// still be kept or patched.
     pub stale_condition: bool,
+    /// The receiver had begun writing the existing file in place
+    /// (`SmallPatch::update_in_place`), which may now hold some of its new
+    /// contents: the file fails as it is, as an in-place file whose write
+    /// fails does, rather than being copied again.
+    pub written: bool,
 }
 
 /// Contents and integrity hash for one successful `SmallRead`.
@@ -1366,8 +1383,9 @@ pub enum WireRequest<Data> {
         reads: Vec<DifferingRead>,
     },
     /// Publish files assembled from new contents and verified blocks of the
-    /// files they replace, as `PutSmallBatch` publishes whole files, or keep
-    /// those that already match.
+    /// files they replace, as `PutSmallBatch` publishes whole files, keep
+    /// those that already match, or write the new blocks of those to update
+    /// in place (`SmallPatch::update_in_place`) into the existing files.
     PatchSmallBatch(Vec<SmallPatch>),
     /// Begin one patch, carrying no data, whose `data_len` new bytes follow
     /// in `PatchData` pieces. Until `PatchEnd`, the connection accepts only
