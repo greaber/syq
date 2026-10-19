@@ -1,4 +1,5 @@
-//! Per-user locations for optional state.
+//! Per-user base directories for syq's caches, settings, and runtime files,
+//! including receiving approval settings and the install receipt.
 //!
 //! An XDG base directory variable is used only when it holds an absolute
 //! path. The XDG Base Directory specification treats a relative value as
@@ -9,14 +10,14 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// The user's cache directory: an absolute `XDG_CACHE_HOME`, otherwise
-/// `.cache` in the home directory. Syq never creates the home directory
-/// itself, so a missing one leaves optional cache state unused.
+/// `.cache` in the home directory when that exists. Syq never creates the
+/// home directory itself, so a missing one leaves the cache unused.
 pub(crate) fn cache_dir() -> Option<PathBuf> {
     base_dir("XDG_CACHE_HOME", Some(".cache"))
 }
 
 /// The user's configuration directory: an absolute `XDG_CONFIG_HOME`,
-/// otherwise `.config` in the home directory.
+/// otherwise `.config` in the home directory when that exists.
 pub(crate) fn config_dir() -> Option<PathBuf> {
     base_dir("XDG_CONFIG_HOME", Some(".config"))
 }
