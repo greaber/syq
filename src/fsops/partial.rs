@@ -3993,108 +3993,20 @@ impl Read for ReadAt<'_> {
 pub(super) struct PublishedStage(Option<(Arc<Root>, crate::rooted::StagedLink)>);
 
 impl PublishedStage {
-    /// Let the staged name go, if one is left, once the caller has closed
-    /// the file: by `staged_links`, off the copy's own path.
+    /// Remove the staged name, if one is left, once the caller has closed
+    /// the file.
     pub(super) fn remove(mut self) -> Result<()> {
-        if let Some((root, link)) = self.0.take() {
-            staged_links::remove(root, link);
+        match self.0.take() {
+            Some((root, link)) => root.remove_staged_link(link),
+            None => Ok(()),
         }
-        Ok(())
     }
 }
 
 impl Drop for PublishedStage {
     fn drop(&mut self) {
         if let Some((root, link)) = self.0.take() {
-            staged_links::remove(root, link);
-        }
-    }
-}
-
-/// Staged names that hard links left beside published files
-/// (`Root::remove_staged_link`), removed by threads of their own: on NFS
-/// each removal is a round trip under the directory's lock, which the
-/// copy need not wait for. Every receiver lets them all go before it ends
-/// (`drain`).
-pub(super) mod staged_links {
-    use super::*;
-    use std::collections::VecDeque;
-    use std::sync::Condvar;
-
-    /// Threads removing names at once: enough to keep several directories
-    /// busy, as the batches that publish into them are.
-    const REMOVERS: usize = 8;
-
-    #[derive(Default)]
-    struct Queue {
-        waiting: VecDeque<(Arc<Root>, crate::rooted::StagedLink)>,
-        /// Names taken from `waiting` and not removed yet.
-        removing: usize,
-        threads: usize,
-    }
-
-    #[derive(Default)]
-    struct Removals {
-        queue: Mutex<Queue>,
-        added: Condvar,
-        done: Condvar,
-    }
-
-    fn removals() -> &'static Removals {
-        static REMOVALS: OnceLock<Removals> = OnceLock::new();
-        REMOVALS.get_or_init(Default::default)
-    }
-
-    /// Queue `link`'s name for removal. Where no thread can start, it is
-    /// removed here.
-    pub(crate) fn remove(root: Arc<Root>, link: crate::rooted::StagedLink) {
-        let removals = removals();
-        let mut queue = removals.queue.lock().unwrap();
-        if queue.threads < REMOVERS {
-            let started = std::thread::Builder::new()
-                .name("syq-staged-links".into())
-                .spawn(work);
-            match started {
-                Ok(_) => queue.threads += 1,
-                Err(_) if queue.threads == 0 => {
-                    drop(queue);
-                    let _ = root.remove_staged_link(link);
-                    return;
-                }
-                Err(_) => {}
-            }
-        }
-        queue.waiting.push_back((root, link));
-        removals.added.notify_one();
-    }
-
-    fn work() {
-        let removals = removals();
-        let mut queue = removals.queue.lock().unwrap();
-        loop {
-            let Some((root, link)) = queue.waiting.pop_front() else {
-                queue = removals.added.wait(queue).unwrap();
-                continue;
-            };
-            queue.removing += 1;
-            drop(queue);
-            // A name that cannot be removed stays for a later copy's sweep,
-            // as an interrupted copy leaves its partials.
             let _ = root.remove_staged_link(link);
-            queue = removals.queue.lock().unwrap();
-            queue.removing -= 1;
-            if queue.waiting.is_empty() && queue.removing == 0 {
-                removals.done.notify_all();
-            }
-        }
-    }
-
-    /// Wait until every queued name is gone.
-    pub(crate) fn drain() {
-        let removals = removals();
-        let mut queue = removals.queue.lock().unwrap();
-        while !queue.waiting.is_empty() || queue.removing != 0 {
-            queue = removals.done.wait(queue).unwrap();
         }
     }
 }

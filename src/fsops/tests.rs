@@ -9111,9 +9111,6 @@ fn every_receiver_links_new_names_and_renames_over_replaced_ones() {
         );
         assert!(errors[2].is_none(), "{errors:?}");
         assert_eq!(crate::rooted::Root::take_checked_renames_for_test(), 0);
-        // The staged names go off the copy's path, and all before its
-        // operations end.
-        super::partial::staged_links::drain();
         let mut names: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())

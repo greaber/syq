@@ -196,8 +196,9 @@ appears under `keep` is kept, but that file's copy is reported as failed
 With `syq rsync --existing`, syq replaces only the files its scan found, by
 renaming its file over whatever the name holds by then: a file another
 program replaces or removes in the meantime is replaced, or created again.
-rsync behaves the same way. A restricted receiver creates nothing its own
-scan of the destination didn't find there.
+rsync behaves the same way. A restricted receiver replaces only files it
+found there itself, in its own scan of the destination or with a look of its
+own, whatever the sender says.
 
 On filesystems with neither an atomic no-replace rename nor hard links, such
 as FAT and exFAT on macOS and rclone mounts, syq checks that a name is free

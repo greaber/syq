@@ -4155,15 +4155,6 @@ fn hash_reader_observed(
     Ok(hashes)
 }
 
-/// A receiver lets the staged names its hard links left go before its
-/// connection's operations end (`partial::staged_links`), so a copy that
-/// ends leaves none behind.
-impl Drop for FsOps {
-    fn drop(&mut self) {
-        partial::staged_links::drain();
-    }
-}
-
 #[cfg(test)]
 mod tests;
 
