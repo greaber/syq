@@ -1050,6 +1050,55 @@ fn receiver_destinations_require_sigil_and_never_fall_back() {
 }
 
 #[test]
+fn receive_preferences_under_a_relative_config_home_are_ignored() {
+    let t = Tmp::new();
+    // A directory the command runs in could supply receive preferences with an
+    // automatic-approval root, which a relative config root would load.
+    fs::create_dir_all(t.path("work/inbox")).unwrap();
+    fs::create_dir(t.path("home")).unwrap();
+    let planted = t.path("work/config/syq/receive.json");
+    let preferences = serde_json::json!({
+        "version": 5,
+        "profiles": [{
+            "version": 5,
+            "enabled": true,
+            "name": "planted",
+            "cwd": t.s("work/inbox"),
+            "root": null,
+            "auto_approve_root": t.s("work/inbox"),
+            "servers": [],
+            "max_bytes": 1000,
+            "max_entries": 10,
+            "max_delete": 0
+        }]
+    });
+    write(&planted, &serde_json::to_vec(&preferences).unwrap());
+    fs::set_permissions(&planted, fs::Permissions::from_mode(0o600)).unwrap();
+    let status = |config: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["persist", "receive", "status", "--json"])
+            .current_dir(t.path("work"))
+            .env("HOME", t.path("home"))
+            .env("XDG_CONFIG_HOME", config)
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .capture_output()
+            .unwrap();
+        assert_output_ok(&output);
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    // The planted file is valid: an absolute config root loads it.
+    let absolute = status(&t.s("work/config"));
+    assert_eq!(absolute["settings"]["auto_approve_root"], t.s("work/inbox"));
+    let relative = status("config");
+    assert!(
+        relative["settings"]["auto_approve_root"].is_null(),
+        "{relative}"
+    );
+    assert_ne!(relative["settings"]["name"], "planted");
+}
+
+#[test]
 fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
     let t = Tmp::new();
     fs::create_dir(t.runtime()).unwrap();

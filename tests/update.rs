@@ -150,7 +150,14 @@ impl UpdateFixture {
     }
 
     fn command_at_args(&self, executable: &Path, arguments: &[&str]) -> Output {
-        Command::new(executable)
+        self.command_builder(executable, arguments)
+            .capture_output()
+            .unwrap()
+    }
+
+    fn command_builder(&self, executable: &Path, arguments: &[&str]) -> Command {
+        let mut command = Command::new(executable);
+        command
             .args(arguments)
             .env("XDG_CONFIG_HOME", &self.config)
             .env("XDG_CACHE_HOME", self.temp.path("cache"))
@@ -164,9 +171,8 @@ impl UpdateFixture {
                 "SYQ_TEST_RELEASE_DOWNLOADS",
                 "https://release.invalid/download",
             )
-            .env("SYQ_TEST_FIXTURES", self.temp.path("fixtures"))
-            .capture_output()
-            .unwrap()
+            .env("SYQ_TEST_FIXTURES", self.temp.path("fixtures"));
+        command
     }
 
     fn command_at(&self, executable: &Path, argument: &str) -> Output {
@@ -487,6 +493,37 @@ fn self_update_accepts_the_released_v052_receipt() {
 }
 
 #[test]
+fn self_update_ignores_a_receipt_under_a_relative_config_home() {
+    let version = next_release_version();
+    let fixture = UpdateFixture::new(&version, &format!("v{version}"));
+    // A directory the command runs in could supply a legacy receipt for the
+    // installed executable, which a relative config root would accept.
+    let work = fixture.temp.path("work");
+    let planted = work.join("config/syq/install.json");
+    fs::create_dir_all(planted.parent().unwrap()).unwrap();
+    let mut receipt: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/standalone-install-v0.5.2.json")).unwrap();
+    receipt["binary"] = fixture.installed.to_str().unwrap().into();
+    let saved = serde_json::to_vec(&receipt).unwrap();
+    fs::write(&planted, &saved).unwrap();
+    let home = fixture.temp.path("home");
+    fs::create_dir_all(&home).unwrap();
+    let out = fixture
+        .command_builder(&fixture.installed, &["--self-update"])
+        .current_dir(&work)
+        .env("XDG_CONFIG_HOME", "config")
+        .env("HOME", &home)
+        .capture_output()
+        .unwrap();
+    assert_failure_contains(
+        &out,
+        "self-update is only available for installs made by the standalone installer",
+    );
+    assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.original);
+    assert_eq!(fs::read(&planted).unwrap(), saved);
+}
+
+#[test]
 fn registration_needs_no_config_and_does_not_change_bin_permissions() {
     let version = next_release_version();
     let fixture = UpdateFixture::new(&version, &format!("v{version}"));
@@ -708,28 +745,182 @@ fn use_version_rejects_wrong_release_and_corrupt_cached_manifest() {
     let mut value: serde_json::Value =
         serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
     value["version"] = "0.7.1".into();
-    fs::write(manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    // A complete stored release is started without reading its manifest; the
+    // manifest is checked again only when the release must be downloaded.
+    fs::remove_file(manifest.with_file_name("syq")).unwrap();
     let out = fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]);
     assert_failure_contains(&out, "signature verification failed");
 }
 
 #[test]
-fn use_version_repairs_corrupt_cached_binary_from_verified_release() {
+fn use_version_starts_a_stored_release_directly_and_downloads_it_again_when_removed() {
     let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
     let run = || fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]);
     assert_success(&run());
-    let cached = fixture.temp.path(&format!(
+    let stored = fixture.temp.path(&format!(
         "cache/syq/helpers/v0.7.0/{}/syq",
         release_target()
     ));
-    fs::write(cached, b"corrupt").unwrap();
+    let release = fs::read(&stored).unwrap();
+    make_cache_private(&fixture, stored.parent().unwrap());
+    // A stored release in a private cache passed its checks before its
+    // manifest was stored, so later runs start it without hashing it or
+    // reading the manifest.
+    executable_support::write_executable(&stored, "#!/bin/sh\necho 'stored copy'\n", 0o755);
+    fs::write(
+        stored.with_file_name("syq-release-manifest.json"),
+        b"not json",
+    )
+    .unwrap();
+    let out = run();
+    assert_success(&out);
+    assert_eq!(out.stdout, b"stored copy\n");
+    fs::remove_dir_all(fixture.temp.path("cache/syq/helpers/v0.7.0")).unwrap();
     let out = run();
     assert_success(&out);
     assert_eq!(out.stdout, b"syq 0.7.0\n");
+    assert_eq!(fs::read(&stored).unwrap(), release);
+}
+
+/// Give every directory from the fixture's cache root down to `directory`
+/// owner-only permissions, so a test of the direct start does not depend on
+/// the umask they were created with.
+fn make_cache_private(fixture: &UpdateFixture, directory: &Path) {
+    let root = fixture.temp.path("cache");
+    let mut path = root.clone();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    for component in directory.strip_prefix(&root).unwrap().components() {
+        path.push(component);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+#[test]
+fn use_version_verifies_a_stored_release_in_a_cache_others_could_change() {
+    for case in ["group-writable directory", "symbolic link"] {
+        let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+        let run =
+            || fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]);
+        assert_success(&run());
+        let stored = fixture.temp.path(&format!(
+            "cache/syq/helpers/v0.7.0/{}/syq",
+            release_target()
+        ));
+        let release = fs::read(&stored).unwrap();
+        make_cache_private(&fixture, stored.parent().unwrap());
+        let version = fixture.temp.path("cache/syq/helpers/v0.7.0");
+        if case == "symbolic link" {
+            let elsewhere = fixture.temp.path("elsewhere");
+            fs::rename(&version, &elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &version).unwrap();
+        } else {
+            let helpers = fixture.temp.path("cache/syq/helpers");
+            fs::set_permissions(&helpers, fs::Permissions::from_mode(0o770)).unwrap();
+        }
+        executable_support::write_executable(&stored, "#!/bin/sh\necho planted\n", 0o755);
+        let out = run();
+        assert_success(&out);
+        assert_eq!(out.stdout, b"syq 0.7.0\n", "{case}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("cached syq release failed integrity verification"),
+            "{case}: {stderr}"
+        );
+        assert_eq!(fs::read(&stored).unwrap(), release, "{case}");
+    }
+}
+
+#[test]
+fn use_version_verifies_a_stored_executable_that_has_no_manifest() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    let run = || fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]);
+    assert_success(&run());
+    let stored = fixture.temp.path(&format!(
+        "cache/syq/helpers/v0.7.0/{}/syq",
+        release_target()
+    ));
+    let release = fs::read(&stored).unwrap();
+    make_cache_private(&fixture, stored.parent().unwrap());
+    // The remote-helper upload path stores executables here without a
+    // manifest. One that reports the right version and identity must still
+    // match the signed hash before its manifest marks it as checked.
+    let manifest = stored.with_file_name("syq-release-manifest.json");
+    fs::remove_file(&manifest).unwrap();
+    executable_support::write_executable(
+        &stored,
+        "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'syq 0.7.0' ;;\n  --build-identity) echo 'v0.7.0' ;;\n  *) echo planted ;;\nesac\n",
+        0o755,
+    );
+    let out = run();
+    assert_success(&out);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("cached syq release failed integrity verification"),
         "{stderr}"
+    );
+    assert_eq!(fs::read(&stored).unwrap(), release);
+    assert!(manifest.is_file());
+}
+
+#[test]
+fn use_version_verifies_a_download_before_storing_it() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    let archive = fixture
+        .temp
+        .path(&format!("fixtures/syq-{}.gz", release_target()));
+    let mut tampered = fs::read(&archive).unwrap();
+    let middle = tampered.len() / 2;
+    tampered[middle] ^= 1;
+    fs::write(&archive, tampered).unwrap();
+    let out = fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]);
+    assert_failure_contains(
+        &out,
+        "downloaded syq release archive failed SHA-256 verification",
+    );
+    let directory = fixture
+        .temp
+        .path(&format!("cache/syq/helpers/v0.7.0/{}", release_target()));
+    let stored: Vec<_> = fs::read_dir(&directory)
+        .map(|entries| entries.map(|entry| entry.unwrap().file_name()).collect())
+        .unwrap_or_default();
+    assert!(stored.is_empty(), "{stored:?}");
+}
+
+#[test]
+fn use_version_ignores_a_relative_cache_home() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    // A directory the command runs in could supply a genuine manifest beside an
+    // executable of its own, which a relative cache root would start.
+    let work = fixture.temp.path("work");
+    let planted = work.join(format!("cache/syq/helpers/v0.7.0/{}", release_target()));
+    fs::create_dir_all(&planted).unwrap();
+    fs::copy(
+        fixture.temp.path("fixtures/syq-release-manifest.json"),
+        planted.join("syq-release-manifest.json"),
+    )
+    .unwrap();
+    executable_support::write_executable(&planted.join("syq"), "#!/bin/sh\necho planted\n", 0o755);
+    let home = fixture.temp.path("home");
+    fs::create_dir_all(&home).unwrap();
+    let out = fixture
+        .command_builder(&fixture.installed, &["--use-version=0.7.0", "--version"])
+        .current_dir(&work)
+        .env("XDG_CACHE_HOME", "cache")
+        .env("HOME", &home)
+        .capture_output()
+        .unwrap();
+    assert_success(&out);
+    assert_eq!(out.stdout, b"syq 0.7.0\n");
+    assert!(home
+        .join(format!(
+            ".cache/syq/helpers/v0.7.0/{}/syq",
+            release_target()
+        ))
+        .is_file());
+    assert_eq!(
+        fs::read(planted.join("syq")).unwrap(),
+        b"#!/bin/sh\necho planted\n"
     );
 }
 
