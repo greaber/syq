@@ -379,16 +379,56 @@ fn read_verified(path: &Path, expected: &ReleaseFile, description: &str) -> Resu
     Ok(bytes)
 }
 
-/// The stored release for `--use-version`, downloading it when it is missing.
-/// Every executable in this cache was checked by `download_helper` before
-/// `store_helper` renamed it into place, so a stored one is used as is.
+/// The stored release for `--use-version` when it cannot be started directly.
+/// An existing executable is hashed against the signed manifest, since it may
+/// have been stored without a manifest or by someone else; one that is missing
+/// or does not match is downloaded, verified, and stored.
 fn stored_release_path(helper: &TrustedCurrentHelper) -> Result<PathBuf> {
     let cache_path = helper_cache_path(helper)?;
-    if !cache_path.is_file() {
-        let binary = download_helper(helper, SYQ_RELEASE)?;
-        store_helper(&cache_path, &binary, SYQ_RELEASE)?;
+    if cache_path.is_file() {
+        match verify_file_as(&cache_path, &helper.binary, "cached syq release") {
+            Ok(()) => return Ok(cache_path),
+            Err(error) => {
+                crate::output::diagnostic!(
+                    "syq: warning: cached syq release failed integrity verification ({error}); discarding it"
+                );
+                let _ = fs::remove_file(&cache_path);
+            }
+        }
     }
+    let binary = download_helper(helper, SYQ_RELEASE)?;
+    store_helper(&cache_path, &binary, SYQ_RELEASE)?;
     Ok(cache_path)
+}
+
+/// Whether a stored release can be started without verifying it again: its
+/// files, and every directory from the cache root down to theirs, are real
+/// files and directories rather than symbolic links, owned by this user, and
+/// not writable by group or others. Otherwise someone else may have put them
+/// there, for example under a shared `XDG_CACHE_HOME`.
+fn privately_stored(root: &Path, directory: &Path, files: &[&Path]) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(below) = directory.strip_prefix(root) else {
+        return false;
+    };
+    let user = unsafe { libc::geteuid() };
+    let private = |path: &Path, is_directory: bool| {
+        fs::symlink_metadata(path).is_ok_and(|metadata| {
+            let kind = if is_directory {
+                metadata.is_dir()
+            } else {
+                metadata.is_file()
+            };
+            kind && metadata.uid() == user && metadata.mode() & 0o022 == 0
+        })
+    };
+    let mut path = root.to_path_buf();
+    private(&path, true)
+        && below.components().all(|component| {
+            path.push(component);
+            private(&path, true)
+        })
+        && files.iter().all(|file| private(file, false))
 }
 
 // What a cached executable is for, as named in messages about it.
@@ -445,18 +485,20 @@ fn store_helper(cache_path: &Path, binary: &[u8], what: &str) -> Result<()> {
 /// An explicit version selection stores the release beside its signed
 /// manifest. A download is checked against the manifest's signature, sizes, and
 /// hashes, and the release must report the expected version and build identity,
-/// before the manifest is stored. Finding both files therefore means the
-/// release passed those checks, so later runs start it directly without reading
-/// either file or checking online for freshness: release tags are immutable,
-/// and selecting a release deliberately permits running an older version. This
+/// before the manifest is stored. Finding both files in a private cache
+/// therefore means the release passed those checks, so later runs start it
+/// directly without reading either file or checking online for freshness:
+/// release tags are immutable, and selecting a release deliberately permits
+/// running an older version. Anything else gets the full checks again. This
 /// does not replace the normal installation.
 pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
     let target = Target::local().context("official releases do not support this platform")?;
     let tag = format!("v{version}");
-    let directory = release_cache_directory(&tag, target)?;
+    let root = release_cache_root()?;
+    let directory = release_directory(&root, &tag, target);
     let manifest_path = directory.join(MANIFEST_NAME);
     let executable = directory.join(CACHED_EXECUTABLE);
-    if manifest_path.is_file() && executable.is_file() {
+    if privately_stored(&root, &directory, &[&manifest_path, &executable]) {
         return Ok(executable);
     }
     // Only explicit selection opts every build into the official trust anchor.
@@ -1111,10 +1153,17 @@ fn helper_cache_path(helper: &TrustedCurrentHelper) -> Result<PathBuf> {
 }
 
 fn release_cache_directory(tag: &str, target: Target) -> Result<PathBuf> {
-    let base = crate::user_dirs::cache_dir().ok_or_else(|| {
+    Ok(release_directory(&release_cache_root()?, tag, target))
+}
+
+fn release_cache_root() -> Result<PathBuf> {
+    crate::user_dirs::cache_dir().ok_or_else(|| {
         anyhow!("cannot locate the release cache: no home directory or absolute XDG_CACHE_HOME")
-    })?;
-    Ok(base.join("syq/helpers").join(tag).join(target.key))
+    })
+}
+
+fn release_directory(root: &Path, tag: &str, target: Target) -> PathBuf {
+    root.join("syq/helpers").join(tag).join(target.key)
 }
 
 fn canonical_current_exe() -> Result<PathBuf> {

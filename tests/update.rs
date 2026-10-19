@@ -763,8 +763,10 @@ fn use_version_starts_a_stored_release_directly_and_downloads_it_again_when_remo
         release_target()
     ));
     let release = fs::read(&stored).unwrap();
-    // A stored release passed its checks before its manifest was stored, so
-    // later runs start it without hashing it or reading the manifest.
+    make_cache_private(&fixture, stored.parent().unwrap());
+    // A stored release in a private cache passed its checks before its
+    // manifest was stored, so later runs start it without hashing it or
+    // reading the manifest.
     executable_support::write_executable(&stored, "#!/bin/sh\necho 'stored copy'\n", 0o755);
     fs::write(
         stored.with_file_name("syq-release-manifest.json"),
@@ -779,6 +781,86 @@ fn use_version_starts_a_stored_release_directly_and_downloads_it_again_when_remo
     assert_success(&out);
     assert_eq!(out.stdout, b"syq 0.7.0\n");
     assert_eq!(fs::read(&stored).unwrap(), release);
+}
+
+/// Give every directory from the fixture's cache root down to `directory`
+/// owner-only permissions, so a test of the direct start does not depend on
+/// the umask they were created with.
+fn make_cache_private(fixture: &UpdateFixture, directory: &Path) {
+    let root = fixture.temp.path("cache");
+    let mut path = root.clone();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    for component in directory.strip_prefix(&root).unwrap().components() {
+        path.push(component);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+#[test]
+fn use_version_verifies_a_stored_release_in_a_cache_others_could_change() {
+    for case in ["group-writable directory", "symbolic link"] {
+        let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+        let run =
+            || fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]);
+        assert_success(&run());
+        let stored = fixture.temp.path(&format!(
+            "cache/syq/helpers/v0.7.0/{}/syq",
+            release_target()
+        ));
+        let release = fs::read(&stored).unwrap();
+        make_cache_private(&fixture, stored.parent().unwrap());
+        let version = fixture.temp.path("cache/syq/helpers/v0.7.0");
+        if case == "symbolic link" {
+            let elsewhere = fixture.temp.path("elsewhere");
+            fs::rename(&version, &elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &version).unwrap();
+        } else {
+            let helpers = fixture.temp.path("cache/syq/helpers");
+            fs::set_permissions(&helpers, fs::Permissions::from_mode(0o770)).unwrap();
+        }
+        executable_support::write_executable(&stored, "#!/bin/sh\necho planted\n", 0o755);
+        let out = run();
+        assert_success(&out);
+        assert_eq!(out.stdout, b"syq 0.7.0\n", "{case}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("cached syq release failed integrity verification"),
+            "{case}: {stderr}"
+        );
+        assert_eq!(fs::read(&stored).unwrap(), release, "{case}");
+    }
+}
+
+#[test]
+fn use_version_verifies_a_stored_executable_that_has_no_manifest() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    let run = || fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]);
+    assert_success(&run());
+    let stored = fixture.temp.path(&format!(
+        "cache/syq/helpers/v0.7.0/{}/syq",
+        release_target()
+    ));
+    let release = fs::read(&stored).unwrap();
+    make_cache_private(&fixture, stored.parent().unwrap());
+    // The remote-helper upload path stores executables here without a
+    // manifest. One that reports the right version and identity must still
+    // match the signed hash before its manifest marks it as checked.
+    let manifest = stored.with_file_name("syq-release-manifest.json");
+    fs::remove_file(&manifest).unwrap();
+    executable_support::write_executable(
+        &stored,
+        "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'syq 0.7.0' ;;\n  --build-identity) echo 'v0.7.0' ;;\n  *) echo planted ;;\nesac\n",
+        0o755,
+    );
+    let out = run();
+    assert_success(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cached syq release failed integrity verification"),
+        "{stderr}"
+    );
+    assert_eq!(fs::read(&stored).unwrap(), release);
+    assert!(manifest.is_file());
 }
 
 #[test]
