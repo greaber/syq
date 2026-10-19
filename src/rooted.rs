@@ -2376,11 +2376,15 @@ impl Root {
         #[cfg(test)]
         run_publication_test_hook(self.identity, target, PublicationTestPoint::AfterAbsentLink);
         // A link from the staged file's descriptor published that file and
-        // no other. Otherwise, where inode numbers can show it, the
+        // no other, and an atomic no-replace rename the staged name checked
+        // just before. Otherwise (a link by name, or a check that the name
+        // was free and then a rename), where inode numbers can show it, the
         // published name is compared with the staged file; where each name
         // reports its own number and one link, as on SSHFS, it cannot be.
         let by_descriptor = moved == publication::Moved::Linked && descriptor.is_some();
-        if profile.link_counts_trusted && !by_descriptor {
+        let atomic_rename =
+            moved == publication::Moved::Renamed && profile.atomic_no_replace_rename;
+        if profile.link_counts_trusted && !by_descriptor && !atomic_rename {
             let published = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
             let expected = match moved {
                 publication::Moved::Renamed => {
