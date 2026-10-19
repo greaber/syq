@@ -37,9 +37,9 @@ pub(super) struct AuthorityState {
     /// before either, so that they leave nothing out.
     pub(super) recorded_any: bool,
     /// Under a grant that creates nothing (`MustExist`), the names this
-    /// receiver's own destination scan found, by keyed hash
-    /// (`RestrictedAuthority::record_scanned`).
-    pub(super) scanned: HashSet<u64>,
+    /// receiver's own destination scan found, by keyed hash, with a regular
+    /// file's permission bits (`RestrictedAuthority::record_scanned`).
+    pub(super) scanned: HashMap<u64, Option<u32>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -588,7 +588,7 @@ impl RestrictedAuthority {
                 in_flight: 0,
                 results_closing: false,
                 recorded_any: false,
-                scanned: HashSet::new(),
+                scanned: HashMap::new(),
             }),
             scan_key: Default::default(),
         };
@@ -1596,7 +1596,8 @@ impl RestrictedAuthority {
         for entry in entries {
             use std::hash::BuildHasher;
             let path = crate::fsops::join(root, &entry.path);
-            state.scanned.insert(self.scan_key.hash_one(&path));
+            let file = (entry.kind == proto::Kind::File).then_some(entry.mode & 0o7777);
+            state.scanned.insert(self.scan_key.hash_one(&path), file);
         }
     }
 
@@ -1604,7 +1605,28 @@ impl RestrictedAuthority {
     fn scanned_existing(&self, path: &[u8]) -> bool {
         use std::hash::BuildHasher;
         let key = self.scan_key.hash_one(path);
-        self.state.lock().unwrap().scanned.contains(&key)
+        self.state.lock().unwrap().scanned.contains_key(&key)
+    }
+
+    /// What a file published at `path` held to `condition` replaces, as
+    /// the receiver knows it without a look: nothing, for a new name the
+    /// publication will not let replace anything, or what this receiver's
+    /// own scan found. Otherwise the receiver looks for itself.
+    fn known_destination(
+        &self,
+        path: &[u8],
+        condition: proto::TargetCondition,
+    ) -> proto::ScannedDestination {
+        use std::hash::BuildHasher;
+        if condition == proto::TargetCondition::Absent {
+            return proto::ScannedDestination::Absent;
+        }
+        let key = self.scan_key.hash_one(path);
+        match self.state.lock().unwrap().scanned.get(&key) {
+            Some(Some(mode)) => proto::ScannedDestination::File(*mode),
+            Some(None) => proto::ScannedDestination::Absent,
+            None => proto::ScannedDestination::Unknown,
+        }
     }
 
     /// Forget that the scan found `path`, once the grant deletes it.
@@ -3621,6 +3643,7 @@ impl RestrictedAuthority {
                 self.require_publication_mode(*inplace, "file finalization")?;
                 self.check_mutation_path(path, false)?;
                 self.constrain_creation(path, condition, (false, true), 0, pending)?;
+                *scanned = self.known_destination(path, *condition);
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
@@ -3647,7 +3670,8 @@ impl RestrictedAuthority {
                     }
                 }
                 for (index, put) in puts.iter_mut().enumerate() {
-                    // As for `Prepare`, the receiver looks for itself.
+                    // As for `Prepare`, the receiver looks for itself
+                    // unless it knows (`known_destination`).
                     put.scanned = proto::ScannedDestination::Unknown;
                     if self.expected_hash(&put.path)?.is_some() {
                         bail!("expected-hash files require checked finalization");
@@ -3663,6 +3687,7 @@ impl RestrictedAuthority {
                         index,
                         pending,
                     )?;
+                    put.scanned = self.known_destination(&put.path, put.condition);
                     outcomes.push(PendingOutcome::Logical {
                         index,
                         path: put.path.clone(),

@@ -1475,21 +1475,8 @@ impl FsOps {
                 .any(|(index, _)| puts[*index].replaces)
                 .then(|| root.replacement_turn());
             let _turn = root.mutation_turn(&directory).ok();
-            // Each publication is a round trip or two on a network
-            // filesystem (a rename, or a link and the permission check that
-            // comes with it), so there the files are published on threads
-            // too, as they are written and closed.
-            let publish = |(index, stage): (usize, SmallStage)| {
-                let outcome = self.publish_small_stage(&puts[index], &stage);
-                (index, stage, outcome)
-            };
-            let outcomes = if network {
-                on_threads(stages, publish)
-            } else {
-                stages.into_iter().map(publish).collect()
-            };
-            for (index, stage, outcome) in outcomes {
-                match outcome {
+            for (index, stage) in stages {
+                match self.publish_small_stage(&puts[index], &stage) {
                     Ok(staged) => published.push((index, stage, staged)),
                     Err(error) => results[index] = Err(wire_error(&error)),
                 }
@@ -1810,6 +1797,17 @@ impl FsOps {
         check_destination_writes(&stage.file, &stage.label)?;
         set_meta_written_file_for_publication(&stage.file, &put.meta, put.flags, &stage.created)
             .with_context(|| format!("set metadata {}", stage.label.display()))?;
+        // A new name published by a hard link has its permission check
+        // done here, on the writing thread, rather than under the
+        // directory's lock as it links (`Root::prepare_link_from`).
+        if put.condition == TargetCondition::Absent
+            && stage
+                .target
+                .root
+                .links_new_names_on(stage.created.dev(), &stage.file)
+        {
+            crate::rooted::Root::prepare_link_from(&stage.file);
+        }
         #[cfg(any(test, debug_assertions))]
         fail_put_small_before_rename_for_test(&stage.target.label)?;
         Ok(())

@@ -10006,3 +10006,72 @@ fn a_late_settlement_leaves_a_newer_reservations_count_alone() {
     );
     assert_eq!(changes(&authority), 2);
 }
+
+/// What a publication replaces, the receiver tells itself without a look
+/// where it knows: nothing, for a new name held to replace nothing, or what
+/// its own scan found. A sender's word is never taken.
+#[test]
+fn publications_tell_the_receiver_what_they_replace_where_the_authority_knows() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("scanned"), b"old").unwrap();
+    fs::set_permissions(target.join("scanned"), fs::Permissions::from_mode(0o640)).unwrap();
+    let scanned_of = |request: &Request| match request {
+        Request::PutSmallBatch(puts) => puts[0].scanned,
+        _ => unreachable!(),
+    };
+    let claimed = |path: &Path| {
+        let mut request = small_put(path);
+        if let Request::PutSmallBatch(puts) = &mut request {
+            // What a sender might claim, which is never taken.
+            puts[0].scanned = proto::ScannedDestination::File(0o4777);
+        }
+        request
+    };
+    let keep = existence_authority(
+        &root,
+        ExistingDestinationPolicy::Skip,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+    )
+    .unwrap();
+    let mut request = claimed(&target.join("new"));
+    keep.authorize(&mut request, false).unwrap();
+    assert_eq!(scanned_of(&request), proto::ScannedDestination::Absent);
+
+    let update = existence_authority(
+        &root,
+        ExistingDestinationPolicy::MustExist,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+    )
+    .unwrap();
+    let metadata = fs::symlink_metadata(target.join("scanned")).unwrap();
+    update.record_scanned(
+        &path_bytes(&target),
+        &[proto::Entry {
+            path: b"scanned".to_vec(),
+            kind: proto::Kind::File,
+            size: metadata.len(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec() as u32,
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            rdev: 0,
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            nlink: 1,
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec() as u32,
+            link: None,
+            atime: Default::default(),
+            inode_metadata: None,
+        }],
+    );
+    let mut request = claimed(&target.join("scanned"));
+    update.authorize(&mut request, false).unwrap();
+    assert_eq!(scanned_of(&request), proto::ScannedDestination::File(0o640));
+}

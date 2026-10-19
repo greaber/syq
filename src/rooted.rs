@@ -448,6 +448,36 @@ impl Root {
         self.profile().link_counts_trusted
     }
 
+    /// Whether a new name (`publish_new_staged`) for a file on device `dev`,
+    /// read through `file`, is published by a hard link here: where the
+    /// filesystem has links but no no-replace rename, as NFS.
+    pub(crate) fn links_new_names_on(&self, dev: u64, file: &File) -> bool {
+        let profile = self.profile_on(dev, file);
+        !profile.atomic_no_replace_rename && profile.hard_links
+    }
+
+    /// Ask now whether this process may read and write `file`, as a hard
+    /// link to it will. Linux checks that for the link while it holds the
+    /// target directory locked, and an NFS client asks its server unless the
+    /// answer is cached: asked here, on the thread that wrote the file, the
+    /// answer is cached by then. A failure is left for the link to report.
+    pub(crate) fn prepare_link_from(file: &File) {
+        #[cfg(target_os = "linux")]
+        if let Ok(path) = CString::new(crate::sys::proc_fd_path(file)) {
+            // SAFETY: the path is a NUL-terminated string that outlives the call.
+            unsafe {
+                libc::faccessat(
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    libc::R_OK | libc::W_OK,
+                    libc::AT_EACCESS,
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = file;
+    }
+
     /// How many names this thread published by checking that they were
     /// absent and then renaming, since it last asked.
     #[cfg(all(test, target_os = "linux"))]
