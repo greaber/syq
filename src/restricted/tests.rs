@@ -9850,17 +9850,56 @@ fn a_symlinked_control_path_is_protected_where_it_leads() {
     }
 }
 
-/// Under a grant that creates nothing (`MustExist`), a file this
-/// receiver's own scan found is replaced with no look of its own; one the
-/// scan did not find is looked at, and refused unless it exists; one the
-/// grant deleted counts as found no more.
+/// Look `paths` up for the planner on `ops`, a connection of `authority`,
+/// as a receiver does for every name it plans (`Request::StatMany`).
+fn look_up_for_planner(
+    authority: &RestrictedAuthority,
+    ops: &mut crate::fsops::FsOps,
+    paths: &[PathBuf],
+) {
+    let mut request = Request::StatMany {
+        paths: paths.iter().map(|path| path_bytes(path)).collect(),
+        sources: None,
+        follow: false,
+    };
+    authority.authorize(&mut request, false).unwrap();
+    let response = ops.handle(&request);
+    assert!(
+        matches!(&response, proto::Response::Stats(stats) if stats.len() == paths.len()),
+        "{response:?}"
+    );
+}
+
+/// Make `authority`'s root look like a filesystem without a no-replace
+/// rename (`no_replace_rename`) or an exchange (`exchange`), as NFS is.
+fn assume_lacking(authority: &RestrictedAuthority, no_replace_rename: bool, exchange: bool) {
+    let mut profile = authority.root.profile();
+    profile.atomic_no_replace_rename &= !no_replace_rename;
+    profile.exchange &= !exchange;
+    profile.hard_links = true;
+    authority.root.assume_profile_for_test(profile);
+}
+
+fn small_put_with(path: &Path, condition: proto::TargetCondition) -> Request {
+    let mut request = small_put(path);
+    if let Request::PutSmallBatch(puts) = &mut request {
+        puts[0].condition = condition;
+    }
+    request
+}
+
+/// Under a grant that creates nothing (`MustExist`), on a filesystem
+/// without an exchange, a file the receiver's own lookup for the planner
+/// found is replaced with no look of its own; one it did not look up is
+/// looked at, and refused unless it exists; one the grant deleted counts as
+/// found no more.
 #[test]
-fn must_exist_takes_the_receivers_own_scan_for_existence() {
+fn must_exist_takes_the_receivers_own_lookups_for_existence() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
-    for name in ["scanned", "unscanned"] {
+    for name in ["found", "unlooked"] {
         fs::write(target.join(name), b"old").unwrap();
     }
     let mut authority = existence_authority(
@@ -9871,35 +9910,23 @@ fn must_exist_takes_the_receivers_own_scan_for_existence() {
     )
     .unwrap();
     authority.copy.limits.max_entries = 64;
-    let metadata = fs::symlink_metadata(target.join("scanned")).unwrap();
-    let entry = proto::Entry {
-        path: b"scanned".to_vec(),
-        kind: proto::Kind::File,
-        size: metadata.len(),
-        mtime: metadata.mtime(),
-        mtime_nsec: metadata.mtime_nsec() as u32,
-        mode: metadata.mode(),
-        uid: metadata.uid(),
-        gid: metadata.gid(),
-        rdev: 0,
-        dev: metadata.dev(),
-        ino: metadata.ino(),
-        nlink: 1,
-        ctime: metadata.ctime(),
-        ctime_nsec: metadata.ctime_nsec() as u32,
-        link: None,
-        atime: Default::default(),
-        inode_metadata: None,
-    };
-    authority.record_scanned(&path_bytes(&target), &[entry]);
-    // Gone since the scan: no look tells the authority so.
-    fs::remove_file(target.join("scanned")).unwrap();
+    assume_lacking(&authority, false, true);
+    let mut ops = authority.test_ops();
+    look_up_for_planner(
+        &authority,
+        &mut ops,
+        &[target.join("found"), target.join("missing")],
+    );
+    // Only the file it found: a name found absent is of no use here.
+    assert_eq!(authority.lookups.as_ref().unwrap().len(), 1);
+    // Gone since the lookup: no look tells the authority so.
+    fs::remove_file(target.join("found")).unwrap();
     authority
-        .authorize(&mut small_put(&target.join("scanned")), false)
+        .authorize(&mut small_put(&target.join("found")), false)
         .unwrap();
-    // Not scanned: looked at.
+    // Not looked up: looked at.
     authority
-        .authorize(&mut small_put(&target.join("unscanned")), false)
+        .authorize(&mut small_put(&target.join("unlooked")), false)
         .unwrap();
     let Err(error) = authority.authorize(&mut small_put(&target.join("missing")), false) else {
         panic!("a file was created under a grant that creates nothing")
@@ -9909,15 +9936,195 @@ fn must_exist_takes_the_receivers_own_scan_for_existence() {
     authority
         .authorize(
             &mut apply(Op::Unlink {
-                path: path_bytes(&target.join("scanned")),
+                path: path_bytes(&target.join("found")),
             }),
             false,
         )
         .unwrap();
-    let Err(error) = authority.authorize(&mut small_put(&target.join("scanned")), false) else {
+    let Err(error) = authority.authorize(&mut small_put(&target.join("found")), false) else {
         panic!("a deleted file was created again")
     };
     assert!(KeptExisting::is(&error), "{error:#}");
+}
+
+/// The receiver records its lookups only where a publication needs them:
+/// on a filesystem with a no-replace rename, keeping files, or an
+/// exchange, replacing only existing ones, it records nothing and holds
+/// every publication as it always has.
+#[test]
+fn lookups_are_recorded_only_where_publication_needs_them() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("there"), b"old").unwrap();
+    for policy in [
+        ExistingDestinationPolicy::Skip,
+        ExistingDestinationPolicy::MustExist,
+    ] {
+        let authority = existence_authority(
+            &root,
+            policy,
+            DestinationPlacement::DirectoryContents,
+            RootExistence::Any,
+        )
+        .unwrap();
+        let mut profile = authority.root.profile();
+        profile.atomic_no_replace_rename = true;
+        profile.exchange = true;
+        authority.root.assume_profile_for_test(profile);
+        let mut ops = authority.test_ops();
+        look_up_for_planner(
+            &authority,
+            &mut ops,
+            &[target.join("there"), target.join("new")],
+        );
+        assert_eq!(authority.lookups.as_ref().unwrap().len(), 0, "{policy:?}");
+        if policy == ExistingDestinationPolicy::Skip {
+            let mut request = small_put(&target.join("new"));
+            authority.authorize(&mut request, false).unwrap();
+            assert_eq!(
+                small_put_condition(&request),
+                proto::TargetCondition::Absent
+            );
+        }
+    }
+    // A grant that replaces records nothing anywhere.
+    let authority = existence_authority(
+        &root,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+    )
+    .unwrap();
+    assert!(authority.lookups.is_none());
+}
+
+/// Keeping existing files on a filesystem without a no-replace rename, the
+/// receiver renames a file into place unchecked, with no link, only at a
+/// name its own lookup for the planner found absent, and only once.
+/// Whatever a sender asks: a name the receiver found present is kept; a
+/// second publication of a name, and one at a name the receiver never
+/// looked up, are held to the strict publication, which refuses a name
+/// that exists.
+///
+/// Another program creating a name after the receiver found it absent, and
+/// before the rename, is the race every copy accepts: that file is
+/// replaced, as an ordinary copy would replace it.
+#[test]
+fn keeping_files_renames_unchecked_only_names_the_receiver_found_absent() {
+    use proto::TargetCondition::{Absent, Any};
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    for name in ["present", "unlooked"] {
+        fs::write(target.join(name), b"old").unwrap();
+    }
+    let mut authority = existence_authority(
+        &root,
+        ExistingDestinationPolicy::Skip,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+    )
+    .unwrap();
+    authority.copy.limits.max_entries = 64;
+    assume_lacking(&authority, true, false);
+    let mut ops = authority.test_ops();
+    let names = ["present", "absent", "twice", "failed", "raced"];
+    let paths: Vec<_> = names.iter().map(|name| target.join(name)).collect();
+    look_up_for_planner(&authority, &mut ops, &paths);
+    assert_eq!(authority.lookups.as_ref().unwrap().len(), names.len());
+    let publish = |ops: &mut crate::fsops::FsOps, request: &mut Request| {
+        let settlement = authority.authorize(request, false)?;
+        let response = ops.handle(request);
+        authority.settle(settlement, &response);
+        match response {
+            proto::Response::Applied(results) if results.len() == 1 => match &results[0] {
+                None => Ok(()),
+                Some(error) => Err(anyhow::anyhow!("{error:?}")),
+            },
+            other => Err(anyhow::anyhow!("{other:?}")),
+        }
+    };
+
+    // Found present: kept, whatever the sender asks.
+    for condition in [Any, Absent] {
+        let Err(error) = publish(
+            &mut ops,
+            &mut small_put_with(&target.join("present"), condition),
+        ) else {
+            panic!("a file the receiver found was replaced")
+        };
+        assert!(KeptExisting::is(&error), "{error:#}");
+    }
+    assert_eq!(fs::read(target.join("present")).unwrap(), b"old");
+
+    // Found absent: renamed into place unchecked.
+    let mut request = small_put_with(&target.join("absent"), Absent);
+    publish(&mut ops, &mut request).unwrap();
+    assert_eq!(small_put_condition(&request), Any);
+    let Request::PutSmallBatch(puts) = &request else {
+        unreachable!()
+    };
+    assert_eq!(puts[0].scanned, proto::ScannedDestination::Absent);
+    assert_eq!(fs::read(target.join("absent")).unwrap(), b"new");
+
+    // Two publications of one name: the second is held to the strict
+    // publication, which refuses the name the first has taken.
+    let mut first = small_put_with(&target.join("twice"), Any);
+    let mut second = small_put_with(&target.join("twice"), Any);
+    let first_settlement = authority.authorize(&mut first, false).unwrap();
+    let second_settlement = authority.authorize(&mut second, false).unwrap();
+    assert_eq!(small_put_condition(&first), Any);
+    assert_eq!(small_put_condition(&second), Absent);
+    let response = ops.handle(&first);
+    authority.settle(first_settlement, &response);
+    let response = ops.handle(&second);
+    assert!(
+        matches!(&response, proto::Response::Applied(results)
+            if matches!(&results[0], Some(error) if error.condition_not_met)),
+        "{response:?}"
+    );
+    authority.settle(second_settlement, &response);
+
+    // A publication that failed has used the name up: another program's
+    // file there since is kept.
+    let mut request = small_put_with(&target.join("failed"), Any);
+    let settlement = authority.authorize(&mut request, false).unwrap();
+    authority.settle(
+        settlement,
+        &proto::Response::Applied(vec![Some(proto::WireError::from("failed"))]),
+    );
+    fs::write(target.join("failed"), b"theirs").unwrap();
+    let mut request = small_put_with(&target.join("failed"), Any);
+    let Err(error) = publish(&mut ops, &mut request) else {
+        panic!("a used-up lookup let a file be replaced")
+    };
+    assert!(
+        format!("{error:#}").contains("condition_not_met: true"),
+        "{error:#}"
+    );
+    assert_eq!(fs::read(target.join("failed")).unwrap(), b"theirs");
+
+    // Never looked up: held to the strict publication, which refuses the
+    // name that exists, whatever the sender asks.
+    let mut request = small_put_with(&target.join("unlooked"), Any);
+    let Err(error) = publish(&mut ops, &mut request) else {
+        panic!("a name the receiver never looked up was replaced")
+    };
+    assert_eq!(small_put_condition(&request), Absent);
+    assert!(
+        format!("{error:#}").contains("condition_not_met: true"),
+        "{error:#}"
+    );
+    assert_eq!(fs::read(target.join("unlooked")).unwrap(), b"old");
+
+    // The accepted race: another program's file, created after the
+    // lookup found the name absent, is replaced.
+    fs::write(target.join("raced"), b"theirs").unwrap();
+    publish(&mut ops, &mut small_put_with(&target.join("raced"), Absent)).unwrap();
+    assert_eq!(fs::read(target.join("raced")).unwrap(), b"new");
 }
 
 /// A grant that creates nothing (`--only-existing`) lets a small file that
@@ -10011,7 +10218,7 @@ fn a_late_settlement_leaves_a_newer_reservations_count_alone() {
 
 /// What a publication replaces, the receiver tells itself without a look
 /// where it knows: nothing, for a new name held to replace nothing, or what
-/// its own scan found. A sender's word is never taken.
+/// its own lookup for the planner found. A sender's word is never taken.
 #[test]
 fn publications_tell_the_receiver_what_they_replace_where_the_authority_knows() {
     let temporary = crate::test_support::tempdir().unwrap();
@@ -10050,29 +10257,8 @@ fn publications_tell_the_receiver_what_they_replace_where_the_authority_knows() 
         RootExistence::Any,
     )
     .unwrap();
-    let metadata = fs::symlink_metadata(target.join("scanned")).unwrap();
-    update.record_scanned(
-        &path_bytes(&target),
-        &[proto::Entry {
-            path: b"scanned".to_vec(),
-            kind: proto::Kind::File,
-            size: metadata.len(),
-            mtime: metadata.mtime(),
-            mtime_nsec: metadata.mtime_nsec() as u32,
-            mode: metadata.mode(),
-            uid: metadata.uid(),
-            gid: metadata.gid(),
-            rdev: 0,
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-            nlink: 1,
-            ctime: metadata.ctime(),
-            ctime_nsec: metadata.ctime_nsec() as u32,
-            link: None,
-            atime: Default::default(),
-            inode_metadata: None,
-        }],
-    );
+    assume_lacking(&update, false, true);
+    look_up_for_planner(&update, &mut update.test_ops(), &[target.join("scanned")]);
     let mut request = claimed(&target.join("scanned"));
     update.authorize(&mut request, false).unwrap();
     assert_eq!(scanned_of(&request), proto::ScannedDestination::File(0o640));

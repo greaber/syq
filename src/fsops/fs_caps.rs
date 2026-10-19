@@ -10,9 +10,11 @@
 //!   known to refuse them: the Linux in-tree filesystems below, whose
 //!   rename handlers reject flags they do not implement, and macOS APFS
 //!   and HFS+ volumes that advertise them, where tests show them working.
-//!   A refusal falls back and is remembered. FUSE passes the flags to a
-//!   userspace server, which could ignore them, so they are not tried
-//!   there, nor on types not audited.
+//!   A refusal falls back and is remembered. They are not tried where the
+//!   handler implements none, as on NFS, so that what a copy plans there
+//!   knows from the start that it will publish without them. FUSE passes
+//!   the flags to a userspace server, which could ignore them, so they are
+//!   not tried there, nor on types not audited.
 //! - Link counts, inode numbers and symlink times cannot be checked by
 //!   their errors, so they are trusted only on filesystems with evidence.
 //!
@@ -84,6 +86,18 @@ const RENAME_FLAGS_REFUSED_WHEN_UNSUPPORTED: [u32; 29] = [
     0x72b6,      // JFFS2
     0x7375_7245, // Coda: refuses every flag
     0x786f_4256, // vboxsf: refuses every flag
+];
+
+/// Of those, the filesystems whose rename handler implements no flag at
+/// all, so every flag is refused: none is tried there.
+#[cfg(target_os = "linux")]
+const RENAME_FLAGS_NEVER_IMPLEMENTED: [u32; 6] = [
+    0x7461_636f, // OCFS2
+    CEPH_SUPER_MAGIC,
+    0x6969,      // NFS
+    0x0102_1997, // 9p
+    0x7375_7245, // Coda
+    0x786f_4256, // vboxsf
 ];
 
 /// What syq may rely on a filesystem for.
@@ -397,7 +411,8 @@ pub(crate) fn profile(file: &File) -> Profile {
 #[cfg(target_os = "linux")]
 pub(super) fn linux_profile(file_system_type: u32, file: &File, key: FileSystemKey) -> Profile {
     let t = file_system_type;
-    let tries_flags = RENAME_FLAGS_REFUSED_WHEN_UNSUPPORTED.contains(&t);
+    let audited = RENAME_FLAGS_REFUSED_WHEN_UNSUPPORTED.contains(&t);
+    let tries_flags = audited && !RENAME_FLAGS_NEVER_IMPLEMENTED.contains(&t);
     // SMB checks a no-replace target in the client and then asks the server
     // to replace (smb2inode.c), and GFS2 drops the flag after the local
     // check, so neither keeps another client or node from the name.
@@ -440,7 +455,7 @@ pub(super) fn linux_profile(file_system_type: u32, file: &File, key: FileSystemK
         link_counts_trusted,
         symlink_times,
         two_second_mtimes: fat,
-        audited: tries_flags,
+        audited,
         serialized_writes: t != ZFS_SUPER_MAGIC,
     }
 }
@@ -857,19 +872,21 @@ mod tests {
                 ..Profile::LOCAL
             }
         );
-        for evidenced in [
-            F2FS_SUPER_MAGIC,
-            NTFS3_SUPER_MAGIC,
-            libc::NFS_SUPER_MAGIC as u32,
-        ] {
+        for evidenced in [F2FS_SUPER_MAGIC, NTFS3_SUPER_MAGIC] {
             let profile = linux_profile(evidenced, &file, key);
             assert!(profile.exchange && profile.link_counts_trusted && profile.symlink_times);
         }
-        // Rename flags are tried where a refusal is certain, but counts and
-        // symlink times need evidence.
+        // NFS has counts and symlink times, but no rename flag to try.
+        let nfs = linux_profile(libc::NFS_SUPER_MAGIC as u32, &file, key);
+        assert!(!nfs.exchange && !nfs.atomic_no_replace_rename && nfs.audited);
+        assert!(nfs.link_counts_trusted && nfs.symlink_times);
+        // Rename flags are tried where a refusal is certain and the handler
+        // implements some, but counts and symlink times need evidence.
+        let afs = linux_profile(0x6b41_4653, &file, key);
+        assert!(afs.exchange && afs.atomic_no_replace_rename && afs.audited);
+        assert!(!afs.link_counts_trusted && !afs.symlink_times);
         let p9 = linux_profile(0x0102_1997, &file, key);
-        assert!(p9.exchange && p9.atomic_no_replace_rename);
-        assert!(!p9.link_counts_trusted && !p9.symlink_times);
+        assert!(!p9.exchange && !p9.atomic_no_replace_rename && p9.audited);
         for racy in [CIFS_SUPER_MAGIC, SMB2_SUPER_MAGIC, GFS2_SUPER_MAGIC] {
             let profile = linux_profile(racy, &file, key);
             assert!(

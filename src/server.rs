@@ -1573,9 +1573,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 ignore,
                 report_ignored,
             } => {
-                // A restricted receiver's authority keeps what its own
-                // destination scan found, by the names the sender uses.
-                let recorded_root = (source.is_none()).then(|| root.clone());
                 // Inode metadata is read beneath the destination root an
                 // ordinary or restricted session installed, by its own name.
                 let requested_root = match ops.scan_metadata_root(&root, source.as_ref()) {
@@ -1625,9 +1622,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         follow_root,
                         &mut batch,
                     )?;
-                    if let (Some(authority), Some(root)) = (&authority, &recorded_root) {
-                        authority.record_scanned(root, &batch);
-                    }
                     let mut w = wref.borrow_mut();
                     for m in warns.borrow_mut().drain(..) {
                         w.write_msg(&Response::ScanWarnAt(m))?;

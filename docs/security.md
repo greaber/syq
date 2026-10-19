@@ -298,7 +298,12 @@ types syq does not recognize, because it cannot tell which file a link would
 name. On filesystems with neither an atomic no-replace rename nor hard links,
 such as FAT and exFAT on macOS and rclone mounts, it still refuses files that
 already exist, but a file another program creates at a name in the instant
-between syq's check and its rename can be replaced.
+between syq's check and its rename can be replaced. On filesystems without an
+atomic no-replace rename, such as NFS, hostB renames a new file into place
+without a check at a name it found free itself while planning, once per name.
+A file another program creates at such a name later in the copy can be
+replaced, as in an ordinary copy; hostA decides when the copy looks names up
+and when it writes them.
 
 The filesystem limitations above still apply. HostB's account and receiver
 remain trusted to enforce the grant and report accurately. HostB's reports

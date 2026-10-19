@@ -36,10 +36,6 @@ pub(super) struct AuthorityState {
     /// A change was attempted or a request refused. Results must start
     /// before either, so that they leave nothing out.
     pub(super) recorded_any: bool,
-    /// Under a grant that creates nothing (`MustExist`), the names this
-    /// receiver's own destination scan found, by keyed hash, with a regular
-    /// file's permission bits (`RestrictedAuthority::record_scanned`).
-    pub(super) scanned: HashMap<u64, Option<u32>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -373,10 +369,11 @@ pub(crate) struct RestrictedAuthority {
     /// The scope of the files this copy is writing, which the receiver holds
     /// open until the copy's control connection ends.
     pub(super) stage_scope: u64,
-    /// The key the names in `AuthorityState::scanned` are hashed with,
-    /// random to this process, so a sender cannot choose a name that
-    /// passes for one the scan found.
-    pub(super) scan_key: std::collections::hash_map::RandomState,
+    /// What this receiver's own lookups for the planner found, where
+    /// they let a file's publication be held to the grant without looking
+    /// again (`constrain_publication`): keeping existing files, or
+    /// replacing only existing ones.
+    pub(super) lookups: Option<std::sync::Arc<crate::fsops::lookups::PlanningLookups>>,
 }
 
 impl RestrictedAuthority {
@@ -541,7 +538,7 @@ impl RestrictedAuthority {
         let file_data_limit = (max_file_data_bytes_per_second > 0)
             .then(|| crate::bwlimit::BandwidthLimit::new(max_file_data_bytes_per_second));
         receipt_policy.validate()?;
-        let authority = Self {
+        let mut authority = Self {
             hashing,
             extra_options,
             owned: Default::default(),
@@ -588,10 +585,19 @@ impl RestrictedAuthority {
                 in_flight: 0,
                 results_closing: false,
                 recorded_any: false,
-                scanned: HashMap::new(),
             }),
-            scan_key: Default::default(),
+            lookups: None,
         };
+        authority.lookups = match authority.creation_policy(false) {
+            ExistingDestinationPolicy::Skip => Some(crate::fsops::lookups::Recording::Keep),
+            ExistingDestinationPolicy::MustExist => {
+                Some(crate::fsops::lookups::Recording::Existing)
+            }
+            _ => None,
+        }
+        .map(|recording| {
+            std::sync::Arc::new(crate::fsops::lookups::PlanningLookups::new(recording))
+        });
         authority.check_root_existence()?;
         Ok(authority)
     }
@@ -1543,28 +1549,6 @@ impl RestrictedAuthority {
         {
             return Ok(());
         }
-        // A file under `MustExist` that this receiver's own scan found
-        // needs no look of its own: the receiver renames over whatever its
-        // name holds, and one another program removes in that moment is
-        // created again.
-        if policy == ExistingDestinationPolicy::MustExist
-            && !directory
-            && !root_must_be_new
-            && self.scanned_existing(path)
-        {
-            if *condition == proto::TargetCondition::Absent {
-                bail!(
-                    "no-replace creation of {label} contradicts the signed existing-object policy"
-                );
-            }
-            pending.push(PendingCreation {
-                index,
-                path: path.to_vec(),
-                persist: false,
-                link: false,
-            });
-            return Ok(());
-        }
         // A new file under `Skip` is published without replacing anything,
         // which the receiver refuses atomically if the name exists: it
         // needs no look first either.
@@ -1584,56 +1568,120 @@ impl RestrictedAuthority {
         )
     }
 
-    /// Record the names a destination scan beneath `root` found, as the
-    /// sender names them, under a grant that creates nothing
-    /// (`MustExist`): replacing one later needs no look of its own
-    /// (`constrain_creation`). Other grants record nothing.
-    pub(crate) fn record_scanned(&self, root: &[u8], entries: &[proto::Entry]) {
-        if self.copy.policy.existing != ExistingDestinationPolicy::MustExist {
-            return;
-        }
-        let mut state = self.state.lock().unwrap();
-        for entry in entries {
-            use std::hash::BuildHasher;
-            let path = crate::fsops::join(root, &entry.path);
-            let file = (entry.kind == proto::Kind::File).then_some(entry.mode & 0o7777);
-            state.scanned.insert(self.scan_key.hash_one(&path), file);
-        }
-    }
-
-    /// Whether this receiver's own scan found `path`.
-    fn scanned_existing(&self, path: &[u8]) -> bool {
-        use std::hash::BuildHasher;
-        let key = self.scan_key.hash_one(path);
-        self.state.lock().unwrap().scanned.contains_key(&key)
-    }
-
-    /// What a file published at `path` held to `condition` replaces, as
-    /// the receiver knows it without a look: nothing, for a new name the
-    /// publication will not let replace anything, or what this receiver's
-    /// own scan found. Otherwise the receiver looks for itself.
-    fn known_destination(
+    /// Bind a staged file's publication at `path`, a put or a
+    /// finalization, to the signed existing-object policy, as
+    /// `constrain_creation` does, and say what it replaces as the receiver
+    /// knows it without a look.
+    ///
+    /// Where this receiver recorded its own lookup of the name for the
+    /// planner (`fsops::lookups`), the publication needs neither a look
+    /// nor a link. Keeping existing files, a name found absent is renamed
+    /// into place unchecked, by one publication only, and one found present
+    /// is kept. Replacing only existing files, a file found present is
+    /// renamed over. A name not recorded, or found absent and already given
+    /// to a publication, is held as `constrain_creation` holds it, and so
+    /// is a publication `in_place`. Another program creating or removing
+    /// the name after the lookup is the race every copy accepts.
+    pub(super) fn constrain_publication(
         &self,
         path: &[u8],
-        condition: proto::TargetCondition,
-    ) -> proto::ScannedDestination {
-        use std::hash::BuildHasher;
-        if condition == proto::TargetCondition::Absent {
-            return proto::ScannedDestination::Absent;
+        condition: &mut proto::TargetCondition,
+        in_place: bool,
+        index: usize,
+        pending: &mut Vec<PendingCreation>,
+    ) -> Result<proto::ScannedDestination> {
+        use crate::fsops::lookups::Looked;
+        use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
+        let label = String::from_utf8_lossy(path);
+        let root_must_be_new =
+            self.root_existence == RootExistence::New && path == self.destination;
+        let recorded = match &self.lookups {
+            Some(lookups)
+                if !(in_place || root_must_be_new || self.created_by_this_grant(path)) =>
+            {
+                crate::fsops::destination_relative_to(&self.root_path, path)
+                    .ok()
+                    .map(|relative| (lookups, relative))
+            }
+            _ => None,
+        };
+        if let Some((lookups, relative)) = recorded {
+            match self.creation_policy(false) {
+                ExistingDestinationPolicy::Skip => match lookups.claim(&relative) {
+                    Some(Looked::Absent) => {
+                        match *condition {
+                            Any | Absent => *condition = Any,
+                            Matches { .. } | MatchesFingerprint { .. } => bail!(
+                                "replacement of {label} contradicts the signed existing-object policy"
+                            ),
+                        }
+                        self.state.lock().unwrap().provisional.insert(path.to_vec());
+                        pending.push(PendingCreation {
+                            index,
+                            path: path.to_vec(),
+                            persist: true,
+                            link: false,
+                        });
+                        return Ok(proto::ScannedDestination::Absent);
+                    }
+                    Some(Looked::Present { .. }) => {
+                        return Err(kept(format!(
+                            "signed grant retains existing objects: {label} already exists"
+                        )))
+                    }
+                    Some(Looked::Claimed) | None => {}
+                },
+                ExistingDestinationPolicy::MustExist => {
+                    if let Some(Looked::Present { file_mode }) = lookups.get(&relative) {
+                        if *condition == Absent {
+                            bail!(
+                                "no-replace creation of {label} contradicts the signed existing-object policy"
+                            );
+                        }
+                        pending.push(PendingCreation {
+                            index,
+                            path: path.to_vec(),
+                            persist: false,
+                            link: false,
+                        });
+                        return Ok(file_mode.map_or(
+                            proto::ScannedDestination::Unknown,
+                            proto::ScannedDestination::File,
+                        ));
+                    }
+                }
+                _ => {}
+            }
         }
-        let key = self.scan_key.hash_one(path);
-        match self.state.lock().unwrap().scanned.get(&key) {
-            Some(Some(mode)) => proto::ScannedDestination::File(*mode),
-            Some(None) => proto::ScannedDestination::Absent,
-            None => proto::ScannedDestination::Unknown,
-        }
+        self.constrain_creation(path, condition, (false, true), index, pending)?;
+        Ok(if *condition == Absent {
+            proto::ScannedDestination::Absent
+        } else {
+            proto::ScannedDestination::Unknown
+        })
     }
 
-    /// Forget that the scan found `path`, once the grant deletes it.
-    fn forget_scanned(&self, path: &[u8]) {
-        use std::hash::BuildHasher;
-        let key = self.scan_key.hash_one(path);
-        self.state.lock().unwrap().scanned.remove(&key);
+    /// Whether this receiver's own lookup for the planner found `path`.
+    fn looked_up_present(&self, path: &[u8]) -> bool {
+        self.lookups.as_ref().is_some_and(|lookups| {
+            crate::fsops::destination_relative_to(&self.root_path, path).is_ok_and(|relative| {
+                matches!(
+                    lookups.get(&relative),
+                    Some(crate::fsops::lookups::Looked::Present { .. })
+                )
+            })
+        })
+    }
+
+    /// Forget what the receiver's lookups found at `path`, once the grant
+    /// deletes it.
+    fn forget_lookup(&self, path: &[u8]) {
+        if let (Some(lookups), Ok(relative)) = (
+            &self.lookups,
+            crate::fsops::destination_relative_to(&self.root_path, path),
+        ) {
+            lookups.forget(&relative);
+        }
     }
 
     /// The existing-object policy a creation is held to: the grant's, or,
@@ -1952,10 +2000,10 @@ impl RestrictedAuthority {
         let label = String::from_utf8_lossy(path);
         // Under `Skip` the publication refuses a name that exists, so
         // nothing is looked at here; under `MustExist`, a name this
-        // receiver's scan found needs no look either.
+        // receiver's lookups found needs no look either.
         match self.creation_policy(false) {
             ExistingDestinationPolicy::MustExist
-                if !self.scanned_existing(path) && self.rooted_metadata(path)?.is_none() =>
+                if !self.looked_up_present(path) && self.rooted_metadata(path)?.is_none() =>
             {
                 Err(kept(format!(
                     "signed grant creates nothing: {label} does not exist"
@@ -2051,6 +2099,7 @@ impl RestrictedAuthority {
         ops.set_owned_objects(self.owned_objects());
         ops.set_stage_scope(self.stage_scope());
         ops.install_restricted_destination(self.root.clone(), &self.root_path);
+        ops.set_planning_lookups(self.lookups.clone());
     }
 
     /// An executor set up as one of this copy's connections, for tests.
@@ -2793,7 +2842,7 @@ impl RestrictedAuthority {
             }
             Op::Rmdir { path } => {
                 self.check_deletion(path, true)?;
-                self.forget_scanned(path);
+                self.forget_lookup(path);
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
@@ -2803,7 +2852,7 @@ impl RestrictedAuthority {
             }
             Op::Unlink { path } => {
                 self.check_deletion(path, false)?;
-                self.forget_scanned(path);
+                self.forget_lookup(path);
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
@@ -3642,8 +3691,7 @@ impl RestrictedAuthority {
                 *expected_hash = self.expected_hash(path)?.map(Into::into);
                 self.require_publication_mode(*inplace, "file finalization")?;
                 self.check_mutation_path(path, false)?;
-                self.constrain_creation(path, condition, (false, true), 0, pending)?;
-                *scanned = self.known_destination(path, *condition);
+                *scanned = self.constrain_publication(path, condition, *inplace, 0, pending)?;
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
@@ -3671,7 +3719,7 @@ impl RestrictedAuthority {
                 }
                 for (index, put) in puts.iter_mut().enumerate() {
                     // As for `Prepare`, the receiver looks for itself
-                    // unless it knows (`known_destination`).
+                    // unless it knows (`constrain_publication`).
                     put.scanned = proto::ScannedDestination::Unknown;
                     if self.expected_hash(&put.path)?.is_some() {
                         bail!("expected-hash files require checked finalization");
@@ -3680,14 +3728,13 @@ impl RestrictedAuthority {
                     if put.inplace {
                         self.constrain_inplace(&put.path, true)?;
                     }
-                    self.constrain_creation(
+                    put.scanned = self.constrain_publication(
                         &put.path,
                         &mut put.condition,
-                        (false, true),
+                        put.inplace,
                         index,
                         pending,
                     )?;
-                    put.scanned = self.known_destination(&put.path, put.condition);
                     outcomes.push(PendingOutcome::Logical {
                         index,
                         path: put.path.clone(),

@@ -74,6 +74,7 @@ mod btrfs;
 mod entry;
 mod fs_caps;
 mod limits;
+pub(crate) mod lookups;
 mod operator;
 pub(crate) mod owned;
 mod partial;
@@ -871,6 +872,9 @@ pub struct FsOps {
     /// A new directory whose mode lacks owner access, as `syq rsync` creates
     /// one, gets that mode only after its contents.
     narrow_new_directories: bool,
+    /// What this receiver's lookups for the planner find, kept for a
+    /// restricted receiver's authority (`lookups::PlanningLookups`).
+    planning_lookups: Option<Arc<lookups::PlanningLookups>>,
     /// This copy skips files whose conditions are unmet, so their partials
     /// go (`Request::ConfigurePreservation::skips_unmet_conditions`).
     skips_unmet_conditions: bool,
@@ -1168,6 +1172,7 @@ impl FsOps {
             receiver_directories: Default::default(),
             inplace_parents: Default::default(),
             narrow_new_directories: false,
+            planning_lookups: None,
             skips_unmet_conditions: false,
             unchecked_keep: false,
             creation_permissions: Default::default(),
@@ -3121,11 +3126,15 @@ impl FsOps {
             list_nfs_directories_before_stats(&root, paths, &mut self.listing_requests);
             let minimum =
                 self.destination_parallel_minimum(paths.len(), paths.iter().map(Vec::as_slice));
+            let lookups = self.planning_lookups.as_deref();
             return parallel_map_init_from(
                 minimum,
                 paths,
                 || None,
-                |parent, path| stat_with_parent(&root, parent, path),
+                |parent, path| match lookups {
+                    Some(lookups) => lookups.look_up(&root, parent, path),
+                    None => stat_with_parent(&root, parent, path),
+                },
             );
         }
         parallel_map(paths, |p| {
@@ -3648,6 +3657,8 @@ struct HeldMetadataParent {
     root: Arc<Root>,
     path: PathBytes,
     directory: File,
+    /// The directory's device, once something asks.
+    dev: std::cell::OnceCell<Option<u64>>,
 }
 
 /// A directory is listed before its entries are stat'ed once at least this
@@ -3825,6 +3836,7 @@ fn strict_stat_with_parent(
                     root: root.clone(),
                     path: parent_path.to_vec(),
                     directory,
+                    dev: Default::default(),
                 })
             }
             Err(_) => return lookup(&RelativePath::new(path)?),
@@ -3845,14 +3857,48 @@ fn stat_with_parent(
     parent: &mut Option<HeldMetadataParent>,
     path: &[u8],
 ) -> Option<Entry> {
+    match lookup_with_parent(root, parent, path) {
+        Lookup::Found(entry) => Some(entry),
+        Lookup::Missing | Lookup::Unknown => None,
+    }
+}
+
+/// What a lookup beneath the destination root found.
+enum Lookup {
+    Found(Entry),
+    /// No entry: the name, or a directory on the way to it, does not exist.
+    Missing,
+    /// Anything else: an error other than a missing entry.
+    Unknown,
+}
+
+/// Look `path` up beneath `root`, holding its parent open in `parent` for
+/// the next name in the same directory.
+fn lookup_with_parent(
+    root: &Arc<Root>,
+    parent: &mut Option<HeldMetadataParent>,
+    path: &[u8],
+) -> Lookup {
+    let missing_or_unknown = |error: &anyhow::Error| {
+        if error_is_kind(error, io::ErrorKind::NotFound) {
+            Lookup::Missing
+        } else {
+            Lookup::Unknown
+        }
+    };
     if path.starts_with(b"/") {
-        return None;
+        return Lookup::Unknown;
     }
     let Some(separator) = path.iter().rposition(|byte| *byte == b'/') else {
         *parent = None;
-        let relative = RelativePath::new(path).ok()?;
-        let metadata = root.metadata(&relative).ok()?;
-        return rooted_entry(root, &relative, Vec::new(), metadata).ok();
+        let Ok(relative) = RelativePath::new(path) else {
+            return Lookup::Unknown;
+        };
+        return match root.metadata(&relative) {
+            Ok(metadata) => rooted_entry(root, &relative, Vec::new(), metadata)
+                .map_or(Lookup::Unknown, Lookup::Found),
+            Err(error) => missing_or_unknown(&error),
+        };
     };
     let parent_path = &path[..separator];
     let name = &path[separator + 1..];
@@ -3861,20 +3907,33 @@ fn stat_with_parent(
         .is_none_or(|held| !Arc::ptr_eq(&held.root, root) || held.path != parent_path)
     {
         *parent = None;
-        let directory = root
-            .open_directory(&RelativePath::new(parent_path).ok()?)
-            .ok()?;
+        let Ok(relative) = RelativePath::new(parent_path) else {
+            return Lookup::Unknown;
+        };
+        let directory = match root.open_directory(&relative) {
+            Ok(directory) => directory,
+            Err(error) => return missing_or_unknown(&error),
+        };
         *parent = Some(HeldMetadataParent {
             root: root.clone(),
             path: parent_path.to_vec(),
             directory,
+            dev: Default::default(),
         });
     }
     // The held parent's key was validated when opened. This operation validates
     // the leaf, so siblings do not need an allocated RelativePath for validation.
-    let directory = &parent.as_ref()?.directory;
-    let metadata = root.metadata_in_directory(directory, name).ok()?;
-    rooted_entry_in_directory(root, directory, name, Vec::new(), metadata, true).ok()
+    let Some(held) = parent.as_ref() else {
+        return Lookup::Unknown;
+    };
+    let directory = &held.directory;
+    match root.metadata_in_directory(directory, name) {
+        Ok(metadata) => {
+            rooted_entry_in_directory(root, directory, name, Vec::new(), metadata, true)
+                .map_or(Lookup::Unknown, Lookup::Found)
+        }
+        Err(error) => missing_or_unknown(&error),
+    }
 }
 
 const PAR_THREADS: usize = 32;
