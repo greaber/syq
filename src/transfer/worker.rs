@@ -384,13 +384,13 @@ impl Worker {
                 } else {
                     self.compare_group_limits().0
                 }
-            // A group's in-place updates take no condition; a staged
-            // replacement may be held to the file the scan found.
-            && match j.target_condition {
-                TargetCondition::Any => true,
-                TargetCondition::Matches { .. } => !j.inplace,
-                _ => false,
-            }
+            // A file may be held to the one the scan found, as under
+            // `--existing`: the receiver checks it against the file it opens
+            // to update or replace.
+            && matches!(
+                j.target_condition,
+                TargetCondition::Any | TargetCondition::Matches { .. }
+            )
             && !self.inspects_destination(j)
             && jobs.destination(idx).is_some_and(|existing| {
                 // An in-place file is written whether or not it is worth

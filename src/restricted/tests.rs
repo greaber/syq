@@ -9917,3 +9917,92 @@ fn must_exist_takes_the_receivers_own_scan_for_existence() {
     };
     assert!(KeptExisting::is(&error), "{error:#}");
 }
+
+/// A grant that creates nothing (`--only-existing`) lets a small file that
+/// exists be updated in place, as one it replaces would be, but not a file
+/// be created in place.
+#[test]
+fn must_exist_updates_existing_files_in_place_and_creates_none() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("there"), b"old contents").unwrap();
+    let authority = test_authority_with_existence(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::InPlaceUpdate,
+        ExistingDestinationPolicy::MustExist,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+    )
+    .unwrap();
+    let block = authority.copy.limits.hash_block_bytes;
+    let mut patch = small_patch(&target.join("there"), 3, block, vec![None], b"new");
+    patch.update_in_place = true;
+    authority
+        .authorize(&mut Request::PatchSmallBatch(vec![patch]), false)
+        .unwrap();
+    let mut create = prepare_request(&target.join("new"));
+    if let Request::Prepare { inplace, .. } = &mut create {
+        *inplace = true;
+    }
+    assert!(authority.authorize(&mut create, false).is_err());
+}
+
+/// A request that shared a file's count settles against the reservation it
+/// shared: once that one is published and gone, a newer reservation of the
+/// same file and partial keeps its own count.
+#[test]
+fn a_late_settlement_leaves_a_newer_reservations_count_alone() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let mut authority = test_authority_with_policy(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::InPlaceUpdate,
+    );
+    authority.copy.limits.max_entries = 8;
+    let mut ops = authority.test_ops();
+    let changes = |authority: &RestrictedAuthority| {
+        authority.changes.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let path = target.join("file");
+    let mut first = prepare_request(&path);
+    if let Request::Prepare { size, .. } = &mut first {
+        *size = 0;
+    }
+    let mut late = first.clone();
+    let first_settlement = authority.authorize(&mut first, false).unwrap();
+    let late_settlement = authority.authorize(&mut late, false).unwrap();
+    let response = ops.handle(&first);
+    authority.settle(first_settlement, &response);
+    let mut publish = finalize_request(&path, proto::TargetCondition::Any);
+    let settlement = authority.authorize(&mut publish, false).unwrap();
+    let response = ops.handle(&publish);
+    authority.settle(settlement, &response);
+    assert!(path.exists());
+    assert_eq!(changes(&authority), 1);
+    // The same file and partial prepared again: a new change.
+    let mut again = first.clone();
+    let _again = authority.authorize(&mut again, false).unwrap();
+    assert_eq!(changes(&authority), 2);
+    // The late request found its condition unmet: its share was of the
+    // published file's reservation, which is gone.
+    authority.settle(
+        late_settlement,
+        &proto::Response::EndpointError(proto::WireError {
+            condition_not_met: true,
+            ..proto::WireError::from("gone")
+        }),
+    );
+    assert_eq!(changes(&authority), 2);
+}

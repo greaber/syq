@@ -21,6 +21,7 @@ pub(super) struct AuthorityState {
     pub(super) reserved: HashMap<(Vec<u8>, proto::CopyId), ByteReservation>,
     pub(super) reserved_bytes: u64,
     pub(super) next_reservation_hold: u64,
+    pub(super) next_reservation_instance: u64,
     pub(super) live_connections: u16,
     pub(super) tcp_listener_started: bool,
     /// Files this grant's results stream is writing that have not been
@@ -55,6 +56,10 @@ pub(super) struct ByteReservation {
     /// The file counts against the entry limit (`charge_request`), and
     /// how many requests still to settle share that count.
     pub(super) entry: Option<EntryCharge>,
+    /// Which reservation of its key this is: one settled away and made
+    /// again for the same file and partial is another, which a request
+    /// that held a share of the first must not touch.
+    pub(super) instance: u64,
 }
 
 /// One file's count against the entry limit, which every request that may
@@ -576,6 +581,7 @@ impl RestrictedAuthority {
                 reserved: HashMap::new(),
                 reserved_bytes: 0,
                 next_reservation_hold: 0,
+                next_reservation_instance: 0,
                 live_connections: 0,
                 tcp_listener_started: false,
                 file_lifecycles: HashMap::new(),
@@ -864,7 +870,18 @@ impl RestrictedAuthority {
         } else {
             None
         };
-        let reservation = state.reserved.entry(key).or_default();
+        let AuthorityState {
+            reserved,
+            next_reservation_instance,
+            ..
+        } = &mut *state;
+        let reservation = reserved.entry(key).or_insert_with(|| {
+            *next_reservation_instance += 1;
+            ByteReservation {
+                instance: *next_reservation_instance,
+                ..Default::default()
+            }
+        });
         if let Some(hold) = hold {
             reservation.observations.insert(hold, size);
         } else {
@@ -1863,11 +1880,19 @@ impl RestrictedAuthority {
     /// Refuse to write in place a root the grant requires to be new: it is
     /// staged and published without replacing anything, so that no one
     /// sees it partly written, unless this grant created it.
-    pub(super) fn constrain_inplace(&self, path: &[u8]) -> Result<()> {
+    /// `creates` says the in-place write creates the file where its name is
+    /// free; one that only updates an existing file creates nothing.
+    pub(super) fn constrain_inplace(&self, path: &[u8], creates: bool) -> Result<()> {
         // In place, the receiver creates the file when its name is free,
         // and the name can become free after any check here: only a grant
-        // that lets the copy replace and create alike allows that.
-        if self.creation_policy(false) != ExistingDestinationPolicy::Replace {
+        // that lets the copy replace and create alike allows that. A grant
+        // that creates nothing lets an existing file be updated in place,
+        // as one it replaces would be: the receiver writes into the file
+        // it opens at the name, and stages the file where there is none,
+        // held to the grant as any staged file is.
+        let policy = self.creation_policy(false);
+        let updates_only = !creates && policy == ExistingDestinationPolicy::MustExist;
+        if policy != ExistingDestinationPolicy::Replace && !updates_only {
             bail!(
                 "signed grant does not let {} be created or replaced freely: it is not written in place",
                 String::from_utf8_lossy(path)
@@ -2190,7 +2215,8 @@ impl RestrictedAuthority {
             Some(key) => match state.reserved.get(&key) {
                 Some(reservation) => {
                     let charge = reservation.entry.is_none();
-                    (Some(key), charge, false)
+                    let instance = reservation.instance;
+                    (Some((key, instance)), charge, false)
                 }
                 None => (None, false, true),
             },
@@ -2258,7 +2284,7 @@ impl RestrictedAuthority {
             refund(&self.deletions, deletions);
             bail!("signed grant total-byte limit exceeded");
         }
-        if let Some(key) = &file {
+        if let Some((key, _)) = &file {
             let reservation = state
                 .reserved
                 .get_mut(key)
@@ -2290,14 +2316,19 @@ impl RestrictedAuthority {
     /// Release a settled request's share of `file`'s count against the
     /// entry limit, noting whether it `made` a change. The count is given
     /// back when the last share goes and no request changed the file.
-    fn release_file(&self, file: Option<&(Vec<u8>, proto::CopyId)>, made: bool) {
-        let Some(key) = file else {
+    fn release_file(&self, file: Option<&FileShare>, made: bool) {
+        let Some((key, instance)) = file else {
             return;
         };
         let mut state = self.state.lock().unwrap();
         // A reservation settled away meanwhile was published or failed
-        // after a change: the count stays.
-        let Some(reservation) = state.reserved.get_mut(key) else {
+        // after a change: the count stays, and a newer reservation of the
+        // same key is another file's.
+        let Some(reservation) = state
+            .reserved
+            .get_mut(key)
+            .filter(|reservation| reservation.instance == *instance)
+        else {
             return;
         };
         let Some(entry) = &mut reservation.entry else {
@@ -2593,7 +2624,7 @@ impl RestrictedAuthority {
                 {
                     bail!("small-file patch does not match the signed publication policy");
                 }
-                self.constrain_inplace(&patch.path)?;
+                self.constrain_inplace(&patch.path, false)?;
             }
             self.check_file_bytes(&patch.path, 0, patch.data.len())?;
             // A patch is for a file that exists: it is looked at.
@@ -3507,7 +3538,7 @@ impl RestrictedAuthority {
                 }
                 self.check_mutation_path(path, false)?;
                 if *inplace {
-                    self.constrain_inplace(path)?;
+                    self.constrain_inplace(path, *create_if_missing)?;
                 }
                 self.constrain_prepare(path)?;
                 let observation_hold =
@@ -3623,7 +3654,7 @@ impl RestrictedAuthority {
                     }
                     self.check_file_bytes(&put.path, 0, put.data.len())?;
                     if put.inplace {
-                        self.constrain_inplace(&put.path)?;
+                        self.constrain_inplace(&put.path, true)?;
                     }
                     self.constrain_creation(
                         &put.path,
@@ -3776,8 +3807,12 @@ pub(super) struct Charged {
     deleting: Vec<usize>,
     /// The file whose shared count against the entry limit this request
     /// holds until it settles (`EntryCharge`).
-    file: Option<(Vec<u8>, proto::CopyId)>,
+    file: Option<FileShare>,
 }
+
+/// A file's reservation key and which reservation of it a request shares
+/// (`ByteReservation::instance`).
+type FileShare = ((Vec<u8>, proto::CopyId), u64);
 
 /// What a request does to its connection's streamed patch.
 #[derive(Debug, Default)]

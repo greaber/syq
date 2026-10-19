@@ -1475,8 +1475,21 @@ impl FsOps {
                 .any(|(index, _)| puts[*index].replaces)
                 .then(|| root.replacement_turn());
             let _turn = root.mutation_turn(&directory).ok();
-            for (index, stage) in stages {
-                match self.publish_small_stage(&puts[index], &stage) {
+            // Each publication is a round trip or two on a network
+            // filesystem (a rename, or a link and the permission check that
+            // comes with it), so there the files are published on threads
+            // too, as they are written and closed.
+            let publish = |(index, stage): (usize, SmallStage)| {
+                let outcome = self.publish_small_stage(&puts[index], &stage);
+                (index, stage, outcome)
+            };
+            let outcomes = if network {
+                on_threads(stages, publish)
+            } else {
+                stages.into_iter().map(publish).collect()
+            };
+            for (index, stage, outcome) in outcomes {
+                match outcome {
                     Ok(staged) => published.push((index, stage, staged)),
                     Err(error) => results[index] = Err(wire_error(&error)),
                 }
