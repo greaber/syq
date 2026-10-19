@@ -286,6 +286,7 @@ fn large_patches_are_written_directly_with_their_buffered_encoding() {
             flags: 0,
             unchanged_flags: 0,
             condition: TargetCondition::Any,
+            update_in_place: false,
         };
         let request = Request::PatchSmallBatch(vec![patch]);
         assert_eq!(request.direct_payload(), direct, "{len}");

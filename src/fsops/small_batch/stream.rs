@@ -77,6 +77,9 @@ fn check_stream_layout(patch: &SmallPatch, data_len: u64) -> Result<()> {
     if !patch.data.is_empty() {
         bail!("a streamed patch carries its data in pieces");
     }
+    if patch.update_in_place {
+        bail!("a streamed patch is staged, not written in place");
+    }
     if patch.len > MAX_PATCH_FILE_BYTES {
         bail!("invalid patch of {} bytes", patch.len);
     }
@@ -125,6 +128,7 @@ impl FsOps {
                 error: wire_error(&error),
                 matched: false,
                 stale_condition: stream.stale,
+                written: false,
             });
         }
         stream.old = None;
@@ -422,6 +426,7 @@ impl FsOps {
                 Ok(identity) => Ok(SmallPatched {
                     kept: false,
                     identity,
+                    replaced: None,
                 }),
                 Err(error) => {
                     self.fail_stream(&mut stream, error);

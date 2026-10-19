@@ -493,6 +493,23 @@ pub(crate) fn time_preserving_test_authority_for(
     authority
 }
 
+/// A signed-grant authority over `root/target` that lets the copy update
+/// existing files in place (`--in-place=update`), preserving times, for up
+/// to `entries` paths, for other modules' tests.
+pub(crate) fn in_place_update_test_authority_for(root: &Path, entries: u64) -> RestrictedAuthority {
+    let mut authority = test_authority_with_policy(
+        root,
+        DeletionPolicy::Forbid,
+        64 << 20,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::InPlaceUpdate,
+    );
+    authority.copy.options.preserve_times = true;
+    authority.copy.limits.max_entries = entries;
+    authority
+}
+
 fn test_authority_with_rate(
     root: &Path,
     deletion: DeletionPolicy,
@@ -3343,6 +3360,7 @@ fn results_report_a_declined_metadata_change_as_the_replacement() {
             error: declined(),
             matched: true,
             stale_condition: false,
+            written: false,
         })]),
     );
     let mut put = small_put(&small);
@@ -5645,6 +5663,7 @@ fn small_patch(
         flags: 0,
         unchanged_flags: 0,
         condition: proto::TargetCondition::Any,
+        update_in_place: false,
     }
 }
 
@@ -5733,11 +5752,13 @@ fn grouped_comparison_keeps_and_patches_files_within_the_grant() {
         vec![
             Ok(proto::SmallPatched {
                 kept: true,
-                identity: None
+                identity: None,
+                replaced: None
             }),
             Ok(proto::SmallPatched {
                 kept: false,
-                identity: None
+                identity: None,
+                replaced: None
             }),
         ]
     );
@@ -5800,7 +5821,8 @@ fn compare_and_keep(
 fn a_linked_file_whose_times_change_is_replaced_name_by_name() {
     // A file with other names is never changed in place: each name whose
     // contents match gets a new file built from those contents, with the
-    // times the copy sets, and the old file keeps its own.
+    // times the copy sets, and the old file keeps its own. The receiver
+    // says why it replaced each.
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     let target = root.join("target");
@@ -5815,6 +5837,7 @@ fn a_linked_file_whose_times_change_is_replaced_name_by_name() {
         Ok(proto::SmallPatched {
             kept: false,
             identity: None,
+            replaced: Some(proto::ReplaceReason::OtherNames),
         })
     };
     let results = compare_and_keep(&authority, &mut ops, &[&a, &b]);
@@ -5900,6 +5923,7 @@ fn a_stale_patch_holds_no_bytes_and_leaves_its_record_to_the_retry() {
     let kept = Ok(proto::SmallPatched {
         kept: true,
         identity: None,
+        replaced: None,
     });
     // Both names are hashed, and the second is then replaced by another
     // file. A patch pinned to the file it hashed, as an exact destination
@@ -6157,6 +6181,7 @@ fn grouped_patches_charge_their_new_data_and_hold_their_published_size() {
         &proto::Response::PatchedBatch(vec![Ok(proto::SmallPatched {
             kept: false,
             identity: None,
+            replaced: None,
         })]),
     );
     assert_eq!(authority.state.lock().unwrap().reserved_bytes, len);
@@ -6170,6 +6195,7 @@ fn grouped_patches_charge_their_new_data_and_hold_their_published_size() {
         &proto::Response::PatchedBatch(vec![Ok(proto::SmallPatched {
             kept: true,
             identity: None,
+            replaced: None,
         })]),
     );
     assert_eq!(authority.state.lock().unwrap().reserved_bytes, len);
@@ -6270,20 +6296,24 @@ fn grouped_patch_results_list_published_and_failed_files() {
             Ok(proto::SmallPatched {
                 kept: true,
                 identity: None,
+                replaced: None,
             }),
             Ok(proto::SmallPatched {
                 kept: false,
                 identity: None,
+                replaced: None,
             }),
             Err(proto::SmallPatchError {
                 error: "executor rejected it".into(),
                 matched: false,
                 stale_condition: false,
+                written: false,
             }),
             Err(proto::SmallPatchError {
                 error: "keeping it failed".into(),
                 matched: true,
                 stale_condition: false,
+                written: false,
             }),
         ]),
     );
@@ -7401,6 +7431,171 @@ fn both_receivers_update_in_place_only_files_they_vouch_for() {
     }
 }
 
+/// Under `--in-place=update`, ordinary and command-restricted receivers
+/// settle each file of a patch batch alike: a file of their own is updated
+/// in place, with only its new block written; one with another name is
+/// replaced through a stage, and the reason returned; an unchanged one is
+/// kept; and one changed since its comparison, in a block the patch
+/// reuses, fails with nothing written. The rest of the batch is done
+/// either way, and the restricted receiver's results list each.
+#[test]
+fn both_receivers_settle_each_file_of_an_in_place_batch_alike() {
+    let block = proto::MIN_HASH_BLOCK_BYTES as usize;
+    let old: Vec<u8> = (0..3 * block).map(|index| (index % 251) as u8).collect();
+    let mut new = old.clone();
+    new[block + 5] ^= 1;
+    let names = ["mine", "linked", "unchanged", "changed"];
+    for restricted in [false, true] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        for name in names {
+            fs::write(target.join(name), &old).unwrap();
+            fs::set_permissions(target.join(name), fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        fs::hard_link(target.join("linked"), root.join("outside")).unwrap();
+        let inodes: Vec<u64> = names
+            .iter()
+            .map(|name| fs::metadata(target.join(name)).unwrap().ino())
+            .collect();
+        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let (secret, policy) = results_policy();
+        let mut receiver =
+            ParityReceiver::new(&root, restricted, true, PublicationPolicy::InPlaceUpdate);
+        let mut reader = None;
+        if restricted {
+            let mut authority = test_authority_with_results(
+                &root,
+                DeletionPolicy::Forbid,
+                4 << 20,
+                0,
+                FilterPolicy::default(),
+                PublicationPolicy::InPlaceUpdate,
+                ExistingDestinationPolicy::Replace,
+                DestinationPlacement::ExactPath,
+                RootExistence::Any,
+                Some((key, policy)),
+            )
+            .unwrap();
+            authority.copy.options.preserve_permissions = true;
+            authority.copy.options.preserve_times = true;
+            authority.copy.limits.max_entries = 1000;
+            reader = Some(start_results(&authority, secret));
+            receiver.authority = Some(authority);
+        }
+        let case = format!("restricted={restricted}");
+        let proto::Response::ExistingHashes(hashed) = receiver.send(Request::HashExistingBatch {
+            block: block as u64,
+            files: names
+                .iter()
+                .map(|name| existing_read(&target.join(name), new.len() as u64))
+                .collect(),
+        }) else {
+            panic!("{case}: unexpected hash response");
+        };
+        // After its comparison, "changed" changes in a block the patch
+        // reuses, and grows, so that its fingerprint shows the change
+        // however coarse its change time.
+        let planted = [&old[..10], b"planted", &old[17..], b"!"].concat();
+        fs::write(target.join("changed"), &planted).unwrap();
+        let flags = proto::flags::MODE | proto::flags::TIMES;
+        let patches = names
+            .iter()
+            .zip(hashed)
+            .map(|(name, hashed)| {
+                let hashed = hashed.unwrap();
+                let (reuse, data) = if *name == "unchanged" {
+                    (hashed.hashes.iter().copied().map(Some).collect(), &[][..])
+                } else {
+                    (
+                        vec![Some(hashed.hashes[0]), None, Some(hashed.hashes[2])],
+                        &new[block..2 * block],
+                    )
+                };
+                let mut patch = small_patch(
+                    &target.join(name),
+                    new.len() as u64,
+                    block as u64,
+                    reuse,
+                    data,
+                );
+                patch.basis = hashed.fingerprint;
+                patch.meta.mtime = 1_600_000_000;
+                patch.flags = flags;
+                patch.unchanged_flags = flags;
+                patch.update_in_place = true;
+                patch
+            })
+            .collect();
+        let proto::Response::PatchedBatch(patched) =
+            receiver.send(Request::PatchSmallBatch(patches))
+        else {
+            panic!("{case}: unexpected patch response");
+        };
+        let settled = |replaced, kept| {
+            Ok(proto::SmallPatched {
+                kept,
+                identity: None,
+                replaced,
+            })
+        };
+        assert_eq!(
+            patched[..3],
+            [
+                settled(None, false),
+                settled(Some(proto::ReplaceReason::OtherNames), false),
+                settled(None, true),
+            ],
+            "{case}"
+        );
+        let Err(failed) = &patched[3] else {
+            panic!("{case}: {:?}", patched[3]);
+        };
+        assert!(
+            !failed.written && !failed.matched && !failed.stale_condition,
+            "{case}: {failed:?}"
+        );
+        for ((name, before), contents) in
+            names.iter().zip(&inodes).zip([&new, &new, &old, &planted])
+        {
+            let status = fs::metadata(target.join(name)).unwrap();
+            assert!(
+                fs::read(target.join(name)).unwrap() == *contents,
+                "{case}: {name}"
+            );
+            assert_eq!(status.ino() == *before, *name != "linked", "{case}: {name}");
+            if *name != "changed" {
+                assert_eq!(status.mtime(), 1_600_000_000, "{case}: {name}");
+            }
+        }
+        assert!(fs::read(root.join("outside")).unwrap() == old, "{case}");
+
+        if let (Some(authority), Some(reader)) = (&receiver.authority, reader.as_mut()) {
+            let results = finish_results(authority, reader);
+            for (name, disposition) in [
+                ("mine", "succeeded"),
+                ("linked", "succeeded"),
+                ("changed", "failed"),
+            ] {
+                assert!(
+                    results.has("transfer_file", name.as_bytes(), disposition),
+                    "{case}: {name}: {:?}",
+                    results.records
+                );
+            }
+            assert!(
+                !results
+                    .changes()
+                    .iter()
+                    .any(|(action, path, _)| action == "transfer_file" && path == b"unchanged"),
+                "{case}: {:?}",
+                results.records
+            );
+        }
+    }
+}
+
 /// Only a grant for `--in-place=update` lets a receiver update an existing
 /// file in place, and only with metadata the grant allows.
 #[test]
@@ -7456,6 +7651,39 @@ fn in_place_updates_need_a_grant_for_them() {
                 .unwrap_err();
             assert!(error.to_string().contains("ownership"), "{error:#}");
         }
+        // So too for a batch's patch, and never for a streamed one.
+        let mut patch = small_patch(
+            &target.join("existing"),
+            3,
+            proto::MIN_HASH_BLOCK_BYTES,
+            vec![None],
+            b"new",
+        );
+        patch.flags = proto::flags::RECEIVER_MODE;
+        patch.unchanged_flags = patch.flags;
+        patch.update_in_place = true;
+        let result = authority.authorize(&mut Request::PatchSmallBatch(vec![patch.clone()]), false);
+        assert_eq!(result.is_ok(), allowed, "{publication:?}");
+        if let Err(error) = result {
+            assert!(
+                error.to_string().contains("signed publication policy"),
+                "{publication:?}: {error:#}"
+            );
+        }
+        patch.data.clear();
+        let error = authority
+            .authorize(
+                &mut Request::PatchBegin {
+                    patch: Box::new(patch),
+                    data_len: 3,
+                },
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("not written in place"),
+            "{publication:?}: {error:#}"
+        );
     }
 }
 

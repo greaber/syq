@@ -263,15 +263,15 @@ fn local_default_replaces_blocks_and_on_overrides_whole_file_copy() {
             let out = cmd.run().unwrap();
             assert_output_ok(&out);
             assert_eq!(read(&t.path("dst")), source);
-            // With block reuse, a file this size is patched in a group, or
-            // updated in place on the per-file path.
+            // With block reuse, a file this size is patched in a group, and
+            // with --inplace updated in place there.
             let observed = tuning_observed(&out);
-            let grouped = reuse == Some("aligned-block") && !inplace;
+            let grouped = reuse == Some("aligned-block");
             assert_eq!(observed["patched_files"], u64::from(grouped));
             assert_eq!(
                 observed["range_requests"],
                 match reuse {
-                    Some("aligned-block") => u64::from(inplace),
+                    Some("aligned-block") => 0,
                     _ => 2,
                 }
             );
@@ -965,8 +965,16 @@ fn a_patch_whose_payload_fails_its_check_is_copied_whole() {
     // With transfer integrity, the receiver checks the differing blocks a
     // patch carries against the payload hash the source sent. Here one
     // payload check fails, as for data corrupted in transit: the patch is
-    // refused and the file is copied whole instead.
-    for (remote, cloning) in [(false, true), (false, false), (true, true)] {
+    // refused and the file is copied whole instead. With --inplace, nothing
+    // of the patch is written into the file, which is then updated in place
+    // on the per-file path and keeps its inode.
+    for (remote, cloning, inplace) in [
+        (false, true, false),
+        (false, false, false),
+        (true, true, false),
+        (false, true, true),
+        (true, true, true),
+    ] {
         let t = Tmp::new();
         let source = prng(8 << 20, 874);
         let mut old = source.clone();
@@ -974,6 +982,7 @@ fn a_patch_whose_payload_fails_its_check_is_copied_whole() {
         write(&t.path("src/file"), &source);
         write(&t.path("dst/file"), &old);
         set_mtime(&t.path("dst/file"), 1);
+        let before = fs::metadata(t.path("dst/file")).unwrap().ino();
         let marker = t.path("corrupted-once");
         let (source_dir, destination_dir) = (t.s("src/"), t.s("dst/"));
         let remote_destination = format!("fake:{destination_dir}");
@@ -982,6 +991,9 @@ fn a_patch_whose_payload_fails_its_check_is_copied_whole() {
             "--no-whole-file",
             "--integrity-checking=transfer=blake3",
         ];
+        if inplace {
+            args.push("--inplace");
+        }
         let mut command = if remote {
             let rsh = fake_rsh(&t);
             args.extend([
@@ -1006,9 +1018,16 @@ fn a_patch_whose_payload_fails_its_check_is_copied_whole() {
         }
         let out = command.run().unwrap();
         assert_output_ok(&out);
-        let case = format!("remote={remote} cloning={cloning}");
+        let case = format!("remote={remote} cloning={cloning} inplace={inplace}");
         assert!(marker.exists(), "{case}: the payload check never ran");
         assert_eq!(read(&t.path("dst/file")), source, "{case}");
+        if inplace {
+            assert_eq!(
+                fs::metadata(t.path("dst/file")).unwrap().ino(),
+                before,
+                "{case}"
+            );
+        }
         let observed = tuning_observed(&out);
         assert_eq!(observed["compared_files"], 1, "{case}");
         assert_eq!(observed["patched_files"], 0, "{case}");

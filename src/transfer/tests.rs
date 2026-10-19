@@ -5213,6 +5213,138 @@ fn copy_through_restricted_receiver_with(
     }
 }
 
+/// Update each of `names` in place (`--in-place=update`) from `root/source`
+/// into `root/target` with one worker, through an ordinary receiver or,
+/// when `restricted`, a command-restricted one granted in-place updates,
+/// preserving times, and return the requests the receiver carried out.
+fn update_in_place_through(
+    root: &std::path::Path,
+    names: &[String],
+    restricted: bool,
+) -> Vec<Request> {
+    use std::os::unix::fs::MetadataExt;
+    let sched = Arc::new(Sched::new(512, 8192));
+    let mut entries = std::collections::HashMap::new();
+    for name in names {
+        let source = root.join("source").join(name);
+        let mut job = pipeline_job(name.as_bytes(), 0);
+        job.src = source.as_os_str().as_bytes().to_vec();
+        job.dst = root
+            .join("target")
+            .join(name)
+            .as_os_str()
+            .as_bytes()
+            .to_vec();
+        job.entry.size = std::fs::metadata(&source).unwrap().len();
+        job.entry.mtime = 1_700_000_000;
+        // The planner found it could update the file in place.
+        job.inplace = true;
+        let existing = std::fs::metadata(OsStr::from_bytes(&job.dst)).unwrap();
+        job.dst_entry = Some(Entry {
+            size: existing.len(),
+            mtime: 0,
+            dev: existing.dev(),
+            ino: existing.ino(),
+            nlink: existing.nlink(),
+            ..job.entry.clone()
+        });
+        entries.insert(job.src.clone(), job.entry.clone());
+        sched.push_file(job);
+    }
+    sched.scan_done();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let unused = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+    worker.src = reading_source(entries);
+    worker.dst = if restricted {
+        let authority = Arc::new(
+            crate::restricted::tests::in_place_update_test_authority_for(
+                root,
+                names.len().max(8) as u64,
+            ),
+        );
+        restricted_destination(authority, requests.clone(), || {})
+    } else {
+        let mut ops = crate::fsops::FsOps::test_destination(&root.join("target"));
+        let requests = requests.clone();
+        Box::new(AnsweringConn {
+            answer: move |request: Request| {
+                let response = ops.handle(&request);
+                requests.lock().unwrap().push(request);
+                response
+            },
+            replies: Default::default(),
+        })
+    };
+    worker.fast_batch_files = names.len();
+    let opts = Arc::get_mut(&mut worker.opts).unwrap();
+    opts.restricted_receiver = restricted;
+    opts.inplace = true;
+    opts.inplace_update = true;
+    opts.block = 1 << 20;
+    opts.flags = flags::TIMES;
+    opts.matching_flags = flags::TIMES;
+    run_workers(&sched, vec![worker]);
+    let executed = std::mem::take(&mut *requests.lock().unwrap());
+    executed
+}
+
+#[test]
+fn small_files_are_updated_in_place_with_a_request_per_stage_for_all_of_them() {
+    // Forty small files that `--in-place=update` writes in place go in one
+    // group, through either receiver: one request hashes them all, and one
+    // writes each file's changed block into it. None costs a request of its
+    // own.
+    use std::os::unix::fs::MetadataExt;
+    for restricted in [false, true] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        for directory in ["source", "target"] {
+            std::fs::create_dir(root.join(directory)).unwrap();
+        }
+        let names: Vec<String> = (0..40).map(|index| format!("file{index:02}")).collect();
+        let mut inodes = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let new: Vec<u8> = (0..8192).map(|byte| (byte + index) as u8).collect();
+            let mut old = new.clone();
+            old[100] ^= 1;
+            std::fs::write(root.join("source").join(name), &new).unwrap();
+            std::fs::write(root.join("target").join(name), &old).unwrap();
+            inodes.push(
+                std::fs::metadata(root.join("target").join(name))
+                    .unwrap()
+                    .ino(),
+            );
+        }
+        let requests = update_in_place_through(root, &names, restricted);
+        let case = format!("restricted={restricted}");
+        let kinds: Vec<&str> = requests
+            .iter()
+            .map(|request| match request {
+                Request::HashExistingBatch { files, .. } => {
+                    assert_eq!(files.len(), names.len(), "{case}");
+                    "hash"
+                }
+                Request::PatchSmallBatch(patches) => {
+                    assert_eq!(patches.len(), names.len(), "{case}");
+                    assert!(patches.iter().all(|patch| patch.update_in_place), "{case}");
+                    "patch"
+                }
+                other => panic!("{case}: {other:?}"),
+            })
+            .collect();
+        assert_eq!(kinds, ["hash", "patch"], "{case}");
+        for (index, (name, before)) in names.iter().zip(&inodes).enumerate() {
+            let path = root.join("target").join(name);
+            let new: Vec<u8> = (0..8192).map(|byte| (byte + index) as u8).collect();
+            let metadata = std::fs::metadata(&path).unwrap();
+            assert!(std::fs::read(&path).unwrap() == new, "{case}: {name}");
+            assert_eq!(metadata.ino(), *before, "{case}: {name}");
+            assert_eq!(metadata.mtime(), 1_700_000_000, "{case}: {name}");
+        }
+    }
+}
+
 /// Each of `names` below `root/target` holds its contents and modification
 /// time, in a file of its own: a destination file's other names never
 /// share the change a name makes (`fsops::vouch`).
