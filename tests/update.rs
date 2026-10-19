@@ -150,7 +150,14 @@ impl UpdateFixture {
     }
 
     fn command_at_args(&self, executable: &Path, arguments: &[&str]) -> Output {
-        Command::new(executable)
+        self.command_builder(executable, arguments)
+            .capture_output()
+            .unwrap()
+    }
+
+    fn command_builder(&self, executable: &Path, arguments: &[&str]) -> Command {
+        let mut command = Command::new(executable);
+        command
             .args(arguments)
             .env("XDG_CONFIG_HOME", &self.config)
             .env("XDG_CACHE_HOME", self.temp.path("cache"))
@@ -164,9 +171,8 @@ impl UpdateFixture {
                 "SYQ_TEST_RELEASE_DOWNLOADS",
                 "https://release.invalid/download",
             )
-            .env("SYQ_TEST_FIXTURES", self.temp.path("fixtures"))
-            .capture_output()
-            .unwrap()
+            .env("SYQ_TEST_FIXTURES", self.temp.path("fixtures"));
+        command
     }
 
     fn command_at(&self, executable: &Path, argument: &str) -> Output {
@@ -708,13 +714,16 @@ fn use_version_rejects_wrong_release_and_corrupt_cached_manifest() {
     let mut value: serde_json::Value =
         serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
     value["version"] = "0.7.1".into();
-    fs::write(manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    // A complete stored release is started without reading its manifest; the
+    // manifest is checked again only when the release must be downloaded.
+    fs::remove_file(manifest.with_file_name("syq")).unwrap();
     let out = fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]);
     assert_failure_contains(&out, "signature verification failed");
 }
 
 #[test]
-fn use_version_runs_the_stored_release_as_is_and_downloads_it_again_when_removed() {
+fn use_version_starts_a_stored_release_directly_and_downloads_it_again_when_removed() {
     let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
     let run = || fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]);
     assert_success(&run());
@@ -723,13 +732,18 @@ fn use_version_runs_the_stored_release_as_is_and_downloads_it_again_when_removed
         release_target()
     ));
     let release = fs::read(&stored).unwrap();
-    // A stored release was verified before it was stored, so it is not hashed
-    // again on each run.
+    // A stored release passed its checks before its manifest was stored, so
+    // later runs start it without hashing it or reading the manifest.
     executable_support::write_executable(&stored, "#!/bin/sh\necho 'stored copy'\n", 0o755);
+    fs::write(
+        stored.with_file_name("syq-release-manifest.json"),
+        b"not json",
+    )
+    .unwrap();
     let out = run();
     assert_success(&out);
     assert_eq!(out.stdout, b"stored copy\n");
-    fs::remove_file(&stored).unwrap();
+    fs::remove_dir_all(fixture.temp.path("cache/syq/helpers/v0.7.0")).unwrap();
     let out = run();
     assert_success(&out);
     assert_eq!(out.stdout, b"syq 0.7.0\n");
@@ -747,7 +761,10 @@ fn use_version_verifies_a_download_before_storing_it() {
     tampered[middle] ^= 1;
     fs::write(&archive, tampered).unwrap();
     let out = fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]);
-    assert_failure_contains(&out, "failed SHA-256 verification");
+    assert_failure_contains(
+        &out,
+        "downloaded syq release archive failed SHA-256 verification",
+    );
     let directory = fixture
         .temp
         .path(&format!("cache/syq/helpers/v0.7.0/{}", release_target()));
@@ -755,6 +772,43 @@ fn use_version_verifies_a_download_before_storing_it() {
         .map(|entries| entries.map(|entry| entry.unwrap().file_name()).collect())
         .unwrap_or_default();
     assert!(stored.is_empty(), "{stored:?}");
+}
+
+#[test]
+fn use_version_ignores_a_relative_cache_home() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    // A directory the command runs in could supply a genuine manifest beside an
+    // executable of its own, which a relative cache root would start.
+    let work = fixture.temp.path("work");
+    let planted = work.join(format!("cache/syq/helpers/v0.7.0/{}", release_target()));
+    fs::create_dir_all(&planted).unwrap();
+    fs::copy(
+        fixture.temp.path("fixtures/syq-release-manifest.json"),
+        planted.join("syq-release-manifest.json"),
+    )
+    .unwrap();
+    executable_support::write_executable(&planted.join("syq"), "#!/bin/sh\necho planted\n", 0o755);
+    let home = fixture.temp.path("home");
+    fs::create_dir_all(&home).unwrap();
+    let out = fixture
+        .command_builder(&fixture.installed, &["--use-version=0.7.0", "--version"])
+        .current_dir(&work)
+        .env("XDG_CACHE_HOME", "cache")
+        .env("HOME", &home)
+        .capture_output()
+        .unwrap();
+    assert_success(&out);
+    assert_eq!(out.stdout, b"syq 0.7.0\n");
+    assert!(home
+        .join(format!(
+            ".cache/syq/helpers/v0.7.0/{}/syq",
+            release_target()
+        ))
+        .is_file());
+    assert_eq!(
+        fs::read(planted.join("syq")).unwrap(),
+        b"#!/bin/sh\necho planted\n"
+    );
 }
 
 #[test]
