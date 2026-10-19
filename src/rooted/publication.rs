@@ -147,6 +147,9 @@ pub(super) struct Placement<'a> {
     pub(super) to_directory: RawFd,
     pub(super) to: &'a CStr,
     pub(super) link: Link,
+    /// A link is made from this open file (`/proc/self/fd/N` on Linux)
+    /// rather than from `from`'s name, so it links exactly that file.
+    pub(super) descriptor: Option<&'a CStr>,
 }
 
 /// Give `from` the name `to` without replacing anything already there,
@@ -188,6 +191,7 @@ pub(super) fn move_without_replacing(
         to_directory,
         to,
         link,
+        descriptor,
     } = *placement;
     let refuse = |profile: &mut Profile, refusal| {
         *profile = profile.without(refusal);
@@ -211,9 +215,18 @@ pub(super) fn move_without_replacing(
         let simulated = LINK_ERROR.get().map(io::Error::from_raw_os_error);
         #[cfg(not(test))]
         let simulated = None;
-        let linked = match simulated {
-            Some(error) => Err(error),
-            None => retry_zero(|| unsafe {
+        let linked = match (simulated, descriptor) {
+            (Some(error), _) => Err(error),
+            (None, Some(descriptor)) => retry_zero(|| unsafe {
+                libc::linkat(
+                    libc::AT_FDCWD,
+                    descriptor.as_ptr(),
+                    to_directory,
+                    to.as_ptr(),
+                    libc::AT_SYMLINK_FOLLOW,
+                )
+            }),
+            (None, None) => retry_zero(|| unsafe {
                 libc::linkat(from_directory, from.as_ptr(), to_directory, to.as_ptr(), 0)
             }),
         };

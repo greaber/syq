@@ -181,32 +181,28 @@ alone too. `--as-new` and `--into-new` constrain the placement root; `--if-exist
 applies to individual selected entries.
 
 Another program can change the destination while a copy runs. With `error`,
-`error-if-different` and `--as-new`, syq creates a new file at a name only
-while the name is still free: a file that appears there first is kept, and
-that file's copy is reported as failed. `--into-new` creates its directory the
-same way; if another program creates one there first, the copy fails.
+`error-if-different`, `keep` (and `syq rsync --ignore-existing`) and
+`--as-new`, syq creates a new file at a name only while the name is still
+free: it renames the file into place without replacing anything, or, on
+filesystems that can't, such as NFS, SMB and FUSE filesystems like SSHFS,
+links it into place, which fails if the name is taken. A file that appears
+there first is kept. Under `keep` syq skips it with a note, as it skips one
+it found at the start; under the other policies that file's copy is reported
+as failed. `--into-new` creates its directory the same way; if another program
+creates one there first, the copy fails. In an S3 bucket, an object that
+appears under `keep` is kept, but that file's copy is reported as failed
+(`S3 PUT failed`).
 
-With `keep` (and `syq rsync --ignore-existing`), a file that appears in a
-destination directory before syq puts its own there is kept, and syq skips it
-with a note, as it skips one it found at the start. With
-`syq rsync --existing`, syq replaces a file only while it is still the one it
-found: one removed or replaced meanwhile is skipped with a note, not created
-again. On filesystems that can't do the check and the rename in one step,
-such as NFS, SMB and FUSE filesystems like SSHFS, syq checks the name and then
-renames its file into place, so a file another program puts there in the
-instant between the two is replaced. rsync doesn't guard against that either.
-Copies with `--as-new` or `--into-new`, and copies to a restricted receiver,
-leave no such instant: there syq links the new file into place, or moves the
-old one aside first, which takes extra requests on those filesystems. In
-an S3 bucket, an object that appears under `keep` is kept, but that file's
-copy is reported as failed (`S3 PUT failed`). On filesystems whose inode
-numbers can't show which file a name leads to, such as SSHFS, rclone mounts
-and FAT on macOS, `--existing` checks only that a file is still there.
+With `syq rsync --existing`, syq replaces only the files its scan found, by
+renaming its file over whatever the name holds by then: a file another
+program replaces or removes in the meantime is replaced, or created again.
+rsync behaves the same way. A restricted receiver creates nothing its own
+scan of the destination didn't find there.
 
 On filesystems with neither an atomic no-replace rename nor hard links, such
-as FAT and exFAT on macOS and rclone mounts, every receiver checks that the
-name is free and then renames, so even under `error` a file another program
-creates there in that instant can be replaced.
+as FAT and exFAT on macOS and rclone mounts, syq checks that a name is free
+and then renames, so even under `error` a file another program creates there
+in that instant can be replaced.
 
 See [Update policies](commands/cp.md#update-policies) for supported combinations.
 

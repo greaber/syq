@@ -450,7 +450,6 @@ fn pipeline_worker(
         restricted_receiver: false,
         receiver_paces_file_data: false,
         own_links: false,
-        check_then_rename: false,
         skips_unmet_conditions: false,
         dry_run: false,
         dry_run_metadata_files: AtomicU64::new(0),

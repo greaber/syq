@@ -3675,9 +3675,11 @@ impl Planner<'_> {
     /// placement condition comes first. A new leaf under the error policies
     /// or `--if-exists=keep` is created without replacing anything: a name
     /// that appears in the meantime is kept. An existing leaf under
-    /// `--only-existing` is replaced only while it is still the object the
-    /// scan found: nothing is created where it went. A restricted receiver
-    /// holds its grant's copies to the same conditions itself.
+    /// `--only-existing` names the object the scan found; a file's
+    /// publication renames over whatever the name holds by then
+    /// (`fsops::publish_partial_rooted`), while other changes are held to
+    /// it. A restricted receiver holds its grant's copies to the same
+    /// policies itself.
     pub(super) fn leaf_condition_for(
         &self,
         path: &[u8],

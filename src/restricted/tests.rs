@@ -2317,26 +2317,32 @@ fn signed_skip_policy_retains_preexisting_objects() {
     let link = target.join("link");
     fs::create_dir_all(&dir).unwrap();
     fs::write(&kept, b"old").unwrap();
-    let authority = existence_authority(
+    let mut authority = existence_authority(
         &root,
         ExistingDestinationPolicy::Skip,
         DestinationPlacement::ExactPath,
         RootExistence::Any,
     )
     .unwrap();
+    // Requests the executor refuses still count until they settle.
+    authority.copy.limits.max_entries = 64;
 
-    // New files are staged and published without replacing anything;
-    // staging for a pre-existing object fails before bytes move.
+    // New files are staged and published without replacing anything,
+    // which the executor refuses where a name exists: a pre-existing
+    // object needs no look here.
     let mut prepare_fresh = prepare_request(&fresh);
     authority.authorize(&mut prepare_fresh, false).unwrap();
     let mut prepare_kept = prepare_request(&kept);
-    assert!(authority.authorize(&mut prepare_kept, false).is_err());
+    authority.authorize(&mut prepare_kept, false).unwrap();
     let mut publish_fresh = finalize_request(&fresh, Any);
     let settlement = authority.authorize(&mut publish_fresh, false).unwrap();
     assert_eq!(finalize_condition(&publish_fresh), Absent);
     authority.settle(settlement, &proto::Response::Ok);
     let mut publish_kept = finalize_request(&kept, Any);
-    assert!(authority.authorize(&mut publish_kept, false).is_err());
+    authority.authorize(&mut publish_kept, false).unwrap();
+    assert_eq!(finalize_condition(&publish_kept), Absent);
+    let mut replace_kept = finalize_request(&kept, Matches { dev: 1, ino: 1 });
+    assert!(authority.authorize(&mut replace_kept, false).is_err());
     // What this grant created, and the executor confirmed, is its own to
     // republish.
     let mut republish_fresh = finalize_request(&fresh, Matches { dev: 1, ino: 1 });
@@ -2346,7 +2352,8 @@ fn signed_skip_policy_retains_preexisting_objects() {
         Matches { dev: 1, ino: 1 }
     );
     let mut small_kept = small_put(&kept);
-    assert!(authority.authorize(&mut small_kept, false).is_err());
+    authority.authorize(&mut small_kept, false).unwrap();
+    assert_eq!(small_put_condition(&small_kept), Absent);
     let mut small_new = small_put(&small);
     authority.authorize(&mut small_new, false).unwrap();
     assert_eq!(small_put_condition(&small_new), Absent);
@@ -2365,7 +2372,8 @@ fn signed_skip_policy_retains_preexisting_objects() {
     // Symlinks follow the same rule, and metadata may follow only this
     // grant's own creations.
     let mut link_over_file = apply(symlink_op(&kept));
-    assert!(authority.authorize(&mut link_over_file, false).is_err());
+    authority.authorize(&mut link_over_file, false).unwrap();
+    assert_eq!(op_condition(&link_over_file), Absent);
     let mut create_link = apply(symlink_op(&link));
     let settlement = authority.authorize(&mut create_link, false).unwrap();
     assert_eq!(op_condition(&create_link), Absent);
@@ -2518,7 +2526,8 @@ fn provisional_creations_are_forgotten_when_execution_fails() {
     authority.settle(settlement, &proto::Response::Err("raced".into()));
     fs::write(&fresh, b"foreign").unwrap();
     let mut republish = finalize_request(&fresh, Any);
-    assert!(authority.authorize(&mut republish, false).is_err());
+    authority.authorize(&mut republish, false).unwrap();
+    assert_eq!(finalize_condition(&republish), Absent);
 
     // A successful one stays this grant's own.
     let mut publish = small_put(&kept);
@@ -2569,7 +2578,7 @@ fn a_refused_request_leaves_no_provisional_creations_behind() {
     // The first entry is authorized before the second is refused; nothing
     // of the batch runs, so the first must not count as created.
     let mut batch = Request::Apply {
-        ops: vec![mkdir(&fresh), symlink_op(&kept)],
+        ops: vec![mkdir(&fresh), mkdir(&kept)],
     };
     assert!(authority.authorize(&mut batch, false).is_err());
     let mut again = apply(mkdir(&fresh));
@@ -5396,11 +5405,12 @@ fn hardlinks_need_the_signed_option_and_keep_to_the_existing_object_policy() {
     replace.authorize(&mut request, false).unwrap();
     assert_eq!(condition(&request), proto::TargetCondition::Any);
 
-    // Keeping existing entries: a new name only, never a replacement.
+    // Keeping existing entries: a new name only, never a replacement,
+    // which the link itself refuses where the name exists.
     let keep = with_policy(ExistingDestinationPolicy::Skip);
-    assert!(keep
-        .authorize(&mut link("target/existing", "target/source"), false)
-        .is_err());
+    let mut request = link("target/existing", "target/source");
+    keep.authorize(&mut request, false).unwrap();
+    assert_eq!(condition(&request), proto::TargetCondition::Absent);
     let mut request = link("target/new", "target/source");
     keep.authorize(&mut request, false).unwrap();
     assert_eq!(condition(&request), proto::TargetCondition::Absent);
@@ -5490,7 +5500,6 @@ fn signed_grants_authorize_only_their_inode_metadata() {
     let configuration = |selection, sparse| Request::ConfigurePreservation {
         narrow_new_directories: false,
         own_links: false,
-        check_then_rename: false,
         skips_unmet_conditions: false,
         sparse,
         selection,
@@ -5554,7 +5563,6 @@ fn signed_grants_authorize_only_their_inode_metadata() {
     let mut rsync_directories = Request::ConfigurePreservation {
         narrow_new_directories: true,
         own_links: false,
-        check_then_rename: false,
         skips_unmet_conditions: false,
         sparse: false,
         selection: acls_only,
@@ -8317,9 +8325,13 @@ fn kept_files_take_no_content() {
             response
         })
     };
-    // Over a file there now, staging and publication are refused.
-    assert!(run(prepare_request(&root.join("target/kept"))).is_err());
-    assert!(run(small_put(&root.join("target/kept"))).is_err());
+    // Over a file there now, publication is refused, and the file kept.
+    run(prepare_request(&root.join("target/kept"))).unwrap();
+    let response = run(small_put(&root.join("target/kept"))).unwrap();
+    assert!(
+        matches!(&response, proto::Response::Applied(errors) if errors[0].as_ref().is_some_and(|error| error.condition_not_met)),
+        "{response:?}"
+    );
     // A file that appears after its approval keeps its contents.
     run(prepare_request(&late)).unwrap();
     let data = b"data".to_vec();
@@ -8972,13 +8984,13 @@ fn files_the_keep_policy_keeps_are_neither_refused_nor_failed() {
     )
     .unwrap();
     let mut reader = start_results(&authority, secret);
-    // Found when the receiver authorizes it.
+    // There when the receiver authorizes it: the publication finds it.
     fs::write(target.join("early"), b"theirs").unwrap();
-    let error = authority
-        .authorize(&mut small_put(&target.join("early")), false)
-        .unwrap_err();
-    assert!(KeptExisting::is(&error), "{error:#}");
-    // Found when the receiver publishes it.
+    let mut early = small_put(&target.join("early"));
+    let settlement = authority.authorize(&mut early, false).unwrap();
+    let response = authority.test_ops().handle(&early);
+    authority.settle(settlement, &response);
+    // Appears after the receiver authorizes it.
     let mut late = small_put(&target.join("late"));
     let settlement = authority.authorize(&mut late, false).unwrap();
     fs::write(target.join("late"), b"theirs").unwrap();
@@ -9681,32 +9693,6 @@ fn changes_check_existence_only_where_numbers_mislead() {
     }
 }
 
-/// A restricted receiver holds every condition atomically: it refuses to
-/// be told it may check, then rename.
-#[test]
-fn restricted_receivers_refuse_to_check_then_rename() {
-    let temporary = crate::test_support::tempdir().unwrap();
-    let root = temporary.path().join("root");
-    fs::create_dir_all(root.join("target")).unwrap();
-    let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    let mut request = Request::ConfigurePreservation {
-        selection: Default::default(),
-        sparse: false,
-        destination: true,
-        narrow_new_directories: false,
-        own_links: false,
-        check_then_rename: true,
-        skips_unmet_conditions: false,
-    };
-    let Err(error) = authority.authorize(&mut request, false) else {
-        panic!("check-then-rename was authorized")
-    };
-    assert!(
-        format!("{error:#}").contains("does not check, then rename"),
-        "{error:#}"
-    );
-}
-
 /// Two requests that may create the same file share its count against the
 /// entry limit: one that finds its condition unmet gives nothing back
 /// while the other may still create the file.
@@ -9860,4 +9846,74 @@ fn a_symlinked_control_path_is_protected_where_it_leads() {
             "follow {follow_dst}: {error:#}"
         );
     }
+}
+
+/// Under a grant that creates nothing (`MustExist`), a file this
+/// receiver's own scan found is replaced with no look of its own; one the
+/// scan did not find is looked at, and refused unless it exists; one the
+/// grant deleted counts as found no more.
+#[test]
+fn must_exist_takes_the_receivers_own_scan_for_existence() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    for name in ["scanned", "unscanned"] {
+        fs::write(target.join(name), b"old").unwrap();
+    }
+    let mut authority = existence_authority(
+        &root,
+        ExistingDestinationPolicy::MustExist,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+    )
+    .unwrap();
+    authority.copy.limits.max_entries = 64;
+    let metadata = fs::symlink_metadata(target.join("scanned")).unwrap();
+    let entry = proto::Entry {
+        path: b"scanned".to_vec(),
+        kind: proto::Kind::File,
+        size: metadata.len(),
+        mtime: metadata.mtime(),
+        mtime_nsec: metadata.mtime_nsec() as u32,
+        mode: metadata.mode(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        rdev: 0,
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        nlink: 1,
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec() as u32,
+        link: None,
+        atime: Default::default(),
+        inode_metadata: None,
+    };
+    authority.record_scanned(&path_bytes(&target), &[entry]);
+    // Gone since the scan: no look tells the authority so.
+    fs::remove_file(target.join("scanned")).unwrap();
+    authority
+        .authorize(&mut small_put(&target.join("scanned")), false)
+        .unwrap();
+    // Not scanned: looked at.
+    authority
+        .authorize(&mut small_put(&target.join("unscanned")), false)
+        .unwrap();
+    let Err(error) = authority.authorize(&mut small_put(&target.join("missing")), false) else {
+        panic!("a file was created under a grant that creates nothing")
+    };
+    assert!(KeptExisting::is(&error), "{error:#}");
+    // Deleted by the grant: found no more.
+    authority
+        .authorize(
+            &mut apply(Op::Unlink {
+                path: path_bytes(&target.join("scanned")),
+            }),
+            false,
+        )
+        .unwrap();
+    let Err(error) = authority.authorize(&mut small_put(&target.join("scanned")), false) else {
+        panic!("a deleted file was created again")
+    };
+    assert!(KeptExisting::is(&error), "{error:#}");
 }

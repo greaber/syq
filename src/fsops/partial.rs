@@ -3118,11 +3118,7 @@ impl FsOps {
             &target.relative,
             &file,
             condition,
-            (
-                self.owned.as_deref(),
-                self.check_then_rename,
-                self.skips_unmet_conditions,
-            ),
+            (self.owned.as_deref(), self.skips_unmet_conditions),
         )
         .map_err(|error| {
             if error
@@ -3289,7 +3285,6 @@ impl FsOps {
                 destination,
                 narrow_new_directories,
                 own_links,
-                check_then_rename,
                 skips_unmet_conditions,
             } => {
                 let validation = if *destination {
@@ -3301,7 +3296,6 @@ impl FsOps {
                     self.inode_preservation = *selection;
                     self.sparse = *sparse;
                     self.narrow_new_directories = *narrow_new_directories;
-                    self.check_then_rename = *check_then_rename;
                     self.skips_unmet_conditions = *skips_unmet_conditions;
                     if *own_links {
                         self.keep_links_to_own_files();
@@ -4018,18 +4012,25 @@ impl Drop for PublishedStage {
 
 /// Publish the private partial `staged` at `source` as `target`. With
 /// `owned`, the published file, which this receiver wrote, is recorded as
-/// its own. With `checked`, a condition that keeps existing files or
-/// replaces only the file found may be checked and then renamed
-/// (`Root::publish_new_staged`). With `skips`, a file whose condition is
-/// unmet is skipped by the copy, and its partial goes. The caller removes
-/// what is left of the staged name once it has closed `staged`.
+/// its own. With `skips`, a file whose condition is unmet is skipped by the
+/// copy, and its partial goes. The caller removes what is left of the
+/// staged name once it has closed `staged`.
+///
+/// A new name (`TargetCondition::Absent`) is published without replacing
+/// anything, by a no-replace rename or a hard link from `staged`, which
+/// fail if something holds the name. A file the copy replaces as it found
+/// it (`Matches`) is renamed over whatever the name holds, with no look
+/// first: the sender's plan, or for a restricted receiver its authority,
+/// already found it there, and a name another program changes in that
+/// moment is replaced. A patch's own condition (`MatchesFingerprint`),
+/// which the receiver set when it compared the file, is checked.
 pub(super) fn publish_partial_rooted(
     root: &Arc<Root>,
     source: &RelativePath,
     target: &RelativePath,
     staged: &File,
     condition: TargetCondition,
-    (owned, checked, skips): (Option<&owned::OwnedObjects>, bool, bool),
+    (owned, skips): (Option<&owned::OwnedObjects>, bool),
 ) -> Result<PublishedStage> {
     let metadata = staged.metadata()?;
     if !is_safe_partial(&metadata) {
@@ -4039,17 +4040,12 @@ pub(super) fn publish_partial_rooted(
     let staged_ino = metadata.ino();
     let staged_identity = (staged_dev, staged_ino);
     let published = match condition {
-        TargetCondition::Any => root
+        TargetCondition::Any | TargetCondition::Matches { .. } => root
             .rename_regular_if_same(source, target, staged_identity)
             .map(|()| None),
         TargetCondition::Absent => {
-            root.publish_new_staged(source, target, staged_identity, checked)
+            root.publish_new_staged(source, target, staged_identity, Some(staged))
         }
-        TargetCondition::Matches { dev, ino } => {
-            root.replace_staged_if_same(source, target, staged_identity, (dev, ino, None), checked)
-        }
-        // A patch's own condition, which the receiver set when it compared
-        // the file.
         TargetCondition::MatchesFingerprint {
             dev,
             ino,
@@ -4060,7 +4056,6 @@ pub(super) fn publish_partial_rooted(
             target,
             staged_identity,
             (dev, ino, Some((ctime, ctime_nsec))),
-            false,
         ),
     };
     let published = match published {

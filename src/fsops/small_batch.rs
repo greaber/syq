@@ -1815,11 +1815,7 @@ impl FsOps {
             &stage.target.relative,
             &stage.file,
             put.condition,
-            (
-                self.owned.as_deref(),
-                self.check_then_rename,
-                self.skips_unmet_conditions,
-            ),
+            (self.owned.as_deref(), self.skips_unmet_conditions),
         )
     }
 
@@ -3205,6 +3201,9 @@ mod tests {
         assert_eq!(entries(temporary.path()), 5);
     }
 
+    /// A put held to the file its patch compared is published only over
+    /// that file. One held to the file the copy found (`Matches`) is renamed
+    /// over whatever the name holds: the plan found it there.
     #[test]
     fn identity_conditioned_puts_publish_atomically() {
         for batched in [false, true] {
@@ -3238,7 +3237,7 @@ mod tests {
                         ops.put_small(&put).map_err(|error| wire_error(&error))
                     };
                     let after = fs::metadata(&target).unwrap();
-                    if changed {
+                    if changed && fingerprint {
                         assert!(result.is_err());
                         assert_eq!(after.ino(), before.ino());
                         assert_eq!(fs::read(&target).unwrap(), b"old contents");
@@ -3339,9 +3338,11 @@ mod tests {
                 }
             };
             let mut first = put("file", b"first attempt");
-            first.condition = TargetCondition::Matches {
+            first.condition = TargetCondition::MatchesFingerprint {
                 dev: before.dev(),
                 ino: before.ino(),
+                ctime: before.ctime(),
+                ctime_nsec: before.ctime_nsec() as u32,
             };
             let error = run(&first).unwrap_err().message;
             let mut held = held.recv().unwrap();

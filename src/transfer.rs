@@ -265,10 +265,6 @@ pub struct Opts {
     /// The copy keeps existing files and copies hard links: a new name goes
     /// only to a file the copy created (`Request::ConfigurePreservation`).
     pub own_links: bool,
-    /// An ordinary receiver may check, then rename, the files this copy's
-    /// keep or `--only-existing` conditions hold where the filesystem
-    /// cannot publish them atomically (`Request::ConfigurePreservation`).
-    pub check_then_rename: bool,
     /// The copy skips files whose conditions the receiver finds unmet
     /// (`Request::ConfigurePreservation`).
     pub skips_unmet_conditions: bool,
@@ -744,7 +740,7 @@ pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
         args.sparse,
         false,
         args.interface == Interface::Rsync,
-        (false, false, false),
+        (false, false),
     )?;
     Ok(connection)
 }
@@ -755,14 +751,13 @@ fn configure_preservation(
     sparse: bool,
     destination: bool,
     narrow_new_directories: bool,
-    (own_links, check_then_rename, skips_unmet_conditions): (bool, bool, bool),
+    (own_links, skips_unmet_conditions): (bool, bool),
 ) -> Result<()> {
     if selection.any()
         || selection.open_noatime
         || sparse
         || narrow_new_directories
         || own_links
-        || check_then_rename
         || skips_unmet_conditions
     {
         connection.send_expecting_ok(
@@ -772,7 +767,6 @@ fn configure_preservation(
                 destination,
                 narrow_new_directories,
                 own_links,
-                check_then_rename,
                 skips_unmet_conditions,
             },
             "configure inode metadata preservation",
@@ -2539,7 +2533,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         own_links: args.hardlinks
             && args.ignore_existing
             && crate::checks::enabled(crate::checks::Check::OwnLinks),
-        check_then_rename: args.checks_then_renames(),
         skips_unmet_conditions: (args.ignore_existing && !args.protects_existing_contents())
             || args.existing,
         dry_run: args.dry_run,
@@ -2730,22 +2723,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
     // A copy that keeps existing files gives new names by hard link only to
     // files it created, on every receiver (`fsops::owned`).
-    if opts.inode_preservation.crtimes
-        || opts.own_links
-        || opts.check_then_rename
-        || opts.skips_unmet_conditions
-    {
+    if opts.inode_preservation.crtimes || opts.own_links || opts.skips_unmet_conditions {
         configure_preservation(
             &mut *dst_ctl,
             opts.inode_preservation,
             opts.sparse,
             true,
             opts.rsync_creation,
-            (
-                opts.own_links,
-                opts.check_then_rename,
-                opts.skips_unmet_conditions,
-            ),
+            (opts.own_links, opts.skips_unmet_conditions),
         )?;
     }
     if debug() {
@@ -3009,7 +2994,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         opts.sparse,
                         false,
                         false,
-                        (false, false, false),
+                        (false, false),
                     )?;
                     configure_preservation(
                         &mut *dst,
@@ -3017,11 +3002,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         opts.sparse,
                         true,
                         opts.rsync_creation,
-                        (
-                            opts.own_links,
-                            opts.check_then_rename,
-                            opts.skips_unmet_conditions,
-                        ),
+                        (opts.own_links, opts.skips_unmet_conditions),
                     )?;
                     let fast_batch_files = opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES);
                     let transport_paced = (opts.src_remote || opts.dst_remote)

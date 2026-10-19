@@ -1301,15 +1301,6 @@ pub enum WireRequest<Data> {
         /// gives a new name only to a file this copy created
         /// (`fsops::owned`).
         own_links: bool,
-        /// The copy keeps existing files (`--if-exists=keep`) or replaces
-        /// only the files it found (`--only-existing`), and accepts that
-        /// another program's file can be replaced in the moment between a
-        /// check and a rename: where the filesystem has no no-replace
-        /// rename (for a new file) or exchange (for a replacement), a file
-        /// held to such a condition is published by checking the name and
-        /// then renaming, not by a hard link or by moving the file found
-        /// aside. Only ordinary receivers accept it.
-        check_then_rename: bool,
         /// The copy skips a file whose condition the receiver finds unmet
         /// (`--if-exists=keep`, `--only-existing`), so the receiver lets
         /// such a file's partial go rather than keep it for a later copy.

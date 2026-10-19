@@ -578,13 +578,15 @@ fn a_file_that_appears_under_keep_is_kept_and_skipped() {
     }
 }
 
-/// Under `--only-existing` a file is replaced only while it is the one the
-/// scan found: one removed while the copy runs is not created again, and
-/// the copy skips it, on every receiver.
+/// Under `--only-existing` a file the scan found is renamed over whatever
+/// its name holds, with no look first: one another program removes in the
+/// moment before is created again, the accepted race, and nothing of the
+/// copy is left behind.
 #[test]
-fn a_file_removed_under_only_existing_is_not_created_again() {
+fn a_file_removed_under_only_existing_just_before_publication_is_created_again() {
     let t = Tmp::new();
-    write(&t.path("src/file"), &prng(3 << 20, 509));
+    let source = prng(3 << 20, 509);
+    write(&t.path("src/file"), &source);
     write(&t.path("dst/file"), b"old");
     let ready = t.path("ready");
     let continuation = t.path("continue");
@@ -605,8 +607,7 @@ fn a_file_removed_under_only_existing_is_not_created_again() {
     release_confinement_barrier(&continuation);
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success(), "{output:?}");
-    assert!(!t.path("dst/file").exists());
-    // Nothing of the skipped copy is left behind.
+    assert_eq!(read(&t.path("dst/file")), source);
     assert_eq!(partial_files(&t.path("dst")), Vec::<PathBuf>::new());
 }
 

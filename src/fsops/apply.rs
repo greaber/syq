@@ -1231,11 +1231,8 @@ impl FsOps {
             | Request::FinishBasis {
                 path, condition, ..
             } => observe(path, condition),
-            Request::PutSmallBatch(puts) => {
-                for put in puts {
-                    observe(&put.path, &mut put.condition);
-                }
-            }
+            // A put renames over whatever its name holds
+            // (`publish_partial_rooted`): its condition is not looked at.
             Request::PatchSmallBatch(patches) => {
                 for patch in patches {
                     observe(&patch.path, &mut patch.condition);

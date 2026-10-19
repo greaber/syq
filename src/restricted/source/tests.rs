@@ -486,7 +486,6 @@ fn hashing_and_metadata_stay_within_the_approved_read_policy() {
             destination: true,
             narrow_new_directories: false,
             own_links: false,
-            check_then_rename: false,
             skips_unmet_conditions: false,
         })
         .is_err());
@@ -501,7 +500,6 @@ fn hashing_and_metadata_stay_within_the_approved_read_policy() {
             destination: false,
             narrow_new_directories: false,
             own_links: false,
-            check_then_rename: false,
             skips_unmet_conditions: false,
         })
         .is_err());

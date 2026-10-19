@@ -8936,7 +8936,6 @@ fn a_keeping_copy_links_new_names_only_to_files_it_created() {
         destination: true,
         narrow_new_directories: false,
         own_links: true,
-        check_then_rename: false,
         skips_unmet_conditions: false,
     };
     let mut publisher = FsOps::test_destination(dir.path());
@@ -9029,7 +9028,6 @@ fn own_file_links_on_filesystems_without_trusted_numbers() {
             destination: true,
             narrow_new_directories: false,
             own_links: true,
-            check_then_rename: false,
             skips_unmet_conditions: false,
         }),
         Response::Ok
@@ -9052,98 +9050,24 @@ fn own_file_links_on_filesystems_without_trusted_numbers() {
     assert!(!dir.path().join("restricted-link").exists());
 }
 
-/// Where inode numbers cannot show which file a name leads to, a
-/// publication held to the file the copy found (`--only-existing`) checks
-/// only that a file is there: it replaces one whatever its number, and
-/// still creates nothing where none is.
+/// Every receiver publishes the same way where the filesystem has hard
+/// links but neither a no-replace rename nor exchange, as NFS: a new name
+/// by a link from the stage, kept if something holds it, and a file
+/// replaced as found by a rename over whatever the name holds, with no
+/// look first. Nothing is checked by name, and no staged name is left.
 #[cfg(target_os = "linux")]
 #[test]
-fn matched_publications_check_existence_only_where_numbers_mislead() {
-    for trusted in [true, false] {
+fn every_receiver_links_new_names_and_renames_over_replaced_ones() {
+    for restricted in [false, true] {
         let dir = crate::test_support::tempdir().unwrap();
         fs::write(dir.path().join("there"), b"old").unwrap();
+        fs::write(dir.path().join("taken"), b"theirs").unwrap();
         let path = |name: &str| dir.path().join(name).as_os_str().as_bytes().to_vec();
-        let mut ops = FsOps::test_destination(dir.path());
-        if !trusted {
-            let root = ops.destination_root.as_ref().unwrap();
-            let mut profile = root.profile();
-            profile.link_counts_trusted = false;
-            root.assume_profile_for_test(profile);
-        }
-        let put = |name: &str| {
-            Request::PutSmallBatch(vec![SmallPut {
-                path: path(name),
-                copy_id: [9; 16],
-                data: b"new".to_vec(),
-                hash: content_digest(b"new"),
-                meta: Meta {
-                    inode_metadata: None,
-                    mode: 0o644,
-                    uid: 0,
-                    gid: 0,
-                    mtime: 0,
-                    mtime_nsec: 0,
-                },
-                flags: 0,
-                inplace: false,
-                // A number the file there does not have.
-                condition: TargetCondition::Matches { dev: 1, ino: 1 },
-                replaces: true,
-                scanned: ScannedDestination::Unknown,
-            }])
+        let mut ops = if restricted {
+            FsOps::test_restricted(dir.path())
+        } else {
+            FsOps::test_destination(dir.path())
         };
-        let failure = |response: &Response| -> Option<WireError> {
-            match response {
-                Response::Applied(errors) => errors[0].clone(),
-                Response::PublishedBatch(results) => results[0].clone().err(),
-                other => panic!("unexpected response {other:?}"),
-            }
-        };
-        let replaced = failure(&ops.handle(&put("there")));
-        assert_eq!(
-            replaced.is_none(),
-            !trusted,
-            "trusted: {trusted}: {replaced:?}"
-        );
-        assert_eq!(
-            fs::read(dir.path().join("there")).unwrap(),
-            if trusted { &b"old"[..] } else { &b"new"[..] }
-        );
-        if let Some(error) = replaced {
-            assert!(error.condition_not_met, "{error:?}");
-        }
-        let gone = failure(&ops.handle(&put("gone"))).expect("nothing to replace");
-        assert!(gone.condition_not_met, "trusted: {trusted}: {gone:?}");
-        assert!(!dir.path().join("gone").exists());
-    }
-}
-
-/// An ordinary receiver told it may check, then rename (keep and
-/// `--only-existing` copies) publishes by a rename where the filesystem has
-/// neither a no-replace rename nor exchange, as NFS. Without it, as for
-/// `--if-exists=error`, it links the file, and removes the staged name
-/// before it replies, once the file is closed.
-#[cfg(target_os = "linux")]
-#[test]
-fn ordinary_receivers_check_then_rename_only_when_told() {
-    for checked in [false, true] {
-        let dir = crate::test_support::tempdir().unwrap();
-        fs::write(dir.path().join("there"), b"old").unwrap();
-        let there = fs::metadata(dir.path().join("there")).unwrap();
-        let path = |name: &str| dir.path().join(name).as_os_str().as_bytes().to_vec();
-        let mut ops = FsOps::test_destination(dir.path());
-        assert!(matches!(
-            ops.handle(&Request::ConfigurePreservation {
-                selection: Default::default(),
-                sparse: false,
-                destination: true,
-                narrow_new_directories: false,
-                own_links: false,
-                check_then_rename: checked,
-                skips_unmet_conditions: false,
-            }),
-            Response::Ok
-        ));
         let root = ops.destination_root.as_ref().unwrap();
         let mut profile = root.profile();
         profile.exchange = false;
@@ -9171,31 +9095,31 @@ fn ordinary_receivers_check_then_rename_only_when_told() {
         crate::rooted::Root::take_checked_renames_for_test();
         let response = ops.handle(&Request::PutSmallBatch(vec![
             put("new", TargetCondition::Absent),
-            put(
-                "there",
-                TargetCondition::Matches {
-                    dev: there.dev(),
-                    ino: there.ino(),
-                },
-            ),
+            put("taken", TargetCondition::Absent),
+            // Numbers the file there does not have: not looked at.
+            put("there", TargetCondition::Matches { dev: 1, ino: 1 }),
         ]));
-        match response {
-            Response::Applied(errors) => assert!(errors.iter().all(Option::is_none), "{errors:?}"),
-            other => panic!("unexpected response {other:?}"),
-        }
-        assert_eq!(
-            crate::rooted::Root::take_checked_renames_for_test(),
-            usize::from(checked)
+        let Response::Applied(errors) = response else {
+            panic!("unexpected response {response:?}")
+        };
+        assert!(errors[0].is_none(), "{errors:?}");
+        assert!(
+            errors[1]
+                .as_ref()
+                .is_some_and(|error| error.condition_not_met),
+            "{errors:?}"
         );
+        assert!(errors[2].is_none(), "{errors:?}");
+        assert_eq!(crate::rooted::Root::take_checked_renames_for_test(), 0);
         let mut names: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
         names.sort();
-        assert_eq!(names, ["new", "there"], "checked {checked}");
+        assert_eq!(names, ["new", "taken", "there"], "restricted {restricted}");
+        assert_eq!(fs::read(dir.path().join("taken")).unwrap(), b"theirs");
         for name in ["new", "there"] {
-            let metadata = fs::metadata(dir.path().join(name)).unwrap();
-            assert_eq!(metadata.nlink(), 1);
+            assert_eq!(fs::metadata(dir.path().join(name)).unwrap().nlink(), 1);
             assert_eq!(fs::read(dir.path().join(name)).unwrap(), b"new");
         }
     }
@@ -9220,7 +9144,6 @@ fn a_restricted_scan_reads_inode_metadata_beneath_its_root() {
             destination: true,
             narrow_new_directories: false,
             own_links: false,
-            check_then_rename: false,
             skips_unmet_conditions: false,
         }),
         Response::Ok

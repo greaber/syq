@@ -871,11 +871,6 @@ pub struct FsOps {
     /// A new directory whose mode lacks owner access, as `syq rsync` creates
     /// one, gets that mode only after its contents.
     narrow_new_directories: bool,
-    /// This copy's conditions on files keep existing files or replace only
-    /// the files it found, and where the filesystem cannot publish a file
-    /// under one atomically, the name is checked and the file then renamed
-    /// (`Request::ConfigurePreservation::check_then_rename`).
-    check_then_rename: bool,
     /// This copy skips files whose conditions are unmet, so their partials
     /// go (`Request::ConfigurePreservation::skips_unmet_conditions`).
     skips_unmet_conditions: bool,
@@ -1169,7 +1164,6 @@ impl FsOps {
             receiver_directories: Default::default(),
             inplace_parents: Default::default(),
             narrow_new_directories: false,
-            check_then_rename: false,
             skips_unmet_conditions: false,
             creation_permissions: Default::default(),
             inherited_acls: Default::default(),
@@ -1839,7 +1833,7 @@ impl FsOps {
                                 } else {
                                     TargetCondition::Any
                                 },
-                                (None, self.check_then_rename, false),
+                                (None, false),
                             );
                             // Closed before its staged name goes.
                             drop(item);

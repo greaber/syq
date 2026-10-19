@@ -35,6 +35,10 @@ pub(super) struct AuthorityState {
     /// A change was attempted or a request refused. Results must start
     /// before either, so that they leave nothing out.
     pub(super) recorded_any: bool,
+    /// Under a grant that creates nothing (`MustExist`), the names this
+    /// receiver's own destination scan found, by keyed hash
+    /// (`RestrictedAuthority::record_scanned`).
+    pub(super) scanned: HashSet<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -364,6 +368,10 @@ pub(crate) struct RestrictedAuthority {
     /// The scope of the files this copy is writing, which the receiver holds
     /// open until the copy's control connection ends.
     pub(super) stage_scope: u64,
+    /// The key the names in `AuthorityState::scanned` are hashed with,
+    /// random to this process, so a sender cannot choose a name that
+    /// passes for one the scan found.
+    pub(super) scan_key: std::collections::hash_map::RandomState,
 }
 
 impl RestrictedAuthority {
@@ -574,7 +582,9 @@ impl RestrictedAuthority {
                 in_flight: 0,
                 results_closing: false,
                 recorded_any: false,
+                scanned: HashSet::new(),
             }),
+            scan_key: Default::default(),
         };
         authority.check_root_existence()?;
         Ok(authority)
@@ -1486,11 +1496,16 @@ impl RestrictedAuthority {
     /// policy, as a directory whenever the placement puts names inside it.
     /// A creation this call records is provisional until `settle` sees the
     /// executor succeed; `index` and `pending` carry that bookkeeping.
+    ///
+    /// `refuses_existing` says the executor's operation refuses a name that
+    /// exists, atomically, when held to `Absent`: a file's publication, a
+    /// symlink, special file or hard link. Under `Skip` such a creation
+    /// needs no look here.
     pub(super) fn constrain_creation(
         &self,
         path: &[u8],
         condition: &mut proto::TargetCondition,
-        directory: bool,
+        (directory, refuses_existing): (bool, bool),
         index: usize,
         pending: &mut Vec<PendingCreation>,
     ) -> Result<()> {
@@ -1511,7 +1526,37 @@ impl RestrictedAuthority {
         {
             return Ok(());
         }
-        let observed = self.rooted_metadata(path)?;
+        // A file under `MustExist` that this receiver's own scan found
+        // needs no look of its own: the receiver renames over whatever its
+        // name holds, and one another program removes in that moment is
+        // created again.
+        if policy == ExistingDestinationPolicy::MustExist
+            && !directory
+            && !root_must_be_new
+            && self.scanned_existing(path)
+        {
+            if *condition == proto::TargetCondition::Absent {
+                bail!(
+                    "no-replace creation of {label} contradicts the signed existing-object policy"
+                );
+            }
+            pending.push(PendingCreation {
+                index,
+                path: path.to_vec(),
+                persist: false,
+                link: false,
+            });
+            return Ok(());
+        }
+        // A new file under `Skip` is published without replacing anything,
+        // which the receiver refuses atomically if the name exists: it
+        // needs no look first either.
+        let observed =
+            if policy == ExistingDestinationPolicy::Skip && refuses_existing && !directory {
+                None
+            } else {
+                self.rooted_metadata(path)?
+            };
         self.constrain_observed_creation(
             path,
             condition,
@@ -1520,6 +1565,36 @@ impl RestrictedAuthority {
             pending,
             (policy, observed),
         )
+    }
+
+    /// Record the names a destination scan beneath `root` found, as the
+    /// sender names them, under a grant that creates nothing
+    /// (`MustExist`): replacing one later needs no look of its own
+    /// (`constrain_creation`). Other grants record nothing.
+    pub(crate) fn record_scanned(&self, root: &[u8], entries: &[proto::Entry]) {
+        if self.copy.policy.existing != ExistingDestinationPolicy::MustExist {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        for entry in entries {
+            use std::hash::BuildHasher;
+            let path = crate::fsops::join(root, &entry.path);
+            state.scanned.insert(self.scan_key.hash_one(&path));
+        }
+    }
+
+    /// Whether this receiver's own scan found `path`.
+    fn scanned_existing(&self, path: &[u8]) -> bool {
+        use std::hash::BuildHasher;
+        let key = self.scan_key.hash_one(path);
+        self.state.lock().unwrap().scanned.contains(&key)
+    }
+
+    /// Forget that the scan found `path`, once the grant deletes it.
+    fn forget_scanned(&self, path: &[u8]) {
+        use std::hash::BuildHasher;
+        let key = self.scan_key.hash_one(path);
+        self.state.lock().unwrap().scanned.remove(&key);
     }
 
     /// The existing-object policy a creation is held to: the grant's, or,
@@ -1828,11 +1903,13 @@ impl RestrictedAuthority {
             return Ok(());
         }
         let label = String::from_utf8_lossy(path);
+        // Under `Skip` the publication refuses a name that exists, so
+        // nothing is looked at here; under `MustExist`, a name this
+        // receiver's scan found needs no look either.
         match self.creation_policy(false) {
-            ExistingDestinationPolicy::Skip if self.rooted_metadata(path)?.is_some() => Err(kept(
-                format!("signed grant retains existing objects: {label} already exists"),
-            )),
-            ExistingDestinationPolicy::MustExist if self.rooted_metadata(path)?.is_none() => {
+            ExistingDestinationPolicy::MustExist
+                if !self.scanned_existing(path) && self.rooted_metadata(path)?.is_none() =>
+            {
                 Err(kept(format!(
                     "signed grant creates nothing: {label} does not exist"
                 )))
@@ -2519,7 +2596,14 @@ impl RestrictedAuthority {
                 self.constrain_inplace(&patch.path)?;
             }
             self.check_file_bytes(&patch.path, 0, patch.data.len())?;
-            self.constrain_creation(&patch.path, &mut patch.condition, false, index, pending)?;
+            // A patch is for a file that exists: it is looked at.
+            self.constrain_creation(
+                &patch.path,
+                &mut patch.condition,
+                (false, false),
+                index,
+                pending,
+            )?;
             self.constrain_update(&patch.path, Some(&mut patch.condition), pending, false)?;
             self.check_metadata(&patch.path, &patch.meta, patch.flags)?;
             let hold = self.reserve_bytes(&patch.path, patch.copy_id, patch.len, true)?;
@@ -2564,7 +2648,7 @@ impl RestrictedAuthority {
         if matches!(condition, proto::TargetCondition::MatchesFingerprint { .. }) {
             bail!("hardlink publication accepts no fingerprint condition");
         }
-        self.constrain_creation(path, condition, false, index, pending)?;
+        self.constrain_creation(path, condition, (false, true), index, pending)?;
         // Keeping existing files, a link replaces nothing, not even a name
         // this grant created, as an honest copy links only new names there.
         // The receiver links to the final name, which the kernel refuses
@@ -2656,6 +2740,7 @@ impl RestrictedAuthority {
             }
             Op::Rmdir { path } => {
                 self.check_deletion(path, true)?;
+                self.forget_scanned(path);
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
@@ -2665,6 +2750,7 @@ impl RestrictedAuthority {
             }
             Op::Unlink { path } => {
                 self.check_deletion(path, false)?;
+                self.forget_scanned(path);
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
@@ -2741,7 +2827,7 @@ impl RestrictedAuthority {
                         (policy, observed),
                     )?;
                 } else {
-                    self.constrain_creation(path, condition, true, index, pending)?;
+                    self.constrain_creation(path, condition, (true, false), index, pending)?;
                 }
                 // Creation limits the permission bits; without -p the
                 // sender chooses no special bits.
@@ -2762,7 +2848,7 @@ impl RestrictedAuthority {
                 flags,
                 ..
             } => {
-                self.constrain_creation(path, condition, false, index, pending)?;
+                self.constrain_creation(path, condition, (false, true), index, pending)?;
                 self.check_metadata(path, meta, *flags)?;
                 outcomes.push(PendingOutcome::Logical {
                     index,
@@ -2799,7 +2885,7 @@ impl RestrictedAuthority {
                     0o777
                 };
                 *mode = file_type | (*mode & permitted);
-                self.constrain_creation(path, condition, false, index, pending)?;
+                self.constrain_creation(path, condition, (false, true), index, pending)?;
                 self.check_metadata(path, meta, *flags)?;
                 outcomes.push(PendingOutcome::Logical {
                     index,
@@ -3503,7 +3589,7 @@ impl RestrictedAuthority {
                 *expected_hash = self.expected_hash(path)?.map(Into::into);
                 self.require_publication_mode(*inplace, "file finalization")?;
                 self.check_mutation_path(path, false)?;
-                self.constrain_creation(path, condition, false, 0, pending)?;
+                self.constrain_creation(path, condition, (false, true), 0, pending)?;
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
@@ -3539,7 +3625,13 @@ impl RestrictedAuthority {
                     if put.inplace {
                         self.constrain_inplace(&put.path)?;
                     }
-                    self.constrain_creation(&put.path, &mut put.condition, false, index, pending)?;
+                    self.constrain_creation(
+                        &put.path,
+                        &mut put.condition,
+                        (false, true),
+                        index,
+                        pending,
+                    )?;
                     outcomes.push(PendingOutcome::Logical {
                         index,
                         path: put.path.clone(),
@@ -3625,13 +3717,8 @@ impl RestrictedAuthority {
                 selection,
                 sparse,
                 narrow_new_directories,
-                check_then_rename,
                 ..
             } => {
-                // Every condition a grant sets is held atomically.
-                if *check_then_rename {
-                    bail!("a command-restricted receiver does not check, then rename");
-                }
                 if *narrow_new_directories
                     || (*sparse && !self.extra_options.sparse)
                     || !self.extra_options.allows(*selection)
