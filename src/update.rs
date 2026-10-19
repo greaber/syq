@@ -349,47 +349,17 @@ pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<V
 }
 
 /// A cached helper to upload, read once within its signed size and verified in
-/// memory, so the bytes sent are the bytes checked.
+/// memory, so the bytes sent are the bytes checked. One that fails the check
+/// is discarded so it is downloaded again.
 fn cached_helper(path: &Path, helper: &TrustedCurrentHelper) -> Option<Vec<u8>> {
-    let description = "cached remote helper";
-    checked_cache(path, description, || {
-        let expected = &helper.binary;
-        let mut binary = Vec::with_capacity(expected.size as usize + 1);
-        File::open(path)
-            .with_context(|| format!("open {description}"))?
-            .take(expected.size + 1)
-            .read_to_end(&mut binary)
-            .with_context(|| format!("read {description}"))?;
-        verify_bytes_as(&binary, expected, description)?;
-        Ok(binary)
-    })
-}
-
-/// Whether the cached release that `--use-version` runs still matches the
-/// signed manifest.
-fn cached_helper_matches(path: &Path, helper: &TrustedCurrentHelper) -> bool {
-    let description = "cached syq release";
-    checked_cache(path, description, || {
-        verify_file_as(path, &helper.binary, description)
-    })
-    .is_some()
-}
-
-/// Check a cached file against the signed manifest. A missing file is simply
-/// absent; one that fails the check is discarded so it is downloaded again.
-fn checked_cache<T>(
-    path: &Path,
-    description: &str,
-    check: impl FnOnce() -> Result<T>,
-) -> Option<T> {
     if !path.is_file() {
         return None;
     }
-    match check() {
-        Ok(value) => Some(value),
+    match read_verified(path, &helper.binary, "cached remote helper") {
+        Ok(binary) => Some(binary),
         Err(error) => {
             crate::output::diagnostic!(
-                "syq: warning: {description} failed integrity verification ({error}); discarding it"
+                "syq: warning: cached remote helper failed integrity verification ({error}); discarding it"
             );
             let _ = fs::remove_file(path);
             None
@@ -397,14 +367,28 @@ fn checked_cache<T>(
     }
 }
 
-/// `--use-version` runs the helper from the cache, so it needs the cache.
+/// Read a file once, within its signed size, and verify the bytes in memory.
+fn read_verified(path: &Path, expected: &ReleaseFile, description: &str) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(expected.size as usize + 1);
+    File::open(path)
+        .with_context(|| format!("open {description}"))?
+        .take(expected.size + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {description}"))?;
+    verify_bytes_as(&bytes, expected, description)?;
+    Ok(bytes)
+}
+
+/// `--use-version` runs the release from the cache, downloading it when it is
+/// missing. `store_helper` renames a release into place only after its bytes
+/// match the signed manifest, so a stored release is run as is, like any other
+/// installed program, without hashing it on every run.
 fn verified_helper_path(helper: &TrustedCurrentHelper) -> Result<PathBuf> {
     let cache_path = helper_cache_path(helper)?;
-    if cached_helper_matches(&cache_path, helper) {
-        return Ok(cache_path);
+    if !cache_path.is_file() {
+        let binary = download_helper(helper)?;
+        store_helper(&cache_path, &binary)?;
     }
-    let binary = download_helper(helper)?;
-    store_helper(&cache_path, &binary)?;
     Ok(cache_path)
 }
 
@@ -432,6 +416,9 @@ fn download_helper(helper: &TrustedCurrentHelper) -> Result<Vec<u8>> {
     Ok(binary)
 }
 
+/// Store a helper that has already been verified. It is written to a temporary
+/// file, synced, and renamed into place, so the cache never holds a partly
+/// written executable.
 fn store_helper(cache_path: &Path, binary: &[u8]) -> Result<()> {
     let parent = cache_path
         .parent()
@@ -451,9 +438,12 @@ fn store_helper(cache_path: &Path, binary: &[u8]) -> Result<()> {
 }
 
 /// An explicit version selection uses a signed manifest cached beside the
-/// executable. Both are verified on reuse, without an online freshness check:
-/// release tags are immutable, and selecting a release deliberately permits
-/// running an older version. This does not replace the normal installation.
+/// executable. The executable is verified against the manifest when it is
+/// downloaded and stored; later runs check the cached manifest's signature and
+/// run the stored executable without hashing it again or checking online for
+/// freshness: release tags are immutable, and selecting a release deliberately
+/// permits running an older version. This does not replace the normal
+/// installation.
 pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
     let target = Target::local().context("official releases do not support this platform")?;
     let tag = format!("v{version}");
@@ -1457,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_helper_checks_keep_a_match_and_discard_a_mismatch() {
+    fn cached_upload_helper_keeps_a_match_and_discards_a_mismatch() {
         let dir = crate::test_support::tempdir().unwrap();
         let path = dir.path().join("syq");
         let contents = b"cached helper";
@@ -1474,16 +1464,11 @@ mod tests {
             },
             archive: manifest().artifacts["linux-x86_64"].archive.clone(),
         };
-        assert!(!cached_helper_matches(&path, &helper));
         assert_eq!(cached_helper(&path, &helper), None);
         fs::write(&path, contents).unwrap();
-        assert!(cached_helper_matches(&path, &helper));
         assert_eq!(cached_helper(&path, &helper).unwrap(), contents);
         assert_eq!(fs::read(&path).unwrap(), contents);
         for corrupt in [&b"cached helpe!"[..], b"cached helper!"] {
-            fs::write(&path, corrupt).unwrap();
-            assert!(!cached_helper_matches(&path, &helper));
-            assert!(!path.exists());
             fs::write(&path, corrupt).unwrap();
             assert_eq!(cached_helper(&path, &helper), None);
             assert!(!path.exists());

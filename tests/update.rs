@@ -714,23 +714,47 @@ fn use_version_rejects_wrong_release_and_corrupt_cached_manifest() {
 }
 
 #[test]
-fn use_version_repairs_corrupt_cached_binary_from_verified_release() {
+fn use_version_runs_the_stored_release_as_is_and_downloads_it_again_when_removed() {
     let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
     let run = || fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]);
     assert_success(&run());
-    let cached = fixture.temp.path(&format!(
+    let stored = fixture.temp.path(&format!(
         "cache/syq/helpers/v0.7.0/{}/syq",
         release_target()
     ));
-    fs::write(cached, b"corrupt").unwrap();
+    let release = fs::read(&stored).unwrap();
+    // A stored release was verified before it was stored, so it is not hashed
+    // again on each run.
+    executable_support::write_executable(&stored, "#!/bin/sh\necho 'stored copy'\n", 0o755);
+    let out = run();
+    assert_success(&out);
+    assert_eq!(out.stdout, b"stored copy\n");
+    fs::remove_file(&stored).unwrap();
     let out = run();
     assert_success(&out);
     assert_eq!(out.stdout, b"syq 0.7.0\n");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("cached syq release failed integrity verification"),
-        "{stderr}"
-    );
+    assert_eq!(fs::read(&stored).unwrap(), release);
+}
+
+#[test]
+fn use_version_verifies_a_download_before_storing_it() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    let archive = fixture
+        .temp
+        .path(&format!("fixtures/syq-{}.gz", release_target()));
+    let mut tampered = fs::read(&archive).unwrap();
+    let middle = tampered.len() / 2;
+    tampered[middle] ^= 1;
+    fs::write(&archive, tampered).unwrap();
+    let out = fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]);
+    assert_failure_contains(&out, "failed SHA-256 verification");
+    let directory = fixture
+        .temp
+        .path(&format!("cache/syq/helpers/v0.7.0/{}", release_target()));
+    let stored: Vec<_> = fs::read_dir(&directory)
+        .map(|entries| entries.map(|entry| entry.unwrap().file_name()).collect())
+        .unwrap_or_default();
+    assert!(stored.is_empty(), "{stored:?}");
 }
 
 #[test]
