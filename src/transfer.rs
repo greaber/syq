@@ -268,6 +268,10 @@ pub struct Opts {
     /// The copy skips files whose conditions the receiver finds unmet
     /// (`Request::ConfigurePreservation`).
     pub skips_unmet_conditions: bool,
+    /// An ordinary receiver may rename this copy's kept files into place
+    /// unchecked where no-replace takes more than a rename
+    /// (`Request::ConfigurePreservation`).
+    pub unchecked_keep: bool,
     pub dry_run: bool,
     dry_run_metadata_files: AtomicU64,
     pub quiet: bool,
@@ -740,7 +744,7 @@ pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
         args.sparse,
         false,
         args.interface == Interface::Rsync,
-        (false, false),
+        (false, false, false),
     )?;
     Ok(connection)
 }
@@ -751,7 +755,7 @@ fn configure_preservation(
     sparse: bool,
     destination: bool,
     narrow_new_directories: bool,
-    (own_links, skips_unmet_conditions): (bool, bool),
+    (own_links, skips_unmet_conditions, unchecked_keep): (bool, bool, bool),
 ) -> Result<()> {
     if selection.any()
         || selection.open_noatime
@@ -759,6 +763,7 @@ fn configure_preservation(
         || narrow_new_directories
         || own_links
         || skips_unmet_conditions
+        || unchecked_keep
     {
         connection.send_expecting_ok(
             Request::ConfigurePreservation {
@@ -768,6 +773,7 @@ fn configure_preservation(
                 narrow_new_directories,
                 own_links,
                 skips_unmet_conditions,
+                unchecked_keep,
             },
             "configure inode metadata preservation",
         )?;
@@ -2535,6 +2541,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             && crate::checks::enabled(crate::checks::Check::OwnLinks),
         skips_unmet_conditions: (args.ignore_existing && !args.protects_existing_contents())
             || args.existing,
+        unchecked_keep: args.keeps_unchecked(),
         dry_run: args.dry_run,
         dry_run_metadata_files: AtomicU64::new(0),
         quiet: args.quiet,
@@ -2723,14 +2730,22 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
     // A copy that keeps existing files gives new names by hard link only to
     // files it created, on every receiver (`fsops::owned`).
-    if opts.inode_preservation.crtimes || opts.own_links || opts.skips_unmet_conditions {
+    if opts.inode_preservation.crtimes
+        || opts.own_links
+        || opts.skips_unmet_conditions
+        || opts.unchecked_keep
+    {
         configure_preservation(
             &mut *dst_ctl,
             opts.inode_preservation,
             opts.sparse,
             true,
             opts.rsync_creation,
-            (opts.own_links, opts.skips_unmet_conditions),
+            (
+                opts.own_links,
+                opts.skips_unmet_conditions,
+                opts.unchecked_keep,
+            ),
         )?;
     }
     if debug() {
@@ -2994,7 +3009,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         opts.sparse,
                         false,
                         false,
-                        (false, false),
+                        (false, false, false),
                     )?;
                     configure_preservation(
                         &mut *dst,
@@ -3002,7 +3017,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         opts.sparse,
                         true,
                         opts.rsync_creation,
-                        (opts.own_links, opts.skips_unmet_conditions),
+                        (
+                            opts.own_links,
+                            opts.skips_unmet_conditions,
+                            opts.unchecked_keep,
+                        ),
                     )?;
                     let fast_batch_files = opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES);
                     let transport_paced = (opts.src_remote || opts.dst_remote)

@@ -3773,8 +3773,13 @@ impl RestrictedAuthority {
                 selection,
                 sparse,
                 narrow_new_directories,
+                unchecked_keep,
                 ..
             } => {
+                // Every no-replace publication a grant sets is held.
+                if *unchecked_keep {
+                    bail!("a command-restricted receiver keeps existing files atomically");
+                }
                 if *narrow_new_directories
                     || (*sparse && !self.extra_options.sparse)
                     || !self.extra_options.allows(*selection)

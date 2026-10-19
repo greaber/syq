@@ -287,6 +287,7 @@ impl SourceConnection {
             narrow_new_directories: false,
             own_links: false,
             skips_unmet_conditions: false,
+            unchecked_keep: false,
         });
         match response {
             Response::Ok => Ok(()),

@@ -3118,7 +3118,11 @@ impl FsOps {
             &target.relative,
             &file,
             condition,
-            (self.owned.as_deref(), self.skips_unmet_conditions),
+            (
+                self.owned.as_deref(),
+                self.skips_unmet_conditions,
+                self.unchecked_keep,
+            ),
         )
         .map_err(|error| {
             if error
@@ -3286,6 +3290,7 @@ impl FsOps {
                 narrow_new_directories,
                 own_links,
                 skips_unmet_conditions,
+                unchecked_keep,
             } => {
                 let validation = if *destination {
                     selection.validate_destination()
@@ -3297,6 +3302,7 @@ impl FsOps {
                     self.sparse = *sparse;
                     self.narrow_new_directories = *narrow_new_directories;
                     self.skips_unmet_conditions = *skips_unmet_conditions;
+                    self.unchecked_keep = *unchecked_keep;
                     if *own_links {
                         self.keep_links_to_own_files();
                     }
@@ -4031,7 +4037,7 @@ pub(super) fn publish_partial_rooted(
     target: &RelativePath,
     staged: &File,
     condition: TargetCondition,
-    (owned, skips): (Option<&owned::OwnedObjects>, bool),
+    (owned, skips, unchecked_keep): (Option<&owned::OwnedObjects>, bool, bool),
 ) -> Result<PublishedStage> {
     let metadata = staged.metadata()?;
     if !is_safe_partial(&metadata) {
@@ -4044,6 +4050,16 @@ pub(super) fn publish_partial_rooted(
         TargetCondition::Any | TargetCondition::Matches { .. } => root
             .rename_regular_if_same(source, target, staged_identity)
             .map(|()| None),
+        // An ordinary copy that keeps existing files renames over a name
+        // another program took in the moment before, rather than pay for a
+        // link where the filesystem has no no-replace rename
+        // (`FsOps::unchecked_keep`).
+        TargetCondition::Absent
+            if unchecked_keep && !root.renames_without_replacing_on(metadata.dev(), staged) =>
+        {
+            root.rename_regular_if_same(source, target, staged_identity)
+                .map(|()| None)
+        }
         TargetCondition::Absent => {
             root.publish_new_staged(source, target, staged_identity, Some(staged))
         }

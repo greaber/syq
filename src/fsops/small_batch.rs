@@ -1801,6 +1801,7 @@ impl FsOps {
         // done here, on the writing thread, rather than under the
         // directory's lock as it links (`Root::prepare_link_from`).
         if put.condition == TargetCondition::Absent
+            && !self.unchecked_keep
             && stage
                 .target
                 .root
@@ -1826,7 +1827,11 @@ impl FsOps {
             &stage.target.relative,
             &stage.file,
             put.condition,
-            (self.owned.as_deref(), self.skips_unmet_conditions),
+            (
+                self.owned.as_deref(),
+                self.skips_unmet_conditions,
+                self.unchecked_keep,
+            ),
         )
     }
 

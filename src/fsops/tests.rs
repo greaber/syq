@@ -8937,6 +8937,7 @@ fn a_keeping_copy_links_new_names_only_to_files_it_created() {
         narrow_new_directories: false,
         own_links: true,
         skips_unmet_conditions: false,
+        unchecked_keep: false,
     };
     let mut publisher = FsOps::test_destination(dir.path());
     publisher.set_stage_scope(crate::fsops::new_stage_scope());
@@ -9029,6 +9030,7 @@ fn own_file_links_on_filesystems_without_trusted_numbers() {
             narrow_new_directories: false,
             own_links: true,
             skips_unmet_conditions: false,
+            unchecked_keep: false,
         }),
         Response::Ok
     ));
@@ -9145,6 +9147,7 @@ fn a_restricted_scan_reads_inode_metadata_beneath_its_root() {
             narrow_new_directories: false,
             own_links: false,
             skips_unmet_conditions: false,
+            unchecked_keep: false,
         }),
         Response::Ok
     ));
@@ -9176,4 +9179,69 @@ fn a_restricted_scan_reads_inode_metadata_beneath_its_root() {
     assert!(ops
         .capture_scan_metadata(&requested, None, false, &mut entries)
         .is_err());
+}
+
+/// An ordinary copy that keeps existing files, told it may, renames its
+/// new files into place unchecked where the filesystem has no no-replace
+/// rename, as NFS: a name another program took in the moment before is
+/// replaced, as an ordinary copy did before. Where a no-replace rename
+/// costs nothing more, the name is still kept.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unchecked_keep_renames_where_no_replace_would_cost_a_link() {
+    for no_replace_rename in [false, true] {
+        let dir = crate::test_support::tempdir().unwrap();
+        fs::write(dir.path().join("taken"), b"theirs").unwrap();
+        let mut ops = FsOps::test_destination(dir.path());
+        assert!(matches!(
+            ops.handle(&Request::ConfigurePreservation {
+                selection: Default::default(),
+                sparse: false,
+                destination: true,
+                narrow_new_directories: false,
+                own_links: false,
+                skips_unmet_conditions: true,
+                unchecked_keep: true,
+            }),
+            Response::Ok
+        ));
+        let root = ops.destination_root.as_ref().unwrap();
+        let mut profile = root.profile();
+        profile.exchange = false;
+        profile.atomic_no_replace_rename &= no_replace_rename;
+        let had_no_replace = profile.atomic_no_replace_rename;
+        root.assume_profile_for_test(profile);
+        let response = ops.handle(&Request::PutSmallBatch(vec![SmallPut {
+            path: dir.path().join("taken").as_os_str().as_bytes().to_vec(),
+            copy_id: [8; 16],
+            data: b"ours".to_vec(),
+            hash: content_digest(b"ours"),
+            meta: Meta {
+                inode_metadata: None,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags: 0,
+            inplace: false,
+            condition: TargetCondition::Absent,
+            replaces: false,
+            scanned: ScannedDestination::Absent,
+        }]));
+        let Response::Applied(errors) = response else {
+            panic!("unexpected response {response:?}")
+        };
+        let contents = fs::read(dir.path().join("taken")).unwrap();
+        if had_no_replace {
+            assert!(errors[0]
+                .as_ref()
+                .is_some_and(|error| error.condition_not_met));
+            assert_eq!(contents, b"theirs");
+        } else {
+            assert!(errors[0].is_none(), "{errors:?}");
+            assert_eq!(contents, b"ours");
+        }
+    }
 }

@@ -874,6 +874,10 @@ pub struct FsOps {
     /// This copy skips files whose conditions are unmet, so their partials
     /// go (`Request::ConfigurePreservation::skips_unmet_conditions`).
     skips_unmet_conditions: bool,
+    /// This copy's no-replace conditions on files keep existing files, and
+    /// where no-replace takes more than a rename, files are renamed into
+    /// place unchecked (`Request::ConfigurePreservation::unchecked_keep`).
+    unchecked_keep: bool,
     /// The permission bits each directory's default ACL lets new files
     /// have, by root and directory, read once per connection.
     creation_permissions: Mutex<receiver_mode::CreationPermissions>,
@@ -1165,6 +1169,7 @@ impl FsOps {
             inplace_parents: Default::default(),
             narrow_new_directories: false,
             skips_unmet_conditions: false,
+            unchecked_keep: false,
             creation_permissions: Default::default(),
             inherited_acls: Default::default(),
             prepared_small_copy: None,
@@ -1833,7 +1838,7 @@ impl FsOps {
                                 } else {
                                     TargetCondition::Any
                                 },
-                                (None, false),
+                                (None, false, false),
                             );
                             // Closed before its staged name goes.
                             drop(item);

@@ -1305,6 +1305,13 @@ pub enum WireRequest<Data> {
         /// (`--if-exists=keep`, `--only-existing`), so the receiver lets
         /// such a file's partial go rather than keep it for a later copy.
         skips_unmet_conditions: bool,
+        /// The copy keeps existing files (`--if-exists=keep`) and accepts
+        /// that a name another program takes in the moment before
+        /// publication is replaced: where the filesystem has no atomic
+        /// no-replace rename, as NFS, a new file held to a free name is
+        /// renamed into place without a check, as an ordinary copy did
+        /// before. Only ordinary receivers accept it.
+        unchecked_keep: bool,
     },
     NativeMap(crate::native_map::Options),
     /// Configure and select a bounded small push without reading its payloads.

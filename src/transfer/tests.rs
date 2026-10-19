@@ -451,6 +451,7 @@ fn pipeline_worker(
         receiver_paces_file_data: false,
         own_links: false,
         skips_unmet_conditions: false,
+        unchecked_keep: false,
         dry_run: false,
         dry_run_metadata_files: AtomicU64::new(0),
         quiet: true,

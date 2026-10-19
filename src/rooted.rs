@@ -448,6 +448,12 @@ impl Root {
         self.profile().link_counts_trusted
     }
 
+    /// Whether a file on device `dev`, read through `file`, can be renamed
+    /// to a new name atomically without replacing anything.
+    pub(crate) fn renames_without_replacing_on(&self, dev: u64, file: &File) -> bool {
+        self.profile_on(dev, file).atomic_no_replace_rename
+    }
+
     /// Whether a new name (`publish_new_staged`) for a file on device `dev`,
     /// read through `file`, is published by a hard link here: where the
     /// filesystem has links but no no-replace rename, as NFS.

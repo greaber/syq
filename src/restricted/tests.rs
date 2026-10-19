@@ -5501,6 +5501,7 @@ fn signed_grants_authorize_only_their_inode_metadata() {
         narrow_new_directories: false,
         own_links: false,
         skips_unmet_conditions: false,
+        unchecked_keep: false,
         sparse,
         selection,
         destination: true,
@@ -5564,6 +5565,7 @@ fn signed_grants_authorize_only_their_inode_metadata() {
         narrow_new_directories: true,
         own_links: false,
         skips_unmet_conditions: false,
+        unchecked_keep: false,
         sparse: false,
         selection: acls_only,
         destination: true,
@@ -10074,4 +10076,30 @@ fn publications_tell_the_receiver_what_they_replace_where_the_authority_knows() 
     let mut request = claimed(&target.join("scanned"));
     update.authorize(&mut request, false).unwrap();
     assert_eq!(scanned_of(&request), proto::ScannedDestination::File(0o640));
+}
+
+/// A restricted receiver keeps existing files atomically: it refuses to be
+/// told it may rename kept files into place unchecked.
+#[test]
+fn restricted_receivers_refuse_unchecked_keeps() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir_all(root.join("target")).unwrap();
+    let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    let mut request = Request::ConfigurePreservation {
+        selection: Default::default(),
+        sparse: false,
+        destination: true,
+        narrow_new_directories: false,
+        own_links: false,
+        skips_unmet_conditions: true,
+        unchecked_keep: true,
+    };
+    let Err(error) = authority.authorize(&mut request, false) else {
+        panic!("an unchecked keep was authorized")
+    };
+    assert!(
+        format!("{error:#}").contains("keeps existing files atomically"),
+        "{error:#}"
+    );
 }
