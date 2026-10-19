@@ -32,9 +32,13 @@ to run an exact official release:
 syq --use-version 0.7.1 cp photos --into backup
 ```
 
-Syq downloads and verifies that release when needed, keeps it alongside other
-versions, and runs it with your command's arguments and environment. Your normal
-installation stays unchanged. Later calls can use the cached release offline.
+Syq downloads and verifies that release the first time it is needed, keeps it
+alongside other versions, and runs it with your command's arguments and
+environment. Your normal installation stays unchanged. Later calls run the
+stored release offline, like any installed program, without checking it again.
+If a stored release is damaged, delete its version directory, for example
+`~/.cache/syq/helpers/v0.7.1/` for 0.7.1 ([local state](environment.md#local-state)),
+and the next call downloads it again.
 The first download needs network access and a writable cache; an unavailable
 release or unsupported platform is an error. `latest` and version ranges are
 not accepted.

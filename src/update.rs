@@ -337,9 +337,9 @@ pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<V
     {
         return Ok(binary);
     }
-    let binary = download_helper(helper)?;
+    let binary = download_helper(helper, REMOTE_HELPER)?;
     if let Some(path) = &cache_path {
-        if let Err(error) = store_helper(path, &binary) {
+        if let Err(error) = store_helper(path, &binary, REMOTE_HELPER) {
             crate::output::diagnostic!(
                 "syq: warning: cannot cache the downloaded remote helper ({error:#}); continuing without caching it"
             );
@@ -349,47 +349,17 @@ pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<V
 }
 
 /// A cached helper to upload, read once within its signed size and verified in
-/// memory, so the bytes sent are the bytes checked.
+/// memory, so the bytes sent are the bytes checked. One that fails the check
+/// is discarded so it is downloaded again.
 fn cached_helper(path: &Path, helper: &TrustedCurrentHelper) -> Option<Vec<u8>> {
-    let description = "cached remote helper";
-    checked_cache(path, description, || {
-        let expected = &helper.binary;
-        let mut binary = Vec::with_capacity(expected.size as usize + 1);
-        File::open(path)
-            .with_context(|| format!("open {description}"))?
-            .take(expected.size + 1)
-            .read_to_end(&mut binary)
-            .with_context(|| format!("read {description}"))?;
-        verify_bytes_as(&binary, expected, description)?;
-        Ok(binary)
-    })
-}
-
-/// Whether the cached release that `--use-version` runs still matches the
-/// signed manifest.
-fn cached_helper_matches(path: &Path, helper: &TrustedCurrentHelper) -> bool {
-    let description = "cached syq release";
-    checked_cache(path, description, || {
-        verify_file_as(path, &helper.binary, description)
-    })
-    .is_some()
-}
-
-/// Check a cached file against the signed manifest. A missing file is simply
-/// absent; one that fails the check is discarded so it is downloaded again.
-fn checked_cache<T>(
-    path: &Path,
-    description: &str,
-    check: impl FnOnce() -> Result<T>,
-) -> Option<T> {
     if !path.is_file() {
         return None;
     }
-    match check() {
-        Ok(value) => Some(value),
+    match read_verified(path, &helper.binary, "cached remote helper") {
+        Ok(binary) => Some(binary),
         Err(error) => {
             crate::output::diagnostic!(
-                "syq: warning: {description} failed integrity verification ({error}); discarding it"
+                "syq: warning: cached remote helper failed integrity verification ({error}); discarding it"
             );
             let _ = fs::remove_file(path);
             None
@@ -397,20 +367,77 @@ fn checked_cache<T>(
     }
 }
 
-/// `--use-version` runs the helper from the cache, so it needs the cache.
-fn verified_helper_path(helper: &TrustedCurrentHelper) -> Result<PathBuf> {
+/// Read a file once, within its signed size, and verify the bytes in memory.
+fn read_verified(path: &Path, expected: &ReleaseFile, description: &str) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(expected.size as usize + 1);
+    File::open(path)
+        .with_context(|| format!("open {description}"))?
+        .take(expected.size + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {description}"))?;
+    verify_bytes_as(&bytes, expected, description)?;
+    Ok(bytes)
+}
+
+/// The stored release for `--use-version` when it cannot be started directly.
+/// An existing executable is hashed against the signed manifest, since it may
+/// have been stored without a manifest or by someone else; one that is missing
+/// or does not match is downloaded, verified, and stored.
+fn stored_release_path(helper: &TrustedCurrentHelper) -> Result<PathBuf> {
     let cache_path = helper_cache_path(helper)?;
-    if cached_helper_matches(&cache_path, helper) {
-        return Ok(cache_path);
+    if cache_path.is_file() {
+        match verify_file_as(&cache_path, &helper.binary, "cached syq release") {
+            Ok(()) => return Ok(cache_path),
+            Err(error) => {
+                crate::output::diagnostic!(
+                    "syq: warning: cached syq release failed integrity verification ({error}); discarding it"
+                );
+                let _ = fs::remove_file(&cache_path);
+            }
+        }
     }
-    let binary = download_helper(helper)?;
-    store_helper(&cache_path, &binary)?;
+    let binary = download_helper(helper, SYQ_RELEASE)?;
+    store_helper(&cache_path, &binary, SYQ_RELEASE)?;
     Ok(cache_path)
 }
 
+/// Whether a stored release can be started without verifying it again: its
+/// files, and every directory from the cache root down to theirs, are real
+/// files and directories rather than symbolic links, owned by this user, and
+/// not writable by group or others. Otherwise someone else may have put them
+/// there, for example under a shared `XDG_CACHE_HOME`.
+fn privately_stored(root: &Path, directory: &Path, files: &[&Path]) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(below) = directory.strip_prefix(root) else {
+        return false;
+    };
+    let user = unsafe { libc::geteuid() };
+    let private = |path: &Path, is_directory: bool| {
+        fs::symlink_metadata(path).is_ok_and(|metadata| {
+            let kind = if is_directory {
+                metadata.is_dir()
+            } else {
+                metadata.is_file()
+            };
+            kind && metadata.uid() == user && metadata.mode() & 0o022 == 0
+        })
+    };
+    let mut path = root.to_path_buf();
+    private(&path, true)
+        && below.components().all(|component| {
+            path.push(component);
+            private(&path, true)
+        })
+        && files.iter().all(|file| private(file, false))
+}
+
+// What a cached executable is for, as named in messages about it.
+const REMOTE_HELPER: &str = "remote helper";
+const SYQ_RELEASE: &str = "syq release";
+
 /// Download, verify, and decompress a helper in memory. The signed sizes bound
 /// both the download and the decompressed result.
-fn download_helper(helper: &TrustedCurrentHelper) -> Result<Vec<u8>> {
+fn download_helper(helper: &TrustedCurrentHelper, what: &str) -> Result<Vec<u8>> {
     let url = format!(
         "{}/{}/{}",
         release_downloads(),
@@ -421,44 +448,59 @@ fn download_helper(helper: &TrustedCurrentHelper) -> Result<Vec<u8>> {
     verify_bytes_as(
         &archive,
         &helper.archive,
-        "downloaded remote helper archive",
+        &format!("downloaded {what} archive"),
     )?;
     let mut binary = Vec::new();
     GzDecoder::new(archive.as_slice())
         .take(helper.binary.size + 1)
         .read_to_end(&mut binary)
-        .context("decompress the remote helper")?;
-    verify_bytes_as(&binary, &helper.binary, "downloaded remote helper")?;
+        .with_context(|| format!("decompress the {what}"))?;
+    verify_bytes_as(&binary, &helper.binary, &format!("downloaded {what}"))?;
     Ok(binary)
 }
 
-fn store_helper(cache_path: &Path, binary: &[u8]) -> Result<()> {
+/// Store an executable. This checks nothing itself: callers pass only bytes
+/// that `download_helper` verified. It is written to a temporary file, synced,
+/// and renamed into place, so the cache never holds a partly written executable.
+fn store_helper(cache_path: &Path, binary: &[u8], what: &str) -> Result<()> {
     let parent = cache_path
         .parent()
-        .ok_or_else(|| anyhow!("the remote helper cache path has no parent directory"))?;
+        .ok_or_else(|| anyhow!("the {what} cache path has no parent directory"))?;
     create_private_dir(parent)?;
     let temporary = TempFile::new(parent, ".bin")?;
     let mut output = temporary.writer()?;
     output
         .write_all(binary)
-        .context("write the remote helper")?;
-    output.sync_all().context("sync the remote helper")?;
+        .with_context(|| format!("write the {what}"))?;
+    output
+        .sync_all()
+        .with_context(|| format!("sync the {what}"))?;
     drop(output);
     let temporary = temporary.seal_executable()?;
     fs::rename(temporary.path(), cache_path)
-        .with_context(|| format!("cache verified remote helper at {}", cache_path.display()))?;
+        .with_context(|| format!("cache verified {what} at {}", cache_path.display()))?;
     sync_parent(parent)
 }
 
-/// An explicit version selection uses a signed manifest cached beside the
-/// executable. Both are verified on reuse, without an online freshness check:
+/// An explicit version selection stores the release beside its signed
+/// manifest. A download is checked against the manifest's signature, sizes, and
+/// hashes, and the release must report the expected version and build identity,
+/// before the manifest is stored. Finding both files in a private cache
+/// therefore means the release passed those checks, so later runs start it
+/// directly without reading either file or checking online for freshness:
 /// release tags are immutable, and selecting a release deliberately permits
-/// running an older version. This does not replace the normal installation.
+/// running an older version. Anything else gets the full checks again. This
+/// does not replace the normal installation.
 pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
     let target = Target::local().context("official releases do not support this platform")?;
     let tag = format!("v{version}");
-    let directory = release_cache_directory(&tag, target)?;
+    let root = release_cache_root()?;
+    let directory = release_directory(&root, &tag, target);
     let manifest_path = directory.join(MANIFEST_NAME);
+    let executable = directory.join(CACHED_EXECUTABLE);
+    if privately_stored(&root, &directory, &[&manifest_path, &executable]) {
+        return Ok(executable);
+    }
     // Only explicit selection opts every build into the official trust anchor.
     let key = embedded_public_key()
         .unwrap_or_else(|_| Cow::Borrowed(include_str!("release-public-key.txt").trim()));
@@ -486,7 +528,7 @@ pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
         version: found,
     };
     let helper = helper_from_release(target, &release)?;
-    let executable = verified_helper_path(&helper)?;
+    let executable = stored_release_path(&helper)?;
     if cached.is_none() {
         verify_executable(&executable, &release)?;
         let temporary = TempFile::new(&directory, ".json")?;
@@ -1097,33 +1139,31 @@ fn check_stamp_path() -> Result<PathBuf> {
 }
 
 fn config_dir() -> Result<PathBuf> {
-    if let Some(base) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(base).join("syq"));
-    }
-    let home = std::env::var_os("HOME")
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| {
-            anyhow!("HOME is not set, so the standalone install receipt cannot be located")
-        })?;
-    Ok(PathBuf::from(home).join(".config/syq"))
+    let base = crate::user_dirs::config_dir().ok_or_else(|| {
+        anyhow!("cannot locate the standalone install receipt: no home directory or absolute XDG_CONFIG_HOME")
+    })?;
+    Ok(base.join("syq"))
 }
 
+/// The executable's name in its release cache directory.
+const CACHED_EXECUTABLE: &str = "syq";
+
 fn helper_cache_path(helper: &TrustedCurrentHelper) -> Result<PathBuf> {
-    Ok(release_cache_directory(&helper.tag, helper.target)?.join("syq"))
+    Ok(release_cache_directory(&helper.tag, helper.target)?.join(CACHED_EXECUTABLE))
 }
 
 fn release_cache_directory(tag: &str, target: Target) -> Result<PathBuf> {
-    let base = if let Some(base) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
-        PathBuf::from(base)
-    } else {
-        let home = std::env::var_os("HOME")
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| {
-                anyhow!("HOME is not set, so the remote helper cache cannot be located")
-            })?;
-        PathBuf::from(home).join(".cache")
-    };
-    Ok(base.join("syq/helpers").join(tag).join(target.key))
+    Ok(release_directory(&release_cache_root()?, tag, target))
+}
+
+fn release_cache_root() -> Result<PathBuf> {
+    crate::user_dirs::cache_dir().ok_or_else(|| {
+        anyhow!("cannot locate the release cache: no home directory or absolute XDG_CACHE_HOME")
+    })
+}
+
+fn release_directory(root: &Path, tag: &str, target: Target) -> PathBuf {
+    root.join("syq/helpers").join(tag).join(target.key)
 }
 
 fn canonical_current_exe() -> Result<PathBuf> {
@@ -1457,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_helper_checks_keep_a_match_and_discard_a_mismatch() {
+    fn cached_upload_helper_keeps_a_match_and_discards_a_mismatch() {
         let dir = crate::test_support::tempdir().unwrap();
         let path = dir.path().join("syq");
         let contents = b"cached helper";
@@ -1474,16 +1514,11 @@ mod tests {
             },
             archive: manifest().artifacts["linux-x86_64"].archive.clone(),
         };
-        assert!(!cached_helper_matches(&path, &helper));
         assert_eq!(cached_helper(&path, &helper), None);
         fs::write(&path, contents).unwrap();
-        assert!(cached_helper_matches(&path, &helper));
         assert_eq!(cached_helper(&path, &helper).unwrap(), contents);
         assert_eq!(fs::read(&path).unwrap(), contents);
         for corrupt in [&b"cached helpe!"[..], b"cached helper!"] {
-            fs::write(&path, corrupt).unwrap();
-            assert!(!cached_helper_matches(&path, &helper));
-            assert!(!path.exists());
             fs::write(&path, corrupt).unwrap();
             assert_eq!(cached_helper(&path, &helper), None);
             assert!(!path.exists());
