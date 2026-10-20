@@ -10,7 +10,7 @@ use crate::enrollment::{
     self, AuthorizedKeyEntry, AuthorizedKeysChange, EnrollmentId, EnrollmentPublicKey,
     EnrollmentRoute, SshEndpoint,
 };
-use crate::proto::{self, ContainerGuard, Op, Request};
+use crate::proto::{self, Op, Request};
 use crate::rooted::{RelativePath, Root, RootIdentity, RootMetadata};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
@@ -103,6 +103,10 @@ struct InstallRequest {
     ssh_public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     security_key_flags: Option<u8>,
+    /// The copy asking for the enrollment follows a symlink at its
+    /// destination (`--follow-dst`), so a link there is no reason to refuse.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    follows_destination: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

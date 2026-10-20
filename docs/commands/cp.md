@@ -123,6 +123,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--s3-region <REGION>` | S3 signing region, used as given (otherwise syq asks AWS where the bucket is) |
 | `--s3-profile <NAME>` | AWS shared configuration/credentials profile |
 | `--s3-header <NAME: VALUE>` | Add a header before signing every S3 request (repeatable; S3-to-S3 metadata/tag overrides are refused) |
+| `--s3-retries <N>` | Retry each S3 request up to N times after a transient failure or throttling, 0..100 (default 10; 0 disables retries) |
 | `--s3-write-header <NAME: VALUE>` | Add a header before signing S3 requests that create or replace objects: uploads, multipart starts, and copies (repeatable; S3-to-S3 metadata/tag overrides are refused) |
 
 <a id="performance-tuning"></a>

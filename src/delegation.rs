@@ -313,10 +313,8 @@ impl CopyOperation {
         if limits.max_entries == 0 || limits.max_entries > MAX_ENTRIES {
             bail!("copy max-entries is outside the supported range");
         }
-        if limits.max_total_bytes == 0
-            || limits.max_file_bytes == 0
-            || limits.max_total_bytes > MAX_COPY_BYTES
-        {
+        // A per-file limit of zero admits only empty files (`--max-size 0`).
+        if limits.max_total_bytes == 0 || limits.max_total_bytes > MAX_COPY_BYTES {
             bail!("copy byte limits are outside the supported range");
         }
         if limits.max_file_bytes > limits.max_total_bytes {
@@ -452,6 +450,13 @@ pub(crate) struct ExtraCopyOptions {
     pub sparse: bool,
     pub open_noatime: bool,
     pub widen_dirs: DirectoryWidening,
+    /// `syq rsync --ignore-existing`: new files, links and special files are
+    /// created without replacing anything, as under the `Skip` policy, while
+    /// existing directories still take the copy's metadata.
+    pub keep_files: bool,
+    /// `--follow-dst` with `--into`: when the destination is a symlink, the
+    /// copy goes into the directory it resolves to inside the enrolled root.
+    pub follow_dst: bool,
 }
 
 /// Which existing destination directories the receiver may briefly give the

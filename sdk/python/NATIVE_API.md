@@ -106,6 +106,7 @@ In addition to the shared arguments above, it accepts:
 | `performance_tuning` | Comma-separated overrides, e.g. `"workers=4"` or `"s3-objects=4,s3-parts-per-object=8,s3-requests=16"`; omitted means automatic |
 | `s3_endpoint`, `s3_region`, `s3_profile` | Endpoint URL, signing region, and AWS profile strings |
 | `s3_header` | Iterable of `"NAME: VALUE"` strings; applied before signing every request |
+| `s3_retries` | Integer from 0 to 100: how many times to retry each S3 request after a temporary failure or throttling; omitted means 10, and `0` turns retries off |
 | `s3_write_header` | Iterable of `"NAME: VALUE"` strings; applied only to requests that create or replace objects |
 | `coordinate_at`, `rsh`, `peer_auth` | Coordinator, SSH command, and peer authentication strings |
 | `pscope` | Existing persistence domain for connections and saved authorization choices |
@@ -158,7 +159,7 @@ them. Choose at most one, as with `cp`. These bases belong to the source
 endpoint, independently of the client's local `process_cwd`. Both accept `rsh`,
 `syq_path`, `pscope`, `no_bootstrap`, `no_compress`, `no_tcp`, `no_tcp_encryption`,
 `tcp_ports`, `tcp_congestion`, `auth_from` (S3 authorization or requested/reused SSH account access), `s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
-`performance_tuning`, `resource_limits`, `integrity_checking`, `if_exists`,
+`s3_retries`, `performance_tuning`, `resource_limits`, `integrity_checking`, `if_exists`,
 `dry_run`, `stats`, `verbose`, `quiet`, `progress`, `no_progress`,
 and `timeout` with the same meanings as `cp`. `open_writer` also accepts
 `s3_write_header`.
@@ -288,7 +289,7 @@ Omitting it lets syq tune deletion separately from copying. See
 [Remove files](https://greaber.github.io/syq/remove.html).
 
 S3 removal uses `rm(..., on="s3://bucket")` with optional `s3_endpoint`,
-`s3_region`, `s3_profile`, `s3_header`, and `auth_from="@NAME"`. `s3_all_versions=True` permanently
+`s3_region`, `s3_profile`, `s3_header`, `s3_retries`, and `auth_from="@NAME"`. `s3_all_versions=True` permanently
 removes all selected versions and delete markers; `s3_version_id="ID"` selects
 one version of one exact key. These options are mutually exclusive.
 `RemovalTrace` and `RemovalResult` expose optional `s3_version_id` and
@@ -329,6 +330,9 @@ with client.map(from_="s3://photos", srcs_in="originals",
                 s3_region="us-east-1") as mapping:
     client.cp(mapping=mapping, into="restored")
 ```
+
+`s3_retries` works as on `cp` but applies only to the listing; the mapping
+does not keep it, so pass it to `cp` as well if the copy should use it.
 
 `MapStream` is a `Mapping` and an iterable context manager; use `with`.
 `AsyncMapStream` is an `AsyncMapping` and an async context manager; use

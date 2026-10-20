@@ -10,13 +10,8 @@ const DIFFERING_READ_CHUNK: u64 = 1 << 20;
 const UPDATE_IN_PLACE: &str = "update it in place";
 
 impl FsOps {
-    pub fn probe_partial(
-        &mut self,
-        path: &[u8],
-        copy_id: &CopyId,
-        guard: Option<&ContainerGuard>,
-    ) -> Result<Response> {
-        if let Some(target) = self.rooted_destination_target(path, guard)? {
+    pub fn probe_partial(&mut self, path: &[u8], copy_id: &CopyId) -> Result<Response> {
+        if let Some(target) = self.rooted_destination_target(path)? {
             let (_, _, metadata) = with_rooted_partial(&target, copy_id, |relative, _| {
                 target.root.metadata_optional(relative)
             })?;
@@ -190,6 +185,7 @@ impl FsOps {
         copy_id: &CopyId,
         mode: u32,
         group: Option<u32>,
+        declared: u64,
     ) -> Result<(File, fs::Metadata, Arc<()>, bool)> {
         let held_for = stages::of(self.stage_scope, target, copy_id, true);
         match self.create_inplace_file(
@@ -206,6 +202,7 @@ impl FsOps {
                     &file,
                     Some(created.clone()),
                     true,
+                    declared,
                 )?;
                 return Ok((file, created, in_use, false));
             }
@@ -229,7 +226,14 @@ impl FsOps {
             identity_of(&created),
             Sidecar::Partial,
         );
-        let in_use = stages::hold(held_for, &relative, &file, Some(created.clone()), true)?;
+        let in_use = stages::hold(
+            held_for,
+            &relative,
+            &file,
+            Some(created.clone()),
+            true,
+            declared,
+        )?;
         Ok((file, created, in_use, true))
     }
 
@@ -248,10 +252,19 @@ impl FsOps {
         copy_id: &CopyId,
         update: &InPlaceUpdate,
         compared: Option<&HeldBasis>,
+        declared: u64,
     ) -> Result<Option<(File, Arc<()>)>> {
         let Some((file, opened)) = self.open_to_update(target, &update.meta, update.flags)? else {
             return Ok(None);
         };
+        if let Some(only) = update.only {
+            if (opened.dev(), opened.ino()) != only {
+                return Err(condition_not_met(format!(
+                    "destination {} changed since it was found, and only it is updated (--only-existing)",
+                    target.label.display()
+                )));
+            }
+        }
         let mut checked = None;
         if let Some(compared) = compared {
             let identity = compared.file.metadata()?;
@@ -291,6 +304,7 @@ impl FsOps {
             &file,
             Some(opened),
             false,
+            declared,
         )?;
         Ok(Some((file, in_use)))
     }
@@ -522,11 +536,7 @@ impl FsOps {
         target: PartialTarget<'_>,
         options: PrepareOptions,
     ) -> Result<Preparation> {
-        let PartialTarget {
-            path,
-            id: copy_id,
-            guard,
-        } = target;
+        let PartialTarget { path, id: copy_id } = target;
         let PrepareOptions {
             size,
             inplace,
@@ -536,7 +546,7 @@ impl FsOps {
             group,
             update,
         } = options;
-        let target = self.destination_mutation_target(path, guard)?;
+        let target = self.destination_mutation_target(path)?;
         // Existing finals get their equality check first. For new files,
         // defer allocation until seeding so a fresh preallocation cannot be
         // mistaken for bytes already written by this invocation on a retry.
@@ -559,6 +569,11 @@ impl FsOps {
             let compared = self
                 .held_basis
                 .take_if(|held| held.location == target.location() && held.copy_id == *copy_id);
+            // A preparation that may neither create nor update its file
+            // only looks: it creates nothing and resizes nothing, as a
+            // restricted receiver counts it (`charge_request`), and reports
+            // that it found nothing to resume.
+            let looks_only = !create_if_missing && update.is_none();
             // A retry, or a worker that connected again, writes the file
             // this copy already holds.
             if let Some(held) = self.held_inplace(&target, copy_id)? {
@@ -571,13 +586,17 @@ impl FsOps {
                         );
                     }
                 }
+                if looks_only {
+                    return Ok(Preparation::default());
+                }
                 self.set_copy_length(&held.file, size)
                     .with_context(|| format!("resize confined file {}", target.label.display()))?;
+                stages::declare(stages::of(self.stage_scope, &target, copy_id, true), size);
                 self.cache_entry(
                     target.location(),
                     attempt,
                     false,
-                    CachedFile::held(held.file, held.in_use),
+                    CachedFile::held(held.file, held.in_use, size),
                 );
                 return Ok(Preparation::default());
             }
@@ -585,7 +604,7 @@ impl FsOps {
             // where it is.
             if let Some(update) = update {
                 if let Some((file, in_use)) =
-                    self.open_inplace_update(&target, copy_id, update, compared.as_ref())?
+                    self.open_inplace_update(&target, copy_id, update, compared.as_ref(), size)?
                 {
                     self.set_copy_length(&file, size).with_context(|| {
                         format!("resize confined file {}", target.label.display())
@@ -594,9 +613,15 @@ impl FsOps {
                         target.location(),
                         attempt,
                         false,
-                        CachedFile::held(file, in_use),
+                        CachedFile::held(file, in_use, size),
                     );
                     return Ok(Preparation::default());
+                }
+                if update.only.is_some() {
+                    return Err(condition_not_met(format!(
+                        "destination {} is gone, and nothing is created there (--only-existing)",
+                        target.label.display()
+                    )));
                 }
             }
             if compared.is_some() {
@@ -606,8 +631,11 @@ impl FsOps {
                     target.label.display()
                 );
             }
+            if !create_if_missing {
+                return Ok(Preparation::default());
+            }
             let (file, _, in_use, staged) =
-                self.create_inplace_output(&target, copy_id, mode, group)?;
+                self.create_inplace_output(&target, copy_id, mode, group, size)?;
             if staged {
                 self.preallocate_new_partial(&file, size)?;
             } else {
@@ -624,7 +652,7 @@ impl FsOps {
                 target.location(),
                 attempt,
                 false,
-                CachedFile::held(file, in_use),
+                CachedFile::held(file, in_use, size),
             );
             return Ok(Preparation::default());
         }
@@ -732,12 +760,18 @@ impl FsOps {
             &file,
             created.clone(),
             true,
+            size,
         )?;
         let location = FileLocation::Rooted {
             root: target.root.identity(),
             relative,
         };
-        self.cache_entry(location, attempt, true, CachedFile::held(file, in_use));
+        self.cache_entry(
+            location,
+            attempt,
+            true,
+            CachedFile::held(file, in_use, size),
+        );
         Ok(Preparation {
             partial_size: basis_size,
             has_candidates: false,
@@ -752,9 +786,8 @@ impl FsOps {
         block: u64,
         len: u64,
         condition: TargetCondition,
-        guard: Option<&ContainerGuard>,
     ) -> Result<(Vec<ContentDigest>, u64)> {
-        self.hash_and_hold_window(path, copy_id, 0, block, len, condition, guard, None)
+        self.hash_and_hold_window(path, copy_id, 0, block, len, condition, None)
             .map(|(hashes, len, _)| (hashes, len))
     }
 
@@ -767,7 +800,6 @@ impl FsOps {
         block: u64,
         len: u64,
         condition: TargetCondition,
-        guard: Option<&ContainerGuard>,
         update: Option<&InPlaceUpdate>,
     ) -> Result<(Vec<ContentDigest>, u64, Option<ReplaceReason>)> {
         #[cfg(debug_assertions)]
@@ -778,7 +810,7 @@ impl FsOps {
             block > 0 && off.is_multiple_of(block) && off.checked_add(len).is_some(),
             "invalid hash interval"
         );
-        let rooted = self.rooted_destination_target(path, guard)?;
+        let rooted = self.rooted_destination_target(path)?;
         let location = rooted
             .as_ref()
             .map(|target| target.location())
@@ -897,13 +929,12 @@ impl FsOps {
         &mut self,
         path: &[u8],
         copy_id: &CopyId,
-        guard: Option<&ContainerGuard>,
     ) -> Result<(HeldBasis, RootedTarget)> {
         let held = self
             .held_basis
             .take()
             .context("no retained destination basis")?;
-        let target = self.destination_mutation_target(path, guard)?;
+        let target = self.destination_mutation_target(path)?;
         if held.location != target.location() || held.copy_id != *copy_id {
             bail!("retained destination basis does not match requested file");
         }
@@ -917,9 +948,8 @@ impl FsOps {
         meta: &Meta,
         flags: u8,
         condition: TargetCondition,
-        guard: Option<&ContainerGuard>,
     ) -> Result<Option<(u64, u64)>> {
-        let (held, target) = self.take_held_basis(path, copy_id, guard)?;
+        let (held, target) = self.take_held_basis(path, copy_id)?;
         require_open_target(&held.file, &held.label, condition)?;
         // A content-identical file is kept only when the receiver can vouch
         // for changing its metadata in place; the copy replaces any other
@@ -939,20 +969,9 @@ impl FsOps {
                     .with_context(|| format!("set metadata on basis {}", held.label.display()))?;
             }
         }
-        if guard.is_some() {
-            // A signed receiver keeps the pre-existing guarded behavior:
-            // even an `Any` update must still be attached to its enrolled
-            // name. An unrestricted content-identical repair preserves
-            // the ordinary retry semantics below, where `Any` may finish
-            // through the retained inode after a concurrent publication.
-            require_rooted_named_identity(
-                &target.root,
-                &target.relative,
-                &target.label,
-                &held.file,
-                condition,
-            )?;
-        } else if condition != TargetCondition::Any {
+        // `Any` may finish through the retained inode after a concurrent
+        // publication.
+        if condition != TargetCondition::Any {
             require_rooted_named_identity(
                 &target.root,
                 &target.relative,
@@ -998,11 +1017,7 @@ impl FsOps {
             stage_only,
             clone_final,
         } = how;
-        let PartialTarget {
-            path,
-            id: copy_id,
-            guard,
-        } = target;
+        let PartialTarget { path, id: copy_id } = target;
         if !hash_response_fits(block, if stage_only { 0 } else { len }) {
             bail!("invalid block reuse request");
         }
@@ -1020,7 +1035,7 @@ impl FsOps {
                 previous_end = end;
             }
         }
-        let target = self.destination_mutation_target(path, guard)?;
+        let target = self.destination_mutation_target(path)?;
         let expected = target.location();
         // A previous failed job may have left a hold on this connection. It is
         // only an optional donor here, unlike the explicit FinishBasis request.
@@ -1218,8 +1233,14 @@ impl FsOps {
                 &output,
                 None,
                 true,
+                len,
             )?;
-            self.cache_entry(location, attempt, true, CachedFile::held(output, in_use));
+            self.cache_entry(
+                location,
+                attempt,
+                true,
+                CachedFile::held(output, in_use, len),
+            );
             return Ok((
                 SeededBasis {
                     hashes: Vec::new(),
@@ -1312,8 +1333,14 @@ impl FsOps {
             &output,
             None,
             true,
+            len,
         )?;
-        self.cache_entry(location, attempt, true, CachedFile::held(output, in_use));
+        self.cache_entry(
+            location,
+            attempt,
+            true,
+            CachedFile::held(output, in_use, len),
+        );
         Ok((
             SeededBasis {
                 hashes,
@@ -1372,12 +1399,15 @@ impl FsOps {
             creation.register_with(&target.root, &relative, Sidecar::Partial, || {
                 clone.metadata().map(|metadata| identity_of(&metadata))
             })?;
+            // Preparation resizes the clone and declares its size.
+            let cloned = clone.metadata()?.len();
             stages::hold(
                 stages::of(self.stage_scope, target, copy_id, false),
                 &relative,
                 &clone,
                 None,
                 true,
+                cloned,
             )?;
         }
         Ok(())
@@ -1420,7 +1450,6 @@ impl FsOps {
                 relative: destination_relative,
                 label: destination_label,
                 create_missing_parents: false,
-                query_partial_name_limit: false,
             },
             inspected,
         ))
@@ -1579,7 +1608,16 @@ impl FsOps {
             // `--in-place=update` an existing one it can vouch for.
             let held = self.held_inplace(&target, copy_id)?;
             let updated = match (&held, update) {
-                (None, Some(update)) => self.open_inplace_update(&target, copy_id, update, None)?,
+                (None, Some(update)) => {
+                    let opened = self.open_inplace_update(&target, copy_id, update, None, size)?;
+                    if opened.is_none() && update.only.is_some() {
+                        return Err(condition_not_met(format!(
+                            "destination {} is gone, and nothing is created there (--only-existing)",
+                            target.label.display()
+                        )));
+                    }
+                    opened
+                }
                 _ => None,
             };
             let (file, fresh) = match (held, updated) {
@@ -1600,7 +1638,7 @@ impl FsOps {
                     // The coordinator sends the in-place creation mode
                     // (`inplace_creation_mode`).
                     let (file, _, _, staged) =
-                        self.create_inplace_output(&target, copy_id, mode, group)?;
+                        self.create_inplace_output(&target, copy_id, mode, group, size)?;
                     if staged {
                         let held =
                             stages::get(stages::of(self.stage_scope, &target, copy_id, true))?
@@ -1874,8 +1912,14 @@ impl FsOps {
                 &d,
                 None,
                 created_inplace,
+                size,
             )?;
-            self.cache_entry(target.location(), 0, false, CachedFile::held(d, in_use));
+            self.cache_entry(
+                target.location(),
+                0,
+                false,
+                CachedFile::held(d, in_use, size),
+            );
         } else {
             // Finalize takes the held duplicate. Collect errors on this
             // descriptor now: closing it flushes, as an NFS client does at
@@ -1886,6 +1930,7 @@ impl FsOps {
                 &d,
                 None,
                 true,
+                size,
             )?;
             close_writer(d, &target_label)?;
         }
@@ -1958,6 +2003,7 @@ impl FsOps {
                     &clone,
                     None,
                     true,
+                    size,
                 )?;
                 _copy.bytes(size);
                 #[cfg(debug_assertions)]
@@ -2204,7 +2250,7 @@ impl FsOps {
                     .map(|&i| reads[i].source().cloned().unwrap())
                     .collect()
             });
-            let entries = self.stat_many_request(&paths, sources.as_deref(), false, None)?;
+            let entries = self.stat_many_request(&paths, sources.as_deref(), false)?;
             for (i, entry) in indices.into_iter().zip(entries) {
                 blocks[i].as_mut().unwrap().set_source(entry);
             }
@@ -2220,7 +2266,6 @@ impl FsOps {
         &mut self,
         put: &SmallPut,
         rooted: &RootedTarget,
-        guarded: bool,
         meta: &mut Cow<'_, Meta>,
         flags: &mut u8,
     ) -> Result<Option<Option<(u64, u64)>>> {
@@ -2268,7 +2313,7 @@ impl FsOps {
             .with_context(|| format!("set metadata {}", rooted.label.display()))?;
         // As when an in-place file is finalized (`finalize_held`): the file
         // is finished only while its name still leads to it.
-        if guarded || rooted.root.link_counts_trusted_on(created.dev(), &file) {
+        if rooted.root.link_counts_trusted_on(created.dev(), &file) {
             require_rooted_named_identity_known(
                 &rooted.root,
                 &rooted.relative,
@@ -2287,7 +2332,6 @@ impl FsOps {
         let target = PartialTarget {
             path: &put.path,
             id: &put.copy_id,
-            guard: put.guard.as_ref(),
         };
         let data = &put.data;
         let hash = put.hash;
@@ -2295,19 +2339,15 @@ impl FsOps {
         let mut flags = put.flags;
         let inplace = put.inplace;
         self.check_payload(data, hash)?;
-        let rooted = self.destination_mutation_target(target.path, target.guard)?;
+        let rooted = self.destination_mutation_target(target.path)?;
         self.uncache_rooted(&rooted.root, &rooted.relative);
         if inplace {
             // Only a file this creates is written at its name. Whatever else
             // the name holds is replaced through a stage, below, as any
             // changed file is.
-            if let Some(identity) = self.create_small_inplace(
-                put,
-                &rooted,
-                target.guard.is_some(),
-                &mut meta,
-                &mut flags,
-            )? {
+            if let Some(identity) =
+                self.create_small_inplace(put, &rooted, &mut meta, &mut flags)?
+            {
                 return Ok(identity);
             }
             let mut put = put.clone();
@@ -2320,13 +2360,13 @@ impl FsOps {
             )?;
             let stage = self.create_small_stage(&put, rooted)?;
             self.write_small_stage(&put, None, &stage, None)?;
-            self.publish_small_stage(&put, &stage)?;
-            return self.finish_small_stage(&put, stage);
+            let published = self.publish_small_stage(&put, &stage)?;
+            return self.finish_small_stage(&put, stage, published);
         }
         let stage = self.create_small_stage(put, rooted)?;
         self.write_small_stage(put, None, &stage, None)?;
-        self.publish_small_stage(put, &stage)?;
-        self.finish_small_stage(put, stage)
+        let published = self.publish_small_stage(put, &stage)?;
+        self.finish_small_stage(put, stage, published)
     }
 
     pub(super) fn hash_blocks(
@@ -2353,9 +2393,6 @@ impl FsOps {
             if std::env::var_os("SYQ_TEST_FAIL_SOURCE_BLOCK_HASH").is_some() {
                 bail!("injected whole-source hash failure");
             }
-            if target.guard.is_some() {
-                bail!("source block hash cannot carry a destination guard");
-            }
             if which != Which::Final {
                 bail!("source block hash is only valid for the final source file");
             }
@@ -2381,7 +2418,7 @@ impl FsOps {
             // Only an explicitly unconfined rsync source session can reach
             // this legacy branch after source roots have been initialized.
         }
-        if let Some(target) = self.rooted_destination_target(target.path, target.guard)? {
+        if let Some(target) = self.rooted_destination_target(target.path)? {
             let file = if which == Which::Partial {
                 // The sidecar this receiver holds, read with positioned
                 // reads: its duplicates on other connections share one
@@ -2450,7 +2487,7 @@ impl FsOps {
             crate::proto::hash_window_fits(off, len, block),
             "invalid hash window"
         );
-        let target = self.destination_mutation_target(partial.path, partial.guard)?;
+        let target = self.destination_mutation_target(partial.path)?;
         if !final_basis {
             self.comparison_window = None;
         }
@@ -2575,7 +2612,7 @@ impl FsOps {
         off: u64,
         len: u32,
     ) -> Result<()> {
-        let target = self.destination_mutation_target(partial.path, partial.guard)?;
+        let target = self.destination_mutation_target(partial.path)?;
         let window = self
             .comparison_window
             .as_mut()
@@ -2724,7 +2761,7 @@ impl FsOps {
         sparse: bool,
     ) -> Result<()> {
         let operation = self.operation.clone();
-        let rooted = self.destination_mutation_target(target.path, target.guard)?;
+        let rooted = self.destination_mutation_target(target.path)?;
         if let Some(window) = self.comparison_window.as_mut().filter(|window| {
             window.location == rooted.location()
                 && window.copy_id == *target.id
@@ -2743,6 +2780,18 @@ impl FsOps {
         let mut write = |relative: &RelativePath, label: &Path| {
             let held = stages::of(self.stage_scope, &rooted, &copy_id, inplace);
             let (file, _) = self.cached_held(label, held, relative, attempt)?;
+            // No write goes past the size declared for the file.
+            if crate::checks::enabled(crate::checks::Check::BoundedWrites)
+                && file.declared().is_some_and(|declared| {
+                    off.checked_add(data.len() as u64)
+                        .is_none_or(|end| end > declared)
+                })
+            {
+                return Ok(Err(anyhow!(
+                    "write {} @{off} extends past the size declared for it",
+                    label.display()
+                )));
+            }
             let writing = operation.span(crate::transfer_observations::Stage::DestinationWrite);
             #[cfg(debug_assertions)]
             record_test_event(
@@ -2805,9 +2854,8 @@ impl FsOps {
         &self,
         path: &[u8],
         expected: &crate::hashing::ExpectedHashes,
-        guard: Option<&ContainerGuard>,
     ) -> Result<()> {
-        let file = if let Some(target) = self.rooted_destination_target(path, guard)? {
+        let file = if let Some(target) = self.rooted_destination_target(path)? {
             target.root.open_regular_read(&target.relative)?
         } else {
             open_existing_regular(&resolve(path), false)?
@@ -2823,7 +2871,6 @@ impl FsOps {
         meta: &Meta,
         flags: u8,
         condition: TargetCondition,
-        guard: Option<&ContainerGuard>,
         expected: Option<&crate::hashing::ExpectedHashes>,
     ) -> Result<Option<(u64, u64)>> {
         if let Some(expected) = expected {
@@ -2832,7 +2879,7 @@ impl FsOps {
                 expected,
             )?;
         }
-        self.finish_basis(path, copy_id, meta, flags, condition, guard)
+        self.finish_basis(path, copy_id, meta, flags, condition)
     }
 
     #[cfg(test)]
@@ -2843,7 +2890,7 @@ impl FsOps {
         copy_id: &CopyId,
         meta: &Meta,
         flags: u8,
-        mutation: TargetMutation<'_>,
+        condition: TargetCondition,
     ) -> Result<Option<(u64, u64)>> {
         self.finalize_expected(
             None,
@@ -2853,7 +2900,7 @@ impl FsOps {
             meta,
             flags,
             ScannedDestination::Unknown,
-            mutation,
+            condition,
         )
     }
 
@@ -2867,11 +2914,11 @@ impl FsOps {
         meta: &Meta,
         flags: u8,
         scanned: ScannedDestination,
-        mutation: TargetMutation<'_>,
+        condition: TargetCondition,
     ) -> Result<Option<(u64, u64)>> {
-        let target = self.destination_mutation_target(path, mutation.guard)?;
+        let target = self.destination_mutation_target(path)?;
         self.finalize_rooted(
-            &target, inplace, copy_id, meta, flags, scanned, mutation, expected,
+            &target, inplace, copy_id, meta, flags, scanned, condition, expected,
         )
     }
 
@@ -2889,7 +2936,7 @@ impl FsOps {
         meta: &Meta,
         flags: u8,
         scanned: ScannedDestination,
-        mutation: TargetMutation<'_>,
+        condition: TargetCondition,
         expected: Option<&crate::hashing::ExpectedHashes>,
     ) -> Result<Option<(u64, u64)>> {
         let held_for = stages::of(self.stage_scope, target, copy_id, inplace);
@@ -2903,15 +2950,36 @@ impl FsOps {
             held.opened.clone(),
             held.relative.clone(),
             held.created,
+            held.declared,
         );
         let result = self.finalize_held(
-            target, held, in_place, meta, flags, scanned, mutation, expected,
+            target, held, in_place, meta, flags, scanned, condition, expected,
         );
-        if result.is_err() {
+        if let Err(error) = &result {
+            let (file, opened, relative, created, declared) = kept;
+            // A stage whose file the copy skips, its name taken under keep
+            // or its file gone under `--only-existing`, is no use to a later
+            // copy either: it goes, as `publish_partial_rooted` removes one.
+            if !in_place
+                && self.skips_unmet_conditions
+                && matches!(
+                    condition,
+                    TargetCondition::Absent | TargetCondition::Matches { .. }
+                )
+                && is_condition_not_met(error)
+            {
+                if let Ok(staged) = file.metadata() {
+                    let identity = (staged.dev(), staged.ino());
+                    drop(file);
+                    if target.root.unlink_if_same_regular(&relative, identity) {
+                        sidecars::forget(identity);
+                    }
+                }
+                return result;
+            }
             // A stage that publication removed is let go. An in-place file
             // stays held whatever its name holds now: a retry then finds a
             // new file that moved away, and fails it.
-            let (file, opened, relative, created) = kept;
             let at_name = || -> Result<bool> {
                 let held = file.metadata()?;
                 Ok(target
@@ -2920,7 +2988,7 @@ impl FsOps {
                     .is_some_and(|named| (named.dev, named.ino) == (held.dev(), held.ino())))
             };
             if in_place || at_name().unwrap_or(false) {
-                stages::hold(held_for, &relative, &file, opened, created)?;
+                stages::hold(held_for, &relative, &file, opened, created, declared)?;
             }
         }
         result
@@ -2935,11 +3003,9 @@ impl FsOps {
         meta: &Meta,
         flags: u8,
         scanned: ScannedDestination,
-        mutation: TargetMutation<'_>,
+        condition: TargetCondition,
         expected: Option<&crate::hashing::ExpectedHashes>,
     ) -> Result<Option<(u64, u64)>> {
-        let TargetMutation { condition, guard } = mutation;
-        let guarded = guard.is_some();
         if inplace {
             // The descriptor Prepare opened carries the metadata read then,
             // before the writes; the condition check, the metadata step and
@@ -2987,10 +3053,9 @@ impl FsOps {
             // The file is finished only while its name still leads to it:
             // a file someone renamed into its place got nothing of the
             // copy's, and the copy fails it. Where inode numbers cannot show
-            // which file a name leads to, only a guarded or conditional
-            // update is checked, against its condition.
-            if guarded
-                || condition != TargetCondition::Any
+            // which file a name leads to, only a conditional update is
+            // checked, against its condition.
+            if condition != TargetCondition::Any
                 || target.root.link_counts_trusted_on(current.dev(), &file)
             {
                 require_rooted_named_identity_known(
@@ -3045,13 +3110,17 @@ impl FsOps {
         require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
         // A directory at the target name fails the rename; looking the name
         // up first cost an NFS client a request for every file.
-        publish_partial_rooted(
+        let published = publish_partial_rooted(
             &target.root,
             &src_relative,
             &target.relative,
             &file,
             condition,
-            self.owned.as_deref(),
+            (
+                self.owned.as_deref(),
+                self.skips_unmet_conditions,
+                self.unchecked_keep,
+            ),
         )
         .map_err(|error| {
             if error
@@ -3068,19 +3137,17 @@ impl FsOps {
             meta.inode_metadata.as_deref(),
             meta.mode,
         )?;
-        match &created {
+        let identity = match &created {
             Some(created) => Ok(known_identity(created, flags)),
             None => published_identity(&file, flags),
-        }
+        };
+        drop(file);
+        published.remove()?;
+        identity
     }
 
-    pub fn file_hash(
-        &mut self,
-        path: &[u8],
-        source: Option<&RegisteredPath>,
-        guard: Option<&ContainerGuard>,
-    ) -> Result<Response> {
-        self.file_hash_checked(path, source, guard, &mut |_, _| Ok(()))
+    pub fn file_hash(&mut self, path: &[u8], source: Option<&RegisteredPath>) -> Result<Response> {
+        self.file_hash_checked(path, source, &mut |_, _| Ok(()))
     }
 
     /// Check an approved source hash's size and lifetime before reading and
@@ -3089,24 +3156,17 @@ impl FsOps {
         &mut self,
         path: &[u8],
         source: Option<&RegisteredPath>,
-        guard: Option<&ContainerGuard>,
         check: &mut impl FnMut(&File, u64) -> Result<()>,
     ) -> Result<Response> {
         let mut f = if source.is_some()
             || (self.destination_root.is_none() && !self.source_roots.is_empty())
         {
-            if guard.is_some() {
-                bail!("source file hash cannot carry a destination guard");
-            }
             if let Some((_, target)) = self.source_content_target(source)? {
                 open_registered_source(&target, self.inode_preservation.open_noatime)?
             } else {
                 // Explicit rsync --insecure-links compatibility path.
                 open_existing_regular(&resolve(path), false)?
             }
-        } else if let Some(guard) = guard {
-            let target = guarded_target(path, guard)?;
-            target.root.open_regular_read(&target.relative)?
         } else if let Some(root) = &self.destination_root {
             root.open_regular_read(&RelativePath::new(path)?)?
         } else {
@@ -3178,15 +3238,13 @@ impl FsOps {
         {
             return Response::Err(OPEN_PATCH_STREAM.into());
         }
-        if let Err(error) = self
-            .validate_source_session_request(req)
-            .and_then(|()| self.validate_destination_session_request(req))
-        {
+        if let Err(error) = self.validate_destination_session_request(req) {
             return Response::Err(errstr(&error));
         }
         if let Err(error) = self.map_request(req) {
             return Response::EndpointError(wire_error(&error));
         }
+        self.existence_only_where_numbers_mislead(req);
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_FAIL_BLOCK_COMPARISON").is_some()
             && matches!(
@@ -3228,6 +3286,9 @@ impl FsOps {
                 sparse,
                 destination,
                 narrow_new_directories,
+                own_links,
+                skips_unmet_conditions,
+                unchecked_keep,
             } => {
                 let validation = if *destination {
                     selection.validate_destination()
@@ -3238,6 +3299,11 @@ impl FsOps {
                     self.inode_preservation = *selection;
                     self.sparse = *sparse;
                     self.narrow_new_directories = *narrow_new_directories;
+                    self.skips_unmet_conditions = *skips_unmet_conditions;
+                    self.unchecked_keep = *unchecked_keep;
+                    if *own_links {
+                        self.keep_links_to_own_files();
+                    }
                     Response::Ok
                 })
             }
@@ -3245,12 +3311,8 @@ impl FsOps {
                 self.hash_policy = *policy;
                 Ok(Response::Ok)
             }
-            Request::ValidateDigest {
-                path,
-                expected,
-                guard,
-            } => self
-                .validate_expected_path(path, expected, guard.as_ref())
+            Request::ValidateDigest { path, expected } => self
+                .validate_expected_path(path, expected)
                 .map(|_| Response::Ok),
             Request::ListDir {
                 directory,
@@ -3302,9 +3364,8 @@ impl FsOps {
                 paths,
                 sources,
                 follow,
-                guard,
             } => self
-                .stat_many_request(paths, sources.as_deref(), *follow, guard.as_ref())
+                .stat_many_request(paths, sources.as_deref(), *follow)
                 .map(Response::Stats),
             Request::CheckOperatorDirectory {
                 path,
@@ -3326,9 +3387,9 @@ impl FsOps {
                 .check_operator_directory_ancestry(checks, None)
                 .map(Response::DirectoryRelations),
             Request::ReceiverUser => Ok(Response::ReceiverUser(crate::rooted::own_uid())),
-            Request::NewFileOwner { path, probe, guard } => {
+            Request::NewFileOwner { path, probe } => {
                 let owner = self
-                    .rooted_destination_target(path, guard.as_ref())
+                    .rooted_destination_target(path)
                     .ok()
                     .flatten()
                     .and_then(|target| {
@@ -3350,31 +3411,20 @@ impl FsOps {
                 path,
                 symlink_policy,
                 create_missing,
-                guard,
-            } => match guard {
+            } => match self.destination_root.clone() {
                 None => prepare_destination_path(
                     path,
                     *symlink_policy,
                     *create_missing,
                     &mut self.destination_path_access,
                 ),
-                // A restricted receiver walks only from its enrolled root down.
-                Some(guard) => (|| {
-                    let root_path = Path::new(OsStr::from_bytes(&guard.root));
-                    let relative = Path::new(OsStr::from_bytes(path))
-                        .strip_prefix(root_path)
-                        .context("destination is outside the enrolled root")?;
-                    let root = Root::open_verified(
-                        root_path,
-                        RootIdentity {
-                            dev: guard.dev,
-                            ino: guard.ino,
-                        },
-                    )?;
+                // A restricted receiver walks only from its root down.
+                Some(root) => (|| {
+                    let relative = self.destination_relative(path)?;
                     let directory = root.open_directory(&RelativePath::new(b"")?)?;
                     prepare_destination_path_beneath(
                         &directory,
-                        relative.as_os_str().as_bytes(),
+                        &relative,
                         *create_missing,
                         &mut self.destination_path_access,
                     )
@@ -3429,30 +3479,22 @@ impl FsOps {
             } => self
                 .destination_filesystem_info(*check_empty, target.as_ref())
                 .map(Response::DestinationFilesystemInfo),
-            Request::PruneLookup { paths, guard } => (|| {
+            Request::PruneLookup { paths } => (|| {
                 #[cfg(debug_assertions)]
                 record_test_event(
                     "SYQ_TEST_DESTINATION_LOOKUPS",
                     format_args!("lookup {}", paths.len()),
                 )?;
-                self.prune_lookup(paths, guard.as_ref())
-                    .map(Response::Stats)
+                self.prune_lookup(paths).map(Response::Stats)
             })(),
-            Request::PartialPaths {
-                paths,
-                copy_id,
-                guard,
-            } => Ok(Response::PathResults(self.partial_paths(
-                paths,
-                copy_id,
-                guard.as_ref(),
-            ))),
+            Request::PartialPaths { paths, copy_id } => {
+                Ok(Response::PathResults(self.partial_paths(paths, copy_id)))
+            }
             Request::PlanBatch {
                 partial_paths,
                 copy_id,
                 directories,
                 others,
-                guard,
                 strict_metadata,
             } => (|| {
                 #[cfg(debug_assertions)]
@@ -3464,12 +3506,11 @@ impl FsOps {
                         others.len()
                     ),
                 )?;
-                let guard = guard.as_ref();
-                let partial_paths = self.partial_paths(partial_paths, copy_id, guard);
+                let partial_paths = self.partial_paths(partial_paths, copy_id);
                 let directories = if *strict_metadata {
-                    self.prune_lookup(directories, guard)?
+                    self.prune_lookup(directories)?
                 } else {
-                    self.stat_many(directories, false, guard)
+                    self.stat_many(directories, false)
                 };
                 let safe_to_stat_others = directories.iter().all(|entry| {
                     entry
@@ -3478,9 +3519,9 @@ impl FsOps {
                 });
                 let others = if safe_to_stat_others {
                     Some(if *strict_metadata {
-                        self.prune_lookup(others, guard)?
+                        self.prune_lookup(others)?
                     } else {
-                        self.stat_many(others, false, guard)
+                        self.stat_many(others, false)
                     })
                 } else {
                     None
@@ -3494,11 +3535,9 @@ impl FsOps {
             Request::WidenDirectories {
                 directories,
                 remember,
-                guard,
                 access,
             } => {
                 let minimum = self.destination_parallel_minimum(
-                    guard.as_ref(),
                     directories.len(),
                     directories.iter().map(|(path, _)| path.as_slice()),
                 );
@@ -3507,7 +3546,7 @@ impl FsOps {
                     directories,
                     |(path, condition)| {
                         (|| {
-                            let target = self.destination_mutation_target(path, guard.as_ref())?;
+                            let target = self.destination_mutation_target(path)?;
                             let widened = widen_directory(
                                 &target.root,
                                 &target.relative,
@@ -3525,12 +3564,8 @@ impl FsOps {
                     },
                 )))
             }
-            Request::Apply { ops, guard } => Ok(Response::Applied(self.apply(ops, guard.as_ref()))),
-            Request::ProbePartial {
-                path,
-                copy_id,
-                guard,
-            } => self.probe_partial(path, copy_id, guard.as_ref()),
+            Request::Apply { ops } => Ok(Response::Applied(self.apply(ops))),
+            Request::ProbePartial { path, copy_id } => self.probe_partial(path, copy_id),
             Request::Prepare {
                 path,
                 size,
@@ -3542,26 +3577,13 @@ impl FsOps {
                 scanned,
                 attempt,
                 create_if_missing,
-                guard,
                 group,
                 update,
             } => self
-                .creation_mode(
-                    path,
-                    guard.as_ref(),
-                    *inplace,
-                    *mode,
-                    *flags,
-                    *acl,
-                    *scanned,
-                )
+                .creation_mode(path, *inplace, *mode, *flags, *acl, *scanned)
                 .and_then(|mode| {
                     self.prepare(
-                        PartialTarget {
-                            path,
-                            id: copy_id,
-                            guard: guard.as_ref(),
-                        },
+                        PartialTarget { path, id: copy_id },
                         PrepareOptions {
                             size: *size,
                             inplace: *inplace,
@@ -3581,7 +3603,6 @@ impl FsOps {
                 block,
                 len,
                 condition,
-                guard,
                 update,
             } => (|| {
                 let result = self.hash_and_hold_window(
@@ -3591,7 +3612,6 @@ impl FsOps {
                     *block,
                     *len,
                     *condition,
-                    guard.as_ref(),
                     update.as_deref(),
                 );
                 #[cfg(debug_assertions)]
@@ -3612,7 +3632,6 @@ impl FsOps {
                 meta,
                 flags,
                 condition,
-                guard,
             } => self
                 .finish_basis_expected(
                     path,
@@ -3620,7 +3639,6 @@ impl FsOps {
                     meta,
                     *flags,
                     *condition,
-                    guard.as_ref(),
                     expected_hash.as_ref(),
                 )
                 .map(publication_response),
@@ -3631,14 +3649,9 @@ impl FsOps {
                 block,
                 allow_final,
                 attempt,
-                guard,
             } => self
                 .seed_basis_impl(
-                    PartialTarget {
-                        path,
-                        id: copy_id,
-                        guard: guard.as_ref(),
-                    },
+                    PartialTarget { path, id: copy_id },
                     *len,
                     *block,
                     if *allow_final { None } else { Some(&[]) },
@@ -3657,16 +3670,11 @@ impl FsOps {
                 len,
                 block,
                 attempt,
-                guard,
             } => (|| {
                 #[cfg(debug_assertions)]
                 record_test_event("SYQ_TEST_DESTINATION_HASHES", format_args!("window {len}"))?;
                 self.hash_window(
-                    PartialTarget {
-                        path,
-                        id: copy_id,
-                        guard: guard.as_ref(),
-                    },
+                    PartialTarget { path, id: copy_id },
                     *off,
                     *len,
                     *block,
@@ -3681,18 +3689,8 @@ impl FsOps {
                 attempt,
                 off,
                 len,
-                guard,
             } => self
-                .reuse_compared_range(
-                    PartialTarget {
-                        path,
-                        id: copy_id,
-                        guard: guard.as_ref(),
-                    },
-                    *attempt,
-                    *off,
-                    *len,
-                )
+                .reuse_compared_range(PartialTarget { path, id: copy_id }, *attempt, *off, *len)
                 .map(|_| Response::Ok),
             Request::ReadComparedRange {
                 path,
@@ -3734,15 +3732,10 @@ impl FsOps {
                 block,
                 final_ranges,
                 attempt,
-                guard,
                 clone_final,
             } => self
                 .seed_basis_impl(
-                    PartialTarget {
-                        path,
-                        id: copy_id,
-                        guard: guard.as_ref(),
-                    },
+                    PartialTarget { path, id: copy_id },
                     *len,
                     *block,
                     final_ranges.as_deref(),
@@ -3816,14 +3809,12 @@ impl FsOps {
                 block,
                 len,
                 attempt,
-                guard,
                 ..
             } => self
                 .hash_blocks(
                     HashTarget {
                         path,
                         source: source.as_ref(),
-                        guard: guard.as_ref(),
                     },
                     HashOptions {
                         off: *off,
@@ -3855,14 +3846,9 @@ impl FsOps {
                 off,
                 hash,
                 data,
-                guard,
             } => self
                 .write_range(
-                    PartialTarget {
-                        path,
-                        id: copy_id,
-                        guard: guard.as_ref(),
-                    },
+                    PartialTarget { path, id: copy_id },
                     *inplace,
                     *attempt,
                     *off,
@@ -3879,7 +3865,6 @@ impl FsOps {
                 flags,
                 scanned,
                 condition,
-                guard,
             } => self
                 .finalize_expected(
                     expected_hash.as_ref(),
@@ -3889,22 +3874,12 @@ impl FsOps {
                     meta,
                     *flags,
                     *scanned,
-                    TargetMutation {
-                        condition: *condition,
-                        guard: guard.as_ref(),
-                    },
+                    *condition,
                 )
                 .map(publication_response),
-            Request::FileHash {
-                path,
-                source,
-                guard,
-            } => self.file_hash(path, source.as_ref(), guard.as_ref()),
-            Request::Canonicalize { path, guard } => {
-                if let Some(guard) = guard {
-                    guarded_target(path, guard)
-                        .map(|target| Response::Path(path_bytes(&target.label)))
-                } else if self.destination_root.is_some() {
+            Request::FileHash { path, source } => self.file_hash(path, source.as_ref()),
+            Request::Canonicalize { path } => {
+                if self.destination_root.is_some() {
                     Err(anyhow!(
                         "canonicalize is not valid after destination capability activation"
                     ))
@@ -3931,7 +3906,7 @@ impl FsOps {
         };
         let mut response = r.unwrap_or_else(|error| Response::EndpointError(wire_error(&error)));
         match (&*req, &mut response) {
-            (Request::Apply { ops, guard }, Response::Applied(errors)) => {
+            (Request::Apply { ops }, Response::Applied(errors)) => {
                 for (op, error) in ops.iter().zip(errors) {
                     if let Some(error) = error {
                         let access =
@@ -3940,51 +3915,32 @@ impl FsOps {
                             } else {
                                 0o300
                             };
-                        self.annotate_permission_failure(
-                            apply::op_path(op),
-                            guard.as_ref(),
-                            access,
-                            error,
-                        );
+                        self.annotate_permission_failure(apply::op_path(op), access, error);
                     }
                 }
             }
+            (Request::Prepare { path, inplace, .. }, Response::EndpointError(error)) => {
+                self.annotate_permission_failure(path, if *inplace { 0o100 } else { 0o300 }, error)
+            }
             (
-                Request::Prepare {
-                    path,
-                    guard,
-                    inplace,
-                    ..
-                },
+                Request::Finalize { path, .. }
+                | Request::SeedBasis { path, .. }
+                | Request::StageBasis { path, .. },
                 Response::EndpointError(error),
-            ) => self.annotate_permission_failure(
-                path,
-                guard.as_ref(),
-                if *inplace { 0o100 } else { 0o300 },
-                error,
-            ),
-            (
-                Request::Finalize { path, guard, .. }
-                | Request::SeedBasis { path, guard, .. }
-                | Request::StageBasis { path, guard, .. },
-                Response::EndpointError(error),
-            ) => self.annotate_permission_failure(path, guard.as_ref(), 0o300, error),
-            (Request::PruneLookup { paths, guard: None }, Response::EndpointError(error)) => self
-                .annotate_operator_failure(
-                    Some(paths.first().map_or(&[][..], Vec::as_slice)),
-                    error,
-                ),
-            // A restricted receiver's lookup of its destination, which needs
-            // search permission on the directories from its root down.
-            (
-                Request::PruneLookup {
-                    paths,
-                    guard: Some(guard),
-                },
-                Response::EndpointError(error),
-            ) => {
-                if let Some(path) = paths.first() {
-                    self.annotate_permission_failure(path, Some(guard), 0o100, error);
+            ) => self.annotate_permission_failure(path, 0o300, error),
+            // A lookup beneath an installed root needs search permission on
+            // the directories from the root down; before one, the operator's
+            // path does.
+            (Request::PruneLookup { paths }, Response::EndpointError(error)) => {
+                if self.destination_root.is_some() {
+                    if let Some(path) = paths.first() {
+                        self.annotate_permission_failure(path, 0o100, error);
+                    }
+                } else {
+                    self.annotate_operator_failure(
+                        Some(paths.first().map_or(&[][..], Vec::as_slice)),
+                        error,
+                    )
                 }
             }
             (
@@ -3995,34 +3951,20 @@ impl FsOps {
             (Request::CreateOperatorDirectory { .. }, Response::EndpointError(error)) => {
                 self.annotate_operator_failure(None, error)
             }
-            (Request::CopyLocal { dst, inplace, .. }, Response::EndpointError(error)) => self
-                .annotate_permission_failure(
-                    dst,
-                    None,
-                    if *inplace { 0o100 } else { 0o300 },
-                    error,
-                ),
+            (Request::CopyLocal { dst, inplace, .. }, Response::EndpointError(error)) => {
+                self.annotate_permission_failure(dst, if *inplace { 0o100 } else { 0o300 }, error)
+            }
             (Request::PutSmallBatch(puts), Response::Applied(errors)) => {
                 for (put, error) in puts.iter().zip(errors) {
                     if let Some(error) = error {
-                        self.annotate_permission_failure(
-                            &put.path,
-                            put.guard.as_ref(),
-                            0o300,
-                            error,
-                        );
+                        self.annotate_permission_failure(&put.path, 0o300, error);
                     }
                 }
             }
             (Request::PatchSmallBatch(patches), Response::PatchedBatch(results)) => {
                 for (patch, result) in patches.iter().zip(results) {
                     if let Err(error) = result {
-                        self.annotate_permission_failure(
-                            &patch.path,
-                            patch.guard.as_ref(),
-                            0o300,
-                            &mut error.error,
-                        );
+                        self.annotate_permission_failure(&patch.path, 0o300, &mut error.error);
                     }
                 }
             }
@@ -4047,17 +3989,54 @@ impl Read for ReadAt<'_> {
     }
 }
 
+/// A published file's staged name, where a hard link published it, to
+/// remove once the caller has closed the file (`Root::remove_staged_link`):
+/// an NFS client only renames an open file's removed name. Dropped, it
+/// removes the name anyway, ignoring a failure.
+#[must_use = "remove the staged name once the file is closed"]
+pub(super) struct PublishedStage(Option<(Arc<Root>, crate::rooted::StagedLink)>);
+
+impl PublishedStage {
+    /// Remove the staged name, if one is left, once the caller has closed
+    /// the file.
+    pub(super) fn remove(mut self) -> Result<()> {
+        match self.0.take() {
+            Some((root, link)) => root.remove_staged_link(link),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for PublishedStage {
+    fn drop(&mut self) {
+        if let Some((root, link)) = self.0.take() {
+            let _ = root.remove_staged_link(link);
+        }
+    }
+}
+
 /// Publish the private partial `staged` at `source` as `target`. With
 /// `owned`, the published file, which this receiver wrote, is recorded as
-/// its own.
+/// its own. With `skips`, a file whose condition is unmet is skipped by the
+/// copy, and its partial goes. The caller removes what is left of the
+/// staged name once it has closed `staged`.
+///
+/// A new name (`TargetCondition::Absent`) is published without replacing
+/// anything, by a no-replace rename or a hard link from `staged`, which
+/// fail if something holds the name. A file the copy replaces as it found
+/// it (`Matches`) is renamed over whatever the name holds, with no look
+/// first: the sender's plan, or for a restricted receiver its authority,
+/// already found it there, and a name another program changes in that
+/// moment is replaced. A patch's own condition (`MatchesFingerprint`),
+/// which the receiver set when it compared the file, is checked.
 pub(super) fn publish_partial_rooted(
-    root: &Root,
+    root: &Arc<Root>,
     source: &RelativePath,
     target: &RelativePath,
     staged: &File,
     condition: TargetCondition,
-    owned: Option<&owned::OwnedObjects>,
-) -> Result<()> {
+    (owned, skips, unchecked_keep): (Option<&owned::OwnedObjects>, bool, bool),
+) -> Result<PublishedStage> {
     let metadata = staged.metadata()?;
     if !is_safe_partial(&metadata) {
         bail!("confined partial is not a private regular file");
@@ -4066,43 +4045,62 @@ pub(super) fn publish_partial_rooted(
     let staged_ino = metadata.ino();
     let staged_identity = (staged_dev, staged_ino);
     let published = match condition {
-        TargetCondition::Any => root.rename_regular_if_same(source, target, staged_identity),
-        TargetCondition::Absent => root.publish_new_regular(source, target, staged_identity),
-        TargetCondition::Matches { dev, ino } => {
-            root.replace_regular_if_same(source, target, staged_identity, dev, ino, None)
+        TargetCondition::Any | TargetCondition::Matches { .. } => root
+            .rename_regular_if_same(source, target, staged_identity)
+            .map(|()| None),
+        // An ordinary copy that keeps existing files renames over a name
+        // another program took in the moment before, rather than pay for a
+        // link where the filesystem has no no-replace rename
+        // (`FsOps::unchecked_keep`).
+        TargetCondition::Absent
+            if unchecked_keep && !root.renames_without_replacing_on(metadata.dev(), staged) =>
+        {
+            root.rename_regular_if_same(source, target, staged_identity)
+                .map(|()| None)
+        }
+        TargetCondition::Absent => {
+            root.publish_new_staged(source, target, staged_identity, Some(staged))
         }
         TargetCondition::MatchesFingerprint {
             dev,
             ino,
             ctime,
             ctime_nsec,
-        } => root.replace_regular_if_same(
+        } => root.replace_staged_if_same(
             source,
             target,
             staged_identity,
-            dev,
-            ino,
-            Some((ctime, ctime_nsec)),
+            (dev, ino, Some((ctime, ctime_nsec))),
         ),
     };
-    if let Err(error) = published {
-        // What could not be published goes as an interrupted receiver's
-        // sweep would remove it; a partial worth resuming stays for a later
-        // copy. Only the staged file itself is removed: a name that now
-        // holds another entry, such as one a failed replacement kept, is
-        // left alone.
-        if sidecars::discard_unpublished(staged_identity, metadata.len())
-            && root.unlink_if_same_regular(source, staged_identity)
-        {
-            sidecars::forget(staged_identity);
+    let published = match published {
+        Ok(link) => link,
+        Err(error) => {
+            // What could not be published goes as an interrupted receiver's
+            // sweep would remove it; a partial worth resuming stays for a later
+            // copy, unless the copy skips its file: under keep or
+            // `--only-existing`, a name taken or a file gone. Only the staged
+            // file itself is removed: a name that now holds another entry,
+            // such as one a failed replacement kept, is left alone.
+            let skipped = skips
+                && matches!(
+                    condition,
+                    TargetCondition::Absent | TargetCondition::Matches { .. }
+                )
+                && is_condition_not_met(&error);
+            if (skipped || sidecars::discard_unpublished(staged_identity, metadata.len()))
+                && root.unlink_if_same_regular(source, staged_identity)
+            {
+                sidecars::forget(staged_identity);
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
+    };
     sidecars::forget(staged_identity);
     if let Some(owned) = owned {
         owned.record(&metadata);
     }
-    Ok(())
+    Ok(PublishedStage(published.map(|link| (root.clone(), link))))
 }
 
 /// Open an existing leaf without following a last-component symlink. Parent

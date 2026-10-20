@@ -23,8 +23,21 @@ Syq uses your AWS credentials and detects AWS bucket regions automatically.
 | `--s3-region REGION` | Set the signing region explicitly |
 | `--s3-header 'NAME: VALUE'` | Add a provider header to every request; repeatable |
 | `--s3-write-header 'NAME: VALUE'` | Add a header only to requests that create or replace objects: uploads, multipart starts, and copies; repeatable. Use it for settings such as storage class, or a server-side encryption method or KMS key, that the service rejects or ignores on other requests. Customer-provided encryption key headers (`x-amz-server-side-encryption-customer-*`) are also required on part uploads and reads, so they cannot be write-only. A write header takes precedence over an `--s3-header` of the same name |
+| `--s3-retries N` | Retry each request up to N times (0–100, default 10) after a dropped connection, a timeout, a server error or throttling; 0 disables retries |
 
-See [S3 copies](tuning.md#s3-copies) for concurrency, part sizes, and retries.
+See [S3 copies](tuning.md#s3-copies) for concurrency and part sizes.
+
+### Retries
+
+Each request has its own retries. They wait longer each time, with randomized
+delays to spread out concurrent retries. Requests keep their concurrency slots
+while waiting, so throttling slows new work too. With the default of 10, a
+single request can keep retrying for a minute or more. If 8 requests in a row
+fail after all their retries, each with no connection, a timeout, or a server
+error or throttling response, `syq cp` and `syq rm` stop instead of trying the
+remaining objects; rerun the command once the service is available. Bulk
+deletion retries only the keys that report a temporary error, up to
+`--s3-retries` times, separately from retries of the batch request itself.
 
 ## Upload and download
 
@@ -188,7 +201,7 @@ output file. Pipes carry only bytes. No local temporary file is created. See
 [File descriptors](commands/cp.md#file-descriptors) for command examples.
 
 S3 descriptor copies default to four parallel 16 MiB parts, with about one
-part of payload buffering per worker plus one input/output part. Use `s3-part-size` and `s3-retries` to change the part size and retry budget.
+part of payload buffering per worker plus one input/output part. Use the `s3-part-size` tuning key and `--s3-retries` to change the part size and the retries.
 The usual S3 request and part concurrency controls apply; object concurrency
 is always one. Unknown-length uploads stop at 10,000 parts: 156.25 GiB at the
 default part size. Select a larger part size before starting a larger upload.

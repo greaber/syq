@@ -1626,3 +1626,73 @@ fn staging_recovery_preserves_patch_sources() {
         assert!(partial_files(&t.path("dst")).is_empty());
     }
 }
+
+/// A file whose block hashes do not fit one response is still compared
+/// whole, in windows: in place, with or without `--hash`, and against a
+/// protected destination. Under `--hash` a differing one is staged and
+/// compared in windows rather than seeded from all its hashes. Debug builds
+/// shrink the response to four blocks.
+#[cfg(debug_assertions)]
+#[test]
+fn whole_file_comparisons_of_files_beyond_one_hash_response_use_windows() {
+    let block = 64 << 10;
+    let size = 10 * block + 17;
+    for (options, differs) in [
+        (&["--in-place=update"][..], true),
+        (&["--hash", "--in-place=update"][..], false),
+        (&["--hash", "--in-place=update"][..], true),
+        (&["--if-exists=error-if-different"][..], false),
+        (&["--hash"][..], true),
+    ] {
+        let t = Tmp::new();
+        let source = prng(size, 912);
+        let mut old = source.clone();
+        if differs {
+            old[7 * block + 5] ^= 0xff;
+        }
+        write(&t.path("src/file"), &source);
+        write(&t.path("dst/file"), &old);
+        // Different times, so that a matching size does not settle it.
+        set_mtime(&t.path("dst/file"), 1);
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "--no-progress", "--performance-tuning"])
+            .arg("workers=1,comparison-block-size=64K")
+            .arg("--transfer-strategy=aligned-block")
+            .args(options)
+            .arg(t.path("src/file"))
+            .arg("--into")
+            .arg(t.path("dst"))
+            // Compared through the worker, not copied by the receiver.
+            .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+            .env("SYQ_TEST_COPY_LOCAL_FS", "unsupported")
+            .env("SYQ_TEST_PER_FILE_COMPARISON", "1")
+            .env("SYQ_TEST_HASH_WINDOW_BLOCKS", "4")
+            .env("SYQ_TEST_BASIS_HASH_EVENTS", t.path("hashes"))
+            .env("SYQ_DEBUG", "1")
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        let copied = read(&t.path("dst/file"));
+        assert!(
+            copied == source,
+            "{options:?}: first difference at {:?}",
+            copied.iter().zip(&source).position(|(a, b)| a != b),
+        );
+        let hashes = fs::read_to_string(t.path("hashes")).unwrap();
+        let windows: Vec<_> = hashes.lines().collect();
+        assert_eq!(
+            windows,
+            [
+                format!("hash 0 {}", 4 * block),
+                format!("hash {} {}", 4 * block, 4 * block),
+                format!("hash {} {}", 8 * block, 2 * block + 17),
+            ],
+            "{options:?}"
+        );
+        if differs {
+            // Only the differing block was sent.
+            assert_eq!(tuning_observed(&out)["range_requests"], 1, "{options:?}");
+        }
+        assert!(partial_files(&t.0).is_empty());
+    }
+}

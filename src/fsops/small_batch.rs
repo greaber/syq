@@ -488,7 +488,10 @@ impl FsOps {
                     data.resize(off as usize + len, 0);
                     let (blocks, expected) = (&mut data[off as usize..], &patch.reuse[index..end]);
                     if !self.holds_blocks(old, off, blocks, patch.block, expected)? {
-                        bail!("the destination changed after it was compared");
+                        // Built in memory: nothing was written.
+                        return Err(unchanged(
+                            "the destination changed after it was compared".into(),
+                        ));
                     }
                     index = end;
                 }
@@ -560,7 +563,7 @@ impl FsOps {
             format_args!("existing {}", read.len),
         )?;
         let blocks = block_count(read.len, block)?;
-        let target = self.destination_mutation_target(&read.path, read.guard.as_ref())?;
+        let target = self.destination_mutation_target(&read.path)?;
         let partials = !self.candidate_partials(&target).is_empty();
         let Some(file) = target
             .root
@@ -624,7 +627,6 @@ impl FsOps {
         len: u64,
         meta: &Meta,
         flags: u8,
-        guarded: bool,
         condition: TargetCondition,
     ) -> Result<Keep> {
         #[cfg(debug_assertions)]
@@ -646,7 +648,7 @@ impl FsOps {
         fail_set_meta_for_test(&target.label)?;
         set_meta_file_known(file, meta, flags, &current)
             .with_context(|| format!("set metadata {}", target.label.display()))?;
-        if guarded || condition != TargetCondition::Any {
+        if condition != TargetCondition::Any {
             require_rooted_named_identity(
                 &target.root,
                 &target.relative,
@@ -780,7 +782,6 @@ impl FsOps {
                         patch.len,
                         &patch.meta,
                         patch.unchanged_flags,
-                        patch.guard.is_some(),
                         patch.condition,
                     )
                     .map_err(failed(true, false))?;
@@ -826,7 +827,7 @@ impl FsOps {
         )
         .map_err(failed(false, false))?;
         let target = self
-            .destination_mutation_target(&patch.path, patch.guard.as_ref())
+            .destination_mutation_target(&patch.path)
             .map_err(failed(false, false))?;
         let (file, opened) = match self.open_to_update(&target, &patch.meta, patch.flags) {
             Ok(Some(opened)) => opened,
@@ -907,8 +908,7 @@ impl FsOps {
         check_destination_writes(file, &target.label)?;
         let current = file.metadata()?;
         finish_updated_metadata(target, file, &current, &patch.meta, patch.flags)?;
-        if patch.guard.is_some()
-            || patch.condition != TargetCondition::Any
+        if patch.condition != TargetCondition::Any
             || target.root.link_counts_trusted_on(current.dev(), file)
         {
             require_rooted_named_identity_known(
@@ -930,7 +930,7 @@ impl FsOps {
         if !reproduces_basis(patch) && patch.reuse.iter().all(Option::is_none) {
             return Ok(None);
         }
-        let target = self.destination_mutation_target(&patch.path, patch.guard.as_ref())?;
+        let target = self.destination_mutation_target(&patch.path)?;
         let file = target
             .root
             .open_regular_read(&target.relative)
@@ -978,7 +978,6 @@ impl FsOps {
             flags: patch.flags,
             inplace: false,
             condition: patch.condition,
-            guard: patch.guard.clone(),
             replaces: true,
             scanned,
         };
@@ -1299,7 +1298,7 @@ impl FsOps {
                 let index = next;
                 next += 1;
                 let target = if built {
-                    self.destination_mutation_target(&puts[index].path, puts[index].guard.as_ref())
+                    self.destination_mutation_target(&puts[index].path)
                 } else {
                     self.small_target(&puts[index])
                 };
@@ -1343,7 +1342,7 @@ impl FsOps {
 
     fn small_target(&mut self, put: &SmallPut) -> Result<RootedTarget> {
         self.check_payload(&put.data, put.hash)?;
-        self.destination_mutation_target(&put.path, put.guard.as_ref())
+        self.destination_mutation_target(&put.path)
     }
 
     fn put_small_run(
@@ -1466,16 +1465,16 @@ impl FsOps {
             let _turn = root.mutation_turn(&directory).ok();
             for (index, stage) in stages {
                 match self.publish_small_stage(&puts[index], &stage) {
-                    Ok(()) => published.push((index, stage)),
+                    Ok(staged) => published.push((index, stage, staged)),
                     Err(error) => results[index] = Err(wire_error(&error)),
                 }
             }
         }
         // Closing a file is a round trip on NFS too, so on a network
         // filesystem the files are finished and closed on threads as well.
-        let finish = |(index, stage): (usize, SmallStage)| {
+        let finish = |(index, stage, staged): (usize, SmallStage, PublishedStage)| {
             let result = self
-                .finish_small_stage(&puts[index], stage)
+                .finish_small_stage(&puts[index], stage, staged)
                 .map_err(|error| wire_error(&error));
             (index, result)
         };
@@ -1518,15 +1517,15 @@ impl FsOps {
             return self.put_small(put);
         }
         let target = if built {
-            self.destination_mutation_target(&put.path, put.guard.as_ref())?
+            self.destination_mutation_target(&put.path)?
         } else {
             self.small_target(put)?
         };
         let mode = staged_file_mode(&put.meta, put.flags);
         let stage = self.create_stage(put, source, target, mode, false)?;
         self.write_small_stage(put, source, &stage, None)?;
-        self.publish_small_stage(put, &stage)?;
-        self.finish_small_stage(put, stage)
+        let published = self.publish_small_stage(put, &stage)?;
+        self.finish_small_stage(put, stage, published)
     }
 
     /// Create the stage of a put, or of a patch with the file it reuses
@@ -1786,6 +1785,18 @@ impl FsOps {
         check_destination_writes(&stage.file, &stage.label)?;
         set_meta_written_file_for_publication(&stage.file, &put.meta, put.flags, &stage.created)
             .with_context(|| format!("set metadata {}", stage.label.display()))?;
+        // A new name published by a hard link has its permission check
+        // done here, on the writing thread, rather than under the
+        // directory's lock as it links (`Root::prepare_link_from`).
+        if put.condition == TargetCondition::Absent
+            && !self.unchecked_keep
+            && stage
+                .target
+                .root
+                .links_new_names_on(stage.created.dev(), &stage.file)
+        {
+            crate::rooted::Root::prepare_link_from(&stage.file);
+        }
         #[cfg(any(test, debug_assertions))]
         fail_put_small_before_rename_for_test(&stage.target.label)?;
         Ok(())
@@ -1793,28 +1804,42 @@ impl FsOps {
 
     /// Publication re-resolves both names from the root and checks the staged
     /// name against the held inode immediately before the rename.
-    pub(super) fn publish_small_stage(&self, put: &SmallPut, stage: &SmallStage) -> Result<()> {
+    pub(super) fn publish_small_stage(
+        &self,
+        put: &SmallPut,
+        stage: &SmallStage,
+    ) -> Result<PublishedStage> {
         publish_partial_rooted(
             &stage.target.root,
             &stage.partial,
             &stage.target.relative,
             &stage.file,
             put.condition,
-            self.owned.as_deref(),
+            (
+                self.owned.as_deref(),
+                self.skips_unmet_conditions,
+                self.unchecked_keep,
+            ),
         )
     }
 
+    /// Finish a published stage and close its file, then remove what is
+    /// left of its staged name.
     pub(super) fn finish_small_stage(
         &self,
         put: &SmallPut,
         stage: SmallStage,
+        published: PublishedStage,
     ) -> Result<Option<(u64, u64)>> {
         crate::inode_metadata::finish_publication(
             &stage.file,
             put.meta.inode_metadata.as_deref(),
             put.meta.mode,
         )?;
-        Ok(known_identity(&stage.created, put.flags))
+        let identity = known_identity(&stage.created, put.flags);
+        drop(stage);
+        published.remove()?;
+        Ok(identity)
     }
 }
 
@@ -1882,7 +1907,6 @@ mod tests {
             flags: 0,
             inplace: false,
             condition: TargetCondition::Any,
-            guard: None,
             replaces: false,
             scanned: ScannedDestination::Unknown,
         }
@@ -1945,7 +1969,6 @@ mod tests {
             flags: 0,
             unchanged_flags: 0,
             condition: TargetCondition::Any,
-            guard: None,
             update_in_place: false,
         }
     }
@@ -2003,7 +2026,6 @@ mod tests {
             path: name.as_bytes().to_vec(),
             len,
             condition: TargetCondition::Any,
-            guard: None,
         };
         let longer = 3 * block + 10;
         let hashed = ops.hash_existing_batch(
@@ -2043,7 +2065,6 @@ mod tests {
                 flags: 0,
                 unchanged_flags: flags::TIMES,
                 condition: TargetCondition::Any,
-                guard: None,
                 update_in_place: false,
             };
         let reuse_all: Vec<_> = expected.iter().copied().map(Some).collect();
@@ -2129,7 +2150,6 @@ mod tests {
                 path: name.as_bytes().to_vec(),
                 len: new.len() as u64,
                 condition: TargetCondition::Any,
-                guard: None,
             };
             let hashed = ops.hash_existing_batch(block, &[read("file"), read("raced")]);
             let patches = [
@@ -2181,7 +2201,6 @@ mod tests {
                     path: b"file".to_vec(),
                     len: 64 * block,
                     condition: TargetCondition::Any,
-                    guard: None,
                 }],
             );
             // Enough reused blocks to copy rather than assemble the file.
@@ -2240,7 +2259,6 @@ mod tests {
                 path: b"file".to_vec(),
                 len: old.len() as u64,
                 condition: TargetCondition::Any,
-                guard: None,
             }],
         );
         let hashed = hashed[0].as_ref().unwrap();
@@ -2267,7 +2285,6 @@ mod tests {
             flags: flags::MODE | flags::TIMES,
             unchanged_flags: 0,
             condition: TargetCondition::Any,
-            guard: None,
             update_in_place: false,
         };
         CLONED_PATCHES.set(0);
@@ -2355,7 +2372,6 @@ mod tests {
                         path: b"file".to_vec(),
                         len: new.len() as u64,
                         condition: TargetCondition::Any,
-                        guard: None,
                     }],
                 )
                 .remove(0)
@@ -2363,7 +2379,7 @@ mod tests {
             let mut patch = patch_from("file", &new, block, &hashed, algorithm);
             patch.meta.mode = wanted;
             patch.flags = flags::MODE;
-            let target = ops.destination_mutation_target(b"file", None).unwrap();
+            let target = ops.destination_mutation_target(b"file").unwrap();
             let (relative, _) = rooted_partial_target(&target, &patch.copy_id).unwrap();
             let sidecar = directory.join(relative.to_path_buf());
             let seeded = std::rc::Rc::new(std::cell::Cell::new(None));
@@ -2420,7 +2436,6 @@ mod tests {
                         path: b"file".to_vec(),
                         len: new.len() as u64,
                         condition: TargetCondition::Any,
-                        guard: None,
                     }],
                 )
                 .remove(0)
@@ -2435,7 +2450,7 @@ mod tests {
             whole.replaces = true;
             let failed = without_space(|| ops.put_small_batch(&mut [whole]));
             assert!(failed[0].is_err(), "{case}: {:?}", failed[0]);
-            let target = ops.destination_mutation_target(b"file", None).unwrap();
+            let target = ops.destination_mutation_target(b"file").unwrap();
             let (relative, _) = rooted_partial_target(&target, &patch.copy_id).unwrap();
             let sidecar = directory.join(relative.to_path_buf());
             let reader = File::open(&sidecar).unwrap();
@@ -2504,7 +2519,6 @@ mod tests {
                     path: b"file".to_vec(),
                     len,
                     condition: TargetCondition::Any,
-                    guard: None,
                 }],
             )
             .remove(0)
@@ -2525,7 +2539,6 @@ mod tests {
             flags: 0,
             unchanged_flags: 0,
             condition: TargetCondition::Any,
-            guard: None,
             update_in_place: false,
         };
         let results = refusing_clones(true, || ops.patch_small_batch(&[patch])).unwrap();
@@ -2560,7 +2573,6 @@ mod tests {
                 path: b"file".to_vec(),
                 len: new.len() as u64,
                 condition: TargetCondition::Any,
-                guard: None,
             }],
         );
         let mut patch = patch_from("file", &new, block, hashed[0].as_ref().unwrap(), algorithm);
@@ -2768,7 +2780,6 @@ mod tests {
             path: name.as_bytes().to_vec(),
             len,
             condition: TargetCondition::Any,
-            guard: None,
         };
         let hashed =
             ops.hash_existing_batch(block, &[read("assembled"), read("copied"), read("holes")]);
@@ -2837,7 +2848,6 @@ mod tests {
                         path: b"file".to_vec(),
                         len: new.len() as u64,
                         condition: TargetCondition::Any,
-                        guard: None,
                     }],
                 )
                 .remove(0)
@@ -2866,7 +2876,6 @@ mod tests {
                 flags: 0,
                 unchanged_flags: 0,
                 condition: TargetCondition::Any,
-                guard: None,
                 update_in_place: false,
             };
             let malformed = |change: &dyn Fn(&mut SmallPatch)| {
@@ -2918,7 +2927,6 @@ mod tests {
             path: name.as_bytes().to_vec(),
             len: old.len() as u64,
             condition: TargetCondition::Any,
-            guard: None,
         };
         let hashed = ops.hash_existing_batch(block, &[read("touched"), read("edited")]);
         let patch = |name: &str, hashed: &ExistingHashes| SmallPatch {
@@ -2934,7 +2942,6 @@ mod tests {
             flags: 0,
             unchanged_flags: 0,
             condition: TargetCondition::Any,
-            guard: None,
             update_in_place: false,
         };
         let patches = [
@@ -2996,7 +3003,6 @@ mod tests {
             flags: 0,
             unchanged_flags: 0,
             condition: TargetCondition::Any,
-            guard: None,
             update_in_place: false,
         };
         let mut ops = receiver(directory);
@@ -3039,7 +3045,6 @@ mod tests {
             path: b"file".to_vec(),
             len: 40 * block,
             condition: TargetCondition::Any,
-            guard: None,
         };
         let hashed = ops.hash_existing_batch(block, &[read]).remove(0).unwrap();
         // Blocks past the old end claim to be reused, which a clone would
@@ -3059,7 +3064,6 @@ mod tests {
             flags: 0,
             unchanged_flags: 0,
             condition: TargetCondition::Any,
-            guard: None,
             update_in_place: false,
         };
         let results = ops.patch_small_batch(&[patch]).unwrap();
@@ -3201,6 +3205,9 @@ mod tests {
         assert_eq!(entries(temporary.path()), 5);
     }
 
+    /// A put held to the file its patch compared is published only over
+    /// that file. One held to the file the copy found (`Matches`) is renamed
+    /// over whatever the name holds: the plan found it there.
     #[test]
     fn identity_conditioned_puts_publish_atomically() {
         for batched in [false, true] {
@@ -3234,7 +3241,7 @@ mod tests {
                         ops.put_small(&put).map_err(|error| wire_error(&error))
                     };
                     let after = fs::metadata(&target).unwrap();
-                    if changed {
+                    if changed && fingerprint {
                         assert!(result.is_err());
                         assert_eq!(after.ino(), before.ino());
                         assert_eq!(fs::read(&target).unwrap(), b"old contents");
@@ -3335,9 +3342,11 @@ mod tests {
                 }
             };
             let mut first = put("file", b"first attempt");
-            first.condition = TargetCondition::Matches {
+            first.condition = TargetCondition::MatchesFingerprint {
                 dev: before.dev(),
                 ino: before.ino(),
+                ctime: before.ctime(),
+                ctime_nsec: before.ctime_nsec() as u32,
             };
             let error = run(&first).unwrap_err().message;
             let mut held = held.recv().unwrap();
@@ -3400,8 +3409,11 @@ mod tests {
         let stage = ops.create_small_stage(&file, target).unwrap();
         assert!(!stage.reused);
         ops.write_small_stage(&file, None, &stage, None).unwrap();
-        ops.publish_small_stage(&file, &stage).unwrap();
-        assert_eq!(ops.finish_small_stage(&file, stage).unwrap(), None);
+        let published = ops.publish_small_stage(&file, &stage).unwrap();
+        assert_eq!(
+            ops.finish_small_stage(&file, stage, published).unwrap(),
+            None
+        );
         assert_eq!(
             fs::read(temporary.path().join("file")).unwrap(),
             b"contents"
@@ -3805,7 +3817,6 @@ mod tests {
                         path: b"file".to_vec(),
                         len: new.len() as u64,
                         condition: TargetCondition::Any,
-                        guard: None,
                     }],
                 )
                 .remove(0)
@@ -3818,7 +3829,7 @@ mod tests {
                 // seeded: it takes the reused blocks as pieces arrive.
                 patch.basis = None;
             }
-            let target = ops.destination_mutation_target(b"file", None).unwrap();
+            let target = ops.destination_mutation_target(b"file").unwrap();
             let (relative, _) = rooted_partial_target(&target, &patch.copy_id).unwrap();
             let sidecar = directory.join(relative.to_path_buf());
             fs::write(&sidecar, b"").unwrap();
@@ -3911,7 +3922,6 @@ mod tests {
                     path: name.as_bytes().to_vec(),
                     len: new.len() as u64,
                     condition: TargetCondition::Any,
-                    guard: None,
                 };
                 let hashed = ops.hash_existing_batch(block, &[read]);
                 let mut patch =
@@ -3997,7 +4007,6 @@ mod tests {
                 path: b"file".to_vec(),
                 len: new.len() as u64,
                 condition: TargetCondition::Any,
-                guard: None,
             };
             let hashed = ops.hash_existing_batch(block, &[read]);
             let mut patch = patch_from("file", &new, block, hashed[0].as_ref().unwrap(), algorithm);
@@ -4199,7 +4208,6 @@ mod tests {
                 path: b"file".to_vec(),
                 len: new.len() as u64,
                 condition,
-                guard: None,
             };
             let hashed = ops.hash_existing_batch(block, &[read]);
             let mut patch = patch_from("file", &new, block, hashed[0].as_ref().unwrap(), algorithm);

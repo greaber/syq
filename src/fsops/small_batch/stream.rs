@@ -154,7 +154,6 @@ impl FsOps {
             flags: patch.flags,
             inplace: false,
             condition: patch.condition,
-            guard: patch.guard.clone(),
             replaces: true,
             scanned: ScannedDestination::Unknown,
         };
@@ -190,7 +189,7 @@ impl FsOps {
         }
         let patch = &stream.patch;
         check_stream_layout(patch, stream.data_len)?;
-        let target = self.destination_mutation_target(&patch.path, patch.guard.as_ref())?;
+        let target = self.destination_mutation_target(&patch.path)?;
         if patch.reuse.iter().any(Option::is_some) {
             let old = target
                 .root
@@ -279,7 +278,7 @@ impl FsOps {
                 STAGING_ADMISSION.reduce();
                 // Other workers must publish and close their bursts first.
                 drop(STAGING_ADMISSION.enter());
-                let target = self.destination_mutation_target(&put.path, put.guard.as_ref())?;
+                let target = self.destination_mutation_target(&put.path)?;
                 let _turn = root.mutation_turn(&relative).ok();
                 self.create_stage(put, source, target, PRIVATE_PARTIAL_MODE, true)
             }
@@ -505,15 +504,15 @@ impl FsOps {
                 return Err(error);
             }
         }
-        {
+        let published = {
             let root = stage.target.root.clone();
             let _replacement = root.replacement_turn();
             let _turn = root.mutation_turn(&stage.target.relative).ok();
-            self.publish_small_stage(&stream.put, stage)?;
-        }
+            self.publish_small_stage(&stream.put, stage)?
+        };
         stream.old = None;
         let stage = stream.stage.take().expect("the stage was just published");
-        self.finish_small_stage(&stream.put, stage)
+        self.finish_small_stage(&stream.put, stage, published)
     }
 }
 

@@ -1039,6 +1039,18 @@ impl Args {
         )
     }
 
+    /// Whether an ordinary receiver may rename the files this copy keeps
+    /// existing files around (`--if-exists=keep`) into place unchecked,
+    /// where no-replace takes more than a rename
+    /// (`Request::ConfigurePreservation::unchecked_keep`). Not for a copy
+    /// with `--as-new` or `--into-new`, nor on a restricted receiver.
+    pub(crate) fn keeps_unchecked(&self) -> bool {
+        self.restricted_grant.is_none()
+            && self.ignore_existing
+            && !self.protects_existing_contents()
+            && self.target_existence != Existence::New
+    }
+
     pub(crate) fn matching_meta_flags(&self) -> u8 {
         let flags = self.meta_flags();
         if self.interface == Interface::NativeCp && !self.copy_mtime_metadata {
@@ -2118,6 +2130,7 @@ fn parse_descriptor_copy(
                 | "s3_profile"
                 | "s3_header"
                 | "s3_write_header"
+                | "s3_retries"
                 | "auth_from"
                 | "performance_tuning"
                 | "rsh"

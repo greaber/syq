@@ -1368,3 +1368,24 @@ fn directory_widening_defaults_and_modes() {
         ["source", "--into", "destination", "--widen-dirs=some"].map(std::ffi::OsString::from);
     assert!(parse_native_copy(&argv).is_err());
 }
+
+/// Only an ordinary copy that keeps existing files may have them renamed
+/// into place unchecked; `--if-exists=error`, `--as-new`, `--into-new`
+/// and restricted receivers keep new names atomically.
+#[test]
+fn only_ordinary_keep_copies_rename_unchecked() {
+    assert!(args(&["--ignore-existing"]).keeps_unchecked());
+    assert!(!args(&["--existing"]).keeps_unchecked());
+    assert!(!args(&[]).keeps_unchecked());
+    for policy in [super::IfExists::Error, super::IfExists::ErrorIfDifferent] {
+        let mut protected = args(&["--ignore-existing"]);
+        protected.if_exists = Some(policy);
+        assert!(!protected.keeps_unchecked());
+    }
+    let mut new_root = args(&["--ignore-existing"]);
+    new_root.target_existence = super::Existence::New;
+    assert!(!new_root.keeps_unchecked());
+    let mut restricted = args(&["--ignore-existing"]);
+    restricted.restricted_grant = Some(Default::default());
+    assert!(!restricted.keeps_unchecked());
+}

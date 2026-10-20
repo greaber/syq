@@ -356,7 +356,6 @@ impl Planner<'_> {
             source.call(Request::FileHash {
                 path: follower.src.clone(),
                 source: Some(follower.source.clone()),
-                guard: None,
             })?,
             "hash hardlink source",
         )?;
@@ -364,7 +363,6 @@ impl Planner<'_> {
             self.dst.call(Request::FileHash {
                 path: follower.dst.clone(),
                 source: None,
-                guard: self.container_guard.clone(),
             })?,
             "hash hardlink destination",
         )?;
@@ -442,13 +440,31 @@ impl Planner<'_> {
             return Ok(());
         }
         self.assert_mutation_root()?;
+        let paths: Vec<PathBytes> = pending
+            .iter()
+            .map(|(_, follower)| follower.dst.clone())
+            .collect();
+        let conditions: Vec<TargetCondition> = pending
+            .iter()
+            .map(|(_, follower)| follower.condition)
+            .collect();
         let errors = self.apply(operations)?;
         anyhow::ensure!(
             errors.len() == pending.len(),
             "hardlink receiver returned an incomplete result batch"
         );
-        for ((group, follower), error) in pending.into_iter().zip(errors) {
-            if let Some(error) = error {
+        let kept = self.kept_by_policy(&paths, &conditions, &errors);
+        for (((group, follower), error), kept) in pending.into_iter().zip(errors).zip(kept) {
+            if kept {
+                self.progress.files_excluded.fetch_add(1, Relaxed);
+                if !self.opts.quiet {
+                    self.progress.eprintln(&format!(
+                        "syq: {}: {}",
+                        display(&follower.rel),
+                        self.opts.kept_note()
+                    ));
+                }
+            } else if let Some(error) = error {
                 self.hardlink_failure(follower, error, crate::results::ReceiverListing::Listed);
             } else if follower.destination == group.published {
                 self.progress.files_unchanged.fetch_add(1, Relaxed);
@@ -591,7 +607,6 @@ impl Worker {
                 meta,
                 flags: self.unchanged_flags(job),
                 condition: job.target_condition,
-                guard: job.container_guard.clone(),
             })?,
             "finish content-identical destination",
         )?;

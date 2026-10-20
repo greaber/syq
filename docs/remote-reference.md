@@ -22,7 +22,8 @@ host keys. HostA's SSH configuration does not override those choices.
 Enrollment needs normal command authority on the destination during setup.
 The receiver does not run as root or with root's capabilities, so enroll an
 ordinary account.
-Use a real directory, not a symlink. Transfers cannot overwrite the receiver's
+Use a real directory, not a symlink, unless the copy that sets up the receiver
+follows it with `--follow-dst`. Transfers cannot overwrite the receiver's
 SSH configuration, programs, or enrollment state. Manage that state with
 `syq receiver` commands; it is not a disposable cache.
 
@@ -89,11 +90,15 @@ for testing source builds.
 Default limits are 100 million entries and 8 TiB of file data. Override them
 for one transfer with `--receiver-max-entries N` and
 `--receiver-max-bytes SIZE`. Values can raise or lower the defaults within the
-allowed ranges. The transfer must start within 24 hours of authorization and
-finish within seven days of authorization. New authorizations allow up to
-128 worker connections, including for named destinations; a smaller worker
-setting or resource limit lowers that allowance. Existing authorizations keep
-their original limits.
+allowed ranges. Entries count the changes the destination makes: each file it
+writes, each directory, link or special file it creates, each metadata change
+and each deletion. Looking at what is already there does not count, and
+neither does a change that fails. The transfer must start within 24 hours of
+authorization and finish within seven days of authorization. New
+authorizations allow up to 128 worker connections, including for named
+destinations; a smaller `--resource-limits workers` ceiling lowers that
+allowance, while a worker count fixed with `--performance-tuning` does not.
+Existing authorizations keep their original limits.
 
 | Option or combination | Restricted receiver |
 |---|---|
@@ -102,6 +107,7 @@ their original limits.
 | `--no-tcp-encryption` | Unsupported; data connections must be encrypted |
 | `--mapping` | Listed destinations and necessary parent creation are authorized |
 | Fixed `workers` above 128 | Unsupported |
+| `--follow-dst` with `--into` | The receiver follows a destination symlink to the directory it leads to inside the directory it was set up for; not with `--widen-dirs all`, and not for [named destinations](persistence-reference.md#copy-limits) |
 | `--widen-dirs` | Approved as part of the copy; `all` widens the directory the copy goes into and those on the way to it, but nothing above the directory the receiver was set up for |
 | `--detach` | Unsupported; the local authorization process must remain attached |
 | Native `rm` | Unsupported; use a normal SSH login |

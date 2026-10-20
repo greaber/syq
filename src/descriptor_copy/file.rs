@@ -718,7 +718,6 @@ mod tests {
             off,
             hash: Settings::default().algorithm.hash(data),
             data: data.to_vec().into(),
-            guard: None,
         };
         second.handle(&write(3, b"two")).unwrap();
         first.handle(&write(0, b"one")).unwrap();
@@ -836,7 +835,6 @@ mod tests {
                     off: 0,
                     hash: [0; 32],
                     data: b"private".to_vec().into(),
-                    guard: None,
                 })
                 .unwrap();
             let modes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -915,8 +913,7 @@ mod tests {
                 attempt: 0,
                 off: 0,
                 hash: [0; 32],
-                data: b"bad".to_vec().into(),
-                guard: None
+                data: b"bad".to_vec().into()
             })
             .is_err());
         std::fs::write(target, b"changed").unwrap();

@@ -28,7 +28,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 | `comparison-block-size` | 4 MiB; 64 KiB for replaced files up to 64 MiB | 64 KiB through 64 MiB; filesystem copies only |
 | `request-size` | Automatic remote requests up to the hash block size (normally 4 MiB); at most 2 MiB for streaming | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
-| `copy-path` | `auto` | `auto`, `ranges`, or experimental `streaming` / `auto-streaming` |
+| `copy-path` | `auto` | `auto` takes shortcuts where they apply (copies and clones the receiver makes on its own machine, small-file batches, and sending a few small files in one turn) and streams long remote ranges; `ranges` copies every file in range requests without those shortcuts, which shows the range engine alone; experimental `streaming` also streams every range; experimental `auto-streaming` keeps the shortcuts and streams every other range |
 | `batch-files` | Up to 2048, sharing queued files across active workers | 1 through 4096 files per worker batch |
 | `batch-bytes` | 16 MiB | 512 bytes through 64 MiB per worker batch, including the first file |
 | `split-min-size` | 32 MiB, at least two hash blocks | 1 byte through 1 GiB, raised to at least two hash blocks |
@@ -48,21 +48,10 @@ filesystem copies; use `s3-requests` for the shared S3 data-request count.
 | `s3-requests` | Automatic | 1–65536 simultaneous data requests across objects; excludes metadata requests and idle sockets |
 | `s3-objects` | Automatic | 1–65536 objects in progress, including preparation and finalization |
 | `s3-parts-per-object` | Automatic | 1–1024 simultaneous parts or ranges per object |
-| `s3-part-size` | Automatic | 5 MiB–5 GiB per upload part or download range |
-| `s3-retries` | `10` | 0–100 retries for transient failures and throttling; 0 disables retries |
+| `s3-part-size` | 16 MiB for uploads (8 MiB to Tigris), 8 MiB for downloads (64 MiB over a low-latency link, 16 MiB from Tigris), 256 MiB for copies between buckets | 5 MiB–5 GiB per upload part or download range. Each part is one request: larger parts take fewer requests per object; smaller ones let one object use more requests at once and resend less after a failed request |
 
-Each request has its own retry allowance. Retries wait longer each time, with
-randomized delays to spread out concurrent retries. Requests keep their
-concurrency slots while waiting, so throttling slows new work too. With the
-default budget a single request can keep retrying for a minute or more. If 8
-requests in a row fail after all their retries, each with no connection, a
-timeout, or a server error or throttling response, `syq cp` and `syq rm` stop
-instead of trying the remaining objects; rerun the command once the service is
-available.
-
-For bulk deletion, syq retries only keys with temporary errors, up to
-`s3-retries` times during pruning or 10 times with `syq rm`. This count is
-separate from retries of the batch request itself.
+`--s3-retries` sets how many times each request is retried; see
+[S3 options](object-storage.md#retries).
 
 The concurrency limits are nested. For example:
 
@@ -276,11 +265,12 @@ Both endpoints still read the full file to compare it. Most staged updates and
 partial resume compare bounded windows; their hash memory does not grow with
 file size. Bandwidth-limited pulls and relays compare before requesting source
 data, so matching blocks do not consume the bandwidth budget. These copies and
-explicit whole-file comparisons (protected-existing-file policies and
-`--hash` other than for same-machine copies without block reuse,
-which compare in bounded windows) have a hash-response limit: at 64 KiB, files
-must be smaller than 130 GiB. Increasing `comparison-block-size` increases that
-limit proportionally.
+explicit whole-file comparisons (protected-existing-file policies, `--hash`
+and in-place updates) get a file's block hashes in one reply when they fit:
+up to about 130 GiB of file at 64 KiB blocks, proportionally more at larger
+blocks. A larger file is compared in windows of that size instead; when it
+differs, it is staged and compared in bounded windows, or, from a
+bandwidth-limited pull or relay, copied whole without reusing its blocks.
 A smaller effective request size, including
 bandwidth pacing, also reduces staged comparison granularity.
 

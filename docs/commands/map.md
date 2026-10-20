@@ -67,6 +67,7 @@ syq map [OPTIONS] --srcs-in DIR
 | `--s3-region <REGION>` | S3 signing region, used as given (otherwise syq asks AWS where the bucket is) |
 | `--s3-profile <NAME>` | AWS shared configuration/credentials profile |
 | `--s3-header <NAME: VALUE>` | Add a header before signing every S3 request (repeatable; S3-to-S3 metadata/tag overrides are refused) |
+| `--s3-retries <N>` | Retry each S3 request up to N times after a transient failure or throttling, 0..100 (default 10; 0 disables retries) |
 
 ## Destination placement
 
@@ -148,8 +149,8 @@ Explicit attributes apply without `--copy-metadata`. Ownership requests fail if 
 filesystem refuses them; symlinks cannot have a requested `mode`.
 S3 uploads store the attributes in syq object metadata; downloads apply them
 to the filesystem. S3-to-S3 copies keep other object metadata and stay server-side.
-Restricted receivers also require matching `--copy-metadata` permissions in the signed
-grant. Selection rules such as `--if-exists=keep` still take precedence. Supplied
+Restricted receivers apply them too, checking each against the mapping signed
+with the copy. Selection rules such as `--if-exists=keep` still take precedence. Supplied
 timestamps disable the size/time shortcut for those entries. Use `--hash` to
 compare contents when repeating a copy with a fixed destination timestamp.
 Older binaries that do not support `metadata` or `s3_last_modified` reject those

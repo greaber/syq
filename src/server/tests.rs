@@ -44,7 +44,6 @@ fn read_stream_shrinks_before_the_next_read_and_fences_late_updates() {
 
 use super::*;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 
 #[test]
 fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
@@ -122,7 +121,6 @@ fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
             scanned: crate::proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
-            guard: None,
             group: None,
             update: None,
         })
@@ -139,7 +137,6 @@ fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
         off: 0,
         hash: fsops::content_digest(data),
         data: data.to_vec().into(),
-        guard: None,
     };
     writer.write_msg(&write(b"keep")).unwrap();
     assert!(matches!(
@@ -263,7 +260,6 @@ fn a_restricted_connection_with_a_streamed_patch_open_carries_nothing_else() {
         flags: flags::RECEIVER_MODE | flags::TIMES,
         unchanged_flags: flags::RECEIVER_MODE | flags::TIMES,
         condition: TargetCondition::Any,
-        guard: None,
         update_in_place: false,
     };
     let new_data = new[..3 * block as usize].to_vec();
@@ -298,7 +294,6 @@ fn a_restricted_connection_with_a_streamed_patch_open_carries_nothing_else() {
                     path: target.join(name).as_os_str().as_bytes().to_vec(),
                     len,
                     condition: TargetCondition::Any,
-                    guard: None,
                 }],
             };
             match exchange(reader, writer, &request) {
@@ -526,12 +521,6 @@ fn tcp_server_joins_request_reader_on_shutdown() {
         reader.read_msg::<Response>().unwrap(),
         Response::HelloOk { .. }
     ));
-    let selected_metadata = std::fs::metadata(selected.path()).unwrap();
-    let guard = ContainerGuard {
-        root: selected.path().as_os_str().as_bytes().to_vec(),
-        dev: selected_metadata.dev(),
-        ino: selected_metadata.ino(),
-    };
     writer
         .write_msg(&Request::Scan {
             root: selected.path().as_os_str().as_bytes().to_vec(),
@@ -539,19 +528,17 @@ fn tcp_server_joins_request_reader_on_shutdown() {
             follow_root: false,
             ignore: Vec::new(),
             report_ignored: false,
-            guard: Some(guard.clone()),
         })
         .unwrap();
     assert!(matches!(
         reader.read_msg::<Response>().unwrap(),
-        Response::Err(error) if error.contains("source session rejects caller-supplied guards")
+        Response::Err(error) if error.contains("omitted its registered source reference")
     ));
     writer
         .write_msg(&Request::Apply {
             ops: vec![Op::Unlink {
                 path: marker.as_os_str().as_bytes().to_vec(),
             }],
-            guard: None,
         })
         .unwrap();
     assert!(matches!(
@@ -564,12 +551,12 @@ fn tcp_server_joins_request_reader_on_shutdown() {
             paths: vec![selected.path().as_os_str().as_bytes().to_vec()],
             sources: None,
             follow: false,
-            guard: Some(guard),
         })
         .unwrap();
     assert!(matches!(
         reader.read_msg::<Response>().unwrap(),
-        Response::Err(error) if error.contains("source session rejects caller-supplied guards")
+        Response::EndpointError(error)
+            if error.as_str().contains("omitted its registered source references")
     ));
     writer
         .write_msg(&Request::ReadRange {
@@ -1309,7 +1296,6 @@ fn stream_worker_rebinds_only_live_files_from_its_original_session() {
             off: 0,
             hash: [0; 32],
             data: b"written".to_vec().into(),
-            guard: None,
         })
         .unwrap();
     assert!(matches!(

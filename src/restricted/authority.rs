@@ -2,7 +2,6 @@ use super::*;
 use crate::destination_results::{Change, Failure};
 
 pub(super) struct AuthorityState {
-    pub(super) paths: HashSet<Vec<u8>>,
     /// Objects this grant created and the executor confirmed. The
     /// existing-object policy is about what existed before the transfer, so
     /// later operations on these are the transfer's own business.
@@ -11,18 +10,18 @@ pub(super) struct AuthorityState {
     /// grant the shortcut above: a second creation of the same path races at
     /// the kernel instead of trusting an outcome that has not happened yet.
     pub(super) provisional: HashSet<Vec<u8>>,
-    /// Bytes each staged or in-place file may occupy on disk, keyed by the
-    /// destination path and the partial this grant declared for it:
-    /// preallocation and basis seeding are charged against the aggregate
-    /// ceiling here, once per file at its largest declared size, and every
-    /// write or publication must name a declared partial. Observation-only
+    /// Bytes each staged, in-place or patched file this copy is writing
+    /// may occupy on disk, keyed by the destination path and the partial
+    /// this grant declared for it: preallocation and basis seeding are
+    /// charged against the aggregate ceiling here, once per file at its
+    /// largest declared size, while the file is in flight. A published file
+    /// leaves the map and its bytes stay counted. Observation-only
     /// preparations own separate provisional holds so an older absent
     /// observation cannot roll back a newer preparation for the same key.
     pub(super) reserved: HashMap<(Vec<u8>, proto::CopyId), ByteReservation>,
     pub(super) reserved_bytes: u64,
     pub(super) next_reservation_hold: u64,
-    pub(super) transferred_bytes: u64,
-    pub(super) deletions: u64,
+    pub(super) next_reservation_instance: u64,
     pub(super) live_connections: u16,
     pub(super) tcp_listener_started: bool,
     /// Files this grant's results stream is writing that have not been
@@ -50,6 +49,24 @@ pub(super) struct ByteReservation {
     /// Capacity provisionally held by observation-only preparations until
     /// their individual outcomes are settled.
     pub(super) observations: HashMap<ReservationHoldId, u64>,
+    /// The file counts against the entry limit (`charge_request`), and
+    /// how many requests still to settle share that count.
+    pub(super) entry: Option<EntryCharge>,
+    /// Which reservation of its key this is: one settled away and made
+    /// again for the same file and partial is another, which a request
+    /// that held a share of the first must not touch.
+    pub(super) instance: u64,
+}
+
+/// One file's count against the entry limit, which every request that may
+/// create or open it for writing shares: it is given back only once all of
+/// them have settled and none changed anything.
+#[derive(Debug, Default)]
+pub(super) struct EntryCharge {
+    /// Requests that rely on the count and have not settled.
+    holders: usize,
+    /// One of them reported a change.
+    made: bool,
 }
 
 impl ByteReservation {
@@ -94,6 +111,203 @@ pub(super) fn reject_control_plane_path(
     Ok(())
 }
 
+/// Most symlinks `resolve_destination_links` follows, as the kernel bounds
+/// a path lookup.
+const MAX_DESTINATION_LINKS: usize = 40;
+
+/// Where `resolve_destination_links` found a destination reached through
+/// symlinks.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ResolvedDestination {
+    /// The deepest existing directory on the resolved path, relative to the
+    /// enrolled root, as components.
+    pub(super) existing: Vec<Vec<u8>>,
+    /// How many of the signed destination's components lead to `existing`:
+    /// the rest do not exist yet, and the copy creates them inside it.
+    pub(super) signed_components: usize,
+}
+
+/// Resolve the symlinks on the way to `destination`, a path relative to
+/// `root` (named `root_path`), inside the root: `None` when no component is
+/// a symlink. Components of the destination itself that do not exist yet
+/// are left for the copy to create; a symlink that leads outside the root,
+/// or to a name that does not exist, is refused.
+pub(super) fn resolve_destination_links(
+    root: &Root,
+    root_path: &[u8],
+    destination: &[u8],
+) -> Result<Option<ResolvedDestination>> {
+    let components = |path: &[u8]| -> Vec<Vec<u8>> {
+        path.split(|byte| *byte == b'/')
+            .filter(|component| !component.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect()
+    };
+    let label = |path: &[Vec<u8>]| String::from_utf8_lossy(&path.join(&b'/')).into_owned();
+    // Each pending component, with the index of the destination component
+    // it is, or the link whose target it comes from.
+    enum Origin {
+        Destination(usize),
+        Link(String, Vec<u8>),
+    }
+    let mut pending: std::collections::VecDeque<(Vec<u8>, Origin)> = components(destination)
+        .into_iter()
+        .enumerate()
+        .map(|(index, component)| (component, Origin::Destination(index)))
+        .collect();
+    let signed_total = pending.len();
+    let mut resolved: Vec<Vec<u8>> = Vec::new();
+    let mut links = 0;
+    while let Some((component, origin)) = pending.pop_front() {
+        match component.as_slice() {
+            b"." => continue,
+            b".." => {
+                if resolved.pop().is_none() {
+                    bail!("a destination symlink leads outside the enrolled root");
+                }
+                continue;
+            }
+            _ => {}
+        }
+        resolved.push(component);
+        let path = crate::rooted::RelativePath::new(&resolved.join(&b'/'))?;
+        let Some(metadata) = root.metadata_optional(&path)? else {
+            resolved.pop();
+            return match origin {
+                // The rest of the destination is missing too: the copy
+                // creates it inside the directory found so far.
+                Origin::Destination(index) => Ok((links > 0).then_some(ResolvedDestination {
+                    existing: resolved,
+                    signed_components: index,
+                })),
+                Origin::Link(link, target) => bail!(
+                    "the destination symlink {link} leads to {}, which does not exist",
+                    String::from_utf8_lossy(&target)
+                ),
+            };
+        };
+        if !metadata.is_symlink() {
+            continue;
+        }
+        links += 1;
+        if links > MAX_DESTINATION_LINKS {
+            bail!("too many symlinks on the way to the destination");
+        }
+        let target = root.read_link(&path)?;
+        let link = label(&resolved);
+        resolved.pop();
+        let rest = if target.starts_with(b"/") {
+            let inside =
+                crate::fsops::destination_relative_to(root_path, &target).with_context(|| {
+                    format!("the destination symlink {link} leads outside the enrolled root")
+                })?;
+            resolved.clear();
+            inside
+        } else {
+            target.clone()
+        };
+        for component in components(&rest).into_iter().rev() {
+            pending.push_front((component, Origin::Link(link.clone(), target.clone())));
+        }
+    }
+    Ok((links > 0).then_some(ResolvedDestination {
+        existing: resolved,
+        signed_components: signed_total,
+    }))
+}
+
+/// Refuse a destination whose directory is, contains or lies inside one of
+/// the receiver's protected control paths, judged by identity: `existing`
+/// is the deepest existing directory of the destination, relative to
+/// `root`, and `whole` says whether it is the destination itself rather
+/// than one the copy creates the destination inside. Names a path is
+/// spelled with, through symlinks or a root of `/`, do not matter, and a
+/// control path that is a symlink is judged where it really is. A control
+/// path that does not exist yet is protected by its ancestors: a
+/// destination that contains where it would be is refused.
+pub(super) fn reject_control_plane_directory(
+    root: &Root,
+    existing: &[Vec<u8>],
+    whole: bool,
+    protected: &[ReceiverControlPath],
+) -> Result<()> {
+    // The identities from the root down to the directory.
+    let mut chain = Vec::with_capacity(existing.len() + 1);
+    for depth in 0..=existing.len() {
+        let relative = crate::rooted::RelativePath::new(&existing[..depth].join(&b'/'))?;
+        let directory = root.open_directory(&relative)?;
+        let metadata = directory.metadata()?;
+        chain.push((metadata.dev(), metadata.ino()));
+    }
+    let destination = *chain.last().expect("the root is always in the chain");
+    for control in protected {
+        let control_path = Path::new(OsStr::from_bytes(&control.path));
+        // The destination is the control path or lies beneath it.
+        let inside = fs::metadata(control_path)
+            .is_ok_and(|metadata| chain.contains(&(metadata.dev(), metadata.ino())));
+        // The destination is the control path or one of its ancestors,
+        // spelled as configured or where the path really is.
+        let real = real_location(control_path);
+        let contains = whole
+            && control_path
+                .ancestors()
+                .chain(real.iter().flat_map(|real| real.ancestors()))
+                .any(|ancestor| {
+                    fs::metadata(ancestor)
+                        .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == destination)
+                });
+        if inside || contains {
+            bail!(
+                "command-restricted destination overlaps the receiver's protected {} {}; choose a destination outside the receiver control plane",
+                control.label,
+                control_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Where `path` really is: its deepest existing ancestor with every symlink
+/// resolved, and the rest of it as spelled.
+fn real_location(path: &Path) -> Option<std::path::PathBuf> {
+    let mut missing = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(real) = fs::canonicalize(existing) {
+            return Some(
+                missing
+                    .iter()
+                    .rev()
+                    .fold(real, |path, name| path.join(name)),
+            );
+        }
+        missing.push(existing.file_name()?);
+        existing = existing.parent()?;
+    }
+}
+
+/// The deepest existing directory of `destination` beneath `root`,
+/// following no symlink, and whether it is the destination itself.
+fn existing_directory_components(root: &Root, destination: &[u8]) -> Result<(Vec<Vec<u8>>, bool)> {
+    let mut existing = Vec::new();
+    for component in destination
+        .split(|byte| *byte == b'/')
+        .filter(|c| !c.is_empty())
+    {
+        existing.push(component.to_vec());
+        let relative = crate::rooted::RelativePath::new(&existing.join(&b'/'))?;
+        match root.metadata_optional(&relative)? {
+            Some(metadata) if metadata.is_dir() => {}
+            Some(_) => bail!("not a directory"),
+            None => {
+                existing.pop();
+                return Ok((existing, false));
+            }
+        }
+    }
+    Ok((existing, true))
+}
+
 pub(super) fn reject_control_plane_scopes(
     copy: &CopyOperation,
     protected: &[ReceiverControlPath],
@@ -108,7 +322,13 @@ pub(super) fn reject_control_plane_scopes(
 /// of its token-authenticated TCP workers. HostA may choose protocol messages,
 /// but it cannot remove or replace this receiver-side authority.
 pub(crate) struct RestrictedAuthority {
-    pub(super) guard: ContainerGuard,
+    /// The enrolled root (or a receiving machine's container), opened once
+    /// and verified by identity when the grant is redeemed. Every
+    /// connection of the copy uses it as its destination root, and every
+    /// lookup here resolves beneath it.
+    pub(super) root: std::sync::Arc<Root>,
+    /// The path requests name `root` by.
+    pub(super) root_path: Vec<u8>,
     pub(super) destination: Vec<u8>,
     pub(super) copy: CopyOperation,
     pub(super) filters: FilterPolicy,
@@ -128,6 +348,14 @@ pub(crate) struct RestrictedAuthority {
     pub(super) file_data_limit: Option<crate::bwlimit::BandwidthLimit>,
     pub(super) deadline: Instant,
     pub(super) control_open: AtomicBool,
+    /// Changes authorized so far, against the signed entry limit: each
+    /// creation, publication, link, metadata change and deletion counts
+    /// each time it is made. Lookups count nothing.
+    pub(super) changes: std::sync::atomic::AtomicU64,
+    /// File bytes received so far, against the signed byte limit.
+    pub(super) transferred_bytes: std::sync::atomic::AtomicU64,
+    /// Deletions authorized so far, against the signed deletion limit.
+    pub(super) deletions: std::sync::atomic::AtomicU64,
     pub(super) state: Mutex<AuthorityState>,
     /// Signalled whenever an in-flight request settles.
     pub(super) settled: std::sync::Condvar,
@@ -141,6 +369,11 @@ pub(crate) struct RestrictedAuthority {
     /// The scope of the files this copy is writing, which the receiver holds
     /// open until the copy's control connection ends.
     pub(super) stage_scope: u64,
+    /// What this receiver's own lookups for the planner found, where
+    /// they let a file's publication be held to the grant without looking
+    /// again (`constrain_publication`): keeping existing files, or
+    /// replacing only existing ones.
+    pub(super) lookups: Option<std::sync::Arc<crate::fsops::lookups::PlanningLookups>>,
 }
 
 impl RestrictedAuthority {
@@ -150,7 +383,7 @@ impl RestrictedAuthority {
     pub(crate) fn owned_objects(
         &self,
     ) -> Option<std::sync::Arc<crate::fsops::owned::OwnedObjects>> {
-        (self.copy.policy.existing == ExistingDestinationPolicy::Skip
+        (self.creation_policy(false) == ExistingDestinationPolicy::Skip
             && self.extra_options.hardlinks)
             .then(|| self.owned.clone())
     }
@@ -242,17 +475,70 @@ impl RestrictedAuthority {
             bail!("signed destination must be a child of the enrolled root");
         }
         crate::rooted::RelativePath::new(relative.as_os_str().as_bytes())?;
-        Root::open_verified(
+        let mut root = std::sync::Arc::new(Root::open_verified(
             root_path,
             RootIdentity {
                 dev: config.root_dev,
                 ino: config.root_ino,
             },
-        )?;
+        )?);
+        let mut held_path = config.root.as_bytes().to_vec();
+        let relative = relative.as_os_str().as_bytes();
+        // `--follow-dst`: a destination reached through symlinks is the
+        // directory they resolve to inside the enrolled root. That
+        // directory, or the deepest existing one the copy creates the rest
+        // of the destination inside, is the root every connection works
+        // beneath, named in requests by the matching part of the signed
+        // destination, so nothing reaches past it.
+        let followed = if extra_options.follow_dst
+            && copy.policy.placement != DestinationPlacement::ExactPath
+        {
+            resolve_destination_links(&root, &held_path, relative)?
+        } else {
+            None
+        };
+        if let Some(found) = followed {
+            let signed: Vec<&[u8]> = relative
+                .split(|byte| *byte == b'/')
+                .filter(|component| !component.is_empty())
+                .collect();
+            let whole = found.signed_components == signed.len();
+            if whole && found.existing.is_empty() {
+                bail!("signed destination resolves to the enrolled root itself");
+            }
+            // The path the links resolve to, with the directories the copy
+            // creates, by its names as well as by identity: a control
+            // directory that does not exist yet has no identity.
+            let resolved = signed[found.signed_components..].iter().fold(
+                crate::fsops::join(config.root.as_bytes(), &found.existing.join(&b'/')),
+                |path, component| crate::fsops::join(&path, component),
+            );
+            reject_control_plane_path(&resolved, protected)?;
+            reject_control_plane_directory(&root, &found.existing, whole, protected)?;
+            let directory = root
+                .open_directory(&crate::rooted::RelativePath::new(
+                    &found.existing.join(&b'/'),
+                )?)
+                .with_context(|| {
+                    format!(
+                        "signed destination {} resolves to {}, which is not a directory",
+                        destination.display(),
+                        String::from_utf8_lossy(&found.existing.join(&b'/'))
+                    )
+                })?;
+            root = std::sync::Arc::new(Root::from_directory(directory)?);
+            held_path =
+                crate::fsops::join(&held_path, &signed[..found.signed_components].join(&b'/'));
+        } else if let Ok(found) = existing_directory_components(&root, relative) {
+            // The destination's directory as it stands, judged by identity
+            // too: a name the strings above miss cannot reach the control
+            // plane either.
+            reject_control_plane_directory(&root, &found.0, found.1, protected)?;
+        }
         let file_data_limit = (max_file_data_bytes_per_second > 0)
             .then(|| crate::bwlimit::BandwidthLimit::new(max_file_data_bytes_per_second));
         receipt_policy.validate()?;
-        let authority = Self {
+        let mut authority = Self {
             hashing,
             extra_options,
             owned: Default::default(),
@@ -264,11 +550,8 @@ impl RestrictedAuthority {
                     copy.limits.max_entries,
                 ))
             }),
-            guard: ContainerGuard {
-                root: config.root.as_bytes().to_vec(),
-                dev: config.root_dev,
-                ino: config.root_ino,
-            },
+            root,
+            root_path: held_path,
             destination: copy.destination.clone(),
             copy,
             filters,
@@ -286,15 +569,16 @@ impl RestrictedAuthority {
             deadline,
             control_open: AtomicBool::new(true),
             settled: std::sync::Condvar::new(),
+            changes: Default::default(),
+            transferred_bytes: Default::default(),
+            deletions: Default::default(),
             state: Mutex::new(AuthorityState {
-                paths: HashSet::new(),
                 created: HashSet::new(),
                 provisional: HashSet::new(),
                 reserved: HashMap::new(),
                 reserved_bytes: 0,
                 next_reservation_hold: 0,
-                transferred_bytes: 0,
-                deletions: 0,
+                next_reservation_instance: 0,
                 live_connections: 0,
                 tcp_listener_started: false,
                 file_lifecycles: HashMap::new(),
@@ -302,7 +586,18 @@ impl RestrictedAuthority {
                 results_closing: false,
                 recorded_any: false,
             }),
+            lookups: None,
         };
+        authority.lookups = match authority.creation_policy(false) {
+            ExistingDestinationPolicy::Skip => Some(crate::fsops::lookups::Recording::Keep),
+            ExistingDestinationPolicy::MustExist => {
+                Some(crate::fsops::lookups::Recording::Existing)
+            }
+            _ => None,
+        }
+        .map(|recording| {
+            std::sync::Arc::new(crate::fsops::lookups::PlanningLookups::new(recording))
+        });
         authority.check_root_existence()?;
         Ok(authority)
     }
@@ -362,7 +657,7 @@ impl RestrictedAuthority {
             state = self.settled.wait_timeout(state, remaining).unwrap().0;
         }
         let unfinished = std::mem::take(&mut state.file_lifecycles);
-        let transferred_bytes = state.transferred_bytes;
+        let transferred_bytes = self.transferred_bytes.load(Ordering::Acquire);
         let mut results = self.results.lock().unwrap();
         let stream = results
             .as_mut()
@@ -582,7 +877,18 @@ impl RestrictedAuthority {
         } else {
             None
         };
-        let reservation = state.reserved.entry(key).or_default();
+        let AuthorityState {
+            reserved,
+            next_reservation_instance,
+            ..
+        } = &mut *state;
+        let reservation = reserved.entry(key).or_insert_with(|| {
+            *next_reservation_instance += 1;
+            ByteReservation {
+                instance: *next_reservation_instance,
+                ..Default::default()
+            }
+        });
         if let Some(hold) = hold {
             reservation.observations.insert(hold, size);
         } else {
@@ -631,85 +937,6 @@ impl RestrictedAuthority {
         }
     }
 
-    /// The size this grant declared for a partial, which bounds what may be
-    /// written into it and what may be published from it. A partial left by
-    /// an earlier grant has no declaration here and cannot be used.
-    pub(super) fn declared_size(&self, path: &[u8], copy_id: proto::CopyId) -> Result<u64> {
-        self.state
-            .lock()
-            .unwrap()
-            .reserved
-            .get(&(path.to_vec(), copy_id))
-            .and_then(ByteReservation::effective_size)
-            .with_context(|| {
-                format!(
-                    "staged file {} was not declared under this grant",
-                    String::from_utf8_lossy(path)
-                )
-            })
-    }
-
-    /// Refuse to publish a staged or in-place file that is larger than the
-    /// size this grant declared for it.
-    pub(super) fn check_published_length(
-        &self,
-        path: &[u8],
-        copy_id: proto::CopyId,
-        inplace: bool,
-    ) -> Result<()> {
-        let declared = self.declared_size(path, copy_id)?;
-        let staged = crate::fsops::partial_path(Path::new(OsStr::from_bytes(path)), &copy_id)?
-            .into_os_string()
-            .into_vec();
-        // An in-place request writes the file at its name only when the
-        // receiver created it there; when the name already held a file it
-        // writes a stage instead.
-        let staged = if inplace && self.rooted_metadata(&staged)?.is_none() {
-            path.to_vec()
-        } else {
-            staged
-        };
-        if let Some(metadata) = self.rooted_metadata(&staged)? {
-            if metadata.len > declared {
-                bail!(
-                    "staged file {} exceeds its declared size",
-                    String::from_utf8_lossy(path)
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// Charge every entry a destination scan returns against the signed entry
-    /// ceiling, so enumeration is bounded like every other observation.
-    pub(crate) fn record_scanned<'a>(
-        &self,
-        root: &[u8],
-        entries: impl IntoIterator<Item = &'a [u8]>,
-    ) -> Result<()> {
-        for relative in entries {
-            if relative.is_empty() {
-                continue;
-            }
-            self.record_path(&crate::fsops::join(root, relative))?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn record_path(&self, path: &[u8]) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        if state.paths.contains(path) {
-            return Ok(());
-        }
-        // Check before inserting: a path rejected at the ceiling must not be
-        // remembered, or resubmitting it would pass as already counted.
-        if state.paths.len() as u64 >= self.copy.limits.max_entries {
-            bail!("signed grant entry limit exceeded");
-        }
-        state.paths.insert(path.to_vec());
-        Ok(())
-    }
-
     pub(super) fn mapping_relative<'a>(&self, path: &'a [u8]) -> Result<&'a [u8]> {
         if path == self.destination {
             return Ok(b"");
@@ -754,8 +981,7 @@ impl RestrictedAuthority {
         {
             bail!("receiver observation is outside the signed destination scopes");
         }
-        self.check_mapping_path(path, None)?;
-        self.record_path(path)
+        self.check_mapping_path(path, None)
     }
 
     /// The directory the copy goes into without filling it, which only an
@@ -841,7 +1067,7 @@ impl RestrictedAuthority {
         if self.path_is_ignored(path, is_dir) {
             bail!("receiver mutation targets a path excluded by the signed filter policy");
         }
-        self.record_path(path)
+        Ok(())
     }
 
     pub(super) fn created_by_this_grant(&self, path: &[u8]) -> bool {
@@ -901,16 +1127,10 @@ impl RestrictedAuthority {
     /// A later publication still reports it. A file not being written has
     /// nothing to mark, and a refusal adds nothing that lasts.
     fn end_refused_lifecycles(&self, state: &mut AuthorityState, request: &Request) {
-        let (path, copy_id) = match request {
-            Request::Prepare { path, copy_id, .. }
-            | Request::StageBasis { path, copy_id, .. }
-            | Request::SeedBasis { path, copy_id, .. }
-            | Request::WriteRange { path, copy_id, .. }
-            | Request::ReuseComparedRange { path, copy_id, .. }
-            | Request::Finalize { path, copy_id, .. } => (path, *copy_id),
-            _ => return,
+        let Some(key) = file_key(request) else {
+            return;
         };
-        if let Some(lifecycle) = state.file_lifecycles.get_mut(&(path.clone(), copy_id)) {
+        if let Some(lifecycle) = state.file_lifecycles.get_mut(&key) {
             lifecycle.listed = true;
         }
     }
@@ -959,6 +1179,11 @@ impl RestrictedAuthority {
                 .iter()
                 .map(|put| file(&put.path, put.data.len() as u64))
                 .collect(),
+            Request::PrepareSmallFiles(request) => request
+                .files
+                .iter()
+                .map(|small| file(&small.path, small.size))
+                .collect(),
             Request::PatchSmallBatch(patches) => patches
                 .iter()
                 .map(|patch| file(&patch.path, patch.len))
@@ -986,9 +1211,11 @@ impl RestrictedAuthority {
         let Settlement {
             creations,
             outcomes,
+            charged,
             tracked,
             stream: _,
         } = settlement;
+        self.refund_unmade(&charged, response);
         if creations.is_empty() && outcomes.is_empty() && !tracked {
             return;
         }
@@ -1013,6 +1240,22 @@ impl RestrictedAuthority {
                     Some(Ok(_)) => None,
                     Some(Err(error)) => Some(Failure::of(error)),
                     None => Some(missing()),
+                },
+                _ => None,
+            }
+        };
+        // The executor's typed error for an operation, where it gave one.
+        let outcome_wire = |index: usize| -> Option<&proto::WireError> {
+            match response {
+                proto::Response::EndpointError(error) => Some(error),
+                proto::Response::Applied(results) => results.get(index).and_then(Option::as_ref),
+                proto::Response::PatchedBatch(results) => match results.get(index) {
+                    Some(Err(error)) => Some(&error.error),
+                    _ => None,
+                },
+                proto::Response::PublishedBatch(results) => match results.get(index) {
+                    Some(Err(error)) => Some(error),
+                    _ => None,
                 },
                 _ => None,
             }
@@ -1083,12 +1326,18 @@ impl RestrictedAuthority {
                     // it declared, as staging keeps its declaration.
                     if let Some(hold) = hold {
                         let key = (path.clone(), copy_id);
+                        let published = !kept && !stale && outcome_error(index).is_none();
                         Self::settle_observation_reservation(
                             &mut state,
                             &key,
                             hold,
                             !kept && !stale,
                         );
+                        // A published file is no longer in flight; what it
+                        // occupies stays counted.
+                        if published {
+                            state.reserved.remove(&key);
+                        }
                     }
                     let change = if kept {
                         Change::KeepFile
@@ -1114,7 +1363,19 @@ impl RestrictedAuthority {
                 }
                 PendingOutcome::LogicalIfFailed { index, .. }
                 | PendingOutcome::Logical { index, .. }
+                | PendingOutcome::Metadata { index, .. }
                     if declined(index) => {}
+                PendingOutcome::Metadata { index, path, kind } => {
+                    if let Some(error) = outcome_error(index) {
+                        let kind = kind.unwrap_or_else(|| {
+                            self.rooted_metadata(&path)
+                                .ok()
+                                .flatten()
+                                .map_or(proto::Kind::File, |metadata| kind_from_mode(metadata.mode))
+                        });
+                        self.record_change(&path, Change::SetMetadata { kind }, Some(error));
+                    }
+                }
                 PendingOutcome::LogicalIfFailed {
                     index,
                     path,
@@ -1124,11 +1385,50 @@ impl RestrictedAuthority {
                         self.record_change(&path, change, Some(error));
                     }
                 }
+                PendingOutcome::SmallCopy { index, path, size } => {
+                    let proto::Response::SmallFilesCopied(proto::SmallCopyResponse {
+                        outcome: proto::SmallCopyOutcome::Published(results),
+                        ..
+                    }) = response
+                    else {
+                        continue;
+                    };
+                    let Some(result) = results.get(index) else {
+                        continue;
+                    };
+                    let error = result.error.as_ref().map(Failure::of);
+                    let change = match result.disposition {
+                        proto::SmallCopyDisposition::Copied => Change::PublishFile { size },
+                        proto::SmallCopyDisposition::QuickChecked
+                        | proto::SmallCopyDisposition::ContentMatched
+                            if result.repaired =>
+                        {
+                            Change::SetMetadata {
+                                kind: proto::Kind::File,
+                            }
+                        }
+                        _ => continue,
+                    };
+                    self.record_change(&path, change, error);
+                }
                 PendingOutcome::Logical {
                     index,
                     path,
                     change,
-                } => self.record_change(&path, change, outcome_error(index)),
+                } => {
+                    let creation = matches!(
+                        change,
+                        Change::PublishFile { .. }
+                            | Change::CreateSymlink
+                            | Change::CreateSpecial
+                            | Change::LinkFile
+                    );
+                    let error = outcome_error(index);
+                    if creation && self.kept_by_policy(&state, &path, false, outcome_wire(index)) {
+                        continue;
+                    }
+                    self.record_change(&path, change, error);
+                }
                 PendingOutcome::FileStage {
                     index,
                     path,
@@ -1158,27 +1458,54 @@ impl RestrictedAuthority {
                     let refused = stage == FileStage::Prepare
                         && matches!(response, proto::Response::EndpointError(error)
                             if crate::fsops::vouch::is_replace_required_wire(error));
+                    // A published file is no longer in flight; what it
+                    // occupies stays counted. Nor is one whose name the
+                    // existing-object policy keeps.
+                    if stage == FileStage::Finalize
+                        && (outcome_error(index).is_none()
+                            || self.kept_by_policy(&state, &path, false, outcome_wire(index)))
+                    {
+                        state.reserved.remove(&(path.clone(), copy_id));
+                        if outcome_error(index).is_some() {
+                            state.file_lifecycles.remove(&(path.clone(), copy_id));
+                            continue;
+                        }
+                    }
                     if absent || refused || !streaming {
                         continue;
                     }
                     let key = (path.clone(), copy_id);
+                    let declared = size.or_else(|| {
+                        state
+                            .reserved
+                            .get(&key)
+                            .and_then(ByteReservation::effective_size)
+                    });
                     match (stage, outcome_error(index)) {
                         // Published: reported now and no longer tracked. A
                         // repeated finalization reports nothing new.
                         (FileStage::Finalize, None) => {
-                            if state.file_lifecycles.remove(&key).is_some() {
-                                self.record_change(&path, Change::PublishFile { size }, None);
+                            if let Some(lifecycle) = state.file_lifecycles.remove(&key) {
+                                self.record_change(
+                                    &path,
+                                    Change::PublishFile {
+                                        size: lifecycle.size,
+                                    },
+                                    None,
+                                );
                             }
                         }
                         (_, error) => {
                             let lifecycle =
                                 state.file_lifecycles.entry(key).or_insert(FileLifecycle {
-                                    size,
+                                    size: declared.unwrap_or(0),
                                     last_error: None,
                                     last_class: "io",
                                     listed: false,
                                 });
-                            lifecycle.size = size;
+                            if let Some(declared) = declared {
+                                lifecycle.size = declared;
+                            }
                             if let Some(error) = error {
                                 lifecycle.last_error =
                                     crate::destination_results::bounded_diagnostic(error.message);
@@ -1209,15 +1536,20 @@ impl RestrictedAuthority {
     /// policy, as a directory whenever the placement puts names inside it.
     /// A creation this call records is provisional until `settle` sees the
     /// executor succeed; `index` and `pending` carry that bookkeeping.
+    ///
+    /// `refuses_existing` says the executor's operation refuses a name that
+    /// exists, atomically, when held to `Absent`: a file's publication, a
+    /// symlink, special file or hard link. Under `Skip` such a creation
+    /// needs no look here.
     pub(super) fn constrain_creation(
         &self,
         path: &[u8],
         condition: &mut proto::TargetCondition,
-        directory: bool,
+        (directory, refuses_existing): (bool, bool),
         index: usize,
         pending: &mut Vec<PendingCreation>,
     ) -> Result<()> {
-        let policy = self.copy.policy.existing;
+        let policy = self.creation_policy(directory);
         let root_must_be_new =
             self.root_existence == RootExistence::New && path == self.destination;
         let label = String::from_utf8_lossy(path);
@@ -1234,7 +1566,15 @@ impl RestrictedAuthority {
         {
             return Ok(());
         }
-        let observed = self.rooted_metadata(path)?;
+        // A new file under `Skip` is published without replacing anything,
+        // which the receiver refuses atomically if the name exists: it
+        // needs no look first either.
+        let observed =
+            if policy == ExistingDestinationPolicy::Skip && refuses_existing && !directory {
+                None
+            } else {
+                self.rooted_metadata(path)?
+            };
         self.constrain_observed_creation(
             path,
             condition,
@@ -1243,6 +1583,159 @@ impl RestrictedAuthority {
             pending,
             (policy, observed),
         )
+    }
+
+    /// Bind a staged file's publication at `path`, a put or a
+    /// finalization, to the signed existing-object policy, as
+    /// `constrain_creation` does, and say what it replaces as the receiver
+    /// knows it without a look.
+    ///
+    /// Where this receiver recorded what it found itself (`fsops::lookups`),
+    /// the publication needs neither a look nor a link. Keeping existing
+    /// files, a name found absent, by the receiver's own lookup for the
+    /// planner or because a directory above it was found missing or empty
+    /// or was created by this receiver, is renamed into place unchecked, by
+    /// one publication only, and a name found present is kept. Replacing
+    /// only existing files, a file found present is renamed over. A name
+    /// not recorded, or found absent and already given to a publication, is
+    /// held as `constrain_creation` holds it, and so is a publication
+    /// `in_place`. Another program creating or removing the name after the
+    /// receiver looked is the race every copy accepts.
+    pub(super) fn constrain_publication(
+        &self,
+        path: &[u8],
+        condition: &mut proto::TargetCondition,
+        in_place: bool,
+        index: usize,
+        pending: &mut Vec<PendingCreation>,
+    ) -> Result<proto::ScannedDestination> {
+        use crate::fsops::lookups::{Claim, Looked};
+        use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
+        let label = String::from_utf8_lossy(path);
+        let root_must_be_new =
+            self.root_existence == RootExistence::New && path == self.destination;
+        let recorded = match &self.lookups {
+            Some(lookups)
+                if !(in_place || root_must_be_new || self.created_by_this_grant(path)) =>
+            {
+                crate::fsops::destination_relative_to(&self.root_path, path)
+                    .ok()
+                    .map(|relative| (lookups, relative))
+            }
+            _ => None,
+        };
+        if let Some((lookups, relative)) = recorded {
+            match self.creation_policy(false) {
+                ExistingDestinationPolicy::Skip => match lookups.claim(&relative) {
+                    Claim::Absent => {
+                        match *condition {
+                            Any | Absent => *condition = Any,
+                            Matches { .. } | MatchesFingerprint { .. } => bail!(
+                                "replacement of {label} contradicts the signed existing-object policy"
+                            ),
+                        }
+                        self.state.lock().unwrap().provisional.insert(path.to_vec());
+                        pending.push(PendingCreation {
+                            index,
+                            path: path.to_vec(),
+                            persist: true,
+                            link: false,
+                        });
+                        return Ok(proto::ScannedDestination::Absent);
+                    }
+                    Claim::Present => {
+                        return Err(kept(format!(
+                            "signed grant retains existing objects: {label} already exists"
+                        )))
+                    }
+                    Claim::Unknown => {}
+                },
+                ExistingDestinationPolicy::MustExist => {
+                    if let Some(Looked::Present { file_mode }) = lookups.get(&relative) {
+                        if *condition == Absent {
+                            bail!(
+                                "no-replace creation of {label} contradicts the signed existing-object policy"
+                            );
+                        }
+                        pending.push(PendingCreation {
+                            index,
+                            path: path.to_vec(),
+                            persist: false,
+                            link: false,
+                        });
+                        return Ok(file_mode.map_or(
+                            proto::ScannedDestination::Unknown,
+                            proto::ScannedDestination::File,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.constrain_creation(path, condition, (false, true), index, pending)?;
+        Ok(if *condition == Absent {
+            proto::ScannedDestination::Absent
+        } else {
+            proto::ScannedDestination::Unknown
+        })
+    }
+
+    /// Whether this receiver's own lookup for the planner found `path`.
+    fn looked_up_present(&self, path: &[u8]) -> bool {
+        self.lookups.as_ref().is_some_and(|lookups| {
+            crate::fsops::destination_relative_to(&self.root_path, path).is_ok_and(|relative| {
+                matches!(
+                    lookups.get(&relative),
+                    Some(crate::fsops::lookups::Looked::Present { .. })
+                )
+            })
+        })
+    }
+
+    /// Forget what the receiver's lookups found at `path`, once the grant
+    /// deletes it.
+    fn forget_lookup(&self, path: &[u8]) {
+        if let (Some(lookups), Ok(relative)) = (
+            &self.lookups,
+            crate::fsops::destination_relative_to(&self.root_path, path),
+        ) {
+            lookups.forget(&relative);
+        }
+    }
+
+    /// The existing-object policy a creation is held to: the grant's, or,
+    /// for anything but a directory under `keep_files` (`syq rsync
+    /// --ignore-existing`), `Skip`.
+    fn creation_policy(&self, directory: bool) -> ExistingDestinationPolicy {
+        match self.copy.policy.existing {
+            ExistingDestinationPolicy::Replace if self.extra_options.keep_files && !directory => {
+                ExistingDestinationPolicy::Skip
+            }
+            policy => policy,
+        }
+    }
+
+    /// Whether the failure of a change at `path` only shows an object its
+    /// existing-object policy keeps: the executor found, before changing
+    /// anything, that the destination did not meet the change's condition
+    /// (`fsops::condition_not_met`), under `Skip` (or `keep_files` for
+    /// anything but a directory) or `MustExist`. Such a change is no
+    /// failure: nothing changed, as the policy asks. A root that must be
+    /// new, and a name this grant created, are never kept.
+    fn kept_by_policy(
+        &self,
+        state: &AuthorityState,
+        path: &[u8],
+        directory: bool,
+        error: Option<&proto::WireError>,
+    ) -> bool {
+        error.is_some_and(crate::fsops::is_condition_not_met_wire)
+            && matches!(
+                self.creation_policy(directory),
+                ExistingDestinationPolicy::Skip | ExistingDestinationPolicy::MustExist
+            )
+            && !(self.root_existence == RootExistence::New && path == self.destination)
+            && !state.created.contains(path)
     }
 
     pub(super) fn constrain_observed_creation(
@@ -1261,15 +1754,23 @@ impl RestrictedAuthority {
                 let metadata = match observed {
                     Some(metadata) if !directory || metadata.is_dir() => metadata,
                     Some(_) => {
-                        bail!("signed grant creates nothing: {label} exists but is not a directory")
+                        return Err(kept(format!(
+                            "signed grant creates nothing: {label} exists but is not a directory"
+                        )))
                     }
-                    None => bail!("signed grant creates nothing: {label} does not exist"),
+                    None => {
+                        return Err(kept(format!(
+                            "signed grant creates nothing: {label} does not exist"
+                        )))
+                    }
                 };
                 // Pin the mutation to what was observed: a signed deletion on
                 // another connection could otherwise empty the path between
                 // this check and execution, turning an update into a creation.
                 // A caller-supplied identity is accepted only when it names
-                // the observed object, never on its own authority.
+                // the observed object, never on its own authority, and only
+                // where numbers can show that.
+                self.existence_only_where_numbers_mislead(&metadata, condition);
                 match *condition {
                     Any => {
                         *condition = Matches {
@@ -1293,9 +1794,11 @@ impl RestrictedAuthority {
                             metadata.ctime,
                             metadata.ctime_nsec,
                         ) => {}
-                    Matches { .. } | MatchesFingerprint { .. } => bail!(
-                        "requested identity for {label} does not match the object the receiver observed"
-                    ),
+                    Matches { .. } | MatchesFingerprint { .. } => {
+                        return Err(kept(format!(
+                            "requested identity for {label} does not match the object the receiver observed"
+                        )))
+                    }
                 }
                 if !directory {
                     // Metadata later in this same batch lands on the new
@@ -1320,7 +1823,13 @@ impl RestrictedAuthority {
                 if observed.is_some_and(|metadata| {
                     !(directory && metadata.is_dir() && policy == ExistingDestinationPolicy::Skip)
                 }) {
-                    bail!("signed grant retains existing objects: {label} already exists")
+                    let refusal =
+                        format!("signed grant retains existing objects: {label} already exists");
+                    // A root that must be new fails; anything else is kept.
+                    if policy == ExistingDestinationPolicy::Skip {
+                        return Err(kept(refusal));
+                    }
+                    bail!(refusal)
                 }
                 match *condition {
                     Any | Absent => *condition = Absent,
@@ -1346,11 +1855,14 @@ impl RestrictedAuthority {
     /// Bind mutations at `path` to the signed existing-object policy.
     /// `Skip` protects all pre-existing objects, including directories,
     /// while permitting updates to objects created by this grant.
+    /// `directory` marks a directory's metadata: under `keep_files` only
+    /// those of existing objects may change.
     pub(super) fn constrain_update(
         &self,
         path: &[u8],
         condition: Option<&mut proto::TargetCondition>,
         pending: &[PendingCreation],
+        directory: bool,
     ) -> Result<()> {
         let label = String::from_utf8_lossy(path);
         // A creation earlier in this same request (a symlink followed by its
@@ -1360,16 +1872,16 @@ impl RestrictedAuthority {
         let created_here = pending
             .iter()
             .any(|creation| creation.path == path && !creation.link);
-        match self.copy.policy.existing {
+        match self.creation_policy(directory) {
             // A name this grant created leads only to an object it created,
             // whatever runs on other connections meanwhile: the one step
             // that could give it an existing file is a hard link, which
             // this policy allows only to the grant's own files
             // (`OwnedObjects`).
             ExistingDestinationPolicy::Skip if created_before || created_here => Ok(()),
-            ExistingDestinationPolicy::Skip => {
-                bail!("signed grant retains existing objects: {label} may not be modified")
-            }
+            ExistingDestinationPolicy::Skip => Err(kept(format!(
+                "signed grant retains existing objects: {label} may not be modified"
+            ))),
             ExistingDestinationPolicy::MustExist if created_before || created_here => Ok(()),
             // Updates are pinned to the observed object, like publications:
             // nothing hostA supplies names an inode on its own authority.
@@ -1378,6 +1890,25 @@ impl RestrictedAuthority {
             ExistingDestinationPolicy::UpdateIfOlder => {
                 bail!("update-if-older existing-object policy is not enforceable by the receiver")
             }
+        }
+    }
+
+    /// Where inode numbers cannot show which file a name leads to
+    /// (`fsops::Profile::link_counts_trusted`), a sender's identity for the
+    /// object observed as `observed` is set aside: the change is pinned to
+    /// what is there, as on any receiver there (`FsOps`'s
+    /// `existence_only_where_numbers_mislead`).
+    fn existence_only_where_numbers_mislead(
+        &self,
+        observed: &RootMetadata,
+        condition: &mut proto::TargetCondition,
+    ) {
+        let trusted = self.root.known_profile(observed.dev).map_or_else(
+            || self.root.link_counts_trusted(),
+            |profile| profile.link_counts_trusted,
+        );
+        if !trusted && matches!(*condition, proto::TargetCondition::Matches { .. }) {
+            *condition = proto::TargetCondition::Any;
         }
     }
 
@@ -1395,11 +1926,14 @@ impl RestrictedAuthority {
     ) -> Result<()> {
         use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
         let Some(metadata) = self.rooted_metadata(path)? else {
-            bail!("signed grant creates nothing: {label} does not exist")
+            return Err(kept(format!(
+                "signed grant creates nothing: {label} does not exist"
+            )));
         };
         let Some(condition) = condition else {
             return Ok(());
         };
+        self.existence_only_where_numbers_mislead(&metadata, condition);
         match *condition {
             Any => {
                 *condition = Matches {
@@ -1423,9 +1957,11 @@ impl RestrictedAuthority {
                     metadata.ctime,
                     metadata.ctime_nsec,
                 ) => {}
-            Matches { .. } | MatchesFingerprint { .. } => bail!(
-                "requested identity for {label} does not match the object the receiver observed"
-            ),
+            Matches { .. } | MatchesFingerprint { .. } => {
+                return Err(kept(format!(
+                    "requested identity for {label} does not match the object the receiver observed"
+                )))
+            }
         }
         Ok(())
     }
@@ -1433,11 +1969,19 @@ impl RestrictedAuthority {
     /// Refuse to write in place a root the grant requires to be new: it is
     /// staged and published without replacing anything, so that no one
     /// sees it partly written, unless this grant created it.
-    pub(super) fn constrain_inplace(&self, path: &[u8]) -> Result<()> {
+    /// `creates` says the in-place write creates the file where its name is
+    /// free; one that only updates an existing file creates nothing.
+    pub(super) fn constrain_inplace(&self, path: &[u8], creates: bool) -> Result<()> {
         // In place, the receiver creates the file when its name is free,
         // and the name can become free after any check here: only a grant
-        // that lets the copy replace and create alike allows that.
-        if self.copy.policy.existing != ExistingDestinationPolicy::Replace {
+        // that lets the copy replace and create alike allows that. A grant
+        // that creates nothing lets an existing file be updated in place,
+        // as one it replaces would be: the receiver writes into the file
+        // it opens at the name, and stages the file where there is none,
+        // held to the grant as any staged file is.
+        let policy = self.creation_policy(false);
+        let updates_only = !creates && policy == ExistingDestinationPolicy::MustExist;
+        if policy != ExistingDestinationPolicy::Replace && !updates_only {
             bail!(
                 "signed grant does not let {} be created or replaced freely: it is not written in place",
                 String::from_utf8_lossy(path)
@@ -1473,18 +2017,26 @@ impl RestrictedAuthority {
             return Ok(());
         }
         let label = String::from_utf8_lossy(path);
-        match self.copy.policy.existing {
-            ExistingDestinationPolicy::Skip if self.rooted_metadata(path)?.is_some() => {
-                bail!("signed grant retains existing objects: {label} already exists")
-            }
-            ExistingDestinationPolicy::MustExist if self.rooted_metadata(path)?.is_none() => {
-                bail!("signed grant creates nothing: {label} does not exist")
+        // Under `Skip` the publication refuses a name that exists, so
+        // nothing is looked at here; under `MustExist`, a name this
+        // receiver's lookups found needs no look either.
+        match self.creation_policy(false) {
+            ExistingDestinationPolicy::MustExist
+                if !self.looked_up_present(path) && self.rooted_metadata(path)?.is_none() =>
+            {
+                Err(kept(format!(
+                    "signed grant creates nothing: {label} does not exist"
+                )))
             }
             _ => Ok(()),
         }
     }
 
-    pub(super) fn check_flags(&self, flags: u8) -> Result<()> {
+    /// Check a request's metadata flags against the grant's options, also
+    /// allowing those in `mapped`, which a signed mapping entry sets for the
+    /// path the request changes (`mapped_grants`).
+    pub(super) fn check_flags(&self, flags: u8, mapped: u8) -> Result<()> {
+        let granted = |flag: u8| mapped & flag != 0;
         let known = proto::flags::MODE_MASK
             | proto::flags::OWNER
             | proto::flags::GROUP
@@ -1509,51 +2061,98 @@ impl RestrictedAuthority {
         if flags & proto::flags::MODE_MASK == proto::flags::MODE_MASK {
             bail!("request cannot mix source and receiver-managed mode flags");
         }
-        if flags & proto::flags::MODE != 0 && !self.copy.options.preserve_permissions {
+        if flags & proto::flags::MODE != 0
+            && !self.copy.options.preserve_permissions
+            && !granted(proto::flags::MODE)
+        {
             bail!("request tries to preserve permissions not authorized by the grant");
         }
         if flags & proto::flags::RECEIVER_MODE != 0 && !self.copy.options.receiver_managed_modes {
             bail!("request tries to apply receiver-managed modes not authorized by the grant");
         }
-        if flags & proto::flags::OWNER != 0 && !self.copy.options.preserve_owner {
+        if flags & proto::flags::OWNER != 0
+            && !self.copy.options.preserve_owner
+            && !granted(proto::flags::OWNER)
+        {
             bail!("request tries to preserve ownership not authorized by the grant");
         }
-        if flags & proto::flags::GROUP != 0 && !self.copy.options.preserve_group {
+        if flags & proto::flags::GROUP != 0
+            && !self.copy.options.preserve_group
+            && !granted(proto::flags::GROUP)
+        {
             bail!("request tries to preserve group not authorized by the grant");
         }
-        if flags & proto::flags::TIMES != 0 && !self.copy.options.preserve_times {
+        if flags & proto::flags::TIMES != 0
+            && !self.copy.options.preserve_times
+            && !granted(proto::flags::TIMES)
+        {
             bail!("request tries to preserve timestamps not authorized by the grant");
         }
         Ok(())
     }
 
+    /// What is at `path` now, looked up beneath the root this copy holds.
     pub(super) fn rooted_metadata(&self, path: &[u8]) -> Result<Option<RootMetadata>> {
-        let root_path = Path::new(OsStr::from_bytes(&self.guard.root));
-        let target = Path::new(OsStr::from_bytes(path));
-        let relative = target.strip_prefix(root_path).with_context(|| {
-            format!(
-                "receiver metadata target {} is outside enrolled root {}",
-                target.display(),
-                root_path.display()
-            )
-        })?;
-        let relative = RelativePath::new(relative.as_os_str().as_bytes())?;
-        let root = Root::open_verified(
-            root_path,
-            RootIdentity {
-                dev: self.guard.dev,
-                ino: self.guard.ino,
-            },
-        )?;
-        root.metadata_optional(&relative)
+        self.root.metadata_optional(&self.root_relative(path)?)
+    }
+
+    /// `path` relative to the root this copy holds.
+    pub(super) fn root_relative(&self, path: &[u8]) -> Result<RelativePath> {
+        let relative =
+            crate::fsops::destination_relative_to(&self.root_path, path).with_context(|| {
+                format!(
+                    "receiver metadata target {} is outside enrolled root {}",
+                    String::from_utf8_lossy(path),
+                    String::from_utf8_lossy(&self.root_path)
+                )
+            })?;
+        RelativePath::new(&relative)
+    }
+
+    /// Set up one connection's executor to serve this copy: its hashing,
+    /// the files it gives new names to, the scope of the files it writes,
+    /// and the root it works beneath, which every connection shares, as an
+    /// ordinary receiver works beneath the directory its sender anchored.
+    pub(crate) fn configure_session(&self, ops: &mut crate::fsops::FsOps) {
+        ops.set_hash_policy(self.hash_policy());
+        ops.set_owned_objects(self.owned_objects());
+        ops.set_stage_scope(self.stage_scope());
+        ops.install_restricted_destination(self.root.clone(), &self.root_path);
+        ops.set_planning_lookups(self.lookups.clone());
+    }
+
+    /// An executor set up as one of this copy's connections, for tests.
+    #[cfg(test)]
+    pub(crate) fn test_ops(&self) -> crate::fsops::FsOps {
+        let mut ops = crate::fsops::FsOps::new();
+        self.configure_session(&mut ops);
+        ops
     }
 
     /// Check metadata a request applies: the grant's flags, and only the
     /// inode metadata the grant selects. A receiver-chosen mode is the
     /// receiver's own to decide, as on every receiver
     /// (`fsops::receiver_mode`).
-    pub(super) fn check_metadata(&self, meta: &proto::Meta, flags: u8) -> Result<()> {
-        self.check_flags(flags)?;
+    pub(super) fn check_metadata(&self, path: &[u8], meta: &proto::Meta, flags: u8) -> Result<()> {
+        let mapped = self.mapped_grants(path, |metadata| {
+            let mut granted = 0;
+            if metadata.mode == Some(meta.mode & 0o7777) {
+                granted |= proto::flags::MODE;
+            }
+            if metadata.uid == Some(meta.uid) {
+                granted |= proto::flags::OWNER;
+            }
+            if metadata.gid == Some(meta.gid) {
+                granted |= proto::flags::GROUP;
+            }
+            if metadata.mtime == Some(meta.mtime)
+                && metadata.mtime_nsec.unwrap_or(0) == meta.mtime_nsec
+            {
+                granted |= proto::flags::TIMES;
+            }
+            granted
+        })?;
+        self.check_flags(flags, mapped)?;
         if let Some(metadata) = &meta.inode_metadata {
             let requested = crate::inode_metadata::Selection {
                 acls: metadata.acls.is_some() || metadata.macos_acl.is_some(),
@@ -1568,6 +2167,39 @@ impl RestrictedAuthority {
             );
         }
         Ok(())
+    }
+
+    /// The metadata flags the signed mapping entry for `path` grants, as
+    /// `grants` finds them in that entry's metadata: what the mapping sets
+    /// explicitly may be applied without the matching copy option, and only
+    /// with exactly its values.
+    fn mapped_grants(
+        &self,
+        path: &[u8],
+        grants: impl FnOnce(&crate::mapping::Metadata) -> u8,
+    ) -> Result<u8> {
+        let Some(mapping) = &self.mapping else {
+            return Ok(0);
+        };
+        let mapping = mapping.lock().unwrap();
+        Ok(mapping
+            .permissions()?
+            .metadata(self.mapping_relative(path)?)
+            .map_or(0, grants))
+    }
+
+    /// The flags a preparation of `path` names for the publication to come,
+    /// in `mode`: a mapping entry's explicit mode must be `mode`, and the
+    /// other values it sets are checked when the file is published.
+    pub(super) fn check_preparation_flags(&self, path: &[u8], mode: u32, flags: u8) -> Result<()> {
+        let mapped = self.mapped_grants(path, |metadata| {
+            let mut granted = metadata.flags() & !proto::flags::MODE;
+            if metadata.mode == Some(mode & 0o7777) {
+                granted |= proto::flags::MODE;
+            }
+            granted
+        })?;
+        self.check_flags(flags, mapped)
     }
 
     pub(super) fn check_hash_request(&self, block: u64, len: u64) -> Result<()> {
@@ -1599,7 +2231,11 @@ impl RestrictedAuthority {
         Ok(())
     }
 
-    pub(super) fn charge_bytes(&self, path: &[u8], offset: u64, bytes: usize) -> Result<()> {
+    /// Check file data a request carries for `path` at `offset`: within the
+    /// per-file limit and one rate-limit burst, paced to the signed rate.
+    /// Its bytes count against the total once the request is authorized
+    /// (`charge_request`).
+    pub(super) fn check_file_bytes(&self, path: &[u8], offset: u64, bytes: usize) -> Result<()> {
         self.check_mutation_path(path, false)?;
         let bytes = u64::try_from(bytes).context("request byte count overflow")?;
         if self
@@ -1613,15 +2249,6 @@ impl RestrictedAuthority {
         if end > self.copy.limits.max_file_bytes {
             bail!("signed grant per-file byte limit exceeded");
         }
-        let mut state = self.state.lock().unwrap();
-        state.transferred_bytes = state
-            .transferred_bytes
-            .checked_add(bytes)
-            .context("signed transfer byte counter overflow")?;
-        if state.transferred_bytes > self.copy.limits.max_total_bytes {
-            bail!("signed grant total-byte limit exceeded");
-        }
-        drop(state);
         if let Some(limit) = &self.file_data_limit {
             limit.wait(bytes);
             self.check_deadline()?;
@@ -1629,25 +2256,276 @@ impl RestrictedAuthority {
         Ok(())
     }
 
-    pub(super) fn charge_deletion(&self, path: &[u8], is_dir: bool) -> Result<()> {
+    /// Check a deletion the grant may make. It counts against the deletion
+    /// limit once its request is authorized (`charge_request`).
+    pub(super) fn check_deletion(&self, path: &[u8], is_dir: bool) -> Result<()> {
         if path == self.destination {
             bail!("the signed destination root itself may not be deleted");
         }
         if self.filters.delete_excluded {
             self.check_mutation_authority(path)?;
-            self.record_path(path)?;
         } else {
             self.check_mutation_path(path, is_dir)?;
         }
         if self.copy.policy.deletion == DeletionPolicy::Forbid {
             bail!("deletion is not authorized by the signed grant");
         }
+        Ok(())
+    }
+
+    /// Count an authorized request against the signed limits: each change
+    /// it makes against the entry limit, each deletion against the deletion
+    /// limit, and the file bytes it carries against the byte limit. Nothing
+    /// is counted when any limit would be exceeded.
+    pub(super) fn charge_request(&self, request: &Request) -> Result<Charged> {
+        let mut deleting = Vec::new();
+        // A file the copy writes counts once, before its first change: the
+        // request that creates or opens it for writing (a stage, a
+        // sidecar, an in-place file, even an empty one) or, for one prepared
+        // only to look, the publication.
+        let file = match request {
+            Request::Prepare {
+                path,
+                copy_id,
+                create_if_missing,
+                update,
+                ..
+            } if *create_if_missing || update.is_some() => Some((path.clone(), *copy_id)),
+            Request::StageBasis { path, copy_id, .. }
+            | Request::SeedBasis { path, copy_id, .. }
+            | Request::Finalize { path, copy_id, .. } => Some((path.clone(), *copy_id)),
+            _ => None,
+        };
+        // The file's count is shared through its reservation; without one,
+        // the request counts the file as an ordinary change of its own.
+        // The state stays locked until the request holds its share, so two
+        // requests never both count the file.
         let mut state = self.state.lock().unwrap();
-        state.deletions += 1;
-        if state.deletions > self.copy.limits.max_deletions {
+        let (file, file_charge, own_file_change) = match file {
+            Some(key) => match state.reserved.get(&key) {
+                Some(reservation) => {
+                    let charge = reservation.entry.is_none();
+                    let instance = reservation.instance;
+                    (Some((key, instance)), charge, false)
+                }
+                None => (None, false, true),
+            },
+            None => (None, false, false),
+        };
+        let (changes, bytes) = match request {
+            Request::Apply { ops } => {
+                deleting = ops
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, op)| matches!(op, Op::Rmdir { .. } | Op::Unlink { .. }))
+                    .map(|(index, _)| index)
+                    .collect();
+                (ops.len() as u64, 0)
+            }
+            Request::PutSmallBatch(puts) => (
+                puts.len() as u64,
+                puts.iter().map(|put| put.data.len() as u64).sum(),
+            ),
+            Request::PatchSmallBatch(patches) => (
+                patches.len() as u64,
+                patches.iter().map(|patch| patch.data.len() as u64).sum(),
+            ),
+            Request::PatchBegin { .. } | Request::FinishBasis { .. } => (1, 0),
+            Request::Prepare { .. }
+            | Request::StageBasis { .. }
+            | Request::SeedBasis { .. }
+            | Request::Finalize { .. } => (u64::from(own_file_change), 0),
+            Request::PrepareSmallFiles(request) => (request.files.len() as u64, 0),
+            Request::CopySmallFiles(payloads) => (
+                0,
+                payloads
+                    .iter()
+                    .map(|payload| payload.data.len() as u64)
+                    .sum(),
+            ),
+            Request::WriteRange { data, .. } | Request::PatchData { data, .. } => {
+                (0, data.len() as u64)
+            }
+            _ => (0, 0),
+        };
+        let charge = |counter: &std::sync::atomic::AtomicU64, amount: u64, limit: u64| {
+            amount == 0
+                || counter
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |total| {
+                        total.checked_add(amount).filter(|total| *total <= limit)
+                    })
+                    .is_ok()
+        };
+        let refund = |counter: &std::sync::atomic::AtomicU64, amount: u64| {
+            counter.fetch_sub(amount, Ordering::AcqRel);
+        };
+        let deletions = deleting.len() as u64;
+        let limits = &self.copy.limits;
+        let counted = changes + u64::from(file_charge);
+        if !charge(&self.changes, counted, limits.max_entries) {
+            bail!("signed grant entry limit exceeded");
+        }
+        if !charge(&self.deletions, deletions, limits.max_deletions) {
+            refund(&self.changes, counted);
             bail!("signed grant deletion limit exceeded");
         }
-        Ok(())
+        if !charge(&self.transferred_bytes, bytes, limits.max_total_bytes) {
+            refund(&self.changes, counted);
+            refund(&self.deletions, deletions);
+            bail!("signed grant total-byte limit exceeded");
+        }
+        if let Some((key, _)) = &file {
+            let reservation = state
+                .reserved
+                .get_mut(key)
+                .expect("the reservation was found under the same lock");
+            reservation
+                .entry
+                .get_or_insert_with(Default::default)
+                .holders += 1;
+        }
+        Ok(Charged {
+            changes,
+            deleting,
+            file,
+        })
+    }
+
+    /// Settle a request whose execution never started, as a small copy
+    /// that ended without its payloads: nothing it was charged for
+    /// changed, and it fails with `reason`.
+    pub(super) fn settle_unexecuted(&self, mut settlement: Settlement, reason: &str) {
+        let charged = std::mem::take(&mut settlement.charged);
+        self.changes.fetch_sub(charged.changes, Ordering::AcqRel);
+        self.deletions
+            .fetch_sub(charged.deleting.len() as u64, Ordering::AcqRel);
+        self.release_file(charged.file.as_ref(), false);
+        self.settle(settlement, &proto::Response::Err(reason.into()));
+    }
+
+    /// Release a settled request's share of `file`'s count against the
+    /// entry limit, noting whether it `made` a change. The count is given
+    /// back when the last share goes and no request changed the file.
+    fn release_file(&self, file: Option<&FileShare>, made: bool) {
+        let Some((key, instance)) = file else {
+            return;
+        };
+        let mut state = self.state.lock().unwrap();
+        // A reservation settled away meanwhile was published or failed
+        // after a change: the count stays, and a newer reservation of the
+        // same key is another file's.
+        let Some(reservation) = state
+            .reserved
+            .get_mut(key)
+            .filter(|reservation| reservation.instance == *instance)
+        else {
+            return;
+        };
+        let Some(entry) = &mut reservation.entry else {
+            return;
+        };
+        entry.holders = entry.holders.saturating_sub(1);
+        entry.made |= made;
+        if entry.holders == 0 && !entry.made {
+            reservation.entry = None;
+            self.changes.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Give back the changes and deletions of an authorized request that
+    /// the executor reports it did not make, and nothing else: a change
+    /// whose condition the executor found unmet before changing anything
+    /// (`fsops::condition_not_met`), a patch that found its file changed
+    /// since it was compared, a small-copy file that needed no change, and
+    /// a small copy that wrote nothing. A change that failed after it may
+    /// have changed something stays counted, as do the files of a small
+    /// copy whose staging failed: their sidecars stay for the fallback
+    /// engine to resume.
+    fn refund_unmade(&self, charged: &Charged, response: &proto::Response) {
+        use crate::fsops::is_unchanged_wire as unmet;
+        let all = || (0..charged.changes as usize).collect::<Vec<usize>>();
+        let unmade: Vec<usize> = match response {
+            proto::Response::EndpointError(error) if unmet(error) => all(),
+            proto::Response::Applied(results) => results
+                .iter()
+                .enumerate()
+                .filter(|(_, error)| error.as_ref().is_some_and(unmet))
+                .map(|(index, _)| index)
+                .collect(),
+            proto::Response::PatchedBatch(results) => results
+                .iter()
+                .enumerate()
+                .filter(|(_, result)| {
+                    result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|error| error.stale_condition || unmet(&error.error))
+                })
+                .map(|(index, _)| index)
+                .collect(),
+            proto::Response::PublishedBatch(results) => results
+                .iter()
+                .enumerate()
+                .filter(|(_, result)| result.as_ref().err().is_some_and(unmet))
+                .map(|(index, _)| index)
+                .collect(),
+            // A small copy changes the files it publishes and those whose
+            // metadata it changes; a preparation waiting for its payloads
+            // is settled with their reply, and one that published nothing
+            // changed nothing.
+            proto::Response::SmallFilesCopied(proto::SmallCopyResponse {
+                outcome: proto::SmallCopyOutcome::Published(results),
+                ..
+            }) => results
+                .iter()
+                .enumerate()
+                .filter(|(_, result)| match &result.error {
+                    Some(error) => unmet(error),
+                    None => match result.disposition {
+                        proto::SmallCopyDisposition::Copied => false,
+                        proto::SmallCopyDisposition::QuickChecked
+                        | proto::SmallCopyDisposition::ContentMatched => !result.repaired,
+                        proto::SmallCopyDisposition::Excluded => true,
+                    },
+                })
+                .map(|(index, _)| index)
+                .collect(),
+            proto::Response::SmallFilesCopied(proto::SmallCopyResponse {
+                outcome: proto::SmallCopyOutcome::StagingFailed(error),
+                ..
+            }) => {
+                if unmet(error) {
+                    all()
+                } else {
+                    Vec::new()
+                }
+            }
+            // A target it does not handle, a capacity shortfall, or one
+            // that needs block reuse: nothing was written.
+            proto::Response::SmallFilesCopied(_) => all(),
+            _ => Vec::new(),
+        };
+        let refunded = (unmade.len() as u64).min(charged.changes);
+        if refunded > 0 {
+            self.changes.fetch_sub(refunded, Ordering::AcqRel);
+        }
+        // A file request changes nothing only when its condition was unmet
+        // before it started.
+        let file_unmade = matches!(response, proto::Response::EndpointError(error) if unmet(error));
+        self.release_file(charged.file.as_ref(), !file_unmade);
+        // Both lists are in operation order.
+        let mut unmade = unmade.iter().peekable();
+        let undeleted = charged
+            .deleting
+            .iter()
+            .filter(|&&index| {
+                while unmade.next_if(|&&unmade| unmade < index).is_some() {}
+                unmade.peek().is_some_and(|&&unmade| unmade == index)
+            })
+            .count() as u64;
+        if undeleted > 0 {
+            self.deletions.fetch_sub(undeleted, Ordering::AcqRel);
+        }
     }
 
     /// Release the sizes held by the patches of a refused request.
@@ -1675,9 +2553,33 @@ impl RestrictedAuthority {
         &self,
         request: &Request,
         stream: &mut Option<OpenPatchStream>,
+        small_copy: &mut Option<PreparedSmallCopy>,
         step: &mut StreamStep,
     ) -> Result<()> {
         match request {
+            Request::PrepareSmallFiles(request) => {
+                *step = StreamStep::PrepareSmallCopy {
+                    sizes: request.files.iter().map(|file| file.size).collect(),
+                };
+            }
+            // Payloads only for the files the preparation asked for, each
+            // of the size it offered.
+            Request::CopySmallFiles(payloads) => {
+                let prepared = small_copy
+                    .take()
+                    .context("no small copy is prepared on this connection")?;
+                let mut sent = vec![false; prepared.needed.len()];
+                let mismatched = payloads.iter().any(|payload| {
+                    let index = payload.index as usize;
+                    !prepared.needed.get(index).is_some_and(|needed| *needed)
+                        || std::mem::replace(&mut sent[index], true)
+                        || prepared.sizes[index] != payload.data.len() as u64
+                });
+                *step = StreamStep::CopySmallCopy(Box::new(prepared.settlement));
+                if mismatched {
+                    bail!("small copy payloads differ from what its preparation asked for");
+                }
+            }
             Request::PatchBegin { patch, data_len } => {
                 if stream.is_some() {
                     bail!("a streamed patch is already open on this connection");
@@ -1696,7 +2598,7 @@ impl RestrictedAuthority {
                     .checked_add(data.len() as u64)
                     .filter(|received| *received <= open.declared)
                     .context("streamed patch data runs past the length its begin declared")?;
-                self.charge_bytes(&open.path, open.received, data.len())?;
+                self.check_file_bytes(&open.path, open.received, data.len())?;
                 open.received = received;
             }
             Request::PatchEnd { .. } => {
@@ -1706,6 +2608,69 @@ impl RestrictedAuthority {
                 *step = StreamStep::End;
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// The small-copy shortcut (`Request::PrepareSmallFiles`) publishes
+    /// staged files at names directly inside one directory, replacing what
+    /// it finds there, or changes a kept file's metadata in place. Each file
+    /// passes the rules a `PutSmallBatch` entry does; the payloads that
+    /// follow are held to them (`authorize_stream`), and `settle` records
+    /// what the reply reports.
+    fn authorize_small_copy(
+        &self,
+        request: &proto::SmallCopyRequest,
+        outcomes: &mut Vec<PendingOutcome>,
+    ) -> Result<()> {
+        if self.creation_policy(false) != ExistingDestinationPolicy::Replace
+            || self.root_existence != RootExistence::Any
+        {
+            bail!("the small-copy shortcut replaces existing files, which this grant does not");
+        }
+        self.require_publication_mode(false, "small-copy publication")?;
+        if request.hash_policy != self.hash_policy() {
+            bail!("hash policy differs from the authorized copy");
+        }
+        let parent = |path: &[u8]| {
+            path.iter()
+                .rposition(|byte| *byte == b'/')
+                .map(|slash| path[..slash.max(1)].to_vec())
+        };
+        let in_destination = request.directory == self.destination
+            && self.copy.policy.placement != DestinationPlacement::ExactPath;
+        let at_destination = self.copy.policy.placement == DestinationPlacement::ExactPath
+            && parent(&self.destination).as_deref() == Some(request.directory.as_slice());
+        if !in_destination && !at_destination {
+            bail!("small copy writes into a directory other than the signed destination");
+        }
+        if let Some(limit) = &self.file_data_limit {
+            let bytes = request.files.iter().try_fold(0u64, |total, file| {
+                total
+                    .checked_add(file.size)
+                    .context("small copy byte count overflow")
+            })?;
+            if bytes > limit.burst_bytes() {
+                bail!("small copy exceeds the signed file-data rate-limit burst");
+            }
+        }
+        // A content match also sets times the copy compares by.
+        let flags = request.flags | (request.matching_flags & proto::flags::TIMES);
+        for (index, file) in request.files.iter().enumerate() {
+            if parent(&file.path).as_deref() != Some(request.directory.as_slice()) {
+                bail!("small copy names a file outside the directory it writes into");
+            }
+            if self.expected_hash(&file.path)?.is_some() {
+                bail!("expected-hash files require checked finalization");
+            }
+            let size = usize::try_from(file.size).context("small copy file size overflow")?;
+            self.check_file_bytes(&file.path, 0, size)?;
+            self.check_metadata(&file.path, &file.meta, flags)?;
+            outcomes.push(PendingOutcome::SmallCopy {
+                index,
+                path: file.path.clone(),
+                size: file.size,
+            });
         }
         Ok(())
     }
@@ -1749,7 +2714,7 @@ impl RestrictedAuthority {
             if (patch.flags ^ patch.unchanged_flags) & !proto::flags::TIMES != 0 {
                 bail!("kept and published metadata flags differ beyond times");
             }
-            self.check_flags(patch.unchanged_flags)?;
+            self.check_metadata(&patch.path, &patch.meta, patch.unchanged_flags)?;
             // A patch that updates its file in place passes the rules of an
             // in-place preparation too (`Request::Prepare` with `update`):
             // under a grant for it, and with metadata the grant allows,
@@ -1763,12 +2728,19 @@ impl RestrictedAuthority {
                 {
                     bail!("small-file patch does not match the signed publication policy");
                 }
-                self.constrain_inplace(&patch.path)?;
+                self.constrain_inplace(&patch.path, false)?;
             }
-            self.charge_bytes(&patch.path, 0, patch.data.len())?;
-            self.constrain_creation(&patch.path, &mut patch.condition, false, index, pending)?;
-            self.constrain_update(&patch.path, Some(&mut patch.condition), pending)?;
-            self.check_metadata(&patch.meta, patch.flags)?;
+            self.check_file_bytes(&patch.path, 0, patch.data.len())?;
+            // A patch is for a file that exists: it is looked at.
+            self.constrain_creation(
+                &patch.path,
+                &mut patch.condition,
+                (false, false),
+                index,
+                pending,
+            )?;
+            self.constrain_update(&patch.path, Some(&mut patch.condition), pending, false)?;
+            self.check_metadata(&patch.path, &patch.meta, patch.flags)?;
             let hold = self.reserve_bytes(&patch.path, patch.copy_id, patch.len, true)?;
             outcomes.push(PendingOutcome::Patch {
                 index,
@@ -1777,7 +2749,6 @@ impl RestrictedAuthority {
                 size: patch.len,
                 hold,
             });
-            patch.guard = Some(self.guard.clone());
         }
         Ok(())
     }
@@ -1812,12 +2783,12 @@ impl RestrictedAuthority {
         if matches!(condition, proto::TargetCondition::MatchesFingerprint { .. }) {
             bail!("hardlink publication accepts no fingerprint condition");
         }
-        self.constrain_creation(path, condition, false, index, pending)?;
+        self.constrain_creation(path, condition, (false, true), index, pending)?;
         // Keeping existing files, a link replaces nothing, not even a name
         // this grant created, as an honest copy links only new names there.
         // The receiver links to the final name, which the kernel refuses
         // when it exists.
-        let keep = self.copy.policy.existing == ExistingDestinationPolicy::Skip;
+        let keep = self.creation_policy(false) == ExistingDestinationPolicy::Skip;
         if keep {
             *condition = proto::TargetCondition::Absent;
         }
@@ -1903,7 +2874,8 @@ impl RestrictedAuthority {
                 bail!("recursive remove is not supported by the root-confined receiver")
             }
             Op::Rmdir { path } => {
-                self.charge_deletion(path, true)?;
+                self.check_deletion(path, true)?;
+                self.forget_lookup(path);
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
@@ -1912,7 +2884,8 @@ impl RestrictedAuthority {
                 return Ok(());
             }
             Op::Unlink { path } => {
-                self.charge_deletion(path, false)?;
+                self.check_deletion(path, false)?;
+                self.forget_lookup(path);
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
@@ -1921,16 +2894,23 @@ impl RestrictedAuthority {
                 return Ok(());
             }
         };
-        // What a metadata change applies to, for its record if it fails.
+        // What a metadata change applies to: a directory's is for nothing
+        // else (`Op::SetMeta::directory`). Otherwise it is looked up only
+        // where filters or a mapping decide by it; a failure's record looks
+        // it up when it is settled.
         let metadata_kind = match operation {
-            Op::SetMeta { .. } => self
-                .rooted_metadata(path)?
-                .map_or(proto::Kind::File, |metadata| kind_from_mode(metadata.mode)),
-            _ => proto::Kind::File,
+            Op::SetMeta {
+                directory: true, ..
+            } => Some(proto::Kind::Dir),
+            Op::SetMeta { .. } if self.filter_matcher.is_some() || self.mapping.is_some() => Some(
+                self.rooted_metadata(path)?
+                    .map_or(proto::Kind::File, |metadata| kind_from_mode(metadata.mode)),
+            ),
+            _ => None,
         };
         let is_dir = match operation {
             Op::Mkdir { .. } => true,
-            Op::SetMeta { .. } => metadata_kind == proto::Kind::Dir,
+            Op::SetMeta { .. } => metadata_kind == Some(proto::Kind::Dir),
             _ => false,
         };
         self.check_mutation_path(path, is_dir)?;
@@ -1982,7 +2962,7 @@ impl RestrictedAuthority {
                         (policy, observed),
                     )?;
                 } else {
-                    self.constrain_creation(path, condition, true, index, pending)?;
+                    self.constrain_creation(path, condition, (true, false), index, pending)?;
                 }
                 // Creation limits the permission bits; without -p the
                 // sender chooses no special bits.
@@ -2003,8 +2983,8 @@ impl RestrictedAuthority {
                 flags,
                 ..
             } => {
-                self.constrain_creation(path, condition, false, index, pending)?;
-                self.check_metadata(meta, *flags)?;
+                self.constrain_creation(path, condition, (false, true), index, pending)?;
+                self.check_metadata(path, meta, *flags)?;
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
@@ -2040,8 +3020,8 @@ impl RestrictedAuthority {
                     0o777
                 };
                 *mode = file_type | (*mode & permitted);
-                self.constrain_creation(path, condition, false, index, pending)?;
-                self.check_metadata(meta, *flags)?;
+                self.constrain_creation(path, condition, (false, true), index, pending)?;
+                self.check_metadata(path, meta, *flags)?;
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
@@ -2054,7 +3034,7 @@ impl RestrictedAuthority {
                 meta,
                 flags,
                 condition,
-                ..
+                directory,
             } => {
                 let implicit = self.mapping_parent(path)?;
                 if implicit {
@@ -2069,21 +3049,19 @@ impl RestrictedAuthority {
                         *flags = proto::flags::RECEIVER_MODE;
                     }
                 }
-                self.constrain_update(path, Some(&mut *condition), pending)?;
+                self.constrain_update(path, Some(&mut *condition), pending, *directory)?;
                 if implicit {
                     anyhow::ensure!(
                         meta.inode_metadata.is_none(),
                         "signed grants do not authorize additional inode metadata"
                     );
                 } else {
-                    self.check_metadata(meta, *flags)?;
+                    self.check_metadata(path, meta, *flags)?;
                 }
-                outcomes.push(PendingOutcome::Logical {
+                outcomes.push(PendingOutcome::Metadata {
                     index,
                     path: path.clone(),
-                    change: Change::SetMetadata {
-                        kind: metadata_kind,
-                    },
+                    kind: metadata_kind,
                 });
                 Ok(())
             }
@@ -2093,8 +3071,8 @@ impl RestrictedAuthority {
                 flags,
                 condition,
             } => {
-                self.constrain_update(path, Some(&mut *condition), pending)?;
-                self.check_metadata(meta, *flags)?;
+                self.constrain_update(path, Some(&mut *condition), pending, false)?;
+                self.check_metadata(path, meta, *flags)?;
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
@@ -2113,17 +3091,32 @@ impl RestrictedAuthority {
     /// response so provisional creations are forgotten when execution fails.
     /// A streamed patch needs its connection's `PatchStreamGate`.
     pub(crate) fn authorize(&self, request: &mut Request, over_ssh: bool) -> Result<Settlement> {
-        self.authorize_streaming(request, over_ssh, &mut None)
+        self.authorize_streaming(request, over_ssh, &mut None, &mut None)
     }
 
     /// `authorize`, with the streamed patch open on the request's
-    /// connection, if any.
+    /// connection and the small copy prepared there, if any.
     fn authorize_streaming(
         &self,
         request: &mut Request,
         over_ssh: bool,
         stream: &mut Option<OpenPatchStream>,
+        small_copy: &mut Option<PreparedSmallCopy>,
     ) -> Result<Settlement> {
+        // A prepared small copy ends with its payloads or with the
+        // connection's next request but a telemetry sample: then it made
+        // no change.
+        if !matches!(
+            request,
+            Request::CopySmallFiles(_) | Request::TransportStats
+        ) {
+            if let Some(prepared) = small_copy.take() {
+                self.settle_unexecuted(
+                    prepared.settlement,
+                    "the small copy ended without its payloads",
+                );
+            }
+        }
         let mut pending = Vec::new();
         let mut outcomes = Vec::new();
         // Requests the server executes and then settles; the results' end
@@ -2161,23 +3154,33 @@ impl RestrictedAuthority {
         }
         let mut step = StreamStep::None;
         let authorized = self.authorize_inner(request, over_ssh, &mut pending, &mut outcomes);
-        let authorized =
-            authorized.and_then(|()| self.authorize_stream(request, stream, &mut step));
+        let authorized = authorized
+            .and_then(|()| self.authorize_stream(request, stream, small_copy, &mut step))
+            .and_then(|()| self.charge_request(request));
         match authorized {
-            Ok(()) => Ok(Settlement {
+            Ok(charged) => Ok(Settlement {
                 creations: pending,
                 outcomes,
+                charged,
                 tracked,
                 stream: step,
             }),
             Err(error) => {
                 // Nothing of a refused request executes, including the
-                // entries authorized before the refusing one.
+                // entries authorized before the refusing one, or the small
+                // copy whose payloads it carries.
+                if let StreamStep::CopySmallCopy(prepared) = step {
+                    self.settle_unexecuted(*prepared, &format!("{error:#}"));
+                }
                 self.forget_provisional(&pending);
                 self.release_patch_holds(outcomes.into_iter());
                 // What it asked for, classified before taking the state lock:
                 // classifying may look at the destination.
-                let changes = if self.results_started.load(Ordering::Acquire) {
+                // The existing-object policy keeping what the destination
+                // holds is no refusal: nothing changed, as the policy asks,
+                // and the file this request was for is no longer in flight.
+                let kept = KeptExisting::is(&error);
+                let changes = if self.results_started.load(Ordering::Acquire) && !kept {
                     self.requested_changes(request)
                 } else {
                     Vec::new()
@@ -2188,12 +3191,18 @@ impl RestrictedAuthority {
                 // cannot end between the two. The state lock is taken before
                 // the results lock, as everywhere.
                 let mut state = self.state.lock().unwrap();
-                state.recorded_any = true;
-                if self.results_started.load(Ordering::Acquire) {
-                    if let Some(stream) = self.results.lock().unwrap().as_mut() {
-                        stream.refused(&format!("refused: {error:#}"), &changes);
+                if kept {
+                    if let Some(key) = file_key(request) {
+                        state.file_lifecycles.remove(&key);
                     }
-                    self.end_refused_lifecycles(&mut state, request);
+                } else {
+                    state.recorded_any = true;
+                    if self.results_started.load(Ordering::Acquire) {
+                        if let Some(stream) = self.results.lock().unwrap().as_mut() {
+                            stream.refused(&format!("refused: {error:#}"), &changes);
+                        }
+                        self.end_refused_lifecycles(&mut state, request);
+                    }
                 }
                 if tracked {
                     state.in_flight = state.in_flight.saturating_sub(1);
@@ -2222,18 +3231,13 @@ impl RestrictedAuthority {
                     bail!("hash policy differs from the authorized copy");
                 }
             }
-            Request::ValidateDigest {
-                path,
-                expected,
-                guard,
-            } => {
+            Request::ValidateDigest { path, expected } => {
                 self.check_observation_path(path)?;
                 if let Some(authorized) = self.expected_hash(path)? {
                     if *expected != crate::hashing::ExpectedHashes::Single(authorized) {
                         bail!("expected hash differs from the authorized copy");
                     }
                 }
-                *guard = Some(self.guard.clone());
             }
 
             Request::MappingChunk {
@@ -2293,7 +3297,6 @@ impl RestrictedAuthority {
                 source,
                 follow_root,
                 ignore,
-                guard,
                 ..
             } => {
                 if source.is_some() {
@@ -2316,13 +3319,11 @@ impl RestrictedAuthority {
                         bail!("destination scan filters do not match the signed filter policy");
                     }
                 }
-                *guard = Some(self.guard.clone());
             }
             Request::StatMany {
                 paths,
                 sources,
                 follow,
-                guard,
                 ..
             } => {
                 if sources.is_some() {
@@ -2334,22 +3335,53 @@ impl RestrictedAuthority {
                 for path in paths {
                     self.check_observation_path(path)?;
                 }
-                *guard = Some(self.guard.clone());
             }
-            Request::DestinationFilesystemInfo { .. } => {
-                bail!("destination filesystem inspection is not authorized by the signed grant")
+            Request::DestinationFilesystemInfo {
+                check_empty,
+                target,
+            } => {
+                // What the copy learns of the destination's filesystem is
+                // about the directory it writes into, found here: the signed
+                // destination when it is a directory, or else the directory
+                // it goes into. Only the destination is checked for
+                // emptiness.
+                let (path, metadata) = match self.rooted_metadata(&self.destination)? {
+                    Some(metadata) if metadata.is_dir() => (self.destination.clone(), metadata),
+                    _ => {
+                        *check_empty = false;
+                        let end = self.destination.iter().rposition(|&byte| byte == b'/');
+                        let parent = end
+                            .map(|end| self.destination[..end].to_vec())
+                            .filter(|parent| parent.len() > self.root_path.len())
+                            .unwrap_or_else(|| self.root_path.clone());
+                        match self.rooted_metadata(&parent)? {
+                            Some(metadata) if metadata.is_dir() => (parent, metadata),
+                            _ => (
+                                self.root_path.clone(),
+                                self.rooted_metadata(&self.root_path)?
+                                    .context("the enrolled root is missing")?,
+                            ),
+                        }
+                    }
+                };
+                *target = (path != self.root_path).then(|| proto::DestinationFilesystemTarget {
+                    relative_path: self
+                        .root_relative(&path)
+                        .map(|relative| relative.to_bytes())
+                        .unwrap_or_default(),
+                    dev: metadata.dev,
+                    ino: metadata.ino,
+                });
             }
-            Request::PartialPaths { paths, guard, .. } | Request::PruneLookup { paths, guard } => {
+            Request::PartialPaths { paths, .. } | Request::PruneLookup { paths } => {
                 for path in paths {
                     self.check_observation_path(path)?;
                 }
-                *guard = Some(self.guard.clone());
             }
             Request::PlanBatch {
                 partial_paths,
                 directories,
                 others,
-                guard,
                 ..
             } => {
                 for path in partial_paths
@@ -2359,12 +3391,10 @@ impl RestrictedAuthority {
                 {
                     self.check_observation_path(path)?;
                 }
-                *guard = Some(self.guard.clone());
             }
             Request::WidenDirectories {
                 directories,
                 remember,
-                guard,
                 access,
             } => {
                 // The approved mode bounds what is widened, and how: `rsync`
@@ -2424,12 +3454,10 @@ impl RestrictedAuthority {
                     };
                     *condition = authorized;
                 }
-                *guard = Some(self.guard.clone());
             }
             Request::PrepareDestinationPath {
                 path,
                 symlink_policy,
-                guard,
                 ..
             } => {
                 // Only an approved `all` widens the directories on the way to
@@ -2442,21 +3470,18 @@ impl RestrictedAuthority {
                 );
                 self.check_mutation_allowed()?;
                 if path.starts_with(b"/") {
-                    let root = &self.guard.root;
+                    let root = &self.root_path;
                     anyhow::ensure!(
-                        path.len() > root.len()
-                            && path.starts_with(root)
-                            && path[root.len()] == b'/',
+                        path != root && path_is_at_or_below(path, root),
                         "the destination's ancestors outside the enrolled root are never widened"
                     );
                 }
                 *path = self.destination.clone();
                 *symlink_policy = proto::OperatorSymlinkPolicy::Refuse;
-                *guard = Some(self.guard.clone());
             }
             // It restores only what the request above changed.
             Request::RestoreDestinationPath => {}
-            Request::Apply { ops, guard } => {
+            Request::Apply { ops } => {
                 let outer = (self.extra_options.widen_dirs == DirectoryWidening::All)
                     .then(|| self.outer_directory())
                     .flatten();
@@ -2473,29 +3498,21 @@ impl RestrictedAuthority {
                     }
                     self.authorize_op(operation, index, pending, outcomes)?;
                 }
-                *guard = Some(self.guard.clone());
             }
-            Request::ProbePartial { path, guard, .. } | Request::Canonicalize { path, guard } => {
+            Request::ProbePartial { path, .. } | Request::Canonicalize { path } => {
                 self.check_observation_path(path)?;
-                *guard = Some(self.guard.clone());
             }
-            Request::FileHash {
-                path,
-                source,
-                guard,
-            } => {
+            Request::FileHash { path, source } => {
                 if source.is_some() {
                     bail!("source references are not valid on a command-restricted destination");
                 }
                 self.check_observation_path(path)?;
-                *guard = Some(self.guard.clone());
             }
             Request::HashBlocks {
                 path,
                 source,
                 block,
                 len,
-                guard,
                 ..
             } => {
                 if source.is_some() {
@@ -2503,14 +3520,12 @@ impl RestrictedAuthority {
                 }
                 self.check_hash_request(*block, *len)?;
                 self.check_observation_path(path)?;
-                *guard = Some(self.guard.clone());
             }
             Request::HashWindow {
                 path,
                 off,
                 len,
                 block,
-                guard,
                 ..
             } => {
                 anyhow::ensure!(
@@ -2518,18 +3533,12 @@ impl RestrictedAuthority {
                     "invalid hash window"
                 );
                 self.check_observation_path(path)?;
-                *guard = Some(self.guard.clone());
             }
             Request::HashAndHold {
-                path,
-                block,
-                len,
-                guard,
-                ..
+                path, block, len, ..
             } => {
                 self.check_hash_request(*block, *len)?;
                 self.check_observation_path(path)?;
-                *guard = Some(self.guard.clone());
             }
             // Each file is observed as HashAndHold observes one, and the
             // hashes of the whole batch share one response.
@@ -2542,7 +3551,6 @@ impl RestrictedAuthority {
                 }
                 for file in files.iter_mut() {
                     self.check_observation_path(&file.path)?;
-                    file.guard = Some(self.guard.clone());
                 }
             }
             Request::StageBasis {
@@ -2550,7 +3558,6 @@ impl RestrictedAuthority {
                 copy_id,
                 len,
                 block,
-                guard,
                 ..
             }
             | Request::SeedBasis {
@@ -2558,7 +3565,6 @@ impl RestrictedAuthority {
                 copy_id,
                 len,
                 block,
-                guard,
                 ..
             } => {
                 self.check_hash_request(*block, if bounded_basis { 0 } else { *len })?;
@@ -2573,12 +3579,11 @@ impl RestrictedAuthority {
                     index: 0,
                     path: path.clone(),
                     copy_id: *copy_id,
-                    size: *len,
+                    size: Some(*len),
                     stage: FileStage::Prepare,
                     skip_if_absent: false,
                     observation_hold: None,
                 });
-                *guard = Some(self.guard.clone());
             }
             Request::FinishBasis {
                 expected_hash,
@@ -2586,29 +3591,27 @@ impl RestrictedAuthority {
                 meta,
                 flags,
                 condition,
-                guard,
                 ..
             } => {
                 *expected_hash = self.expected_hash(path)?.map(Into::into);
                 self.check_mutation_path(path, false)?;
-                self.constrain_update(path, Some(&mut *condition), pending)?;
-                self.check_metadata(meta, *flags)?;
+                self.constrain_update(path, Some(&mut *condition), pending, false)?;
+                self.check_metadata(path, meta, *flags)?;
                 outcomes.push(PendingOutcome::Logical {
                     index: 0,
                     path: path.clone(),
                     change: Change::KeepFile,
                 });
-                *guard = Some(self.guard.clone());
             }
             Request::Prepare {
                 path,
                 size,
                 inplace,
                 copy_id,
+                mode,
                 flags,
                 scanned,
                 create_if_missing,
-                guard,
                 update,
                 ..
             } => {
@@ -2629,15 +3632,15 @@ impl RestrictedAuthority {
                     {
                         bail!("file preparation does not match the signed publication policy");
                     }
-                    self.check_metadata(&update.meta, update.flags)?;
+                    self.check_metadata(path, &update.meta, update.flags)?;
                 }
-                self.check_flags(*flags)?;
+                self.check_preparation_flags(path, *mode, *flags)?;
                 if *size > self.copy.limits.max_file_bytes {
                     bail!("signed grant per-file byte limit exceeded");
                 }
                 self.check_mutation_path(path, false)?;
                 if *inplace {
-                    self.constrain_inplace(path)?;
+                    self.constrain_inplace(path, *create_if_missing)?;
                 }
                 self.constrain_prepare(path)?;
                 let observation_hold =
@@ -2646,43 +3649,38 @@ impl RestrictedAuthority {
                     index: 0,
                     path: path.clone(),
                     copy_id: *copy_id,
-                    size: *size,
+                    size: Some(*size),
                     stage: FileStage::Prepare,
                     skip_if_absent: !*create_if_missing,
                     observation_hold,
                 });
-                *guard = Some(self.guard.clone());
             }
             Request::ReuseComparedRange {
                 path,
                 copy_id,
                 off,
                 len,
-                guard,
                 ..
             } => {
                 self.require_publication_mode(false, "staged block reuse")?;
                 self.check_mutation_path(path, false)?;
-                let declared = self.declared_size(path, *copy_id)?;
+                // The receiver writes only within the size declared for the
+                // file it holds (`fsops::stages`).
                 anyhow::ensure!(
-                    *len > 0
-                        && off
-                            .checked_add(u64::from(*len))
-                            .is_some_and(|end| end <= declared),
-                    "reused block extends past declared file size"
+                    *len > 0 && off.checked_add(u64::from(*len)).is_some(),
+                    "invalid reused block"
                 );
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
                     copy_id: *copy_id,
-                    size: declared,
+                    size: None,
                     stage: FileStage::Write,
                     skip_if_absent: false,
                     observation_hold: None,
                 });
                 // No payload crossed the transport. Logical file capacity was
                 // reserved by StageBasis, just as for a native cloned basis.
-                *guard = Some(self.guard.clone());
             }
             Request::WriteRange {
                 path,
@@ -2690,28 +3688,21 @@ impl RestrictedAuthority {
                 copy_id,
                 off,
                 data,
-                guard,
                 ..
             } => {
+                // The receiver writes only within the size declared for the
+                // file it holds (`fsops::stages`).
                 self.require_publication_mode(*inplace, "file write")?;
-                let declared = self.declared_size(path, *copy_id)?;
-                if off
-                    .checked_add(data.len() as u64)
-                    .is_none_or(|end| end > declared)
-                {
-                    bail!("file write extends past the size declared for it");
-                }
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
                     copy_id: *copy_id,
-                    size: declared,
+                    size: None,
                     stage: FileStage::Write,
                     skip_if_absent: false,
                     observation_hold: None,
                 });
-                self.charge_bytes(path, *off, data.len())?;
-                *guard = Some(self.guard.clone());
+                self.check_file_bytes(path, *off, data.len())?;
             }
             Request::Finalize {
                 expected_hash,
@@ -2722,7 +3713,6 @@ impl RestrictedAuthority {
                 flags,
                 scanned,
                 condition,
-                guard,
                 ..
             } => {
                 // The receiver looks for itself, and knows the in-place
@@ -2732,19 +3722,17 @@ impl RestrictedAuthority {
                 *expected_hash = self.expected_hash(path)?.map(Into::into);
                 self.require_publication_mode(*inplace, "file finalization")?;
                 self.check_mutation_path(path, false)?;
-                self.check_published_length(path, *copy_id, *inplace)?;
-                self.constrain_creation(path, condition, false, 0, pending)?;
+                *scanned = self.constrain_publication(path, condition, *inplace, 0, pending)?;
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
                     copy_id: *copy_id,
-                    size: self.declared_size(path, *copy_id)?,
+                    size: None,
                     stage: FileStage::Finalize,
                     skip_if_absent: false,
                     observation_hold: None,
                 });
-                self.check_metadata(meta, *flags)?;
-                *guard = Some(self.guard.clone());
+                self.check_metadata(path, meta, *flags)?;
             }
             Request::PutSmallBatch(puts) => {
                 if puts.iter().any(|put| put.inplace) {
@@ -2761,16 +3749,23 @@ impl RestrictedAuthority {
                     }
                 }
                 for (index, put) in puts.iter_mut().enumerate() {
-                    // As for `Prepare`, the receiver looks for itself.
+                    // As for `Prepare`, the receiver looks for itself
+                    // unless it knows (`constrain_publication`).
                     put.scanned = proto::ScannedDestination::Unknown;
                     if self.expected_hash(&put.path)?.is_some() {
                         bail!("expected-hash files require checked finalization");
                     }
-                    self.charge_bytes(&put.path, 0, put.data.len())?;
+                    self.check_file_bytes(&put.path, 0, put.data.len())?;
                     if put.inplace {
-                        self.constrain_inplace(&put.path)?;
+                        self.constrain_inplace(&put.path, true)?;
                     }
-                    self.constrain_creation(&put.path, &mut put.condition, false, index, pending)?;
+                    put.scanned = self.constrain_publication(
+                        &put.path,
+                        &mut put.condition,
+                        put.inplace,
+                        index,
+                        pending,
+                    )?;
                     outcomes.push(PendingOutcome::Logical {
                         index,
                         path: put.path.clone(),
@@ -2778,8 +3773,7 @@ impl RestrictedAuthority {
                             size: put.data.len() as u64,
                         },
                     });
-                    self.check_metadata(&put.meta, put.flags)?;
-                    put.guard = Some(self.guard.clone());
+                    self.check_metadata(&put.path, &put.meta, put.flags)?;
                 }
             }
             Request::PatchSmallBatch(patches) => {
@@ -2827,11 +3821,12 @@ impl RestrictedAuthority {
             | Request::ShrinkReadStream { .. }
             | Request::StopReadStream
             | Request::ReadSmallBatch(_)
-            | Request::ReadDifferingBatch { .. }
-            | Request::PrepareSmallFiles(_)
-            | Request::CopySmallFiles(_) => {
+            | Request::ReadDifferingBatch { .. } => {
                 bail!("request is not valid on a command-restricted destination")
             }
+            Request::PrepareSmallFiles(request) => self.authorize_small_copy(request, outcomes)?,
+            // Held to its preparation in `authorize_stream`.
+            Request::CopySmallFiles(_) => {}
             Request::ListDir { .. }
             | Request::ListDirDetails { .. }
             | Request::ListDirNoFollowFinal { .. } => {
@@ -2856,8 +3851,13 @@ impl RestrictedAuthority {
                 selection,
                 sparse,
                 narrow_new_directories,
+                unchecked_keep,
                 ..
             } => {
+                // Every no-replace publication a grant sets is held.
+                if *unchecked_keep {
+                    bail!("a command-restricted receiver keeps existing files atomically");
+                }
                 if *narrow_new_directories
                     || (*sparse && !self.extra_options.sparse)
                     || !self.extra_options.allows(*selection)
@@ -2874,7 +3874,7 @@ impl RestrictedAuthority {
                     bail!("destination results run only on the signed control connection");
                 }
             }
-            Request::NewFileOwner { path, probe, guard } => {
+            Request::NewFileOwner { path, probe } => {
                 // A probe the receiver creates to learn whom its files show
                 // stays inside the destination and is removed at once, and
                 // is made only while the grant allows changes.
@@ -2882,7 +3882,6 @@ impl RestrictedAuthority {
                 if self.check_mutation_allowed().is_err() {
                     *probe = false;
                 }
-                *guard = Some(self.guard.clone());
             }
             Request::TransportStats
             | Request::ReceiverUser
@@ -2900,11 +3899,28 @@ impl RestrictedAuthority {
 pub(crate) struct Settlement {
     pub(super) creations: Vec<PendingCreation>,
     pub(super) outcomes: Vec<PendingOutcome>,
+    /// What the request counted against the signed limits.
+    pub(super) charged: Charged,
     /// The request counts as in flight until settled.
     pub(super) tracked: bool,
     /// Where the request leaves its connection's streamed patch.
     pub(super) stream: StreamStep,
 }
+
+/// The changes a request counted against the entry limit, and which of its
+/// operations, by index, counted as deletions (`charge_request`).
+#[derive(Debug, Default)]
+pub(super) struct Charged {
+    changes: u64,
+    deleting: Vec<usize>,
+    /// The file whose shared count against the entry limit this request
+    /// holds until it settles (`EntryCharge`).
+    file: Option<FileShare>,
+}
+
+/// A file's reservation key and which reservation of it a request shares
+/// (`ByteReservation::instance`).
+type FileShare = ((Vec<u8>, proto::CopyId), u64);
 
 /// What a request does to its connection's streamed patch.
 #[derive(Debug, Default)]
@@ -2917,6 +3933,23 @@ pub(super) enum StreamStep {
         declared: u64,
     },
     End,
+    /// Prepare a small copy of files of these sizes.
+    PrepareSmallCopy {
+        sizes: Vec<u64>,
+    },
+    /// Send the prepared small copy's payloads; its preparation settles
+    /// with their reply.
+    CopySmallCopy(Box<Settlement>),
+}
+
+/// A small copy prepared on one connection, waiting for its payloads: the
+/// files its preparation asked for, and that preparation's settlement,
+/// which the payloads' reply settles. Until then it counts as in flight.
+#[derive(Debug)]
+pub(crate) struct PreparedSmallCopy {
+    sizes: Vec<u64>,
+    needed: Vec<bool>,
+    settlement: Settlement,
 }
 
 /// A streamed patch open on one connection: the new data its pieces may
@@ -2936,6 +3969,7 @@ pub(crate) struct OpenPatchStream {
 pub(crate) struct PatchStreamGate {
     authority: std::sync::Arc<RestrictedAuthority>,
     open: Option<OpenPatchStream>,
+    small_copy: Option<PreparedSmallCopy>,
 }
 
 impl PatchStreamGate {
@@ -2943,6 +3977,7 @@ impl PatchStreamGate {
         Self {
             authority,
             open: None,
+            small_copy: None,
         }
     }
 
@@ -2957,7 +3992,7 @@ impl PatchStreamGate {
         over_ssh: bool,
     ) -> Result<Settlement> {
         self.authority
-            .authorize_streaming(request, over_ssh, &mut self.open)
+            .authorize_streaming(request, over_ssh, &mut self.open, &mut self.small_copy)
     }
 
     /// Settle an executed request. A begin whose patch the executor left
@@ -2983,6 +4018,20 @@ impl PatchStreamGate {
                     self.authority.settle(open.settlement, response);
                 }
             }
+            StreamStep::PrepareSmallCopy { sizes } => match response {
+                proto::Response::SmallFilesPrepared(needed) if needed.len() == sizes.len() => {
+                    self.small_copy = Some(PreparedSmallCopy {
+                        sizes,
+                        needed: needed.clone(),
+                        settlement,
+                    });
+                }
+                _ => self.authority.settle(settlement, response),
+            },
+            StreamStep::CopySmallCopy(prepared) => {
+                self.authority.settle(settlement, response);
+                self.authority.settle(*prepared, response);
+            }
             _ => self.authority.settle(settlement, response),
         }
     }
@@ -3007,6 +4056,12 @@ impl PatchStreamGate {
 impl Drop for PatchStreamGate {
     fn drop(&mut self) {
         self.abandon("the connection closed before its streamed patch ended");
+        if let Some(prepared) = self.small_copy.take() {
+            self.authority.settle_unexecuted(
+                prepared.settlement,
+                "the connection closed before the small copy's payloads",
+            );
+        }
     }
 }
 
@@ -3060,6 +4115,13 @@ pub(super) enum PendingOutcome {
         path: Vec<u8>,
         change: Change,
     },
+    /// A metadata change, whose kind is looked up if it fails and was not
+    /// known when it was authorized.
+    Metadata {
+        index: usize,
+        path: Vec<u8>,
+        kind: Option<proto::Kind>,
+    },
     /// An operation expected to change nothing, recorded only if it fails.
     LogicalIfFailed {
         index: usize,
@@ -3070,7 +4132,9 @@ pub(super) enum PendingOutcome {
         index: usize,
         path: Vec<u8>,
         copy_id: proto::CopyId,
-        size: u64,
+        /// The size a preparation declares; writes and finalization leave
+        /// the declared size as it is.
+        size: Option<u64>,
         stage: FileStage,
         /// Ignore a successful observation-only Prepare when it found no
         /// resumable sidecar and therefore performed no lifecycle mutation.
@@ -3079,6 +4143,13 @@ pub(super) enum PendingOutcome {
         /// releases or retains precisely this hold without affecting a
         /// concurrent preparation for the same partial.
         observation_hold: Option<ReservationHoldId>,
+    },
+    /// A file of the small-copy shortcut, which the executor reports as
+    /// published, kept with its metadata changed or not, or excluded.
+    SmallCopy {
+        index: usize,
+        path: Vec<u8>,
+        size: u64,
     },
     /// A small-file patch, which the executor reports as kept or published.
     Patch {
@@ -3102,4 +4173,46 @@ pub(crate) struct PendingCreation {
     /// The name a hard link made, for a file that may already have been
     /// there: never the grant's own, even later in its own request.
     pub(super) link: bool,
+}
+
+/// The file a request writes, by destination path and partial.
+fn file_key(request: &Request) -> Option<(Vec<u8>, proto::CopyId)> {
+    match request {
+        Request::Prepare { path, copy_id, .. }
+        | Request::StageBasis { path, copy_id, .. }
+        | Request::SeedBasis { path, copy_id, .. }
+        | Request::WriteRange { path, copy_id, .. }
+        | Request::ReuseComparedRange { path, copy_id, .. }
+        | Request::Finalize { path, copy_id, .. } => Some((path.clone(), *copy_id)),
+        _ => None,
+    }
+}
+
+/// A request the grant's existing-object policy declines because of what
+/// the destination holds now: a name that is taken where only new objects
+/// are made, or an object gone or replaced where only existing ones are
+/// changed. Nothing is changed, and the existing object is kept, as the
+/// policy asks; it is not reported as a refusal.
+#[derive(Debug)]
+pub(crate) struct KeptExisting(String);
+
+impl std::fmt::Display for KeptExisting {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for KeptExisting {}
+
+fn kept(message: String) -> anyhow::Error {
+    KeptExisting(message).into()
+}
+
+impl KeptExisting {
+    /// Whether `error` is one.
+    pub(crate) fn is(error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .any(|cause| cause.downcast_ref::<KeptExisting>().is_some())
+    }
 }

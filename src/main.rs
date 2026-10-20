@@ -6,6 +6,7 @@ mod agent_broker;
 mod approval_command;
 mod auth_from;
 mod bwlimit;
+mod checks;
 mod cli;
 mod completion;
 mod completion_details;

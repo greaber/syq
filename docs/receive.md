@@ -151,7 +151,8 @@ syq persist receive on --name laptop --no-auto-approve-root
 
 ### Copy permissions and limits
 
-By default, each copy is limited to 100 GiB and one million entries. Pruning
+By default, each copy is limited to 100 GiB and one million entries (changes
+it makes, such as files written and directories created). Pruning
 is off until you set a deletion limit; a copy that would delete more removes
 nothing. Change limits with
 `syq persist receive on --name laptop --max-bytes SIZE --max-entries N --max-delete N`.

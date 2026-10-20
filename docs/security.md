@@ -240,6 +240,13 @@ The protection has several parts:
    reports to your laptop, which checks that they are hostB's and that hostA
    left none out, added none, and did not cut them short.
 
+HostB's receiver opens the directory it was set up for once, when it
+verifies the grant, and does everything the copy asks beneath it, without
+following symlinks. Renaming or replacing a directory on the way to it during
+the copy does not redirect the copy. With `--follow-dst`, the receiver itself
+follows a symlink at the destination, and only to a directory inside the one
+it was set up for and outside its control files.
+
 File data travels directly from hostA to hostB, over encrypted TCP or SSH.
 Your laptop provides authorization and verifies the result without carrying
 the file data. See [Copy between servers](remote-to-remote.md) for setup and
@@ -291,7 +298,13 @@ types syq does not recognize, because it cannot tell which file a link would
 name. On filesystems with neither an atomic no-replace rename nor hard links,
 such as FAT and exFAT on macOS and rclone mounts, it still refuses files that
 already exist, but a file another program creates at a name in the instant
-between syq's check and its rename can be replaced.
+between syq's check and its rename can be replaced. On filesystems without an
+atomic no-replace rename, such as NFS, hostB renames a new file into place
+without a check at a name it found free itself while planning, once per name,
+including any name in a directory it found missing or empty or created.
+A file another program creates at such a name later in the copy can be
+replaced, as in an ordinary copy; hostA decides when the copy looks names up
+and when it writes them.
 
 The filesystem limitations above still apply. HostB's account and receiver
 remain trusted to enforce the grant and report accurately. HostB's reports

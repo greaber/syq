@@ -158,7 +158,7 @@ impl ExpressionServer {
                 "--s3-endpoint",
                 &self.address,
                 "--no-progress",
-                "--performance-tuning=s3-retries=0",
+                "--s3-retries=0",
             ])
             .args(options)
             .env("AWS_ACCESS_KEY_ID", "test-access")

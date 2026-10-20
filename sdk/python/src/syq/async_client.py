@@ -573,6 +573,7 @@ class AsyncClient:
         s3_profile: str | None = None,
         auth_from: str | None = None,
         s3_header: Iterable[str] | None = None,
+        s3_retries: int | None = None,
         s3_write_header: Iterable[str] | None = None,
         performance_tuning: str | None = None,
         resource_limits: str | None = None,
@@ -599,7 +600,8 @@ class AsyncClient:
                              no_tcp=no_tcp, no_tcp_encryption=no_tcp_encryption,
                              tcp_ports=tcp_ports, tcp_congestion=tcp_congestion,
                              s3_endpoint=s3_endpoint, s3_region=s3_region,
-                             s3_profile=s3_profile, s3_header=s3_header, s3_write_header=s3_write_header,
+                             s3_profile=s3_profile, s3_header=s3_header, s3_retries=s3_retries,
+                             s3_write_header=s3_write_header,
                              auth_from=auth_from,
                              resource_limits=resource_limits, integrity_checking=integrity_checking,
                              stats=stats, verbose=verbose,
@@ -635,6 +637,7 @@ class AsyncClient:
         s3_profile: str | None = None,
         auth_from: str | None = None,
         s3_header: Iterable[str] | None = None,
+        s3_retries: int | None = None,
         performance_tuning: str | None = None,
         resource_limits: str | None = None,
         integrity_checking: str | None = None,
@@ -660,7 +663,8 @@ class AsyncClient:
                              no_tcp=no_tcp, no_tcp_encryption=no_tcp_encryption,
                              tcp_ports=tcp_ports, tcp_congestion=tcp_congestion,
                              s3_endpoint=s3_endpoint, s3_region=s3_region,
-                             s3_profile=s3_profile, s3_header=s3_header, auth_from=auth_from,
+                             s3_profile=s3_profile, s3_header=s3_header, s3_retries=s3_retries,
+                             auth_from=auth_from,
                              resource_limits=resource_limits, integrity_checking=integrity_checking,
                              stats=stats, verbose=verbose,
                              quiet=quiet, progress=progress, no_progress=no_progress,
@@ -835,6 +839,7 @@ class AsyncClient:
         s3_region: str | None = None,
         s3_profile: str | None = None,
         s3_header: Iterable[str] | None = None,
+        s3_retries: int | None = None,
         s3_write_header: Iterable[str] | None = None,
         auth_from: str | None = None,
         coordinate_at: str | None = None,
@@ -932,7 +937,7 @@ class AsyncClient:
             mapping=mapping is not None,
         )
         _s3_arguments(argv, connection.s3_endpoint, connection.s3_region,
-                      connection.s3_profile, connection.s3_header)
+                      connection.s3_profile, connection.s3_header, s3_retries)
         _s3_write_arguments(argv, s3_write_header)
         if connection.auth_from is not None:
             argv.extend(("--auth-from", _text_arg(connection.auth_from, label="auth_from")))
@@ -1043,6 +1048,7 @@ class AsyncClient:
         s3_profile: str | None = None,
         auth_from: str | None = None,
         s3_header: Iterable[str] | None = None,
+        s3_retries: int | None = None,
         s3_all_versions: bool = False,
         s3_version_id: str | None = None,
         cwd: PathArgument | None = None,
@@ -1074,6 +1080,7 @@ class AsyncClient:
             s3_profile=s3_profile,
             auth_from=auth_from,
             s3_header=s3_header,
+            s3_retries=s3_retries,
             s3_all_versions=s3_all_versions,
             s3_version_id=s3_version_id,
             cwd=cwd,
@@ -1120,6 +1127,7 @@ class AsyncClient:
         s3_region: str | None = None,
         s3_profile: str | None = None,
         s3_header: Iterable[str] | None = None,
+        s3_retries: int | None = None,
         cwd: PathArgument | None = None,
         root: PathArgument | None = None,
         follow: bool = False,
@@ -1189,7 +1197,7 @@ class AsyncClient:
                 raise SyqInvocationError("auth_from requires an SSH source for map")
             argv.extend(("--auth-from", _text_arg(connection.auth_from, label="auth_from")))
         _s3_arguments(argv, connection.s3_endpoint, connection.s3_region,
-                      connection.s3_profile, connection.s3_header)
+                      connection.s3_profile, connection.s3_header, s3_retries)
         if source_count == 0:
             raise SyqInvocationError("syq map needs a source selector")
         selected_base = root if root is not None else cwd

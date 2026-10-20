@@ -2528,6 +2528,9 @@ fn matched_publication_never_rolls_back_a_later_writer() {
             None,
         )
         .unwrap_err();
+    // Another program's file was moved to a recovery name: no plain
+    // condition failure, which a copy's existing-file policy would skip.
+    assert!(!crate::fsops::is_condition_not_met(&error), "{error:#}");
 
     let error = format!("{error:#}");
     assert!(error.contains("changed during publication"));
@@ -2851,4 +2854,174 @@ fn the_owner_new_files_show_is_learned_and_never_assumed() {
         );
     }
     fs::set_permissions(&read_only, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A matched replacement whose target is gone or another file before the
+/// exchange changes nothing, and says so: its condition was not met.
+#[test]
+fn a_matched_replacement_refused_before_the_exchange_is_a_condition_failure() {
+    let tree = TestDir::new("matched-precheck");
+    let root = Root::open(tree.path()).unwrap();
+    let (staged, target) = (relative(b"staged"), relative(b"target"));
+    fs::write(tree.path().join("staged"), b"new").unwrap();
+    fs::write(tree.path().join("target"), b"old").unwrap();
+    let staged_metadata = fs::metadata(tree.path().join("staged")).unwrap();
+    let old = root.metadata(&target).unwrap();
+    // The old file stays, under another name, so its number is not reused.
+    fs::rename(tree.path().join("target"), tree.path().join("aside")).unwrap();
+    for replace_with_other in [false, true] {
+        if replace_with_other {
+            fs::write(tree.path().join("target"), b"other").unwrap();
+        }
+        let error = root
+            .replace_regular_if_same(
+                &staged,
+                &target,
+                (staged_metadata.dev(), staged_metadata.ino()),
+                old.dev,
+                old.ino,
+                None,
+            )
+            .unwrap_err();
+        assert!(crate::fsops::is_condition_not_met(&error), "{error:#}");
+        assert_eq!(fs::read(tree.path().join("staged")).unwrap(), b"new");
+    }
+    let error = root
+        .publish_new_regular(
+            &staged,
+            &target,
+            (staged_metadata.dev(), staged_metadata.ino()),
+        )
+        .unwrap_err();
+    assert!(crate::fsops::is_condition_not_met(&error), "{error:#}");
+    assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"other");
+}
+
+/// Where a filesystem has hard links but no no-replace rename, as NFS, a
+/// new name is published by a link from the staged file's descriptor,
+/// which fails while the name exists, and the staged name is left for the
+/// caller to remove once it has closed the file. Nothing is checked or
+/// renamed by name.
+#[cfg(target_os = "linux")]
+#[test]
+fn new_names_link_from_the_staged_descriptor_where_renames_cannot_refuse() {
+    use super::publication::CHECKED_RENAMES;
+    let tree = TestDir::new("descriptor-link");
+    let root = Root::open(tree.path()).unwrap();
+    assume_missing(&root, true, true, false);
+    CHECKED_RENAMES.set(0);
+    fs::write(tree.path().join("staged"), b"new").unwrap();
+    let staged = File::open(tree.path().join("staged")).unwrap();
+    let identity = (
+        staged.metadata().unwrap().dev(),
+        staged.metadata().unwrap().ino(),
+    );
+    let link = root
+        .publish_new_staged(
+            &relative(b"staged"),
+            &relative(b"fresh"),
+            identity,
+            Some(&staged),
+        )
+        .unwrap()
+        .expect("published by a link");
+    assert!(tree.path().join("staged").exists());
+    drop(staged);
+    root.remove_staged_link(link).unwrap();
+    assert_eq!(sorted_names(tree.path()), ["fresh"]);
+    let fresh = fs::metadata(tree.path().join("fresh")).unwrap();
+    assert_eq!((fresh.nlink(), fresh.ino()), (1, identity.1));
+    assert_eq!(CHECKED_RENAMES.get(), 0);
+
+    // A name something holds is kept, and nothing was published.
+    fs::write(tree.path().join("staged"), b"newer").unwrap();
+    let staged = File::open(tree.path().join("staged")).unwrap();
+    let identity = (
+        staged.metadata().unwrap().dev(),
+        staged.metadata().unwrap().ino(),
+    );
+    let Err(error) = root.publish_new_staged(
+        &relative(b"staged"),
+        &relative(b"fresh"),
+        identity,
+        Some(&staged),
+    ) else {
+        panic!("a name that exists was replaced")
+    };
+    assert!(crate::fsops::is_condition_not_met(&error), "{error:#}");
+    assert_eq!(fs::read(tree.path().join("fresh")).unwrap(), b"new");
+}
+
+/// A matched replacement by moving the old file aside and linking the
+/// staged file, as on NFS: one that fails its final check leaves no staged
+/// name behind, and one that was published is not failed because the old
+/// file could not be removed.
+#[test]
+fn moved_aside_replacements_clean_up_and_report_what_happened() {
+    for case in ["extra link", "aside not removable"] {
+        let tree = TestDir::new("moved-aside");
+        let root = Root::open(tree.path()).unwrap();
+        assume_missing(&root, true, true, false);
+        fs::write(tree.path().join("target"), b"old").unwrap();
+        fs::write(tree.path().join("staged"), b"new").unwrap();
+        let staged = fs::metadata(tree.path().join("staged")).unwrap();
+        let old = root.metadata(&relative(b"target")).unwrap();
+        let path = tree.path().to_path_buf();
+        let _hook = install_publication_test_hook(
+            root.identity(),
+            &relative(b"target"),
+            PublicationTestPoint::AfterMovedAsidePublication,
+            move || match case {
+                "extra link" => fs::hard_link(path.join("target"), path.join("other")).unwrap(),
+                _ => {
+                    // The displaced file, under its recovery name, becomes a
+                    // directory that cannot be unlinked.
+                    let aside = fs::read_dir(&path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().file_name())
+                        .find(|name| crate::fsops::is_recovery_name(name))
+                        .unwrap();
+                    fs::rename(path.join(&aside), path.join("old")).unwrap();
+                    fs::create_dir(path.join(&aside)).unwrap();
+                }
+            },
+        );
+        let replaced = root.replace_staged_if_same(
+            &relative(b"staged"),
+            &relative(b"target"),
+            (staged.dev(), staged.ino()),
+            (old.dev, old.ino, None),
+        );
+        match case {
+            "extra link" => {
+                let Err(error) = replaced else {
+                    panic!("a file with another name was taken as published")
+                };
+                assert!(format!("{error:#}").contains("changed during publication"));
+                assert!(!tree.path().join("staged").exists(), "{case}");
+            }
+            _ => {
+                let link = replaced.unwrap().expect("published by a link");
+                root.remove_staged_link(link).unwrap();
+                assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"new");
+                assert!(!tree.path().join("staged").exists(), "{case}");
+            }
+        }
+    }
+}
+
+/// A profile read through a directory is kept only under the device that
+/// directory is on. A caller that pairs it with another device, as a lookup
+/// that found a filesystem mounted on an entry would, gets the directory's
+/// profile without that device inheriting it: a local filesystem mounted
+/// beneath NFS keeps its own no-replace rename.
+#[test]
+fn a_profile_is_kept_only_under_the_device_it_was_read_from() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = Root::open(temporary.path()).unwrap();
+    let directory = File::open(temporary.path()).unwrap();
+    let foreign = root.identity().dev ^ 0x5a5a_5a5a;
+    let read = root.profile_on(foreign, &directory);
+    assert_eq!(read, crate::fsops::profile(&directory));
+    assert_eq!(root.known_profile(foreign), None);
 }

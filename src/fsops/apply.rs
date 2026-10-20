@@ -16,91 +16,88 @@ pub(super) fn op_path(op: &Op) -> &[u8] {
 }
 
 /// Carry out `op`. What it creates is limited as creating it limits it: by
-/// its directory's default ACL, or else by the umask.
+/// its directory's default ACL, or else by the umask. A restricted
+/// receiver's session never creates missing parents on the way
+/// (`create_missing_parents`): each directory it creates passes its
+/// authority.
+/// Told the directory a new directory was made in, once a creation made
+/// one (`mkdir_rooted`).
+pub(super) type MadeDirectory<'a> = Option<&'a (dyn Fn(&File) + Sync)>;
+
 pub(super) fn apply_one(
     op: &Op,
-    guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
-    owned: Option<&owned::OwnedObjects>,
+    create_missing_parents: bool,
+    (owned, made): (Option<&owned::OwnedObjects>, MadeDirectory<'_>),
 ) -> Result<()> {
-    let registered_target = if let Some(root) = destination_root {
-        let path = op_path(op);
-        let relative = RelativePath::new(path)?;
-        let label = PathBuf::from(OsStr::from_bytes(
-            &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
-        ));
-        Some(RootedTarget {
-            root,
-            relative,
-            label,
-            create_missing_parents: true,
-            query_partial_name_limit: false,
-        })
-    } else {
-        None
+    let Some(root) = destination_root else {
+        bail!("{UNROOTED_MUTATION}");
+    };
+    let path = op_path(op);
+    let relative = RelativePath::new(path)?;
+    let label = PathBuf::from(OsStr::from_bytes(
+        &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
+    ));
+    hold_before_destination_mutation_for_test(&label)?;
+    let target = RootedTarget {
+        root,
+        relative,
+        label,
+        create_missing_parents,
     };
     #[cfg(debug_assertions)]
-    fail_apply_capacity_for_test(
-        registered_target
-            .as_ref()
-            .map_or_else(|| resolve(op_path(op)), |target| target.label.clone())
-            .as_path(),
-    )?;
+    fail_apply_capacity_for_test(&target.label)?;
     #[cfg(debug_assertions)]
     if matches!(op, Op::SetMeta { .. } | Op::SetFileMetaIfSame { .. }) {
-        let label = registered_target
-            .as_ref()
-            .map_or_else(|| resolve(op_path(op)), |target| target.label.clone());
-        fail_set_meta_for_test(&label)?;
-        meet_concurrent_set_meta_for_test(&label)?;
+        fail_set_meta_for_test(&target.label)?;
+        meet_concurrent_set_meta_for_test(&target.label)?;
     }
     if matches!(op, Op::SetFileMetaIfSame { .. }) {
         hold_before_quick_metadata_for_test()?;
     }
-    if let Some(guard) = guard {
-        let target = guarded_target(op_path(op), guard)?;
-        if let Op::Hardlink {
-            path,
-            source,
-            dev,
-            ino,
-            condition,
-        } = op
-        {
-            let source = guarded_target(source, guard)?;
-            let operation = Op::Hardlink {
-                path: path.clone(),
-                source: source.relative.to_path_buf().into_os_string().into_vec(),
-                dev: *dev,
-                ino: *ino,
-                condition: *condition,
-            };
-            return apply_one_rooted(&operation, &target.as_rooted(), owned);
+    apply_one_rooted(op, &target, owned, made).map_err(|error| {
+        // A no-replace creation whose name something already holds made
+        // nothing: its condition was not met.
+        let absent = matches!(
+            op,
+            Op::Mkdir {
+                condition: TargetCondition::Absent,
+                ..
+            } | Op::Symlink {
+                condition: TargetCondition::Absent,
+                ..
+            } | Op::Mknod {
+                condition: TargetCondition::Absent,
+                ..
+            } | Op::Hardlink {
+                condition: TargetCondition::Absent,
+                ..
+            }
+        );
+        let taken = error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists)
+        });
+        if absent && taken && !is_condition_not_met(&error) {
+            error.context(ConditionNotMet(
+                "the name was taken before a no-replace creation".into(),
+            ))
+        } else {
+            error
         }
-        return apply_one_rooted(op, &target.as_rooted(), owned);
-    }
-    let Some(target) = registered_target else {
-        bail!("{UNROOTED_MUTATION}");
-    };
-    apply_one_rooted(op, &target, owned)
+    })
 }
 
 /// Resolve one authorized request's root, then keep the caller's explicit
 /// names. No Selected operation permits traversal or recursive discovery.
 pub(super) fn selected_removals(
     ops: &[Op],
-    guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
 ) -> Vec<Result<crate::deletion::Selected>> {
-    let root = if let Some(guard) = guard {
-        ops.first()
-            .map(|op| guarded_target(op_path(op), guard).map(|target| target.root))
-            .unwrap_or_else(|| Err(anyhow::anyhow!("empty deletion request")))
-    } else {
-        destination_root.context(UNROOTED_MUTATION)
-    };
+    let root = destination_root.context(UNROOTED_MUTATION);
     ops.iter()
         .map(|op| {
             let root = root
@@ -108,23 +105,14 @@ pub(super) fn selected_removals(
                 .map_err(|error| anyhow::Error::new(wire_error(error)))?
                 .clone();
             let path = op_path(op);
-            let label = if guard.is_some() {
-                resolve(path)
-            } else {
-                PathBuf::from(OsStr::from_bytes(
-                    &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
-                ))
-            };
+            let label = PathBuf::from(OsStr::from_bytes(
+                &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
+            ));
             #[cfg(debug_assertions)]
             fail_apply_capacity_for_test(&label)?;
-            let relative = if let Some(guard) = guard {
-                relative_under(&resolve(&guard.root), &resolve(path))?
-            } else {
-                RelativePath::new(path)?
-            };
             Ok(crate::deletion::Selected {
                 root,
-                path: relative,
+                path: RelativePath::new(path)?,
                 label,
                 directory: matches!(op, Op::Rmdir { .. }),
                 size: None,
@@ -140,20 +128,11 @@ pub(super) fn error_is_kind(error: &anyhow::Error, kind: io::ErrorKind) -> bool 
         .is_some_and(|error| error.kind() == kind)
 }
 
-pub(super) struct GuardedTarget {
-    pub(super) root: Arc<Root>,
-    pub(super) relative: RelativePath,
-    pub(super) label: PathBuf,
-}
-
 pub(super) struct RootedTarget {
     pub(super) root: Arc<Root>,
     pub(super) relative: RelativePath,
     pub(super) label: PathBuf,
     pub(super) create_missing_parents: bool,
-    // Signed receivers independently derive the partial name for quota checks.
-    // Keep their exact limit selection in sync with that authority.
-    pub(super) query_partial_name_limit: bool,
 }
 
 // One filename-limit observation for adjacent siblings in a read-only batch
@@ -188,29 +167,13 @@ impl PartialNameLimits {
 
 impl RootedTarget {
     pub(super) fn partial_name_max(&self) -> Result<usize> {
-        if self.query_partial_name_limit {
-            self.root.name_max_for_parent(&self.relative)
-        } else {
-            self.root.partial_name_max(&self.relative)
-        }
+        self.root.partial_name_max(&self.relative)
     }
 
     pub(super) fn location(&self) -> FileLocation {
         FileLocation::Rooted {
             root: self.root.identity(),
             relative: self.relative.clone(),
-        }
-    }
-}
-
-impl GuardedTarget {
-    pub(super) fn as_rooted(&self) -> RootedTarget {
-        RootedTarget {
-            root: self.root.clone(),
-            relative: self.relative.clone(),
-            label: self.label.clone(),
-            create_missing_parents: false,
-            query_partial_name_limit: true,
         }
     }
 }
@@ -260,7 +223,7 @@ pub(super) fn with_rooted_partial<T>(
             let too_long = error
                 .downcast_ref::<io::Error>()
                 .is_some_and(|error| error.raw_os_error() == Some(libc::ENAMETOOLONG));
-            if !too_long || target.query_partial_name_limit {
+            if !too_long {
                 return Err(error);
             }
             let limit = target.root.rejected_partial_name_max(&target.relative)?;
@@ -274,41 +237,7 @@ pub(super) fn with_rooted_partial<T>(
     }
 }
 
-pub(super) fn guarded_target(path: &[u8], guard: &ContainerGuard) -> Result<GuardedTarget> {
-    hold_before_guarded_mutation_for_test(path)?;
-    guarded_target_unheld(path, guard)
-}
-
-pub(super) fn guarded_target_unheld(path: &[u8], guard: &ContainerGuard) -> Result<GuardedTarget> {
-    let root_path = resolve(&guard.root);
-    let target = resolve(path);
-    let relative = relative_under(&root_path, &target)?;
-    let root = Arc::new(Root::open_verified(
-        &root_path,
-        RootIdentity {
-            dev: guard.dev,
-            ino: guard.ino,
-        },
-    )?);
-    Ok(GuardedTarget {
-        root,
-        relative,
-        label: target,
-    })
-}
-
-pub(super) fn relative_under(root: &Path, target: &Path) -> Result<RelativePath> {
-    let relative = target.strip_prefix(root).with_context(|| {
-        format!(
-            "destination {} is outside guarded root {}",
-            target.display(),
-            root.display()
-        )
-    })?;
-    RelativePath::new(relative.as_os_str().as_bytes())
-}
-
-/// Observe the object at a guarded path and hold it to the planner's
+/// Observe the object at a destination path and hold it to the planner's
 /// condition. `Absent` requires nothing there (the following `*at` creation
 /// then fails atomically if something appears); the matching conditions
 /// require the observed identity. `Any` accepts whatever is found.
@@ -321,12 +250,10 @@ pub(super) fn observe_rooted_condition(
     match (condition, observed) {
         (TargetCondition::Any, observed) => Ok(observed),
         (TargetCondition::Absent, None) => Ok(None),
-        (TargetCondition::Absent, Some(_)) => {
-            bail!(
-                "destination {} appeared before no-replace creation",
-                label.display()
-            )
-        }
+        (TargetCondition::Absent, Some(_)) => Err(condition_not_met(format!(
+            "destination {} appeared before no-replace creation",
+            label.display()
+        ))),
         (TargetCondition::Matches { dev, ino }, Some(metadata))
             if metadata.dev == dev && metadata.ino == ino =>
         {
@@ -348,10 +275,10 @@ pub(super) fn observe_rooted_condition(
             Ok(Some(metadata))
         }
         (TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }, _) => {
-            bail!(
+            Err(condition_not_met(format!(
                 "destination {} changed before it could be replaced",
                 label.display()
-            )
+            )))
         }
     }
 }
@@ -362,13 +289,14 @@ fn apply_one_rooted(
     op: &Op,
     target: &RootedTarget,
     owned: Option<&owned::OwnedObjects>,
+    made: MadeDirectory<'_>,
 ) -> Result<()> {
     let root = &target.root;
     let path = &target.relative;
     match op {
         Op::Mkdir {
             mode, condition, ..
-        } => mkdir_rooted(target, *mode, *condition, false).map(drop),
+        } => mkdir_rooted(target, *mode, *condition, false, made).map(drop),
         Op::Symlink {
             target: link,
             condition,
@@ -423,7 +351,16 @@ fn apply_one_rooted(
         } => {
             // The publication links only the file with this identity, so
             // checking the identity checks the file linked (`OwnedObjects`).
-            // Where inode numbers cannot show that, the link is refused.
+            // Where inode numbers cannot show that, a restricted receiver
+            // refuses the link, and an ordinary one links as without the
+            // check.
+            let owned = match owned {
+                Some(owned) if !owned.applies(false) => {
+                    let trusted = root.link_counts_trusted_on(*dev, &root.parent_directory(path)?);
+                    trusted.then_some(owned)
+                }
+                owned => owned,
+            };
             if let Some(owned) = owned {
                 owned.require_link((*dev, *ino), &target.label)?;
             }
@@ -497,16 +434,16 @@ fn leaf_replacement(
         TargetCondition::Any => LeafReplacement::Any,
         TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
             let Some(metadata) = observe_rooted_condition(target, condition)? else {
-                bail!(
+                return Err(condition_not_met(format!(
                     "destination {} changed before it could be replaced",
                     target.label.display()
-                );
+                )));
             };
             if file_type_bits(metadata.mode) != file_type {
-                bail!(
+                return Err(condition_not_met(format!(
                     "destination {} cannot change type under a matched condition",
                     target.label.display()
-                );
+                )));
             }
             LeafReplacement::Same {
                 dev: metadata.dev,
@@ -902,13 +839,10 @@ pub(super) fn set_meta_rooted(
 /// The target an operation on `path` resolves to, as `apply_one` resolves it.
 pub(super) fn operation_target(
     path: &[u8],
-    guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
+    create_missing_parents: bool,
 ) -> Result<RootedTarget> {
-    if let Some(guard) = guard {
-        return guarded_target_unheld(path, guard).map(|target| target.as_rooted());
-    }
     let Some(root) = destination_root else {
         bail!("{UNROOTED_MUTATION}");
     };
@@ -918,8 +852,7 @@ pub(super) fn operation_target(
         label: PathBuf::from(OsStr::from_bytes(
             &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
         )),
-        create_missing_parents: true,
-        query_partial_name_limit: false,
+        create_missing_parents,
     })
 }
 
@@ -936,7 +869,6 @@ pub(super) fn starting_group_may_differ(
     path: &[u8],
     group: u32,
     parents: &CreationParents,
-    guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
 ) -> bool {
@@ -944,7 +876,7 @@ pub(super) fn starting_group_may_differ(
     let cached = parents.lock().unwrap().get(&parent_path).copied();
     let parent = cached.unwrap_or_else(|| {
         let observed = (|| -> Result<(u32, u32)> {
-            let target = operation_target(path, guard, destination_root, destination_prefix)?;
+            let target = operation_target(path, destination_root, destination_prefix, false)?;
             let (parents, _) = target.relative.leaf()?;
             let parent = target
                 .root
@@ -1013,10 +945,11 @@ pub(super) type CreatedDirectory = (u64, u64, u32);
 /// rather than finding one already there.
 pub(super) fn create_identified_directory(
     op: &Op,
-    guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
+    create_missing_parents: bool,
     private: bool,
+    made: MadeDirectory<'_>,
 ) -> Result<Option<CreatedDirectory>> {
     let Op::Mkdir {
         path,
@@ -1026,14 +959,17 @@ pub(super) fn create_identified_directory(
     else {
         bail!("identified creation requires a Mkdir");
     };
-    let target = match guard {
-        Some(guard) => guarded_target(path, guard)?.as_rooted(),
-        None => operation_target(path, None, destination_root, destination_prefix)?,
-    };
+    let target = operation_target(
+        path,
+        destination_root,
+        destination_prefix,
+        create_missing_parents,
+    )?;
+    hold_before_destination_mutation_for_test(&target.label)?;
     #[cfg(debug_assertions)]
     fail_apply_capacity_for_test(&target.label)?;
     let mode = if private { 0o700 } else { *mode };
-    mkdir_rooted(&target, mode, *condition, true)
+    mkdir_rooted(&target, mode, *condition, true, made)
 }
 
 /// Give a directory this receiver created private, once it has taken its
@@ -1046,11 +982,10 @@ pub(super) fn open_created_directory(
     path: &[u8],
     proposed: u32,
     created: (u64, u64),
-    guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
 ) -> Result<()> {
-    let target = operation_target(path, guard, destination_root, destination_prefix)?;
+    let target = operation_target(path, destination_root, destination_prefix, false)?;
     let directory = target.root.open_metadata(&target.relative)?;
     let current = directory.metadata()?;
     if (current.dev(), current.ino()) != created || !current.is_dir() {
@@ -1073,12 +1008,14 @@ pub(crate) fn created_directory_mode(directory: &File, proposed: u32, current: u
 /// Create the directory `target` names, or accept an existing one as the
 /// condition allows, without changing an existing directory. With `identify`,
 /// return the identity of a directory this call created; `None` means it
-/// found one already there.
+/// found one already there. `made` is told the directory a directory this
+/// call created is in.
 fn mkdir_rooted(
     target: &RootedTarget,
     mode: u32,
     condition: TargetCondition,
     identify: bool,
+    made: MadeDirectory<'_>,
 ) -> Result<Option<CreatedDirectory>> {
     let root = &target.root;
     let path = &target.relative;
@@ -1101,6 +1038,9 @@ fn mkdir_rooted(
             .with_context(|| format!("create confined directory {}", target.label.display()))
         {
             Ok(()) => {
+                if let Some(made) = made {
+                    made(parent.directory());
+                }
                 let created = identify
                     .then(|| {
                         parent
@@ -1113,11 +1053,12 @@ fn mkdir_rooted(
             }
             Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {
                 if condition == TargetCondition::Absent {
-                    // Keeps the error's kind: the destination exists.
-                    return Err(error.context(format!(
+                    // Something holds the name: nothing was created. The
+                    // error keeps its kind: the destination exists.
+                    return Err(error.context(ConditionNotMet(format!(
                         "destination {} appeared before no-replace creation",
                         target.label.display()
-                    )));
+                    ))));
                 }
             }
             Err(error) => return Err(error),
@@ -1176,6 +1117,177 @@ pub(super) fn create_rooted_directory_or_existing(
     }
 }
 
+/// The marker of a destination that did not meet an operation's
+/// condition, found before anything was changed
+/// (`WireError::condition_not_met`).
+#[derive(Debug)]
+pub(crate) struct ConditionNotMet(pub(crate) String);
+
+impl std::fmt::Display for ConditionNotMet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConditionNotMet {}
+
+/// The error for a destination that does not meet an operation's
+/// condition, found before anything was changed. The copy's existing-file
+/// policy may keep it: under `--if-exists=keep` and `--only-existing` such
+/// a file is skipped, not failed.
+pub(crate) fn condition_not_met(message: String) -> anyhow::Error {
+    anyhow::Error::new(ConditionNotMet(message))
+}
+
+/// `condition_not_met`, keeping the operating system's error that showed
+/// it, so its kind still reaches the copy's results.
+pub(crate) fn condition_not_met_by(error: std::io::Error, message: String) -> anyhow::Error {
+    anyhow::Error::new(error).context(ConditionNotMet(message))
+}
+
+/// Whether `error` says the destination did not meet the operation's
+/// condition and nothing was changed (`condition_not_met`), here or at the
+/// receiver.
+pub(crate) fn is_condition_not_met(error: &anyhow::Error) -> bool {
+    // A context layer downcasts through the error itself, not its chain.
+    error.downcast_ref::<ConditionNotMet>().is_some()
+        || error.chain().any(|cause| cause.is::<ConditionNotMet>())
+        || crate::conn::wire_error_of(error).is_some_and(is_condition_not_met_wire)
+}
+
+/// The same for an error the receiver sent.
+pub(crate) fn is_condition_not_met_wire(error: &WireError) -> bool {
+    error.condition_not_met
+}
+
+/// The marker of an operation that changed nothing: found impossible
+/// before it started (`WireError::unchanged`).
+#[derive(Debug)]
+pub(crate) struct Unchanged(pub(crate) String);
+
+impl std::fmt::Display for Unchanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unchanged {}
+
+/// The error for an operation found impossible before it changed anything.
+pub(crate) fn unchanged(message: String) -> anyhow::Error {
+    anyhow::Error::new(Unchanged(message))
+}
+
+/// Whether `error` says nothing was changed: an unmet condition
+/// (`condition_not_met`) or another reason found before starting
+/// (`unchanged`), here or at the receiver.
+pub(crate) fn is_unchanged(error: &anyhow::Error) -> bool {
+    is_condition_not_met(error)
+        || error.downcast_ref::<Unchanged>().is_some()
+        || error.chain().any(|cause| cause.is::<Unchanged>())
+        || crate::conn::wire_error_of(error).is_some_and(is_unchanged_wire)
+}
+
+/// The same for an error the receiver sent.
+pub(crate) fn is_unchanged_wire(error: &WireError) -> bool {
+    error.unchanged || error.condition_not_met
+}
+
+impl FsOps {
+    /// On a filesystem whose inode numbers cannot show which file a name
+    /// leads to (`Profile::link_counts_trusted`), a condition that names
+    /// the object the copy found (`TargetCondition::Matches`,
+    /// `InPlaceUpdate::only`) is held to whatever is at the name now: the
+    /// receiver checks only that something is there, which is all it can
+    /// check. The destination root's filesystem decides; one mounted below
+    /// it is judged as the root's.
+    pub(super) fn existence_only_where_numbers_mislead(&self, request: &mut Request) {
+        let Some(root) = &self.destination_root else {
+            return;
+        };
+        if root.link_counts_trusted() {
+            return;
+        }
+        let now = |path: &[u8]| {
+            RelativePath::new(path)
+                .ok()
+                .and_then(|relative| root.metadata_optional(&relative).ok().flatten())
+        };
+        let observe = |path: &[u8], condition: &mut TargetCondition| {
+            if let TargetCondition::Matches { .. } = condition {
+                if let Some(now) = now(path) {
+                    *condition = TargetCondition::Matches {
+                        dev: now.dev,
+                        ino: now.ino,
+                    };
+                }
+            }
+        };
+        let observe_update =
+            |path: &[u8], update: &mut Option<Box<crate::proto::InPlaceUpdate>>| {
+                if let Some(update) = update {
+                    if update.only.is_some() {
+                        if let Some(now) = now(path) {
+                            update.only = Some((now.dev, now.ino));
+                        }
+                    }
+                }
+            };
+        match request {
+            Request::Finalize {
+                path, condition, ..
+            }
+            | Request::HashAndHold {
+                path, condition, ..
+            }
+            | Request::FinishBasis {
+                path, condition, ..
+            } => observe(path, condition),
+            // A put renames over whatever its name holds
+            // (`publish_partial_rooted`): its condition is not looked at.
+            Request::PatchSmallBatch(patches) => {
+                for patch in patches {
+                    observe(&patch.path, &mut patch.condition);
+                }
+            }
+            Request::PatchBegin { patch, .. } => observe(&patch.path, &mut patch.condition),
+            Request::HashExistingBatch { files, .. } => {
+                for file in files {
+                    observe(&file.path, &mut file.condition);
+                }
+            }
+            Request::Apply { ops } => {
+                for op in ops {
+                    match op {
+                        Op::Mkdir {
+                            path, condition, ..
+                        }
+                        | Op::Symlink {
+                            path, condition, ..
+                        }
+                        | Op::Mknod {
+                            path, condition, ..
+                        }
+                        | Op::Hardlink {
+                            path, condition, ..
+                        }
+                        | Op::SetMeta {
+                            path, condition, ..
+                        }
+                        | Op::SetFileMetaIfSame {
+                            path, condition, ..
+                        } => observe(path, condition),
+                        Op::Remove { .. } | Op::Rmdir { .. } | Op::Unlink { .. } => {}
+                    }
+                }
+            }
+            Request::Prepare { path, update, .. } => observe_update(path, update),
+            Request::CopyLocal { dst, update, .. } => observe_update(dst, update),
+            _ => {}
+        }
+    }
+}
+
 pub(super) fn require_rooted_condition(
     metadata: RootMetadata,
     condition: TargetCondition,
@@ -1183,12 +1295,10 @@ pub(super) fn require_rooted_condition(
 ) -> Result<()> {
     match condition {
         TargetCondition::Any => Ok(()),
-        TargetCondition::Absent => {
-            bail!(
-                "destination {} appeared before metadata update",
-                label.display()
-            )
-        }
+        TargetCondition::Absent => Err(condition_not_met(format!(
+            "destination {} appeared before metadata update",
+            label.display()
+        ))),
         TargetCondition::Matches { dev, ino } if (metadata.dev, metadata.ino) == (dev, ino) => {
             Ok(())
         }
@@ -1207,10 +1317,10 @@ pub(super) fn require_rooted_condition(
             Ok(())
         }
         TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
-            bail!(
+            Err(condition_not_met(format!(
                 "destination {} changed before metadata update",
                 label.display()
-            )
+            )))
         }
     }
 }
@@ -1271,23 +1381,25 @@ pub(super) fn file_type_bits(mode: u32) -> u32 {
     mode & libc::S_IFMT as u32
 }
 
+/// Pause before an Apply operation on a destination path ending with
+/// `SYQ_TEST_DESTINATION_MUTATION_SUFFIX` resolves it beneath the root.
 #[cfg(any(test, debug_assertions))]
-pub(super) fn hold_before_guarded_mutation_for_test(path: &[u8]) -> Result<()> {
-    let Some(suffix) = std::env::var_os("SYQ_TEST_GUARDED_MUTATION_SUFFIX") else {
+pub(super) fn hold_before_destination_mutation_for_test(label: &Path) -> Result<()> {
+    let Some(suffix) = std::env::var_os("SYQ_TEST_DESTINATION_MUTATION_SUFFIX") else {
         return Ok(());
     };
-    if !path.ends_with(suffix.as_bytes()) {
+    if !label.as_os_str().as_bytes().ends_with(suffix.as_bytes()) {
         return Ok(());
     }
     test_race_barrier(
-        "SYQ_TEST_GUARDED_MUTATION_READY_FILE",
-        "SYQ_TEST_GUARDED_MUTATION_CONTINUE_FILE",
-        "guarded-mutation-ready",
+        "SYQ_TEST_DESTINATION_MUTATION_READY_FILE",
+        "SYQ_TEST_DESTINATION_MUTATION_CONTINUE_FILE",
+        "destination-mutation-ready",
     )
 }
 
 #[cfg(not(any(test, debug_assertions)))]
-pub(super) fn hold_before_guarded_mutation_for_test(_path: &[u8]) -> Result<()> {
+pub(super) fn hold_before_destination_mutation_for_test(_label: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -1334,10 +1446,10 @@ pub(super) fn require_open_target(
 ) -> Result<()> {
     match condition {
         TargetCondition::Any => Ok(()),
-        TargetCondition::Absent => bail!(
+        TargetCondition::Absent => Err(condition_not_met(format!(
             "destination {} appeared after the new-path precondition was checked",
             path.display()
-        ),
+        ))),
         TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
             require_open_target_known(&file.metadata()?, path, condition)
         }
@@ -1351,16 +1463,16 @@ pub(super) fn require_open_target_known(
 ) -> Result<()> {
     match condition {
         TargetCondition::Any => Ok(()),
-        TargetCondition::Absent => bail!(
+        TargetCondition::Absent => Err(condition_not_met(format!(
             "destination {} appeared after the new-path precondition was checked",
             path.display()
-        ),
+        ))),
         TargetCondition::Matches { dev, ino } => {
             if metadata.dev() != dev || metadata.ino() != ino {
-                bail!(
+                return Err(condition_not_met(format!(
                     "destination {} changed after the existing-path precondition was checked",
                     path.display()
-                );
+                )));
             }
             Ok(())
         }
@@ -1375,10 +1487,10 @@ pub(super) fn require_open_target_known(
                 || metadata.ctime() != ctime
                 || metadata.ctime_nsec() as u32 != ctime_nsec
             {
-                bail!(
+                return Err(condition_not_met(format!(
                     "destination {} changed after the existing-path precondition was checked",
                     path.display()
-                );
+                )));
             }
             Ok(())
         }

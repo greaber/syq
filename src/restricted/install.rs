@@ -256,7 +256,9 @@ pub(crate) fn remote_install() -> Result<()> {
         .file_name()
         .context("restricted destination / is not supported")?;
     let canonical_destination = canonical_root.join(leaf);
-    if fs::symlink_metadata(&canonical_destination).is_ok_and(|metadata| metadata.is_symlink()) {
+    if !request.follows_destination
+        && fs::symlink_metadata(&canonical_destination).is_ok_and(|metadata| metadata.is_symlink())
+    {
         bail!(
             "command-restricted enrollment does not follow a destination-root symlink; enroll its explicit referent instead"
         );

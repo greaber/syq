@@ -103,9 +103,13 @@ def main():
         refused = refused_paths(records)
         assert refused, (name, records)
         for path in refused:
+            # A directory created before the limit was reached is listed as
+            # created too; the change to it that was refused is listed once.
+            # Messages name the directory the copy goes into ".".
             about = [record for record in records
-                     if record.get("dst", {}).get("value") == path
-                     or record.get("message", "").startswith(f"syq: {path}: ")]
+                     if (record.get("dst", {}).get("value") == path
+                         and record.get("disposition") != "succeeded")
+                     or record.get("message", "").startswith(f"syq: {path or '.'}: ")]
             # Once, from the receiver: its error record and its operation
             # record, which has none of the coordinator's retry fields.
             assert [(record["type"], record.get("class")) for record in about] == [

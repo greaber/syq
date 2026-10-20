@@ -147,6 +147,9 @@ pub(super) struct Placement<'a> {
     pub(super) to_directory: RawFd,
     pub(super) to: &'a CStr,
     pub(super) link: Link,
+    /// A link is made from this open file (`/proc/self/fd/N` on Linux)
+    /// rather than from `from`'s name, so it links exactly that file.
+    pub(super) descriptor: Option<&'a CStr>,
 }
 
 /// Give `from` the name `to` without replacing anything already there,
@@ -161,14 +164,15 @@ pub(super) struct Placement<'a> {
 ///    name exists, when `link` allows and the filesystem may have links;
 /// 3. a check that `to` is absent, then a plain rename.
 ///
-/// Steps 1 and 2 never replace anything. Step 3 runs only where neither is
+/// Steps 1 and 2 never replace anything. Step 3 runs where neither is
 /// available, as on rclone mounts and on FAT and exFAT volumes on macOS,
-/// and there a name another writer creates between the check and the
-/// rename is replaced. A name that existed before is always refused, so a
-/// policy that keeps existing files keeps them, and every receiver uses
-/// this same order: a sender cannot move an existing file onto the name,
-/// because no operation it may request renames an existing destination
-/// entry to another name.
+/// and where an ordinary receiver's copy accepts it in place of a link
+/// (`Root::publish_new_staged`); there a name another writer creates
+/// between the check and the rename is replaced. A name that existed
+/// before is always refused, so a policy that keeps existing files keeps
+/// them, and a restricted receiver always uses this same order: a sender
+/// cannot move an existing file onto the name, because no operation it may
+/// request renames an existing destination entry to another name.
 ///
 /// A refusal of a step the profile allowed is passed to `record_refusal`
 /// and taken out of `profile`, so the rest of a publication skips it too:
@@ -187,6 +191,7 @@ pub(super) fn move_without_replacing(
         to_directory,
         to,
         link,
+        descriptor,
     } = *placement;
     let refuse = |profile: &mut Profile, refusal| {
         *profile = profile.without(refusal);
@@ -210,9 +215,18 @@ pub(super) fn move_without_replacing(
         let simulated = LINK_ERROR.get().map(io::Error::from_raw_os_error);
         #[cfg(not(test))]
         let simulated = None;
-        let linked = match simulated {
-            Some(error) => Err(error),
-            None => retry_zero(|| unsafe {
+        let linked = match (simulated, descriptor) {
+            (Some(error), _) => Err(error),
+            (None, Some(descriptor)) => retry_zero(|| unsafe {
+                libc::linkat(
+                    libc::AT_FDCWD,
+                    descriptor.as_ptr(),
+                    to_directory,
+                    to.as_ptr(),
+                    libc::AT_SYMLINK_FOLLOW,
+                )
+            }),
+            (None, None) => retry_zero(|| unsafe {
                 libc::linkat(from_directory, from.as_ptr(), to_directory, to.as_ptr(), 0)
             }),
         };

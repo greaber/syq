@@ -88,7 +88,6 @@ fn selected_seed_frames_accommodate_large_comparisons() {
         final_ranges: Some(ranges),
         block: MIN_HASH_BLOCK_BYTES,
         attempt: 0,
-        guard: None,
         clone_final: false,
     };
     let Request::SeedBasis { len, block, .. } = &request else {
@@ -171,7 +170,6 @@ fn owned_messages_frame_as_borrowed_ones_do() {
                 off: 0,
                 hash: [2; 32],
                 data: data.clone().into(),
-                guard: None,
             };
             let batch = || {
                 Request::PutSmallBatch(vec![SmallPut {
@@ -190,7 +188,6 @@ fn owned_messages_frame_as_borrowed_ones_do() {
                     flags: 0,
                     inplace: false,
                     condition: TargetCondition::Any,
-                    guard: None,
                     replaces: false,
                     scanned: crate::proto::ScannedDestination::Unknown,
                 }])
@@ -289,7 +286,6 @@ fn large_patches_are_written_directly_with_their_buffered_encoding() {
             flags: 0,
             unchanged_flags: 0,
             condition: TargetCondition::Any,
-            guard: None,
             update_in_place: false,
         };
         let request = Request::PatchSmallBatch(vec![patch]);

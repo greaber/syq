@@ -218,10 +218,10 @@ fn approved_source_control_and_worker_confine_reads_hashes_stats_and_mutation() 
         matches!(worker.request(read(Some(source.clone()), 8)), Response::Block { data, .. } if data == b"approved")
     );
     assert!(matches!(worker.request(Request::FileHash {
-        path: secret.as_os_str().as_bytes().to_vec(), source: Some(source.clone()), guard: None,
+        path: secret.as_os_str().as_bytes().to_vec(), source: Some(source.clone()),
     }), Response::FileHash { size: 8, hash } if hash == crate::hashing::HashAlgorithm::Sha256.hash(b"approved")));
     assert!(matches!(worker.request(Request::StatMany {
-        paths: vec![secret.as_os_str().as_bytes().to_vec()], sources: Some(vec![source.clone()]), follow: true, guard: None,
+        paths: vec![secret.as_os_str().as_bytes().to_vec()], sources: Some(vec![source.clone()]), follow: true,
     }), Response::Stats(entries) if entries.len() == 1 && entries[0].as_ref().unwrap().size == 8));
     let sibling = RegisteredPath::new(source.root(), b"secret".to_vec()).unwrap();
     for channel in [&mut server.control, &mut worker] {
@@ -234,14 +234,12 @@ fn approved_source_control_and_worker_confine_reads_hashes_stats_and_mutation() 
                 ops: vec![Op::Remove {
                     path: approved.as_os_str().as_bytes().to_vec()
                 }],
-                guard: None,
             }),
             Response::Err(_)
         ));
         assert!(matches!(
             channel.request(Request::Canonicalize {
-                path: b"/".to_vec(),
-                guard: None
+                path: b"/".to_vec()
             }),
             Response::Err(_)
         ));
@@ -347,7 +345,6 @@ fn approved_source_scan_entry_limit_is_enforced_before_emitting_the_batch() {
             follow_root: false,
             ignore: Vec::new(),
             report_ignored: true,
-            guard: None,
         })
         .unwrap();
     loop {
@@ -465,7 +462,6 @@ fn approved_source_tcp_requires_encryption_and_keeps_workers_read_only() {
             ops: vec![Op::Remove {
                 path: file.as_os_str().as_bytes().to_vec(),
             }],
-            guard: None,
         })
         .unwrap();
     assert!(matches!(

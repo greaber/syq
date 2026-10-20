@@ -170,7 +170,6 @@ fn write_range_tag() -> u32 {
             off: 0,
             hash: [0; 32],
             data: &[] as &[u8],
-            guard: None,
         })
     })
 }
@@ -221,7 +220,6 @@ pub(super) fn decode_request(mut frame: FrameBuffer) -> io::Result<Budgeted<Requ
             off,
             hash,
             data,
-            guard,
         } => {
             let range = located(data)?;
             Request::WriteRange {
@@ -235,7 +233,6 @@ pub(super) fn decode_request(mut frame: FrameBuffer) -> io::Result<Budgeted<Requ
                     storage: frame,
                     range,
                 },
-                guard,
             }
         }
         WireRequest::PatchData { data, hash } => {
@@ -261,7 +258,7 @@ pub(super) fn decode_request(mut frame: FrameBuffer) -> io::Result<Budgeted<Requ
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{ContainerGuard, FrameReader, FrameWriter};
+    use crate::proto::{FrameReader, FrameWriter};
 
     fn request(data: Vec<u8>) -> Request {
         Request::WriteRange {
@@ -272,11 +269,6 @@ mod tests {
             off: (1 << 40) + 17,
             hash: [231; 32],
             data: data.into(),
-            guard: Some(ContainerGuard {
-                root: b"/root".to_vec(),
-                dev: 456,
-                ino: 789,
-            }),
         }
     }
 
@@ -284,7 +276,12 @@ mod tests {
     fn unchanged_writer_fixture_keeps_wire_bytes_and_frame_allocation() {
         // Captured with the unchanged writer at master 2a708853, before the
         // payload representation changed. Do not regenerate with this writer.
-        let old = include_bytes!("../../tests/fixtures/protocol/write-range-2a708853.bin");
+        let captured = include_bytes!("../../tests/fixtures/protocol/write-range-2a708853.bin");
+        // Requests no longer carry a guard. The capture ends with the one it
+        // had: `Some`, the root "/root", device 456 and inode 789.
+        let guard = [1, 5, b'/', b'r', b'o', b'o', b't', 0xc8, 3, 0x95, 6];
+        let (old, captured_guard) = captured.split_at(captured.len() - guard.len());
+        assert_eq!(captured_guard, guard);
         let bytes = [0, 1, 127, 128, 255, 9];
         assert_eq!(postcard::to_stdvec(&request(bytes.to_vec())).unwrap(), old);
         let frame = old.to_vec();
@@ -378,11 +375,10 @@ mod tests {
             let messages: Vec<_> = rx.into_iter().collect();
             reader.join().unwrap();
             for (message, expected) in messages.into_iter().zip(expected) {
-                let Request::WriteRange { data, guard, .. } = message.value else {
+                let Request::WriteRange { data, .. } = message.value else {
                     panic!("not a write")
                 };
                 assert_eq!(&*data, expected);
-                assert_eq!(guard.unwrap().ino, 789);
             }
         }
     }

@@ -14,6 +14,10 @@
 //! recently is let go, unless a connection is using it. A copy has about two
 //! files in flight per worker, so what is let go is a file that failed and
 //! was not retried.
+//!
+//! Each held file keeps the size the request that created or opened it
+//! declared, and no write goes past it: what a copy writes is bounded by
+//! what it said it would write, on every receiver.
 
 use super::*;
 use std::collections::HashSet;
@@ -98,6 +102,8 @@ pub(super) struct Held {
     pub(super) opened: Option<fs::Metadata>,
     pub(super) relative: RelativePath,
     pub(super) created: bool,
+    /// The size declared for the file, which no write may go past.
+    pub(super) declared: u64,
     /// Shared with each connection that caches a descriptor of the file,
     /// which is then not let go to make room.
     in_use: Arc<()>,
@@ -119,6 +125,8 @@ pub(super) struct Got {
     /// This copy created the file, as `Held::created`.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(super) created: bool,
+    /// As `Held::declared`.
+    pub(super) declared: u64,
 }
 
 #[derive(Default)]
@@ -150,8 +158,9 @@ fn registry() -> MutexGuard<'static, Registry> {
 }
 
 /// Hold `file`, which this receiver just created (`created`) or opened at
-/// `relative`, as the file for `target`, replacing what was held for it, and
-/// return the share of its use count for a connection that caches `file`.
+/// `relative`, as the file for `target`, `declared` bytes long, replacing
+/// what was held for it, and return the share of its use count for a
+/// connection that caches `file`.
 /// Descriptors let go are closed after the registry is unlocked: a close
 /// can wait for a network filesystem.
 pub(super) fn hold(
@@ -160,6 +169,7 @@ pub(super) fn hold(
     file: &File,
     opened: Option<fs::Metadata>,
     created: bool,
+    declared: u64,
 ) -> io::Result<Arc<()>> {
     let file = file.try_clone()?;
     let in_use = Arc::new(());
@@ -173,6 +183,7 @@ pub(super) fn hold(
             opened,
             relative: relative.clone(),
             created,
+            declared,
             in_use: in_use.clone(),
             used: registry.clock,
         };
@@ -208,7 +219,16 @@ pub(super) fn get(target: For<'_>) -> io::Result<Option<Got>> {
         relative: held.relative.clone(),
         in_use: held.in_use.clone(),
         created: held.created,
+        declared: held.declared,
     }))
+}
+
+/// Declare the file held for `target` `declared` bytes long, as a request
+/// that prepares it again does.
+pub(super) fn declare(target: For<'_>, declared: u64) {
+    if let Some(held) = registry().held.get_mut(&target.key()) {
+        held.declared = declared;
+    }
 }
 
 /// Whether a file is held for `target` at `relative`.
@@ -318,12 +338,20 @@ mod tests {
             inplace: false,
         };
         for name in &names[..MAX_HELD] {
-            hold(held(name), name, &file, None, true).unwrap();
+            hold(held(name), name, &file, None, true, 0).unwrap();
         }
         // The oldest was used since; the next is cached by a connection.
         get(held(&names[0])).unwrap().unwrap();
         let cached = get(held(&names[1])).unwrap().unwrap().in_use;
-        hold(held(&names[MAX_HELD]), &names[MAX_HELD], &file, None, true).unwrap();
+        hold(
+            held(&names[MAX_HELD]),
+            &names[MAX_HELD],
+            &file,
+            None,
+            true,
+            0,
+        )
+        .unwrap();
         assert_eq!(count(scope), MAX_HELD);
         assert!(get(held(&names[2])).unwrap().is_none());
         for name in [&names[0], &names[1], &names[3], &names[MAX_HELD]] {
@@ -341,6 +369,7 @@ mod tests {
             &file,
             None,
             true,
+            0,
         )
         .unwrap();
         assert_eq!(count(scope), MAX_HELD + 1);
@@ -364,7 +393,7 @@ mod tests {
                     copy_id: &copy_id,
                     inplace: false,
                 };
-                hold(held, &name, &file, None, true).unwrap();
+                hold(held, &name, &file, None, true, u64::MAX).unwrap();
             }
         }
         release(ended);
@@ -386,7 +415,7 @@ mod tests {
             copy_id: &copy_id,
             inplace: false,
         };
-        hold(held, &name, &file, None, true).unwrap();
+        hold(held, &name, &file, None, true, u64::MAX).unwrap();
         let (first, finalizing) = finalize(held).unwrap();
         std::thread::scope(|threads| {
             let (sender, receiver) = std::sync::mpsc::channel();
@@ -400,7 +429,7 @@ mod tests {
             assert!(receiver
                 .recv_timeout(std::time::Duration::from_millis(200))
                 .is_err());
-            hold(held, &first.relative, &first.file, None, true).unwrap();
+            hold(held, &first.relative, &first.file, None, true, u64::MAX).unwrap();
             drop(finalizing);
             let second = receiver
                 .recv_timeout(std::time::Duration::from_secs(10))
@@ -408,7 +437,7 @@ mod tests {
             assert!(second == Some(name.clone()));
         });
         // After one that published, a second finds nothing held.
-        hold(held, &name, &file, None, true).unwrap();
+        hold(held, &name, &file, None, true, u64::MAX).unwrap();
         drop(finalize(held).unwrap());
         assert!(finalize(held).is_none());
         release(scope);

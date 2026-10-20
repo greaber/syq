@@ -591,6 +591,8 @@ pub fn change_ok(resp: Response, what: &str) -> Result<Response> {
             message: format!("{what}: {e}"),
             io_kind: None,
             raw_os_error: None,
+            condition_not_met: false,
+            unchanged: false,
         })),
         Response::EndpointError(error) => Err(ChangeFailed::replying(what, error)),
         r => Ok(r),
@@ -1365,7 +1367,6 @@ impl Conn for RemoteConn {
             follow_root,
             ignore: ignore.to_vec(),
             report_ignored,
-            guard: None,
         })?;
         let matcher = crate::scan::build_ignore(ignore)?;
         let mut saw_root = false;

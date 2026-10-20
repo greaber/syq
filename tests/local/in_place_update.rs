@@ -1180,3 +1180,37 @@ fn a_refused_file_changed_unseen_after_its_group_was_compared_gets_the_sources_b
     );
     assert!(partial_files(&t.0).is_empty());
 }
+
+/// Under `--existing` small existing files are updated in place in groups
+/// as well, with no request of their own: the files a copy finds are
+/// grouped whatever condition holds them to it.
+#[cfg(debug_assertions)]
+#[test]
+fn small_files_under_existing_are_updated_in_place_in_groups() {
+    for route in ["ssh", "blocks"] {
+        let t = Tmp::new();
+        let names: Vec<String> = (0..12).map(|index| format!("file{index:02}")).collect();
+        for (seed, name) in names.iter().enumerate() {
+            small_update(&t, name, 760 + seed as u64, true);
+        }
+        let hashes = t.path("hashes");
+        let out = rsync_inplace(
+            &t,
+            route,
+            &["--existing"],
+            &[
+                ("SYQ_TEST_DESTINATION_HASHES", &hashes.to_string_lossy()),
+                ("SYQ_DEBUG", "1"),
+            ],
+        );
+        assert_output_ok(&out);
+        assert!(
+            hashed_in_groups(&hashes),
+            "{route}: {}",
+            fs::read_to_string(&hashes).unwrap_or_default()
+        );
+        let observed = tuning_observed(&out);
+        assert_eq!(observed["compared_files"], 12, "{route}: {observed}");
+        assert_eq!(observed["range_requests"], 0, "{route}: {observed}");
+    }
+}
