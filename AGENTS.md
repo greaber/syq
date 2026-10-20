@@ -78,6 +78,23 @@ command with this restoration when necessary.
 - If the command runtime moves a live command into the background, continue monitoring the original task or session handle. Do not launch a second copy. When stopping an owned command, terminate and verify its whole process group so children cannot survive as stale workers or lock holders.
 - For asynchronous CI, use the repository's CI monitor/wait mechanism instead of shell polling.
 
+## Keep shell commands simple
+
+Run one logical step per shell command: cleanup, then a loop, then any
+`sh -c` script, as separate commands. Claude Code statically checks each
+Bash call for dangerous `rm` and prompts on a hit even in bypass mode. The
+user cannot audit a long compound command, so a prompt on one is a dead
+end, and most "could not check" prompts come from combining cleanup, loops,
+`cd`, and inline scripts in one call.
+
+- Give `rm` literal absolute paths, with a glob only in the last segment.
+  Do not build a target from `$VAR`, `$(...)`, `~`, `..`, or a relative
+  path after `cd`. If a variable is unavoidable, write `"${VAR:?}"`.
+- Never put `rm` in the same command as an inline `sh -c` script, and
+  inside such a script call programs by literal path, not `$BIN args`.
+- A command may begin with `cd`; chain everything after it with `&&`, and
+  do not mix `&&` with `;` in one command.
+
 ## Documentation over agent memory
 
 Keep documentation focused on current user-facing behavior. Do not create or
