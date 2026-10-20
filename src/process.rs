@@ -77,82 +77,55 @@ fn require_started_file(path: &std::path::Path) -> std::io::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn replaced(path: &std::path::Path) -> std::io::Error {
-    std::io::Error::other(replaced_message(path, SERVICE.get()))
+    std::io::Error::other(replaced_message(path, RECEIVING.get()))
 }
 
-/// A long-lived background process, which a user restarts rather than
-/// reruns once syq is upgraded under it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) enum Service {
-    /// A receiving connection to this server (`--receive-service`).
-    Receiving { endpoint: String },
-    /// The local provider service `syq persist receive on` starts.
-    Provider,
-    /// A persistent connection that `syq persist off` closes and the next
-    /// command opens again, named here.
-    Connection(&'static str),
-}
-
-/// The service this process runs, and its persistence domain's explicit path.
-#[cfg(target_os = "macos")]
-static SERVICE: std::sync::OnceLock<(Service, Option<std::path::PathBuf>)> =
-    std::sync::OnceLock::new();
-
-/// Note that this process runs `service` in the persistence domain at
-/// `scope` (`None` for the default one), so that a refused start says how
-/// to restart it. Call once, as the service starts.
-pub(crate) fn running_service(service: Service, scope: Option<&std::path::Path>) {
-    #[cfg(target_os = "macos")]
-    let _ = SERVICE.set((service, scope.map(std::path::Path::to_path_buf)));
-    #[cfg(not(target_os = "macos"))]
-    let _ = (service, scope);
-}
-
-/// What a refused start says: a command is rerun, a service restarted with
-/// the commands for its kind and domain.
+/// A receiving connection (`--receive-service`): the server it serves, and
+/// its persistence domain's explicit path. Of syq's long-lived processes,
+/// only it starts syq processes of its own, the return helpers each request
+/// runs, so only it is restarted rather than rerun.
 #[cfg(any(target_os = "macos", test))]
-fn replaced_message(
-    path: &std::path::Path,
-    service: Option<&(Service, Option<std::path::PathBuf>)>,
-) -> String {
-    let Some((service, scope)) = service else {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Receiving {
+    endpoint: String,
+    scope: Option<std::path::PathBuf>,
+}
+
+#[cfg(target_os = "macos")]
+static RECEIVING: std::sync::OnceLock<Receiving> = std::sync::OnceLock::new();
+
+/// Note that this process is the receiving connection to `endpoint` in the
+/// persistence domain at `scope` (`None` for the default one), so that a
+/// refused start says how to restart it. Call once, as it starts.
+pub(crate) fn running_receiving_connection(endpoint: String, scope: Option<&std::path::Path>) {
+    #[cfg(target_os = "macos")]
+    let _ = RECEIVING.set(Receiving {
+        endpoint,
+        scope: scope.map(std::path::Path::to_path_buf),
+    });
+    #[cfg(not(target_os = "macos"))]
+    let _ = (endpoint, scope);
+}
+
+/// What a refused start says: a command is rerun, and a receiving
+/// connection restarted by connecting again, which replaces a connection
+/// from another version and keeps the domain's settings.
+#[cfg(any(target_os = "macos", test))]
+fn replaced_message(path: &std::path::Path, receiving: Option<&Receiving>) -> String {
+    let Some(Receiving { endpoint, scope }) = receiving else {
         return format!(
             "syq at {} was replaced while this command was running; rerun the command",
             path.display()
         );
     };
-    let persist = |words: &str| match scope {
-        Some(scope) => format!(
-            "`syq persist {words} --pscope {}`",
-            shell_words::quote(&scope.to_string_lossy())
-        ),
-        None => format!("`syq persist {words}`"),
-    };
-    let (name, restart) = match service {
-        Service::Receiving { endpoint } => (
-            format!("the receiving connection to {endpoint}"),
-            format!(
-                "restart it with {}, then {}",
-                persist("off"),
-                persist(&format!("connect {}", shell_words::quote(endpoint)))
-            ),
-        ),
-        Service::Provider => (
-            "the local provider service".to_owned(),
-            format!("restart it with {}", persist("receive on")),
-        ),
-        Service::Connection(name) => (
-            (*name).to_owned(),
-            format!(
-                "close it with {}; the next syq command starts the new version",
-                persist("off")
-            ),
-        ),
-    };
+    let scope = scope.as_ref().map_or_else(String::new, |scope| {
+        format!(" --pscope {}", shell_words::quote(&scope.to_string_lossy()))
+    });
     format!(
-        "syq at {} was upgraded while {name} was running; {restart}",
-        path.display()
+        "syq at {} was upgraded while the receiving connection to {endpoint} was running; \
+         restart it with `syq persist connect {}{scope}`",
+        path.display(),
+        shell_words::quote(endpoint)
     )
 }
 
@@ -466,43 +439,35 @@ mod tests {
     }
 }
 
-/// A refused start tells a command to rerun and a service how to restart.
+/// A refused start tells a command to rerun and a receiving connection how
+/// to restart.
 #[cfg(test)]
 mod replaced_message_tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
     #[test]
-    fn commands_rerun_and_services_name_their_restart() {
+    fn commands_rerun_and_receiving_connections_connect_again() {
         let path = Path::new("/opt/syq/bin/syq");
-        let message = |service: Service, scope: Option<&str>| {
-            replaced_message(path, Some(&(service, scope.map(PathBuf::from))))
-        };
         assert_eq!(
             replaced_message(path, None),
             "syq at /opt/syq/bin/syq was replaced while this command was running; \
              rerun the command"
         );
+        let receiving = |scope: Option<&str>| Receiving {
+            endpoint: "alice@server".into(),
+            scope: scope.map(PathBuf::from),
+        };
         assert_eq!(
-            message(
-                Service::Receiving {
-                    endpoint: "alice@server".into()
-                },
-                None
-            ),
+            replaced_message(path, Some(&receiving(None))),
             "syq at /opt/syq/bin/syq was upgraded while the receiving connection to \
-             alice@server was running; restart it with `syq persist off`, then \
-             `syq persist connect alice@server`"
+             alice@server was running; restart it with `syq persist connect alice@server`"
         );
         assert_eq!(
-            message(Service::Provider, Some("/tmp/my scope")),
-            "syq at /opt/syq/bin/syq was upgraded while the local provider service was \
-             running; restart it with `syq persist receive on --pscope '/tmp/my scope'`"
-        );
-        assert_eq!(
-            message(Service::Connection("the session pool"), None),
-            "syq at /opt/syq/bin/syq was upgraded while the session pool was running; \
-             close it with `syq persist off`; the next syq command starts the new version"
+            replaced_message(path, Some(&receiving(Some("/tmp/my scope")))),
+            "syq at /opt/syq/bin/syq was upgraded while the receiving connection to \
+             alice@server was running; restart it with \
+             `syq persist connect alice@server --pscope '/tmp/my scope'`"
         );
     }
 }

@@ -2677,6 +2677,39 @@ fn hardlink_publication_is_confined_and_rejects_a_replaced_representative() {
     assert!(tree.path().join("directory").is_dir());
 }
 
+/// Where a filesystem has no hard links and inode numbers cannot tie a name
+/// to a file (FAT and exFAT on macOS), a hard link fails because of the
+/// missing links, even for a grant that keeps existing files.
+#[test]
+fn hardlink_publication_names_missing_hard_links_before_untied_identities() {
+    use crate::proto::TargetCondition::Any;
+    let tree = TestDir::new("hardlinks-missing");
+    let root = Root::open(tree.path()).unwrap();
+    assume_missing(&root, false, false, true);
+    assume_untrusted_link_counts(&root);
+    fs::write(tree.path().join("source"), b"payload").unwrap();
+    let source = relative(b"source");
+    let original = root.metadata(&source).unwrap();
+    for identity_relied_on in [false, true] {
+        let error = root
+            .publish_hardlink_to(
+                &source,
+                &relative(b"target"),
+                (original.dev, original.ino),
+                Any,
+                identity_relied_on,
+            )
+            .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "target cannot be linked to source: the destination filesystem does not \
+             support hard links",
+            "{identity_relied_on}"
+        );
+    }
+    assert_eq!(sorted_names(tree.path()), ["source"]);
+}
+
 /// A temporary link that turns out not to name the representative is
 /// removed, whatever the condition: no exchange ran, so nothing it holds was
 /// displaced from the destination. On Linux a new name is linked from the

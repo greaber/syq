@@ -1979,6 +1979,20 @@ impl Root {
         // link from another filesystem fails with EXDEV, which teaches
         // nothing.
         let mut profile = self.profile_on(opened.dev, &file);
+        // A filesystem without hard links refuses every link with an error
+        // that says little (EPERM from Linux FAT, ENOTSUP from macOS FAT and
+        // exFAT, EIO from an rclone mount), so the cause is named instead,
+        // before any check that only matters where links can be made.
+        let unsupported = |cause: &str| {
+            anyhow::anyhow!(
+                "{} cannot be linked to {}: the destination filesystem {cause}",
+                target.label(),
+                source.label()
+            )
+        };
+        if !profile.hard_links {
+            return Err(unsupported("does not support hard links"));
+        }
         if identity_relied_on && !profile.link_counts_trusted {
             bail!(
                 "hard link {} cannot be tied to the file it would name on this filesystem, \
@@ -2047,19 +2061,6 @@ impl Root {
                 bail!("hardlink destination {} is a directory", target.label())
             }
             (Any | Absent | Matches { .. }, _) => {}
-        }
-        // A filesystem without hard links refuses every link with an error
-        // that says little (EPERM from Linux FAT, ENOTSUP from macOS FAT and
-        // exFAT, EIO from an rclone mount), so the cause is named instead.
-        let unsupported = |cause: &str| {
-            anyhow::anyhow!(
-                "{} cannot be linked to {}: the destination filesystem {cause}",
-                target.label(),
-                source.label()
-            )
-        };
-        if !profile.hard_links {
-            return Err(unsupported("does not support hard links"));
         }
         let refused = |error: anyhow::Error| {
             let Some(cause) = error

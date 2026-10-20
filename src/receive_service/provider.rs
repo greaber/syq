@@ -1020,14 +1020,7 @@ pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
             "local provider service needs its persistence domain path"
         );
         crate::fsops::reserve_startup_descriptors();
-        let domain = Domain::select(Some(Path::new(&argv[2])));
-        if let Ok(domain) = &domain {
-            crate::process::running_service(
-                crate::process::Service::Provider,
-                domain.explicit_path(),
-            );
-        }
-        let runtime = domain.and_then(Runtime::new);
+        let runtime = Domain::select(Some(Path::new(&argv[2]))).and_then(Runtime::new);
         let ready = runtime
             .as_ref()
             .map(|_| ())

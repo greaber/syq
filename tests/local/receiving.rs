@@ -2288,3 +2288,174 @@ fn turning_off_the_last_profile_leaves_no_provider_after_another_build() {
     assert_eq!(old.join().unwrap(), ["Stop"]);
     assert!(local_provider(&t).is_null());
 }
+
+/// Turns a scoped domain off when dropped, even if the test fails.
+struct ScopeOff<'a>(&'a Tmp, PathBuf);
+
+impl Drop for ScopeOff<'_> {
+    fn drop(&mut self) {
+        let _ = persistence_command(self.0, &["off", "--pscope", self.1.to_str().unwrap()]).run();
+    }
+}
+
+/// After an upgrade, a receiving connection from the old build refuses to
+/// start helpers on macOS and names `syq persist connect SERVER --pscope
+/// PATH`. Running that replaces the old connection with one from this build
+/// and keeps the domain and its settings. The fake ssh cannot forward the
+/// return socket, so each connect reports that the connection failed after
+/// the service starts; the real-SSH suite runs the same steps to "online".
+#[test]
+fn connecting_again_replaces_a_receiving_connection_from_another_build() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    fs::create_dir(t.path("root")).unwrap();
+    fs::create_dir(t.path("home")).unwrap();
+    let ssh = fake_ssh(&t);
+    let scope = ephemeral_scope(&t);
+    let _off = ScopeOff(&t, scope.clone());
+    let run = |args: &[&str]| {
+        persistence_command(&t, args)
+            .args(["--pscope", scope.to_str().unwrap()])
+            .env("HOME", t.path("home"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            )
+            .run()
+            .unwrap()
+    };
+    let connect = || {
+        let output = run(&[
+            "connect",
+            "test-server",
+            "--timeout",
+            "20",
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+        ]);
+        let stderr = stderr_of(&output);
+        assert!(
+            stderr.contains("server rejected return connection"),
+            "{stderr}"
+        );
+    };
+    assert_output_ok(&run(&[
+        "receive",
+        "on",
+        "--notify",
+        "off",
+        "--root",
+        &t.s("root"),
+        "--all-connections",
+    ]));
+    connect();
+    let settings = read(&scope.join("receive.json"));
+
+    // The control of the connection to test-server, and its service.
+    let control = fs::read_dir(&scope)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.to_str().unwrap().ends_with(".recv-json"))
+        .expect("receiving record");
+    let control = PathBuf::from(
+        control
+            .to_str()
+            .unwrap()
+            .strip_suffix(".recv-json")
+            .unwrap(),
+    );
+    let suffixed = |suffix: &str| PathBuf::from(format!("{}{suffix}", control.display()));
+    let status = |stop: bool| {
+        let mut stream = std::os::unix::net::UnixStream::connect(suffixed(".recv")).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        write_provider_frame(&mut stream, serde_json::json!({"version": 2, "stop": stop}));
+        read_provider_frame(&mut stream)
+    };
+    let build = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("--build-identity")
+        .capture_output()
+        .unwrap();
+    let build = String::from_utf8(build.stdout).unwrap();
+    assert_eq!(status(false)["identity"], build.trim());
+
+    // Replace it with a connection from another build, as after an upgrade.
+    let pid = status(false)["pid"].as_u64().unwrap();
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let lock = loop {
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(suffixed(".recv-lock"))
+            .unwrap();
+        if unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&lock),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        } == 0
+            && !suffixed(".recv").exists()
+        {
+            break lock;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the receiving connection from this build did not stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let socket = suffixed(".recv");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let old = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the old receiving connection was not stopped: {requests:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let stop = read_provider_frame(&mut stream)["stop"] == true;
+            requests.push(if stop { "stop" } else { "status" });
+            write_provider_frame(
+                &mut stream,
+                serde_json::json!({
+                    "version": 2, "identity": "other-build", "pid": 0,
+                    "endpoint": "test-server", "name": "",
+                    "connection": {"phase": "online", "error": null, "ssh_pid": null}
+                }),
+            );
+            if stop {
+                // Like the service, remove the socket before the lock.
+                fs::remove_file(&socket).unwrap();
+                drop(lock);
+                return requests;
+            }
+        }
+    });
+
+    // The step the refusal names.
+    connect();
+    assert_eq!(old.join().unwrap().last(), Some(&"stop"));
+    assert_eq!(status(false)["identity"], build.trim());
+    assert_eq!(read(&scope.join("receive.json")), settings);
+}

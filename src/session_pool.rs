@@ -391,14 +391,6 @@ pub(crate) fn run(argv: &[OsString]) -> Result<()> {
         .parent()
         .context("control socket path has no parent")?;
     crate::persistence::validate_scope(scope)?;
-    // Only macOS reports the domain (`process::running_service`).
-    #[cfg(target_os = "macos")]
-    if let Ok(domain) = crate::persistence::Domain::select(Some(scope)) {
-        crate::process::running_service(
-            crate::process::Service::Connection("the session pool"),
-            domain.explicit_path(),
-        );
-    }
     let Some(lock) = try_lock(&control, true)? else {
         // Another pool serves this endpoint.
         return Ok(());
