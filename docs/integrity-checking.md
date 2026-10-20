@@ -65,10 +65,10 @@ sets `transfer`, including `transfer=off`. That check catches data corrupted in
 transit, but no checksum authenticates unencrypted traffic: an attacker can
 replace both the data and its checksum.
 
-When received data fails the check, syq does not use it. A file it was
-updating from matching blocks is sent again whole; otherwise the file fails
-with `data corrupted in transit; rerun the command to retry`, and the run ends
-with exit status 23. Rerunning the command copies it again.
+Syq doesn't write data that fails the check. Depending on how the file was
+being sent, it either sends the file again in the same run, or reports it as
+failed with `data corrupted in transit; rerun the command to retry` and ends
+with exit status 23.
 
 For a complete check of a local copy, use an [expected hash](#expected-hashes).
 
