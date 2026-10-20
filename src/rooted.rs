@@ -2048,6 +2048,36 @@ impl Root {
             }
             (Any | Absent | Matches { .. }, _) => {}
         }
+        // A filesystem without hard links refuses every link with an error
+        // that says little (EPERM from Linux FAT, ENOTSUP from macOS FAT and
+        // exFAT, EIO from an rclone mount), so the cause is named instead.
+        let unsupported = |cause: &str| {
+            anyhow::anyhow!(
+                "{} cannot be linked to {}: the destination filesystem {cause}",
+                target.label(),
+                source.label()
+            )
+        };
+        if !profile.hard_links {
+            return Err(unsupported("does not support hard links"));
+        }
+        let refused = |error: anyhow::Error| {
+            let Some(cause) = error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<io::Error>())
+            else {
+                return error;
+            };
+            if publication::links_unsupported(cause) {
+                unsupported("does not support hard links")
+            } else if cause.raw_os_error() == Some(libc::EIO) && !profile.audited {
+                // As for publication (`publication::link_falls_back`), EIO
+                // may mean an I/O error or no hard links here.
+                unsupported(&format!("may not support hard links: {cause}"))
+            } else {
+                error
+            }
+        };
         #[cfg(target_os = "linux")]
         let source_name = CString::new(crate::sys::proc_fd_path(&file))?;
         #[cfg(not(target_os = "linux"))]
@@ -2070,7 +2100,8 @@ impl Root {
                     libc::AT_SYMLINK_FOLLOW,
                 )
             })
-            .with_context(|| format!("publish hardlink {}", target.label()));
+            .with_context(|| format!("publish hardlink {}", target.label()))
+            .map_err(refused);
         }
         let temporary = create_temporary(&parent, |fd, name| {
             #[cfg(target_os = "linux")]
@@ -2094,7 +2125,8 @@ impl Root {
                 )
             });
             result
-        })?;
+        })
+        .map_err(refused)?;
         let directory = parent.directory.as_raw_fd();
         // Set once a matched exchange has displaced the old destination
         // into the temporary name.

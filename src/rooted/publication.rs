@@ -67,7 +67,7 @@ pub(super) fn rename_flag_unsupported(error: &io::Error) -> bool {
 /// Whether `linkat` failed with an error that says the filesystem has no
 /// hard links: `ENOTSUP` from macOS FAT, exFAT and SMB, `ENOSYS` from a
 /// server without them.
-fn links_unsupported(error: &io::Error) -> bool {
+pub(super) fn links_unsupported(error: &io::Error) -> bool {
     error.raw_os_error().is_some_and(|code| {
         matches!(code, libc::ENOSYS | libc::EOPNOTSUPP) || code == libc::ENOTSUP
     })
