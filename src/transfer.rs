@@ -3526,6 +3526,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     } else {
         None
     };
+    // `--into-new` found its directory missing. One that another program
+    // created since is not adopted: the copy refuses it, as the check would
+    // have, and later creates its own without replacing anything.
+    if args.target_existence == Existence::New && dst_is_dir && directory_selection.is_some() {
+        return Err(new_target_exists(&dst_root));
+    }
     if debug() {
         crate::output::diagnostic!(
             "syq: destination selection complete at {:.2}s",
@@ -5202,9 +5208,11 @@ fn target_container(root: &[u8], entry: &Entry) -> ContainerGuard {
     }
 }
 
+/// Tests pause a copy whose placement requires a new or existing target
+/// here, between checking that target and selecting its directory.
 #[cfg(debug_assertions)]
 fn hold_after_target_precondition_for_test(args: &Args) -> Result<()> {
-    if args.interface != Interface::Rsync || args.target_existence == Existence::Any {
+    if args.target_existence == Existence::Any {
         return Ok(());
     }
     crate::fsops::test_race_barrier(

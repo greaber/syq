@@ -182,12 +182,12 @@ applies to individual selected entries.
 
 With `error`, `error-if-different` and `--as-new`, syq publishes a new file at a
 name only while the name is still free: if a file appears there first, syq keeps
-it and reports that file's copy as failed. On filesystems with neither an atomic
+it and reports that file's copy as failed. Likewise, `--into-new` creates its
+directory only while the name is free: if one appears there first, the copy
+stops without writing into it. On filesystems with neither an atomic
 no-replace rename nor hard links, such as FAT and exFAT on macOS and rclone
-mounts, syq checks that the name is free and then renames, so a file another
-program creates there in the instant between the two can be replaced.
-Likewise, `--into-new` creates its directory only while the name is free: if
-one appears there first, the copy stops without writing into it.
+mounts, syq checks that a file's name is free and then renames, so a file
+another program creates there in the instant between the two can be replaced.
 
 See [Update policies](commands/cp.md#update-policies) for supported combinations.
 
