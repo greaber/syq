@@ -12,7 +12,7 @@ fn advanced_description(path: &str) -> Option<&'static str> {
     match path {
         "syq map" => Some("Print source-to-destination mappings as NDJSON"),
         "syq receiver" => Some("Manage manual receiver enrollment and recovery"),
-        "syq receiver enroll" => Some("Manually enroll or refresh a receiver"),
+        "syq receiver enroll" => Some("Manually enroll or refresh a server account"),
         "syq persist destinations" => {
             Some("Inspect shared receiving names; --pscope does not filter them")
         }

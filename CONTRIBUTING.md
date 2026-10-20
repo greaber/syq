@@ -80,18 +80,19 @@ The rsync spellings are `--rsync-path` and `--syq-no-bootstrap`.
 ## Direct server-to-server copies
 
 Follow the [remote-copy prerequisites](docs/remote-to-remote.md#what-you-need).
-The first copy can enroll a destination automatically. To enroll explicitly,
-or update an existing receiver after rebuilding:
+The first copy enrolls the destination account automatically, and the next
+copy after a rebuild installs the matching receiver. To enroll explicitly:
 
 ```sh
-./target/release/syq receiver enroll hostB:/tmp/syq-dev-copy
+./target/release/syq receiver enroll hostB
 ./target/release/syq cp --from hostA --srcs-in data \
   --to hostB --into /tmp/syq-dev-copy
 ```
 
-Stop active copies before updating the receiver. Repeating enrollment preserves
-its receipt key. Use `receiver list` and `receiver revoke ID` to remove access
-when finished; add `--via hostA` if management needs a jump host.
+Each build identity installs its own receiver in hostB's
+`~/.local/lib/syq`, and refreshing keeps the enrollment's keys. Use
+`receiver list` and `receiver revoke ID` to remove access when finished; add
+`--via hostA` if management needs a jump host.
 
 Enrollment uploads your executable by default, so it must run on the destination.
 A build selecting official helpers installs the released receiver instead.

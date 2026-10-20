@@ -254,7 +254,7 @@ fn management_help_separates_everyday_options_from_manual_overrides() {
         (vec!["persist", "receive", "status"], vec![], vec!["--json"]),
         (
             vec!["receiver", "enroll"],
-            vec!["[USER@]HOST:DESTINATION"],
+            vec!["[USER@]HOST"],
             vec!["--via"],
         ),
         (
@@ -328,7 +328,7 @@ fn advanced_commands_are_discoverable_and_keep_their_full_descriptions() {
         (
             vec!["receiver"],
             "enroll",
-            "Copies normally enroll receivers automatically",
+            "Copies normally enroll accounts automatically",
         ),
         (
             vec!["persist"],
@@ -378,7 +378,7 @@ fn advanced_commands_are_discoverable_and_keep_their_full_descriptions() {
         }
     }
     let enroll = help(&["receiver", "enroll", "--help-all"]);
-    assert!(enroll.contains("Copies normally enroll receivers automatically"));
+    assert!(enroll.contains("Copies normally enroll accounts automatically"));
     for path in [
         vec!["ssh"],
         vec!["exec"],

@@ -217,48 +217,62 @@ limiting the access hostA receives.
 
 The protection has several parts:
 
-1. **Set up a restricted entry point on hostB.** Your laptop uses its normal
-   SSH access to install a receiver, a dedicated SSH public key, and a separate
-   public key for verifying copy grants. The SSH key's `authorized_keys` entry
-   permits only the receiver command, with SSH forwarding disabled. The receiver
-   refuses to run as root.
-2. **Keep the grant-signing key on your laptop.** A dedicated agent exposes only
-   the receiver's SSH key to hostA. That key can authenticate to the receiver,
-   but cannot sign valid copy grants. It is stored unencrypted on your laptop: anyone
-   holding it can enter that receiver, but still needs a valid signed grant to
-   copy files. Your ordinary SSH agent and the grant-signing key are not forwarded. Ordinary
-   SSH host-key checking on hostA uses the destination keys trusted by your laptop.
-   Keep this SSH key dedicated to the receiver: authorizing it elsewhere would
+1. **Set up a restricted entry point on hostB.** The first copy uses your
+   normal SSH login to install a receiver and add one `authorized_keys` line.
+   That line's entry key permits only the receiver command, with SSH
+   forwarding disabled, and its comment names the login key the receiver
+   trusts. The receiver refuses to run as root.
+2. **Give hostA only the entry key.** HostA receives the entry key with each
+   copy you authorize and uses it for every connection to the receiver,
+   checking hostB's host key against the keys your laptop trusts. The entry
+   key can start the receiver but authorizes nothing: anyone holding it,
+   including a server that ran an earlier copy, still needs a newly signed grant
+   to copy files. Your login key and SSH agent stay on your
+   laptop; no agent is forwarded. The entry key is stored unencrypted on your
+   laptop. Keep it dedicated to the receiver: authorizing it elsewhere would
    give hostA that access too.
-3. **Authorize the particular copy separately.** Your laptop signs a grant
-   stating the permitted destination paths, write and deletion permissions,
-   limits, and expiry. HostB's receiver verifies the signature, records that
-   the grant has been used, and enforces it throughout the transfer. HostA
-   cannot broaden the grant or redeem it again for a later copy.
+3. **Sign the particular copy with your login key.** Your laptop signs a
+   grant stating the permitted destination paths, write and deletion
+   permissions, limits, and expiry, using the key you log in to hostB with.
+   HostB's receiver checks the signature against that key, including a FIDO
+   key's touch and PIN and a certificate's expiry, records that the
+   grant has been used, and enforces it throughout the transfer. HostA
+   cannot broaden the grant or redeem it again for a later copy. The
+   signature is made for syq copies alone and cannot pass as a login.
 4. **Check the outcome with hostB.** The receiver reports each change it
    makes, protected by a key hostB created during setup. HostA passes the
    reports to your laptop, which checks that they are hostB's and that hostA
    left none out, added none, and did not cut them short.
 
-HostB's receiver opens the directory it was set up for once, when it
-verifies the grant, and does everything the copy asks beneath it, without
-following symlinks. Renaming or replacing a directory on the way to it during
-the copy does not redirect the copy. With `--follow-dst`, the receiver itself
-follows a symlink at the destination, and only to a directory inside the one
-it was set up for and outside its control files.
+An enrollment covers the whole account. Each copy's grant names its
+destination, which can be anywhere the account can write except the
+receiver's protected paths: the account's SSH configuration, syq's stored
+programs, enrollment state on either side, and receiving state. A file
+written elsewhere in the account, such as a shell startup file, can run code
+as the account, so a grant is as strong as a login. That is
+acceptable because only your login key can sign one, and you choose each
+destination.
+
+HostB's receiver opens the directory the destination is in when the copy
+starts, resolving it as the account would, and refuses it when it is one of
+the protected paths or lies inside one, whatever names lead to it. It then
+does everything the copy asks beneath that directory, without following
+symlinks. Renaming or replacing a directory on the way to it during the copy
+does not redirect the copy. With `--follow-dst`, the receiver itself follows
+a symlink at the destination, and only to a directory inside the one the
+destination is in and outside its protected paths.
+
+When syq refreshes the receiver after an update, or starts trusting a new
+login key, it rewrites syq's line, and SSH connections opened before that
+cannot start new copies. An enrollment outlives removing or revoking your
+login key on hostB: end it with `syq receiver revoke`, or remove every
+`authorized_keys` line that contains the key, syq's own line included.
 
 File data travels directly from hostA to hostB, over encrypted TCP or SSH.
 Your laptop provides authorization and verifies the result without carrying
 the file data. See [Copy between servers](remote-to-remote.md) for setup and
-revoking access.
-
-For passphrase-protected software logins, syq encrypts the grant-signing key on disk
-and uses the original key's agent to unlock it locally. Anyone able to request
-unrestricted signatures from that agent and read the encrypted file can also
-unlock it. The dedicated SSH agent does not expose that operation.
-The decrypted software key exists in local memory during a copy; a FIDO
-grant-signing key continues to require its hardware device. See
-[key matching and supported logins](remote-reference.md#enrollment).
+revoking access, and [Enrollment](remote-reference.md#enrollment) for the
+login keys that can sign.
 
 Alternative authentication modes grant more authority. `--peer-auth broker`
 limits authentication to the chosen host and user but allows that account's
@@ -289,7 +303,9 @@ HostA cannot:
   metadata, or give them new names with hard links, when the grant permits
   only creating new ones, or delete files without permission.
 - Exceed the signed byte, entry, or deletion limits.
-- Reuse the grant for another copy or use the restricted key to run a shell.
+- Reuse the grant for another copy, use the entry key it keeps to start a
+  later copy without a newly signed grant, or use that key to run a
+  shell.
 - Forge, alter, or cut short hostB's reports of its changes.
 
 A grant that permits only creating new files refuses hard links on

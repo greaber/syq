@@ -13,7 +13,8 @@ The source and destination have separate filesystems, homes, host keys, sshd
 processes, and network namespaces. The runner generates a new test-only client
 key for every invocation. Only its public key enters the endpoint containers;
 the source has no independent destination credential. A successful default
-direct transfer therefore exercises syq's isolated receiver-key agent.
+direct transfer therefore exercises the entry key that syq hands to the source
+for its connections to the destination's restricted receiver.
 The destination's network namespace also rejects one dedicated TCP port with a
 real firewall rule; a transfer aimed at that port must automatically fall back
 to SSH data connections.
@@ -280,9 +281,20 @@ to an unresponsive old connection without displacing it, and that readiness
 checks verify the identity of the registered receiver. Dirty baseline builds
 are rejected.
 
-The separate-receiver-keys case uses a checksum-pinned OpenSSH 8.8 build for
-both clients, the laptop agent, and a second destination server. It checks SSH
-and TCP copies, rejection of an untrusted destination key, forced-command
-confinement, and upgrading a single-key enrollment without replacing its grant
-key, receipt key, identity, or existing replay records. The unchanged v0.7.1
-state fixtures are also exercised by the Rust tests.
+The OpenSSH 8.8 enrollment case uses a checksum-pinned OpenSSH 8.8 build for
+both clients, the laptop agent, and a second destination server, and repeats
+on an RSA-only server. It checks that a dry run does not enroll, SSH and TCP
+copies, rejection of an untrusted destination key, forced-command confinement,
+and that repeating enrollment keeps the receiver's state. The unchanged
+v0.7.1 state fixtures are exercised by the Rust tests, which check that
+released enrollments are never read or changed.
+
+The login-key case enrolls the destination with each kind of login key: key
+files, passphrase-protected and agent-only keys in the agent, FIDO keys
+through the agent with the lab's test provider (with and without touch, with
+a PIN, and with the device unavailable), and a certificate login. It checks
+that keys which cannot sign, such as keys added with `ssh-add -h`, are refused
+before anything is installed; that a new login key replaces only the trusted
+signer; that a connection opened before a refresh cannot start a new copy
+while a copy running through it finishes; and that replacing the destination
+directory, as a remount does, needs no new enrollment.

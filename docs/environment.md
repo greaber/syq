@@ -53,7 +53,9 @@ Default locations include:
 | `~/.config/syq/install.json`, `last-update-check` | Install receipt and update-check timing |
 | `$XDG_RUNTIME_DIR/syq-persist-UID/` | Persistent connection sockets |
 | `~/.syq-destinations-v3/` | Registered receiving names on a server |
-| `~/.local/share/syq/restricted/` | Receiver enrollment state |
+| `~/.local/state/syq/enrollments/` | Your restricted-copy enrollments, with their entry keys |
+| `~/.local/share/syq/enrollments/` | A server's enrollment state |
+| `~/.local/lib/syq/` | A server's restricted receivers, one directory per release |
 
 Copies can proceed when optional caches cannot be written, and syq does not
 create a missing home directory to hold them. Copies do need a little space for
