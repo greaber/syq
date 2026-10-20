@@ -744,17 +744,13 @@ fn local_receiver_starts_from_the_running_build_after_its_file_is_replaced() {
     assert_eq!(read(&t.path("dst/file")), b"contents");
 }
 
-/// macOS has no /proc/self/exe, so once an upgrade or rebuild replaces
-/// syq's file while a copy runs, the copy refuses to start its local
-/// receiver from that path, which would run another build, and says to
-/// rerun.
+/// Start a local copy from a copy of syq, rename `replacement` over that
+/// file as an upgrade or reinstall does, then let the copy start its
+/// receiver. Returns the copy's status and stderr.
 #[cfg(target_os = "macos")]
-#[test]
-fn local_receiver_is_not_started_from_a_replaced_file() {
-    let t = Tmp::new();
+fn copy_after_replacing_syq(t: &Tmp, replacement: &Path) -> (std::process::ExitStatus, String) {
     write(&t.path("src/file"), b"contents");
     let program = t.path("bin/syq");
-    fs::create_dir_all(t.path("bin")).unwrap();
     executable_support::copy_executable(Path::new(env!("CARGO_BIN_EXE_syq")), &program, 0o755);
     let errors = File::create(t.path("stderr")).unwrap();
     // The coordinator reads the whole manifest before it starts the receiver.
@@ -767,14 +763,7 @@ fn local_receiver_is_not_started_from_a_replaced_file() {
         .stderr(errors)
         .start()
         .unwrap();
-    // Replace the file as a package upgrade or cargo rebuild does.
-    let replacement = t.path("bin/replacement");
-    executable_support::write_executable(
-        &replacement,
-        b"#!/bin/sh\necho replaced build ran >&2\nexit 97\n",
-        0o755,
-    );
-    fs::rename(&replacement, &program).unwrap();
+    fs::rename(replacement, &program).unwrap();
     let mut manifest = child.stdin.take().unwrap();
     manifest
         .write_all(entry_line("file", "file", None).as_bytes())
@@ -795,12 +784,58 @@ fn local_receiver_is_not_started_from_a_replaced_file() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
-    let stderr = String::from_utf8_lossy(&read(&t.path("stderr"))).into_owned();
+    (
+        status,
+        String::from_utf8_lossy(&read(&t.path("stderr"))).into_owned(),
+    )
+}
+
+/// macOS has no /proc/self/exe, so once an upgrade or rebuild replaces
+/// syq's file with another build while a copy runs, the copy refuses to
+/// start its local receiver from that path and says to rerun. The new file
+/// is only asked for its build identity.
+#[cfg(target_os = "macos")]
+#[test]
+fn local_receiver_is_not_started_from_another_build() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("bin")).unwrap();
+    let replacement = t.path("bin/replacement");
+    let calls = t.path("calls");
+    executable_support::write_executable(
+        &replacement,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+             if [ \"$1\" = --build-identity ]; then echo other-build; exit 0; fi\n\
+             exit 97\n",
+            calls.display()
+        )
+        .as_bytes(),
+        0o755,
+    );
+    let (status, stderr) = copy_after_replacing_syq(&t, &replacement);
     assert!(!status.success(), "{status:?}: {stderr}");
     assert!(
-        stderr.contains("was replaced while this command was running; rerun the command"),
+        stderr.contains(
+            "was replaced by another version while this command was running; rerun the command"
+        ),
         "{stderr}"
     );
-    assert!(!stderr.contains("replaced build ran"), "{stderr}");
+    assert_eq!(read(&calls), b"--build-identity\n");
     assert!(!t.path("dst/file").exists());
+}
+
+/// Reinstalling the same build (another copy of the same version, as a
+/// package manager or a copy leaves) gives the file a new inode. The copy
+/// checks the new file's build identity, starts its receiver from it, and
+/// completes.
+#[cfg(target_os = "macos")]
+#[test]
+fn local_receiver_starts_from_a_reinstalled_same_build() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("bin")).unwrap();
+    let replacement = t.path("bin/replacement");
+    executable_support::copy_executable(Path::new(env!("CARGO_BIN_EXE_syq")), &replacement, 0o755);
+    let (status, stderr) = copy_after_replacing_syq(&t, &replacement);
+    assert!(status.success(), "{status:?}: {stderr}");
+    assert_eq!(read(&t.path("dst/file")), b"contents");
 }

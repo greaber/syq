@@ -52,27 +52,53 @@ pub(crate) fn self_command() -> std::io::Result<Command> {
     Ok(command)
 }
 
-/// macOS: refuse to start `path` once it names a file other than the one
-/// this process runs, as after an upgrade or rebuild replaced or removed it,
-/// since that would start another build. The file this process runs is read
-/// from the kernel at the first start, so syq's own startup pays nothing;
-/// each start then costs one stat of the path. Where the kernel does not say,
-/// the path is started as before.
+/// macOS: refuse to start `path` once it names another build than the one
+/// this process runs, as after an upgrade or rebuild replaced or removed it.
+/// The file this process runs is read from the kernel at the first start, so
+/// syq's own startup pays nothing; each start then costs one stat of the
+/// path. Only where that shows another file is the file asked for its build
+/// identity: a reinstall of this same build, which syq treats as compatible
+/// everywhere, is started, and remembered so that later starts need only the
+/// stat. Where the kernel does not say, the path is started as before.
 #[cfg(target_os = "macos")]
 fn require_started_file(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     static RUNNING: std::sync::OnceLock<Option<(u32, u64)>> = std::sync::OnceLock::new();
+    static SAME_BUILD: std::sync::Mutex<Option<(u32, u64)>> = std::sync::Mutex::new(None);
     let Some(running) = *RUNNING.get_or_init(running_file) else {
         return Ok(());
     };
-    match std::fs::metadata(path) {
-        // st_dev is 32 bits on macOS; the kernel reports it unsigned.
-        Ok(metadata) if (metadata.dev() as u32, metadata.ino()) == running => Ok(()),
-        Ok(_) => Err(replaced(path)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(replaced(path)),
+    // st_dev is 32 bits on macOS; the kernel reports it unsigned.
+    let identity = |path| std::fs::metadata(path).map(|m| (m.dev() as u32, m.ino()));
+    let current = match identity(path) {
+        Ok(current) => current,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(replaced(path)),
         // Starting it reports anything else.
-        Err(_) => Ok(()),
+        Err(_) => return Ok(()),
+    };
+    let same_build = || SAME_BUILD.lock().unwrap_or_else(|error| error.into_inner());
+    if current == running || *same_build() == Some(current) {
+        return Ok(());
     }
+    // The file asked must still be the file started.
+    if reports_this_build(path) && identity(path).is_ok_and(|after| after == current) {
+        *same_build() = Some(current);
+        return Ok(());
+    }
+    Err(replaced(path))
+}
+
+/// Whether the executable at `path` reports this build's identity, as syq
+/// checks a helper's or an update's.
+#[cfg(target_os = "macos")]
+fn reports_this_build(path: &std::path::Path) -> bool {
+    let mut probe = Command::new(path);
+    probe.arg("--build-identity");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    capture_output_bounded(&mut probe, deadline, &|| false, 4096).is_ok_and(|output| {
+        output.status.success()
+            && output.stdout.strip_suffix(b"\n") == Some(env!("SYQ_BUILD_IDENTITY").as_bytes())
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -114,7 +140,8 @@ pub(crate) fn running_receiving_connection(endpoint: String, scope: Option<&std:
 fn replaced_message(path: &std::path::Path, receiving: Option<&Receiving>) -> String {
     let Some(Receiving { endpoint, scope }) = receiving else {
         return format!(
-            "syq at {} was replaced while this command was running; rerun the command",
+            "syq at {} was replaced by another version while this command was running; \
+             rerun the command",
             path.display()
         );
     };
@@ -432,7 +459,7 @@ mod tests {
             assert!(
                 error
                     .to_string()
-                    .contains("was replaced while this command was running"),
+                    .contains("was replaced by another version while this command was running"),
                 "{error}"
             );
         }
@@ -451,8 +478,8 @@ mod replaced_message_tests {
         let path = Path::new("/opt/syq/bin/syq");
         assert_eq!(
             replaced_message(path, None),
-            "syq at /opt/syq/bin/syq was replaced while this command was running; \
-             rerun the command"
+            "syq at /opt/syq/bin/syq was replaced by another version while this command \
+             was running; rerun the command"
         );
         let receiving = |scope: Option<&str>| Receiving {
             endpoint: "alice@server".into(),

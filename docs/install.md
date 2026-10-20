@@ -113,10 +113,11 @@ for Homebrew.
 
 A command that is already running when you update keeps running its own
 version. On macOS, if it then needs to start another syq process, such as the
-receiver of a local copy, it stops with a message to rerun the command instead
-of starting the new version. A receiving connection started before the update
-refuses in the same way and names the command that restarts it,
-`syq persist connect SERVER`, which replaces a receiving connection from
+receiver of a local copy, and the update installed a different version, it
+stops with a message to rerun the command instead of starting the new version;
+reinstalling the same version does not stop it. A receiving connection started
+before the update refuses in the same way and names the command that restarts
+it, `syq persist connect SERVER`, which replaces a receiving connection from
 another version and keeps your settings. See
 [Updating connections](persistence-reference.md#updating-connections).
 
