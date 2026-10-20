@@ -366,6 +366,66 @@ pub(crate) fn reports_owners_faithfully(file: &File) -> bool {
     }
 }
 
+/// Whether the filesystem at `path` shows every file with an owner and mode
+/// set when it was mounted, rather than kept per file, so neither says who
+/// can change a file: FAT, exFAT, NTFS (ntfs3), SMB and VirtualBox shared
+/// folders on Linux; FAT, exFAT, NTFS and SMB volumes, and volumes mounted to
+/// ignore ownership, on macOS. NFS and FUSE keep the owners their servers
+/// report, so they are not included. Decided from the filesystem type with
+/// one `statfs`; a path that cannot be inspected counts as keeping owners.
+/// Debug builds given `SYQ_TEST_FIXED_OWNERS` count every filesystem.
+pub(crate) fn fixed_owners_and_modes(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SYQ_TEST_FIXED_OWNERS").is_some() {
+        return true;
+    }
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: statfs writes only into the local structure.
+    if unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let stats = unsafe { stats.assume_init() };
+    #[cfg(target_os = "linux")]
+    {
+        linux_fixed_owners_and_modes(stats.f_type as u32)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: statfs NUL-terminates the type name.
+        let kind = unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) };
+        macos_fixed_owners_and_modes(kind.to_bytes(), stats.f_flags)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = stats;
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fixed_owners_and_modes(file_system_type: u32) -> bool {
+    matches!(
+        file_system_type,
+        0x4d44 // FAT
+            | EXFAT_SUPER_MAGIC
+            | NTFS3_SUPER_MAGIC
+            | CIFS_SUPER_MAGIC
+            | SMB2_SUPER_MAGIC
+            | 0x517b // SMB
+            | 0x786f_4256 // vboxsf
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_fixed_owners_and_modes(kind: &[u8], flags: u32) -> bool {
+    matches!(kind, b"msdos" | b"exfat" | b"ntfs" | b"smbfs")
+        || flags & libc::MNT_IGNORE_OWNERSHIP as u32 != 0
+}
+
 /// The profile of the filesystem `file` is on.
 pub(crate) fn profile(file: &File) -> Profile {
     #[cfg(target_os = "linux")]
@@ -723,6 +783,52 @@ fn read_volume_capabilities(mount: &std::ffi::CStr) -> Option<VolumeCapabilities
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fat_exfat_ntfs_and_smb_have_fixed_owners_on_linux() {
+        for kind in [
+            0x4d44,
+            EXFAT_SUPER_MAGIC,
+            NTFS3_SUPER_MAGIC,
+            CIFS_SUPER_MAGIC,
+            SMB2_SUPER_MAGIC,
+        ] {
+            assert!(linux_fixed_owners_and_modes(kind), "{kind:#x}");
+        }
+        for kind in [
+            0xef53,
+            0x5846_5342,
+            0x9123_683e,
+            0x0102_1994,
+            ZFS_SUPER_MAGIC,
+            libc::NFS_SUPER_MAGIC as u32,
+            libc::FUSE_SUPER_MAGIC as u32,
+        ] {
+            assert!(!linux_fixed_owners_and_modes(kind), "{kind:#x}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fat_exfat_ntfs_smb_and_ignored_ownership_have_fixed_owners_on_macos() {
+        for kind in [&b"msdos"[..], b"exfat", b"ntfs", b"smbfs"] {
+            assert!(macos_fixed_owners_and_modes(kind, 0));
+        }
+        for kind in [&b"apfs"[..], b"hfs", b"nfs"] {
+            assert!(!macos_fixed_owners_and_modes(kind, 0));
+        }
+        assert!(macos_fixed_owners_and_modes(
+            b"apfs",
+            libc::MNT_IGNORE_OWNERSHIP as u32
+        ));
+    }
+
+    #[test]
+    fn a_local_test_directory_keeps_owners() {
+        let directory = crate::test_support::tempdir().unwrap();
+        assert!(!fixed_owners_and_modes(directory.path()));
+    }
 
     #[test]
     fn two_second_mtimes_belong_to_fat_kinds_only() {

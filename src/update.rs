@@ -412,17 +412,20 @@ enum StoredRelease {
 /// Check a release's directories, from the store root down, and its files.
 /// Each one that exists must be a real directory or file, not a symbolic link,
 /// owned by this user, that group and others cannot write; syq creates them
-/// that way. Anything else is refused rather than verified and run, because
-/// whoever could change it could also change it again between a check and the
-/// `exec`. The directories above the store are trusted, as `~/.local/bin/syq`
-/// and the rest of the home directory are: whoever can change them can
-/// replace syq or the shell's startup files directly.
-fn stored_release(store: &Path, directory: &Path, files: &[&Path]) -> Result<StoredRelease> {
+/// that way. The store root alone may be a symbolic link, for example to a
+/// larger disk, and then the directory it leads to gets the same check.
+/// Anything else is refused rather than verified and run, because whoever
+/// could change it could also change it again between a check and the `exec`.
+///
+/// The directories above the store are trusted: anyone who can write them can
+/// replace the store, just as anyone who can write `~/.local/bin` can replace
+/// syq, so they should be writable only by the user.
+fn stored_release(store: &Path, directory: &Path) -> Result<StoredRelease> {
     use std::os::unix::fs::MetadataExt;
     let below = directory
         .strip_prefix(store)
         .context("a release directory is outside the binary store")?;
-    let user = unsafe { libc::geteuid() };
+    let user = crate::rooted::own_uid();
     // Whether `path` exists, after refusing it if it is not private.
     let check = |path: &Path, is_directory: bool| -> Result<bool> {
         let metadata = match fs::symlink_metadata(path) {
@@ -430,14 +433,21 @@ fn stored_release(store: &Path, directory: &Path, files: &[&Path]) -> Result<Sto
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
         };
+        if metadata.uid() != user && !metadata.file_type().is_symlink() {
+            // Deleting it would only let this account recreate it and lock
+            // its owner out, as root running with another user's HOME would.
+            let owner = crate::completion_details::account_name(metadata.uid(), false);
+            bail!(
+                "{} belongs to {owner}; run syq as {owner}, or with HOME set to your own home directory",
+                path.display()
+            );
+        }
         let problem = if metadata.file_type().is_symlink() {
             "is a symbolic link"
         } else if is_directory && !metadata.is_dir() {
             "is not a directory"
         } else if !is_directory && !metadata.is_file() {
             "is not a regular file"
-        } else if metadata.uid() != user {
-            "belongs to another user"
         } else if metadata.mode() & 0o022 != 0 {
             "is writable by group or others"
         } else {
@@ -449,7 +459,19 @@ fn stored_release(store: &Path, directory: &Path, files: &[&Path]) -> Result<Sto
             if is_directory { "directory" } else { "file" },
         )
     };
-    let mut path = store.to_path_buf();
+    let mut path = match fs::symlink_metadata(store) {
+        Ok(metadata) if metadata.file_type().is_symlink() => match fs::canonicalize(store) {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
+                "{} is a symbolic link to a missing directory; create that directory, or remove the link and syq will install the release again",
+                store.display()
+            ),
+            Err(error) => {
+                return Err(error).with_context(|| format!("resolve {}", store.display()))
+            }
+        },
+        _ => store.to_path_buf(),
+    };
     if !check(&path, true)? {
         return Ok(StoredRelease::Incomplete);
     }
@@ -460,8 +482,8 @@ fn stored_release(store: &Path, directory: &Path, files: &[&Path]) -> Result<Sto
         }
     }
     let mut complete = true;
-    for file in files {
-        complete &= check(file, false)?;
+    for name in [MANIFEST_NAME, STORED_EXECUTABLE] {
+        complete &= check(&path.join(name), false)?;
     }
     Ok(if complete {
         StoredRelease::Complete
@@ -545,8 +567,10 @@ fn create_store_directory(store: &Path, directory: &Path) -> Result<()> {
 /// runs start it directly without reading either file or checking online for
 /// freshness: release tags are immutable, and selecting a release deliberately
 /// permits running an older version. A release with a missing file is
-/// completed with the full checks; one that is not private is refused. This
-/// does not replace the normal installation.
+/// completed with the full checks; one that is not private is refused; and one
+/// on a filesystem that cannot show who may change it (FAT, exFAT, NTFS, SMB)
+/// is verified in full on every run. This does not replace the normal
+/// installation.
 pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
     let target = Target::local().context("official releases do not support this platform")?;
     let tag = format!("v{version}");
@@ -554,9 +578,14 @@ pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
     let directory = release_directory(&store, &tag, target);
     let manifest_path = directory.join(MANIFEST_NAME);
     let executable = directory.join(STORED_EXECUTABLE);
-    if stored_release(&store, &directory, &[&manifest_path, &executable])
-        .with_context(|| format!("cannot start syq {version} from the binary store"))?
-        == StoredRelease::Complete
+    // Where owners and modes are fixed when the filesystem is mounted, they
+    // cannot show that only this user can change the release, so it is
+    // verified in full on every run instead, as before stored releases were
+    // started directly.
+    if !crate::fsops::fixed_owners_and_modes(&store)
+        && stored_release(&store, &directory)
+            .with_context(|| format!("cannot start syq {version} from the binary store"))?
+            == StoredRelease::Complete
     {
         return Ok(executable);
     }

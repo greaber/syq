@@ -873,6 +873,103 @@ fn use_version_refuses_a_stored_release_others_could_change() {
     }
 }
 
+/// The store root alone may be a symbolic link, for example to a larger disk.
+/// The directory it leads to must be private like the store itself.
+#[test]
+fn use_version_follows_a_linked_store_root_and_checks_its_target() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    let target = fixture.temp.path("other-disk/syq");
+    fs::create_dir_all(&target).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+    let lib = fixture.home.join(".local/lib");
+    fs::create_dir_all(&lib).unwrap();
+    std::os::unix::fs::symlink(&target, lib.join("syq")).unwrap();
+    let run = || fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]);
+    assert_success(&run());
+    let stored = target.join(format!("v0.7.0/{}/syq", release_target()));
+    assert!(stored.is_file());
+    executable_support::write_executable(&stored, "#!/bin/sh\necho planted\n", 0o755);
+    let out = run();
+    assert_success(&out);
+    assert_eq!(out.stdout, b"planted\n");
+
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o770)).unwrap();
+    let out = run();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "{} must be a directory that you own and nobody else can write, but it is writable by group or others",
+            fs::canonicalize(&target).unwrap().display()
+        )),
+        "{stderr}"
+    );
+}
+
+/// A store that belongs to someone else, as when root runs syq with another
+/// user's HOME, is refused with its owner's name rather than an offer to
+/// delete it, which would let the store be recreated with the wrong owner.
+#[test]
+fn use_version_names_the_owner_of_another_users_store() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    assert_success(
+        &fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]),
+    );
+    let owner = Command::new("id").arg("-un").output().unwrap();
+    let owner = String::from_utf8(owner.stdout).unwrap();
+    let out = fixture
+        .command_builder(&fixture.installed, &["--use-version=0.7.0", "--version"])
+        .env("SYQ_TEST_OWN_UID", "4294967294")
+        .capture_output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "{} belongs to {owner}; run syq as {owner}, or with HOME set to your own home directory",
+            fixture.stored("").display().to_string().trim_end_matches('/'),
+            owner = owner.trim()
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("delete"), "{stderr}");
+}
+
+/// Where the filesystem fixes owners and modes when it is mounted (FAT, exFAT,
+/// NTFS, SMB), they cannot show that only this user can change a release, so
+/// it is verified in full on every run instead of being refused.
+#[test]
+fn use_version_verifies_on_every_run_where_the_filesystem_fixes_owners() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    let run = || {
+        fixture
+            .command_builder(&fixture.installed, &["--use-version=0.7.0", "--version"])
+            .env("SYQ_TEST_FIXED_OWNERS", "1")
+            .capture_output()
+            .unwrap()
+    };
+    assert_success(&run());
+    // Such filesystems typically show everything as writable by everyone.
+    fs::set_permissions(fixture.stored(""), fs::Permissions::from_mode(0o777)).unwrap();
+    let out = run();
+    assert_success(&out);
+    assert_eq!(out.stdout, b"syq 0.7.0\n");
+    assert!(out.stderr.is_empty(), "{out:?}");
+    let stored = fixture.release_directory("0.7.0").join("syq");
+    let release = fs::read(&stored).unwrap();
+    executable_support::write_executable(&stored, "#!/bin/sh\necho planted\n", 0o755);
+    let out = run();
+    assert_success(&out);
+    assert_eq!(out.stdout, b"syq 0.7.0\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("stored syq release failed integrity verification"),
+        "{stderr}"
+    );
+    assert_eq!(fs::read(&stored).unwrap(), release);
+}
+
 #[test]
 fn use_version_verifies_a_stored_executable_that_has_no_manifest() {
     let fixture = UpdateFixture::new("0.7.0", "v0.7.0");

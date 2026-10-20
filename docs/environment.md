@@ -87,10 +87,16 @@ use, delete its directory, for example `~/.local/lib/syq/v0.7.1`; syq
 downloads or installs it again if it is needed later.
 
 Syq starts a stored release only when you own its directories and files in the
-store and nobody else can write them, as syq creates them. Otherwise it stops
-and names the problem: fix the permissions, or delete what it names and syq
-installs the release again. The directories above the store are trusted, as
-your home directory is trusted for `~/.local/bin/syq` itself.
+store and nobody else can write them, as syq creates them. `~/.local/lib/syq`
+itself may be a symbolic link, for example to a larger disk; the directory it
+leads to must meet the same rule. Otherwise syq stops and names the problem:
+fix the permissions, or delete what it names and syq installs the release
+again. If the store belongs to another user, as when you run syq as root with
+another user's `HOME`, run syq as that user or with your own `HOME` instead.
+On filesystems that do not keep Unix owners and modes, such as FAT, exFAT,
+NTFS and SMB shares, syq checks a stored release against its signed manifest
+on every run instead, which takes longer. The store trusts the directories
+above it; see [Downloaded executables](security.md#downloaded-executables).
 
 Earlier releases kept their helpers in `~/.cache/syq/helpers`. Syq no longer
 reads that directory, and you can delete it on each machine. Those releases

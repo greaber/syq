@@ -35,6 +35,7 @@ mod apply;
 mod basis_copy;
 #[cfg(test)]
 pub(crate) use fs_caps::distrust_owners_for_test;
+pub(crate) use fs_caps::fixed_owners_and_modes;
 pub(crate) use fs_caps::reports_owners_faithfully;
 pub(crate) use partial::SeedAccess;
 
