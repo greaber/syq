@@ -214,6 +214,18 @@ pub(super) fn receiver_control_paths(
     ] {
         protected.push((home.join(directory), "named destination authority state"));
     }
+    if machine == ControlPaths::Elsewhere {
+        // Where another machine keeps its receiving state unless its
+        // environment moves it; the receiver itself checks where it is.
+        protected.push((
+            home.join(".syq-receiver-identity"),
+            "background receiving control state",
+        ));
+        protected.push((
+            home.join(".config/syq"),
+            "background receiving control state",
+        ));
+    }
     for path in [
         crate::destination::receiver_identity_directory().ok(),
         crate::receive_service::config_path(&crate::persistence::Domain::default())

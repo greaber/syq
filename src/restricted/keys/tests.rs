@@ -614,6 +614,97 @@ fn security_key_grants_without_the_recorded_touch_or_pin_are_refused() {
     }
 }
 
+/// A FIDO ECDSA key, with the software key that stands in for its
+/// authenticator.
+fn security_ecdsa_key() -> (PrivateKey, PublicKey) {
+    let software = PrivateKey::random(
+        &mut ssh_key::rand_core::OsRng,
+        Algorithm::Ecdsa {
+            curve: ssh_key::EcdsaCurve::NistP256,
+        },
+    )
+    .unwrap();
+    let ssh_key::public::EcdsaPublicKey::NistP256(point) =
+        *software.public_key().key_data().ecdsa().unwrap()
+    else {
+        unreachable!()
+    };
+    let key = PublicKey::new(
+        ssh_key::public::SkEcdsaSha2NistP256::new(point, "ssh:").into(),
+        "",
+    );
+    (software, key)
+}
+
+/// Regression: ssh-key 0.6.7 writes a FIDO ECDSA signature's flags and
+/// counter inside its signature string (see `delegation::armored_sshsig`).
+/// A grant signed through the agent with such a key must still verify.
+#[test]
+fn fido_ecdsa_grants_signed_through_the_agent_verify() {
+    use sha2::Digest as _;
+    use signature::Signer as _;
+    use ssh_agent_lib::ssh_encoding::Encode as _;
+    let (software, key) = security_ecdsa_key();
+    let flags = SK_USER_PRESENCE | SK_USER_VERIFICATION;
+    let directory = crate::test_support::short_tempdir().unwrap();
+    let socket = directory.path().join("a");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let worker = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let frame = crate::agent_broker::read_frame(&mut stream)
+            .unwrap()
+            .unwrap();
+        let Ok(Request::SignRequest(request)) = Request::decode(&mut frame.as_slice()) else {
+            panic!("expected a signing request");
+        };
+        let mut signed = sha2::Sha256::digest(b"ssh:").to_vec();
+        signed.push(flags);
+        signed.extend_from_slice(&9u32.to_be_bytes());
+        signed.extend_from_slice(&sha2::Sha256::digest(&request.data));
+        let ecdsa: ssh_key::Signature = software.try_sign(&signed).unwrap();
+        // The authenticator's signature as OpenSSH's agent sends it: the
+        // flags and counter follow the signature string.
+        let mut blob = Vec::new();
+        "sk-ecdsa-sha2-nistp256@openssh.com"
+            .encode(&mut blob)
+            .unwrap();
+        ecdsa.as_bytes().encode(&mut blob).unwrap();
+        blob.push(flags);
+        blob.extend_from_slice(&9u32.to_be_bytes());
+        let mut response = vec![14];
+        blob.encode(&mut response).unwrap();
+        crate::agent_broker::write_frame(&mut stream, &response).unwrap();
+    });
+    let signer = LoginSigner::Agent {
+        socket,
+        key: key.clone(),
+    };
+    let armored = signer.sign(NAMESPACE, b"grant").unwrap();
+    worker.join().unwrap();
+    let decoded = ssh_key::SshSig::from_pem(&armored).unwrap();
+    assert_eq!(decoded.algorithm(), Algorithm::SkEcdsaSha2NistP256);
+    assert_eq!(delegation::security_key_flags(&decoded).unwrap(), flags);
+    TrustedSigner::new(&key, Some(flags), None)
+        .unwrap()
+        .verify(NAMESPACE, b"grant", &armored, now())
+        .unwrap();
+    // The upstream symptom: ssh-key's own encoding of that signature does
+    // not read back. When this starts passing, `armored_sshsig` can go.
+    let upstream = ssh_key::SshSig::new(
+        key.key_data().clone(),
+        NAMESPACE,
+        ssh_key::HashAlg::Sha512,
+        decoded.signature().clone(),
+    )
+    .unwrap()
+    .to_pem(LineEnding::LF)
+    .unwrap();
+    assert!(
+        ssh_key::SshSig::from_pem(&upstream).is_err(),
+        "ssh-key now encodes FIDO ECDSA signatures correctly; armored_sshsig can use SshSig::to_pem"
+    );
+}
+
 #[test]
 fn only_key_logins_on_openssh_7_2_or_later_can_enroll() {
     let key = PrivateKey::random(&mut ssh_key::rand_core::OsRng, Algorithm::Ed25519).unwrap();

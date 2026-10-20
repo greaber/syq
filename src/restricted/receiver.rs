@@ -176,7 +176,7 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
                 .expect("account required");
             let (login, host) = enrollment_account(account)?;
             let via = via()?;
-            let (metadata, _, _) = enroll(&host, None, &login, via.as_ref(), true)?;
+            let (metadata, _, _) = enroll(&host, None, &login, via.as_ref(), true, None)?;
             println!(
                 "enrolled {} for {}",
                 metadata.id,

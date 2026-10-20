@@ -260,6 +260,32 @@ pub(super) fn mapping_authorization(args: &Args) -> Result<Option<crate::mapping
         .transpose()
 }
 
+/// Refuse a copy whose destination, as `requested` names it on a server
+/// whose home is `home`, would write a path the receiver protects. The
+/// laptop can tell from names alone; a destination reached through a link
+/// into a protected path is refused only by the server, by identity.
+pub(super) fn refuse_protected_destination(
+    args: &Args,
+    sources: &[Location],
+    requested: &[u8],
+    login: &str,
+    home: &Path,
+) -> Result<()> {
+    let destination = normalize_absolute(std::ffi::OsStr::from_bytes(requested), home)?
+        .into_os_string()
+        .into_vec();
+    let grant = grant_for(
+        args,
+        sources,
+        (EnrollmentId::random(), 1),
+        login,
+        &destination,
+    )?;
+    let protected = receiver_control_paths(home, None, ControlPaths::Elsewhere)?;
+    let GrantOperation::Copy(copy) = &grant.operation;
+    reject_control_plane_scopes(copy, &protected)
+}
+
 /// Sign a grant for a copy to `destination` with the user's login key,
 /// setting up the destination account's enrollment, refreshing it for this
 /// build, or finding the login key again first when needed. A dry run
@@ -284,6 +310,11 @@ pub(crate) fn prepare_transfer(
         sources[0].host.as_deref().context("source host missing")?,
         sources[0].port,
     )?;
+    // A destination the receiver would refuse is refused before anything
+    // is set up or refreshed on the server.
+    let check = |home: &Path| {
+        refuse_protected_destination(args, sources, &destination.path, destination_login, home)
+    };
     let enroll_now = |refresh: bool| {
         enroll(
             host,
@@ -291,6 +322,7 @@ pub(crate) fn prepare_transfer(
             destination_login,
             Some(&jump),
             refresh,
+            Some(&check),
         )
     };
     let found = load_local_enrollments()?.into_iter().find(|(metadata, _)| {
@@ -298,6 +330,9 @@ pub(crate) fn prepare_transfer(
             && metadata.port == destination.port
             && metadata.target_login == destination_login
     });
+    if let Some((metadata, _)) = &found {
+        check(Path::new(&metadata.remote_home))?;
+    }
     let (metadata, directory, signer) = match found {
         Some((metadata, directory)) if metadata.release == crate::identity::build() => {
             (metadata, directory, None)
@@ -349,13 +384,7 @@ pub(crate) fn prepare_transfer(
         destination_login,
         &destination_path,
     )?;
-    let protected = receiver_control_paths(
-        Path::new(&metadata.remote_home),
-        None,
-        ControlPaths::Elsewhere,
-    )?;
-    let GrantOperation::Copy(copy) = &grant.operation;
-    reject_control_plane_scopes(copy, &protected)?;
+    check(Path::new(&metadata.remote_home))?;
     let request_id = grant.request_id;
     let (recipient_secret, recipient_public_key) =
         crate::destination_results::generate_recipient()?;

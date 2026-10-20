@@ -338,6 +338,11 @@ enum Session {
     StateMissing,
 }
 
+/// What a copy checks once a session knows the server's home directory,
+/// before anything is installed: that its destination is not a path the
+/// receiver protects.
+pub(super) type DestinationCheck<'a> = Option<&'a dyn Fn(&Path) -> Result<()>>;
+
 /// The enrollment for `login@host:port`, set up when there is none, and
 /// refreshed when it runs another build or `refresh` asks to find the
 /// login key again. Returns the login key's signer when this logged in to
@@ -348,6 +353,7 @@ pub(super) fn enroll(
     login: &str,
     jump: Option<&SshEndpoint>,
     refresh: bool,
+    check: DestinationCheck<'_>,
 ) -> Result<(LocalEnrollment, PathBuf, Option<LoginSigner>)> {
     // The receiver refuses to run as root; say so before creating anything.
     // An account with another name and user ID 0 is refused when installing.
@@ -392,46 +398,46 @@ pub(super) fn enroll(
         },
     };
     let lost = (plan.refresh, plan.id, plan.directory.clone());
-    let (metadata, directory, signer) = match run_session(&target, jump, host, port, login, plan)? {
-        (Session::Installed(installed), directory) => {
-            let (metadata, signer) = *installed;
-            (metadata, directory, signer)
-        }
-        (Session::StateMissing, _) => {
-            // The server lost this enrollment's state. Enroll under a new ID
-            // instead of re-creating the old one, so no grant can be replayed
-            // against an empty record, and remove the old line.
-            let (_, old_id, old_directory) = lost;
-            let old_key = load_entry_key(&old_directory)?;
-            crate::output::diagnostic!(
-                "syq: {} has lost the state of enrollment {old_id}; enrolling again",
-                target.label()
-            );
-            let replaced = ReplacedEnrollment {
-                id: old_id,
-                entry_public_key: old_key.public_key().to_openssh()?,
-            };
-            match run_session(
-                &target,
-                jump,
-                host,
-                port,
-                login,
-                new_plan(&base, Some(replaced)),
-            )? {
-                (Session::Installed(installed), directory) => {
-                    // Keep the old record until its replacement is installed,
-                    // so a failure here can still name the line to remove.
-                    remove_local_enrollment(&old_directory)?;
-                    let (metadata, signer) = *installed;
-                    (metadata, directory, signer)
-                }
-                (Session::StateMissing, _) => {
-                    bail!("the server reported missing state for a new enrollment")
+    let (metadata, directory, signer) =
+        match run_session(&target, jump, (host, port, login), plan, check)? {
+            (Session::Installed(installed), directory) => {
+                let (metadata, signer) = *installed;
+                (metadata, directory, signer)
+            }
+            (Session::StateMissing, _) => {
+                // The server lost this enrollment's state. Enroll under a new ID
+                // instead of re-creating the old one, so no grant can be replayed
+                // against an empty record, and remove the old line.
+                let (_, old_id, old_directory) = lost;
+                let old_key = load_entry_key(&old_directory)?;
+                crate::output::diagnostic!(
+                    "syq: {} has lost the state of enrollment {old_id}; enrolling again",
+                    target.label()
+                );
+                let replaced = ReplacedEnrollment {
+                    id: old_id,
+                    entry_public_key: old_key.public_key().to_openssh()?,
+                };
+                match run_session(
+                    &target,
+                    jump,
+                    (host, port, login),
+                    new_plan(&base, Some(replaced)),
+                    check,
+                )? {
+                    (Session::Installed(installed), directory) => {
+                        // Keep the old record until its replacement is installed,
+                        // so a failure here can still name the line to remove.
+                        remove_local_enrollment(&old_directory)?;
+                        let (metadata, signer) = *installed;
+                        (metadata, directory, signer)
+                    }
+                    (Session::StateMissing, _) => {
+                        bail!("the server reported missing state for a new enrollment")
+                    }
                 }
             }
-        }
-    };
+        };
     Ok((metadata, directory, Some(signer)))
 }
 
@@ -451,10 +457,9 @@ fn new_plan(base: &Path, replaces: Option<ReplacedEnrollment>) -> Plan {
 fn run_session(
     target: &SshEndpoint,
     jump: Option<&SshEndpoint>,
-    host: &str,
-    port: Option<u16>,
-    login: &str,
+    account: (&str, Option<u16>, &str),
     plan: Plan,
+    check: DestinationCheck<'_>,
 ) -> Result<(Session, PathBuf)> {
     let retry_state = if plan.refresh {
         "remains active with its previous state; the refresh can be retried"
@@ -462,17 +467,16 @@ fn run_session(
         "remains pending for a safe retry"
     };
     let id = plan.id;
-    let direct = install_over_route(target, EnrollmentRoute::Direct, host, port, login, &plan);
+    let direct = install_over_route(target, EnrollmentRoute::Direct, account, &plan, check);
     let session = match (direct, jump) {
         (Ok(session), _) => session,
         (Err(direct_error), Some(jump)) if is_enrollment_transport_failure(&direct_error) => {
             install_over_route(
                 target,
                 EnrollmentRoute::ProxyJump { jump },
-                host,
-                port,
-                login,
+                account,
                 &plan,
+                check,
             )
             .with_context(|| {
                 format!("enrollment {id} {retry_state}; direct enrollment also failed: {direct_error:#}")
@@ -492,17 +496,16 @@ fn run_session(
 fn install_over_route(
     target: &SshEndpoint,
     route: EnrollmentRoute<'_>,
-    host: &str,
-    port: Option<u16>,
-    login: &str,
+    (host, port, login): (&str, Option<u16>, &str),
     plan: &Plan,
+    check: DestinationCheck<'_>,
 ) -> Result<Session> {
     let agent = configured_agent(target, route.clone())?;
     let temporary = crate::private_broker::private_temp_dir("syq-enroll-")?;
     let trace_path = temporary.path().join("ssh.log");
     let stage = stage_name(plan.id)?;
     let remote = format!(
-        "set -eu; uname -s; uname -m; if test -f \"$HOME/.ssh/authorized_keys\"; then wc -c <\"$HOME/.ssh/authorized_keys\"; cat \"$HOME/.ssh/authorized_keys\"; else printf '0\\n'; fi; IFS= read -r request; {}; printf '%s' \"$request\" | \"$p\" --restricted-install",
+        "set -eu; uname -s; uname -m; printf '%s\\n' \"$HOME\"; if test -f \"$HOME/.ssh/authorized_keys\"; then wc -c <\"$HOME/.ssh/authorized_keys\"; cat \"$HOME/.ssh/authorized_keys\"; else printf '0\\n'; fi; IFS= read -r request; {}; printf '%s' \"$request\" | \"$p\" --restricted-install",
         stage_commands(&stage)
     );
     let mut command = Command::new("ssh");
@@ -542,6 +545,7 @@ fn install_over_route(
         greeted = !std::io::BufRead::fill_buf(&mut stdout)?.is_empty();
         let os = read_enrollment_line(&mut stdout)?;
         let arch = read_enrollment_line(&mut stdout)?;
+        let home = read_enrollment_line(&mut stdout)?;
         let length: usize = read_enrollment_line(&mut stdout)?
             .parse()
             .context("authorized_keys byte count")?;
@@ -550,10 +554,10 @@ fn install_over_route(
         }
         let mut authorized = vec![0u8; length];
         stdout.read_exact(&mut authorized)?;
-        Ok((os, arch, authorized))
+        Ok((os, arch, home, authorized))
     })();
     drop(foreground);
-    let (os, arch, authorized) = match platform {
+    let (os, arch, home, authorized) = match platform {
         Ok(platform) => platform,
         Err(error) => {
             drop(input);
@@ -575,6 +579,10 @@ fn install_over_route(
     // Everything before the request is checked with nothing installed: an
     // error closes the session's input, and the remote shell stops.
     let prepared = (|| -> Result<_> {
+        // A destination the receiver would refuse leaves no enrollment.
+        if let Some(check) = check {
+            check(Path::new(&home))?;
+        }
         let trace =
             fs::read_to_string(&trace_path).context("read enrollment SSH authentication trace")?;
         keys::require_openssh_server(&trace)?;

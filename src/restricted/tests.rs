@@ -576,6 +576,231 @@ fn a_receiver_from_an_older_line_refuses_new_copies() {
     }
 }
 
+/// Every key of a JSON document, at any depth.
+fn json_keys(value: &serde_json::Value, keys: &mut std::collections::BTreeSet<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                keys.insert(key.clone());
+                json_keys(value, keys);
+            }
+        }
+        serde_json::Value::Array(values) => values.iter().for_each(|value| json_keys(value, keys)),
+        _ => {}
+    }
+}
+
+fn file_keys(path: &Path) -> std::collections::BTreeSet<String> {
+    let mut keys = Default::default();
+    json_keys(
+        &serde_json::from_slice(&fs::read(path).unwrap()).unwrap(),
+        &mut keys,
+    );
+    keys
+}
+
+#[test]
+fn enrollment_state_names_no_device_or_inode_and_sessions_compare_none() {
+    let expected = |names: &[&str]| -> std::collections::BTreeSet<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    };
+    // The server's state, as an install writes it.
+    let (account, home) = enrollment_home();
+    let home = home.path();
+    let id = EnrollmentId::random();
+    let entry = generate_test_key("entry").unwrap();
+    let login = generate_test_key("login").unwrap();
+    install_for_account(
+        &install_request(&account, id, &entry, &login, false),
+        &account,
+        home,
+    )
+    .unwrap();
+    let state = enrollment_state(home, id);
+    assert_eq!(
+        file_keys(&state.join("config.json")),
+        expected(&[
+            "version",
+            "id",
+            "target_login",
+            "generation",
+            "release",
+            "receiver_path",
+            "entry_public_key",
+            "signer",
+            "public_key",
+        ])
+    );
+
+    // The enrolling machine's records, pending and complete.
+    let directory = home.join("local").join(id.to_string());
+    fs::create_dir_all(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    store_entry_key(&directory, &entry).unwrap();
+    atomic_write(
+        &directory,
+        PENDING_FILE,
+        &serde_json::to_vec(&PendingEnrollment {
+            version: CONFIG_VERSION,
+            id,
+            host: "host-b".into(),
+            port: Some(2222),
+            target_login: account.clone(),
+        })
+        .unwrap(),
+        0o600,
+    )
+    .unwrap();
+    assert_eq!(
+        file_keys(&directory.join(PENDING_FILE)),
+        expected(&["version", "id", "host", "port", "target_login"])
+    );
+    complete_local_enrollment(
+        &directory,
+        &LocalEnrollment {
+            version: CONFIG_VERSION,
+            id,
+            host: "host-b".into(),
+            port: Some(2222),
+            target_login: account.clone(),
+            remote_home: home.to_string_lossy().into_owned(),
+            generation: 1,
+            release: crate::identity::build().into(),
+            receiver_path: store_receiver_path(home).to_string_lossy().into_owned(),
+            results_public_key: generate_results_key(id)
+                .unwrap()
+                .public_key()
+                .to_openssh()
+                .unwrap(),
+            signer: delegation::TrustedSigner::new(login.public_key(), None, Some(1_900_000_000))
+                .unwrap(),
+            identity_file: Some(home.join("id_ed25519")),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        file_keys(&directory.join(ENROLLMENT_FILE)),
+        expected(&[
+            "version",
+            "id",
+            "host",
+            "port",
+            "target_login",
+            "remote_home",
+            "generation",
+            "release",
+            "receiver_path",
+            "results_public_key",
+            "signer",
+            "public_key",
+            "valid_before",
+            "identity_file",
+        ])
+    );
+
+    // A receiver session uses its state and the filesystem as it finds
+    // them: what an earlier session opened is nowhere to compare against.
+    let parent = home.join("mounted");
+    fs::create_dir(&parent).unwrap();
+    let destination = parent.join("archive");
+    let session = || {
+        let config = read_receiver_config(&state).unwrap().unwrap();
+        require_current_receiver(&config, 1, crate::identity::build()).unwrap();
+        ConfinedRoot::resolve(destination.as_os_str().as_bytes(), &[]).unwrap()
+    };
+    let first = session().identity();
+    fs::rename(&parent, home.join("unmounted")).unwrap();
+    fs::create_dir(&parent).unwrap();
+    let second = session().identity();
+    assert_ne!(first, second);
+}
+
+#[test]
+fn protected_destinations_are_refused_from_their_names_before_enrolling() {
+    let home = Path::new("/home/backup");
+    let source = Location::parse("host-a:data").unwrap();
+    let refused = |placement: &str, destination: &str| {
+        let mut args = Args::try_parse_from([
+            "syq rsync",
+            "-r",
+            "host-a:data",
+            &format!("host-b:{destination}"),
+        ])
+        .unwrap();
+        args.normalize();
+        if placement == "as" {
+            args.placement = Placement::As;
+        }
+        refuse_protected_destination(
+            &args,
+            std::slice::from_ref(&source),
+            destination.as_bytes(),
+            "backup",
+            home,
+        )
+        .err()
+        .map(|error| error.to_string())
+    };
+    for (placement, destination, label) in [
+        ("into", "~/.ssh", "SSH configuration directory"),
+        ("as", ".ssh/authorized_keys", "SSH configuration directory"),
+        (
+            "as",
+            "/home/backup/.ssh/authorized_keys",
+            "SSH configuration directory",
+        ),
+        (
+            "into",
+            "/home/backup/.local/lib/syq",
+            "store of syq executables",
+        ),
+        (
+            "into",
+            "~/.local/share/syq/enrollments",
+            "enrollment state directory",
+        ),
+        (
+            "into",
+            ".local/state/syq/enrollments/x",
+            "enrollment state directory",
+        ),
+        (
+            "into",
+            "~/.local/libexec",
+            "released receiver executable directory",
+        ),
+        (
+            "into",
+            "~/.syq-destinations-v3",
+            "named destination authority state",
+        ),
+        (
+            "into",
+            "~/.config/syq",
+            "background receiving control state",
+        ),
+        (
+            "into",
+            "~/.syq-receiver-identity",
+            "background receiving control state",
+        ),
+        // Copying named sources into the home directory writes beside them.
+        ("into", "~", "SSH configuration directory"),
+    ] {
+        let error =
+            refused(placement, destination).unwrap_or_else(|| panic!("{destination} was accepted"));
+        assert!(error.contains(label), "{destination}: {error}");
+    }
+    for (placement, destination) in [
+        ("into", "~/archive"),
+        ("into", "/srv/archive"),
+        ("as", ".ssh-backup"),
+        ("into", "~/.config/other"),
+    ] {
+        assert_eq!(refused(placement, destination), None, "{destination}");
+    }
+}
+
 #[test]
 fn a_destination_is_resolved_afresh_by_every_copy() {
     // The directory a destination goes in is opened when each copy starts,

@@ -905,7 +905,14 @@ done
 
 printf 'case: restricted copies refuse an SSH control-plane destination\n'
 make_tree source /tmp/syq-real-ssh/protected-source protected
-for protected_destination in /home/syq/.ssh/sender-controlled /home/syq/.local/lib/syq/sender-controlled; do
+# A refused destination leaves no enrollment on either machine.
+protected_server_state='cat ~/.ssh/authorized_keys 2>/dev/null; find ~/.local/share/syq/enrollments -mindepth 1 -maxdepth 1 2>/dev/null | sort'
+# shellcheck disable=SC2029
+protected_server_before=$(ssh destination "$protected_server_state" | sha256sum)
+protected_local_before=$(find "$home/.local/state/syq/enrollments" -mindepth 1 -maxdepth 1 2>/dev/null | sort | sha256sum)
+# The laptop expands a leading ~ with the server's home, so it stays literal.
+# shellcheck disable=SC2088
+for protected_destination in /home/syq/.ssh/sender-controlled '~/.local/lib/syq/sender-controlled' .local/share/syq/enrollments/sender-controlled; do
     if protected_output=$(syq cp --no-progress --performance-tuning workers=2 --copy-metadata=permissions \
         --from source --srcs-in /tmp/syq-real-ssh/protected-source \
         --to destination --into "$protected_destination" 2>&1); then
@@ -913,7 +920,7 @@ for protected_destination in /home/syq/.ssh/sender-controlled /home/syq/.local/l
         exit 1
     fi
     case "$protected_output" in
-        *"protected SSH configuration directory"*|*"protected store of syq executables"*) ;;
+        *"protected SSH configuration directory"*|*"protected store of syq executables"*|*"protected enrollment state directory"*) ;;
         *)
             echo 'control-plane refusal did not report the protected directory:' >&2
             printf '%s\n' "$protected_output" >&2
@@ -921,8 +928,11 @@ for protected_destination in /home/syq/.ssh/sender-controlled /home/syq/.local/l
             ;;
     esac
     # shellcheck disable=SC2029
-    ssh destination "test ! -e $protected_destination"
+    ssh destination "cd && test ! -e $protected_destination"
 done
+# shellcheck disable=SC2029
+test "$(ssh destination "$protected_server_state" | sha256sum)" = "$protected_server_before"
+test "$(find "$home/.local/state/syq/enrollments" -mindepth 1 -maxdepth 1 2>/dev/null | sort | sha256sum)" = "$protected_local_before"
 # Released versions' state is never created.
 ssh destination '
     test ! -e ~/.local/share/syq/restricted

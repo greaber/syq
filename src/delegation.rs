@@ -1200,9 +1200,15 @@ impl TrustedSigner {
 }
 
 /// The armored SSHSIG of `signature`, made by `key` over a message hashed
-/// with `hash` in `namespace`. Syq writes the blob itself: ssh-key 0.6.7
-/// leaves a FIDO ECDSA signature's flags and counter inside its signature
-/// string, which neither it nor OpenSSH can read back.
+/// with `hash` in `namespace`.
+///
+/// Syq writes the blob itself instead of using `ssh_key::SshSig::to_pem`.
+/// In ssh-key 0.6.7, `Signature`'s `Encode` splits off the flags byte and
+/// counter of a FIDO signature only for `sk-ssh-ed25519@openssh.com`; for
+/// `sk-ecdsa-sha2-nistp256@openssh.com` it writes them inside the signature
+/// string. `SshSig::from_pem` then fails on the result with "length
+/// invalid", and OpenSSH cannot read it either, so every grant signed with
+/// a FIDO ECDSA login key would be refused. Decoding is correct.
 pub(crate) fn armored_sshsig(
     key: &ssh_key::public::KeyData,
     namespace: &str,
