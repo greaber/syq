@@ -368,6 +368,34 @@ fn helper_upload_works_without_a_writable_local_store_or_config() {
     );
 }
 
+/// A helper downloaded for uploading is not stored under a home directory
+/// that belongs to another user, as root running with that user's HOME would
+/// have it; the upload goes ahead from the download verified in memory.
+#[test]
+fn helper_upload_does_not_store_under_another_users_home() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    setup_release_bootstrap(&t);
+    executable(&t.path("remote-bin/curl"), b"#!/bin/sh\nexit 22\n");
+    write(&t.path("src"), b"not stored");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_syq_command(&t, &rsh, &["-q", &t.s("src"), &remote])
+        .env("SYQ_TEST_OWN_UID", "4294967294")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"not stored");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "cannot store the downloaded remote helper (HOME ({}) belongs to ",
+            t.path("home").display()
+        )),
+        "{stderr}"
+    );
+    assert!(!t.path("home/.local").exists());
+}
+
 #[test]
 fn corrupted_local_stored_helper_is_discarded_and_refetched() {
     let t = Tmp::new();

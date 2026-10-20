@@ -91,8 +91,9 @@ store and nobody else can write them, as syq creates them. `~/.local/lib/syq`
 itself may be a symbolic link, for example to a larger disk; the directory it
 leads to must meet the same rule. Otherwise syq stops and names the problem:
 fix the permissions, or delete what it names and syq installs the release
-again. If the store belongs to another user, as when you run syq as root with
-another user's `HOME`, run syq as that user or with your own `HOME` instead.
+again. If the store, or the home directory it would be created in, belongs to
+another user, as when you run syq as root with another user's `HOME`, syq
+refuses to use or create it: run syq as that user or with your own `HOME`.
 On filesystems that do not keep Unix owners and modes, such as FAT, exFAT,
 NTFS and SMB shares, syq checks a stored release against its signed manifest
 on every run instead, which takes longer. The store trusts the directories

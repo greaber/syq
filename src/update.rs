@@ -549,6 +549,7 @@ fn store_helper(store: &Path, path: &Path, binary: &[u8], what: &str) -> Result<
 /// check even under a group-writable umask.
 fn create_store_directory(store: &Path, directory: &Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
+    require_own_home(store)?;
     if let Some(above) = store.parent() {
         fs::create_dir_all(above).with_context(|| format!("create {}", above.display()))?;
     }
@@ -557,6 +558,30 @@ fn create_store_directory(store: &Path, directory: &Path) -> Result<()> {
         .mode(0o700)
         .create(directory)
         .with_context(|| format!("create {}", directory.display()))
+}
+
+/// Refuse to put anything in the store under a home directory that belongs to
+/// another user, as when root runs syq with that user's `HOME`. The store
+/// would belong to the wrong user, and its owner would be locked out of it.
+fn require_own_home(store: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let depth = Path::new(crate::user_dirs::BINARY_STORE_IN_HOME)
+        .components()
+        .count();
+    let Some(home) = store.ancestors().nth(depth) else {
+        return Ok(());
+    };
+    let owner = fs::metadata(home)
+        .with_context(|| format!("inspect {}", home.display()))?
+        .uid();
+    if owner != crate::rooted::own_uid() {
+        let owner = crate::completion_details::account_name(owner, false);
+        bail!(
+            "HOME ({}) belongs to {owner}; run syq as {owner}, or set HOME to your own home directory",
+            home.display()
+        );
+    }
+    Ok(())
 }
 
 /// An explicit version selection stores the release beside its signed
@@ -582,12 +607,14 @@ pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
     // cannot show that only this user can change the release, so it is
     // verified in full on every run instead, as before stored releases were
     // started directly.
-    if !crate::fsops::fixed_owners_and_modes(&store)
-        && stored_release(&store, &directory)
+    if !crate::fsops::fixed_owners_and_modes(&store) {
+        match stored_release(&store, &directory)
             .with_context(|| format!("cannot start syq {version} from the binary store"))?
-            == StoredRelease::Complete
-    {
-        return Ok(executable);
+        {
+            StoredRelease::Complete => return Ok(executable),
+            // Refuse before downloading anything that could not be stored.
+            StoredRelease::Incomplete => require_own_home(&store)?,
+        }
     }
     // Only explicit selection opts every build into the official trust anchor.
     let key = embedded_public_key()

@@ -936,6 +936,33 @@ fn use_version_names_the_owner_of_another_users_store() {
     assert!(!stderr.contains("delete"), "{stderr}");
 }
 
+/// Syq never creates a store under a home directory that belongs to another
+/// user, as root running with that user's HOME would, and refuses before
+/// downloading anything.
+#[test]
+fn use_version_does_not_create_a_store_in_another_users_home() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    fs::remove_dir_all(fixture.temp.path("fixtures")).unwrap();
+    let owner = Command::new("id").arg("-un").output().unwrap();
+    let owner = String::from_utf8(owner.stdout).unwrap();
+    let out = fixture
+        .command_builder(&fixture.installed, &["--use-version=0.7.0", "--version"])
+        .env("SYQ_TEST_OWN_UID", "4294967294")
+        .capture_output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "HOME ({}) belongs to {owner}; run syq as {owner}, or set HOME to your own home directory",
+            fixture.home.display(),
+            owner = owner.trim()
+        )),
+        "{stderr}"
+    );
+    assert!(!fixture.home.join(".local").exists());
+}
+
 /// Where the filesystem fixes owners and modes when it is mounted (FAT, exFAT,
 /// NTFS, SMB), they cannot show that only this user can change a release, so
 /// it is verified in full on every run instead of being refused.
