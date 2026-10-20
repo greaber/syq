@@ -1,5 +1,5 @@
 use super::*;
-use crate::destination_results::Change;
+use crate::destination_results::{Change, Failure};
 
 pub(super) struct AuthorityState {
     pub(super) paths: HashSet<Vec<u8>>,
@@ -376,12 +376,13 @@ impl RestrictedAuthority {
                     size: lifecycle.size,
                 },
                 self.result_path(&path, false).as_deref(),
-                Some(
-                    lifecycle
+                Some(Failure {
+                    message: lifecycle
                         .last_error
                         .as_deref()
                         .unwrap_or("the file was not finished"),
-                ),
+                    class: lifecycle.last_class,
+                }),
             );
         }
         stream.finish(transferred_bytes)?;
@@ -860,7 +861,7 @@ impl RestrictedAuthority {
     }
 
     /// Add one settled change to the results, if they have started.
-    pub(super) fn record_change(&self, path: &[u8], change: Change, error: Option<&str>) {
+    pub(super) fn record_change(&self, path: &[u8], change: Change, error: Option<Failure<'_>>) {
         if !self.results_started.load(Ordering::Acquire) {
             return;
         }
@@ -981,26 +982,27 @@ impl RestrictedAuthority {
         if creations.is_empty() && outcomes.is_empty() && !tracked {
             return;
         }
-        let outcome_error = |index: usize| -> Option<&str> {
+        let outcome_error = |index: usize| -> Option<Failure<'_>> {
+            let missing = || Failure::io("receiver returned no outcome for this file");
             match response {
-                proto::Response::Err(error) => Some(error.as_str()),
-                proto::Response::EndpointError(error) => Some(error.as_str()),
+                proto::Response::Err(error) => Some(Failure::io(error.as_str())),
+                proto::Response::EndpointError(error) => Some(Failure::of(error)),
                 proto::Response::WidenedDirectories(results) => results
                     .get(index)
-                    .and_then(|result| result.as_ref().err().map(proto::WireError::as_str)),
+                    .and_then(|result| result.as_ref().err().map(Failure::of)),
                 proto::Response::Applied(results) => results
                     .get(index)
-                    .and_then(|error| error.as_ref().map(proto::WireError::as_str)),
+                    .and_then(|error| error.as_ref().map(Failure::of)),
                 proto::Response::PatchedBatch(results) => match results.get(index) {
                     Some(Ok(_)) => None,
-                    Some(Err(error)) => Some(error.error.as_str()),
-                    None => Some("receiver returned no outcome for this file"),
+                    Some(Err(error)) => Some(Failure::of(&error.error)),
+                    None => Some(missing()),
                 },
                 // Small files published with their identities, for links.
                 proto::Response::PublishedBatch(results) => match results.get(index) {
                     Some(Ok(_)) => None,
-                    Some(Err(error)) => Some(error.as_str()),
-                    None => Some("receiver returned no outcome for this file"),
+                    Some(Err(error)) => Some(Failure::of(error)),
+                    None => Some(missing()),
                 },
                 _ => None,
             }
@@ -1162,12 +1164,14 @@ impl RestrictedAuthority {
                                 state.file_lifecycles.entry(key).or_insert(FileLifecycle {
                                     size,
                                     last_error: None,
+                                    last_class: "io",
                                     listed: false,
                                 });
                             lifecycle.size = size;
                             if let Some(error) = error {
                                 lifecycle.last_error =
-                                    crate::destination_results::bounded_diagnostic(error);
+                                    crate::destination_results::bounded_diagnostic(error.message);
+                                lifecycle.last_class = error.class;
                             }
                         }
                     }
@@ -3031,6 +3035,9 @@ pub(super) fn kind_from_mode(mode: u32) -> proto::Kind {
 pub(super) struct FileLifecycle {
     pub(super) size: u64,
     pub(super) last_error: Option<String>,
+    /// The error class of `last_error`, as `destination_results::Failure`
+    /// carries it.
+    pub(super) last_class: &'static str,
     /// A refusal already listed it as failed: the end does not list it again.
     pub(super) listed: bool,
 }

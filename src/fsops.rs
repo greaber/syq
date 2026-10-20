@@ -178,6 +178,16 @@ pub(crate) fn corrupted_in_transit(error: &anyhow::Error) -> bool {
             .is_some_and(|error| error.io_kind == Some(WireIoKind::CorruptedInTransit))
 }
 
+/// The `--results` error class of a failure the receiver reported: data
+/// corrupted in transit is an integrity failure, anything else an I/O one.
+pub(crate) fn failure_class(error: &WireError) -> &'static str {
+    if error.io_kind == Some(WireIoKind::CorruptedInTransit) {
+        "integrity"
+    } else {
+        "io"
+    }
+}
+
 /// Tests simulate data corrupted in transit: the first received payload whose
 /// check runs after `SYQ_TEST_CORRUPT_PAYLOAD_ONCE` names a missing file fails
 /// its check, and that file is created so later payloads pass.

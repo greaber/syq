@@ -405,7 +405,12 @@ impl Stream {
     /// Record one settled change. `dst` is the record's destination path, or
     /// `None` when ordinary results would not list it; a failure is listed
     /// whatever its path.
-    pub(crate) fn record(&mut self, change: Change, dst: Option<&[u8]>, error: Option<&str>) {
+    pub(crate) fn record(
+        &mut self,
+        change: Change,
+        dst: Option<&[u8]>,
+        error: Option<Failure<'_>>,
+    ) {
         if self.ended {
             return;
         }
@@ -413,7 +418,7 @@ impl Stream {
         match (change, error) {
             (_, Some(error)) => {
                 totals.failed += 1;
-                self.list_failure(change, dst, "io", error);
+                self.list_failure(change, dst, error.class, error.message);
                 return;
             }
             (Change::PublishFile { .. } | Change::LinkFile, None) => totals.files_transferred += 1,
@@ -899,6 +904,32 @@ pub(crate) mod relay {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+}
+
+/// Why a change failed, as the results list it: its message and its error
+/// class, the same class an ordinary copy reports for that failure.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Failure<'a> {
+    pub(crate) message: &'a str,
+    pub(crate) class: &'static str,
+}
+
+impl<'a> Failure<'a> {
+    /// A failure the receiver knows only by its message.
+    pub(crate) fn io(message: &'a str) -> Self {
+        Self {
+            message,
+            class: "io",
+        }
+    }
+
+    /// A failure the receiver's executor reported as `error`.
+    pub(crate) fn of(error: &'a crate::proto::WireError) -> Self {
+        Self {
+            message: error.as_str(),
+            class: crate::fsops::failure_class(error),
         }
     }
 }

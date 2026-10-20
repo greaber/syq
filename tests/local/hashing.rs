@@ -925,8 +925,9 @@ fn a_file_whose_data_is_corrupted_in_transit_fails_retryably() {
             stderr.contains("syq: file: data corrupted in transit; rerun the command to retry"),
             "{case}: {stderr}"
         );
-        let records: Vec<serde_json::Value> = fs::read_to_string(&results)
-            .unwrap()
+        let content = fs::read_to_string(&results).unwrap();
+        assert_automation_stream(&automation_validator(), &content, case);
+        let records: Vec<serde_json::Value> = content
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();

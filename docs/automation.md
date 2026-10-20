@@ -165,8 +165,9 @@ An outcome for a completed copy change or a failed mapping entry.
 | `class`, `os_kind`, `message` | Error details where available |
 
 A file whose data failed its [payload check](integrity-checking.md#payload-checks)
-on the way has `class: "integrity"`, `retryable: "yes"`, and the message
-`data corrupted in transit; rerun the command to retry`.
+on the way has `class: "integrity"` and the message
+`data corrupted in transit; rerun the command to retry`, whichever receiver
+reports it, and `retryable: "yes"` in a record that has that field.
 
 A command-restricted receiver's own records have no `src`, `attempts`, or
 `retryable`, and a deletion has no `kind`; a file it did not finish is
