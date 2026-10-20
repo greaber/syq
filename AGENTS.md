@@ -92,9 +92,14 @@ variables, and mixing `&&` with `;` all pass. The shapes that prompt are:
   prompt names one, stop and report it instead of rewriting around it.
 - A glob in more than one path segment, such as `dir/*/*` or `e*/*`. One
   trailing `/*`, or a glob in the last segment, passes.
-- A target ending in `/*` after `..`, `$(...)`, or a variable that may be
-  empty, such as `"$VAR"/*` or `$(pwd)/*`, and such a variable followed by a
-  top-level name, such as `$VAR/usr`. The same targets without `/*` pass.
+- A possibly-empty variable followed by `/*` or `/`, as in `"$VAR"/*`, or by
+  a top-level name, as in `$VAR/usr`; and `..` or `$(...)` followed by `/*`.
+  Without that suffix, `..` and a bare variable pass.
+- A recursive `rm` whose target is only `$(...)` or backtick output, such as
+  `rm -rf "$(mktemp -d)"`, or a variable the same command sets from `$(pwd)`
+  or another directory-printing substitution. A literal segment after the
+  substitution, as in `$(pwd)/target`, passes unless the path before it is
+  critical, as in `/tmp/$(cmd)` or `~/$(cmd)`.
 - A relative target ending in `/*` in a command that also runs `cd`. Write it
   as an absolute path.
 - In a command that runs `rm` anywhere, an inline `sh -c` script that starts
