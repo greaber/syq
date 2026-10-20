@@ -9695,6 +9695,67 @@ fn changes_check_existence_only_where_numbers_mislead() {
     }
 }
 
+/// A preparation that may neither create nor update its file only looks,
+/// and so counts nothing against the entry limit: in place too, it creates
+/// no file and resizes none this copy holds.
+#[test]
+fn an_in_place_preparation_that_only_looks_changes_nothing() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let authority = test_authority_with_policy(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::InPlace,
+    );
+    let mut ops = authority.test_ops();
+    let changes = || authority.changes.load(std::sync::atomic::Ordering::Relaxed);
+    let look = |path: &Path, size: u64| {
+        let mut request = prepare_request(path);
+        if let Request::Prepare {
+            inplace,
+            create_if_missing,
+            size: declared,
+            ..
+        } = &mut request
+        {
+            *inplace = true;
+            *create_if_missing = false;
+            *declared = size;
+        }
+        request
+    };
+    let mut carry_out = |request: &mut Request| {
+        let settlement = authority.authorize(request, false).unwrap();
+        let response = ops.handle(request);
+        authority.settle(settlement, &response);
+        response
+    };
+
+    let response = carry_out(&mut look(&target.join("new"), 512));
+    assert!(
+        fs::symlink_metadata(target.join("new")).is_err(),
+        "a look created a file: {response:?}"
+    );
+    assert_eq!(changes(), 0);
+
+    // A file this copy holds keeps the size its creation declared.
+    let mut create = prepare_request(&target.join("held"));
+    if let Request::Prepare { inplace, .. } = &mut create {
+        *inplace = true;
+    }
+    carry_out(&mut create);
+    assert_eq!(fs::metadata(target.join("held")).unwrap().len(), 4);
+    assert_eq!(changes(), 1);
+    carry_out(&mut look(&target.join("held"), 512));
+    assert_eq!(fs::metadata(target.join("held")).unwrap().len(), 4);
+    assert_eq!(changes(), 1);
+}
+
 /// Two requests that may create the same file share its count against the
 /// entry limit: one that finds its condition unmet gives nothing back
 /// while the other may still create the file.

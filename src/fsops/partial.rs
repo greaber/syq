@@ -569,6 +569,11 @@ impl FsOps {
             let compared = self
                 .held_basis
                 .take_if(|held| held.location == target.location() && held.copy_id == *copy_id);
+            // A preparation that may neither create nor update its file
+            // only looks: it creates nothing and resizes nothing, as a
+            // restricted receiver counts it (`charge_request`), and reports
+            // that it found nothing to resume.
+            let looks_only = !create_if_missing && update.is_none();
             // A retry, or a worker that connected again, writes the file
             // this copy already holds.
             if let Some(held) = self.held_inplace(&target, copy_id)? {
@@ -580,6 +585,9 @@ impl FsOps {
                             target.label.display()
                         );
                     }
+                }
+                if looks_only {
+                    return Ok(Preparation::default());
                 }
                 self.set_copy_length(&held.file, size)
                     .with_context(|| format!("resize confined file {}", target.label.display()))?;
@@ -622,6 +630,9 @@ impl FsOps {
                     "destination {} was compared, but this copy does not hold it",
                     target.label.display()
                 );
+            }
+            if !create_if_missing {
+                return Ok(Preparation::default());
             }
             let (file, _, in_use, staged) =
                 self.create_inplace_output(&target, copy_id, mode, group, size)?;
