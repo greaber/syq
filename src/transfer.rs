@@ -3670,12 +3670,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     });
     let defer_destination_mutations =
         args.hardlinks || multiple_distinct_sources || args.prune_before;
-    // Native new/existing forms check their pathnames above. A new target
-    // (`--as-new`, `--into-new`) is then also published without replacing
+    // Native new/existing forms check their pathnames above. A new exact
+    // target (`--as-new`) is then also published without replacing
     // anything, so that one another program creates at its name first is
     // kept and the copy fails; an existing one takes the ordinary engine's
-    // conditions, with no identity precondition of its own.
-    let exact_condition = if args.target_existence == Existence::New {
+    // conditions, with no identity precondition of its own. The directory
+    // `--into-new` names is created as the copy's root before anything is
+    // planned, so the planner must not require it to be missing again.
+    let exact_condition = if args.target_existence == Existence::New && !dst_is_dir {
         TargetCondition::Absent
     } else {
         TargetCondition::Any

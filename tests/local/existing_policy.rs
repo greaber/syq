@@ -224,6 +224,45 @@ fn new_placement_stays_strict_when_updates_are_allowed() {
 }
 
 #[test]
+fn into_new_copies_a_directorys_contents_into_the_directory_it_creates() {
+    // The new directory is the copy's root: creating it once must not count
+    // as finding it already there. Copying metadata or hard links, or
+    // several sources, creates it at a later point of the copy.
+    for extra in [
+        &[][..],
+        &["--copy-metadata=permissions"],
+        &["--copy-metadata=hardlinks"],
+        &["--srcs-in", "other"],
+    ] {
+        let t = Tmp::new();
+        write(&t.path("src/file"), b"file");
+        write(&t.path("src/sub/child"), b"child");
+        write(&t.path("other/more"), b"more");
+        let (cwd, dst) = (t.s(""), t.s("dst"));
+        let mut args = vec!["cp", "--cwd", &cwd, "--srcs-in", "src"];
+        args.extend_from_slice(extra);
+        args.extend(["--into-new", &dst]);
+        run_native_ok(&args);
+        assert_eq!(read(&t.path("dst/file")), b"file", "{extra:?}");
+        assert_eq!(read(&t.path("dst/sub/child")), b"child", "{extra:?}");
+        assert!(!t.path("dst/src").exists(), "{extra:?}");
+        assert_eq!(
+            t.path("dst/more").exists(),
+            extra.contains(&"other"),
+            "{extra:?}"
+        );
+
+        // A directory already there is still refused, and left alone.
+        let output = native_syq(&args);
+        assert!(!output.status.success(), "{extra:?}: {output:?}");
+        assert!(
+            stderr_of(&output).contains("requires a new path"),
+            "{extra:?}: {output:?}"
+        );
+    }
+}
+
+#[test]
 fn previous_partials_remain_reusable_without_an_option() {
     let t = Tmp::new();
     let contents = vec![b'a'; 5 << 20];
