@@ -971,12 +971,9 @@ impl RestrictedAuthority {
             Request::WriteRange { path, .. }
             | Request::ReuseComparedRange { path, .. }
             | Request::Finalize { path, .. } => vec![file(path, 0)],
-            Request::FinishBasis { path, .. } => vec![(
-                self.result_path(path, false),
-                Change::SetMetadata {
-                    kind: proto::Kind::File,
-                },
-            )],
+            Request::FinishBasis { path, .. } => {
+                vec![(self.result_path(path, false), Change::KeepFile)]
+            }
             _ => Vec::new(),
         }
     }
@@ -1094,9 +1091,7 @@ impl RestrictedAuthority {
                         );
                     }
                     let change = if kept {
-                        Change::SetMetadata {
-                            kind: proto::Kind::File,
-                        }
+                        Change::KeepFile
                     } else {
                         Change::PublishFile { size }
                     };
@@ -2601,9 +2596,7 @@ impl RestrictedAuthority {
                 outcomes.push(PendingOutcome::Logical {
                     index: 0,
                     path: path.clone(),
-                    change: Change::SetMetadata {
-                        kind: proto::Kind::File,
-                    },
+                    change: Change::KeepFile,
                 });
                 *guard = Some(self.guard.clone());
             }

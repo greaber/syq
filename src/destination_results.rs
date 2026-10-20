@@ -211,6 +211,11 @@ pub(crate) enum Change {
     SetMetadata {
         kind: crate::proto::Kind,
     },
+    /// An existing file kept, with its metadata set, because its contents
+    /// were compared and already matched (a patch that reused every block,
+    /// or `FinishBasis`). Listed, as a metadata change is, only when it
+    /// fails; unlike one, it completes the file's contents.
+    KeepFile,
     /// The removal of a name that is not a directory, of a kind the
     /// receiver does not look up.
     DeleteNonDirectory,
@@ -225,16 +230,29 @@ impl Change {
             self,
             Change::PublishFile { .. }
                 | Change::LinkFile
+                | Change::KeepFile
                 | Change::SetMetadata {
                     kind: crate::proto::Kind::File
                 }
         )
     }
 
+    /// Whether this change, succeeding, leaves the file's contents complete:
+    /// a publication of the file or of a name for it, or a file kept because
+    /// its contents matched. A metadata change says nothing of them.
+    fn completes_file(self) -> bool {
+        matches!(
+            self,
+            Change::PublishFile { .. } | Change::LinkFile | Change::KeepFile
+        )
+    }
+
     /// The ordinary record's action and kind, where known.
     fn action(self) -> (&'static str, Option<&'static str>) {
         let (action, kind) = match self {
-            Change::PublishFile { .. } | Change::LinkFile => ("transfer_file", "file"),
+            Change::PublishFile { .. } | Change::LinkFile | Change::KeepFile => {
+                ("transfer_file", "file")
+            }
             Change::EnsureDirectory => ("create_directory", "dir"),
             Change::CreateSymlink => ("create_symlink", "symlink"),
             Change::CreateSpecial => ("create_special", "special"),
@@ -441,9 +459,14 @@ impl Stream {
         if self.ended {
             return;
         }
-        // A later outcome for a file settles a failure held for its retry:
-        // the retry is listed instead, succeeded or failed.
-        if let Some(dst) = dst.filter(|_| change.is_file()) {
+        // A failure held for a file's retry is settled by a later change
+        // that completes the file, or replaced by a later failure of any
+        // change to it. A metadata change that succeeds settles nothing.
+        let settles = match error {
+            Some(_) => change.is_file(),
+            None => change.completes_file(),
+        };
+        if let Some(dst) = dst.filter(|_| settles) {
             self.retried.remove(dst);
         }
         let totals = &mut self.totals;
@@ -460,7 +483,7 @@ impl Stream {
             (Change::DeleteNonDirectory | Change::DeleteDirectory, None) => {
                 totals.deletions_completed += 1
             }
-            (Change::SetMetadata { .. }, None) => return,
+            (Change::SetMetadata { .. } | Change::KeepFile, None) => return,
         }
         let (Some(dst), true) = (dst, self.records) else {
             return;
