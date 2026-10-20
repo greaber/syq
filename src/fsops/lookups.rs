@@ -123,7 +123,11 @@ impl PlanningLookups {
             }
             _ => None,
         };
-        if let Some(looked) = looked.filter(|_| self.needed_for(root, parent.as_ref(), path)) {
+        let dev = match &found {
+            Lookup::Found(entry) => Some(entry.dev),
+            Lookup::Missing | Lookup::Unknown => None,
+        };
+        if let Some(looked) = looked.filter(|_| self.needed_for(root, parent.as_ref(), path, dev)) {
             self.record(path, looked);
         }
         match found {
@@ -135,12 +139,14 @@ impl PlanningLookups {
     /// Whether the directory holding `path` is on a filesystem where this
     /// copy's publications need the record: a name directly beneath the
     /// root is in the root, and any other in the parent `look_up` held
-    /// open. A name whose parent did not open is not recorded.
+    /// open, on the device of the entry found (`dev`) or else of that
+    /// parent. A name whose parent did not open is not recorded.
     fn needed_for(
         &self,
         root: &Arc<Root>,
         parent: Option<&HeldMetadataParent>,
         path: &[u8],
+        dev: Option<u64>,
     ) -> bool {
         let profile = match path.iter().rposition(|byte| *byte == b'/') {
             None => root.profile(),
@@ -150,9 +156,8 @@ impl PlanningLookups {
                 else {
                     return false;
                 };
-                let Some(dev) = *held
-                    .dev
-                    .get_or_init(|| held.directory.metadata().ok().map(|m| m.dev()))
+                let Some(dev) =
+                    dev.or_else(|| *held.dev.get_or_init(|| cached_device(&held.directory)))
                 else {
                     return false;
                 };
@@ -168,10 +173,10 @@ impl PlanningLookups {
         if self.recording != Recording::Keep || relative.is_empty() {
             return;
         }
-        let Ok(metadata) = directory.metadata() else {
+        let Some(dev) = cached_device(directory) else {
             return;
         };
-        if self.needed_on(root.profile_on(metadata.dev(), directory)) {
+        if self.needed_on(root.profile_on(dev, directory)) {
             self.record(relative, Looked::Empty);
         }
     }
@@ -262,10 +267,50 @@ impl PlanningLookups {
     }
 }
 
+/// The device `file` is on, from what the kernel already holds: on NFS a
+/// plain `fstat` can ask the server for fresh attributes, which the device
+/// needs none of.
+fn cached_device(file: &File) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
+        let result = unsafe {
+            libc::statx(
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC,
+                0,
+                stat.as_mut_ptr(),
+            )
+        };
+        if result != 0 {
+            return None;
+        }
+        let stat = unsafe { stat.assume_init() };
+        Some(libc::makedev(stat.stx_dev_major, stat.stx_dev_minor))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        file.metadata().ok().map(|metadata| metadata.dev())
+    }
+}
+
 impl FsOps {
     /// Record what this executor's lookups for the planner find in
     /// `lookups`, as a restricted receiver's authority asks.
     pub(crate) fn set_planning_lookups(&mut self, lookups: Option<Arc<PlanningLookups>>) {
         self.planning_lookups = lookups;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_cached_device_is_the_files_own() {
+        let directory = crate::test_support::tempdir().unwrap();
+        let file = File::open(directory.path()).unwrap();
+        assert_eq!(cached_device(&file), Some(file.metadata().unwrap().dev()));
     }
 }
