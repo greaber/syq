@@ -20,12 +20,16 @@ pub(super) fn op_path(op: &Op) -> &[u8] {
 /// receiver's session never creates missing parents on the way
 /// (`create_missing_parents`): each directory it creates passes its
 /// authority.
+/// Told the directory a new directory was made in, once a creation made
+/// one (`mkdir_rooted`).
+pub(super) type MadeDirectory<'a> = Option<&'a (dyn Fn(&File) + Sync)>;
+
 pub(super) fn apply_one(
     op: &Op,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
     create_missing_parents: bool,
-    owned: Option<&owned::OwnedObjects>,
+    (owned, made): (Option<&owned::OwnedObjects>, MadeDirectory<'_>),
 ) -> Result<()> {
     let Some(root) = destination_root else {
         bail!("{UNROOTED_MUTATION}");
@@ -52,7 +56,7 @@ pub(super) fn apply_one(
     if matches!(op, Op::SetFileMetaIfSame { .. }) {
         hold_before_quick_metadata_for_test()?;
     }
-    apply_one_rooted(op, &target, owned).map_err(|error| {
+    apply_one_rooted(op, &target, owned, made).map_err(|error| {
         // A no-replace creation whose name something already holds made
         // nothing: its condition was not met.
         let absent = matches!(
@@ -285,13 +289,14 @@ fn apply_one_rooted(
     op: &Op,
     target: &RootedTarget,
     owned: Option<&owned::OwnedObjects>,
+    made: MadeDirectory<'_>,
 ) -> Result<()> {
     let root = &target.root;
     let path = &target.relative;
     match op {
         Op::Mkdir {
             mode, condition, ..
-        } => mkdir_rooted(target, *mode, *condition, false).map(drop),
+        } => mkdir_rooted(target, *mode, *condition, false, made).map(drop),
         Op::Symlink {
             target: link,
             condition,
@@ -944,6 +949,7 @@ pub(super) fn create_identified_directory(
     destination_prefix: Option<&[u8]>,
     create_missing_parents: bool,
     private: bool,
+    made: MadeDirectory<'_>,
 ) -> Result<Option<CreatedDirectory>> {
     let Op::Mkdir {
         path,
@@ -963,7 +969,7 @@ pub(super) fn create_identified_directory(
     #[cfg(debug_assertions)]
     fail_apply_capacity_for_test(&target.label)?;
     let mode = if private { 0o700 } else { *mode };
-    mkdir_rooted(&target, mode, *condition, true)
+    mkdir_rooted(&target, mode, *condition, true, made)
 }
 
 /// Give a directory this receiver created private, once it has taken its
@@ -1002,12 +1008,14 @@ pub(crate) fn created_directory_mode(directory: &File, proposed: u32, current: u
 /// Create the directory `target` names, or accept an existing one as the
 /// condition allows, without changing an existing directory. With `identify`,
 /// return the identity of a directory this call created; `None` means it
-/// found one already there.
+/// found one already there. `made` is told the directory a directory this
+/// call created is in.
 fn mkdir_rooted(
     target: &RootedTarget,
     mode: u32,
     condition: TargetCondition,
     identify: bool,
+    made: MadeDirectory<'_>,
 ) -> Result<Option<CreatedDirectory>> {
     let root = &target.root;
     let path = &target.relative;
@@ -1030,6 +1038,9 @@ fn mkdir_rooted(
             .with_context(|| format!("create confined directory {}", target.label.display()))
         {
             Ok(()) => {
+                if let Some(made) = made {
+                    made(parent.directory());
+                }
                 let created = identify
                     .then(|| {
                         parent

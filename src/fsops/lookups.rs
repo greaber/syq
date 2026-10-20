@@ -167,8 +167,10 @@ impl PlanningLookups {
         self.needed_on(profile)
     }
 
-    /// Record that `directory`, open at `relative` beneath `root`, was found
-    /// empty or created by this receiver, where this copy needs it.
+    /// Record that the directory at `relative` beneath `root` was found
+    /// empty or created by this receiver, where this copy needs it:
+    /// `directory` is it, or the directory it was made in, on the same
+    /// filesystem.
     pub(super) fn record_empty(&self, root: &Root, relative: &[u8], directory: &File) {
         if self.recording != Recording::Keep || relative.is_empty() {
             return;
@@ -178,20 +180,6 @@ impl PlanningLookups {
         };
         if self.needed_on(root.profile_on(dev, directory)) {
             self.record(relative, Looked::Empty);
-        }
-    }
-
-    /// Record that this receiver created the directory at `relative`
-    /// beneath `root`, where this copy needs it.
-    pub(super) fn record_created_directory(&self, root: &Root, relative: &[u8]) {
-        if self.recording != Recording::Keep {
-            return;
-        }
-        let Ok(path) = RelativePath::new(relative) else {
-            return;
-        };
-        if let Ok(directory) = root.open_directory(&path) {
-            self.record_empty(root, relative, &directory);
         }
     }
 

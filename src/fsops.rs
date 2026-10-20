@@ -3516,6 +3516,23 @@ impl FsOps {
         // Only directories this request actually created, by identity.
         let private = std::sync::Mutex::new(HashMap::<Vec<u8>, (u32, (u64, u64))>::new());
         let create = |op: &Op| {
+            // A directory created without replacing anything is one this
+            // receiver made, empty: recorded through the directory it was
+            // made in, on the same filesystem.
+            let record = |parent: &File| {
+                if let (Some(lookups), Some(root)) = (lookups, &destination_root) {
+                    lookups.record_empty(root, op_path(op), parent);
+                }
+            };
+            let made: apply::MadeDirectory<'_> = matches!(
+                op,
+                Op::Mkdir {
+                    condition: TargetCondition::Absent,
+                    ..
+                }
+            )
+            .then_some(&record as &(dyn Fn(&File) + Sync))
+            .filter(|_| lookups.is_some());
             let result = match op {
                 Op::Mkdir { path, mode, .. }
                     if groups.get(path.as_slice()).is_some_and(|&group| {
@@ -3534,6 +3551,7 @@ impl FsOps {
                         destination_prefix,
                         create_missing_parents,
                         true,
+                        made,
                     )
                     .map(|created| {
                         if let Some((dev, ino, created)) = created {
@@ -3562,6 +3580,7 @@ impl FsOps {
                         destination_prefix,
                         create_missing_parents,
                         !narrowing,
+                        made,
                     )
                     .map(|created| {
                         if let Some((dev, ino, created)) = created {
@@ -3574,24 +3593,9 @@ impl FsOps {
                     destination_root.clone(),
                     destination_prefix,
                     create_missing_parents,
-                    owned,
+                    (owned, made),
                 ),
             };
-            // A directory created without replacing anything is one this
-            // receiver made, empty.
-            if let (
-                Ok(()),
-                Some(lookups),
-                Some(root),
-                Op::Mkdir {
-                    path,
-                    condition: TargetCondition::Absent,
-                    ..
-                },
-            ) = (&result, lookups, &destination_root, op)
-            {
-                lookups.record_created_directory(root, path);
-            }
             result.err().as_ref().map(wire_error)
         };
         let gres = parallel_map_from(minimum, &guarded_idx, |&i| create(&ops[i]));
@@ -3644,7 +3648,7 @@ impl FsOps {
                 destination_root.clone(),
                 destination_prefix,
                 create_missing_parents,
-                owned,
+                (owned, None),
             );
             // After its group change, even a refused one, as creating it
             // directly and then changing its group would have left it.
