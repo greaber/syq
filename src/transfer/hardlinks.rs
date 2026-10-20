@@ -117,9 +117,7 @@ impl Planner<'_> {
                 followers: Vec::new(),
             });
         } else if self.opts.dry_run
-            && (!self
-                .opts
-                .previews_by_comparing(leaf.e.size, destination.as_ref())
+            && (!self.opts.previews_by_comparing()
                 || destination
                     .as_ref()
                     .is_none_or(|d| d.kind != Kind::File || d.size != leaf.e.size))

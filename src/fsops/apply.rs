@@ -1053,11 +1053,12 @@ fn mkdir_rooted(
             }
             Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {
                 if condition == TargetCondition::Absent {
-                    // Something holds the name: nothing was created.
-                    return Err(condition_not_met(format!(
+                    // Something holds the name: nothing was created. The
+                    // error keeps its kind: the destination exists.
+                    return Err(error.context(ConditionNotMet(format!(
                         "destination {} appeared before no-replace creation",
                         target.label.display()
-                    )));
+                    ))));
                 }
             }
             Err(error) => return Err(error),

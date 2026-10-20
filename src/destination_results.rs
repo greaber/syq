@@ -211,6 +211,11 @@ pub(crate) enum Change {
     SetMetadata {
         kind: crate::proto::Kind,
     },
+    /// An existing file kept, with its metadata set, because its contents
+    /// were compared and already matched (a patch that reused every block,
+    /// or `FinishBasis`). Listed, as a metadata change is, only when it
+    /// fails; unlike one, it completes the file's contents.
+    KeepFile,
     /// The removal of a name that is not a directory, of a kind the
     /// receiver does not look up.
     DeleteNonDirectory,
@@ -218,10 +223,36 @@ pub(crate) enum Change {
 }
 
 impl Change {
+    /// Whether this is a change to a file: its contents, a name for it, or
+    /// its metadata.
+    fn is_file(self) -> bool {
+        matches!(
+            self,
+            Change::PublishFile { .. }
+                | Change::LinkFile
+                | Change::KeepFile
+                | Change::SetMetadata {
+                    kind: crate::proto::Kind::File
+                }
+        )
+    }
+
+    /// Whether this change, succeeding, leaves the file's contents complete:
+    /// a publication of the file or of a name for it, or a file kept because
+    /// its contents matched. A metadata change says nothing of them.
+    fn completes_file(self) -> bool {
+        matches!(
+            self,
+            Change::PublishFile { .. } | Change::LinkFile | Change::KeepFile
+        )
+    }
+
     /// The ordinary record's action and kind, where known.
     fn action(self) -> (&'static str, Option<&'static str>) {
         let (action, kind) = match self {
-            Change::PublishFile { .. } | Change::LinkFile => ("transfer_file", "file"),
+            Change::PublishFile { .. } | Change::LinkFile | Change::KeepFile => {
+                ("transfer_file", "file")
+            }
             Change::EnsureDirectory => ("create_directory", "dir"),
             Change::CreateSymlink => ("create_symlink", "symlink"),
             Change::CreateSpecial => ("create_special", "special"),
@@ -332,7 +363,8 @@ fn encode_frame<T: Serialize>(frame: &T) -> Result<Vec<u8>> {
 }
 
 /// The destination's side of one copy's stream. It holds the records that
-/// have not reached a connection yet and nothing else that grows.
+/// have not reached a connection yet, and the failures of files the sender
+/// is expected to try again until a later record settles each.
 pub(crate) struct Stream {
     keys: Keys,
     records: bool,
@@ -340,8 +372,20 @@ pub(crate) struct Stream {
     pending: Vec<u8>,
     pending_since: Option<Instant>,
     ready: Vec<Vec<u8>>,
+    /// Failed changes to files the sender tries again, by destination path:
+    /// each is listed when the results end unless a later record for that
+    /// file settles it (`record_retried`).
+    retried: std::collections::BTreeMap<Vec<u8>, RetriedFailure>,
     totals: Totals,
     ended: bool,
+}
+
+/// A failure `Stream::record_retried` holds until a retry settles it.
+#[derive(Debug)]
+struct RetriedFailure {
+    change: Change,
+    message: String,
+    class: &'static str,
 }
 
 impl std::fmt::Debug for Stream {
@@ -397,6 +441,7 @@ impl Stream {
             pending: Vec::new(),
             pending_since: None,
             ready: vec![encode_frame(&Frame::Header { body, signature })?],
+            retried: Default::default(),
             totals: Totals::default(),
             ended: false,
         })
@@ -405,15 +450,30 @@ impl Stream {
     /// Record one settled change. `dst` is the record's destination path, or
     /// `None` when ordinary results would not list it; a failure is listed
     /// whatever its path.
-    pub(crate) fn record(&mut self, change: Change, dst: Option<&[u8]>, error: Option<&str>) {
+    pub(crate) fn record(
+        &mut self,
+        change: Change,
+        dst: Option<&[u8]>,
+        error: Option<Failure<'_>>,
+    ) {
         if self.ended {
             return;
+        }
+        // A failure held for a file's retry is settled by a later change
+        // that completes the file, or replaced by a later failure of any
+        // change to it. A metadata change that succeeds settles nothing.
+        let settles = match error {
+            Some(_) => change.is_file(),
+            None => change.completes_file(),
+        };
+        if let Some(dst) = dst.filter(|_| settles) {
+            self.retried.remove(dst);
         }
         let totals = &mut self.totals;
         match (change, error) {
             (_, Some(error)) => {
                 totals.failed += 1;
-                self.list_failure(change, dst, "io", error);
+                self.list_failure(change, dst, error.class, error.message);
                 return;
             }
             (Change::PublishFile { .. } | Change::LinkFile, None) => totals.files_transferred += 1,
@@ -423,7 +483,7 @@ impl Stream {
             (Change::DeleteNonDirectory | Change::DeleteDirectory, None) => {
                 totals.deletions_completed += 1
             }
-            (Change::SetMetadata { .. }, None) => return,
+            (Change::SetMetadata { .. } | Change::KeepFile, None) => return,
         }
         let (Some(dst), true) = (dst, self.records) else {
             return;
@@ -449,6 +509,36 @@ impl Stream {
         self.push(&record);
     }
 
+    /// Hold the failure of a change to a file that the sender tries again,
+    /// such as a small-file patch it then copies whole. A later record for
+    /// that file settles it; otherwise it is listed, and counted, when the
+    /// results end, so a sender that never retries cannot hide it. A
+    /// failure with no destination path is recorded at once.
+    pub(crate) fn record_retried(
+        &mut self,
+        change: Change,
+        dst: Option<&[u8]>,
+        error: Failure<'_>,
+    ) {
+        if self.ended {
+            return;
+        }
+        match dst.filter(|_| change.is_file()) {
+            Some(dst) => {
+                self.retried.insert(
+                    dst.to_vec(),
+                    RetriedFailure {
+                        change,
+                        message: bounded_diagnostic(error.message)
+                            .unwrap_or_else(|| "failed".into()),
+                        class: error.class,
+                    },
+                );
+            }
+            None => self.record(change, dst, Some(error)),
+        }
+    }
+
     /// Count a request the destination refused, and list each change it
     /// asked for: the changes with a destination path, or the request as a
     /// whole.
@@ -460,6 +550,10 @@ impl Stream {
         let mut listed = false;
         for (dst, change) in changes {
             if let Some(dst) = dst {
+                // The refusal is the outcome of a retry it refuses.
+                if change.is_file() {
+                    self.retried.remove(dst);
+                }
                 self.list_failure(*change, Some(dst), "safety_limit", message);
                 listed = true;
             }
@@ -572,6 +666,17 @@ impl Stream {
     pub(crate) fn finish(&mut self, bytes_transferred: u64) -> Result<Totals> {
         if self.ended {
             bail!("the destination's results have already ended");
+        }
+        // Failures no retry settled are failures of the copy.
+        for (dst, failure) in std::mem::take(&mut self.retried) {
+            self.record(
+                failure.change,
+                Some(&dst),
+                Some(Failure {
+                    message: &failure.message,
+                    class: failure.class,
+                }),
+            );
         }
         self.seal()?;
         self.ended = true;
@@ -899,6 +1004,32 @@ pub(crate) mod relay {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+}
+
+/// Why a change failed, as the results list it: its message and its error
+/// class, the same class an ordinary copy reports for that failure.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Failure<'a> {
+    pub(crate) message: &'a str,
+    pub(crate) class: &'static str,
+}
+
+impl<'a> Failure<'a> {
+    /// A failure the receiver knows only by its message.
+    pub(crate) fn io(message: &'a str) -> Self {
+        Self {
+            message,
+            class: "io",
+        }
+    }
+
+    /// A failure the receiver's executor reported as `error`.
+    pub(crate) fn of(error: &'a crate::proto::WireError) -> Self {
+        Self {
+            message: error.as_str(),
+            class: crate::fsops::failure_class(error),
         }
     }
 }

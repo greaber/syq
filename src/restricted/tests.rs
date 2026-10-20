@@ -6313,11 +6313,13 @@ fn grouped_patch_results_list_published_and_failed_files() {
                 identity: None,
                 replaced: None,
             }),
+            // Writing it in place began and failed, so it is not copied
+            // again.
             Err(proto::SmallPatchError {
-                error: "executor rejected it".into(),
+                error: "writing it in place failed".into(),
                 matched: false,
                 stale_condition: false,
-                written: false,
+                written: true,
             }),
             Err(proto::SmallPatchError {
                 error: "keeping it failed".into(),
@@ -6358,6 +6360,313 @@ fn grouped_patch_results_list_published_and_failed_files() {
             ),
         ]
     );
+}
+
+#[test]
+fn a_failed_patch_is_listed_unless_the_senders_retry_settles_it() {
+    // A patch that fails with nothing written, and a batch that fails
+    // whole, are files the sender copies again. The retry's outcome is the
+    // file's; without one, the failure is listed when the results end.
+    for (whole_batch, retry) in [(false, true), (false, false), (true, true), (true, false)] {
+        let case = format!("whole_batch={whole_batch} retry={retry}");
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        let file = target.join("file");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(&file, b"old").unwrap();
+        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let (secret, policy) = results_policy();
+        let authority = test_authority_with_results(
+            &root,
+            DeletionPolicy::Forbid,
+            1024,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+            Some((key, policy)),
+        )
+        .unwrap();
+        let mut reader = start_results(&authority, secret);
+        let mut ops = authority.test_ops();
+        let block = proto::MIN_HASH_BLOCK_BYTES;
+        if whole_batch {
+            // The receiver's executor failed the batch as a whole.
+            let mut batch =
+                Request::PatchSmallBatch(vec![small_patch(&file, 3, block, vec![None], b"new")]);
+            let settlement = authority.authorize(&mut batch, false).unwrap();
+            authority.settle(
+                settlement,
+                &proto::Response::EndpointError("the batch failed".into()),
+            );
+        } else {
+            // The patch reuses a block the file does not hold, so it fails
+            // with nothing written (`small_compare`'s `Compared::Differs`).
+            let patch = small_patch(&file, 3, block, vec![Some([0; 32])], b"");
+            let proto::Response::PatchedBatch(patched) =
+                execute_authorized(&authority, &mut ops, Request::PatchSmallBatch(vec![patch]))
+            else {
+                panic!("{case}: unexpected patch response")
+            };
+            assert!(
+                matches!(
+                    &patched[..],
+                    [Err(error @ proto::SmallPatchError { stale_condition: false, .. })]
+                        if error.retried()
+                ),
+                "{case}: {patched:?}"
+            );
+        }
+        assert_eq!(fs::read(&file).unwrap(), b"old", "{case}");
+        if retry {
+            let proto::Response::Applied(errors) =
+                execute_authorized(&authority, &mut ops, small_put(&file))
+            else {
+                panic!("{case}: unexpected put response")
+            };
+            assert_eq!(errors, [None], "{case}");
+            assert_eq!(fs::read(&file).unwrap(), b"new", "{case}");
+        }
+
+        let results = finish_results(&authority, &mut reader);
+        let disposition = if retry { "succeeded" } else { "failed" };
+        assert_eq!(
+            results.changes(),
+            [(
+                "transfer_file".to_owned(),
+                b"file".to_vec(),
+                disposition.to_owned()
+            )],
+            "{case}"
+        );
+        assert_eq!(results.totals.failed, u64::from(!retry), "{case}");
+        assert_eq!(results.totals.files_transferred, u64::from(retry), "{case}");
+    }
+}
+
+#[test]
+fn a_metadata_change_does_not_settle_a_failed_patch() {
+    // After a patch fails with nothing written, a metadata change to the
+    // same file, whatever the sender claims, says nothing of its contents:
+    // the file is still listed failed when the results end.
+    let metadata_changes = |path: &Path| {
+        let mut meta = plain_meta();
+        meta.mtime = 1_600_000_000;
+        [
+            Op::SetMeta {
+                path: path_bytes(path),
+                meta: meta.clone(),
+                flags: proto::flags::TIMES,
+                condition: proto::TargetCondition::Any,
+                directory: false,
+            },
+            Op::SetFileMetaIfSame {
+                path: path_bytes(path),
+                condition: proto::TargetCondition::Any,
+                meta,
+                flags: proto::flags::TIMES,
+            },
+        ]
+    };
+    for (case, op) in metadata_changes(Path::new("")).into_iter().enumerate() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        let file = target.join("file");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(&file, b"old").unwrap();
+        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let (secret, policy) = results_policy();
+        let mut authority = test_authority_with_results(
+            &root,
+            DeletionPolicy::Forbid,
+            1024,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+            Some((key, policy)),
+        )
+        .unwrap();
+        authority.copy.options.preserve_times = true;
+        let mut reader = start_results(&authority, secret);
+        let mut ops = authority.test_ops();
+        let block = proto::MIN_HASH_BLOCK_BYTES;
+        let patch = small_patch(&file, 3, block, vec![Some([0; 32])], b"");
+        let proto::Response::PatchedBatch(patched) =
+            execute_authorized(&authority, &mut ops, Request::PatchSmallBatch(vec![patch]))
+        else {
+            panic!("{case}: unexpected patch response")
+        };
+        assert!(
+            matches!(&patched[..], [Err(error)] if error.retried()),
+            "{case}: {patched:?}"
+        );
+        // The executor reports the metadata change done.
+        let op = match op {
+            Op::SetMeta {
+                meta,
+                flags,
+                condition,
+                directory,
+                ..
+            } => Op::SetMeta {
+                path: path_bytes(&file),
+                meta,
+                flags,
+                condition,
+                directory,
+            },
+            Op::SetFileMetaIfSame {
+                meta,
+                flags,
+                condition,
+                ..
+            } => Op::SetFileMetaIfSame {
+                path: path_bytes(&file),
+                condition,
+                meta,
+                flags,
+            },
+            _ => unreachable!(),
+        };
+        let mut request = apply(op);
+        let settlement = authority.authorize(&mut request, false).unwrap();
+        authority.settle(settlement, &proto::Response::Applied(vec![None]));
+        assert_eq!(fs::read(&file).unwrap(), b"old", "{case}");
+
+        let results = finish_results(&authority, &mut reader);
+        assert_eq!(results.totals.failed, 1, "{case}: {:?}", results.records);
+        assert_eq!(results.totals.files_transferred, 0, "{case}");
+        assert_eq!(
+            results.changes(),
+            [(
+                "transfer_file".to_owned(),
+                b"file".to_vec(),
+                "failed".to_owned()
+            )],
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn data_corrupted_in_transit_is_listed_as_an_integrity_failure() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let (secret, policy) = results_policy();
+    let authority = test_authority_with_results(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::ExactPath,
+        RootExistence::Any,
+        Some((key, policy)),
+    )
+    .unwrap();
+    let mut reader = start_results(&authority, secret);
+    let mut ops = authority.test_ops();
+    ops.set_hash_policy(authority.hash_policy());
+    // A file whose data does not match the payload hash the source sent:
+    // it changed on the way. Another file in the batch fails otherwise.
+    let mut corrupted = small_put(&target.join("corrupted"));
+    let Request::PutSmallBatch(puts) = &mut corrupted else {
+        unreachable!()
+    };
+    puts[0].hash = [0; 32];
+    let mut missing = small_put(&target.join("missing/file"));
+    let Request::PutSmallBatch(missing) = &mut missing else {
+        unreachable!()
+    };
+    puts.append(missing);
+    let proto::Response::Applied(errors) = execute_authorized(&authority, &mut ops, corrupted)
+    else {
+        panic!("unexpected put response")
+    };
+    assert_eq!(
+        errors[0].as_ref().and_then(|error| error.io_kind),
+        Some(proto::WireIoKind::CorruptedInTransit),
+        "{errors:?}"
+    );
+    assert!(errors[1].is_some(), "{errors:?}");
+    // A range of a file copied per file fails the same way. The file is
+    // listed unfinished when the results end, with that failure.
+    let image = target.join("image");
+    let mut prepare = Request::Prepare {
+        path: path_bytes(&image),
+        size: 4,
+        inplace: false,
+        copy_id: [2; 16],
+        mode: 0o600,
+        flags: 0,
+        acl: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
+        attempt: 0,
+        create_if_missing: true,
+        group: None,
+        update: None,
+    };
+    let settlement = authority.authorize(&mut prepare, false).unwrap();
+    authority.settle(settlement, &proto::Response::Ok);
+    let mut write = Request::WriteRange {
+        path: path_bytes(&image),
+        inplace: false,
+        copy_id: [2; 16],
+        attempt: 0,
+        off: 0,
+        hash: [0; 32],
+        data: b"data".to_vec().into(),
+    };
+    let settlement = authority.authorize(&mut write, false).unwrap();
+    authority.settle(
+        settlement,
+        &proto::Response::EndpointError(crate::fsops::wire_error(&anyhow::Error::new(
+            crate::fsops::CorruptedInTransit,
+        ))),
+    );
+
+    // The receiver lists each as an ordinary copy reports it: an integrity
+    // failure, with the message saying to rerun the command.
+    let results = finish_results(&authority, &mut reader);
+    assert_eq!(results.totals.failed, 3);
+    let failed = |name: &str| {
+        results
+            .records
+            .iter()
+            .find(|record| record["type"] == "operation_result" && record["dst"]["value"] == name)
+            .unwrap_or_else(|| panic!("{name}: {:?}", results.records))
+            .clone()
+    };
+    for name in ["corrupted", "image"] {
+        let corrupted = failed(name);
+        assert_eq!(corrupted["disposition"], "failed", "{name}");
+        assert_eq!(corrupted["class"], "integrity", "{name}");
+        assert_eq!(
+            corrupted["message"], "data corrupted in transit; rerun the command to retry",
+            "{name}"
+        );
+    }
+    assert_eq!(failed("missing/file")["class"], "io");
+    let mut errors: Vec<_> = results
+        .records
+        .iter()
+        .filter(|record| record["type"] == "error")
+        .map(|record| record["class"].as_str().unwrap())
+        .collect();
+    errors.sort();
+    assert_eq!(errors, ["integrity", "integrity", "io"]);
 }
 
 /// Authorize, execute and settle a request on the connection whose
@@ -6596,7 +6905,7 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
     assert_eq!(fs::read(&paths[1]).unwrap(), new);
 
     // A connection that closes with a patch open removes its stage, and
-    // its patch is settled as failed.
+    // its patch is settled as failed, with nothing published.
     {
         let mut gate = PatchStreamGate::new(authority.clone());
         let mut ops = authority.test_ops();
@@ -6616,7 +6925,10 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
     // refused begin by its path: three for `refused` (data in the begin, a
     // short declaration, a second begin) and one for `published` (a begin
     // while another was open). The begin outside the destination is not
-    // listed by path.
+    // listed by path. A patch that failed with nothing published, here
+    // `refused` once its piece was refused and `dropped`, is held for the
+    // sender to copy again; as no copy follows, each is listed failed when
+    // the results end.
     let results = finish_results(&authority, &mut reader);
     let mut changes = results.changes();
     changes.sort();
@@ -7583,6 +7895,8 @@ fn both_receivers_settle_each_file_of_an_in_place_batch_alike() {
 
         if let (Some(authority), Some(reader)) = (&receiver.authority, reader.as_mut()) {
             let results = finish_results(authority, reader);
+            // One whose patch failed with nothing written is held for the
+            // sender to copy again; as no copy follows, it is listed failed.
             for (name, disposition) in [
                 ("mine", "succeeded"),
                 ("linked", "succeeded"),

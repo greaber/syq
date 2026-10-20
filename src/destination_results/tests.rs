@@ -66,7 +66,7 @@ fn sample(records: bool) -> (Reader, Vec<Vec<u8>>) {
     stream.record(
         Change::PublishFile { size: 5 },
         Some(b"dir/b"),
-        Some("disk full"),
+        Some(Failure::io("disk full")),
     );
     stream.record(
         Change::SetMetadata {
@@ -164,7 +164,7 @@ fn a_refusal_without_a_listable_path_is_still_an_error_record() {
             kind: crate::proto::Kind::Symlink,
         },
         Some(b"link"),
-        Some("lchown failed"),
+        Some(Failure::io("lchown failed")),
     );
     stream.finish(0).unwrap();
     all.extend(drain(&mut stream));

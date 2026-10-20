@@ -224,6 +224,109 @@ fn new_placement_stays_strict_when_updates_are_allowed() {
 }
 
 #[test]
+fn into_new_copies_a_directorys_contents_into_the_directory_it_creates() {
+    // The new directory is the copy's root: creating it once must not count
+    // as finding it already there. Copying metadata or hard links, or
+    // several sources, creates it at a later point of the copy.
+    for extra in [
+        &[][..],
+        &["--copy-metadata=permissions"],
+        &["--copy-metadata=hardlinks"],
+        &["--srcs-in", "other"],
+    ] {
+        let t = Tmp::new();
+        write(&t.path("src/file"), b"file");
+        write(&t.path("src/sub/child"), b"child");
+        write(&t.path("other/more"), b"more");
+        let (cwd, dst) = (t.s(""), t.s("dst"));
+        let mut args = vec!["cp", "--cwd", &cwd, "--srcs-in", "src"];
+        args.extend_from_slice(extra);
+        args.extend(["--into-new", &dst]);
+        run_native_ok(&args);
+        assert_eq!(read(&t.path("dst/file")), b"file", "{extra:?}");
+        assert_eq!(read(&t.path("dst/sub/child")), b"child", "{extra:?}");
+        assert!(!t.path("dst/src").exists(), "{extra:?}");
+        assert_eq!(
+            t.path("dst/more").exists(),
+            extra.contains(&"other"),
+            "{extra:?}"
+        );
+
+        // A directory already there is still refused, and left alone.
+        let output = native_syq(&args);
+        assert!(!output.status.success(), "{extra:?}: {output:?}");
+        assert!(
+            stderr_of(&output).contains("requires a new path"),
+            "{extra:?}: {output:?}"
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn into_new_refuses_a_directory_that_appears_after_its_check() {
+    // The pathname check finds no `dst`, and another program creates it,
+    // with a file of the name the copy would write, before the copy uses
+    // it: while the copy selects the directory it goes into, or just before
+    // it creates that directory. The copy refuses the directory found there,
+    // as the check would have, and writes nothing into it. Copying hard
+    // links creates the directory later, once the sources are scanned.
+    for (hook, stage) in [
+        ("SYQ_TEST_TARGET_PRECONDITION", "target precondition"),
+        (
+            "SYQ_TEST_OPERATOR_DIRECTORY",
+            "destination directory creation",
+        ),
+    ] {
+        for (source, extra) in [
+            (&["--srcs-in", "src"][..], &[][..]),
+            (&["src"][..], &[][..]),
+            (
+                &["--srcs-in", "src"][..],
+                &["--copy-metadata=hardlinks"][..],
+            ),
+        ] {
+            let case = format!("{stage}: {source:?} {extra:?}");
+            let t = Tmp::new();
+            write(&t.path("src/file"), b"file");
+            let (ready, continuation) = (t.path("ready"), t.path("continue"));
+            let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+                .args(["cp", "-q", "--cwd", &t.s("")])
+                .args(source)
+                .args(extra)
+                .args(["--into-new", &t.s("dst")])
+                .env(format!("{hook}_READY_FILE"), &ready)
+                .env(format!("{hook}_CONTINUE_FILE"), &continuation)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .start()
+                .unwrap();
+            wait_for_confinement_marker(&mut child, &ready, stage);
+            write(&t.path("dst/file"), b"theirs");
+            write(&t.path("dst/src/file"), b"theirs");
+            release_confinement_barrier(&continuation);
+            let output = child.wait_with_output().unwrap();
+            assert!(!output.status.success(), "{case}: {output:?}");
+            assert!(
+                stderr_of(&output).contains(&format!(
+                    "target {} already exists, but the selected placement requires a new path",
+                    t.s("dst")
+                )),
+                "{case}: {output:?}"
+            );
+            assert_eq!(read(&t.path("dst/file")), b"theirs", "{case}");
+            assert_eq!(read(&t.path("dst/src/file")), b"theirs", "{case}");
+            let mut names: Vec<_> = fs::read_dir(t.path("dst"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            assert_eq!(names, ["file", "src"], "{case}");
+        }
+    }
+}
+
+#[test]
 fn previous_partials_remain_reusable_without_an_option() {
     let t = Tmp::new();
     let contents = vec![b'a'; 5 << 20];

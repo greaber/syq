@@ -1569,6 +1569,7 @@ impl Planner<'_> {
                         .unwrap_or_else(|| operator_directory_mode(self.opts)),
                 };
                 let (selection, created) = create_operator_directory(self.dst, condition, mode)
+                    .map_err(|error| new_root_refused(error, condition, &self.dst_root))
                     .map_err(|error| with_failure_hint(self.opts, error))?;
                 if is_destination_root && !created {
                     self.adopt_existing_root(&root, &selection);
@@ -1590,7 +1591,8 @@ impl Planner<'_> {
                 } else {
                     self.root_source_mode.unwrap_or(0o755)
                 };
-                let created = mkdir_root(self.dst, &root, condition, mode)?;
+                let created = mkdir_root(self.dst, &root, condition, mode)
+                    .map_err(|error| new_root_refused(error, condition, &root))?;
                 self.mutation_root_condition = target_identity(&created);
             }
         }
@@ -2009,7 +2011,7 @@ impl Planner<'_> {
             self.progress.files_unchanged.fetch_add(1, Relaxed);
             self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
         } else if opts.dry_run
-            && opts.previews_by_comparing(e.size, dst_entry.as_ref())
+            && opts.previews_by_comparing()
             && dst_entry
                 .as_ref()
                 .is_some_and(|d| d.kind == Kind::File && d.size == e.size)

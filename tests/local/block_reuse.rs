@@ -916,7 +916,7 @@ fn a_streamed_patch_whose_stage_is_refused_for_want_of_descriptors_is_staged_aga
 }
 
 #[test]
-fn by_default_only_replaced_files_of_unchanged_size_are_compared() {
+fn by_default_remote_copies_compare_replaced_files_of_any_size() {
     for explicit in [false, true] {
         let t = Tmp::new();
         let source = prng(2 << 20, 873);
@@ -950,12 +950,64 @@ fn by_default_only_replaced_files_of_unchanged_size_are_compared() {
         for name in ["grown", "edited"] {
             assert_eq!(read(&t.path(&format!("dst/{name}"))), source, "{name}");
         }
-        // A file whose size changed is copied whole without reading the old
-        // one, unless block reuse was chosen explicitly.
+        // As rsync does by default, a file whose size changed is compared
+        // too, whether or not block reuse was chosen explicitly.
         let observed = tuning_observed(&out);
-        let compared = if explicit { 2 } else { 1 };
-        assert_eq!(observed["compared_files"], compared, "explicit={explicit}");
-        assert_eq!(observed["patched_files"], compared, "explicit={explicit}");
+        assert_eq!(observed["compared_files"], 2, "explicit={explicit}");
+        assert_eq!(observed["patched_files"], 2, "explicit={explicit}");
+    }
+}
+
+#[test]
+fn by_default_an_appended_remote_file_reuses_its_old_blocks() {
+    // A remote copy compares a file that grew with the one it replaces:
+    // the blocks the destination already holds are reused, and only the
+    // appended data is sent. So too on the per-file path, which a file too
+    // large to compare in groups takes.
+    for per_file in [false, true] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        t.expose_remote_syq();
+        let old = prng(3 << 20, 885);
+        let appended = prng((1 << 20) + 12345, 886);
+        let source = [&old[..], &appended[..]].concat();
+        write(&t.path("src/file"), &source);
+        write(&t.path("dst/file"), &old);
+        set_mtime(&t.path("dst/file"), 1);
+        let results = t.path("results.jsonl");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(["cp", "--no-progress", "--srcs-in", &t.s("src")])
+            .args(["--to", "fake", "--no-tcp", "--no-bootstrap", "--rsh"])
+            .arg(&rsh)
+            .args(["--into", &t.s("dst"), "--results"])
+            .arg(&results)
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("XDG_CACHE_HOME", t.path("cache"));
+        if per_file {
+            // The per-file path compares the default 4 MiB blocks; the old
+            // file holds whole blocks of 1 MiB.
+            command
+                .arg("--performance-tuning=comparison-block-size=1M")
+                .env("SYQ_TEST_PER_FILE_COMPARISON", "1");
+        }
+        let out = command.run().unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst/file")), source, "per_file={per_file}");
+        let records = fs::read_to_string(&results).unwrap();
+        let summary: serde_json::Value =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            summary["bytes_transferred"],
+            appended.len() as u64,
+            "per_file={per_file}: {summary}"
+        );
+        assert_eq!(
+            summary["bytes_unchanged"],
+            old.len() as u64,
+            "per_file={per_file}: {summary}"
+        );
     }
 }
 

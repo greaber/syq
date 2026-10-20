@@ -29,7 +29,7 @@ pub enum TransferStrategy {
     WholeFile,
     /// Reuse matching blocks at the same offsets in the corresponding destination file.
     AlignedBlock,
-    /// Use whole-file locally; with a remote syq endpoint, aligned-block for files of unchanged size and whole-file for the rest.
+    /// Use whole-file locally and aligned-block with a remote syq endpoint.
     #[default]
     Locality,
 }
@@ -62,7 +62,7 @@ impl TransferStrategy {
     }
 }
 
-const TRANSFER_STRATEGY_HELP: &str = "Choose how filesystem copies transfer file contents: whole-file copies selected files without reusing blocks from the final destination; aligned-block reuses matching blocks at the same offsets in the corresponding destination file. locality (the default) uses whole-file for local copies, including mounted network filesystems; when a syq endpoint is remote, it uses aligned-block for files whose destination has the same size and whole-file for files whose size changed. Size/time skips, explicit content checks, and partial-file resume apply to all strategies.";
+const TRANSFER_STRATEGY_HELP: &str = "Choose how filesystem copies transfer file contents: whole-file copies selected files without reusing blocks from the final destination; aligned-block reuses matching blocks at the same offsets in the corresponding destination file. locality (the default) uses whole-file for local copies, including mounted network filesystems, and aligned-block when a syq endpoint is remote. Size/time skips, explicit content checks, and partial-file resume apply to all strategies.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Existence {
@@ -477,7 +477,7 @@ pub struct Args {
     /// Skip quick check; compare file contents block by block and repair differences
     #[arg(short = 'c', long)]
     pub checksum: bool,
-    /// Don't skip files whose size and modification time match; compare those that block reuse would compare (by default, files of unchanged size with a remote syq endpoint) and copy the rest
+    /// Don't skip files whose size and modification time match; compare those that block reuse would compare (by default, every file with a remote syq endpoint) and copy the rest
     #[arg(short = 'I', long = "ignore-times")]
     pub hash_or_copy: bool,
     /// Algorithm for file content comparisons and optional transfer checks
@@ -1350,7 +1350,7 @@ struct NativeCopyOperationalArgs {
     /// Hash existing source and destination files instead of trusting size and modification time
     #[arg(long)]
     hash: bool,
-    /// Like --hash, but compare only files the transfer strategy would compare (by default, files of unchanged size with a remote syq endpoint) and copy the rest, so identical files may be rewritten
+    /// Like --hash, but compare only files the transfer strategy would compare (by default, every file with a remote syq endpoint) and copy the rest, so identical files may be rewritten
     #[arg(long, conflicts_with = "hash")]
     hash_or_copy: bool,
     /// Choose a file transfer strategy (default: locality)

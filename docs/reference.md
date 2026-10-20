@@ -180,14 +180,14 @@ contents are accepted unchanged. A content conflict leaves that file's metadata
 alone too. `--as-new` and `--into-new` constrain the placement root; `--if-exists`
 applies to individual selected entries.
 
-Another program can change the destination while a copy runs. With `error`,
-`error-if-different` and `--as-new`, syq creates a new file at a name only
-while the name is still free: it renames the file into place without
-replacing anything, or, on filesystems that can't, such as NFS, SMB and FUSE
-filesystems like SSHFS, links it into place, which fails if the name is
-taken. A file that appears there first is kept, and that file's copy is
-reported as failed. `--into-new` creates its directory the same way; if
-another program creates one there first, the copy fails.
+With `error`, `error-if-different` and `--as-new`, syq publishes a new file at a
+name only while the name is still free: if a file appears there first, syq keeps
+it and reports that file's copy as failed. Likewise, `--into-new` creates its
+directory only while the name is free: if one appears there first, the copy
+stops without writing into it. On filesystems with neither an atomic
+no-replace rename nor hard links, such as FAT and exFAT on macOS and rclone
+mounts, syq checks that a file's name is free and then renames, so a file
+another program creates there in the instant between the two can be replaced.
 
 With `keep` (and `syq rsync --ignore-existing`), a file that appears in a
 destination directory before syq puts its own there is kept, and syq skips it
@@ -211,11 +211,6 @@ rsync behaves the same way. A restricted receiver replaces only files it
 found there itself, while planning the copy or with a look of its own just
 before, whatever the sender says.
 
-On filesystems with neither an atomic no-replace rename nor hard links, such
-as FAT and exFAT on macOS and rclone mounts, syq checks that a name is free
-and then renames, so even under `error` a file another program creates there
-in that instant can be replaced.
-
 See [Update policies](commands/cp.md#update-policies) for supported combinations.
 
 ## Choose a transfer strategy
@@ -227,14 +222,15 @@ files selected for copying in `syq cp`.
 |---|---|
 | `whole-file` | Copy the selected file without comparing or reusing blocks from the final destination |
 | `aligned-block` | Compare each replaced file with the destination file and reuse matching blocks at the same offsets; shifted blocks and blocks from other files are not matched |
-| `locality` (default) | Use `whole-file` for local copies. When a syq endpoint is remote, use `aligned-block` for a file whose destination has the same size, and `whole-file` for one whose size changed |
+| `locality` (default) | Use `whole-file` for local copies and `aligned-block` when a syq endpoint is remote |
 
-A file whose size changed was usually rewritten, so `locality` copies it whole
-rather than reading the old file to look for matching blocks. A file with the
-same size may be unchanged or edited in place, and comparing it costs about a
-read of the old file on the destination. `locality` treats paths on mounted
-network filesystems as local. It chooses by endpoint location and file size,
-without measuring link or filesystem speed. To choose explicitly:
+When a syq endpoint is remote, `locality` compares every replaced file, as
+rsync does by default, and sends only the blocks that differ. Comparing costs
+about a read of the old file on the destination. A file that grew keeps the
+blocks before its new data; unlike rsync, only blocks at the same offsets
+match. `locality` treats paths on mounted network filesystems as local. It
+chooses by endpoint location, without measuring link or filesystem speed. To
+choose explicitly:
 
 ```sh
 syq cp --srcs-in source --to server --into destination \
@@ -408,9 +404,8 @@ syq cp --hash --srcs-in project --into backup
 `--hash-or-copy` also checks files whose size and time match, but compares
 only the files that the [transfer strategy](#choose-a-transfer-strategy) would
 compare and copies the rest whole, so files that already match may be
-rewritten. With the default strategy, that means comparing files whose size is
-unchanged when a syq endpoint is remote, and copying every file on the same
-machine.
+rewritten. With the default strategy, that means comparing every file when a
+syq endpoint is remote, and copying every file on the same machine.
 
 Use [per-file expected hashes in mappings](mappings.md#the-format) to require
 known contents, including when reusing destination bytes.

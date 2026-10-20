@@ -45,8 +45,7 @@ only the files that the
 [transfer strategy](reference.md#choose-a-transfer-strategy) would compare and
 copies the rest whole, so a file whose contents already match may be
 rewritten. With the default strategy, copies with a remote syq endpoint compare
-files whose size is unchanged and keep those that match, and same-machine
-copies copy every file. In rsync syntax, use `-I` or `--ignore-times`; `-c`
+every file and keep those that match, and same-machine copies copy every file. In rsync syntax, use `-I` or `--ignore-times`; `-c`
 takes precedence when both are given. A dry run with `--hash-or-copy` compares
 where the copy would compare, and lists the files the copy would write.
 
@@ -65,6 +64,11 @@ SSH and encrypted TCP retain their transport authentication independently.
 sets `transfer`, including `transfer=off`. That check catches data corrupted in
 transit, but no checksum authenticates unencrypted traffic: an attacker can
 replace both the data and its checksum.
+
+Syq doesn't write data that fails the check. Depending on how the file was
+being sent, it either sends the file again in the same run, or reports it as
+failed with `data corrupted in transit; rerun the command to retry` and ends
+with exit status 23.
 
 For a complete check of a local copy, use an [expected hash](#expected-hashes).
 

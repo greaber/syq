@@ -1,5 +1,5 @@
 use super::*;
-use crate::destination_results::Change;
+use crate::destination_results::{Change, Failure};
 
 pub(super) struct AuthorityState {
     /// Objects this grant created and the executor confirmed. The
@@ -671,12 +671,13 @@ impl RestrictedAuthority {
                     size: lifecycle.size,
                 },
                 self.result_path(&path, false).as_deref(),
-                Some(
-                    lifecycle
+                Some(Failure {
+                    message: lifecycle
                         .last_error
                         .as_deref()
                         .unwrap_or("the file was not finished"),
-                ),
+                    class: lifecycle.last_class,
+                }),
             );
         }
         stream.finish(transferred_bytes)?;
@@ -1086,7 +1087,7 @@ impl RestrictedAuthority {
     }
 
     /// Add one settled change to the results, if they have started.
-    pub(super) fn record_change(&self, path: &[u8], change: Change, error: Option<&str>) {
+    pub(super) fn record_change(&self, path: &[u8], change: Change, error: Option<Failure<'_>>) {
         if !self.results_started.load(Ordering::Acquire) {
             return;
         }
@@ -1105,6 +1106,19 @@ impl RestrictedAuthority {
         let dst = self.result_path(path, directory);
         if let Some(stream) = self.results.lock().unwrap().as_mut() {
             stream.record(change, dst.as_deref(), error);
+        }
+    }
+
+    /// Hold the failure of a change the sender tries again until a later
+    /// change to the same file settles it (`destination_results::Stream::
+    /// record_retried`).
+    fn record_retried(&self, path: &[u8], change: Change, error: Failure<'_>) {
+        if !self.results_started.load(Ordering::Acquire) {
+            return;
+        }
+        let dst = self.result_path(path, false);
+        if let Some(stream) = self.results.lock().unwrap().as_mut() {
+            stream.record_retried(change, dst.as_deref(), error);
         }
     }
 
@@ -1182,12 +1196,9 @@ impl RestrictedAuthority {
             Request::WriteRange { path, .. }
             | Request::ReuseComparedRange { path, .. }
             | Request::Finalize { path, .. } => vec![file(path, 0)],
-            Request::FinishBasis { path, .. } => vec![(
-                self.result_path(path, false),
-                Change::SetMetadata {
-                    kind: proto::Kind::File,
-                },
-            )],
+            Request::FinishBasis { path, .. } => {
+                vec![(self.result_path(path, false), Change::KeepFile)]
+            }
             _ => Vec::new(),
         }
     }
@@ -1208,26 +1219,27 @@ impl RestrictedAuthority {
         if creations.is_empty() && outcomes.is_empty() && !tracked {
             return;
         }
-        let outcome_error = |index: usize| -> Option<&str> {
+        let outcome_error = |index: usize| -> Option<Failure<'_>> {
+            let missing = || Failure::io("receiver returned no outcome for this file");
             match response {
-                proto::Response::Err(error) => Some(error.as_str()),
-                proto::Response::EndpointError(error) => Some(error.as_str()),
+                proto::Response::Err(error) => Some(Failure::io(error.as_str())),
+                proto::Response::EndpointError(error) => Some(Failure::of(error)),
                 proto::Response::WidenedDirectories(results) => results
                     .get(index)
-                    .and_then(|result| result.as_ref().err().map(proto::WireError::as_str)),
+                    .and_then(|result| result.as_ref().err().map(Failure::of)),
                 proto::Response::Applied(results) => results
                     .get(index)
-                    .and_then(|error| error.as_ref().map(proto::WireError::as_str)),
+                    .and_then(|error| error.as_ref().map(Failure::of)),
                 proto::Response::PatchedBatch(results) => match results.get(index) {
                     Some(Ok(_)) => None,
-                    Some(Err(error)) => Some(error.error.as_str()),
-                    None => Some("receiver returned no outcome for this file"),
+                    Some(Err(error)) => Some(Failure::of(&error.error)),
+                    None => Some(missing()),
                 },
                 // Small files published with their identities, for links.
                 proto::Response::PublishedBatch(results) => match results.get(index) {
                     Some(Ok(_)) => None,
-                    Some(Err(error)) => Some(error.as_str()),
-                    None => Some("receiver returned no outcome for this file"),
+                    Some(Err(error)) => Some(Failure::of(error)),
+                    None => Some(missing()),
                 },
                 _ => None,
             }
@@ -1327,24 +1339,27 @@ impl RestrictedAuthority {
                             state.reserved.remove(&key);
                         }
                     }
-                    // As for a staged file whose publication failed on its
-                    // condition and was then retried, only the retry's
-                    // outcome is recorded; so too for a file replaced
-                    // because it could not be kept.
-                    if stale || declined(index) {
-                        continue;
+                    let change = if kept {
+                        Change::KeepFile
+                    } else {
+                        Change::PublishFile { size }
+                    };
+                    // The sender tries a file again when its patch failed
+                    // with nothing kept or written: it compares again one
+                    // that no longer met its condition and copies the rest
+                    // whole, as it does each file of a batch that failed
+                    // whole or returned no outcome for it, and one the
+                    // receiver would only replace. The failure is held until
+                    // that retry settles it, and listed if none does.
+                    let retried = match reply {
+                        Some(Err(error)) => error.retried(),
+                        Some(Ok(_)) => false,
+                        None => true,
+                    } || declined(index);
+                    match outcome_error(index) {
+                        Some(error) if retried => self.record_retried(&path, change, error),
+                        error => self.record_change(&path, change, error),
                     }
-                    self.record_change(
-                        &path,
-                        if kept {
-                            Change::SetMetadata {
-                                kind: proto::Kind::File,
-                            }
-                        } else {
-                            Change::PublishFile { size }
-                        },
-                        outcome_error(index),
-                    );
                 }
                 PendingOutcome::LogicalIfFailed { index, .. }
                 | PendingOutcome::Logical { index, .. }
@@ -1381,7 +1396,7 @@ impl RestrictedAuthority {
                     let Some(result) = results.get(index) else {
                         continue;
                     };
-                    let error = result.error.as_ref().map(proto::WireError::as_str);
+                    let error = result.error.as_ref().map(Failure::of);
                     let change = match result.disposition {
                         proto::SmallCopyDisposition::Copied => Change::PublishFile { size },
                         proto::SmallCopyDisposition::QuickChecked
@@ -1485,6 +1500,7 @@ impl RestrictedAuthority {
                                 state.file_lifecycles.entry(key).or_insert(FileLifecycle {
                                     size: declared.unwrap_or(0),
                                     last_error: None,
+                                    last_class: "io",
                                     listed: false,
                                 });
                             if let Some(declared) = declared {
@@ -1492,7 +1508,8 @@ impl RestrictedAuthority {
                             }
                             if let Some(error) = error {
                                 lifecycle.last_error =
-                                    crate::destination_results::bounded_diagnostic(error);
+                                    crate::destination_results::bounded_diagnostic(error.message);
+                                lifecycle.last_class = error.class;
                             }
                         }
                     }
@@ -3583,9 +3600,7 @@ impl RestrictedAuthority {
                 outcomes.push(PendingOutcome::Logical {
                     index: 0,
                     path: path.clone(),
-                    change: Change::SetMetadata {
-                        kind: proto::Kind::File,
-                    },
+                    change: Change::KeepFile,
                 });
             }
             Request::Prepare {
@@ -4084,6 +4099,9 @@ pub(super) fn kind_from_mode(mode: u32) -> proto::Kind {
 pub(super) struct FileLifecycle {
     pub(super) size: u64,
     pub(super) last_error: Option<String>,
+    /// The error class of `last_error`, as `destination_results::Failure`
+    /// carries it.
+    pub(super) last_class: &'static str,
     /// A refusal already listed it as failed: the end does not list it again.
     pub(super) listed: bool,
 }
