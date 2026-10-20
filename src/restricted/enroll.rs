@@ -411,7 +411,6 @@ pub(super) fn enroll(
                 id: old_id,
                 entry_public_key: old_key.public_key().to_openssh()?,
             };
-            remove_local_enrollment(&old_directory)?;
             match run_session(
                 &target,
                 jump,
@@ -421,6 +420,9 @@ pub(super) fn enroll(
                 new_plan(&base, Some(replaced)),
             )? {
                 (Session::Installed(installed), directory) => {
+                    // Keep the old record until its replacement is installed,
+                    // so a failure here can still name the line to remove.
+                    remove_local_enrollment(&old_directory)?;
                     let (metadata, signer) = *installed;
                     (metadata, directory, signer)
                 }
