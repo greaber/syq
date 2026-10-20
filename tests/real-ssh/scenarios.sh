@@ -155,12 +155,17 @@ if [ -z "$ssh_release" ] || [ "$ssh_major" -lt 8 ] || { [ "$ssh_major" -eq 8 ] &
     exit 1
 fi
 
-printf 'case: source build uploads itself over real SSH to empty helper caches\n'
+printf 'case: source build uploads itself over real SSH to empty binary stores\n'
 printf 'development helper upload\n' > /tmp/dev-helper-upload.txt
+identity=$(syq --build-identity)
 for host in source destination; do
-    ssh "$host" 'test ! -e "$HOME/.cache/syq/helpers"'
+    ssh "$host" 'test ! -e "$HOME/.local/lib/syq" && test ! -e "$HOME/.cache/syq/helpers"'
     syq cp /tmp/dev-helper-upload.txt --to "$host" --into /tmp
     ssh "$host" 'cmp /tmp/dev-helper-upload.txt /dev/stdin' < /tmp/dev-helper-upload.txt
+    # The helper went to the binary store, and nothing to the old cache.
+    # shellcheck disable=SC2029
+    ssh "$host" "cmp /usr/local/bin/syq \"\$HOME/.local/lib/syq/$identity/linux-\$(uname -m)/syq\" &&
+        test ! -e \"\$HOME/.cache/syq/helpers\""
 done
 # The completion scenario expects to discover only its own endpoint.
 syq completion cache clear >/dev/null

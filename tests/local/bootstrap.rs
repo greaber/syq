@@ -146,12 +146,12 @@ fn background_bootstrap_installs_the_command_quietly() {
                 );
             }
             assert!(
-                cached_remote_helper(&t).is_file(),
+                stored_remote_helper(&t).is_file(),
                 "completion={completion}, upload={upload}: {output:?}"
             );
             assert_eq!(
                 read(&t.path("remote-home/.local/bin/syq")),
-                read(&cached_remote_helper(&t))
+                read(&stored_remote_helper(&t))
             );
             assert!(t.path("remote-home/.local/bin/.syq-install.json").is_file());
             let log = fs::read_to_string(t.path("rsh.log")).unwrap();
@@ -193,7 +193,7 @@ exec /bin/sh -c "$1""#,
         }
         let output = command.capture_output().unwrap();
         assert!(!output.status.success(), "{output:?}");
-        assert!(cached_remote_helper(&t).is_file(), "{output:?}");
+        assert!(stored_remote_helper(&t).is_file(), "{output:?}");
         assert!(t.path("remote-home/.local/bin/syq").is_file(), "{output:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -211,7 +211,7 @@ exec /bin/sh -c "$1""#,
 }
 
 #[test]
-fn managed_remote_helper_install_is_cached() {
+fn managed_remote_helper_is_installed_once_and_reused() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     let script = fs::read_to_string(&rsh).unwrap();
@@ -231,7 +231,7 @@ fn managed_remote_helper_install_is_cached() {
     let out = remote_syq(&t, &rsh, &["-avv", &t.s("src"), &remote]);
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"first");
-    assert!(cached_remote_helper(&t).is_file());
+    assert!(stored_remote_helper(&t).is_file());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!stderr.contains("syq: fake: unrelated SSH banner"));
     for line in stderr
@@ -244,7 +244,7 @@ fn managed_remote_helper_install_is_cached() {
         );
     }
     let installed = t.path("remote-home/.local/bin/syq");
-    assert_eq!(read(&installed), read(&cached_remote_helper(&t)));
+    assert_eq!(read(&installed), read(&stored_remote_helper(&t)));
     assert!(String::from_utf8_lossy(&out.stderr).contains("installed syq"));
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("ensure ~/.local/bin is on your shell PATH")
@@ -283,7 +283,7 @@ fn managed_remote_helper_install_is_cached() {
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains(&format!(
-            "helper: {} (managed helper cache)",
+            "helper: {} (managed; already installed)",
             binary_identity("--build-identity")
         )),
         "{}",
@@ -299,13 +299,13 @@ fn managed_remote_helper_install_is_cached() {
     let receipt = installed.with_file_name(".syq-install.json");
     let saved_receipt = read(&receipt);
     fs::remove_file(&installed).unwrap();
-    fs::remove_file(cached_remote_helper(&t)).unwrap();
+    fs::remove_file(stored_remote_helper(&t)).unwrap();
     write(&t.path("src"), b"third");
     let out = remote_syq(&t, &rsh, &["-avv", &t.s("src"), &remote]);
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"third");
     assert_eq!(
-        read(&cached_remote_helper(&t)),
+        read(&stored_remote_helper(&t)),
         read(Path::new(env!("CARGO_BIN_EXE_syq")))
     );
     assert!(
@@ -320,7 +320,7 @@ fn remote_helper_optional_command_install_failure_does_not_fail_copy() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     setup_release_bootstrap(&t);
-    write(&t.path("remote-home/.local"), b"not a directory");
+    write(&t.path("remote-home/.local/bin"), b"not a directory");
     write(&t.path("src"), b"copy succeeds");
     let remote = format!("fake:{}", t.s("dst"));
     let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
@@ -329,10 +329,11 @@ fn remote_helper_optional_command_install_failure_does_not_fail_copy() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("could not install ~/.local/bin/syq"));
 }
 
-/// The local helper cache only saves later downloads. When it cannot be
-/// written, the upload still happens from a download verified in memory.
+/// Keeping a downloaded helper in the local binary store only saves later
+/// downloads. When the store cannot be written, the upload still happens from
+/// a download verified in memory.
 #[test]
-fn helper_upload_works_without_a_writable_local_cache_or_config() {
+fn helper_upload_works_without_a_writable_local_store_or_config() {
     if unsafe { libc::geteuid() } == 0 {
         return;
     }
@@ -340,35 +341,35 @@ fn helper_upload_works_without_a_writable_local_cache_or_config() {
     let rsh = fake_rsh(&t);
     setup_release_bootstrap(&t);
     executable(&t.path("remote-bin/curl"), b"#!/bin/sh\nexit 22\n");
-    for directory in ["cache", "config"] {
+    for directory in ["home", "cache", "config"] {
         fs::create_dir_all(t.path(directory)).unwrap();
         fs::set_permissions(t.path(directory), fs::Permissions::from_mode(0o555)).unwrap();
     }
 
-    write(&t.path("src"), b"uncached helper");
+    write(&t.path("src"), b"unstored helper");
     let remote = format!("fake:{}", t.s("dst"));
     let out = remote_syq(&t, &rsh, &["-a", "-q", &t.s("src"), &remote]);
-    for directory in ["cache", "config"] {
+    for directory in ["home", "cache", "config"] {
         fs::set_permissions(t.path(directory), fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     assert_output_ok(&out);
-    assert_eq!(read(&t.path("dst")), b"uncached helper");
+    assert_eq!(read(&t.path("dst")), b"unstored helper");
     assert_eq!(
-        read(&cached_remote_helper(&t)),
+        read(&stored_remote_helper(&t)),
         read(Path::new(env!("CARGO_BIN_EXE_syq")))
     );
-    assert!(!cached_local_helper(&t).exists());
+    assert!(!stored_local_helper(&t).exists());
     assert_eq!(fs::read_dir(t.path("config")).unwrap().count(), 0);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("cannot cache the downloaded remote helper"),
+        stderr.contains("cannot store the downloaded remote helper"),
         "{stderr}"
     );
 }
 
 #[test]
-fn remote_corrupted_local_helper_cache_is_discarded_and_refetched() {
+fn corrupted_local_stored_helper_is_discarded_and_refetched() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     setup_release_bootstrap(&t);
@@ -381,22 +382,22 @@ exit 22
     let mut corrupt = read(Path::new(env!("CARGO_BIN_EXE_syq")));
     let middle = corrupt.len() / 2;
     corrupt[middle] ^= 1;
-    fs::create_dir_all(cached_local_helper(&t).parent().unwrap()).unwrap();
-    write(&cached_local_helper(&t), &corrupt);
+    fs::create_dir_all(stored_local_helper(&t).parent().unwrap()).unwrap();
+    write(&stored_local_helper(&t), &corrupt);
 
-    write(&t.path("src"), b"local cache repair");
+    write(&t.path("src"), b"local store repair");
     let remote = format!("fake:{}", t.s("dst"));
     let out = remote_syq(&t, &rsh, &["-a", "-q", &t.s("src"), &remote]);
 
     assert_output_ok(&out);
-    assert_eq!(read(&t.path("dst")), b"local cache repair");
+    assert_eq!(read(&t.path("dst")), b"local store repair");
     assert_eq!(
-        read(&cached_local_helper(&t)),
+        read(&stored_local_helper(&t)),
         read(Path::new(env!("CARGO_BIN_EXE_syq")))
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("cached remote helper failed integrity verification"),
+        stderr.contains("stored remote helper failed integrity verification"),
         "{stderr}"
     );
     assert!(stderr.contains("discarding it"), "{stderr}");
@@ -416,12 +417,12 @@ fn development_build_uploads_itself_and_reuses_cached_helper() {
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"offline source build");
     assert_eq!(
-        read(&cached_remote_helper(&t)),
+        read(&stored_remote_helper(&t)),
         read(Path::new(env!("CARGO_BIN_EXE_syq")))
     );
     assert!(!t.path("remote-home/.local/bin/syq").exists());
     assert!(!t.path("curl.log").exists());
-    assert!(!cached_local_helper(&t).exists());
+    assert!(!stored_local_helper(&t).exists());
 
     write(&t.path("rsh.log"), b"");
     let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
@@ -452,12 +453,12 @@ fn source_build_can_download_helpers_without_installing_a_command() {
             .unwrap();
         assert_output_ok(&out);
         assert_eq!(read(&t.path("dst")), read(&t.path("src")));
-        assert!(cached_remote_helper(&t).exists());
+        assert!(stored_remote_helper(&t).exists());
         assert!(!t.path("remote-home/.local/bin/syq").exists());
         if upload {
             // Falling back must download a verified release locally, not send
             // the source executable merely because it is the same platform.
-            assert!(cached_local_helper(&t).exists());
+            assert!(stored_local_helper(&t).exists());
         } else {
             assert!(!read(&t.path("curl.log")).is_empty());
         }
@@ -507,7 +508,7 @@ fn development_build_rejects_cross_platform_upload() {
     );
     assert!(stderr.contains("--syq-path"), "{stderr}");
     assert!(!t.path("dst").exists());
-    assert!(!t.path("remote-home/.cache/syq/helpers").exists());
+    assert!(!t.path("remote-home/.local/lib/syq").exists());
 }
 
 #[test]
@@ -531,7 +532,7 @@ fn development_build_does_not_install_an_unrunnable_upload() {
     );
     assert!(stderr.contains("Linux riscv64"), "{stderr}");
     assert!(!t.path("dst").exists());
-    let helper = cached_remote_helper(&t)
+    let helper = stored_remote_helper(&t)
         .parent()
         .unwrap()
         .parent()
@@ -542,7 +543,7 @@ fn development_build_does_not_install_an_unrunnable_upload() {
 }
 
 #[test]
-fn no_bootstrap_uses_remote_path_without_managed_cache() {
+fn no_bootstrap_uses_remote_path_without_managed_store() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     t.expose_remote_syq();
@@ -556,7 +557,91 @@ fn no_bootstrap_uses_remote_path_without_managed_cache() {
     );
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"preinstalled");
-    assert!(!t.path("remote-home/.cache/syq/helpers").exists());
+    assert!(!t.path("remote-home/.local/lib/syq").exists());
+}
+
+/// Helpers are installed in the binary store on both machines; nothing is
+/// written to the cache where earlier releases kept them.
+#[test]
+fn helpers_are_stored_outside_the_cache() {
+    for case in ["download", "upload", "development"] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        if case != "development" {
+            setup_release_bootstrap(&t);
+        }
+        if case == "upload" {
+            executable(&t.path("remote-bin/curl"), b"#!/bin/sh\nexit 22\n");
+        }
+        fs::create_dir_all(t.path("home")).unwrap();
+        write(&t.path("src"), b"stored helper");
+        let remote = format!("fake:{}", t.s("dst"));
+        // Without XDG_CACHE_HOME, the cache would be in the home directory.
+        let out = remote_syq_command(&t, &rsh, &["-a", "-q", &t.s("src"), &remote])
+            .env("HOME", t.path("home"))
+            .env_remove("XDG_CACHE_HOME")
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst")), b"stored helper", "{case}");
+        assert_eq!(
+            read(&stored_remote_helper(&t)),
+            read(Path::new(env!("CARGO_BIN_EXE_syq"))),
+            "{case}"
+        );
+        assert_eq!(stored_local_helper(&t).exists(), case == "upload", "{case}");
+        for home in ["home", "remote-home"] {
+            assert!(
+                !t.path(&format!("{home}/.cache/syq/helpers")).exists(),
+                "{case}: {home}"
+            );
+        }
+    }
+}
+
+/// Before the binary store, helpers lived in the server's cache, for example
+/// `~/.cache/syq/helpers/v0.7.1-release/linux-x86_64/syq` for 0.7.1. A server
+/// that has only such a helper, even one for this very build, gets the helper
+/// installed again in the store, and the old file is left alone.
+#[test]
+fn helper_in_the_old_cache_layout_is_installed_again_in_the_store() {
+    for case in ["download", "upload", "development"] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        if case != "development" {
+            setup_release_bootstrap(&t);
+        }
+        if case == "upload" {
+            executable(&t.path("remote-bin/curl"), b"#!/bin/sh\nexit 22\n");
+        }
+        let old = t.path(&format!(
+            "remote-home/.cache/syq/helpers/{}-release/{}/syq",
+            binary_identity("--build-identity"),
+            helper_target()
+        ));
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::copy(env!("CARGO_BIN_EXE_syq"), &old).unwrap();
+        let before = read(&old);
+        write(&t.path("src"), b"reinstalled helper");
+        let remote = format!("fake:{}", t.s("dst"));
+        let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst")), b"reinstalled helper", "{case}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("installing"), "{case}: {stderr}");
+        assert!(
+            fs::read_to_string(t.path("rsh.log"))
+                .unwrap()
+                .contains("syq-helper-target:"),
+            "{case}"
+        );
+        assert_eq!(
+            read(&stored_remote_helper(&t)),
+            read(Path::new(env!("CARGO_BIN_EXE_syq"))),
+            "{case}"
+        );
+        assert_eq!(read(&old), before, "{case}");
+    }
 }
 
 #[cfg(debug_assertions)]

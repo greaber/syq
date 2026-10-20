@@ -105,9 +105,11 @@ internal Docker network: no ports are published and no real SSH configuration,
 agent, keys, homes, or remote hosts are used. The destination service alone gets
 `NET_ADMIN`, solely to install the test's port-specific firewall rule.
 
-Endpoint helper caches start empty. The suite copies a file to each endpoint
-using the source build, exercising automatic executable upload over real SSH
-before the remaining scenarios reuse those helpers.
+Endpoint binary stores (`~/.local/lib/syq`) start empty. The suite copies a
+file to each endpoint using the source build, exercising automatic executable
+upload over real SSH, and checks that the helper landed in the store and not in
+the old `~/.cache/syq/helpers`, before the remaining scenarios reuse those
+helpers.
 
 The source sshd permits remote Unix socket forwarding for named return transfers
 (OpenSSH 9.2 also requires remote TCP forwarding permission). The destination

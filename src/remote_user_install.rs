@@ -50,13 +50,13 @@ pub fn install() {
         }
         Ok(InstallOutcome::Unchanged) => {}
         Ok(InstallOutcome::Unregistered(error)) => notice(format!("installed ~/.local/bin/syq, but could not enable self-update ({error:#}); rerun the standalone installer to enable updates")),
-        Err(error) => notice(format!("could not install ~/.local/bin/syq ({error:#}); the transfer can still use its cached helper")),
+        Err(error) => notice(format!("could not install ~/.local/bin/syq ({error:#}); the transfer can still use its installed helper")),
     }
 }
 
 fn running_executable() -> Result<PathBuf> {
     // Open the proc link itself: readlink/current_exe may describe an unlinked
-    // inode as "path (deleted)" when another bootstrap replaces the cache entry.
+    // inode as "path (deleted)" when another bootstrap replaces the stored helper.
     #[cfg(target_os = "linux")]
     {
         Ok(PathBuf::from("/proc/self/exe"))
@@ -126,7 +126,7 @@ fn copy_and_publish(source: &Path, bin: &Path, destination: &Path) -> Result<boo
     fs::copy(source, &temporary).context("copy the helper for interactive use")?;
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))?;
     fs::File::open(&temporary)?.sync_all()?;
-    // Atomic no-clobber publication never links to the cached helper inode.
+    // Atomic no-clobber publication never links to the stored helper inode.
     match temporary.persist_noclobber(destination) {
         Ok(_) => {}
         Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),

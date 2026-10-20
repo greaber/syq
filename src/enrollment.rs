@@ -600,12 +600,12 @@ mod tests {
     fn copy_worker_accepts_installed_source_build_path() {
         let entry = AuthorizedKeyEntry::copy_worker(
             id(),
-            Path::new("/home/backup/.cache/syq/v0.7.1+dev.source.123/syq"),
+            Path::new("/home/backup/.local/lib/syq/v0.7.1+dev.0123456789ab.dirty.0123abcd/linux-x86_64/syq"),
             "ticket",
             &key(),
         )
         .unwrap();
-        assert!(entry.line().starts_with("restrict,command=\"/home/backup/.cache/syq/v0.7.1+dev.source.123/syq --return-ssh-worker ticket\""));
+        assert!(entry.line().starts_with("restrict,command=\"/home/backup/.local/lib/syq/v0.7.1+dev.0123456789ab.dirty.0123abcd/linux-x86_64/syq --return-ssh-worker ticket\""));
     }
 
     #[test]
