@@ -289,21 +289,13 @@ pub struct Opts {
 }
 
 impl Opts {
-    /// Whether to compare a file of `size` bytes with the existing entry it
-    /// replaces and reuse its matching blocks. The default strategy compares
-    /// a remote file only when its destination has the same size: a file
-    /// whose size changed was almost always rewritten, and comparing it
-    /// would read and hash the old file for nothing. An explicit
-    /// aligned-block strategy compares every replaced file.
-    pub(crate) fn reuses_blocks(&self, size: u64, existing: Option<&Entry>) -> bool {
-        match self.transfer_strategy {
-            crate::cli::TransferStrategy::Locality => {
-                !self.same_host
-                    && existing
-                        .is_none_or(|existing| existing.kind != Kind::File || existing.size == size)
-            }
-            strategy => strategy.reuse_destination_blocks(self.same_host),
-        }
+    /// Whether to compare files with the existing entries they replace and
+    /// reuse their matching blocks. The default strategy does so whenever a
+    /// syq endpoint is remote, whatever a file's size, as rsync does: a file
+    /// that grew or shrank keeps the blocks before its change.
+    pub(crate) fn reuses_blocks(&self) -> bool {
+        self.transfer_strategy
+            .reuse_destination_blocks(self.same_host)
     }
 
     /// Whether a destination whose size and modification time match its
@@ -316,10 +308,10 @@ impl Opts {
     /// Whether a dry run compares an existing file of the same size to
     /// learn whether the copy would change it, because the copy would
     /// compare it too.
-    fn previews_by_comparing(&self, size: u64, existing: Option<&Entry>) -> bool {
+    fn previews_by_comparing(&self) -> bool {
         self.checksum
             || self.protects_existing_contents()
-            || (self.hash_or_copy && self.reuses_blocks(size, existing))
+            || (self.hash_or_copy && self.reuses_blocks())
     }
 
     /// Whether copying `source` over `existing` certainly changes the
@@ -335,8 +327,7 @@ impl Opts {
         existing.is_none_or(|existing| {
             existing.kind != Kind::File
                 || existing.size != source.size
-                || !(self.previews_by_comparing(source.size, Some(existing))
-                    || self.reuses_blocks(source.size, Some(existing)))
+                || !(self.previews_by_comparing() || self.reuses_blocks())
         })
     }
 

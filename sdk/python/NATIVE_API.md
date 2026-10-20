@@ -90,7 +90,7 @@ In addition to the shared arguments above, it accepts:
 | `prune_before` | Boolean: remove extras before copying to free space; implies pruning. Later copy failures do not restore removals |
 | `widen_dirs` | `"none"`, `"rsync"`, or `"all"`: which directories you own may temporarily get the owner permission the copy needs; `"rsync"` covers the directories the copy includes, and `"all"` also covers the directory it goes into and the directories above it. Each is restored afterwards, unless explicit permission metadata takes precedence. When omitted, `syq cp`'s default applies |
 | `prune`, `dry_run`, `hash` | Boolean: mirror, preview, or compare content |
-| `hash_or_copy` | Boolean: like `hash`, but compare only files the transfer strategy would compare (by default, files of unchanged size with a remote syq endpoint) and copy the rest, so identical files may be rewritten; cannot combine with `hash` |
+| `hash_or_copy` | Boolean: like `hash`, but compare only files the transfer strategy would compare (by default, every file with a remote syq endpoint) and copy the rest, so identical files may be rewritten; cannot combine with `hash` |
 | `integrity_checking` | Comma-separated string, e.g. `"transfer=sha256"`; defaults to size/mtime comparison and no extra payload checks |
 | `if_exists` | `"error-if-different"`, `"error"`, `"keep"`, `"update"` (default), or `"update-if-older"` |
 | `ignore` | Pattern string, `IgnoreFrom(path)`, or ordered iterable of either |

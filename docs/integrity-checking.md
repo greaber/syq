@@ -45,8 +45,7 @@ only the files that the
 [transfer strategy](reference.md#choose-a-transfer-strategy) would compare and
 copies the rest whole, so a file whose contents already match may be
 rewritten. With the default strategy, copies with a remote syq endpoint compare
-files whose size is unchanged and keep those that match, and same-machine
-copies copy every file. In rsync syntax, use `-I` or `--ignore-times`; `-c`
+every file and keep those that match, and same-machine copies copy every file. In rsync syntax, use `-I` or `--ignore-times`; `-c`
 takes precedence when both are given. A dry run with `--hash-or-copy` compares
 where the copy would compare, and lists the files the copy would write.
 

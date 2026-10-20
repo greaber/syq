@@ -228,7 +228,7 @@ impl Worker {
     fn hashes_destination(&self, job: &WorkerJob) -> bool {
         let existing = job.dst_entry.as_deref();
         !job.inplace
-            || self.reuses_blocks_for(job, existing)
+            || self.opts.reuses_blocks()
             || (self.opts.checksum
                 && existing.is_some_and(|existing| existing.size == job.entry.size))
     }
@@ -955,8 +955,7 @@ impl Worker {
                     // Without block reuse (--hash alone), a comparison only
                     // decides whether the file is unchanged. A file updated
                     // in place without comparing it is sent whole.
-                    let compare_only = !self.reuses_blocks_for(job, job.dst_entry.as_deref())
-                        && self.hashes_destination(job);
+                    let compare_only = !self.opts.reuses_blocks() && self.hashes_destination(job);
                     reads.push(DifferingRead {
                         path: job.src.clone(),
                         source: self.source_reference(job),

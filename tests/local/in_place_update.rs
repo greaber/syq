@@ -1042,13 +1042,21 @@ fn a_file_linked_after_its_group_was_compared_is_replaced() {
     );
 }
 
-/// A small file whose size changed is not compared, as on the per-file
-/// path without block reuse: in its group, it is sent whole and written
-/// over the existing file, which keeps its inode and takes the new length,
-/// an emptied one too.
+/// Without block reuse, a small file whose size changed is not compared, as
+/// on the per-file path: in its group, it is sent whole and written over the
+/// existing file, which keeps its inode and takes the new length, an emptied
+/// one too. With block reuse, which a remote copy has by default, it is
+/// compared, and only the blocks that differ are written.
 #[cfg(debug_assertions)]
 #[test]
-fn small_files_of_another_size_are_written_whole_in_place_in_groups() {
+fn small_files_of_another_size_are_updated_in_place_in_groups() {
+    for reuse in [false, true] {
+        small_files_of_another_size_in_place(reuse);
+    }
+}
+
+#[cfg(debug_assertions)]
+fn small_files_of_another_size_in_place(reuse: bool) {
     let t = Tmp::new();
     let new = prng(SMALL, 780);
     let files = [
@@ -1064,10 +1072,11 @@ fn small_files_of_another_size_are_written_whole_in_place_in_groups() {
         inodes.push(inode(&t.path(&format!("dst/{name}"))));
     }
     let (writes, hashes) = (t.path("writes"), t.path("hashes"));
+    let strategy = if reuse { "locality" } else { "whole-file" };
     let out = cp_update(
         &t,
         "ssh",
-        &[],
+        &["--transfer-strategy", strategy],
         &[
             ("SYQ_TEST_DESTINATION_WRITES", &writes.to_string_lossy()),
             ("SYQ_TEST_DESTINATION_HASHES", &hashes.to_string_lossy()),
@@ -1079,11 +1088,20 @@ fn small_files_of_another_size_are_written_whole_in_place_in_groups() {
         assert!(read(&destination) == *source, "{name}");
         assert_eq!(inode(&destination), *before, "{name}");
     }
-    assert_eq!(written_bytes(&writes), 2 * SMALL as u64);
-    // The receiver looked at each in its group, and hashed none.
     let hashed = fs::read_to_string(&hashes).unwrap_or_default();
-    assert_eq!(hashed.lines().count(), 3, "{hashed}");
-    assert!(hashed.lines().all(|line| line == "existing 0"), "{hashed}");
+    let mut hashed: Vec<_> = hashed.lines().collect();
+    hashed.sort();
+    if reuse {
+        // Each nonempty one was hashed in its group; of "grown" only its
+        // last block differs, and "shrunk" only loses its tail.
+        assert_eq!(written_bytes(&writes), 1 << 16);
+        let compared = format!("existing {SMALL}");
+        assert_eq!(hashed, ["existing 0", &*compared, &*compared]);
+    } else {
+        assert_eq!(written_bytes(&writes), 2 * SMALL as u64);
+        // The receiver looked at each in its group, and hashed none.
+        assert_eq!(hashed, ["existing 0"; 3]);
+    }
 }
 
 /// A file the receiver refuses to update in place is replaced through a

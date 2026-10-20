@@ -318,7 +318,7 @@ impl Worker {
         let inspects_destination = self.inspects_destination(job)
             || (!job.compared
                 && (self.compares_first(job, existing)
-                    || (self.reuses_blocks_for(job, Some(existing))
+                    || (self.opts.reuses_blocks()
                         && job.entry.size > self.compare_group_limits().0)));
         existing.kind == Kind::File
             && job.target_condition == TargetCondition::Any
@@ -331,10 +331,6 @@ impl Worker {
             || (self.opts.hardlinks && job.entry.nlink > 1)
     }
 
-    pub(super) fn reuses_blocks_for(&self, job: &FileJobData, existing: Option<&Entry>) -> bool {
-        self.opts.reuses_blocks(job.entry.size, existing)
-    }
-
     /// Whether to compare a file with its destination before copying it:
     /// with block reuse, when the destination can hold any of its blocks
     /// (its size matches, or the file spans more than one comparison block);
@@ -343,8 +339,7 @@ impl Worker {
     fn compares_first(&self, job: &FileJobData, existing: &Entry) -> bool {
         let same_size = existing.size == job.entry.size;
         existing.kind == Kind::File
-            && ((self.reuses_blocks_for(job, Some(existing))
-                && (same_size || job.entry.size > self.patch_block()))
+            && ((self.opts.reuses_blocks() && (same_size || job.entry.size > self.patch_block()))
                 || (self.opts.checksum && same_size))
     }
 
@@ -354,8 +349,8 @@ impl Worker {
     /// the kernel. A grouped comparison would first hash the whole
     /// destination and read the whole source into memory, to save round
     /// trips that cost nothing on the same host.
-    fn probes_per_file(&self, job: &FileJobData, existing: &Entry) -> bool {
-        self.opts.same_host && !self.reuses_blocks_for(job, Some(existing))
+    fn probes_per_file(&self) -> bool {
+        self.opts.same_host && !self.opts.reuses_blocks()
     }
 
     /// A replaced file small enough to compare in groups is compared before
@@ -391,8 +386,7 @@ impl Worker {
                 // An in-place file is written whether or not it is worth
                 // comparing first. On the same host without block reuse,
                 // the per-file path copies it in the kernel.
-                (j.inplace || self.compares_first(j, existing))
-                    && !self.probes_per_file(j, existing)
+                (j.inplace || self.compares_first(j, existing)) && !self.probes_per_file()
             })
     }
 
@@ -1156,7 +1150,7 @@ impl Worker {
         let inplace = job.inplace;
         // A file a grouped comparison already found different, or could not
         // patch, is copied whole without comparing it again.
-        let reuse_blocks = !job.compared && self.reuses_blocks_for(&job, job.dst_entry.as_deref());
+        let reuse_blocks = !job.compared && self.opts.reuses_blocks();
         let checksum = self.opts.checksum && !job.compared;
         let final_file = job
             .dst_entry
