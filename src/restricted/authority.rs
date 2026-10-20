@@ -883,6 +883,19 @@ impl RestrictedAuthority {
         }
     }
 
+    /// Hold the failure of a change the sender tries again until a later
+    /// change to the same file settles it (`destination_results::Stream::
+    /// record_retried`).
+    fn record_retried(&self, path: &[u8], change: Change, error: Failure<'_>) {
+        if !self.results_started.load(Ordering::Acquire) {
+            return;
+        }
+        let dst = self.result_path(path, false);
+        if let Some(stream) = self.results.lock().unwrap().as_mut() {
+            stream.record_retried(change, dst.as_deref(), error);
+        }
+    }
+
     /// A refused request for a file being written lists that file as
     /// failed; it is not listed again as unfinished when the results end.
     /// A later publication still reports it. A file not being written has
@@ -1080,26 +1093,29 @@ impl RestrictedAuthority {
                             !kept && !stale,
                         );
                     }
-                    // As for a staged file whose publication failed on its
-                    // condition and was then retried, only the retry's
-                    // outcome is recorded for a file the sender compares or
-                    // copies again; so too for a file replaced because it
-                    // could not be kept.
-                    let retried = matches!(reply, Some(Err(error)) if error.retried());
-                    if retried || declined(index) {
-                        continue;
+                    let change = if kept {
+                        Change::SetMetadata {
+                            kind: proto::Kind::File,
+                        }
+                    } else {
+                        Change::PublishFile { size }
+                    };
+                    // The sender tries a file again when its patch failed
+                    // with nothing kept or written: it compares again one
+                    // that no longer met its condition and copies the rest
+                    // whole, as it does each file of a batch that failed
+                    // whole or returned no outcome for it, and one the
+                    // receiver would only replace. The failure is held until
+                    // that retry settles it, and listed if none does.
+                    let retried = match reply {
+                        Some(Err(error)) => error.retried(),
+                        Some(Ok(_)) => false,
+                        None => true,
+                    } || declined(index);
+                    match outcome_error(index) {
+                        Some(error) if retried => self.record_retried(&path, change, error),
+                        error => self.record_change(&path, change, error),
                     }
-                    self.record_change(
-                        &path,
-                        if kept {
-                            Change::SetMetadata {
-                                kind: proto::Kind::File,
-                            }
-                        } else {
-                            Change::PublishFile { size }
-                        },
-                        outcome_error(index),
-                    );
                 }
                 PendingOutcome::LogicalIfFailed { index, .. }
                 | PendingOutcome::Logical { index, .. }

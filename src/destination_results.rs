@@ -218,6 +218,19 @@ pub(crate) enum Change {
 }
 
 impl Change {
+    /// Whether this is a change to a file: its contents, a name for it, or
+    /// its metadata.
+    fn is_file(self) -> bool {
+        matches!(
+            self,
+            Change::PublishFile { .. }
+                | Change::LinkFile
+                | Change::SetMetadata {
+                    kind: crate::proto::Kind::File
+                }
+        )
+    }
+
     /// The ordinary record's action and kind, where known.
     fn action(self) -> (&'static str, Option<&'static str>) {
         let (action, kind) = match self {
@@ -332,7 +345,8 @@ fn encode_frame<T: Serialize>(frame: &T) -> Result<Vec<u8>> {
 }
 
 /// The destination's side of one copy's stream. It holds the records that
-/// have not reached a connection yet and nothing else that grows.
+/// have not reached a connection yet, and the failures of files the sender
+/// is expected to try again until a later record settles each.
 pub(crate) struct Stream {
     keys: Keys,
     records: bool,
@@ -340,8 +354,20 @@ pub(crate) struct Stream {
     pending: Vec<u8>,
     pending_since: Option<Instant>,
     ready: Vec<Vec<u8>>,
+    /// Failed changes to files the sender tries again, by destination path:
+    /// each is listed when the results end unless a later record for that
+    /// file settles it (`record_retried`).
+    retried: std::collections::BTreeMap<Vec<u8>, RetriedFailure>,
     totals: Totals,
     ended: bool,
+}
+
+/// A failure `Stream::record_retried` holds until a retry settles it.
+#[derive(Debug)]
+struct RetriedFailure {
+    change: Change,
+    message: String,
+    class: &'static str,
 }
 
 impl std::fmt::Debug for Stream {
@@ -397,6 +423,7 @@ impl Stream {
             pending: Vec::new(),
             pending_since: None,
             ready: vec![encode_frame(&Frame::Header { body, signature })?],
+            retried: Default::default(),
             totals: Totals::default(),
             ended: false,
         })
@@ -413,6 +440,11 @@ impl Stream {
     ) {
         if self.ended {
             return;
+        }
+        // A later outcome for a file settles a failure held for its retry:
+        // the retry is listed instead, succeeded or failed.
+        if let Some(dst) = dst.filter(|_| change.is_file()) {
+            self.retried.remove(dst);
         }
         let totals = &mut self.totals;
         match (change, error) {
@@ -454,6 +486,36 @@ impl Stream {
         self.push(&record);
     }
 
+    /// Hold the failure of a change to a file that the sender tries again,
+    /// such as a small-file patch it then copies whole. A later record for
+    /// that file settles it; otherwise it is listed, and counted, when the
+    /// results end, so a sender that never retries cannot hide it. A
+    /// failure with no destination path is recorded at once.
+    pub(crate) fn record_retried(
+        &mut self,
+        change: Change,
+        dst: Option<&[u8]>,
+        error: Failure<'_>,
+    ) {
+        if self.ended {
+            return;
+        }
+        match dst.filter(|_| change.is_file()) {
+            Some(dst) => {
+                self.retried.insert(
+                    dst.to_vec(),
+                    RetriedFailure {
+                        change,
+                        message: bounded_diagnostic(error.message)
+                            .unwrap_or_else(|| "failed".into()),
+                        class: error.class,
+                    },
+                );
+            }
+            None => self.record(change, dst, Some(error)),
+        }
+    }
+
     /// Count a request the destination refused, and list each change it
     /// asked for: the changes with a destination path, or the request as a
     /// whole.
@@ -465,6 +527,10 @@ impl Stream {
         let mut listed = false;
         for (dst, change) in changes {
             if let Some(dst) = dst {
+                // The refusal is the outcome of a retry it refuses.
+                if change.is_file() {
+                    self.retried.remove(dst);
+                }
                 self.list_failure(*change, Some(dst), "safety_limit", message);
                 listed = true;
             }
@@ -577,6 +643,17 @@ impl Stream {
     pub(crate) fn finish(&mut self, bytes_transferred: u64) -> Result<Totals> {
         if self.ended {
             bail!("the destination's results have already ended");
+        }
+        // Failures no retry settled are failures of the copy.
+        for (dst, failure) in std::mem::take(&mut self.retried) {
+            self.record(
+                failure.change,
+                Some(&dst),
+                Some(Failure {
+                    message: &failure.message,
+                    class: failure.class,
+                }),
+            );
         }
         self.seal()?;
         self.ended = true;
