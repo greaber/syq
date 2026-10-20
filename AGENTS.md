@@ -78,22 +78,29 @@ command with this restoration when necessary.
 - If the command runtime moves a live command into the background, continue monitoring the original task or session handle. Do not launch a second copy. When stopping an owned command, terminate and verify its whole process group so children cannot survive as stale workers or lock holders.
 - For asynchronous CI, use the repository's CI monitor/wait mechanism instead of shell polling.
 
-## Keep shell commands simple
+## Write removals the harness can check
 
-Run one logical step per shell command: cleanup, then a loop, then any
-`sh -c` script, as separate commands. Claude Code statically checks each
-Bash call for dangerous `rm` and prompts on a hit even in bypass mode. The
-user cannot audit a long compound command, so a prompt on one is a dead
-end, and most "could not check" prompts come from combining cleanup, loops,
-`cd`, and inline scripts in one call.
+Claude Code statically checks each Bash call for dangerous `rm` and prompts
+on a hit even in bypass mode. The user will not audit a long compound command
+at that prompt, so a hit is a dead end: write removals in a shape that passes.
+Loops, `if`, `find -exec`, `xargs`, heredoc scripts, relative paths, `~`,
+variables, and mixing `&&` with `;` all pass. The shapes that prompt are:
 
-- Give `rm` literal absolute paths, with a glob only in the last segment.
-  Do not build a target from `$VAR`, `$(...)`, `~`, `..`, or a relative
-  path after `cd`. If a variable is unavoidable, write `"${VAR:?}"`.
-- Never put `rm` in the same command as an inline `sh -c` script, and
-  inside such a script call programs by literal path, not `$BIN args`.
-- A command may begin with `cd`; chain everything after it with `&&`, and
-  do not mix `&&` with `;` in one command.
+- A system, home, or workspace directory, or its contents with `/*`: a
+  top-level directory such as `/tmp`, the home directory, the working
+  directory and its parents, and mounted drives. Never remove these. If a
+  prompt names one, stop and report it instead of rewriting around it.
+- A glob in more than one path segment, such as `dir/*/*` or `e*/*`. One
+  trailing `/*`, or a glob in the last segment, passes.
+- A target ending in `/*` after `..`, `$(...)`, or a variable that may be
+  empty, such as `"$VAR"/*` or `$(pwd)/*`, and such a variable followed by a
+  top-level name, such as `$VAR/usr`. The same targets without `/*` pass.
+- A relative target ending in `/*` in a command that also runs `cd`. Write it
+  as an absolute path.
+- In a command that runs `rm` anywhere, an inline `sh -c` script that starts
+  a command with `$VAR` instead of a literal program name, gives `rm` a loop
+  variable as its target, or exceeds 2000 characters. A literal `rm` inside
+  the script passes, as does `rm` elsewhere in the same command.
 
 ## Documentation over agent memory
 
