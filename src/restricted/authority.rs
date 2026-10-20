@@ -1573,15 +1573,17 @@ impl RestrictedAuthority {
     /// `constrain_creation` does, and say what it replaces as the receiver
     /// knows it without a look.
     ///
-    /// Where this receiver recorded its own lookup of the name for the
-    /// planner (`fsops::lookups`), the publication needs neither a look
-    /// nor a link. Keeping existing files, a name found absent is renamed
-    /// into place unchecked, by one publication only, and one found present
-    /// is kept. Replacing only existing files, a file found present is
-    /// renamed over. A name not recorded, or found absent and already given
-    /// to a publication, is held as `constrain_creation` holds it, and so
-    /// is a publication `in_place`. Another program creating or removing
-    /// the name after the lookup is the race every copy accepts.
+    /// Where this receiver recorded what it found itself (`fsops::lookups`),
+    /// the publication needs neither a look nor a link. Keeping existing
+    /// files, a name found absent, by the receiver's own lookup for the
+    /// planner or because a directory above it was found missing or empty
+    /// or was created by this receiver, is renamed into place unchecked, by
+    /// one publication only, and a name found present is kept. Replacing
+    /// only existing files, a file found present is renamed over. A name
+    /// not recorded, or found absent and already given to a publication, is
+    /// held as `constrain_creation` holds it, and so is a publication
+    /// `in_place`. Another program creating or removing the name after the
+    /// receiver looked is the race every copy accepts.
     pub(super) fn constrain_publication(
         &self,
         path: &[u8],
@@ -1590,7 +1592,7 @@ impl RestrictedAuthority {
         index: usize,
         pending: &mut Vec<PendingCreation>,
     ) -> Result<proto::ScannedDestination> {
-        use crate::fsops::lookups::Looked;
+        use crate::fsops::lookups::{Claim, Looked};
         use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
         let label = String::from_utf8_lossy(path);
         let root_must_be_new =
@@ -1608,7 +1610,7 @@ impl RestrictedAuthority {
         if let Some((lookups, relative)) = recorded {
             match self.creation_policy(false) {
                 ExistingDestinationPolicy::Skip => match lookups.claim(&relative) {
-                    Some(Looked::Absent) => {
+                    Claim::Absent => {
                         match *condition {
                             Any | Absent => *condition = Any,
                             Matches { .. } | MatchesFingerprint { .. } => bail!(
@@ -1624,12 +1626,12 @@ impl RestrictedAuthority {
                         });
                         return Ok(proto::ScannedDestination::Absent);
                     }
-                    Some(Looked::Present { .. }) => {
+                    Claim::Present => {
                         return Err(kept(format!(
                             "signed grant retains existing objects: {label} already exists"
                         )))
                     }
-                    Some(Looked::Claimed) | None => {}
+                    Claim::Unknown => {}
                 },
                 ExistingDestinationPolicy::MustExist => {
                     if let Some(Looked::Present { file_mode }) = lookups.get(&relative) {

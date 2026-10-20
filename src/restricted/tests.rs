@@ -9981,6 +9981,14 @@ fn lookups_are_recorded_only_where_publication_needs_them() {
         );
         assert_eq!(authority.lookups.as_ref().unwrap().len(), 0, "{policy:?}");
         if policy == ExistingDestinationPolicy::Skip {
+            // Nor a directory this receiver creates.
+            carry_out(
+                &authority,
+                &mut ops,
+                &mut apply(mkdir(&target.join("made"))),
+            )
+            .unwrap();
+            assert_eq!(authority.lookups.as_ref().unwrap().len(), 0);
             let mut request = small_put(&target.join("new"));
             authority.authorize(&mut request, false).unwrap();
             assert_eq!(
@@ -9998,6 +10006,182 @@ fn lookups_are_recorded_only_where_publication_needs_them() {
     )
     .unwrap();
     assert!(authority.lookups.is_none());
+}
+
+/// Carry out `request` on `ops`, a connection of `authority`, as a receiver
+/// does, and give what it did to the one request it carries.
+fn carry_out(
+    authority: &RestrictedAuthority,
+    ops: &mut crate::fsops::FsOps,
+    request: &mut Request,
+) -> Result<()> {
+    let settlement = authority.authorize(request, false)?;
+    let response = ops.handle(request);
+    authority.settle(settlement, &response);
+    match response {
+        proto::Response::Applied(results) if results.len() == 1 => match &results[0] {
+            None => Ok(()),
+            Some(error) => Err(anyhow::anyhow!("{error:?}")),
+        },
+        proto::Response::DestinationFilesystemInfo(_) => Ok(()),
+        other => Err(anyhow::anyhow!("{other:?}")),
+    }
+}
+
+/// Keeping existing files on a filesystem without a no-replace rename,
+/// nothing was beneath a directory the receiver found empty, found missing
+/// or created itself: a file published there is renamed into place
+/// unchecked, once, as at a name its own lookup found absent. Beneath a
+/// directory it found present, a name it never looked up is held to the
+/// strict publication, which refuses one that exists.
+///
+/// Another program creating a name beneath such a directory, after the
+/// receiver looked and before the rename, is the race every copy accepts:
+/// that file is replaced, as an ordinary copy would replace it.
+#[test]
+fn keeping_files_renames_unchecked_beneath_directories_found_empty_or_made() {
+    use proto::TargetCondition::{Absent, Any};
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let mut authority = existence_authority(
+        &root,
+        ExistingDestinationPolicy::Skip,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+    )
+    .unwrap();
+    authority.copy.limits.max_entries = 64;
+    assume_lacking(&authority, true, false);
+    let mut ops = authority.test_ops();
+
+    // The destination, found empty when the copy asked about it.
+    carry_out(
+        &authority,
+        &mut ops,
+        &mut Request::DestinationFilesystemInfo {
+            check_empty: true,
+            target: None,
+        },
+    )
+    .unwrap();
+    // Two publications of one name there: once only, so the second is
+    // held to the strict publication, which refuses the name the first
+    // took.
+    let mut first = small_put_with(&target.join("new"), Absent);
+    let mut second = small_put_with(&target.join("new"), Any);
+    let first_settlement = authority.authorize(&mut first, false).unwrap();
+    let second_settlement = authority.authorize(&mut second, false).unwrap();
+    assert_eq!(small_put_condition(&first), Any);
+    assert_eq!(small_put_condition(&second), Absent);
+    let response = ops.handle(&first);
+    authority.settle(first_settlement, &response);
+    assert_eq!(fs::read(target.join("new")).unwrap(), b"new");
+    let response = ops.handle(&second);
+    assert!(
+        matches!(&response, proto::Response::Applied(results)
+            if matches!(&results[0], Some(error) if error.condition_not_met)),
+        "{response:?}"
+    );
+    authority.settle(second_settlement, &response);
+
+    // A directory this receiver created.
+    carry_out(
+        &authority,
+        &mut ops,
+        &mut apply(mkdir(&target.join("made"))),
+    )
+    .unwrap();
+    let mut request = small_put_with(&target.join("made/file"), Absent);
+    carry_out(&authority, &mut ops, &mut request).unwrap();
+    assert_eq!(small_put_condition(&request), Any);
+
+    // A directory found missing. Another program makes it, and a file in
+    // it, after the lookup: the accepted race.
+    look_up_for_planner(&authority, &mut ops, &[target.join("missing")]);
+    fs::create_dir(target.join("missing")).unwrap();
+    fs::write(target.join("missing/theirs"), b"theirs").unwrap();
+    let mut request = small_put_with(&target.join("missing/theirs"), Absent);
+    carry_out(&authority, &mut ops, &mut request).unwrap();
+    assert_eq!(small_put_condition(&request), Any);
+    assert_eq!(fs::read(target.join("missing/theirs")).unwrap(), b"new");
+
+    // A directory found present says nothing of the names in it.
+    fs::create_dir(target.join("old")).unwrap();
+    fs::write(target.join("old/kept"), b"old").unwrap();
+    look_up_for_planner(&authority, &mut ops, &[target.join("old")]);
+    for name in ["kept", "unlooked"] {
+        let mut request = small_put_with(&target.join("old").join(name), Any);
+        let result = carry_out(&authority, &mut ops, &mut request);
+        assert_eq!(small_put_condition(&request), Absent, "{name}");
+        if name == "kept" {
+            let error = result.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("condition_not_met: true"),
+                "{error:#}"
+            );
+        } else {
+            result.unwrap();
+        }
+    }
+    assert_eq!(fs::read(target.join("old/kept")).unwrap(), b"old");
+}
+
+/// The record holds a bounded number of names. Past it, a name is not
+/// recorded and not given to a publication, which is then held to the
+/// strict publication as if the receiver had not looked; names already
+/// recorded keep being updated.
+#[test]
+fn a_full_record_holds_further_names_to_the_strict_publication() {
+    use crate::fsops::lookups::{Claim, Looked, PlanningLookups, Recording};
+    use proto::TargetCondition::Absent;
+    let lookups = PlanningLookups::with_limit(Recording::Keep, 2);
+    lookups.record(b"d", Looked::Empty);
+    lookups.record(b"a", Looked::Absent);
+    lookups.record(b"b", Looked::Absent);
+    assert_eq!(lookups.len(), 2);
+    assert_eq!(lookups.get(b"b"), None);
+    lookups.record(b"a", Looked::Present { file_mode: None });
+    assert_eq!(lookups.get(b"a"), Some(Looked::Present { file_mode: None }));
+    // Beneath a directory found empty, but no room to remember the claim.
+    assert_eq!(lookups.claim(b"d/x"), Claim::Unknown);
+    assert_eq!(lookups.len(), 2);
+
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let mut authority = existence_authority(
+        &root,
+        ExistingDestinationPolicy::Skip,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+    )
+    .unwrap();
+    authority.copy.limits.max_entries = 64;
+    authority.lookups = Some(std::sync::Arc::new(PlanningLookups::with_limit(
+        Recording::Keep,
+        1,
+    )));
+    assume_lacking(&authority, true, false);
+    let mut ops = authority.test_ops();
+    look_up_for_planner(
+        &authority,
+        &mut ops,
+        &[target.join("first"), target.join("second")],
+    );
+    assert_eq!(authority.lookups.as_ref().unwrap().len(), 1);
+    let mut conditions = Vec::new();
+    for name in ["first", "second"] {
+        let mut request = small_put_with(&target.join(name), Absent);
+        carry_out(&authority, &mut ops, &mut request).unwrap();
+        conditions.push(small_put_condition(&request));
+    }
+    // One of the two was recorded and is renamed unchecked; the other is
+    // held to the strict publication.
+    conditions.sort_by_key(|condition| *condition == Absent);
+    assert_eq!(conditions, [proto::TargetCondition::Any, Absent]);
 }
 
 /// Keeping existing files on a filesystem without a no-replace rename, the

@@ -300,7 +300,8 @@ such as FAT and exFAT on macOS and rclone mounts, it still refuses files that
 already exist, but a file another program creates at a name in the instant
 between syq's check and its rename can be replaced. On filesystems without an
 atomic no-replace rename, such as NFS, hostB renames a new file into place
-without a check at a name it found free itself while planning, once per name.
+without a check at a name it found free itself while planning, once per name,
+including any name in a directory it found missing or empty or created.
 A file another program creates at such a name later in the copy can be
 replaced, as in an ordinary copy; hostA decides when the copy looks names up
 and when it writes them.

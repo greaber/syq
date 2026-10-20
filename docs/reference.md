@@ -195,13 +195,14 @@ with a note, as it skips one it found at the start. On filesystems that can't
 rename without replacing, syq renames its file into place with no check, so a
 file another program creates there in the moment before is replaced; rsync
 doesn't guard against that either. A restricted receiver does the same only
-at a name it found free itself while planning the copy, and only once, and it
-never replaces a file it found there, whatever the sender asks. At any other
-name it links its file into place, which keeps a file that appears there
-first. When the destination is missing or empty at the start, syq looks no
-names up, so a restricted receiver links every file. In an S3 bucket, an object
-that appears under `keep` is kept, but that file's copy is reported as failed
-(`S3 PUT failed`).
+where it found the name free itself while planning the copy, by looking it
+up or because the directory it goes into was missing or empty or was created
+by the receiver, and only once; it never replaces a file it found there,
+whatever the sender asks. At any other name it links its file into place,
+which keeps a file that appears there first. It notes at most about 3.7
+million names in one copy and links any name it couldn't note. In an S3
+bucket, an object that appears under `keep` is kept, but that file's copy is
+reported as failed (`S3 PUT failed`).
 
 With `syq rsync --existing`, syq replaces only the files its scan found, by
 renaming its file over whatever the name holds by then: a file another

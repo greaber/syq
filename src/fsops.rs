@@ -2605,6 +2605,16 @@ impl FsOps {
         let empty = check_empty
             .then(|| Self::selected_directory_empty(&directory))
             .flatten();
+        // A restricted receiver that found the directory it writes into
+        // empty knows that nothing beneath it was there.
+        if let (Some(true), Some(target), Some(root), Some(lookups)) = (
+            empty,
+            target,
+            &self.destination_root,
+            self.planning_lookups.as_deref(),
+        ) {
+            lookups.record_empty(root, &target.relative_path, &directory);
+        }
         Ok(DestinationFilesystemInfo {
             filesystem: filesystem_hint(&directory),
             device: metadata.dev(),
@@ -3486,6 +3496,7 @@ impl FsOps {
         let destination_root = self.destination_root.clone();
         let destination_prefix = self.destination_prefix.as_deref();
         let create_missing_parents = self.create_missing_parents;
+        let lookups = self.planning_lookups.as_deref();
         let mut out: Vec<Option<WireError>> = vec![None; ops.len()];
         // A directory this request creates and then gives a group starts
         // private when its starting group may differ, so that group cannot
@@ -3566,6 +3577,21 @@ impl FsOps {
                     owned,
                 ),
             };
+            // A directory created without replacing anything is one this
+            // receiver made, empty.
+            if let (
+                Ok(()),
+                Some(lookups),
+                Some(root),
+                Op::Mkdir {
+                    path,
+                    condition: TargetCondition::Absent,
+                    ..
+                },
+            ) = (&result, lookups, &destination_root, op)
+            {
+                lookups.record_created_directory(root, path);
+            }
             result.err().as_ref().map(wire_error)
         };
         let gres = parallel_map_from(minimum, &guarded_idx, |&i| create(&ops[i]));
