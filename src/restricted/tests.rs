@@ -10013,8 +10013,9 @@ fn changes_check_existence_only_where_numbers_mislead() {
 /// have staged: their sidecars stay for the fallback engine to resume, so
 /// they count against the entry limit as any file a change created. Here an
 /// invalid time fails each file's metadata after its sidecar is created,
-/// and a grant of one entry admits one such copy, not three. A small copy
-/// that fails before staging anything gives its count back.
+/// and a grant of one entry admits one such copy, not three; only Linux
+/// refuses that time, so only there. A small copy that fails before staging
+/// anything gives its count back.
 #[test]
 fn a_failed_small_copy_keeps_the_entries_its_staging_made() {
     let temporary = crate::test_support::tempdir().unwrap();
@@ -10102,7 +10103,9 @@ fn a_failed_small_copy_keeps_the_entries_its_staging_made() {
     );
     assert_eq!(changes(), 0);
 
-    for index in 0..3 {
+    // macOS accepts a nanosecond count of a whole second.
+    let tries = if cfg!(target_os = "linux") { 3 } else { 0 };
+    for index in 0..tries {
         let file = target.join(format!("{index}-fail"));
         let prepared = execute_on_connection(
             &mut gate,
