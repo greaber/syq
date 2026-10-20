@@ -47,6 +47,9 @@ impl TempDir {
         let path = parent.join(format!("syq-update-test-{}-{sequence}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
+        // Fixed permissions keep the stored-release trust check, which
+        // covers every parent directory, independent of the runner's umask.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         Self(path)
     }
 
@@ -143,6 +146,7 @@ impl UpdateFixture {
 
         let home = temp.path("home");
         fs::create_dir_all(&home).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
         Self {
             config: temp.path("config"),
             home,
@@ -773,6 +777,13 @@ fn use_version_starts_a_stored_release_directly_and_downloads_it_again_when_remo
     use std::os::unix::process::CommandExt as _;
     let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
     // A group-writable umask must not keep the store from being private.
+    // Directories above the store follow the umask, so they are created first
+    // here: whether a group-writable one is trusted depends on its group.
+    let lib = fixture.home.join(".local/lib");
+    fs::create_dir_all(&lib).unwrap();
+    for directory in [lib.parent().unwrap(), &lib] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let run = || {
         let mut command =
             fixture.command_builder(&fixture.installed, &["--use-version=0.7.0", "--version"]);
@@ -806,25 +817,85 @@ fn use_version_starts_a_stored_release_directly_and_downloads_it_again_when_remo
     assert_eq!(fs::read(&stored).unwrap(), release);
 }
 
+/// Store a release, apply `change` to the fixture, replace the stored
+/// executable, and run the release again through `home`. The group of
+/// `private_group_of`, if given, stands in for the user's private group, so
+/// the result does not depend on the runner's accounts. The planted executable
+/// runs only when the release is started without verifying it again.
+fn run_planted_release(
+    fixture: &UpdateFixture,
+    change: impl FnOnce(&UpdateFixture),
+    private_group_of: Option<&Path>,
+    home: &Path,
+) -> (Output, Vec<u8>) {
+    use std::os::unix::fs::MetadataExt;
+    let run = |home: &Path, private_group: String| {
+        fixture
+            .command_builder(&fixture.installed, &["--use-version=0.7.0", "--version"])
+            .env("HOME", home)
+            .env("SYQ_TEST_PRIVATE_GROUP", private_group)
+            .capture_output()
+            .unwrap()
+    };
+    assert_success(&run(&fixture.home, "none".into()));
+    let stored = fixture.release_directory("0.7.0").join("syq");
+    let release = fs::read(&stored).unwrap();
+    change(fixture);
+    executable_support::write_executable(&stored, "#!/bin/sh\necho planted\n", 0o755);
+    let private_group = private_group_of.map_or("none".into(), |path| {
+        fs::metadata(path).unwrap().gid().to_string()
+    });
+    (run(home, private_group), release)
+}
+
 #[test]
 fn use_version_verifies_a_stored_release_in_a_store_others_could_change() {
-    for case in ["group-writable directory", "symbolic link"] {
-        let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
-        let run =
-            || fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]);
-        assert_success(&run());
-        let stored = fixture.release_directory("0.7.0").join("syq");
-        let release = fs::read(&stored).unwrap();
-        let version = fixture.stored("v0.7.0");
-        if case == "symbolic link" {
-            let elsewhere = fixture.temp.path("elsewhere");
-            fs::rename(&version, &elsewhere).unwrap();
-            std::os::unix::fs::symlink(&elsewhere, &version).unwrap();
-        } else {
-            fs::set_permissions(fixture.stored(""), fs::Permissions::from_mode(0o770)).unwrap();
+    let mode = |path: PathBuf, mode: u32| {
+        move |_: &UpdateFixture| {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
         }
-        executable_support::write_executable(&stored, "#!/bin/sh\necho planted\n", 0o755);
-        let out = run();
+    };
+    for case in [
+        "store root writable by a shared group",
+        "parent writable by a shared group",
+        "world-writable parent",
+        "symbolic link",
+    ] {
+        let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+        let local = fixture.home.join(".local");
+        let (out, release) = match case {
+            "store root writable by a shared group" => run_planted_release(
+                &fixture,
+                mode(fixture.stored(""), 0o770),
+                None,
+                &fixture.home,
+            ),
+            "parent writable by a shared group" => run_planted_release(
+                &fixture,
+                mode(local.join("lib"), 0o775),
+                None,
+                &fixture.home,
+            ),
+            // Even the user's private group does not make this safe.
+            "world-writable parent" => run_planted_release(
+                &fixture,
+                mode(local.clone(), 0o777),
+                Some(&local),
+                &fixture.home,
+            ),
+            _ => run_planted_release(
+                &fixture,
+                |fixture| {
+                    let version = fixture.stored("v0.7.0");
+                    let elsewhere = fixture.temp.path("elsewhere");
+                    fs::rename(&version, &elsewhere).unwrap();
+                    std::os::unix::fs::symlink(&elsewhere, &version).unwrap();
+                },
+                None,
+                &fixture.home,
+            ),
+        };
+        let stored = fixture.release_directory("0.7.0").join("syq");
         assert_success(&out);
         assert_eq!(out.stdout, b"syq 0.7.0\n", "{case}");
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -833,6 +904,46 @@ fn use_version_verifies_a_stored_release_in_a_store_others_could_change() {
             "{case}: {stderr}"
         );
         assert_eq!(fs::read(&stored).unwrap(), release, "{case}");
+    }
+}
+
+/// Parents only this user and root can change keep the direct start, whatever
+/// their spelling: one the user's private group can write, as a umask of 002
+/// leaves them; a sticky world-writable one such as `/tmp`; and a home reached
+/// through a symbolic link, such as `/home -> var/home`.
+#[test]
+fn use_version_starts_directly_under_parents_only_the_user_controls() {
+    for case in [
+        "parent writable by the user's private group",
+        "sticky world-writable parent",
+        "home reached through a symbolic link",
+    ] {
+        let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+        let local = fixture.home.join(".local");
+        let (out, _) = match case {
+            "parent writable by the user's private group" => run_planted_release(
+                &fixture,
+                |_| {
+                    let lib = local.join("lib");
+                    fs::set_permissions(&lib, fs::Permissions::from_mode(0o775)).unwrap()
+                },
+                Some(&local.join("lib")),
+                &fixture.home,
+            ),
+            "sticky world-writable parent" => run_planted_release(
+                &fixture,
+                |_| fs::set_permissions(&local, fs::Permissions::from_mode(0o1777)).unwrap(),
+                None,
+                &fixture.home,
+            ),
+            _ => {
+                let link = fixture.temp.path("home-link");
+                std::os::unix::fs::symlink(&fixture.home, &link).unwrap();
+                run_planted_release(&fixture, |_| {}, None, &link)
+            }
+        };
+        assert_success(&out);
+        assert_eq!(out.stdout, b"planted\n", "{case}: {out:?}");
     }
 }
 
