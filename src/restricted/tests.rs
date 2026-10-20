@@ -10316,6 +10316,73 @@ fn keeping_files_renames_unchecked_beneath_directories_found_empty_or_made() {
     assert_eq!(fs::read(target.join("old/kept")).unwrap(), b"old");
 }
 
+/// A destination reached through links, which the receiver then holds as
+/// its root, is known empty as one named directly is: keeping existing
+/// files on a filesystem without a no-replace rename, a new file there is
+/// renamed into place, not linked.
+#[test]
+fn an_empty_destination_reached_through_links_is_known_empty() {
+    use proto::TargetCondition::{Absent, Any};
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let real = root.join("data/real");
+    fs::create_dir_all(&real).unwrap();
+    let protected = [];
+    for follow_dst in [false, true] {
+        let link = root.join("target");
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_dir_all(&link);
+        let published = if follow_dst {
+            symlink("data/real", &link).unwrap();
+            real.join("new")
+        } else {
+            fs::create_dir(&link).unwrap();
+            link.join("new")
+        };
+        let _ = fs::remove_file(real.join("new"));
+        let mut authority = test_authority_with_options(
+            &root,
+            DeletionPolicy::Forbid,
+            1024,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            ExistingDestinationPolicy::Skip,
+            DestinationPlacement::DirectoryContents,
+            RootExistence::Any,
+            None,
+            (
+                crate::delegation::ExtraCopyOptions {
+                    follow_dst,
+                    ..Default::default()
+                },
+                &protected,
+            ),
+        )
+        .unwrap();
+        authority.copy.limits.max_entries = 64;
+        assume_lacking(&authority, true, false);
+        let mut ops = authority.test_ops();
+        carry_out(
+            &authority,
+            &mut ops,
+            &mut Request::DestinationFilesystemInfo {
+                check_empty: true,
+                target: None,
+            },
+        )
+        .unwrap();
+        let mut request = small_put_with(&root.join("target/new"), Absent);
+        carry_out(&authority, &mut ops, &mut request).unwrap();
+        assert_eq!(
+            small_put_condition(&request),
+            Any,
+            "follow_dst {follow_dst}"
+        );
+        assert_eq!(fs::read(&published).unwrap(), b"new");
+    }
+}
+
 /// The record holds a bounded number of names. Past it, a name is not
 /// recorded and not given to a publication, which is then held to the
 /// strict publication as if the receiver had not looked; names already

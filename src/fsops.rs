@@ -2613,14 +2613,16 @@ impl FsOps {
             .then(|| Self::selected_directory_empty(&directory))
             .flatten();
         // A restricted receiver that found the directory it writes into
-        // empty knows that nothing beneath it was there.
-        if let (Some(true), Some(target), Some(root), Some(lookups)) = (
+        // empty knows that nothing beneath it was there. Without a target,
+        // that directory is the root it holds, as a destination reached
+        // through links is.
+        if let (Some(true), Some(root), Some(lookups)) = (
             empty,
-            target,
             &self.destination_root,
             self.planning_lookups.as_deref(),
         ) {
-            lookups.record_empty(root, &target.relative_path, &directory);
+            let relative = target.map_or(&[][..], |target| target.relative_path.as_slice());
+            lookups.record_empty(root, relative, &directory);
         }
         Ok(DestinationFilesystemInfo {
             filesystem: filesystem_hint(&directory),

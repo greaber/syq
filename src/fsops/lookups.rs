@@ -161,12 +161,12 @@ impl PlanningLookups {
         self.needed_on(profile)
     }
 
-    /// Record that the directory at `relative` beneath `root` was found
-    /// empty or created by this receiver, where this copy needs it:
-    /// `directory` is it, or the directory it was made in, on the same
-    /// filesystem.
+    /// Record that the directory at `relative` beneath `root` (the root
+    /// itself when empty) was found empty or created by this receiver,
+    /// where this copy needs it: `directory` is it, or the directory it was
+    /// made in, on the same filesystem.
     pub(super) fn record_empty(&self, root: &Root, relative: &[u8], directory: &File) {
-        if self.recording != Recording::Keep || relative.is_empty() {
+        if self.recording != Recording::Keep {
             return;
         }
         let Some(dev) = cached_device(directory) else {
@@ -207,8 +207,9 @@ impl PlanningLookups {
     /// What the receiver found at `relative`, for a publication there,
     /// giving the name to that publication when it was found absent: by its
     /// own lookup, or because the nearest directory above it the record
-    /// names was found missing or empty, or created by this receiver. The
-    /// name is then `Claimed`; one that cannot be recorded is not given.
+    /// names, the root last, was found missing or empty, or created by this
+    /// receiver. The name is then `Claimed`; one that cannot be recorded is
+    /// not given.
     pub(crate) fn claim(&self, relative: &[u8]) -> Claim {
         let key = self.key(relative);
         let mut names = self.names.lock().unwrap();
@@ -223,17 +224,21 @@ impl PlanningLookups {
             None => {}
         }
         let mut end = relative.len();
-        while let Some(separator) = relative[..end].iter().rposition(|byte| *byte == b'/') {
-            match names.get(&self.key(&relative[..separator])) {
+        loop {
+            let separator = relative[..end].iter().rposition(|byte| *byte == b'/');
+            let above = &relative[..separator.unwrap_or(0)];
+            match names.get(&self.key(above)) {
                 Some(Looked::Absent | Looked::Empty) if names.len() < self.limit => {
                     names.insert(key, Looked::Claimed);
                     return Claim::Absent;
                 }
                 Some(_) => return Claim::Unknown,
-                None => end = separator,
+                None => match separator {
+                    Some(separator) => end = separator,
+                    None => return Claim::Unknown,
+                },
             }
         }
-        Claim::Unknown
     }
 
     /// Forget `relative`, once the grant deletes it.
