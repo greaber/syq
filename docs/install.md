@@ -111,6 +111,11 @@ read its results.
 Use `syq --self-update` for a standalone installation, or `brew upgrade syq`
 for Homebrew.
 
+A command that is already running when you update keeps running its own
+version. On macOS, if it then needs to start another syq process, such as the
+receiver of a local copy, it stops with a message to rerun the command instead
+of starting the new version.
+
 Standalone and Homebrew installs may print an update reminder in a terminal,
 at most once a day after a successful command, naming the upgrade command for
 that install. Nothing updates automatically. Set `SYQ_NO_UPDATE_CHECK=1` or

@@ -27,7 +27,8 @@ pub(crate) fn with_inheritance_guard<T>(operation: impl FnOnce() -> T) -> T {
 /// path syq started from while it runs. On Linux, /proc/self/exe still names
 /// the running image; the child gets the original path as argv[0], and
 /// `restore_self_started_name` gives it the file's name. macOS has no
-/// equivalent, so there the child runs whatever file the path names now.
+/// equivalent, so there a path that names another file is refused
+/// (`require_started_file`) rather than started.
 pub(crate) fn self_command() -> std::io::Result<Command> {
     let path = std::env::current_exe()?;
     #[cfg(target_os = "linux")]
@@ -41,9 +42,88 @@ pub(crate) fn self_command() -> std::io::Result<Command> {
         command.arg0(std::ffi::OsStr::from_bytes(path));
         command
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    let command = {
+        require_started_file(&path)?;
+        Command::new(path)
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let command = Command::new(path);
     Ok(command)
+}
+
+/// macOS: refuse to start `path` once it names a file other than the one
+/// this process runs, as after an upgrade or rebuild replaced or removed it,
+/// since that would start another build. The file this process runs is read
+/// from the kernel at the first start, so syq's own startup pays nothing;
+/// each start then costs one stat of the path. Where the kernel does not say,
+/// the path is started as before.
+#[cfg(target_os = "macos")]
+fn require_started_file(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    static RUNNING: std::sync::OnceLock<Option<(u32, u64)>> = std::sync::OnceLock::new();
+    let Some(running) = *RUNNING.get_or_init(running_file) else {
+        return Ok(());
+    };
+    match std::fs::metadata(path) {
+        // st_dev is 32 bits on macOS; the kernel reports it unsigned.
+        Ok(metadata) if (metadata.dev() as u32, metadata.ino()) == running => Ok(()),
+        Ok(_) => Err(replaced(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(replaced(path)),
+        // Starting it reports anything else.
+        Err(_) => Ok(()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn replaced(path: &std::path::Path) -> std::io::Error {
+    std::io::Error::other(format!(
+        "syq at {} was replaced while this command was running; rerun the command",
+        path.display()
+    ))
+}
+
+/// macOS: the device and inode of the file this process runs, as the kernel
+/// recorded them when it mapped this code, which stay right after that file
+/// is replaced or removed.
+#[cfg(target_os = "macos")]
+fn running_file() -> Option<(u32, u64)> {
+    // <sys/proc_info.h>; libc does not declare this flavor.
+    const PROC_PIDREGIONPATHINFO: libc::c_int = 8;
+    #[repr(C)]
+    struct RegionInfo {
+        protection_inheritance_flags: [u32; 4],
+        offset: u64,
+        counts: [u32; 14],
+        address: u64,
+        size: u64,
+    }
+    #[repr(C)]
+    struct RegionWithPathInfo {
+        region: RegionInfo,
+        vnode: libc::vnode_info_path,
+    }
+    let address = running_file as *const () as u64;
+    let mut info = std::mem::MaybeUninit::<RegionWithPathInfo>::zeroed();
+    let size = std::mem::size_of::<RegionWithPathInfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            PROC_PIDREGIONPATHINFO,
+            address,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    // The kernel returns the region holding the address, or the next one.
+    let region = &info.region;
+    let stat = &info.vnode.vip_vi.vi_stat;
+    (region.address <= address && address - region.address < region.size && stat.vst_ino != 0)
+        .then_some((stat.vst_dev, stat.vst_ino))
 }
 
 #[cfg(target_os = "linux")]
@@ -284,6 +364,32 @@ mod tests {
         });
         assert!(finished_rx.recv_timeout(Duration::from_secs(5)).unwrap());
         assert!(child.join().unwrap().success());
+    }
+
+    /// The kernel's record of the running file is this test binary, so its
+    /// own path may start, and another file or a missing one may not.
+    #[test]
+    fn only_the_running_file_starts() {
+        use std::os::unix::fs::MetadataExt;
+        let executable = std::env::current_exe().unwrap();
+        let metadata = std::fs::metadata(&executable).unwrap();
+        assert_eq!(
+            running_file(),
+            Some((metadata.dev() as u32, metadata.ino()))
+        );
+        require_started_file(&executable).unwrap();
+        let directory = crate::test_support::tempdir().unwrap();
+        let other = directory.path().join("syq");
+        std::fs::write(&other, b"another build").unwrap();
+        for path in [other.clone(), directory.path().join("missing")] {
+            let error = require_started_file(&path).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("was replaced while this command was running"),
+                "{error}"
+            );
+        }
     }
 }
 
