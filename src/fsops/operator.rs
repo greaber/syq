@@ -237,7 +237,7 @@ impl OperatorDirectorySelection {
                     if metadata.st_mode & libc::S_IFMT == libc::S_IFDIR
                         && !(final_component && require_absent) => {}
                 Ok(metadata) if metadata.st_mode & libc::S_IFMT == libc::S_IFDIR => {
-                    bail!("destination directory appeared after the new-path precondition")
+                    return Err(appeared_after_precondition())
                 }
                 Ok(_) => bail!(
                     "destination path component {:?} appeared with an unsafe type while creating the destination",
@@ -265,7 +265,7 @@ impl OperatorDirectorySelection {
                                 && final_component
                                 && require_absent =>
                         {
-                            bail!("destination directory appeared after the new-path precondition")
+                            return Err(appeared_after_precondition())
                         }
                         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                             match operator_lstat_at(&self.directory, &component) {
@@ -661,4 +661,15 @@ pub(super) fn operator_lstat_at(parent: &File, component: &[u8]) -> io::Result<l
             return Err(error);
         }
     }
+}
+
+/// A destination directory that must be new appeared at its name after it
+/// was found missing: the receiver creates nothing there. Its kind tells the
+/// coordinator the destination exists.
+fn appeared_after_precondition() -> anyhow::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "destination directory appeared after the new-path precondition",
+    )
+    .into()
 }

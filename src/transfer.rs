@@ -3356,10 +3356,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         .is_some_and(|entry| entry.kind == Kind::Dir);
     match args.target_existence {
         Existence::Any => {}
-        Existence::New if dst_existed => bail!(
-            "target {} already exists, but the selected placement requires a new path",
-            display(&dst_root)
-        ),
+        Existence::New if dst_existed => return Err(new_target_exists(&dst_root)),
         Existence::Existing if !dst_existed => bail!(
             "target {} does not exist, but the selected placement requires an existing path",
             display(&dst_root)
@@ -3914,7 +3911,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let root_creatable = dst_root_entry.is_none() && dst_is_dir && !args.existing;
     let mut create_root = root_creatable && !args.dry_run;
     let dry_run_creates_root = root_creatable && args.dry_run;
-    let root_create_condition = TargetCondition::Any;
+    // The directory `--into-new` names is created without replacing
+    // anything: one another program creates there after the check above is
+    // refused as the check refuses it.
+    let root_create_condition = if args.target_existence == Existence::New && dst_is_dir {
+        TargetCondition::Absent
+    } else {
+        TargetCondition::Any
+    };
     // A directory target takes a contents source's metadata, which the
     // planner sends only once it has scanned the source root. When its
     // permissions or group are copied, create the root private until they
@@ -3988,6 +3992,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     |_| 0o700,
                 ),
             )
+            .map_err(|error| new_root_refused(error, condition, &dst_root))
             .map_err(|error| with_failure_hint(&opts, error))?;
             if dst_is_dir && !created {
                 // Another process created the destination root after it was
@@ -4042,7 +4047,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             } else {
                 root_source_mode.unwrap_or(0o755)
             },
-        )?;
+        )
+        .map_err(|error| new_root_refused(error, root_create_condition, &dst_root))?;
         mutation_root_condition = target_identity(&created);
         if guard_containers {
             container_guard = Some(target_container(&dst_root, &created));
@@ -5211,6 +5217,32 @@ fn hold_after_target_precondition_for_test(args: &Args) -> Result<()> {
 #[cfg(not(debug_assertions))]
 fn hold_after_target_precondition_for_test(_args: &Args) -> Result<()> {
     Ok(())
+}
+
+/// A destination that must be new but already exists.
+fn new_target_exists(dst_root: &[u8]) -> anyhow::Error {
+    anyhow::anyhow!(
+        "target {} already exists, but the selected placement requires a new path",
+        display(dst_root)
+    )
+}
+
+/// Creating a destination root under `condition` failed with `error`. One
+/// that must be new and was found already there when the receiver created
+/// it, after the pathname check found it missing, is reported as that check
+/// reports one: the receiver created nothing in its place.
+fn new_root_refused(
+    error: anyhow::Error,
+    condition: TargetCondition,
+    dst_root: &[u8],
+) -> anyhow::Error {
+    let exists = crate::conn::wire_error_of(&error)
+        .is_some_and(|error| error.io_kind == Some(WireIoKind::AlreadyExists));
+    if condition == TargetCondition::Absent && exists {
+        new_target_exists(dst_root)
+    } else {
+        error
+    }
 }
 
 fn mkdir_root(

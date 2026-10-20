@@ -1587,6 +1587,7 @@ impl Planner<'_> {
                         .unwrap_or_else(|| operator_directory_mode(self.opts)),
                 };
                 let (selection, created) = create_operator_directory(self.dst, condition, mode)
+                    .map_err(|error| new_root_refused(error, condition, &self.dst_root))
                     .map_err(|error| with_failure_hint(self.opts, error))?;
                 if is_destination_root && !created {
                     self.adopt_existing_root(&root, &selection);
@@ -1615,7 +1616,8 @@ impl Planner<'_> {
                 } else {
                     self.root_source_mode.unwrap_or(0o755)
                 };
-                let created = mkdir_root(self.dst, &root, condition, mode)?;
+                let created = mkdir_root(self.dst, &root, condition, mode)
+                    .map_err(|error| new_root_refused(error, condition, &root))?;
                 self.mutation_root_condition = target_identity(&created);
                 if self.guard_containers {
                     self.container_guard = Some(target_container(&root, &created));

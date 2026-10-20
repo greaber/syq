@@ -262,6 +262,58 @@ fn into_new_copies_a_directorys_contents_into_the_directory_it_creates() {
     }
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn into_new_refuses_a_directory_that_appears_before_it_creates_one() {
+    // The pathname check finds no `dst`, and another program creates it
+    // before the copy does: creating it refuses the directory found there,
+    // as the check would have, and copies nothing into it. Copying hard
+    // links creates it later, once the sources are scanned.
+    for (source, extra) in [
+        (&["--srcs-in", "src"][..], &[][..]),
+        (&["src"][..], &[][..]),
+        (
+            &["--srcs-in", "src"][..],
+            &["--copy-metadata=hardlinks"][..],
+        ),
+    ] {
+        let case = format!("{source:?} {extra:?}");
+        let t = Tmp::new();
+        write(&t.path("src/file"), b"file");
+        let (ready, continuation) = (t.path("ready"), t.path("continue"));
+        let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "-q", "--cwd", &t.s("")])
+            .args(source)
+            .args(extra)
+            .args(["--into-new", &t.s("dst")])
+            .env("SYQ_TEST_OPERATOR_DIRECTORY_READY_FILE", &ready)
+            .env("SYQ_TEST_OPERATOR_DIRECTORY_CONTINUE_FILE", &continuation)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+        wait_for_confinement_marker(&mut child, &ready, "destination directory creation");
+        write(&t.path("dst/theirs"), b"theirs");
+        release_confinement_barrier(&continuation);
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success(), "{case}: {output:?}");
+        assert!(
+            stderr_of(&output).contains(&format!(
+                "target {} already exists, but the selected placement requires a new path",
+                t.s("dst")
+            )),
+            "{case}: {output:?}"
+        );
+        let mut names: Vec<_> = fs::read_dir(t.path("dst"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["theirs"], "{case}");
+        assert_eq!(read(&t.path("dst/theirs")), b"theirs", "{case}");
+    }
+}
+
 #[test]
 fn previous_partials_remain_reusable_without_an_option() {
     let t = Tmp::new();

@@ -186,6 +186,8 @@ it and reports that file's copy as failed. On filesystems with neither an atomic
 no-replace rename nor hard links, such as FAT and exFAT on macOS and rclone
 mounts, syq checks that the name is free and then renames, so a file another
 program creates there in the instant between the two can be replaced.
+Likewise, `--into-new` creates its directory only while the name is free: if
+one appears there first, the copy stops without writing into it.
 
 See [Update policies](commands/cp.md#update-policies) for supported combinations.
 
