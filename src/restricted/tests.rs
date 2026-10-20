@@ -1156,7 +1156,8 @@ fn test_authority_with_options(
 
 #[test]
 fn restricted_destinations_cannot_overlap_receiver_control_paths() {
-    let protected = receiver_control_paths(Path::new("/home/receiver"), None).unwrap();
+    let protected =
+        receiver_control_paths(Path::new("/home/receiver"), None, ControlPaths::Elsewhere).unwrap();
 
     reject_control_plane_path(b"/home/receiver/archive", &protected)
         .expect("an unrelated destination remains available");

@@ -824,7 +824,7 @@ pub(crate) fn prepare_receiver_ssh(args: &mut Args) -> Result<Option<tempfile::T
 /// Read the entry key the requesting syq sends first on this coordinator's
 /// input, before any manifest.
 fn read_entry_key(length: usize) -> Result<zeroize::Zeroizing<Vec<u8>>> {
-    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::fd::AsFd;
     anyhow::ensure!(
         (1..=MAX_ENTRY_KEY_BYTES).contains(&length),
         "invalid entry key length"
@@ -837,7 +837,6 @@ fn read_entry_key(length: usize) -> Result<zeroize::Zeroizing<Vec<u8>>> {
             .try_clone_to_owned()
             .context("take the requesting syq's input")?,
     );
-    let _ = input.as_raw_fd();
     let mut key = zeroize::Zeroizing::new(vec![0; length]);
     input
         .read_exact(&mut key)
@@ -913,13 +912,7 @@ fn prepare_receiver_ssh_with(
 // lifetime of a data worker.
 const DEFAULT_BROKER_CONNECTIONS: usize = 129;
 
-fn broker_connection_limit(worker_limit: Option<usize>, restricted: bool) -> Result<usize> {
-    let worker_limit = if restricted {
-        let maximum = usize::from(crate::delegation::MAX_CONNECTIONS);
-        Some(worker_limit.unwrap_or(maximum).min(maximum))
-    } else {
-        worker_limit
-    };
+fn broker_connection_limit(worker_limit: Option<usize>) -> Result<usize> {
     match worker_limit {
         Some(workers) => workers
             .checked_add(1)
@@ -1182,14 +1175,11 @@ fn run_remote(
             ));
             Some(AgentForwarding::Disabled)
         } else {
-            let limit = broker_connection_limit(
-                args.connections_opt.or_else(|| {
-                    args.resource_limits
-                        .as_ref()
-                        .and_then(|limits| limits.workers)
-                }),
-                false,
-            )?;
+            let limit = broker_connection_limit(args.connections_opt.or_else(|| {
+                args.resource_limits
+                    .as_ref()
+                    .and_then(|limits| limits.workers)
+            }))?;
             let policy = crate::agent_broker::BrokerPolicy::new(coordinator_policy, peer_policy);
             let broker = crate::agent_broker::ConstrainedAgentBroker::start(policy, limit)?;
             let ambient = broker.ambient_socket().to_string_lossy().into_owned();

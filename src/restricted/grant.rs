@@ -349,7 +349,11 @@ pub(crate) fn prepare_transfer(
         destination_login,
         &destination_path,
     )?;
-    let protected = receiver_control_paths(Path::new(&metadata.remote_home), None)?;
+    let protected = receiver_control_paths(
+        Path::new(&metadata.remote_home),
+        None,
+        ControlPaths::Elsewhere,
+    )?;
     let GrantOperation::Copy(copy) = &grant.operation;
     reject_control_plane_scopes(copy, &protected)?;
     let request_id = grant.request_id;
@@ -493,7 +497,7 @@ pub(crate) fn named_authority(
     let digest = delegation::signed_grant_digest(&signed)?;
     let executable = fs::canonicalize(std::env::current_exe()?)?;
     let home = fs::canonicalize(home)?;
-    let protected = receiver_control_paths(&home, Some(&executable))?;
+    let protected = receiver_control_paths(&home, Some(&executable), ControlPaths::Here)?;
     let confined = ConfinedRoot::opened(
         parent,
         RootIdentity {

@@ -169,18 +169,11 @@ fn setup_and_destination_connections_apply_only_the_selected_agent_policy() {
 
 #[test]
 fn broker_capacity_is_bounded_independently_of_automatic_workers() {
-    for restricted in [false, true] {
-        assert_eq!(broker_connection_limit(None, restricted).unwrap(), 129);
-        assert_eq!(broker_connection_limit(Some(3), restricted).unwrap(), 4);
-        assert_eq!(broker_connection_limit(Some(128), restricted).unwrap(), 129);
-    }
-    assert_eq!(broker_connection_limit(Some(1000), false).unwrap(), 1001);
-    assert!(broker_connection_limit(Some(usize::MAX), false).is_err());
-    assert_eq!(broker_connection_limit(Some(1000), true).unwrap(), 129);
-    assert_eq!(
-        broker_connection_limit(Some(usize::MAX), true).unwrap(),
-        129
-    );
+    assert_eq!(broker_connection_limit(None).unwrap(), 129);
+    assert_eq!(broker_connection_limit(Some(3)).unwrap(), 4);
+    assert_eq!(broker_connection_limit(Some(128)).unwrap(), 129);
+    assert_eq!(broker_connection_limit(Some(1000)).unwrap(), 1001);
+    assert!(broker_connection_limit(Some(usize::MAX)).is_err());
 }
 
 #[test]

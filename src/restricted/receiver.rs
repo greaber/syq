@@ -38,7 +38,7 @@ pub(crate) fn run_receiver(enrollment: &str, generation: &str) -> Result<()> {
     let (_, home) = current_account()?;
     let canonical_home = fs::canonicalize(&home)
         .with_context(|| format!("resolve receiver home {}", home.display()))?;
-    let protected = receiver_control_paths(&canonical_home, None)?;
+    let protected = receiver_control_paths(&canonical_home, None, ControlPaths::Here)?;
     let replay = delegation::ReplayStore::open(&state.join("replay"))?;
     let observed_at = Instant::now();
     let signer_name = signer_name(enrollment, config.generation);

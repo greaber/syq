@@ -160,6 +160,15 @@ fn install_receiver(home: &Path) -> Result<PathBuf> {
     Ok(receiver)
 }
 
+/// Which machine's paths `receiver_control_paths` lists.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ControlPaths {
+    /// This machine's, including receiving state its environment locates.
+    Here,
+    /// Another machine's, known only by its home directory.
+    Elsewhere,
+}
+
 /// The paths every receiver refuses to write, by name and by the identity
 /// each has in the session: the account's SSH configuration, syq's stored
 /// executables, enrollment state on both sides (including the directories
@@ -168,6 +177,7 @@ fn install_receiver(home: &Path) -> Result<PathBuf> {
 pub(super) fn receiver_control_paths(
     home: &Path,
     executable: Option<&Path>,
+    machine: ControlPaths,
 ) -> Result<Vec<ReceiverControlPath>> {
     let mut protected = vec![
         (home.join(".ssh"), "SSH configuration directory"),
@@ -213,6 +223,7 @@ pub(super) fn receiver_control_paths(
     ]
     .into_iter()
     .flatten()
+    .filter(|_| machine == ControlPaths::Here)
     {
         protected.push((path, "background receiving control state"));
     }
@@ -352,9 +363,15 @@ pub(super) fn install_for_account(
         read_leaf(&directory, "authorized_keys", MAX_AUTHORIZED_KEYS, false)?.unwrap_or_default();
     if let Some(replaced) = &request.replaces {
         replaced.id.validate()?;
-        if replaced.id != request.id
-            && fs::symlink_metadata(state_base.join(replaced.id.to_string())).is_err()
-        {
+        // Only an enrollment whose state is gone is replaced; its receiver
+        // refuses everything already.
+        let replaced_state = state_base.join(replaced.id.to_string());
+        let lost = match fs::symlink_metadata(&replaced_state) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => return Err(error).context("inspect the replaced enrollment's state"),
+            Ok(_) => read_receiver_config(&replaced_state)?.is_none(),
+        };
+        if replaced.id != request.id && lost {
             let key = EnrollmentPublicKey::parse(&replaced.entry_public_key)?;
             original = enrollment::remove_enrollment_line(&original, replaced.id, &key)?.0;
         }
