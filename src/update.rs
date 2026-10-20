@@ -402,34 +402,72 @@ fn stored_release_path(store: &Path, helper: &TrustedCurrentHelper) -> Result<Pa
     Ok(path)
 }
 
-/// Whether a stored release can be started without verifying it again: its
-/// files, and every directory from the store root down to theirs, are real
-/// files and directories rather than symbolic links, owned by this user, and
-/// not writable by group or others. Otherwise someone else may have put them
-/// there, for example in a home directory shared with other users.
-fn privately_stored(root: &Path, directory: &Path, files: &[&Path]) -> bool {
+/// Whether the store holds all of a release's files.
+#[derive(Debug, PartialEq, Eq)]
+enum StoredRelease {
+    Complete,
+    Incomplete,
+}
+
+/// Check a release's directories, from the store root down, and its files.
+/// Each one that exists must be a real directory or file, not a symbolic link,
+/// owned by this user, that group and others cannot write; syq creates them
+/// that way. Anything else is refused rather than verified and run, because
+/// whoever could change it could also change it again between a check and the
+/// `exec`. The directories above the store are trusted, as `~/.local/bin/syq`
+/// and the rest of the home directory are: whoever can change them can
+/// replace syq or the shell's startup files directly.
+fn stored_release(store: &Path, directory: &Path, files: &[&Path]) -> Result<StoredRelease> {
     use std::os::unix::fs::MetadataExt;
-    let Ok(below) = directory.strip_prefix(root) else {
-        return false;
-    };
+    let below = directory
+        .strip_prefix(store)
+        .context("a release directory is outside the binary store")?;
     let user = unsafe { libc::geteuid() };
-    let private = |path: &Path, is_directory: bool| {
-        fs::symlink_metadata(path).is_ok_and(|metadata| {
-            let kind = if is_directory {
-                metadata.is_dir()
-            } else {
-                metadata.is_file()
-            };
-            kind && metadata.uid() == user && metadata.mode() & 0o022 == 0
-        })
+    // Whether `path` exists, after refusing it if it is not private.
+    let check = |path: &Path, is_directory: bool| -> Result<bool> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+        };
+        let problem = if metadata.file_type().is_symlink() {
+            "is a symbolic link"
+        } else if is_directory && !metadata.is_dir() {
+            "is not a directory"
+        } else if !is_directory && !metadata.is_file() {
+            "is not a regular file"
+        } else if metadata.uid() != user {
+            "belongs to another user"
+        } else if metadata.mode() & 0o022 != 0 {
+            "is writable by group or others"
+        } else {
+            return Ok(true);
+        };
+        bail!(
+            "{} must be a {} that you own and nobody else can write, but it {problem}; fix its permissions, or delete it and syq will install the release again",
+            path.display(),
+            if is_directory { "directory" } else { "file" },
+        )
     };
-    let mut path = root.to_path_buf();
-    private(&path, true)
-        && below.components().all(|component| {
-            path.push(component);
-            private(&path, true)
-        })
-        && files.iter().all(|file| private(file, false))
+    let mut path = store.to_path_buf();
+    if !check(&path, true)? {
+        return Ok(StoredRelease::Incomplete);
+    }
+    for component in below.components() {
+        path.push(component);
+        if !check(&path, true)? {
+            return Ok(StoredRelease::Incomplete);
+        }
+    }
+    let mut complete = true;
+    for file in files {
+        complete &= check(file, false)?;
+    }
+    Ok(if complete {
+        StoredRelease::Complete
+    } else {
+        StoredRelease::Incomplete
+    })
 }
 
 // What a stored executable is for, as named in messages about it.
@@ -503,10 +541,11 @@ fn create_store_directory(store: &Path, directory: &Path) -> Result<()> {
 /// manifest. A download is checked against the manifest's signature, sizes, and
 /// hashes, and the release must report the expected version and build identity,
 /// before the manifest is stored. Finding both files in a private store
-/// therefore means the release passed those checks, so later runs start it
-/// directly without reading either file or checking online for freshness:
-/// release tags are immutable, and selecting a release deliberately permits
-/// running an older version. Anything else gets the full checks again. This
+/// (`stored_release`) therefore means the release passed those checks, so later
+/// runs start it directly without reading either file or checking online for
+/// freshness: release tags are immutable, and selecting a release deliberately
+/// permits running an older version. A release with a missing file is
+/// completed with the full checks; one that is not private is refused. This
 /// does not replace the normal installation.
 pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
     let target = Target::local().context("official releases do not support this platform")?;
@@ -515,7 +554,10 @@ pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
     let directory = release_directory(&store, &tag, target);
     let manifest_path = directory.join(MANIFEST_NAME);
     let executable = directory.join(STORED_EXECUTABLE);
-    if privately_stored(&store, &directory, &[&manifest_path, &executable]) {
+    if stored_release(&store, &directory, &[&manifest_path, &executable])
+        .with_context(|| format!("cannot start syq {version} from the binary store"))?
+        == StoredRelease::Complete
+    {
         return Ok(executable);
     }
     // Only explicit selection opts every build into the official trust anchor.

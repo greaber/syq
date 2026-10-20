@@ -86,6 +86,12 @@ Syq does not remove old releases from the store. To remove one you no longer
 use, delete its directory, for example `~/.local/lib/syq/v0.7.1`; syq
 downloads or installs it again if it is needed later.
 
+Syq starts a stored release only when you own its directories and files in the
+store and nobody else can write them, as syq creates them. Otherwise it stops
+and names the problem: fix the permissions, or delete what it names and syq
+installs the release again. The directories above the store are trusted, as
+your home directory is trusted for `~/.local/bin/syq` itself.
+
 Earlier releases kept their helpers in `~/.cache/syq/helpers`. Syq no longer
 reads that directory, and you can delete it on each machine. Those releases
 still use it themselves, including when you select one with `--use-version`.

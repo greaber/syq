@@ -147,7 +147,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 |---|---|
 | `--results <FILE>` | Write the machine-readable NDJSON result stream to FILE (created fresh; an existing file is refused) |
 | `--results-fd <FD>` | Write the result stream to an inherited file descriptor the caller opened (e.g. `--results-fd 3 3>run.ndjson`); must be above 2 |
-| `-n, --dry-run` | Preview without changing copy/removal data; remote setup may still cache the helper or install syq; requested results files are still written |
+| `-n, --dry-run` | Preview without changing copy/removal data; remote setup may still install the helper or syq; requested results files are still written |
 | `-v, --verbose...` | List files with -v; explain helpers and transport with -vv |
 | `-q, --quiet` | Suppress non-error messages |
 | `--progress` | Show progress even when stderr is not a terminal |

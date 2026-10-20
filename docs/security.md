@@ -187,7 +187,11 @@ release public key. It verifies the manifest's Ed25519 signature with that key,
 then checks downloaded files against the signed sizes and hashes before using
 them. The verification key comes from the installed executable, not from the
 server supplying the download. Source builds also carry the official public
-key for explicit `--use-version` selections.
+key for explicit `--use-version` selections. A selected release is verified
+once, when it is stored in `~/.local/lib/syq`, and later runs start it without
+checking it again; like `~/.local/bin/syq`, it is only as safe as your home
+directory, since anyone who can change the directories above the store could
+replace either.
 
 This also applies when the SSH server downloads its own helper: your client
 verifies the manifest and checks the reported archive hash before authorizing

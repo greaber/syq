@@ -806,32 +806,69 @@ fn use_version_starts_a_stored_release_directly_and_downloads_it_again_when_remo
     assert_eq!(fs::read(&stored).unwrap(), release);
 }
 
+/// A stored release that someone else could change is refused, not verified
+/// and run: whoever could change it could change it again between a check and
+/// the `exec`. Deleting what the message names lets syq install it again.
 #[test]
-fn use_version_verifies_a_stored_release_in_a_store_others_could_change() {
-    for case in ["group-writable directory", "symbolic link"] {
+fn use_version_refuses_a_stored_release_others_could_change() {
+    for case in [
+        "store root writable by group",
+        "release directory is a symbolic link",
+        "executable writable by group",
+    ] {
         let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
         let run =
             || fixture.command_at_args(&fixture.installed, &["--use-version=0.7.0", "--version"]);
         assert_success(&run());
         let stored = fixture.release_directory("0.7.0").join("syq");
         let release = fs::read(&stored).unwrap();
-        let version = fixture.stored("v0.7.0");
-        if case == "symbolic link" {
-            let elsewhere = fixture.temp.path("elsewhere");
-            fs::rename(&version, &elsewhere).unwrap();
-            std::os::unix::fs::symlink(&elsewhere, &version).unwrap();
-        } else {
-            fs::set_permissions(fixture.stored(""), fs::Permissions::from_mode(0o770)).unwrap();
-        }
         executable_support::write_executable(&stored, "#!/bin/sh\necho planted\n", 0o755);
+        let planted = fs::read(&stored).unwrap();
+        let named = match case {
+            "store root writable by group" => {
+                fs::set_permissions(fixture.stored(""), fs::Permissions::from_mode(0o770)).unwrap();
+                fixture.stored("")
+            }
+            "release directory is a symbolic link" => {
+                let version = fixture.stored("v0.7.0");
+                let elsewhere = fixture.temp.path("elsewhere");
+                fs::rename(&version, &elsewhere).unwrap();
+                std::os::unix::fs::symlink(&elsewhere, &version).unwrap();
+                version
+            }
+            _ => {
+                fs::set_permissions(&stored, fs::Permissions::from_mode(0o775)).unwrap();
+                stored.clone()
+            }
+        };
+        let out = run();
+        assert!(!out.status.success(), "{case}: {out:?}");
+        assert!(out.stdout.is_empty(), "{case}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let expected = format!(
+            "syq: cannot start syq 0.7.0 from the binary store: {} must be a ",
+            named.to_string_lossy().trim_end_matches('/')
+        );
+        assert!(stderr.starts_with(&expected), "{case}: {stderr}");
+        assert!(
+            stderr.contains(
+                "fix its permissions, or delete it and syq will install the release again"
+            ),
+            "{case}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("integrity verification"),
+            "{case}: {stderr}"
+        );
+        assert_eq!(fs::read(&stored).unwrap(), planted, "{case}");
+        if fs::symlink_metadata(&named).unwrap().is_dir() {
+            fs::remove_dir_all(&named).unwrap();
+        } else {
+            fs::remove_file(&named).unwrap();
+        }
         let out = run();
         assert_success(&out);
         assert_eq!(out.stdout, b"syq 0.7.0\n", "{case}");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("stored syq release failed integrity verification"),
-            "{case}: {stderr}"
-        );
         assert_eq!(fs::read(&stored).unwrap(), release, "{case}");
     }
 }

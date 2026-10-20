@@ -282,5 +282,5 @@ invoking build; normal bootstrap installs them unless disabled.
 For comparisons between two servers, use `--dry-run --hash --coordinate-at local`.
 This uses ordinary SSH access and supports `--results FILE` without restricted
 receiver enrollment. Files are hashed on the servers; your machine receives
-hashes, listings, and results. Remote setup may still cache the helper or
-[install syq](install.md#automatic-installation-on-ssh-servers).
+hashes, listings, and results. Remote setup may still install the helper or
+[syq](install.md#automatic-installation-on-ssh-servers).

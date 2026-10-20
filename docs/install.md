@@ -97,10 +97,7 @@ prerelease and development-build identities cannot be used in expressions.
 Syq installs its SSH helper on the server when needed, in the server's
 `~/.local/lib/syq`, and leaves it there for later copies. Official releases also
 try to make `syq` available at `~/.local/bin/syq` for commands you run there.
-Existing commands and shell startup files are left alone.
-
-Earlier releases kept helpers in `~/.cache/syq/helpers`. Syq no longer reads
-it, and you can delete it on your machine and on servers. See
+Existing commands and shell startup files are left alone. See
 [stored releases and helpers](environment.md#stored-releases-and-helpers) for
 removing old releases.
 
