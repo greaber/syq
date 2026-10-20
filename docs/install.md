@@ -36,8 +36,7 @@ Syq downloads and verifies that release the first time it is needed, keeps it
 in `~/.local/lib/syq` alongside other versions, and runs it with your command's
 arguments and environment. Your normal installation stays unchanged. Later
 calls run the stored release offline, like any installed program, without
-checking it again. If someone other than you or root could have changed it, or
-any directory above it, syq checks it again on each call instead.
+checking it again.
 
 Stored releases stay until you delete them. To remove a release, or replace a
 damaged one, delete its directory, for example `~/.local/lib/syq/v0.7.1/` for

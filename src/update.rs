@@ -402,157 +402,34 @@ fn stored_release_path(store: &Path, helper: &TrustedCurrentHelper) -> Result<Pa
     Ok(path)
 }
 
-/// The executable of a stored release that can be started without verifying
-/// it again, when only this user and root can have changed it since it was
-/// checked. Otherwise someone else could have put it there, or could rename
-/// the store away and plant another between this check and the `exec`, for
-/// example through a home directory or one of its parents that others can
-/// write.
-///
-/// Like OpenSSH's `StrictModes`, this resolves symbolic links above the store
-/// and then checks every directory of the resolved path from `/` down
-/// (`trusted_directory`). Below the store root, the release's directories must
-/// not be symbolic links, and its manifest and executable must be regular
-/// files owned by this user that group and others cannot write. The result is
-/// the resolved path, so the `exec` follows exactly the checked directories.
-/// This costs a `realpath` and a dozen `lstat`s; anything else gets the full
-/// checks instead.
-fn trusted_release(store: &Path, directory: &Path) -> Option<PathBuf> {
+/// Whether a stored release can be started without verifying it again: its
+/// files, and every directory from the store root down to theirs, are real
+/// files and directories rather than symbolic links, owned by this user, and
+/// not writable by group or others. Otherwise someone else may have put them
+/// there, for example in a home directory shared with other users.
+fn privately_stored(root: &Path, directory: &Path, files: &[&Path]) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let below = directory.strip_prefix(store).ok()?;
+    let Ok(below) = directory.strip_prefix(root) else {
+        return false;
+    };
     let user = unsafe { libc::geteuid() };
-    let mut path = PathBuf::new();
-    for component in fs::canonicalize(store)
-        .ok()?
-        .components()
-        .chain(below.components())
-    {
-        path.push(component);
-        if !trusted_directory(&fs::symlink_metadata(&path).ok()?, user) {
-            return None;
-        }
-    }
-    let executable = path.join(STORED_EXECUTABLE);
-    [path.join(MANIFEST_NAME), executable.clone()]
-        .iter()
-        .all(|file| {
-            fs::symlink_metadata(file).is_ok_and(|metadata| {
-                metadata.is_file() && metadata.uid() == user && metadata.mode() & 0o022 == 0
-            })
+    let private = |path: &Path, is_directory: bool| {
+        fs::symlink_metadata(path).is_ok_and(|metadata| {
+            let kind = if is_directory {
+                metadata.is_dir()
+            } else {
+                metadata.is_file()
+            };
+            kind && metadata.uid() == user && metadata.mode() & 0o022 == 0
         })
-        .then_some(executable)
-}
-
-/// A directory only root and this user can change: a real directory, not a
-/// symbolic link, owned by root or the user, that nobody else can write. Two
-/// writable cases are as safe. In a sticky directory, such as `/tmp`, only an
-/// entry's owner, the directory's owner, or root can rename the entry, and the
-/// caller checks the owner of the entry it uses next. A directory only the
-/// user's private group can write is as private as one only the user can
-/// write; it is common under a umask of 002.
-fn trusted_directory(metadata: &fs::Metadata, user: u32) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    metadata.is_dir()
-        && (metadata.uid() == user || metadata.uid() == 0)
-        && match metadata.mode() & 0o022 {
-            0 => true,
-            _ if metadata.mode() & 0o1000 != 0 => true,
-            0o020 => private_group() == Some(metadata.gid()),
-            _ => false,
-        }
-}
-
-/// The user's private group: the primary group, when it is named like the user
-/// and lists no other members. It is looked up at most once per process, and
-/// only when a group-writable directory needs it.
-fn private_group() -> Option<u32> {
-    #[cfg(debug_assertions)]
-    if let Some(value) = std::env::var_os("SYQ_TEST_PRIVATE_GROUP") {
-        return value.to_str().and_then(|value| value.parse().ok());
-    }
-    static GROUP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    *GROUP.get_or_init(|| {
-        let (name, gid) = user_account(unsafe { libc::geteuid() })?;
-        let (group, members) = group_record(gid)?;
-        is_private_group(&name, &group, &members).then_some(gid)
-    })
-}
-
-fn is_private_group(user: &[u8], group: &[u8], members: &[Vec<u8>]) -> bool {
-    group == user && members.iter().all(|member| member == user)
-}
-
-/// Run a reentrant NSS lookup with a growing buffer, up to a bound.
-fn with_account_buffer<T>(
-    mut lookup: impl FnMut(&mut [u8]) -> Result<Option<T>, i32>,
-) -> Option<T> {
-    let mut size = 1024;
-    while size <= 1024 * 1024 {
-        let mut buffer = vec![0u8; size];
-        match lookup(&mut buffer) {
-            Ok(found) => return found,
-            Err(libc::ERANGE) => size *= 2,
-            Err(_) => return None,
-        }
-    }
-    None
-}
-
-/// This user's name and primary group.
-fn user_account(uid: u32) -> Option<(Vec<u8>, u32)> {
-    use std::ffi::CStr;
-    with_account_buffer(|buffer| unsafe {
-        let mut record: libc::passwd = std::mem::zeroed();
-        let mut result = std::ptr::null_mut();
-        let status = libc::getpwuid_r(
-            uid,
-            &mut record,
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-            &mut result,
-        );
-        if status != 0 {
-            return Err(status);
-        }
-        Ok((!result.is_null() && !record.pw_name.is_null()).then(|| {
-            (
-                CStr::from_ptr(record.pw_name).to_bytes().to_vec(),
-                record.pw_gid,
-            )
-        }))
-    })
-}
-
-/// A group's name and listed members.
-fn group_record(gid: u32) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
-    use std::ffi::CStr;
-    with_account_buffer(|buffer| unsafe {
-        let mut record: libc::group = std::mem::zeroed();
-        let mut result = std::ptr::null_mut();
-        let status = libc::getgrgid_r(
-            gid,
-            &mut record,
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-            &mut result,
-        );
-        if status != 0 {
-            return Err(status);
-        }
-        if result.is_null() || record.gr_name.is_null() {
-            return Ok(None);
-        }
-        let mut members = Vec::new();
-        let mut member = record.gr_mem;
-        while !member.is_null() && !(*member).is_null() {
-            members.push(CStr::from_ptr(*member).to_bytes().to_vec());
-            member = member.add(1);
-        }
-        Ok(Some((
-            CStr::from_ptr(record.gr_name).to_bytes().to_vec(),
-            members,
-        )))
-    })
+    };
+    let mut path = root.to_path_buf();
+    private(&path, true)
+        && below.components().all(|component| {
+            path.push(component);
+            private(&path, true)
+        })
+        && files.iter().all(|file| private(file, false))
 }
 
 // What a stored executable is for, as named in messages about it.
@@ -608,7 +485,7 @@ fn store_helper(store: &Path, path: &Path, binary: &[u8], what: &str) -> Result<
 
 /// Create a directory in the binary store. Directories above the store follow
 /// the umask, like other programs' files there. The store's own directories
-/// are owner-only, so a release stored in them passes the `trusted_release`
+/// are owner-only, so a release stored in them passes the `privately_stored`
 /// check even under a group-writable umask.
 fn create_store_directory(store: &Path, directory: &Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
@@ -625,9 +502,8 @@ fn create_store_directory(store: &Path, directory: &Path) -> Result<()> {
 /// An explicit version selection stores the release beside its signed
 /// manifest. A download is checked against the manifest's signature, sizes, and
 /// hashes, and the release must report the expected version and build identity,
-/// before the manifest is stored. Finding both files where only this user and
-/// root can change them (`trusted_release`) therefore means the release passed
-/// those checks, so later runs start it
+/// before the manifest is stored. Finding both files in a private store
+/// therefore means the release passed those checks, so later runs start it
 /// directly without reading either file or checking online for freshness:
 /// release tags are immutable, and selecting a release deliberately permits
 /// running an older version. Anything else gets the full checks again. This
@@ -637,10 +513,11 @@ pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
     let tag = format!("v{version}");
     let store = binary_store()?;
     let directory = release_directory(&store, &tag, target);
-    if let Some(executable) = trusted_release(&store, &directory) {
+    let manifest_path = directory.join(MANIFEST_NAME);
+    let executable = directory.join(STORED_EXECUTABLE);
+    if privately_stored(&store, &directory, &[&manifest_path, &executable]) {
         return Ok(executable);
     }
-    let manifest_path = directory.join(MANIFEST_NAME);
     // Only explicit selection opts every build into the official trust anchor.
     let key = embedded_public_key()
         .unwrap_or_else(|_| Cow::Borrowed(include_str!("release-public-key.txt").trim()));
@@ -1636,20 +1513,6 @@ mod tests {
             error.downcast_ref::<DownloadTooLarge>().is_some(),
             "{error}"
         );
-    }
-
-    #[test]
-    fn private_group_is_named_like_the_user_and_lists_no_one_else() {
-        let user = b"alice".as_slice();
-        assert!(is_private_group(user, b"alice", &[]));
-        assert!(is_private_group(user, b"alice", &[b"alice".to_vec()]));
-        assert!(!is_private_group(user, b"staff", &[]));
-        assert!(!is_private_group(user, b"alice", &[b"bob".to_vec()]));
-        assert!(!is_private_group(
-            user,
-            b"alice",
-            &[b"alice".to_vec(), b"bob".to_vec()]
-        ));
     }
 
     #[test]
