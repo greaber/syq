@@ -9695,6 +9695,133 @@ fn changes_check_existence_only_where_numbers_mislead() {
     }
 }
 
+/// A small copy whose staging failed keeps the count of the files it may
+/// have staged: their sidecars stay for the fallback engine to resume, so
+/// they count against the entry limit as any file a change created. Here an
+/// invalid time fails each file's metadata after its sidecar is created,
+/// and a grant of one entry admits one such copy, not three. A small copy
+/// that fails before staging anything gives its count back.
+#[test]
+fn a_failed_small_copy_keeps_the_entries_its_staging_made() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let mut authority = test_authority_with_results(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+        None,
+    )
+    .unwrap();
+    authority.copy.limits.max_entries = 1;
+    authority.copy.options.preserve_times = true;
+    let authority = std::sync::Arc::new(authority);
+    let mut ops = authority.test_ops();
+    let mut gate = PatchStreamGate::new(authority.clone());
+    let changes = || authority.changes.load(std::sync::atomic::Ordering::Relaxed);
+    let offer = |file: &Path, if_exists| proto::SmallCopyRequest {
+        reuse_block_size: None,
+        if_exists,
+        matching_flags: 0,
+        hash_policy: authority.hash_policy(),
+        copy_if: None,
+        directory: path_bytes(&target),
+        symlink_policy: proto::OperatorSymlinkPolicy::Refuse,
+        request_prefix: path_bytes(&target),
+        identity: proto::SmallCopyIdentity {
+            copy_id: [8; 16],
+            dst_leaf: None,
+        },
+        flags: proto::flags::TIMES,
+        files: vec![proto::SmallCopyFile {
+            path: path_bytes(file),
+            expression_source: None,
+            size: 1,
+            meta: proto::Meta {
+                // Not a valid time: setting it fails once the file exists.
+                mtime_nsec: 1_000_000_000,
+                ..plain_meta()
+            },
+        }],
+    };
+    let payload = || {
+        Request::CopySmallFiles(vec![proto::SmallCopyPayload {
+            index: 0,
+            data: b"x".to_vec(),
+            hash: crate::fsops::content_digest(b"x"),
+        }])
+    };
+
+    // Different contents under `error-if-different`: nothing is staged, and
+    // the count comes back.
+    fs::write(target.join("other"), b"y").unwrap();
+    let response = execute_on_connection(
+        &mut gate,
+        &mut ops,
+        Request::PrepareSmallFiles(offer(
+            &target.join("other"),
+            crate::cli::IfExists::ErrorIfDifferent,
+        )),
+    )
+    .unwrap();
+    assert!(
+        matches!(response, proto::Response::SmallFilesPrepared(_)),
+        "{response:?}"
+    );
+    let response = execute_on_connection(&mut gate, &mut ops, payload()).unwrap();
+    assert!(
+        matches!(
+            response,
+            proto::Response::SmallFilesCopied(proto::SmallCopyResponse {
+                outcome: proto::SmallCopyOutcome::StagingFailed(_),
+                ..
+            })
+        ),
+        "{response:?}"
+    );
+    assert_eq!(changes(), 0);
+
+    for index in 0..3 {
+        let file = target.join(format!("{index}-fail"));
+        let prepared = execute_on_connection(
+            &mut gate,
+            &mut ops,
+            Request::PrepareSmallFiles(offer(&file, crate::cli::IfExists::Update)),
+        );
+        if index > 0 {
+            let error = prepared.unwrap_err();
+            assert!(error.contains("entry limit"), "{error}");
+            continue;
+        }
+        assert!(
+            matches!(prepared, Ok(proto::Response::SmallFilesPrepared(_))),
+            "{prepared:?}"
+        );
+        let response = execute_on_connection(&mut gate, &mut ops, payload()).unwrap();
+        assert!(
+            matches!(
+                response,
+                proto::Response::SmallFilesCopied(proto::SmallCopyResponse {
+                    outcome: proto::SmallCopyOutcome::StagingFailed(_),
+                    ..
+                })
+            ),
+            "{response:?}"
+        );
+        assert!(crate::fsops::partial_path(&file, &[8; 16])
+            .unwrap()
+            .exists());
+        assert_eq!(changes(), 1);
+    }
+}
+
 /// A preparation that may neither create nor update its file only looks,
 /// and so counts nothing against the entry limit: in place too, it creates
 /// no file and resizes none this copy holds.

@@ -2419,9 +2419,11 @@ impl RestrictedAuthority {
     /// the executor reports it did not make, and nothing else: a change
     /// whose condition the executor found unmet before changing anything
     /// (`fsops::condition_not_met`), a patch that found its file changed
-    /// since it was compared, and a small-copy file that needed no change.
-    /// A change that failed after it may have changed something stays
-    /// counted.
+    /// since it was compared, a small-copy file that needed no change, and
+    /// a small copy that wrote nothing. A change that failed after it may
+    /// have changed something stays counted, as do the files of a small
+    /// copy whose staging failed: their sidecars stay for the fallback
+    /// engine to resume.
     fn refund_unmade(&self, charged: &Charged, response: &proto::Response) {
         use crate::fsops::is_unchanged_wire as unmet;
         let all = || (0..charged.changes as usize).collect::<Vec<usize>>();
@@ -2471,6 +2473,18 @@ impl RestrictedAuthority {
                 })
                 .map(|(index, _)| index)
                 .collect(),
+            proto::Response::SmallFilesCopied(proto::SmallCopyResponse {
+                outcome: proto::SmallCopyOutcome::StagingFailed(error),
+                ..
+            }) => {
+                if unmet(error) {
+                    all()
+                } else {
+                    Vec::new()
+                }
+            }
+            // A target it does not handle, a capacity shortfall, or one
+            // that needs block reuse: nothing was written.
             proto::Response::SmallFilesCopied(_) => all(),
             _ => Vec::new(),
         };

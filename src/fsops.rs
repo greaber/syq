@@ -1734,10 +1734,14 @@ impl FsOps {
                     matched_content[i] = held;
                 }
                 Ok(None) => {}
+                // Only the destinations were read: nothing changed.
                 Err(error) => {
                     return Ok(Response::SmallFilesCopied(SmallCopyResponse {
                         anchor,
-                        outcome: SmallCopyOutcome::StagingFailed(wire_error(&error)),
+                        outcome: SmallCopyOutcome::StagingFailed(WireError {
+                            unchanged: true,
+                            ..wire_error(&error)
+                        }),
                     }))
                 }
             }
@@ -1751,9 +1755,12 @@ impl FsOps {
         {
             return Ok(Response::SmallFilesCopied(SmallCopyResponse {
                 anchor,
-                outcome: SmallCopyOutcome::StagingFailed(wire_error(&anyhow::anyhow!(
-                    "destination contents differ (--if-exists=error-if-different)"
-                ))),
+                outcome: SmallCopyOutcome::StagingFailed(WireError {
+                    unchanged: true,
+                    ..wire_error(&anyhow::anyhow!(
+                        "destination contents differ (--if-exists=error-if-different)"
+                    ))
+                }),
             }));
         }
 
