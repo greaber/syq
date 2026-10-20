@@ -709,14 +709,19 @@ enum DestinationAuthentication {
     Receiver,
 }
 
+/// The SSH command a coordinator uses to reach the destination. With the
+/// broker it authenticates through the forwarded, filtered agent. With an
+/// enrollment it uses the entry key alone, whose file replaces the
+/// `IdentityFile=none` placeholder on the coordinator, with no agent, no
+/// control socket, no forwarding, no proxy, and only the pinned host keys.
 fn constrained_destination_rsh(
     port: u16,
     host_key_algorithms: &str,
     authentication: DestinationAuthentication,
 ) -> String {
-    let (publickey, checking) = match authentication {
-        DestinationAuthentication::Broker => ("host-bound", "no"),
-        DestinationAuthentication::Receiver => ("yes", "yes"),
+    let (publickey, checking, agent, only) = match authentication {
+        DestinationAuthentication::Broker => ("host-bound", "no", "SSH_AUTH_SOCK", "no"),
+        DestinationAuthentication::Receiver => ("yes", "yes", "none", "yes"),
     };
     let mut command = vec![
         "ssh".to_owned(),
@@ -727,11 +732,11 @@ fn constrained_destination_rsh(
         "-k".to_owned(),
         "-T".to_owned(),
         "-o".to_owned(),
-        "IdentityAgent=SSH_AUTH_SOCK".to_owned(),
+        format!("IdentityAgent={agent}"),
         "-o".to_owned(),
-        "IdentitiesOnly=no".to_owned(),
+        format!("IdentitiesOnly={only}"),
         "-o".to_owned(),
-        "IdentityFile=none".to_owned(),
+        ENTRY_KEY_PLACEHOLDER.to_owned(),
         "-o".to_owned(),
         "CertificateFile=none".to_owned(),
         "-o".to_owned(),
@@ -782,18 +787,70 @@ fn constrained_destination_rsh(
 }
 
 pub(crate) const RECEIVER_KNOWN_HOSTS: &str = "SYQ_INTERNAL_NATIVE_RECEIVER_KNOWN_HOSTS";
+/// Set when a remote coordinator's input starts with this many bytes of the
+/// enrollment's entry key. The key never appears in arguments or the
+/// environment.
+pub(crate) const ENTRY_KEY_STDIN: &str = "SYQ_INTERNAL_NATIVE_ENTRY_KEY";
 const RECEIVER_HOST_ALIAS: &str = "syq-enrolled-receiver";
+/// The identity of the coordinator's SSH command to the receiver until the
+/// coordinator puts its copy of the entry key there. An SSH command that
+/// keeps it has no identity, and fails.
+const ENTRY_KEY_PLACEHOLDER: &str = "IdentityFile=none";
+/// The longest entry key a coordinator reads: a 16,384-bit RSA key.
+const MAX_ENTRY_KEY_BYTES: usize = 16 * 1024;
 
-/// Materialize the laptop's trusted destination keys on the source. The guard
-/// lives through all workers; ordinary OpenSSH verifies every connection.
+/// Materialize the laptop's trusted destination keys and the entry key on
+/// the coordinator, in a private temporary directory that lives through all
+/// workers; ordinary OpenSSH verifies every connection with them.
 pub(crate) fn prepare_receiver_ssh(args: &mut Args) -> Result<Option<tempfile::TempDir>> {
+    let entry_key = args
+        .entry_key_stdin
+        .take()
+        .filter(|_| args.delegated)
+        .map(read_entry_key)
+        .transpose()?;
     let Some(known_hosts) = args.receiver_known_hosts.take() else {
+        anyhow::ensure!(
+            entry_key.is_none(),
+            "an entry key needs the receiver's host keys"
+        );
         return Ok(None);
     };
-    prepare_receiver_ssh_with(args, &known_hosts).map(Some)
+    let entry_key =
+        entry_key.context("a restricted receiver's SSH connections need its entry key")?;
+    prepare_receiver_ssh_with(args, &known_hosts, &entry_key).map(Some)
 }
 
-fn prepare_receiver_ssh_with(args: &mut Args, known_hosts: &str) -> Result<tempfile::TempDir> {
+/// Read the entry key the requesting syq sends first on this coordinator's
+/// input, before any manifest.
+fn read_entry_key(length: usize) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    use std::os::fd::{AsFd, AsRawFd};
+    anyhow::ensure!(
+        (1..=MAX_ENTRY_KEY_BYTES).contains(&length),
+        "invalid entry key length"
+    );
+    // Read exactly the key from the descriptor, without buffering any of the
+    // input that follows it.
+    let mut input = std::fs::File::from(
+        std::io::stdin()
+            .as_fd()
+            .try_clone_to_owned()
+            .context("take the requesting syq's input")?,
+    );
+    let _ = input.as_raw_fd();
+    let mut key = zeroize::Zeroizing::new(vec![0; length]);
+    input
+        .read_exact(&mut key)
+        .context("the requesting syq ended before sending the entry key")?;
+    crate::restricted::parse_entry_key(&key)?;
+    Ok(key)
+}
+
+fn prepare_receiver_ssh_with(
+    args: &mut Args,
+    known_hosts: &str,
+    entry_key: &[u8],
+) -> Result<tempfile::TempDir> {
     anyhow::ensure!(
         args.restricted_grant
             .as_deref()
@@ -811,15 +868,42 @@ fn prepare_receiver_ssh_with(args: &mut Args, known_hosts: &str) -> Result<tempf
         ssh_key::PublicKey::from_openssh(key).context("invalid receiver host key")?;
     }
     let mut command = parse_rsh(&args.rsh)?;
-    let entry = command
-        .iter_mut()
-        .find(|argument| *argument == "UserKnownHostsFile=/dev/null")
-        .context("receiver SSH command is missing its known-hosts placeholder")?;
+    for required in [
+        "IdentityAgent=none",
+        "IdentitiesOnly=yes",
+        "ControlPath=none",
+    ] {
+        anyhow::ensure!(
+            command.iter().any(|argument| argument == required),
+            "receiver SSH command is missing {required}"
+        );
+    }
     let directory = crate::private_broker::private_temp_dir("syq-receiver-hosts-")?;
     let path = directory.path().join("known_hosts");
     std::fs::write(&path, known_hosts)?;
     crate::agent_broker::validate_openssh_option_path(&path, "receiver known-hosts file")?;
-    *entry = format!("UserKnownHostsFile={}", path.display());
+    let key = directory.path().join("entry-key");
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&key)
+            .context("write the entry key for the receiver's SSH connections")?;
+        file.write_all(entry_key)?;
+    }
+    crate::agent_broker::validate_openssh_option_path(&key, "entry key file")?;
+    let known = command
+        .iter_mut()
+        .find(|argument| *argument == "UserKnownHostsFile=/dev/null")
+        .context("receiver SSH command is missing its known-hosts placeholder")?;
+    *known = format!("UserKnownHostsFile={}", path.display());
+    let identity = command
+        .iter_mut()
+        .find(|argument| *argument == ENTRY_KEY_PLACEHOLDER)
+        .context("receiver SSH command is missing its entry key placeholder")?;
+    *identity = format!("IdentityFile={}", key.display());
     args.rsh = Some(shell_words::join(command));
     Ok(directory)
 }
@@ -987,7 +1071,7 @@ fn run_remote(
     }
 
     let mut broker_guard = None;
-    let mut _receiver_agent_guard = None;
+    let mut entry_key = None;
     let mut receiver_known_hosts = None;
     let mut peer_login_user = None;
     let mut peer_connection_host = None;
@@ -1061,29 +1145,17 @@ fn run_remote(
             .context(
                 "prepare command-restricted destination enrollment; use --peer-auth broker to explicitly request authentication-only confinement",
             )?;
-        let limit = broker_connection_limit(
-            args.connections_opt.or_else(|| {
-                args.resource_limits
-                    .as_ref()
-                    .and_then(|limits| limits.workers)
-            }),
-            prepared.is_some(),
-        )?;
-        let (ambient, socket) = if let Some(prepared) = prepared {
-            let ambient = coordinator_policy.agent_socket()
-                .context("authenticating to the source host needs its configured SSH agent; configure IdentityAgent or SSH_AUTH_SOCK")?
-                .to_string_lossy().into_owned();
-            crate::agent_broker::validate_openssh_option_path(
-                std::path::Path::new(&ambient),
-                "source SSH agent",
-            )?;
+        if let Some(prepared) = prepared {
+            // The coordinator gets the entry key on its input and uses it
+            // for every SSH connection to the receiver, so the copy needs
+            // nothing more from this machine: no agent is forwarded.
             receiver_known_hosts = Some(peer_policy.known_hosts(RECEIVER_HOST_ALIAS)?);
             constrained_rsh = Some(constrained_destination_rsh(
                 peer_policy.port(),
                 &peer_policy.host_key_algorithms(),
                 DestinationAuthentication::Receiver,
             ));
-            restricted_destination_path = Some(prepared.canonical_destination);
+            restricted_destination_path = Some(prepared.destination);
             restricted_grant = Some(prepared.grant);
             destination_results = Some(crate::destination_results::Expectation {
                 public_key: prepared.results_public_key.clone(),
@@ -1101,26 +1173,33 @@ fn run_remote(
                     prepared.enrollment_id
                 );
             }
-            let agent = crate::restricted::ReceiverAgent::start(prepared.ssh_key, limit)?;
-            crate::agent_broker::validate_openssh_option_path(
-                agent.socket_path(),
-                "receiver agent",
-            )?;
-            let socket = agent.socket_path().to_string_lossy().into_owned();
-            _receiver_agent_guard = Some(agent);
-            (ambient, socket)
+            entry_key = Some(zeroize::Zeroizing::new(
+                prepared
+                    .entry_key
+                    .to_openssh(ssh_key::LineEnding::LF)?
+                    .as_bytes()
+                    .to_vec(),
+            ));
+            Some(AgentForwarding::Disabled)
         } else {
+            let limit = broker_connection_limit(
+                args.connections_opt.or_else(|| {
+                    args.resource_limits
+                        .as_ref()
+                        .and_then(|limits| limits.workers)
+                }),
+                false,
+            )?;
             let policy = crate::agent_broker::BrokerPolicy::new(coordinator_policy, peer_policy);
             let broker = crate::agent_broker::ConstrainedAgentBroker::start(policy, limit)?;
             let ambient = broker.ambient_socket().to_string_lossy().into_owned();
             let socket = broker.socket_path().to_string_lossy().into_owned();
             broker_guard = Some(broker);
-            (ambient, socket)
-        };
-        Some(AgentForwarding::Constrained {
-            ambient,
-            broker: socket,
-        })
+            Some(AgentForwarding::Constrained {
+                ambient,
+                broker: socket,
+            })
+        }
     };
     if (args.receiver_max_entries.is_some() || args.receiver_max_bytes.is_some())
         && restricted_grant.is_none()
@@ -1330,12 +1409,19 @@ fn run_remote(
         remote.push(format!("--tcp-congestion={algorithm}"));
     }
     remote.push(format!("--tcp-ports={}", args.tcp_ports));
-    if let Some(remote_shell) = destination_rsh(
-        args.rsh.as_deref(),
-        same_host,
-        default_ssh_agent_policy.as_ref(),
-        constrained_rsh.as_deref(),
-    ) {
+    // With an entry key, the coordinator reaches the receiver with the entry
+    // key alone; otherwise the forwarding policy decides.
+    let remote_shell = if entry_key.is_some() {
+        constrained_rsh.clone()
+    } else {
+        destination_rsh(
+            args.rsh.as_deref(),
+            same_host,
+            default_ssh_agent_policy.as_ref(),
+            constrained_rsh.as_deref(),
+        )
+    };
+    if let Some(remote_shell) = remote_shell {
         remote.push("--rsh".into());
         remote.push(remote_shell);
     }
@@ -1430,6 +1516,9 @@ fn run_remote(
     }
     if let Some(known_hosts) = receiver_known_hosts {
         internal_environment.push((RECEIVER_KNOWN_HOSTS, known_hosts));
+    }
+    if let Some(key) = &entry_key {
+        internal_environment.push((ENTRY_KEY_STDIN, key.len().to_string()));
     }
     // Results come back as lines on the coordinator's output, marked with a
     // token file names printed there cannot guess.
@@ -1572,11 +1661,13 @@ fn run_remote(
             };
         }
         let mut cmd = make_command();
-        cmd.stdin(if follow_requester || args.mapping_contents.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
+        cmd.stdin(
+            if follow_requester || args.mapping_contents.is_some() || entry_key.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            },
+        )
         .stderr(Stdio::inherit());
         if relay.is_some() {
             cmd.stdout(Stdio::piped());
@@ -1590,7 +1681,13 @@ fn run_remote(
         // after the marker until the coordinator has exited.
         let input = child.stdin.take().map(|mut stdin| {
             let mapping = args.mapping_contents.clone();
+            let entry_key = entry_key.clone();
             std::thread::spawn(move || {
+                // The entry key comes first; the coordinator reads exactly
+                // its length before anything else reads its input.
+                if let Some(key) = entry_key {
+                    stdin.write_all(&key)?;
+                }
                 if let Some(mapping) = mapping {
                     stdin.write_all(&mapping.contents)?;
                 }

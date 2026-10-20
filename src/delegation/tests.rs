@@ -1,15 +1,14 @@
 use super::*;
+use crate::process::CommandExt as _;
 use std::fs;
 use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::net::UnixStream;
-use std::process::Child;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
 const NOW: i64 = 1_900_000_000;
 const SIGNER: &str = "alice@example.test";
-const MALLORY: &str = "mallory@example.test";
 const TARGET: &str = "backup";
 
 struct TestDir(PathBuf);
@@ -62,22 +61,10 @@ impl Drop for TestDir {
     }
 }
 
-struct AgentGuard {
-    child: Child,
-    socket: PathBuf,
-}
-
-impl Drop for AgentGuard {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 struct Fixture {
     directory: TestDir,
     key: PathBuf,
-    allowed_signers: PathBuf,
+    trusted: std::cell::RefCell<TrustedSigner>,
 }
 
 impl Fixture {
@@ -85,13 +72,18 @@ impl Fixture {
         let directory = TestDir::new("ordinary");
         let key = directory.join("signer");
         generate_key(&key);
-        let allowed_signers = directory.join("allowed-signers");
-        write_allowed_signers(&allowed_signers, SIGNER, &key.with_extension("pub"), false);
+        let public = ssh_key::PublicKey::read_openssh_file(&key.with_extension("pub"))
+            .expect("read test public key");
         Self {
             directory,
             key,
-            allowed_signers,
+            trusted: std::cell::RefCell::new(TrustedSigner::new(&public, None, None).unwrap()),
         }
+    }
+
+    /// Trust another login key instead.
+    fn trust(&self, key: &ssh_key::PublicKey) {
+        *self.trusted.borrow_mut() = TrustedSigner::new(key, None, None).unwrap();
     }
 
     fn replay(&self, name: &str) -> ReplayStore {
@@ -100,16 +92,12 @@ impl Fixture {
         ReplayStore::open(&path).expect("open replay store")
     }
 
-    fn policy(&self) -> SshsigPolicy {
-        SshsigPolicy {
-            ssh_keygen: ssh_tool("ssh-keygen"),
-            allowed_signers: self.allowed_signers.clone(),
-            revocation_file: None,
-        }
+    fn policy(&self) -> TrustedSigner {
+        self.trusted.borrow().clone()
     }
 
     fn signed(&self, grant: Grant) -> Vec<u8> {
-        signed_envelope(grant, &self.key, SSHSIG_NAMESPACE, None)
+        signed_envelope(grant, &self.key, SSHSIG_NAMESPACE)
     }
 }
 
@@ -145,18 +133,6 @@ fn generate_key(path: &Path) {
     command_output(command, "generate test signing key");
 }
 
-fn certify_key(ca: &Path, public_key: &Path, principals: &str) {
-    let mut command = Command::new(ssh_tool("ssh-keygen"));
-    command
-        .env_clear()
-        .args(["-q", "-s"])
-        .arg(ca)
-        .args(["-I", "syq-test", "-n", principals])
-        .arg(public_key)
-        .stdin(Stdio::null());
-    command_output(command, "create test signing certificate");
-}
-
 fn write_private(path: &Path, contents: &[u8]) {
     let mut file = OpenOptions::new()
         .write(true)
@@ -175,88 +151,7 @@ fn provision_test_replay_directory(path: &Path) {
         .expect("provision test replay directory");
 }
 
-fn write_allowed_signers(path: &Path, signer: &str, public_key: &Path, certificate: bool) {
-    let public_key = fs::read_to_string(public_key).expect("read test public key");
-    let authority = if certificate { "cert-authority," } else { "" };
-    let line = format!(
-        "{signer} {authority}namespaces=\"{SSHSIG_NAMESPACE}\" {}\n",
-        public_key.trim()
-    );
-    write_private(path, line.as_bytes());
-}
-
-fn agent_is_listening(socket: &Path) -> bool {
-    // bind() creates the socket file before listen() makes it connectable.
-    UnixStream::connect(socket).is_ok()
-}
-
-#[test]
-fn agent_readiness_requires_a_listener_not_just_a_socket_file() {
-    let directory = TestDir::new("agent-ready");
-    let path = directory.join("agent.sock");
-    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
-        .expect("create bound agent fixture");
-    socket
-        .bind(&socket2::SockAddr::unix(&path).unwrap())
-        .unwrap();
-    assert!(path.exists());
-    assert!(!agent_is_listening(&path));
-    socket.listen(1).unwrap();
-    assert!(agent_is_listening(&path));
-}
-
-fn start_agent(directory: &TestDir) -> AgentGuard {
-    let socket = directory.join("agent.sock");
-    let child = Command::new(ssh_tool("ssh-agent"))
-        .env_clear()
-        .args(["-D", "-a"])
-        .arg(&socket)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn_guarded()
-        .expect("start test ssh-agent");
-    let mut agent = AgentGuard { child, socket };
-    let started = Instant::now();
-    let deadline = started + Duration::from_secs(5);
-    let mut next_report = started + Duration::from_secs(1);
-    loop {
-        let status = agent.child.try_wait().expect("check test ssh-agent");
-        assert!(
-            status.is_none(),
-            "test ssh-agent exited before listening: {status:?}"
-        );
-        if agent_is_listening(&agent.socket) {
-            return agent;
-        }
-        let now = Instant::now();
-        assert!(
-            now < deadline,
-            "test ssh-agent did not listen on {}",
-            agent.socket.display()
-        );
-        if now >= next_report {
-            eprintln!(
-                "waiting for test ssh-agent to listen on {}",
-                agent.socket.display()
-            );
-            next_report = now + Duration::from_secs(1);
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-fn add_to_agent(agent: &AgentGuard, key: &Path) {
-    let mut command = Command::new(ssh_tool("ssh-add"));
-    command
-        .env_clear()
-        .env("SSH_AUTH_SOCK", &agent.socket)
-        .arg(key)
-        .stdin(Stdio::null());
-    command_output(command, "load test agent key");
-}
-
-fn sign(payload: &[u8], key: &Path, namespace: &str, agent: Option<&AgentGuard>) -> Vec<u8> {
+fn sign(payload: &[u8], key: &Path, namespace: &str) -> Vec<u8> {
     let mut command = Command::new(ssh_tool("ssh-keygen"));
     command
         .env_clear()
@@ -266,9 +161,6 @@ fn sign(payload: &[u8], key: &Path, namespace: &str, agent: Option<&AgentGuard>)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(agent) = agent {
-        command.env("SSH_AUTH_SOCK", &agent.socket);
-    }
     let mut child = command.spawn_guarded().expect("start test signer");
     child
         .stdin
@@ -358,13 +250,8 @@ fn context_at<'a>(
     }
 }
 
-fn signed_envelope(
-    grant: Grant,
-    key: &Path,
-    namespace: &str,
-    agent: Option<&AgentGuard>,
-) -> Vec<u8> {
-    signed_envelope_with_rate(grant, 0, key, namespace, agent)
+fn signed_envelope(grant: Grant, key: &Path, namespace: &str) -> Vec<u8> {
+    signed_envelope_with_rate(grant, 0, key, namespace)
 }
 
 fn signed_envelope_with_rate(
@@ -372,11 +259,10 @@ fn signed_envelope_with_rate(
     max_file_data_bytes_per_second: u64,
     key: &Path,
     namespace: &str,
-    agent: Option<&AgentGuard>,
 ) -> Vec<u8> {
     let payload = signing_payload_default(&grant, max_file_data_bytes_per_second)
         .expect("make signing payload");
-    let signature = sign(&payload, key, namespace, agent);
+    let signature = sign(&payload, key, namespace);
     SignedGrantEnvelope::new(grant, max_file_data_bytes_per_second, signature)
         .encode()
         .expect("encode signed grant")
@@ -432,11 +318,7 @@ fn released_v041_grants_keep_their_bytes_signature_and_replay_identity() {
         encoded
     );
     let fixture = Fixture::ordinary();
-    fs::write(
-        &fixture.allowed_signers,
-        format!("{SIGNER} {}\n", private.public_key().to_openssh().unwrap()),
-    )
-    .unwrap();
+    fixture.trust(private.public_key());
     let replay = fixture.replay("released-replay");
     verify_and_redeem(
         encoded,
@@ -462,11 +344,7 @@ fn congestion_extension_is_signed_and_cannot_be_removed_or_changed() {
     )
     .unwrap();
     let fixture = Fixture::ordinary();
-    fs::write(
-        &fixture.allowed_signers,
-        format!("{SIGNER} {}\n", private.public_key().to_openssh().unwrap()),
-    )
-    .unwrap();
+    fixture.trust(private.public_key());
     let encoded = sign_grant(
         fixture_grant(44),
         GrantConstraints {
@@ -511,11 +389,7 @@ fn extra_copy_options_are_signed_in_an_extension_released_readers_reject() {
     )
     .unwrap();
     let fixture = Fixture::ordinary();
-    fs::write(
-        &fixture.allowed_signers,
-        format!("{SIGNER} {}\n", private.public_key().to_openssh().unwrap()),
-    )
-    .unwrap();
+    fixture.trust(private.public_key());
     let options = ExtraCopyOptions {
         hardlinks: true,
         acls: true,
@@ -617,11 +491,7 @@ fn hashing_constraints_are_signed_and_preserve_legacy_encoding() {
     )
     .unwrap();
     let fixture = Fixture::ordinary();
-    fs::write(
-        &fixture.allowed_signers,
-        format!("{SIGNER} {}\n", private.public_key().to_openssh().unwrap()),
-    )
-    .unwrap();
+    fixture.trust(private.public_key());
     let hashing = CopyHashing {
         policy: HashPolicy {
             algorithm: HashAlgorithm::Xxh3,
@@ -683,11 +553,7 @@ fn mapping_extension_is_signed_and_preserves_non_mapping_encoding() {
     )
     .unwrap();
     let fixture = Fixture::ordinary();
-    fs::write(
-        &fixture.allowed_signers,
-        format!("{SIGNER} {}\n", private.public_key().to_openssh().unwrap()),
-    )
-    .unwrap();
+    fixture.trust(private.public_key());
     let mapping = crate::mapping::Authorization::from_contents(b"manifest bytes");
     for tcp in [None, Some("cubic".to_string())] {
         let encoded = sign_grant(
@@ -809,8 +675,7 @@ fn in_process_enrollment_key_signature_is_accepted_by_openssh() {
     let fixture = Fixture::ordinary();
     let keypair = ssh_key::private::Ed25519Keypair::from_seed(&[42; 32]);
     let private = PrivateKey::new(keypair.into(), "syq-test").unwrap();
-    let public = private.public_key().to_openssh().unwrap();
-    fs::write(&fixture.allowed_signers, format!("{SIGNER} {public}\n")).unwrap();
+    fixture.trust(private.public_key());
     let replay = fixture.replay("in-process-signature-replay");
     let encoded = sign_grant(fixture_grant(44), GrantConstraints::default(), &private).unwrap();
     SignedGrantEnvelope::decode(&encoded).unwrap();
@@ -960,7 +825,7 @@ fn malformed_and_noncanonical_sshsig_are_rejected() {
     let fixture = Fixture::ordinary();
     let grant = fixture_grant(5);
     let payload = signing_payload_default(&grant, 0).expect("payload");
-    let signature = sign(&payload, &fixture.key, SSHSIG_NAMESPACE, None);
+    let signature = sign(&payload, &fixture.key, SSHSIG_NAMESPACE);
 
     let mut malformed = signature.clone();
     let body_start = malformed
@@ -1018,13 +883,8 @@ fn verifies_ordinary_key_and_binds_every_typed_field() {
     .is_err());
 
     let rate_grant = fixture_grant(29);
-    let rate_limited = signed_envelope_with_rate(
-        rate_grant.clone(),
-        4096,
-        &fixture.key,
-        SSHSIG_NAMESPACE,
-        None,
-    );
+    let rate_limited =
+        signed_envelope_with_rate(rate_grant.clone(), 4096, &fixture.key, SSHSIG_NAMESPACE);
     let decoded = SignedGrantEnvelope::decode(&rate_limited).expect("decode rate-limited grant");
     assert_eq!(decoded.max_file_data_bytes_per_second, 4096);
     let tampered_rate = raw_envelope_with_rate(&rate_grant, 8192, &decoded.signature);
@@ -1041,12 +901,8 @@ fn verifies_ordinary_key_and_binds_every_typed_field() {
 fn rejects_wrong_namespace_signer_target_and_enrollment_without_redeeming() {
     let fixture = Fixture::ordinary();
     let grant = fixture_grant(8);
-    let wrong_namespace = signed_envelope(
-        grant.clone(),
-        &fixture.key,
-        "other-protocol@example.test",
-        None,
-    );
+    let wrong_namespace =
+        signed_envelope(grant.clone(), &fixture.key, "other-protocol@example.test");
     let replay = fixture.replay("binding-replay");
     assert!(verify_and_redeem(
         &wrong_namespace,
@@ -1059,16 +915,6 @@ fn rejects_wrong_namespace_signer_target_and_enrollment_without_redeeming() {
     let encoded = fixture.signed(grant.clone());
     assert!(verify_and_redeem(
         &encoded,
-        &context("mallory@example.test", TARGET, NOW, 0),
-        &fixture.policy(),
-        &replay,
-    )
-    .is_err());
-    let mut unlisted_signer = grant.clone();
-    unlisted_signer.signer = "mallory@example.test".to_owned();
-    let unlisted_signer = fixture.signed(unlisted_signer);
-    assert!(verify_and_redeem(
-        &unlisted_signer,
         &context("mallory@example.test", TARGET, NOW, 0),
         &fixture.policy(),
         &replay,
@@ -1236,12 +1082,18 @@ fn duplicate_and_concurrent_redemption_allow_exactly_one_redeem() {
             .contains("signed request has already been redeemed")),
         "{failures:?}"
     );
-    let mut no_verifier = fixture.policy();
-    no_verifier.ssh_keygen = PathBuf::from("/missing/verifier-must-not-run");
+    // The replay record is checked before the signature: a signer that
+    // could not verify the grant still reports the redemption.
+    let other = PrivateKey::new(
+        ssh_key::private::Ed25519Keypair::from_seed(&[43; 32]).into(),
+        "other",
+    )
+    .unwrap();
+    let no_signature = TrustedSigner::new(other.public_key(), None, None).unwrap();
     let error = verify_and_redeem(
         &encoded,
         &context(SIGNER, TARGET, NOW, 0),
-        &no_verifier,
+        &no_signature,
         &replay,
     )
     .expect_err("duplicate request must fail");
@@ -1282,56 +1134,6 @@ fn replay_redeem_survives_reopen_ignores_stale_temp_and_fails_closed_on_corrupti
         b"partial",
     );
     assert!(reopened.redeem(corrupt, [0x33; 32], NOW + 2).is_err());
-}
-
-#[test]
-fn verifier_snapshots_remain_pinned_when_the_state_path_is_replaced() {
-    let directory = TestDir::new("pinned-snapshot");
-    let state = directory.join("state");
-    let relocated = directory.join("relocated-state");
-    provision_test_replay_directory(&state);
-    let store = ReplayStore::open(&state).expect("open replay store");
-    fs::rename(&state, &relocated).expect("relocate open replay directory");
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&state)
-        .expect("replace replay pathname");
-
-    let temporary = store
-        .temporary_file("policy", b"pinned policy contents")
-        .expect("create pinned verifier snapshot");
-    let name = temporary.name.clone();
-    assert!(relocated.join(&name).is_file());
-    assert!(!state.join(&name).exists());
-    assert!(temporary
-        .is_read_only()
-        .expect("inspect snapshot access mode"));
-    assert!(temporary
-        .is_close_on_exec()
-        .expect("inspect snapshot descriptor flags"));
-    let byte = [0u8];
-    assert_eq!(
-        unsafe { libc::write(temporary.file.as_raw_fd(), byte.as_ptr().cast(), byte.len(),) },
-        -1,
-        "the verifier snapshot itself must not be writable"
-    );
-    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
-    let reserved = VerifierSnapshotFd::reserve(&temporary, 64)
-        .expect("reserve child-only verifier descriptor");
-    assert!(reserved
-        .is_close_on_exec()
-        .expect("inspect reserved descriptor flags"));
-    assert!(
-        descriptor_is_read_only(reserved.child.as_raw_fd()).expect("inspect reserved access mode")
-    );
-    assert_eq!(
-        fs::read(format!("/dev/fd/{}", temporary.file.as_raw_fd()))
-            .expect("read snapshot descriptor"),
-        b"pinned policy contents"
-    );
-
-    drop(temporary);
-    assert!(!relocated.join(name).exists());
 }
 
 #[test]
@@ -1378,30 +1180,29 @@ fn replay_store_accepts_a_setgid_private_directory() {
 }
 
 #[test]
-fn verifier_and_policy_checks_are_structural_not_ownership_walks() {
+fn private_state_checks_are_structural_not_ownership_walks() {
     let directory = TestDir::new("structural-policy");
     fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o777)).unwrap();
 
-    let verifier = directory.join("ssh-keygen");
-    fs::write(&verifier, b"test executable").unwrap();
-    fs::set_permissions(&verifier, fs::Permissions::from_mode(0o777)).unwrap();
-    validate_regular_executable(&verifier, "test verifier")
+    let executable = directory.join("syq");
+    fs::write(&executable, b"test executable").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o777)).unwrap();
+    validate_regular_executable(&executable, "test receiver")
         .expect("writable permissions do not reject a trusted receiver executable");
-    fs::set_permissions(&verifier, fs::Permissions::from_mode(0o666)).unwrap();
-    assert!(validate_regular_executable(&verifier, "test verifier").is_err());
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(validate_regular_executable(&executable, "test receiver").is_err());
 
-    let policy = directory.join("allowed-signers");
-    fs::write(&policy, b"signer ssh-ed25519 test\n").unwrap();
-    fs::set_permissions(&policy, fs::Permissions::from_mode(0o600)).unwrap();
+    let state = directory.join("config.json");
+    fs::write(&state, b"{}\n").unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(
-        read_private_regular(&policy, "test policy", 1024).unwrap(),
-        b"signer ssh-ed25519 test\n"
+        read_private_regular(&state, "test state", 1024).unwrap(),
+        b"{}\n"
     );
-    fs::set_permissions(&policy, fs::Permissions::from_mode(0o660)).unwrap();
-    assert!(read_private_regular(&policy, "test policy", 1024).is_err());
-    assert!(read_private_regular(&directory.0, "test policy", 1024).is_err());
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o660)).unwrap();
+    assert!(read_private_regular(&state, "test state", 1024).is_err());
+    assert!(read_private_regular(&directory.0, "test state", 1024).is_err());
 }
-
 #[test]
 fn request_ids_are_fresh_and_distinct_from_stable_copy_ids() {
     let first = RequestId::fresh(NOW).expect("fresh request ID");
@@ -1429,201 +1230,150 @@ fn timestamped_request_ids_sort_chronologically_and_stay_unique() {
 }
 
 #[test]
-fn verifier_timeout_kills_its_process_group() {
-    let mut command = Command::new("/bin/sh");
-    command
-        .args(["-c", "sleep 30"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let child = command
-        .spawn_guarded()
-        .expect("start stalled verifier fixture");
-    let started = Instant::now();
-    let error = wait_for_verifier(child, b"test", Duration::from_millis(50))
-        .expect_err("stalled verifier must time out");
-    assert!(error.to_string().contains("timeout"));
-    assert!(started.elapsed() < Duration::from_secs(2));
-}
-
-#[test]
-fn rejects_a_key_authorized_only_for_another_principal() {
-    let directory = TestDir::new("wrong-principal-key");
-    let key = directory.join("mallory");
+fn rejects_a_signature_by_any_key_but_the_trusted_one() {
+    let fixture = Fixture::ordinary();
+    let directory = TestDir::new("other-key");
+    let key = directory.join("other");
     generate_key(&key);
-    let allowed_signers = directory.join("allowed-signers");
-    write_allowed_signers(&allowed_signers, MALLORY, &key.with_extension("pub"), false);
-    let encoded = signed_envelope(fixture_grant(24), &key, SSHSIG_NAMESPACE, None);
-    let replay_path = directory.join("replay");
-    provision_test_replay_directory(&replay_path);
-    let replay = ReplayStore::open(&replay_path).expect("open replay store");
-    let policy = SshsigPolicy {
-        ssh_keygen: ssh_tool("ssh-keygen"),
-        allowed_signers,
-        revocation_file: None,
-    };
-
-    let error = verify_and_redeem(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
-        .expect_err("a key listed only for another principal must fail");
-    assert!(error.to_string().starts_with("SSHSIG verification failed"));
-}
-
-#[test]
-fn revocation_survives_replay_path_replacement() {
-    let fixture = Fixture::ordinary();
-    let revocations = fixture.directory.join("revocations");
-    let public_key =
-        fs::read(fixture.key.with_extension("pub")).expect("read revoked test public key");
-    write_private(&revocations, &public_key);
-    let mut policy = fixture.policy();
-    policy.revocation_file = Some(revocations);
-    let replay = fixture.replay("replaced-replay");
-    // Move the opened store aside and put a fresh, empty store at its
-    // old path. The verifier must keep using the retained directory.
-    let moved = fixture.directory.join("replaced-replay-moved");
-    fs::rename(&replay.path, &moved).expect("move replay directory");
-    provision_test_replay_directory(&replay.path);
+    let encoded = signed_envelope(fixture_grant(60), &key, SSHSIG_NAMESPACE);
     let error = verify_and_redeem(
-        &fixture.signed(fixture_grant(26)),
+        &encoded,
         &context(SIGNER, TARGET, NOW, 0),
-        &policy,
-        &replay,
+        &fixture.policy(),
+        &fixture.replay("other-key-replay"),
     )
-    .expect_err("a revoked signer must fail after its store path is replaced");
-    assert!(
-        error.to_string().starts_with("SSHSIG verification failed"),
-        "{error:#}"
-    );
-    assert!(fs::read_dir(&replay.path).unwrap().next().is_none());
+    .unwrap_err();
+    assert!(error.to_string().contains("does not trust"), "{error:#}");
 }
 
 #[test]
-fn rejects_a_revoked_signing_key() {
+fn a_probe_or_other_namespace_signature_never_verifies_as_a_grant() {
     let fixture = Fixture::ordinary();
-    let revocations = fixture.directory.join("revocations");
-    let public_key =
-        fs::read(fixture.key.with_extension("pub")).expect("read revoked test public key");
-    write_private(&revocations, &public_key);
-    let mut policy = fixture.policy();
-    policy.revocation_file = Some(revocations);
-    let replay = fixture.replay("revoked-replay");
+    for namespace in [
+        "syq-receiver-key-check-v1@greaber.github",
+        "syq-receiver-key-wrap-v1@greaber.github",
+        "git",
+        "file",
+    ] {
+        let encoded = signed_envelope(fixture_grant(61), &fixture.key, namespace);
+        let replay = fixture.replay(&format!("namespace-{}", namespace.len()));
+        let error = verify_and_redeem(
+            &encoded,
+            &context(SIGNER, TARGET, NOW, 0),
+            &fixture.policy(),
+            &replay,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("another purpose"), "{error:#}");
+    }
+}
 
-    let error = verify_and_redeem(
-        &fixture.signed(fixture_grant(25)),
-        &context(SIGNER, TARGET, NOW, 0),
-        &policy,
-        &replay,
+/// A FIDO key's SSHSIG over `payload` in `namespace`, with `flags`.
+fn security_key_signature(
+    seed: u8,
+    flags: u8,
+    namespace: &str,
+    payload: &[u8],
+) -> (ssh_key::PublicKey, Vec<u8>) {
+    use sha2::Digest as _;
+    use signature::Signer as _;
+    let pair = ssh_key::private::Ed25519Keypair::from_seed(&[seed; 32]);
+    let public = ssh_key::public::SkEd25519::new(pair.public, "ssh:");
+    let key = ssh_key::PublicKey::new(public.into(), "");
+    let hash = HashAlg::Sha512;
+    let data = ssh_key::SshSig::signed_data(namespace, hash, payload).unwrap();
+    let mut signed = Sha256::digest(b"ssh:").to_vec();
+    signed.push(flags);
+    signed.extend_from_slice(&7u32.to_be_bytes());
+    signed.extend_from_slice(&Sha256::digest(&data));
+    let mut bytes = pair.try_sign(&signed).unwrap().as_bytes().to_vec();
+    bytes.push(flags);
+    bytes.extend_from_slice(&7u32.to_be_bytes());
+    let signature = ssh_key::SshSig::new(
+        key.key_data().clone(),
+        namespace,
+        hash,
+        ssh_key::Signature::new(ssh_key::Algorithm::SkEd25519, bytes).unwrap(),
     )
-    .expect_err("a revoked signer must fail");
-    assert!(error.to_string().starts_with("SSHSIG verification failed"));
+    .unwrap()
+    .to_pem(LineEnding::LF)
+    .unwrap()
+    .into_bytes();
+    (key, signature)
 }
 
 #[test]
-fn verifies_certificate_signature_against_allowed_ca() {
-    let directory = TestDir::new("certificate");
-    let ca = directory.join("ca");
-    let user = directory.join("user");
-    generate_key(&ca);
-    generate_key(&user);
-    certify_key(&ca, &user.with_extension("pub"), SIGNER);
-
-    let agent = start_agent(&directory);
-    add_to_agent(&agent, &user);
-    let allowed_signers = directory.join("allowed-signers");
-    write_allowed_signers(&allowed_signers, SIGNER, &ca.with_extension("pub"), true);
-    let grant = fixture_grant(16);
-    let encoded = signed_envelope(
-        grant,
-        &directory.join("user-cert.pub"),
-        SSHSIG_NAMESPACE,
-        Some(&agent),
-    );
-    let replay_path = directory.join("replay");
-    provision_test_replay_directory(&replay_path);
-    let replay = ReplayStore::open(&replay_path).expect("open replay store");
-    let policy = SshsigPolicy {
-        ssh_keygen: ssh_tool("ssh-keygen"),
-        allowed_signers,
-        revocation_file: None,
-    };
-    verify_and_redeem(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
-        .expect("verify SSH certificate signature through allowed CA");
+fn security_key_grants_need_the_touch_and_pin_the_enrollment_recorded() {
+    let fixture = Fixture::ordinary();
+    let mut request = 70;
+    for flags in [0u8, 1, 4, 5] {
+        for required in [0u8, 1, 4, 5] {
+            request += 1;
+            let grant = fixture_grant(request);
+            let payload = signing_payload_default(&grant, 0).unwrap();
+            let (key, signature) = security_key_signature(9, flags, SSHSIG_NAMESPACE, &payload);
+            let encoded = SignedGrantEnvelope::new(grant, 0, signature)
+                .encode()
+                .unwrap();
+            let signer = TrustedSigner::new(&key, Some(required), None).unwrap();
+            let result = verify_and_redeem(
+                &encoded,
+                &context(SIGNER, TARGET, NOW, 0),
+                &signer,
+                &fixture.replay(&format!("sk-{flags}-{required}")),
+            );
+            assert_eq!(
+                result.is_ok(),
+                flags & required == required,
+                "{flags} {required}: {result:?}"
+            );
+            if let Err(error) = result {
+                assert!(error.to_string().contains("FIDO"), "{error:#}");
+            }
+        }
+    }
+    // A FIDO key needs a policy; a software key cannot have one.
+    let (key, _) = security_key_signature(9, 1, SSHSIG_NAMESPACE, b"");
+    assert!(TrustedSigner::new(&key, None, None).is_err());
+    assert!(TrustedSigner::new(&key, Some(2), None).is_err());
+    let software =
+        ssh_key::PublicKey::read_openssh_file(&fixture.key.with_extension("pub")).unwrap();
+    assert!(TrustedSigner::new(&software, Some(1), None).is_err());
 }
 
 #[test]
-fn rejects_certificate_without_the_expected_principal() {
-    let directory = TestDir::new("certificate-principal");
-    let ca = directory.join("ca");
-    let user = directory.join("user");
-    generate_key(&ca);
-    generate_key(&user);
-    certify_key(&ca, &user.with_extension("pub"), MALLORY);
-
-    let agent = start_agent(&directory);
-    add_to_agent(&agent, &user);
-    let allowed_signers = directory.join("allowed-signers");
-    write_allowed_signers(&allowed_signers, SIGNER, &ca.with_extension("pub"), true);
-    let encoded = signed_envelope(
-        fixture_grant(26),
-        &directory.join("user-cert.pub"),
-        SSHSIG_NAMESPACE,
-        Some(&agent),
-    );
-    let replay_path = directory.join("replay");
-    provision_test_replay_directory(&replay_path);
-    let replay = ReplayStore::open(&replay_path).expect("open replay store");
-    let policy = SshsigPolicy {
-        ssh_keygen: ssh_tool("ssh-keygen"),
-        allowed_signers,
-        revocation_file: None,
-    };
-
-    let error = verify_and_redeem(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
-        .expect_err("a certificate without the expected principal must fail");
-    assert!(error.to_string().starts_with("SSHSIG verification failed"));
+fn a_certificate_login_key_is_trusted_until_the_certificate_expires() {
+    let fixture = Fixture::ordinary();
+    let public = ssh_key::PublicKey::read_openssh_file(&fixture.key.with_extension("pub")).unwrap();
+    for (valid_before, skew, accepted) in [
+        // The receiver's clock is read to the second, and its later bound
+        // decides.
+        (NOW as u64 + 2, 0, true),
+        (NOW as u64 + 1, 0, false),
+        (NOW as u64, 0, false),
+        (NOW as u64 - 1, 0, false),
+        // The clock skew allowance favours the signer, as for start-by.
+        (NOW as u64 - 30, 60, true),
+        (NOW as u64 - 61, 60, false),
+    ] {
+        let signer = TrustedSigner::new(&public, None, Some(valid_before)).unwrap();
+        let grant = fixture_grant(90 + (valid_before % 100) as u8);
+        let result = verify_and_redeem(
+            &fixture.signed(grant),
+            &context(SIGNER, TARGET, NOW, skew),
+            &signer,
+            &fixture.replay(&format!("certificate-{valid_before}-{skew}")),
+        );
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "{valid_before} {skew}: {result:?}"
+        );
+        if let Err(error) = result {
+            assert!(error.to_string().contains("expired"), "{error:#}");
+        }
+    }
 }
-
-#[test]
-fn rejects_certificate_when_ca_is_not_marked_as_an_authority() {
-    let directory = TestDir::new("certificate-not-ca");
-    let ca = directory.join("ca");
-    let user = directory.join("user");
-    generate_key(&ca);
-    generate_key(&user);
-    certify_key(&ca, &user.with_extension("pub"), SIGNER);
-
-    let agent = start_agent(&directory);
-    add_to_agent(&agent, &user);
-    let allowed_signers = directory.join("allowed-signers");
-    write_allowed_signers(&allowed_signers, SIGNER, &ca.with_extension("pub"), false);
-    let encoded = signed_envelope(
-        fixture_grant(27),
-        &directory.join("user-cert.pub"),
-        SSHSIG_NAMESPACE,
-        Some(&agent),
-    );
-    let replay_path = directory.join("replay");
-    provision_test_replay_directory(&replay_path);
-    let replay = ReplayStore::open(&replay_path).expect("open replay store");
-    let policy = SshsigPolicy {
-        ssh_keygen: ssh_tool("ssh-keygen"),
-        allowed_signers,
-        revocation_file: None,
-    };
-
-    let error = verify_and_redeem(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
-        .expect_err("a certificate signed by a non-authority entry must fail");
-    assert!(error.to_string().starts_with("SSHSIG verification failed"));
-}
-
 #[test]
 fn publication_policies_keep_their_encodings() {
     // Released receivers know only the first two. `InPlaceNew` and

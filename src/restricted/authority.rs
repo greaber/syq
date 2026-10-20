@@ -318,6 +318,105 @@ pub(super) fn reject_control_plane_scopes(
     Ok(())
 }
 
+/// The directory a copy's destination is in, resolved and opened when the
+/// copy starts and held for the whole copy. No device or inode outlives the
+/// session: a remount between copies changes nothing.
+pub(crate) struct ConfinedRoot {
+    root: Root,
+    /// The path requests name the directory by: the signed destination's
+    /// parent.
+    named: Vec<u8>,
+    /// Where the directory really is.
+    real: Vec<u8>,
+}
+
+impl ConfinedRoot {
+    /// The signed destination's directory as the account itself resolves it
+    /// now, refused when it is, or is inside, a protected path, by name or
+    /// by identity.
+    pub(super) fn resolve(destination: &[u8], protected: &[ReceiverControlPath]) -> Result<Self> {
+        let destination = Path::new(OsStr::from_bytes(destination));
+        let parent = requested_parent(destination);
+        let real = fs::canonicalize(parent).with_context(|| {
+            format!(
+                "resolve the directory {} the destination goes in",
+                parent.display()
+            )
+        })?;
+        reject_control_plane_path(real.as_os_str().as_bytes(), protected)?;
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOCTTY | libc::O_CLOEXEC)
+            .open(&real)
+            .with_context(|| format!("open the destination's directory {}", real.display()))?;
+        reject_protected_ancestry(&directory, protected)?;
+        Ok(Self {
+            root: Root::from_directory(directory)?,
+            named: parent.as_os_str().as_bytes().to_vec(),
+            real: real.as_os_str().as_bytes().to_vec(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn identity(&self) -> RootIdentity {
+        self.root.identity()
+    }
+
+    /// A directory this session already chose and checked, such as a
+    /// receiving machine's container.
+    pub(super) fn opened(path: &Path, expected: RootIdentity) -> Result<Self> {
+        Ok(Self {
+            root: Root::open_verified(path, expected)?,
+            named: path.as_os_str().as_bytes().to_vec(),
+            real: path.as_os_str().as_bytes().to_vec(),
+        })
+    }
+}
+
+/// Refuse a directory that is a protected path or lies anywhere beneath
+/// one, by the identities of the directory and of each directory above it,
+/// as the session finds them.
+fn reject_protected_ancestry(directory: &File, protected: &[ReceiverControlPath]) -> Result<()> {
+    let identities: Vec<_> = protected
+        .iter()
+        .filter_map(|control| {
+            fs::metadata(Path::new(OsStr::from_bytes(&control.path)))
+                .ok()
+                .map(|metadata| ((metadata.dev(), metadata.ino()), control))
+        })
+        .collect();
+    let mut current = directory.try_clone()?;
+    for _ in 0..4096 {
+        let metadata = current.metadata()?;
+        let identity = (metadata.dev(), metadata.ino());
+        if let Some((_, control)) = identities.iter().find(|(known, _)| *known == identity) {
+            bail!(
+                "command-restricted destination overlaps the receiver's protected {} {}; choose a destination outside the receiver control plane",
+                control.label,
+                Path::new(OsStr::from_bytes(&control.path)).display()
+            );
+        }
+        let fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                c"..".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOCTTY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("open a directory above the destination");
+        }
+        let parent = unsafe { File::from_raw_fd(fd) };
+        let parent_metadata = parent.metadata()?;
+        if (parent_metadata.dev(), parent_metadata.ino()) == identity {
+            return Ok(());
+        }
+        current = parent;
+    }
+    bail!("the destination's directory is nested too deeply")
+}
+
 /// Shared capability inherited by the authorized SSH control process and all
 /// of its token-authenticated TCP workers. HostA may choose protocol messages,
 /// but it cannot remove or replace this receiver-side authority.
@@ -433,7 +532,7 @@ impl RestrictedAuthority {
     }
 
     pub(super) fn new(
-        config: &ReceiverEnrollment,
+        confined: ConfinedRoot,
         grant: Grant,
         extensions: GrantConstraints,
         grant_digest: [u8; 32],
@@ -462,28 +561,26 @@ impl RestrictedAuthority {
         }
         let filter_matcher = crate::scan::build_ignore(&filters.ignore)?;
         let filter_roots = filters.destination_roots.clone();
-        let root_path = Path::new(&config.root);
+        let root_path = Path::new(std::ffi::OsStr::from_bytes(&confined.named));
         let destination = Path::new(std::ffi::OsStr::from_bytes(&copy.destination));
         let relative = destination.strip_prefix(root_path).with_context(|| {
             format!(
-                "signed destination {} is outside enrolled root {}",
+                "signed destination {} is outside the directory {} it was resolved in",
                 destination.display(),
                 root_path.display()
             )
         })?;
         if relative.as_os_str().is_empty() {
-            bail!("signed destination must be a child of the enrolled root");
+            bail!("signed destination must be a child of its directory");
         }
         crate::rooted::RelativePath::new(relative.as_os_str().as_bytes())?;
-        let mut root = std::sync::Arc::new(Root::open_verified(
-            root_path,
-            RootIdentity {
-                dev: config.root_dev,
-                ino: config.root_ino,
-            },
-        )?);
-        let mut held_path = config.root.as_bytes().to_vec();
         let relative = relative.as_os_str().as_bytes();
+        // Where the destination really is, by name, beside the checks of the
+        // names the grant uses and of identities below.
+        reject_control_plane_path(&crate::fsops::join(&confined.real, relative), protected)?;
+        let real_root = confined.real.clone();
+        let mut held_path = confined.named.clone();
+        let mut root = std::sync::Arc::new(confined.root);
         // `--follow-dst`: a destination reached through symlinks is the
         // directory they resolve to inside the enrolled root. That
         // directory, or the deepest existing one the copy creates the rest
@@ -510,7 +607,7 @@ impl RestrictedAuthority {
             // creates, by its names as well as by identity: a control
             // directory that does not exist yet has no identity.
             let resolved = signed[found.signed_components..].iter().fold(
-                crate::fsops::join(config.root.as_bytes(), &found.existing.join(&b'/')),
+                crate::fsops::join(&real_root, &found.existing.join(&b'/')),
                 |path, component| crate::fsops::join(&path, component),
             );
             reject_control_plane_path(&resolved, protected)?;

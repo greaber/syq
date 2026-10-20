@@ -1,28 +1,73 @@
+//! The enrolling machine's side of enrollment: one enrollment per server
+//! account, set up and refreshed over the user's own login.
 use super::*;
 use crate::process::CommandExt as _;
 use std::io::BufRead as _;
 
 pub(super) fn local_state_base() -> Result<PathBuf> {
     let (_, home) = current_account()?;
-    ensure_private_chain(&home, &[".local", "state", "syq", "restricted"])
-        .context("validate restricted enrollment state on the invoking machine")
+    ensure_private_chain(&home, &LOCAL_STATE).context("validate enrollment state on this machine")
 }
 
-#[cfg(test)]
-pub(super) fn store_pending_files(
-    directory: &Path,
-    pending: &PendingEnrollment,
-    private_key: &PrivateKey,
-) -> Result<()> {
-    let private = private_key
-        .to_openssh(LineEnding::LF)
-        .context("encode enrollment private key")?;
-    atomic_write(directory, "enrollment-key", private.as_bytes(), 0o600)?;
-    atomic_write(
-        directory,
-        "pending.json",
-        &serde_json::to_vec(pending)?,
-        0o600,
+pub(super) const ENROLLMENT_FILE: &str = "enrollment.json";
+pub(super) const PENDING_FILE: &str = "pending.json";
+
+/// The records named `file` in the enrollment directories below `base`, of
+/// this version only: state that released versions wrote lives elsewhere
+/// and is never read.
+fn load_records<T: serde::de::DeserializeOwned>(
+    base: &Path,
+    file: &str,
+    label: &str,
+    version: impl Fn(&T) -> (u16, EnrollmentId),
+) -> Result<Vec<(T, PathBuf)>> {
+    let mut records = Vec::new();
+    for entry in fs::read_dir(base).with_context(|| format!("list {}", base.display()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let directory = entry.path();
+        if delegation::validate_private_directory_path(&directory).is_err() {
+            continue;
+        }
+        let Ok(encoded) =
+            delegation::read_private_regular(&directory.join(file), label, MAX_STATE_FILE)
+        else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<T>(&encoded) else {
+            continue;
+        };
+        let (record_version, id) = version(&record);
+        if record_version == CONFIG_VERSION && id.to_string() == entry.file_name().to_string_lossy()
+        {
+            records.push((record, directory));
+        }
+    }
+    records.sort_by_key(|(record, _)| version(record).1.to_string());
+    Ok(records)
+}
+
+pub(super) fn load_local_enrollments() -> Result<Vec<(LocalEnrollment, PathBuf)>> {
+    load_local_enrollments_in(&local_state_base()?)
+}
+
+pub(super) fn load_local_enrollments_in(base: &Path) -> Result<Vec<(LocalEnrollment, PathBuf)>> {
+    load_records(
+        base,
+        ENROLLMENT_FILE,
+        "local enrollment",
+        |record: &LocalEnrollment| (record.version, record.id),
+    )
+}
+
+pub(super) fn load_pending_enrollments() -> Result<Vec<(PendingEnrollment, PathBuf)>> {
+    load_records(
+        &local_state_base()?,
+        PENDING_FILE,
+        "pending local enrollment",
+        |record: &PendingEnrollment| (record.version, record.id),
     )
 }
 
@@ -32,88 +77,21 @@ pub(super) fn complete_local_enrollment(
 ) -> Result<()> {
     atomic_write(
         directory,
-        "metadata.json",
+        ENROLLMENT_FILE,
         &serde_json::to_vec(metadata)?,
         0o600,
     )?;
     let directory = open_directory(directory)?;
     lock_directory(&directory)?;
-    remove_leaf_locked(&directory, "pending.json")
+    remove_leaf_locked(&directory, PENDING_FILE)
 }
 
-pub(super) fn load_local_enrollments() -> Result<Vec<(LocalEnrollment, PathBuf)>> {
-    let base = local_state_base()?;
-    let mut enrollments = Vec::new();
-    for entry in fs::read_dir(&base).with_context(|| format!("list {}", base.display()))? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let directory = entry.path();
-        if delegation::validate_private_directory_path(&directory).is_err() {
-            continue;
-        }
-        let metadata_path = directory.join("metadata.json");
-        let Ok(encoded) = delegation::read_private_regular(
-            &metadata_path,
-            "local enrollment metadata",
-            MAX_STATE_FILE,
-        ) else {
-            continue;
-        };
-        let Ok(metadata) = serde_json::from_slice::<LocalEnrollment>(&encoded) else {
-            continue;
-        };
-        if supported_config_version(metadata.version)
-            && metadata.id.to_string() == entry.file_name().to_string_lossy()
-        {
-            enrollments.push((metadata, directory));
-        }
-    }
-    Ok(enrollments)
-}
-
-pub(super) fn load_pending_enrollments() -> Result<Vec<(PendingEnrollment, PathBuf)>> {
-    let base = local_state_base()?;
-    let mut enrollments = Vec::new();
-    for entry in fs::read_dir(&base).with_context(|| format!("list {}", base.display()))? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let directory = entry.path();
-        if delegation::validate_private_directory_path(&directory).is_err() {
-            continue;
-        }
-        let metadata_path = directory.join("pending.json");
-        let Ok(encoded) = delegation::read_private_regular(
-            &metadata_path,
-            "pending local enrollment metadata",
-            MAX_STATE_FILE,
-        ) else {
-            continue;
-        };
-        let Ok(metadata) = serde_json::from_slice::<PendingEnrollment>(&encoded) else {
-            continue;
-        };
-        if supported_config_version(metadata.version)
-            && metadata.id.to_string() == entry.file_name().to_string_lossy()
-        {
-            enrollments.push((metadata, directory));
-        }
-    }
-    enrollments.sort_by_key(|(metadata, _)| metadata.id.to_string());
-    Ok(enrollments)
-}
-
-#[cfg(test)]
-pub(super) fn load_private_key(directory: &Path) -> Result<PrivateKey> {
-    let encoded = delegation::read_private_regular(
-        &directory.join("enrollment-key"),
-        "enrollment private key",
-        128 * 1024,
-    )?;
-    PrivateKey::from_openssh(&encoded).context("parse enrollment private key")
+/// Remove an enrollment's local state, after it was revoked or its server
+/// state was found missing.
+pub(super) fn remove_local_enrollment(directory: &Path) -> Result<()> {
+    delegation::validate_private_directory_path(directory)?;
+    fs::remove_dir_all(directory)
+        .with_context(|| format!("remove local enrollment {}", directory.display()))
 }
 
 #[derive(Debug)]
@@ -199,19 +177,31 @@ pub(super) fn run_ssh(
     Ok(output.stdout)
 }
 
+/// What a management session runs on the server after the user's login.
+/// Installing runs in its own session (`install_over_route`), which also
+/// reads the login trace.
 #[derive(Clone, Copy)]
 pub(super) enum ManagementAction {
-    Install,
     Revoke,
 }
 
 impl ManagementAction {
     pub(super) fn argument(self) -> &'static str {
         match self {
-            Self::Install => "--restricted-install",
             Self::Revoke => "--restricted-revoke",
         }
     }
+}
+
+/// Shell commands that make the store's directory `$d` and stage the
+/// uploaded syq at `$p` in it, removed again when the shell exits.
+/// Directories above the store follow the umask; the store's own are the
+/// owner's alone.
+fn stage_commands(stage: &str) -> String {
+    format!(
+        "d=\"$HOME/{store}\"; p=\"$d/{stage}\"; mkdir -p -- \"$HOME/.local/lib\"; umask 077; mkdir -p -- \"$d\"; trap 'rm -f -- \"$p\"' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; cat >\"$p\"; chmod 700 \"$p\"",
+        store = BINARY_STORE,
+    )
 }
 
 pub(super) fn management_remote_command(
@@ -221,7 +211,8 @@ pub(super) fn management_remote_command(
 ) -> Result<String> {
     let request = std::str::from_utf8(request).context("management request is not UTF-8")?;
     Ok(format!(
-        "set -eu; d=\"$HOME/.local/libexec\"; p=\"$d/{stage}\"; umask 077; mkdir -p -- \"$d\"; trap 'rm -f -- \"$p\"' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; cat >\"$p\"; chmod 700 \"$p\"; printf '%s' {} | \"$p\" {}",
+        "set -eu; {}; printf '%s' {} | \"$p\" {}",
+        stage_commands(stage),
         shell_words::quote(request),
         action.argument()
     ))
@@ -246,15 +237,23 @@ pub(super) fn run_management_over_route(
     let platform = crate::remote_helper::Target::for_bootstrap(os, arch)
         .with_context(|| format!("restricted enrollment does not support {os} {arch}"))?;
     let bytes = management_executable(platform)?;
-    let mut nonce = [0u8; 8];
-    getrandom::fill(&mut nonce).context("generate receiver staging filename")?;
-    let stage = format!(".syq-receiver-{}-{:016x}", id, u64::from_le_bytes(nonce));
+    let stage = stage_name(id)?;
     let command = management_remote_command(&stage, action, input)?;
     // Upload and invocation share one SSH session. The remote shell installs
     // its cleanup trap before reading the binary and retains it until the
     // management helper exits, so there is no inter-session orphan window or
     // cleanup request that depends on a route which has already failed.
     run_ssh(target, route, &command, &bytes)
+}
+
+fn stage_name(id: EnrollmentId) -> Result<String> {
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce).context("generate receiver staging filename")?;
+    Ok(format!(
+        ".syq-stage-{}-{:016x}",
+        id,
+        u64::from_le_bytes(nonce)
+    ))
 }
 
 pub(super) fn management_executable(target: crate::remote_helper::Target) -> Result<Vec<u8>> {
@@ -299,226 +298,204 @@ pub(super) fn read_local_management_executable(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub(super) fn install_over_route(
-    target: &SshEndpoint,
-    route: EnrollmentRoute<'_>,
-    request: &InstallRequest,
-) -> Result<InstallResponse> {
-    let expected_id = request.id;
-    let expected_login = request.target_login.clone();
-    let request = serde_json::to_vec(request)?;
-    let output = run_management_over_route(
-        target,
-        route,
-        expected_id,
-        ManagementAction::Install,
-        &request,
-    )?;
-    let response: InstallResponse =
-        serde_json::from_slice(&output).context("decode restricted enrollment response")?;
-    if response.version != CONFIG_VERSION
-        || response.id != expected_id
-        || response.target_login != expected_login
-    {
-        bail!("restricted enrollment response did not match the request");
-    }
-    Ok(response)
-}
-
 pub(super) fn endpoint(login: &str, host: &str, port: Option<u16>) -> Result<SshEndpoint> {
     SshEndpoint::from_parts(login, host, port)
 }
 
+/// The SSH agent the user's configuration selects for `target`: its
+/// `IdentityAgent`, else `SSH_AUTH_SOCK`.
+pub(super) fn configured_agent(
+    target: &SshEndpoint,
+    route: EnrollmentRoute<'_>,
+) -> Result<Option<PathBuf>> {
+    let output = Command::new("ssh")
+        .arg("-G")
+        .args(enrollment::enrollment_ssh_args_raw(target, route, ""))
+        .capture_output()
+        .context("inspect the SSH configuration for the enrollment's login")?;
+    if !output.status.success() {
+        bail!(
+            "could not read the SSH configuration for {}",
+            target.label()
+        );
+    }
+    crate::agent_broker::configured_agent_socket(&output.stdout)
+}
+
+/// What one enrollment session sets up: a new enrollment, a retry of one
+/// whose installation was not confirmed, or a refresh of an existing one.
+struct Plan {
+    id: EnrollmentId,
+    directory: PathBuf,
+    /// The entry key, unless a new enrollment makes one for the login key.
+    entry_key: Option<PrivateKey>,
+    refresh: bool,
+    replaces: Option<ReplacedEnrollment>,
+}
+
+enum Session {
+    Installed(LocalEnrollment, Box<LoginSigner>),
+    StateMissing,
+}
+
+/// The enrollment for `login@host:port`, set up when there is none, and
+/// refreshed when it runs another build or `refresh` asks to find the
+/// login key again. Returns the login key's signer when this logged in to
+/// the server.
 pub(super) fn enroll(
     host: &str,
     port: Option<u16>,
     login: &str,
-    requested_destination: &str,
     jump: Option<&SshEndpoint>,
-    refresh_existing: bool,
-    follows_destination: bool,
-) -> Result<(LocalEnrollment, PathBuf, Vec<u8>)> {
+    refresh: bool,
+) -> Result<(LocalEnrollment, PathBuf, Option<LoginSigner>)> {
+    // The receiver refuses to run as root; say so before creating anything.
+    // An account with another name and user ID 0 is refused when installing.
+    if login == "root" {
+        bail!(privileged_receiver_message(None));
+    }
     let base = local_state_base()?;
     let base_lock = open_directory(&base)?;
     lock_directory(&base_lock)?;
-
-    let mut active = None;
-    for (metadata, directory) in load_local_enrollments()? {
-        if metadata.host == host && metadata.port == port && metadata.target_login == login {
-            if let Some(canonical_destination) =
-                destination_for(&metadata, requested_destination.as_bytes())?
-            {
-                active = Some((metadata, directory, canonical_destination));
-                break;
-            }
+    let account = |metadata_host: &str, metadata_port: Option<u16>, target_login: &str| {
+        metadata_host == host && metadata_port == port && target_login == login
+    };
+    let active = load_local_enrollments()?
+        .into_iter()
+        .find(|(metadata, _)| account(&metadata.host, metadata.port, &metadata.target_login));
+    if let Some((metadata, directory)) = &active {
+        if !refresh && metadata.release == crate::identity::build() {
+            return Ok((metadata.clone(), directory.clone(), None));
         }
     }
-    // The receiver refuses to run as root; say so before creating anything,
-    // with how to remove a root enrollment made before. An account with
-    // another name and user ID 0 is refused when installing.
-    if login == "root" {
-        let existing = active
-            .as_ref()
-            .map(|(metadata, _, _)| metadata.id.to_string());
-        bail!(privileged_receiver_message(existing.as_deref()));
-    }
-    if !refresh_existing
-        && active
-            .as_ref()
-            .is_some_and(|(metadata, _, _)| metadata.version == CONFIG_VERSION)
-    {
-        return Ok(active.take().unwrap());
-    }
-    let retry_state = if active.is_some() {
-        "remains active with its previous metadata; the receiver refresh can be retried"
-    } else {
-        "remains pending for a safe retry"
-    };
-
-    let pending = if active.is_none() {
-        load_pending_enrollments()?
+    let target = endpoint(login, host, port)?;
+    let plan = match active {
+        Some((metadata, directory)) => Plan {
+            id: metadata.id,
+            entry_key: Some(load_entry_key(&directory)?),
+            directory,
+            refresh: true,
+            replaces: None,
+        },
+        None => match load_pending_enrollments()?
             .into_iter()
-            .find(|(pending, _)| {
-                pending.host == host
-                    && pending.port == port
-                    && pending.target_login == login
-                    && pending.requested_destination == requested_destination
-            })
-    } else {
-        None
+            .find(|(pending, _)| account(&pending.host, pending.port, &pending.target_login))
+        {
+            Some((pending, directory)) => Plan {
+                id: pending.id,
+                entry_key: Some(load_entry_key(&directory)?),
+                directory,
+                refresh: false,
+                replaces: None,
+            },
+            None => new_plan(&base, None),
+        },
     };
-    let (pending, directory, private_key) = match (active, pending) {
-        (Some((metadata, directory, _)), _) => {
-            let private_key = load_enrollment_public_key(&directory)?;
-            let pending = PendingEnrollment {
-                security_key_flags: metadata.security_key_flags,
-                version: CONFIG_VERSION,
-                id: metadata.id,
-                host: metadata.host,
-                port: metadata.port,
-                target_login: metadata.target_login,
-                requested_destination: requested_destination.to_owned(),
+    let lost = (plan.refresh, plan.id, plan.directory.clone());
+    let (metadata, directory, signer) = match run_session(&target, jump, host, port, login, plan)? {
+        (Session::Installed(metadata, signer), directory) => (metadata, directory, *signer),
+        (Session::StateMissing, _) => {
+            // The server lost this enrollment's state. Enroll under a new ID
+            // instead of re-creating the old one, so no grant can be replayed
+            // against an empty record, and remove the old line.
+            let (_, old_id, old_directory) = lost;
+            let old_key = load_entry_key(&old_directory)?;
+            crate::output::diagnostic!(
+                "syq: {} has lost the state of enrollment {old_id}; enrolling again",
+                target.label()
+            );
+            let replaced = ReplacedEnrollment {
+                id: old_id,
+                entry_public_key: old_key.public_key().to_openssh()?,
             };
-            (pending, directory, private_key)
-        }
-        (None, Some((pending, directory))) => {
-            let private_key = load_enrollment_public_key(&directory)?;
-            (pending, directory, private_key)
-        }
-        (None, None) => {
-            return create_enrollment(
+            remove_local_enrollment(&old_directory)?;
+            match run_session(
+                &target,
+                jump,
                 host,
                 port,
                 login,
-                (requested_destination, follows_destination),
-                jump,
-            );
+                new_plan(&base, Some(replaced)),
+            )? {
+                (Session::Installed(metadata, signer), directory) => (metadata, directory, *signer),
+                (Session::StateMissing, _) => {
+                    bail!("the server reported missing state for a new enrollment")
+                }
+            }
         }
     };
-    let public_key = private_key.to_openssh()?;
-    let ssh_key = ensure_ssh_key(&directory)?;
-    let request = InstallRequest {
-        ssh_public_key: ssh_key.public_key().to_openssh()?,
-        security_key_flags: pending.security_key_flags,
-        version: CONFIG_VERSION,
-        id: pending.id,
-        target_login: login.to_owned(),
-        requested_destination: requested_destination.to_owned(),
-        public_key,
-        follows_destination,
-    };
-    let target = endpoint(login, host, port)?;
-    let direct = install_over_route(&target, EnrollmentRoute::Direct, &request);
-    let response = match (direct, jump) {
-        (Ok(response), _) => response,
-        (Err(direct_error), Some(jump)) if is_enrollment_transport_failure(&direct_error) => {
-            install_over_route(&target, EnrollmentRoute::ProxyJump { jump }, &request)
-                .with_context(|| {
-                    format!(
-                "enrollment {} {retry_state}; direct enrollment also failed: {direct_error:#}",
-                pending.id,
-            )
-                })?
-        }
-        (Err(error), _) => {
-            return Err(error).with_context(|| format!("enrollment {} {retry_state}", pending.id,))
-        }
-    };
-    let metadata = LocalEnrollment {
-        security_key_flags: pending.security_key_flags,
-        version: CONFIG_VERSION,
-        id: pending.id,
-        host: host.to_owned(),
-        port,
-        target_login: login.to_owned(),
-        remote_home: response.remote_home,
-        requested_parent: response.requested_parent,
-        canonical_root: response.canonical_root,
-        receiver_path: response.receiver_path,
-        receipt_public_key: response.receipt_public_key,
-    };
-    complete_local_enrollment(&directory, &metadata)?;
-    Ok((
-        metadata,
-        directory,
-        response.canonical_destination.into_bytes(),
-    ))
+    Ok((metadata, directory, Some(signer)))
 }
 
-/// Keep the login open while selecting and creating the credential. This is
-/// the authentication that installs the receiver, not a separate probe that
-/// could have selected a different key.
-fn create_enrollment(
-    host: &str,
-    port: Option<u16>,
-    login: &str,
-    destination: (&str, bool),
-    jump: Option<&SshEndpoint>,
-) -> Result<(LocalEnrollment, PathBuf, Vec<u8>)> {
-    let target = endpoint(login, host, port)?;
+fn new_plan(base: &Path, replaces: Option<ReplacedEnrollment>) -> Plan {
     let id = EnrollmentId::random();
-    let direct = create_over_route(
-        &target,
-        EnrollmentRoute::Direct,
+    Plan {
         id,
-        host,
-        port,
-        login,
-        destination,
-    );
-    match (direct, jump) {
-        (Ok(enrollment), _) => Ok(enrollment),
-        (Err(error), Some(jump)) if is_enrollment_transport_failure(&error) => create_over_route(
-            &target,
-            EnrollmentRoute::ProxyJump { jump },
-            id,
-            host,
-            port,
-            login,
-            destination,
-        )
-        .with_context(|| format!("direct enrollment also failed: {error:#}")),
-        (Err(error), _) => Err(error),
+        directory: base.join(id.to_string()),
+        entry_key: None,
+        refresh: false,
+        replaces,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-/// `destination` is the destination the copy asked for, and whether it
-/// follows a symlink there (`InstallRequest::follows_destination`).
-fn create_over_route(
+/// Run one enrollment session, directly or, when that cannot connect,
+/// through `jump`.
+fn run_session(
     target: &SshEndpoint,
-    route: EnrollmentRoute<'_>,
-    id: EnrollmentId,
+    jump: Option<&SshEndpoint>,
     host: &str,
     port: Option<u16>,
     login: &str,
-    (destination, follows_destination): (&str, bool),
-) -> Result<(LocalEnrollment, PathBuf, Vec<u8>)> {
+    plan: Plan,
+) -> Result<(Session, PathBuf)> {
+    let retry_state = if plan.refresh {
+        "remains active with its previous state; the refresh can be retried"
+    } else {
+        "remains pending for a safe retry"
+    };
+    let id = plan.id;
+    let direct = install_over_route(target, EnrollmentRoute::Direct, host, port, login, &plan);
+    let session = match (direct, jump) {
+        (Ok(session), _) => session,
+        (Err(direct_error), Some(jump)) if is_enrollment_transport_failure(&direct_error) => {
+            install_over_route(
+                target,
+                EnrollmentRoute::ProxyJump { jump },
+                host,
+                port,
+                login,
+                &plan,
+            )
+            .with_context(|| {
+                format!("enrollment {id} {retry_state}; direct enrollment also failed: {direct_error:#}")
+            })?
+        }
+        (Err(error), _) => {
+            return Err(error).with_context(|| format!("enrollment {id} {retry_state}"))
+        }
+    };
+    Ok((session, plan.directory))
+}
+
+/// Log in to the server with the user's own SSH, find the key that
+/// authenticated and check that it can sign, then install. The login stays
+/// open throughout: this is the authentication that installs the receiver,
+/// not a separate probe that could have selected a different key.
+fn install_over_route(
+    target: &SshEndpoint,
+    route: EnrollmentRoute<'_>,
+    host: &str,
+    port: Option<u16>,
+    login: &str,
+    plan: &Plan,
+) -> Result<Session> {
+    let agent = configured_agent(target, route.clone())?;
     let temporary = crate::private_broker::private_temp_dir("syq-enroll-")?;
     let trace_path = temporary.path().join("ssh.log");
-    let stage = format!(".syq-receiver-{id}-{}", EnrollmentId::random());
+    let stage = stage_name(plan.id)?;
     let remote = format!(
-        "set -eu; uname -s; uname -m; if test -f \"$HOME/.ssh/authorized_keys\"; then wc -c <\"$HOME/.ssh/authorized_keys\"; cat \"$HOME/.ssh/authorized_keys\"; else printf '0\\n'; fi; IFS= read -r request; d=\"$HOME/.local/libexec\"; p=\"$d/{stage}\"; umask 077; mkdir -p -- \"$d\"; trap 'rm -f -- \"$p\"' EXIT; trap 'exit 129' HUP; trap 'exit 143' TERM; cat >\"$p\"; chmod 700 \"$p\"; printf '%s' \"$request\" | \"$p\" --restricted-install"
+        "set -eu; uname -s; uname -m; if test -f \"$HOME/.ssh/authorized_keys\"; then wc -c <\"$HOME/.ssh/authorized_keys\"; cat \"$HOME/.ssh/authorized_keys\"; else printf '0\\n'; fi; IFS= read -r request; {}; printf '%s' \"$request\" | \"$p\" --restricted-install",
+        stage_commands(&stage)
     );
     let mut command = Command::new("ssh");
     command
@@ -587,47 +564,62 @@ fn create_over_route(
             ));
         }
     };
-    let trace =
-        fs::read_to_string(&trace_path).context("read enrollment SSH authentication trace")?;
-    let mut template = key_template(&trace, &authorized)?;
-    configure_key_agent(&mut template, target, route)?;
-    let platform = crate::remote_helper::Target::for_bootstrap(&os, &arch)
-        .context("unsupported receiver platform")?;
-    let executable = management_executable(platform)?;
-    let pending = PendingEnrollment {
-        version: CONFIG_VERSION,
-        id,
-        host: host.to_owned(),
-        port,
-        target_login: login.to_owned(),
-        requested_destination: destination.to_owned(),
-        security_key_flags: template.security_key_flags,
-    };
-    let directory = local_state_base()?.join(id.to_string());
-    ensure_directory(&directory, 0o700)?;
-    let key = match generate_matching_key(&directory, id, &template) {
-        Ok(key) => key,
+    // Everything before the request is checked with nothing installed: an
+    // error closes the session's input, and the remote shell stops.
+    let prepared = (|| -> Result<_> {
+        let trace =
+            fs::read_to_string(&trace_path).context("read enrollment SSH authentication trace")?;
+        keys::require_openssh_server(&trace)?;
+        let login_key = keys::discover(
+            &trace,
+            &authorized,
+            agent.as_deref(),
+            plan.id.to_string().as_bytes(),
+        )?;
+        let platform = crate::remote_helper::Target::for_bootstrap(&os, &arch)
+            .context("unsupported receiver platform")?;
+        let executable = management_executable(platform)?;
+        let entry_key = match &plan.entry_key {
+            Some(key) => key.clone(),
+            None => {
+                let key = keys::generate_entry_key(&login_key.trusted.key()?, plan.id)?;
+                // The entry key is durable before installation starts, so a
+                // failed installation is retried, or revoked, with it.
+                ensure_directory(&plan.directory, 0o700)?;
+                keys::store_entry_key(&plan.directory, &key)?;
+                atomic_write(
+                    &plan.directory,
+                    PENDING_FILE,
+                    &serde_json::to_vec(&PendingEnrollment {
+                        version: CONFIG_VERSION,
+                        id: plan.id,
+                        host: host.to_owned(),
+                        port,
+                        target_login: login.to_owned(),
+                    })?,
+                    0o600,
+                )?;
+                key
+            }
+        };
+        let request = InstallRequest {
+            version: CONFIG_VERSION,
+            id: plan.id,
+            target_login: login.to_owned(),
+            entry_public_key: entry_key.public_key().to_openssh()?,
+            signer: login_key.trusted.clone(),
+            refresh: plan.refresh,
+            replaces: plan.replaces.clone(),
+        };
+        Ok((login_key, executable, request))
+    })();
+    let (login_key, executable, request) = match prepared {
+        Ok(prepared) => prepared,
         Err(error) => {
-            let _ = remove_empty_directory(&directory);
+            drop(input);
+            let _ = group.close();
             return Err(error);
         }
-    };
-    atomic_write(
-        &directory,
-        "pending.json",
-        &serde_json::to_vec(&pending)?,
-        0o600,
-    )?;
-    let ssh_key = ensure_ssh_key(&directory)?;
-    let request = InstallRequest {
-        ssh_public_key: ssh_key.public_key().to_openssh()?,
-        version: CONFIG_VERSION,
-        id,
-        target_login: login.to_owned(),
-        requested_destination: destination.to_owned(),
-        public_key: key.to_openssh()?,
-        security_key_flags: template.security_key_flags,
-        follows_destination,
     };
     let write = (|| -> Result<()> {
         serde_json::to_writer(&mut input, &request)?;
@@ -645,34 +637,48 @@ fn create_over_route(
     }
     let status = group.wait()?;
     if !status.success() {
-        // Once a key is durable and installation has started, leave pending
-        // state for the ordinary enrollment retry; do not mint another key.
-        bail!("enrollment {id} remains pending after SSH installation failed ({status}); retry receiver enroll or revoke it");
+        bail!(
+            "installation over SSH failed ({status}); retry, or run `syq receiver revoke {}`",
+            plan.id
+        );
     }
     write?;
-    let response: InstallResponse = serde_json::from_slice(&response)?;
-    if response.version != CONFIG_VERSION || response.id != id || response.target_login != login {
-        bail!("restricted enrollment response did not match the request");
+    match serde_json::from_slice(&response).context("decode the enrollment response")? {
+        InstallResponse::StateMissing { version, id }
+            if version == CONFIG_VERSION && id == plan.id && plan.refresh =>
+        {
+            Ok(Session::StateMissing)
+        }
+        InstallResponse::Installed {
+            version,
+            id,
+            target_login,
+            remote_home,
+            generation,
+            release,
+            receiver_path,
+            results_public_key,
+            changed: _,
+        } if version == CONFIG_VERSION && id == plan.id && target_login == login => {
+            let metadata = LocalEnrollment {
+                version: CONFIG_VERSION,
+                id,
+                host: host.to_owned(),
+                port,
+                target_login,
+                remote_home,
+                generation,
+                release,
+                receiver_path,
+                results_public_key,
+                signer: login_key.trusted.clone(),
+                identity_file: login_key.identity_file.clone(),
+            };
+            complete_local_enrollment(&plan.directory, &metadata)?;
+            Ok(Session::Installed(metadata, Box::new(login_key.signer)))
+        }
+        _ => bail!("the enrollment response did not match the request"),
     }
-    let metadata = LocalEnrollment {
-        version: CONFIG_VERSION,
-        id,
-        host: host.to_owned(),
-        port,
-        target_login: login.to_owned(),
-        remote_home: response.remote_home,
-        requested_parent: response.requested_parent,
-        canonical_root: response.canonical_root,
-        receiver_path: response.receiver_path,
-        receipt_public_key: response.receipt_public_key,
-        security_key_flags: template.security_key_flags,
-    };
-    complete_local_enrollment(&directory, &metadata)?;
-    Ok((
-        metadata,
-        directory,
-        response.canonical_destination.into_bytes(),
-    ))
 }
 
 fn read_enrollment_line(input: &mut impl std::io::BufRead) -> Result<String> {

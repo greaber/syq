@@ -1,79 +1,64 @@
 use super::*;
 
-pub(crate) fn receiver_config(id: EnrollmentId) -> Result<(ReceiverEnrollment, PathBuf, PathBuf)> {
+/// The enrollment's state directory and its configuration, for the account
+/// this receiver runs as.
+fn receiver_state(id: EnrollmentId) -> Result<(PathBuf, ReceiverEnrollment)> {
     let (_, home) = current_account()?;
-    let state = home
-        .join(".local/share/syq/restricted")
-        .join(id.to_string());
-    let encoded = delegation::read_private_regular(
-        &state.join("config.json"),
-        "restricted receiver configuration",
-        MAX_STATE_FILE,
-    )?;
-    let config: ReceiverEnrollment = serde_json::from_slice(&encoded)?;
-    if !supported_config_version(config.version) || config.id != id {
+    let state = enrollment_state(&home, id);
+    let config = read_receiver_config(&state)?.with_context(|| {
+        format!("this server has no state for enrollment {id}; enroll again from your machine")
+    })?;
+    if config.id != id {
         bail!("restricted receiver configuration does not match enrollment");
     }
-    Ok((config, state.join("allowed-signers"), state.join("replay")))
+    Ok((state, config))
 }
 
-pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
+/// The forced command of syq's line: `--restricted-receiver
+/// --enrollment=ID --generation=N`.
+pub(crate) fn run_receiver(enrollment: &str, generation: &str) -> Result<()> {
     refuse_privileged_receiver(Some(enrollment))?;
     let enrollment = EnrollmentId::parse(enrollment)?;
+    let generation: u64 = generation
+        .parse()
+        .context("restricted receiver generation must be a number")?;
     let original = std::env::var("SSH_ORIGINAL_COMMAND")
         .context("restricted receiver requires SSH_ORIGINAL_COMMAND from sshd")?;
     if let Some(ticket) = ssh::worker_command(&original)? {
-        let (_, _, replay) = receiver_config(enrollment)?;
-        ssh::enter_state_directory(replay.parent().context("receiver state directory")?)?;
+        // A worker joins a copy that is already running, which continues
+        // whatever has changed since it started.
+        let (_, home) = current_account()?;
+        ssh::enter_state_directory(&enrollment_state(&home, enrollment))?;
         return ssh::connect(&ticket);
     }
     let envelope = decode_receiver_command(&original)?;
-    let (config, allowed_signers, replay_path) = receiver_config(enrollment)?;
-    let state = replay_path.parent().context("receiver state directory")?;
-    let observed_state = fs::symlink_metadata(state).context("inspect receiver enrollment")?;
+    let (state, config) = receiver_state(enrollment)?;
+    require_current_receiver(&config, generation, crate::identity::build())?;
+    let observed_state = fs::symlink_metadata(&state).context("inspect receiver enrollment")?;
     let (_, home) = current_account()?;
     let canonical_home = fs::canonicalize(&home)
         .with_context(|| format!("resolve receiver home {}", home.display()))?;
-    let canonical_receiver = fs::canonicalize(&config.receiver_path).with_context(|| {
-        format!(
-            "resolve restricted receiver {}",
-            Path::new(&config.receiver_path).display()
-        )
-    })?;
-    let canonical_ssh_keygen = fs::canonicalize(&config.ssh_keygen).with_context(|| {
-        format!(
-            "resolve signature verifier {}",
-            Path::new(&config.ssh_keygen).display()
-        )
-    })?;
-    let protected = receiver_control_paths(
-        &canonical_home,
-        &canonical_receiver,
-        Some(&canonical_ssh_keygen),
-    )?;
-    let replay = delegation::ReplayStore::open(&replay_path)?;
+    let protected = receiver_control_paths(&canonical_home, None)?;
+    let replay = delegation::ReplayStore::open(&state.join("replay"))?;
     let observed_at = Instant::now();
+    let signer_name = signer_name(enrollment, config.generation);
     let context = delegation::ReceiverContext {
         enrollment_id: enrollment,
         target_login: &config.target_login,
-        expected_signer: &config.signer,
+        expected_signer: &signer_name,
         clock: delegation::ClockObservation {
             unix_seconds: now()?,
             monotonic: observed_at,
         },
         clock_skew_seconds: CLOCK_SKEW_SECONDS,
     };
-    let policy = delegation::SshsigPolicy {
-        ssh_keygen: PathBuf::from(&config.ssh_keygen),
-        allowed_signers,
-        revocation_file: None,
-    };
-    enforce_grant_security_key_flags(&envelope, config.security_key_flags)?;
-    let verified = delegation::verify_and_redeem(&envelope, &context, &policy, &replay)?;
+    let verified = delegation::verify_and_redeem(&envelope, &context, &config.signer, &replay)?;
     let (grant, extensions, grant_digest, deadline) = verified.into_parts();
-    let results_key = load_receipt_key(replay_path.parent().context("receiver state directory")?)?;
+    let results_key = load_results_key(&state)?;
+    let GrantOperation::Copy(copy) = &grant.operation;
+    let root = ConfinedRoot::resolve(&copy.destination, &protected)?;
     let authority = std::sync::Arc::new(RestrictedAuthority::new(
-        &config,
+        root,
         grant,
         extensions,
         grant_digest,
@@ -81,16 +66,35 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
         deadline,
         &protected,
     )?);
-    ssh::enter_state_directory(state)?;
+    ssh::enter_state_directory(&state)?;
     // Verification does not hold the lifecycle lock or permit mutations. A
     // revoke during verification is caught when this receiver tries to enter.
     active::watch(
         &home,
-        state,
+        &state,
         (observed_state.dev(), observed_state.ino()),
         deadline,
     )?;
     crate::server::run_restricted(authority)
+}
+
+/// A connection started from an older line still runs the forced command it
+/// had: another generation, or another build. Refuse a new copy from it
+/// before anything is recorded.
+pub(super) fn require_current_receiver(
+    config: &ReceiverEnrollment,
+    generation: u64,
+    build: &str,
+) -> Result<()> {
+    if config.generation != generation || config.release != build {
+        bail!(
+            "this connection runs an outdated receiver for enrollment {} (generation {generation} of {build}, now generation {} of {}); start a new connection",
+            config.id,
+            config.generation,
+            config.release
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn decode_receiver_command(original: &str) -> Result<Vec<u8>> {
@@ -99,7 +103,7 @@ pub(super) fn decode_receiver_command(original: &str) -> Result<Vec<u8>> {
     }
     let words = shell_words::split(original).context("parse restricted receiver command")?;
     if words.len() != 3 || words[0] != "syq" || words[1] != "--server" {
-        bail!("the enrollment key accepts only a syq server request with one signed grant");
+        bail!("the entry key accepts only a syq server request with one signed grant");
     }
     let encoded = words[2]
         .strip_prefix("--restricted-grant=")
@@ -108,6 +112,18 @@ pub(super) fn decode_receiver_command(original: &str) -> Result<Vec<u8>> {
         .decode(encoded)
         .context("decode restricted receiver grant")?;
     Ok(envelope)
+}
+
+/// `[USER@]HOST` as `syq receiver enroll` takes it, with the login the
+/// user's SSH configuration selects.
+fn enrollment_account(value: &str) -> Result<(String, String)> {
+    let endpoint = SshEndpoint::parse(value)?;
+    let (user, host) = match endpoint.as_str().split_once('@') {
+        Some((user, host)) => (Some(user), host),
+        None => (None, endpoint.as_str()),
+    };
+    let policy = crate::agent_broker::resolve_host_policy("ssh", user, host)?;
+    Ok((policy.login_user, host.to_owned()))
 }
 
 /// `syq receiver enroll|list|revoke`: the receiver enrollment system is one
@@ -139,53 +155,32 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
             for (metadata, _) in active {
                 let target = endpoint(&metadata.target_login, &metadata.host, metadata.port)?;
                 println!(
-                    "{}\tactive\t{}\t{}",
+                    "{}\tactive\t{}\t{}\t{}",
                     metadata.id,
                     target.label(),
-                    metadata.canonical_root
+                    metadata.release,
+                    metadata.signer.fingerprint()?
                 );
             }
             for (pending, _) in load_pending_enrollments()? {
                 if !active_ids.contains(&pending.id) {
                     let target = endpoint(&pending.target_login, &pending.host, pending.port)?;
-                    println!(
-                        "{}\tpending\t{}\t{}",
-                        pending.id,
-                        target.label(),
-                        pending.requested_destination
-                    );
+                    println!("{}\tpending\t{}", pending.id, target.label());
                 }
             }
             Ok(0)
         })()),
         "enroll" => Some((|| {
-            let target = options
-                .get_one::<String>("target")
-                .expect("target required");
-            let location = Location::parse(target)?;
-            let host = location
-                .host
-                .as_deref()
-                .context("enrollment target must be remote")?;
-            let requested = std::str::from_utf8(&location.path)
-                .context("enrollment destination is not UTF-8")?;
+            let account = options
+                .get_one::<String>("account")
+                .expect("account required");
+            let (login, host) = enrollment_account(account)?;
             let via = via()?;
-            let policy =
-                crate::agent_broker::resolve_host_policy("ssh", location.user.as_deref(), host)?;
-            let (metadata, _, destination) = enroll(
-                host,
-                None,
-                &policy.login_user,
-                requested,
-                via.as_ref(),
-                true,
-                false,
-            )?;
+            let (metadata, _, _) = enroll(&host, None, &login, via.as_ref(), true)?;
             println!(
-                "enrolled {} for {}:{}",
+                "enrolled {} for {}",
                 metadata.id,
                 endpoint(&metadata.target_login, &metadata.host, metadata.port)?.label(),
-                String::from_utf8_lossy(&destination)
             );
             Ok(0)
         })()),
@@ -195,36 +190,27 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
             let active = load_local_enrollments()?
                 .into_iter()
                 .find(|(metadata, _)| metadata.id == id);
-            let (target_login, host, port, directory, security_key_flags) = match active {
+            let (target_login, host, port, directory) = match active {
                 Some((metadata, directory)) => (
                     metadata.target_login,
                     metadata.host,
                     metadata.port,
                     directory,
-                    metadata.security_key_flags,
                 ),
                 None => {
                     let (pending, directory) = load_pending_enrollments()?
                         .into_iter()
                         .find(|(pending, _)| pending.id == id)
                         .context("no local enrollment has that ID")?;
-                    (
-                        pending.target_login,
-                        pending.host,
-                        pending.port,
-                        directory,
-                        pending.security_key_flags,
-                    )
+                    (pending.target_login, pending.host, pending.port, directory)
                 }
             };
-            let public_key = load_enrollment_public_key(&directory)?;
+            let entry_key = load_entry_key(&directory)?;
             let request = RevokeRequest {
-                ssh_public_key: optional_ssh_public_key(&directory)?,
-                security_key_flags,
                 version: CONFIG_VERSION,
                 id,
                 target_login: target_login.clone(),
-                public_key: public_key.to_openssh()?,
+                entry_public_key: entry_key.public_key().to_openssh()?,
             };
             let target = endpoint(&target_login, &host, port)?;
             let encoded = serde_json::to_vec(&request)?;
@@ -251,9 +237,7 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
                 }
                 (Err(error), _) => return Err(error),
             }
-            delegation::validate_private_directory_path(&directory)?;
-            fs::remove_dir_all(&directory)
-                .with_context(|| format!("remove local enrollment {}", directory.display()))?;
+            remove_local_enrollment(&directory)?;
             println!("revoked {id} from {}", target.label());
             Ok(0)
         })()),

@@ -1,31 +1,5 @@
 use super::*;
 
-pub(super) fn destination_for(
-    metadata: &LocalEnrollment,
-    requested: &[u8],
-) -> Result<Option<Vec<u8>>> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let normalized = normalize_absolute(
-        std::ffi::OsStr::from_bytes(requested),
-        Path::new(&metadata.remote_home),
-    )?;
-    if requested_parent(&normalized) != Path::new(&metadata.requested_parent) {
-        return Ok(None);
-    }
-    let leaf = normalized
-        .file_name()
-        .context("restricted destination / is not supported")?;
-    // The enrollment's canonical root is UTF-8 (it is administrative,
-    // declared at enrollment time); the leaf may be any bytes.
-    Ok(Some(
-        Path::new(&metadata.canonical_root)
-            .join(leaf)
-            .as_os_str()
-            .as_bytes()
-            .to_vec(),
-    ))
-}
-
 pub(super) fn now() -> Result<i64> {
     i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
         .context("current time exceeds signed grant range")
@@ -110,7 +84,7 @@ pub(crate) fn requests_pruning(args: &Args) -> bool {
 pub(super) fn grant_for(
     args: &Args,
     sources: &[Location],
-    id: EnrollmentId,
+    (id, generation): (EnrollmentId, u64),
     login: &str,
     destination: &[u8],
 ) -> Result<Grant> {
@@ -198,7 +172,7 @@ pub(super) fn grant_for(
     let grant = Grant {
         enrollment_id: id,
         target_login: login.to_owned(),
-        signer: signer_name(id),
+        signer: signer_name(id, generation),
         request_id: RequestId::fresh(issued_at)?,
         issued_at,
         not_before: issued_at.saturating_sub(CLOCK_SKEW_SECONDS),
@@ -286,6 +260,10 @@ pub(super) fn mapping_authorization(args: &Args) -> Result<Option<crate::mapping
         .transpose()
 }
 
+/// Sign a grant for a copy to `destination` with the user's login key,
+/// setting up the destination account's enrollment, refreshing it for this
+/// build, or finding the login key again first when needed. A dry run
+/// (`allow_enrollment` false) changes nothing on the server.
 pub(crate) fn prepare_transfer(
     args: &Args,
     sources: &[Location],
@@ -300,71 +278,78 @@ pub(crate) fn prepare_transfer(
         .host
         .as_deref()
         .context("destination host missing")?;
-    let requested = destination.path.as_slice();
-    let mut selected = None;
-    for (metadata, directory) in load_local_enrollments()? {
-        if metadata.host == host
+    let account = endpoint(destination_login, host, destination.port)?.label();
+    let jump = endpoint(
+        source_login,
+        sources[0].host.as_deref().context("source host missing")?,
+        sources[0].port,
+    )?;
+    let enroll_now = |refresh: bool| {
+        enroll(
+            host,
+            destination.port,
+            destination_login,
+            Some(&jump),
+            refresh,
+        )
+    };
+    let found = load_local_enrollments()?.into_iter().find(|(metadata, _)| {
+        metadata.host == host
             && metadata.port == destination.port
             && metadata.target_login == destination_login
-        {
-            if let Some(canonical_destination) = destination_for(&metadata, requested)? {
-                selected = Some((metadata, directory, canonical_destination));
-                break;
-            }
+    });
+    let (metadata, directory, signer) = match found {
+        Some((metadata, directory)) if metadata.release == crate::identity::build() => {
+            (metadata, directory, None)
         }
-    }
-    if !allow_enrollment
-        && selected
-            .as_ref()
-            .is_some_and(|(metadata, _, _)| metadata.version != CONFIG_VERSION)
-    {
-        bail!("existing receiver enrollment needs updating; run `syq receiver enroll host:/path` for this destination before retrying the read-only operation");
-    }
-    let (metadata, directory, canonical_destination) = match selected {
-        Some(selected) if selected.0.version == CONFIG_VERSION => selected,
-        _ => {
-            if !allow_enrollment {
-                bail!(
-                    "read-only operations will not install a receiver enrollment; pre-enroll this destination with `syq receiver enroll` or explicitly use --peer-auth broker"
-                );
-            }
-            let jump = endpoint(
-                source_login,
-                sources[0].host.as_deref().context("source host missing")?,
-                sources[0].port,
-            )?;
-            enroll(
-                host,
-                destination.port,
-                destination_login,
-                // Automatic enrollment declares a new administrative scope,
-                // which stays UTF-8; transfers against an existing
-                // enrollment accept any destination bytes above.
-                std::str::from_utf8(requested).context(
-                    "automatic enrollment requires a UTF-8 destination; pre-enroll a scope with `syq receiver enroll` to copy to this path",
-                )?,
-                Some(&jump),
-                false,
-                args.follows_native_destination_paths()
-                    && args.placement == crate::cli::Placement::Into,
-            )?
+        _ if !allow_enrollment => bail!(
+            "a dry run does not set up restricted copying on {account} for this syq build; the next copy does, or run `syq receiver enroll {account}`"
+        ),
+        _ => enroll_now(false)?,
+    };
+    let signer = match signer {
+        Some(signer) => Some(signer),
+        None => LoginSigner::find(
+            &metadata.signer,
+            destination_agent,
+            metadata.identity_file.as_deref(),
+            now()?,
+        )?,
+    };
+    let (metadata, directory, signer) = match signer {
+        Some(signer) => (metadata, directory, signer),
+        None if !allow_enrollment => bail!(
+            "the login key restricted copying on {account} trusts ({}) cannot sign: load it into your SSH agent, or let the next copy enroll your current login key",
+            metadata.signer.fingerprint()?
+        ),
+        None => {
+            // The recorded login key can no longer sign: enroll the current
+            // login's key. That rewrites only the trusted signer; the entry
+            // key, and so copies in flight, stay.
+            drop((metadata, directory));
+            let (metadata, directory, signer) = enroll_now(true)?;
+            (
+                metadata,
+                directory,
+                signer.context("enrollment did not find the login key")?,
+            )
         }
     };
-    let private_key = load_signing_key(&directory, destination_agent)?;
-    let ssh_key = load_ssh_key(&directory)?;
-    let results_public_key = metadata.receipt_public_key.clone();
+    let entry_key = load_entry_key(&directory)?;
+    let destination_path = normalize_absolute(
+        std::ffi::OsStr::from_bytes(&destination.path),
+        Path::new(&metadata.remote_home),
+    )?
+    .into_os_string()
+    .into_vec();
     let grant = grant_for(
         args,
         sources,
-        metadata.id,
+        (metadata.id, metadata.generation),
         destination_login,
-        &canonical_destination,
+        &destination_path,
     )?;
-    let protected = receiver_control_paths(
-        Path::new(&metadata.remote_home),
-        Path::new(&metadata.receiver_path),
-        None,
-    )?;
+    let protected = receiver_control_paths(Path::new(&metadata.remote_home), None)?;
     let GrantOperation::Copy(copy) = &grant.operation;
     reject_control_plane_scopes(copy, &protected)?;
     let request_id = grant.request_id;
@@ -381,7 +366,7 @@ pub(crate) fn prepare_transfer(
             max_file_data_bytes_per_second: 0,
             filters: FilterPolicy {
                 ignore: args.ignore_lines.clone(),
-                destination_roots: filter_destination_roots(args, sources, &canonical_destination)?,
+                destination_roots: filter_destination_roots(args, sources, &destination_path)?,
                 delete_excluded: args.delete_excluded,
             },
             root_existence: root_existence_for(args.target_existence),
@@ -390,16 +375,25 @@ pub(crate) fn prepare_transfer(
             ),
             extra_options: extra_copy_options(args),
         },
-        |payload| private_key.sign_grant(payload),
+        |payload| {
+            let signature = signer.sign(delegation::SSHSIG_NAMESPACE, payload)?;
+            // Check here what the receiver checks, so a FIDO policy or an
+            // expired certificate fails before anything starts.
+            metadata
+                .signer
+                .verify(delegation::SSHSIG_NAMESPACE, payload, &signature, now()?)
+                .context("check the grant's signature")?;
+            Ok(signature)
+        },
     )?;
     let grant_digest = delegation::signed_grant_digest(&grant)?;
     Ok(PreparedTransfer {
-        ssh_key,
+        entry_key,
         request_id,
-        results_public_key,
+        results_public_key: metadata.results_public_key.clone(),
         recipient_secret,
         grant_digest,
-        canonical_destination,
+        destination: destination_path,
         grant: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(grant),
         enrollment_id: metadata.id,
     })
@@ -432,7 +426,7 @@ pub(crate) fn named_request(
     let grant = grant_for(
         &checked,
         sources,
-        EnrollmentId::random(),
+        (EnrollmentId::random(), 1),
         "named-destination",
         &path,
     )?;
@@ -483,8 +477,8 @@ pub(crate) fn named_authority(
     let request_id = RequestId::fresh(issued_at)?;
     let grant = Grant {
         enrollment_id: id,
-        target_login: login.clone(),
-        signer: signer_name(id),
+        target_login: login,
+        signer: signer_name(id, 1),
         request_id,
         issued_at,
         not_before: issued_at,
@@ -492,53 +486,21 @@ pub(crate) fn named_authority(
         finish_by: issued_at + FINISH_WINDOW_SECONDS,
         operation: GrantOperation::Copy(request.copy.clone()),
     };
-    let key = generate_receipt_key(id)?;
+    let key = generate_results_key(id)?;
     // Reuse the complete canonical grant validator. This ephemeral signature
     // is not sent to the requester as a redeemable enrollment credential.
     let signed = delegation::sign_grant(grant.clone(), request.constraints.clone(), &key)?;
     let digest = delegation::signed_grant_digest(&signed)?;
     let executable = fs::canonicalize(std::env::current_exe()?)?;
     let home = fs::canonicalize(home)?;
-    let mut protected = receiver_control_paths(&home, &executable, None)?;
-    for directory in [
-        ".syq-receive-v1",
-        ".syq-destinations-v1",
-        ".syq-destinations-v2",
-        ".syq-destinations-v3",
-    ] {
-        protected.push(ReceiverControlPath {
-            path: home.join(directory).as_os_str().as_bytes().to_vec(),
-            label: "named destination authority state",
-        });
-    }
-    for path in [
-        crate::destination::receiver_identity_directory()?,
-        crate::receive_service::config_path(&crate::persistence::Domain::default())?
-            .parent()
-            .unwrap()
-            .to_path_buf(),
-        crate::persistence::runtime_parent_path(),
-    ] {
-        protected.push(ReceiverControlPath {
-            path: path.as_os_str().as_bytes().to_vec(),
-            label: "background receiving control state",
-        });
-    }
-    let config = ReceiverEnrollment {
-        security_key_flags: None,
-        version: CONFIG_VERSION,
-        id,
-        target_login: login,
-        signer: signer_name(id),
-        root: parent
-            .to_str()
-            .context("receiving directory must be UTF-8")?
-            .into(),
-        root_dev: metadata.dev(),
-        root_ino: metadata.ino(),
-        ssh_keygen: String::new(),
-        receiver_path: executable.to_string_lossy().into_owned(),
-    };
+    let protected = receiver_control_paths(&home, Some(&executable))?;
+    let confined = ConfinedRoot::opened(
+        parent,
+        RootIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        },
+    )?;
     let approved = crate::destination::Approved {
         token: String::new(),
         destination: request.copy.destination.clone(),
@@ -549,7 +511,7 @@ pub(crate) fn named_authority(
         max_delete: None,
     };
     let authority = RestrictedAuthority::new(
-        &config,
+        confined,
         grant,
         request.constraints,
         digest,
