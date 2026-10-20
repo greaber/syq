@@ -1313,7 +1313,7 @@ fn fido_ecdsa_signatures_keep_their_flags_through_encoding() {
     )
     .unwrap();
     let ssh_key::public::EcdsaPublicKey::NistP256(point) =
-        software.public_key().key_data().ecdsa().unwrap().clone()
+        *software.public_key().key_data().ecdsa().unwrap()
     else {
         unreachable!()
     };

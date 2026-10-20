@@ -96,7 +96,7 @@ pub(crate) enum LoginSigner {
     /// Through the SSH agent at `socket`, which holds the key.
     Agent { socket: PathBuf, key: PublicKey },
     /// From an unencrypted software key file.
-    File(PrivateKey),
+    File(Box<PrivateKey>),
 }
 
 impl LoginSigner {
@@ -170,7 +170,7 @@ impl LoginSigner {
                     && private.public_key().key_data() == key.key_data()
                     && software_key(&key)
                 {
-                    return Ok(Some(Self::File(private)));
+                    return Ok(Some(Self::File(Box::new(private))));
                 }
             }
         }
@@ -414,7 +414,7 @@ pub(super) fn discover(
             key,
         },
         (None, Some(private)) if !private.is_encrypted() && software_key(&key) => {
-            LoginSigner::File(private.clone())
+            LoginSigner::File(Box::new(private.clone()))
         }
         (None, Some(private)) if private.is_encrypted() => bail!(
             "the login key {} is passphrase-protected; load it into your SSH agent with ssh-add, then retry",

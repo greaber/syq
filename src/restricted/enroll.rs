@@ -334,7 +334,7 @@ struct Plan {
 }
 
 enum Session {
-    Installed(LocalEnrollment, Box<LoginSigner>),
+    Installed(Box<(LocalEnrollment, LoginSigner)>),
     StateMissing,
 }
 
@@ -393,7 +393,10 @@ pub(super) fn enroll(
     };
     let lost = (plan.refresh, plan.id, plan.directory.clone());
     let (metadata, directory, signer) = match run_session(&target, jump, host, port, login, plan)? {
-        (Session::Installed(metadata, signer), directory) => (metadata, directory, *signer),
+        (Session::Installed(installed), directory) => {
+            let (metadata, signer) = *installed;
+            (metadata, directory, signer)
+        }
         (Session::StateMissing, _) => {
             // The server lost this enrollment's state. Enroll under a new ID
             // instead of re-creating the old one, so no grant can be replayed
@@ -417,7 +420,10 @@ pub(super) fn enroll(
                 login,
                 new_plan(&base, Some(replaced)),
             )? {
-                (Session::Installed(metadata, signer), directory) => (metadata, directory, *signer),
+                (Session::Installed(installed), directory) => {
+                    let (metadata, signer) = *installed;
+                    (metadata, directory, signer)
+                }
                 (Session::StateMissing, _) => {
                     bail!("the server reported missing state for a new enrollment")
                 }
@@ -675,7 +681,7 @@ fn install_over_route(
                 identity_file: login_key.identity_file.clone(),
             };
             complete_local_enrollment(&plan.directory, &metadata)?;
-            Ok(Session::Installed(metadata, Box::new(login_key.signer)))
+            Ok(Session::Installed(Box::new((metadata, login_key.signer))))
         }
         _ => bail!("the enrollment response did not match the request"),
     }

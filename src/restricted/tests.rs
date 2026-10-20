@@ -502,7 +502,7 @@ fn lost_server_state_means_a_new_enrollment_that_replaces_the_old_line() {
     };
     let replay_path = enrollment_state(home, new_id).join("replay");
     let replay = delegation::ReplayStore::open(&replay_path).unwrap();
-    let signer = keys::LoginSigner::File(login.clone());
+    let signer = keys::LoginSigner::File(Box::new(login.clone()));
     for (grant_id, generation, accepted) in [(id, 1, false), (new_id, 2, false), (new_id, 1, true)]
     {
         let grant = grant_for(

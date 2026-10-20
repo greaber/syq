@@ -158,7 +158,7 @@ fn key_files_sign_grants_that_only_the_trusted_key_verifies() {
     ] {
         let algorithm = key.algorithm();
         let trusted = TrustedSigner::new(key.public_key(), None, None).unwrap();
-        let signer = LoginSigner::File(key);
+        let signer = LoginSigner::File(Box::new(key));
         let signature = signer.sign(NAMESPACE, b"grant").unwrap();
         trusted
             .verify(NAMESPACE, b"grant", &signature, now())
@@ -731,7 +731,9 @@ fn signing_and_verifying_start_no_program() {
         let marker = PathBuf::from(marker);
         let key = PrivateKey::random(&mut ssh_key::rand_core::OsRng, Algorithm::Ed25519).unwrap();
         let trusted = TrustedSigner::new(key.public_key(), None, None).unwrap();
-        let signature = LoginSigner::File(key).sign(NAMESPACE, b"grant").unwrap();
+        let signature = LoginSigner::File(Box::new(key))
+            .sign(NAMESPACE, b"grant")
+            .unwrap();
         trusted
             .verify(NAMESPACE, b"grant", &signature, now())
             .unwrap();
