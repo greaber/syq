@@ -289,21 +289,13 @@ pub struct Opts {
 }
 
 impl Opts {
-    /// Whether to compare a file of `size` bytes with the existing entry it
-    /// replaces and reuse its matching blocks. The default strategy compares
-    /// a remote file only when its destination has the same size: a file
-    /// whose size changed was almost always rewritten, and comparing it
-    /// would read and hash the old file for nothing. An explicit
-    /// aligned-block strategy compares every replaced file.
-    pub(crate) fn reuses_blocks(&self, size: u64, existing: Option<&Entry>) -> bool {
-        match self.transfer_strategy {
-            crate::cli::TransferStrategy::Locality => {
-                !self.same_host
-                    && existing
-                        .is_none_or(|existing| existing.kind != Kind::File || existing.size == size)
-            }
-            strategy => strategy.reuse_destination_blocks(self.same_host),
-        }
+    /// Whether to compare files with the existing entries they replace and
+    /// reuse their matching blocks. The default strategy does so whenever a
+    /// syq endpoint is remote, whatever a file's size, as rsync does: a file
+    /// that grew or shrank keeps the blocks before its change.
+    pub(crate) fn reuses_blocks(&self) -> bool {
+        self.transfer_strategy
+            .reuse_destination_blocks(self.same_host)
     }
 
     /// Whether a destination whose size and modification time match its
@@ -316,10 +308,10 @@ impl Opts {
     /// Whether a dry run compares an existing file of the same size to
     /// learn whether the copy would change it, because the copy would
     /// compare it too.
-    fn previews_by_comparing(&self, size: u64, existing: Option<&Entry>) -> bool {
+    fn previews_by_comparing(&self) -> bool {
         self.checksum
             || self.protects_existing_contents()
-            || (self.hash_or_copy && self.reuses_blocks(size, existing))
+            || (self.hash_or_copy && self.reuses_blocks())
     }
 
     /// Whether copying `source` over `existing` certainly changes the
@@ -335,8 +327,7 @@ impl Opts {
         existing.is_none_or(|existing| {
             existing.kind != Kind::File
                 || existing.size != source.size
-                || !(self.previews_by_comparing(source.size, Some(existing))
-                    || self.reuses_blocks(source.size, Some(existing)))
+                || !(self.previews_by_comparing() || self.reuses_blocks())
         })
     }
 
@@ -1467,24 +1458,22 @@ fn attempt_small_copy(
         }
         progress.files_total.fetch_add(1, Relaxed);
         progress.bytes_total.fetch_add(entry.size, Relaxed);
-        let failure = match result.error {
-            Some(error) => {
-                let error = endpoint_error(error).context("put");
-                Some((
-                    "unknown",
-                    os_kind_of(&error),
-                    copy_error_message(
-                        &error,
-                        // It writes only into the directory the copy goes into.
-                        opts.hint_for(WidenDirs::All)
-                            .filter(|_| !args.only_new_native_entries()),
-                    ),
-                ))
-            }
-            None => None,
-        };
-        if let Some((retryable, os_kind, message)) = failure {
-            progress.error_classified(&format!("syq: {rel}: {message}"), Some("io"), os_kind);
+        let failure = result.error.map(|error| {
+            FileFailure::of(
+                &endpoint_error(error).context("put"),
+                // It writes only into the directory the copy goes into.
+                opts.hint_for(WidenDirs::All)
+                    .filter(|_| !args.only_new_native_entries()),
+            )
+        });
+        if let Some(FileFailure {
+            class,
+            retryable,
+            os_kind,
+            message,
+        }) = failure
+        {
+            progress.error_classified(&format!("syq: {rel}: {message}"), Some(class), os_kind);
             if let Some(results) = progress.results_writer() {
                 results.emit_operation(&crate::results::OperationRecord {
                     action: "transfer_file",
@@ -1495,7 +1484,7 @@ fn attempt_small_copy(
                     bytes: None,
                     attempts: Some(1),
                     retryable: Some(retryable),
-                    class: Some("io"),
+                    class: Some(class),
                     os_kind,
                     message: Some(&message),
                 });
@@ -1951,8 +1940,11 @@ fn os_kind_of(error: &anyhow::Error) -> Option<&'static str> {
     })
 }
 
+/// The OS error kind of an error the receiver sent; none for data
+/// corrupted in transit, which no OS error caused.
 fn wire_os_kind(error: &WireError) -> Option<&'static str> {
     Some(match error.io_kind? {
+        WireIoKind::CorruptedInTransit => return None,
         WireIoKind::NotFound => "not_found",
         WireIoKind::PermissionDenied | WireIoKind::OwnedDirectoryPermissions => "permission_denied",
         WireIoKind::AlreadyExists => "already_exists",
@@ -2009,6 +2001,37 @@ fn permission_error_message(
             format!("{message}; {hint}")
         }
         _ => message,
+    }
+}
+
+/// How one file's failure is reported: its error class, whether copying it
+/// again may help, its OS error kind, and its message.
+struct FileFailure {
+    class: &'static str,
+    retryable: &'static str,
+    os_kind: Option<&'static str>,
+    message: String,
+}
+
+impl FileFailure {
+    /// A failure to copy a file, with `hint` when it is one the hint is for.
+    /// Data corrupted in transit is retryable, and says so; whether copying
+    /// again helps after another error is unknown.
+    fn of(error: &anyhow::Error, hint: Option<&str>) -> Self {
+        if crate::fsops::corrupted_in_transit(error) {
+            return Self {
+                class: "integrity",
+                retryable: "yes",
+                os_kind: None,
+                message: crate::fsops::CorruptedInTransit.to_string(),
+            };
+        }
+        Self {
+            class: "io",
+            retryable: "unknown",
+            os_kind: os_kind_of(error),
+            message: copy_error_message(error, hint),
+        }
     }
 }
 
@@ -3333,10 +3356,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         .is_some_and(|entry| entry.kind == Kind::Dir);
     match args.target_existence {
         Existence::Any => {}
-        Existence::New if dst_existed => bail!(
-            "target {} already exists, but the selected placement requires a new path",
-            display(&dst_root)
-        ),
+        Existence::New if dst_existed => return Err(new_target_exists(&dst_root)),
         Existence::Existing if !dst_existed => bail!(
             "target {} does not exist, but the selected placement requires an existing path",
             display(&dst_root)
@@ -3506,6 +3526,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     } else {
         None
     };
+    // `--into-new` found its directory missing. One that another program
+    // created since is not adopted: the copy refuses it, as the check would
+    // have, and later creates its own without replacing anything.
+    if args.target_existence == Existence::New && dst_is_dir && directory_selection.is_some() {
+        return Err(new_target_exists(&dst_root));
+    }
     if debug() {
         crate::output::diagnostic!(
             "syq: destination selection complete at {:.2}s",
@@ -3670,12 +3696,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     });
     let defer_destination_mutations =
         args.hardlinks || multiple_distinct_sources || args.prune_before;
-    // Native new/existing forms check their pathnames above. A new target
-    // (`--as-new`, `--into-new`) is then also published without replacing
+    // Native new/existing forms check their pathnames above. A new exact
+    // target (`--as-new`) is then also published without replacing
     // anything, so that one another program creates at its name first is
     // kept and the copy fails; an existing one takes the ordinary engine's
-    // conditions, with no identity precondition of its own.
-    let exact_condition = if args.target_existence == Existence::New {
+    // conditions, with no identity precondition of its own. The directory
+    // `--into-new` names is created as the copy's root before anything is
+    // planned, so the planner must not require it to be missing again.
+    let exact_condition = if args.target_existence == Existence::New && !dst_is_dir {
         TargetCondition::Absent
     } else {
         TargetCondition::Any
@@ -3889,7 +3917,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let root_creatable = dst_root_entry.is_none() && dst_is_dir && !args.existing;
     let mut create_root = root_creatable && !args.dry_run;
     let dry_run_creates_root = root_creatable && args.dry_run;
-    let root_create_condition = TargetCondition::Any;
+    // The directory `--into-new` names is created without replacing
+    // anything: one another program creates there after the check above is
+    // refused as the check refuses it.
+    let root_create_condition = if args.target_existence == Existence::New && dst_is_dir {
+        TargetCondition::Absent
+    } else {
+        TargetCondition::Any
+    };
     // A directory target takes a contents source's metadata, which the
     // planner sends only once it has scanned the source root. When its
     // permissions or group are copied, create the root private until they
@@ -3963,6 +3998,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     |_| 0o700,
                 ),
             )
+            .map_err(|error| new_root_refused(error, condition, &dst_root))
             .map_err(|error| with_failure_hint(&opts, error))?;
             if dst_is_dir && !created {
                 // Another process created the destination root after it was
@@ -4017,7 +4053,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             } else {
                 root_source_mode.unwrap_or(0o755)
             },
-        )?;
+        )
+        .map_err(|error| new_root_refused(error, root_create_condition, &dst_root))?;
         mutation_root_condition = target_identity(&created);
         if guard_containers {
             container_guard = Some(target_container(&dst_root, &created));
@@ -5171,9 +5208,11 @@ fn target_container(root: &[u8], entry: &Entry) -> ContainerGuard {
     }
 }
 
+/// Tests pause a copy whose placement requires a new or existing target
+/// here, between checking that target and selecting its directory.
 #[cfg(debug_assertions)]
 fn hold_after_target_precondition_for_test(args: &Args) -> Result<()> {
-    if args.interface != Interface::Rsync || args.target_existence == Existence::Any {
+    if args.target_existence == Existence::Any {
         return Ok(());
     }
     crate::fsops::test_race_barrier(
@@ -5186,6 +5225,32 @@ fn hold_after_target_precondition_for_test(args: &Args) -> Result<()> {
 #[cfg(not(debug_assertions))]
 fn hold_after_target_precondition_for_test(_args: &Args) -> Result<()> {
     Ok(())
+}
+
+/// A destination that must be new but already exists.
+fn new_target_exists(dst_root: &[u8]) -> anyhow::Error {
+    anyhow::anyhow!(
+        "target {} already exists, but the selected placement requires a new path",
+        display(dst_root)
+    )
+}
+
+/// Creating a destination root under `condition` failed with `error`. One
+/// that must be new and was found already there when the receiver created
+/// it, after the pathname check found it missing, is reported as that check
+/// reports one: the receiver created nothing in its place.
+fn new_root_refused(
+    error: anyhow::Error,
+    condition: TargetCondition,
+    dst_root: &[u8],
+) -> anyhow::Error {
+    let exists = crate::conn::wire_error_of(&error)
+        .is_some_and(|error| error.io_kind == Some(WireIoKind::AlreadyExists));
+    if condition == TargetCondition::Absent && exists {
+        new_target_exists(dst_root)
+    } else {
+        error
+    }
 }
 
 fn mkdir_root(

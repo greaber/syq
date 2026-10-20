@@ -368,7 +368,9 @@ fn wire_os_kind(kind: WireIoKind) -> &'static str {
         WireIoKind::NoSpace => "no_space",
         WireIoKind::QuotaExceeded => "quota_exceeded",
         WireIoKind::ReadOnly => "read_only",
-        WireIoKind::Other | WireIoKind::ReplaceRequired(_) => "other",
+        WireIoKind::Other | WireIoKind::ReplaceRequired(_) | WireIoKind::CorruptedInTransit => {
+            "other"
+        }
     }
 }
 

@@ -156,6 +156,38 @@ pub(crate) fn record_test_event(variable: &str, event: std::fmt::Arguments<'_>) 
     Ok(())
 }
 
+/// Data the receiver was sent failed its integrity check: it changed on the
+/// way. Copying it again may succeed, so a file that fails with it is
+/// reported retryable (`WireIoKind::CorruptedInTransit` across the wire).
+#[derive(Debug)]
+pub(crate) struct CorruptedInTransit;
+
+impl std::fmt::Display for CorruptedInTransit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("data corrupted in transit; rerun the command to retry")
+    }
+}
+
+impl std::error::Error for CorruptedInTransit {}
+
+/// Whether `error` is, or came from, data corrupted in transit, here or as
+/// the receiver reported it.
+pub(crate) fn corrupted_in_transit(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<CorruptedInTransit>())
+        || crate::conn::wire_error_of(error)
+            .is_some_and(|error| error.io_kind == Some(WireIoKind::CorruptedInTransit))
+}
+
+/// The `--results` error class of a failure the receiver reported: data
+/// corrupted in transit is an integrity failure, anything else an I/O one.
+pub(crate) fn failure_class(error: &WireError) -> &'static str {
+    if error.io_kind == Some(WireIoKind::CorruptedInTransit) {
+        "integrity"
+    } else {
+        "io"
+    }
+}
+
 /// Tests simulate data corrupted in transit: the first received payload whose
 /// check runs after `SYQ_TEST_CORRUPT_PAYLOAD_ONCE` names a missing file fails
 /// its check, and that file is created so later payloads pass.
@@ -625,6 +657,13 @@ fn errstr(e: &anyhow::Error) -> String {
 }
 
 pub(crate) fn wire_error(error: &anyhow::Error) -> WireError {
+    if error.chain().any(|cause| cause.is::<CorruptedInTransit>()) {
+        return WireError {
+            message: errstr(error),
+            io_kind: Some(WireIoKind::CorruptedInTransit),
+            raw_os_error: None,
+        };
+    }
     if let Some(wire) = crate::conn::wire_error_of(error) {
         return WireError {
             message: errstr(error),
@@ -1115,6 +1154,16 @@ impl FsOps {
         self.hash_policy.payload_algorithm().hash(bytes)
     }
 
+    /// With transfer integrity, check received `bytes` against the payload
+    /// hash the source sent: data that changed on the way fails with
+    /// `CorruptedInTransit`.
+    fn check_payload(&self, bytes: &[u8], expected: ContentDigest) -> Result<()> {
+        if self.hash_policy.transfer_integrity && self.observed_payload_hash(bytes) != expected {
+            return Err(CorruptedInTransit.into());
+        }
+        Ok(())
+    }
+
     pub fn new() -> Self {
         Self::with_descriptor_session(DescriptorSessionSlot::default())
     }
@@ -1599,11 +1648,7 @@ impl FsOps {
             if payload.data.len() as u64 != file.size {
                 bail!("small copy payload size differs from its offer");
             }
-            if self.hash_policy.transfer_integrity
-                && self.observed_payload_hash(&payload.data) != payload.hash
-            {
-                bail!("block hash mismatch on receive");
-            }
+            self.check_payload(&payload.data, payload.hash)?;
             data[index] = Some(&payload.data);
         }
         if unchanged

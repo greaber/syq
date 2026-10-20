@@ -313,9 +313,7 @@ impl FsOps {
         data: &[u8],
         hash: ContentDigest,
     ) -> Result<()> {
-        if self.hash_policy.transfer_integrity && self.observed_payload_hash(data) != hash {
-            bail!("block hash mismatch on receive");
-        }
+        self.check_payload(data, hash)?;
         let received = stream
             .received
             .checked_add(data.len() as u64)

@@ -687,7 +687,9 @@ fn a_source_failure_explains_a_file_the_receiver_left_unfinished_at_once() {
     stream.record(
         crate::destination_results::Change::PublishFile { size: 4096 },
         Some(b"a"),
-        Some("the file was not finished"),
+        Some(crate::destination_results::Failure::io(
+            "the file was not finished",
+        )),
     );
     stream.finish(0).unwrap();
     take(&mut stream);

@@ -195,8 +195,14 @@ impl Worker {
                                 .all(|&i| self.opts.failure_hint_at(&self.job(i).dst).is_some())
                         });
                         let message = copy_error_message(&e, hint);
+                        let corrupted = crate::fsops::corrupted_in_transit(&e);
                         for &i in &fast {
-                            self.file_error(i, anyhow::anyhow!(message.clone()))?;
+                            let error = if corrupted {
+                                anyhow::Error::new(crate::fsops::CorruptedInTransit)
+                            } else {
+                                anyhow::anyhow!(message.clone())
+                            };
+                            self.file_error(i, error)?;
                         }
                     }
                     for (position, &i) in slow.iter().enumerate() {
@@ -312,7 +318,7 @@ impl Worker {
         let inspects_destination = self.inspects_destination(job)
             || (!job.compared
                 && (self.compares_first(job, existing)
-                    || (self.reuses_blocks_for(job, Some(existing))
+                    || (self.opts.reuses_blocks()
                         && job.entry.size > self.compare_group_limits().0)));
         existing.kind == Kind::File
             && job.target_condition == TargetCondition::Any
@@ -325,10 +331,6 @@ impl Worker {
             || (self.opts.hardlinks && job.entry.nlink > 1)
     }
 
-    pub(super) fn reuses_blocks_for(&self, job: &FileJobData, existing: Option<&Entry>) -> bool {
-        self.opts.reuses_blocks(job.entry.size, existing)
-    }
-
     /// Whether to compare a file with its destination before copying it:
     /// with block reuse, when the destination can hold any of its blocks
     /// (its size matches, or the file spans more than one comparison block);
@@ -337,8 +339,7 @@ impl Worker {
     fn compares_first(&self, job: &FileJobData, existing: &Entry) -> bool {
         let same_size = existing.size == job.entry.size;
         existing.kind == Kind::File
-            && ((self.reuses_blocks_for(job, Some(existing))
-                && (same_size || job.entry.size > self.patch_block()))
+            && ((self.opts.reuses_blocks() && (same_size || job.entry.size > self.patch_block()))
                 || (self.opts.checksum && same_size))
     }
 
@@ -348,8 +349,8 @@ impl Worker {
     /// the kernel. A grouped comparison would first hash the whole
     /// destination and read the whole source into memory, to save round
     /// trips that cost nothing on the same host.
-    fn probes_per_file(&self, job: &FileJobData, existing: &Entry) -> bool {
-        self.opts.same_host && !self.reuses_blocks_for(job, Some(existing))
+    fn probes_per_file(&self) -> bool {
+        self.opts.same_host && !self.opts.reuses_blocks()
     }
 
     /// A replaced file small enough to compare in groups is compared before
@@ -385,8 +386,7 @@ impl Worker {
                 // An in-place file is written whether or not it is worth
                 // comparing first. On the same host without block reuse,
                 // the per-file path copies it in the kernel.
-                (j.inplace || self.compares_first(j, existing))
-                    && !self.probes_per_file(j, existing)
+                (j.inplace || self.compares_first(j, existing)) && !self.probes_per_file()
             })
     }
 
@@ -871,8 +871,7 @@ impl Worker {
                 continue;
             };
             if let Err(e) = res {
-                let os_kind = os_kind_of(&e);
-                let message = copy_error_message(&e, self.opts.failure_hint_at(&j.dst));
+                let failure = FileFailure::of(&e, self.opts.failure_hint_at(&j.dst));
                 // The receiver lists a publication it refused or failed; a
                 // file that could not be read never reached it.
                 let listing = if ChangeFailed::is(&e) {
@@ -881,14 +880,14 @@ impl Worker {
                     crate::results::ReceiverListing::Unlisted
                 };
                 self.progress.entry_error_classified(
-                    &format!("syq: {}: {message}", j.rel),
-                    Some("io"),
-                    os_kind,
+                    &format!("syq: {}: {}", j.rel, failure.message),
+                    Some(failure.class),
+                    failure.os_kind,
                     Some((&j.rel_bytes, listing)),
                 );
-                self.emit_file_result_failed(j, "unknown", os_kind, &message, listing);
+                self.emit_file_result_failed(j, &failure, listing);
                 self.sched.fail_file(*idx);
-                if capacity_os_kind(os_kind) {
+                if capacity_os_kind(failure.os_kind) {
                     self.sched.abort();
                 }
                 continue;
@@ -964,9 +963,12 @@ impl Worker {
             ));
             self.emit_file_result_failed(
                 j,
-                "yes",
-                None,
-                "source changed during transfer (or vanished)",
+                &FileFailure {
+                    class: "io",
+                    retryable: "yes",
+                    os_kind: None,
+                    message: "source changed during transfer (or vanished)".into(),
+                },
                 crate::results::ReceiverListing::Unlisted,
             );
             self.sched.fail_file(idx);
@@ -982,17 +984,16 @@ impl Worker {
         }
         if self.sched.fail_file(idx) {
             let job = self.job(idx);
-            let os_kind = os_kind_of(&e);
-            let message = copy_error_message(&e, self.opts.failure_hint_at(&job.dst));
+            let failure = FileFailure::of(&e, self.opts.failure_hint_at(&job.dst));
             let listing = self.receiver_listing(idx, &e);
             self.progress.entry_error_classified(
-                &format!("syq: {}: {message}", job.rel),
-                Some("io"),
-                os_kind,
+                &format!("syq: {}: {}", job.rel, failure.message),
+                Some(failure.class),
+                failure.os_kind,
                 Some((&job.rel_bytes, listing)),
             );
-            self.emit_file_result_failed(&job, "unknown", os_kind, &message, listing);
-            if capacity_os_kind(os_kind) {
+            self.emit_file_result_failed(&job, &failure, listing);
+            if capacity_os_kind(failure.os_kind) {
                 self.sched.abort();
             }
         }
@@ -1040,9 +1041,7 @@ impl Worker {
     pub(super) fn emit_file_result_failed(
         &self,
         job: &WorkerJob,
-        retryable: &'static str,
-        os_kind: Option<&'static str>,
-        message: &str,
+        failure: &FileFailure,
         listing: crate::results::ReceiverListing,
     ) {
         // Verification reports differences and inspection failures as errors,
@@ -1060,10 +1059,10 @@ impl Worker {
                     disposition: "failed",
                     bytes: None,
                     attempts: Some(u64::from(job.attempt) + 1),
-                    retryable: Some(retryable),
-                    class: Some("io"),
-                    os_kind,
-                    message: Some(message),
+                    retryable: Some(failure.retryable),
+                    class: Some(failure.class),
+                    os_kind: failure.os_kind,
+                    message: Some(&failure.message),
                 },
                 self.opts.expected_for(&job.rel_bytes),
                 listing,
@@ -1151,7 +1150,7 @@ impl Worker {
         let inplace = job.inplace;
         // A file a grouped comparison already found different, or could not
         // patch, is copied whole without comparing it again.
-        let reuse_blocks = !job.compared && self.reuses_blocks_for(&job, job.dst_entry.as_deref());
+        let reuse_blocks = !job.compared && self.opts.reuses_blocks();
         let checksum = self.opts.checksum && !job.compared;
         let final_file = job
             .dst_entry

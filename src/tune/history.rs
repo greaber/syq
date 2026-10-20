@@ -18,6 +18,9 @@ const SCHEMA: i64 = 2;
 const DEFAULT_BUDGET: u64 = 10 << 20;
 const MAX_PENDING: usize = 4096;
 const FINISH_LOCK_WAIT: Duration = Duration::from_millis(100);
+/// How long opening history waits for another run's lock before this run
+/// goes without history.
+const OPEN_LOCK_WAIT: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub(crate) struct Recorder(Arc<Mutex<Writer>>);
@@ -94,6 +97,11 @@ fn budget() -> Result<u64> {
 }
 
 fn open(path: &Path) -> Result<Connection> {
+    open_waiting(path, OPEN_LOCK_WAIT)
+}
+
+/// `open`, waiting up to `lock_wait` for another connection's lock.
+fn open_waiting(path: &Path, lock_wait: Duration) -> Result<Connection> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let parent = path
         .parent()
@@ -118,7 +126,7 @@ fn open(path: &Path) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
-    db.busy_timeout(Duration::from_millis(100))?;
+    db.busy_timeout(lock_wait)?;
     // This history is disposable: avoid durability barriers on the copy path.
     // Set this before schema creation or journal changes, which can also sync.
     // A system crash can lose or corrupt history; it never authorizes file work.
@@ -180,7 +188,7 @@ fn open(path: &Path) -> Result<Connection> {
     // returns BUSY immediately for this lock upgrade, without the busy handler.
     // Retry only this operation, within the same small startup wait budget.
     db.busy_timeout(Duration::ZERO)?;
-    let deadline = Instant::now() + Duration::from_millis(100);
+    let deadline = Instant::now() + lock_wait;
     loop {
         match db.pragma_update(None, "journal_mode", "WAL") {
             Err(rusqlite::Error::SqliteFailure(error, _))
@@ -197,7 +205,7 @@ fn open(path: &Path) -> Result<Connection> {
             }
         }
     }
-    db.busy_timeout(Duration::from_millis(100))?;
+    db.busy_timeout(lock_wait)?;
     db.pragma_update(None, "foreign_keys", true)?;
     Ok(db)
 }
@@ -215,7 +223,18 @@ impl Recorder {
     }
 
     fn at(path: &Path, start: Instant, details: Value, budget: u64) -> Result<Self> {
-        let db = open(path)?;
+        Self::at_waiting(path, start, details, budget, OPEN_LOCK_WAIT)
+    }
+
+    /// `at`, waiting up to `lock_wait` for another run's lock.
+    fn at_waiting(
+        path: &Path,
+        start: Instant,
+        details: Value,
+        budget: u64,
+        lock_wait: Duration,
+    ) -> Result<Self> {
+        let db = open_waiting(path, lock_wait)?;
         let mut generated = [0u8; 32];
         getrandom::fill(&mut generated).context("create tuning history identity key")?;
         db.execute(

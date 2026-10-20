@@ -1113,10 +1113,11 @@ fn mkdir_rooted(
             }
             Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {
                 if condition == TargetCondition::Absent {
-                    bail!(
+                    // Keeps the error's kind: the destination exists.
+                    return Err(error.context(format!(
                         "destination {} appeared before no-replace creation",
                         target.label.display()
-                    );
+                    )));
                 }
             }
             Err(error) => return Err(error),
