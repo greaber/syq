@@ -871,6 +871,93 @@ fn rejected_small_copy_payloads_reconnect_before_the_ordinary_engine() {
     );
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn a_file_whose_data_is_corrupted_in_transit_fails_retryably() {
+    // One received payload fails its check, as for data corrupted on the
+    // way: on the small-file path, on the range path, and from a remote
+    // sender. The file fails with a message saying to rerun the command,
+    // and its record says it is retryable; the rerun copies it.
+    let ranges = &["--performance-tuning=copy-path=ranges,request-size=1M"][..];
+    for (case, size, extra, remote) in [
+        ("small files", 1 << 10, &[][..], false),
+        ("ranges", 3 << 20, ranges, false),
+        ("remote ranges", 3 << 20, ranges, true),
+    ] {
+        let t = Tmp::new();
+        let contents = prng(size, 931);
+        write(&t.path("src/file"), &contents);
+        let marker = t.path("corrupted-once");
+        let results = t.path("results.jsonl");
+        let copy = |corrupt: bool| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command
+                .args(["cp", "--srcs-in", &t.s("src")])
+                .args(["--integrity-checking", "transfer=blake3", "--no-progress"])
+                .args(extra);
+            if remote {
+                let rsh = fake_rsh(&t);
+                command
+                    .args(["--to", "host", "--into", &t.s("dst")])
+                    .args(["--rsh", rsh.to_str().unwrap()])
+                    .args(["--syq-path", env!("CARGO_BIN_EXE_syq"), "--no-tcp"])
+                    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                    .env("XDG_CONFIG_HOME", t.path("config"))
+                    .env("XDG_CACHE_HOME", t.path("cache"));
+            } else {
+                command.args(["--into", &t.s("dst")]);
+            }
+            if corrupt {
+                command
+                    .args(["--results", &t.s("results.jsonl")])
+                    .env("SYQ_TEST_CORRUPT_PAYLOAD_ONCE", &marker);
+            }
+            command.run().unwrap()
+        };
+
+        let out = copy(true);
+        assert!(marker.exists(), "{case}: the payload check never ran");
+        assert_eq!(out.status.code(), Some(23), "{case}: {out:?}");
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains("syq: file: data corrupted in transit; rerun the command to retry"),
+            "{case}: {stderr}"
+        );
+        let records: Vec<serde_json::Value> = fs::read_to_string(&results)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let failed: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record["type"] == "operation_result" && record["disposition"] == "failed"
+            })
+            .collect();
+        assert_eq!(failed.len(), 1, "{case}: {records:?}");
+        assert_eq!(failed[0]["dst"]["value"], "file", "{case}");
+        assert_eq!(failed[0]["retryable"], "yes", "{case}");
+        assert_eq!(failed[0]["class"], "integrity", "{case}");
+        assert_eq!(
+            failed[0]["message"], "data corrupted in transit; rerun the command to retry",
+            "{case}"
+        );
+        assert!(failed[0].get("os_kind").is_none(), "{case}");
+        let errors: Vec<_> = records
+            .iter()
+            .filter(|record| record["type"] == "error")
+            .collect();
+        assert_eq!(errors.len(), 1, "{case}: {records:?}");
+        assert_eq!(errors[0]["class"], "integrity", "{case}");
+        assert_eq!(records.last().unwrap()["status"], "partial", "{case}");
+
+        assert_output_ok(&copy(false));
+        assert_eq!(read(&t.path("dst/file")), contents, "{case}");
+    }
+}
+
 /// Equal-size, equal-time files: `same{n}` already matches its source and
 /// `bad{n}` differs by one byte. Returns the inodes of the `same` files.
 fn equal_metadata_tree(t: &Tmp, count: u64) -> Vec<u64> {

@@ -1892,6 +1892,9 @@ pub enum WireIoKind {
     /// vouch for the file (`fsops::vouch`), for this reason. The copy
     /// replaces it as it replaces a changed file.
     ReplaceRequired(ReplaceReason),
+    /// Data the receiver was sent failed its integrity check
+    /// (`fsops::CorruptedInTransit`): copying it again may succeed.
+    CorruptedInTransit,
 }
 
 /// Why the receiver will not change an existing file in place, and the copy

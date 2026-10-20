@@ -66,6 +66,11 @@ sets `transfer`, including `transfer=off`. That check catches data corrupted in
 transit, but no checksum authenticates unencrypted traffic: an attacker can
 replace both the data and its checksum.
 
+When received data fails the check, syq does not use it. A file it was
+updating from matching blocks is sent again whole; otherwise the file fails
+with `data corrupted in transit; rerun the command to retry`, and the run ends
+with exit status 23. Rerunning the command copies it again.
+
 For a complete check of a local copy, use an [expected hash](#expected-hashes).
 
 For local/S3 copies, uploads over HTTPS rely on it to protect the transfer and

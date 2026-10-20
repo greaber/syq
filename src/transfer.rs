@@ -1467,24 +1467,22 @@ fn attempt_small_copy(
         }
         progress.files_total.fetch_add(1, Relaxed);
         progress.bytes_total.fetch_add(entry.size, Relaxed);
-        let failure = match result.error {
-            Some(error) => {
-                let error = endpoint_error(error).context("put");
-                Some((
-                    "unknown",
-                    os_kind_of(&error),
-                    copy_error_message(
-                        &error,
-                        // It writes only into the directory the copy goes into.
-                        opts.hint_for(WidenDirs::All)
-                            .filter(|_| !args.only_new_native_entries()),
-                    ),
-                ))
-            }
-            None => None,
-        };
-        if let Some((retryable, os_kind, message)) = failure {
-            progress.error_classified(&format!("syq: {rel}: {message}"), Some("io"), os_kind);
+        let failure = result.error.map(|error| {
+            FileFailure::of(
+                &endpoint_error(error).context("put"),
+                // It writes only into the directory the copy goes into.
+                opts.hint_for(WidenDirs::All)
+                    .filter(|_| !args.only_new_native_entries()),
+            )
+        });
+        if let Some(FileFailure {
+            class,
+            retryable,
+            os_kind,
+            message,
+        }) = failure
+        {
+            progress.error_classified(&format!("syq: {rel}: {message}"), Some(class), os_kind);
             if let Some(results) = progress.results_writer() {
                 results.emit_operation(&crate::results::OperationRecord {
                     action: "transfer_file",
@@ -1495,7 +1493,7 @@ fn attempt_small_copy(
                     bytes: None,
                     attempts: Some(1),
                     retryable: Some(retryable),
-                    class: Some("io"),
+                    class: Some(class),
                     os_kind,
                     message: Some(&message),
                 });
@@ -1951,8 +1949,11 @@ fn os_kind_of(error: &anyhow::Error) -> Option<&'static str> {
     })
 }
 
+/// The OS error kind of an error the receiver sent; none for data
+/// corrupted in transit, which no OS error caused.
 fn wire_os_kind(error: &WireError) -> Option<&'static str> {
     Some(match error.io_kind? {
+        WireIoKind::CorruptedInTransit => return None,
         WireIoKind::NotFound => "not_found",
         WireIoKind::PermissionDenied | WireIoKind::OwnedDirectoryPermissions => "permission_denied",
         WireIoKind::AlreadyExists => "already_exists",
@@ -2009,6 +2010,37 @@ fn permission_error_message(
             format!("{message}; {hint}")
         }
         _ => message,
+    }
+}
+
+/// How one file's failure is reported: its error class, whether copying it
+/// again may help, its OS error kind, and its message.
+struct FileFailure {
+    class: &'static str,
+    retryable: &'static str,
+    os_kind: Option<&'static str>,
+    message: String,
+}
+
+impl FileFailure {
+    /// A failure to copy a file, with `hint` when it is one the hint is for.
+    /// Data corrupted in transit is retryable, and says so; whether copying
+    /// again helps after another error is unknown.
+    fn of(error: &anyhow::Error, hint: Option<&str>) -> Self {
+        if crate::fsops::corrupted_in_transit(error) {
+            return Self {
+                class: "integrity",
+                retryable: "yes",
+                os_kind: None,
+                message: crate::fsops::CorruptedInTransit.to_string(),
+            };
+        }
+        Self {
+            class: "io",
+            retryable: "unknown",
+            os_kind: os_kind_of(error),
+            message: copy_error_message(error, hint),
+        }
     }
 }
 

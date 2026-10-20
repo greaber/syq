@@ -2294,9 +2294,7 @@ impl FsOps {
         let mut meta = Cow::Borrowed(&put.meta);
         let mut flags = put.flags;
         let inplace = put.inplace;
-        if self.hash_policy.transfer_integrity && self.observed_payload_hash(data) != hash {
-            bail!("block hash mismatch on receive");
-        }
+        self.check_payload(data, hash)?;
         let rooted = self.destination_mutation_target(target.path, target.guard)?;
         self.uncache_rooted(&rooted.root, &rooted.relative);
         if inplace {
@@ -2712,18 +2710,7 @@ impl FsOps {
         {
             bail!("test range write failure");
         }
-        let operation = self.operation.clone();
-        let actual_hash = {
-            if self.hash_policy.transfer_integrity {
-                let _hash = operation.span(crate::transfer_observations::Stage::Hashing);
-                self.hash_policy.payload_algorithm().hash(data)
-            } else {
-                [0; 32]
-            }
-        };
-        if self.hash_policy.transfer_integrity && actual_hash != hash {
-            bail!("block hash mismatch on receive @{off}");
-        }
+        self.check_payload(data, hash)?;
         self.write_range_bytes(target, inplace, attempt, off, data, self.sparse)
     }
 

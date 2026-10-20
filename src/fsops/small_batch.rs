@@ -757,13 +757,8 @@ impl FsOps {
             // integrity, the new data must match the payload hash the source
             // sent before any of it is written. A file that fails is copied
             // again, with nothing of it written.
-            if self.hash_policy.transfer_integrity
-                && self.observed_payload_hash(&patch.data) != patch.hash
-            {
-                return Err(failed(false, false)(anyhow!(
-                    "block hash mismatch on receive"
-                )));
-            }
+            self.check_payload(&patch.data, patch.hash)
+                .map_err(failed(false, false))?;
             match self.update_patch_in_place(patch)? {
                 Updated::InPlace(identity) => return Ok(PatchStep::Updated(identity)),
                 Updated::Refused(reason) => replaced = Some(reason),
@@ -966,11 +961,7 @@ impl FsOps {
         patch: &'a SmallPatch,
         old: Option<File>,
     ) -> Result<(SmallPut, Option<PatchSource<'a>>)> {
-        if self.hash_policy.transfer_integrity
-            && self.observed_payload_hash(&patch.data) != patch.hash
-        {
-            bail!("block hash mismatch on receive");
-        }
+        self.check_payload(&patch.data, patch.hash)?;
         // The patch's new data was checked above, and its put is published
         // without another check, so it carries no payload hash.
         // The file it replaces is open here, so its mode is known.
@@ -1351,10 +1342,7 @@ impl FsOps {
     }
 
     fn small_target(&mut self, put: &SmallPut) -> Result<RootedTarget> {
-        if self.hash_policy.transfer_integrity && self.observed_payload_hash(&put.data) != put.hash
-        {
-            bail!("block hash mismatch on receive");
-        }
+        self.check_payload(&put.data, put.hash)?;
         self.destination_mutation_target(&put.path, put.guard.as_ref())
     }
 
