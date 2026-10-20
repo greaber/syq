@@ -1080,9 +1080,11 @@ impl RestrictedAuthority {
                     }
                     // As for a staged file whose publication failed on its
                     // condition and was then retried, only the retry's
-                    // outcome is recorded; so too for a file replaced
-                    // because it could not be kept.
-                    if stale || declined(index) {
+                    // outcome is recorded for a file the sender compares or
+                    // copies again; so too for a file replaced because it
+                    // could not be kept.
+                    let retried = matches!(reply, Some(Err(error)) if error.retried());
+                    if retried || declined(index) {
                         continue;
                     }
                     self.record_change(

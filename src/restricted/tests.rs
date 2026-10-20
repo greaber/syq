@@ -6343,11 +6343,13 @@ fn grouped_patch_results_list_published_and_failed_files() {
                 identity: None,
                 replaced: None,
             }),
+            // Writing it in place began and failed, so it is not copied
+            // again.
             Err(proto::SmallPatchError {
-                error: "executor rejected it".into(),
+                error: "writing it in place failed".into(),
                 matched: false,
                 stale_condition: false,
-                written: false,
+                written: true,
             }),
             Err(proto::SmallPatchError {
                 error: "keeping it failed".into(),
@@ -6387,6 +6389,76 @@ fn grouped_patch_results_list_published_and_failed_files() {
                 "failed".to_owned()
             ),
         ]
+    );
+}
+
+#[test]
+fn a_failed_patch_the_sender_copies_again_leaves_its_record_to_the_retry() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    let file = target.join("file");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(&file, b"old").unwrap();
+    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let (secret, policy) = results_policy();
+    let authority = test_authority_with_results(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::ExactPath,
+        RootExistence::Any,
+        Some((key, policy)),
+    )
+    .unwrap();
+    let mut reader = start_results(&authority, secret);
+    let mut ops = crate::fsops::FsOps::new();
+    // The patch reuses a block the file does not hold, so it fails with
+    // nothing written, and the sender copies the file whole instead
+    // (`small_compare`'s `Compared::Differs`).
+    let block = proto::MIN_HASH_BLOCK_BYTES;
+    let patch = small_patch(&file, 3, block, vec![Some([0; 32])], b"");
+    let proto::Response::PatchedBatch(patched) =
+        execute_authorized(&authority, &mut ops, Request::PatchSmallBatch(vec![patch]))
+    else {
+        panic!("unexpected patch response")
+    };
+    assert!(
+        matches!(
+            &patched[..],
+            [Err(proto::SmallPatchError {
+                matched: false,
+                stale_condition: false,
+                written: false,
+                ..
+            })]
+        ),
+        "{patched:?}"
+    );
+    assert_eq!(fs::read(&file).unwrap(), b"old");
+    let proto::Response::Applied(errors) =
+        execute_authorized(&authority, &mut ops, small_put(&file))
+    else {
+        panic!("unexpected put response")
+    };
+    assert_eq!(errors, [None]);
+    assert_eq!(fs::read(&file).unwrap(), b"new");
+
+    // Only the retry's outcome is listed: the file was transferred.
+    let results = finish_results(&authority, &mut reader);
+    assert_eq!(results.totals.failed, 0, "{:?}", results.records);
+    assert_eq!(results.totals.files_transferred, 1);
+    assert_eq!(
+        results.changes(),
+        [(
+            "transfer_file".to_owned(),
+            b"file".to_vec(),
+            "succeeded".to_owned()
+        )]
     );
 }
 
@@ -6622,7 +6694,7 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
     assert_eq!(fs::read(&paths[1]).unwrap(), new);
 
     // A connection that closes with a patch open removes its stage, and
-    // its patch is settled as failed.
+    // its patch is settled as failed, with nothing published.
     {
         let mut gate = PatchStreamGate::new(authority.clone());
         let mut ops = crate::fsops::FsOps::new();
@@ -6642,7 +6714,9 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
     // refused begin by its path: three for `refused` (data in the begin, a
     // short declaration, a second begin) and one for `published` (a begin
     // while another was open). The begin outside the destination is not
-    // listed by path.
+    // listed by path. A patch that failed with nothing published, here
+    // `refused` once its piece was refused and `dropped`, is copied again
+    // by the sender, which leaves its outcome to that copy.
     let results = finish_results(&authority, &mut reader);
     let mut changes = results.changes();
     changes.sort();
@@ -6656,10 +6730,8 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
     assert_eq!(
         changes,
         [
-            publish(b"dropped", "failed"),
             publish(b"published", "failed"),
             publish(b"published", "succeeded"),
-            publish(b"refused", "failed"),
             publish(b"refused", "failed"),
             publish(b"refused", "failed"),
             publish(b"refused", "failed"),
@@ -7628,25 +7700,24 @@ fn both_receivers_settle_each_file_of_an_in_place_batch_alike() {
 
         if let (Some(authority), Some(reader)) = (&receiver.authority, reader.as_mut()) {
             let results = finish_results(authority, reader);
-            for (name, disposition) in [
-                ("mine", "succeeded"),
-                ("linked", "succeeded"),
-                ("changed", "failed"),
-            ] {
+            for name in ["mine", "linked"] {
                 assert!(
-                    results.has("transfer_file", name.as_bytes(), disposition),
+                    results.has("transfer_file", name.as_bytes(), "succeeded"),
                     "{case}: {name}: {:?}",
                     results.records
                 );
             }
-            assert!(
-                !results
-                    .changes()
-                    .iter()
-                    .any(|(action, path, _)| action == "transfer_file" && path == b"unchanged"),
-                "{case}: {:?}",
-                results.records
-            );
+            // A kept file lists no change, and one whose patch failed with
+            // nothing written leaves its outcome to the copy that retries it.
+            for name in ["unchanged", "changed"] {
+                assert!(
+                    !results.changes().iter().any(|(action, path, _)| {
+                        action == "transfer_file" && path == name.as_bytes()
+                    }),
+                    "{case}: {name}: {:?}",
+                    results.records
+                );
+            }
         }
     }
 }

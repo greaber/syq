@@ -1122,21 +1122,19 @@ impl Worker {
                     streamed: false,
                     replaced,
                 },
+                Err(error) if error.retried() => {
+                    if error.stale_condition {
+                        Compared::StaleCondition
+                    } else {
+                        Compared::Differs
+                    }
+                }
                 Err(SmallPatchError {
                     error,
                     matched: true,
                     ..
                 }) => Compared::KeepFailed(error),
-                Err(SmallPatchError {
-                    error,
-                    written: true,
-                    ..
-                }) => Compared::UpdateFailed(error),
-                Err(SmallPatchError {
-                    stale_condition: true,
-                    ..
-                }) => Compared::StaleCondition,
-                Err(_) => Compared::Differs,
+                Err(SmallPatchError { error, .. }) => Compared::UpdateFailed(error),
             });
         }
     }

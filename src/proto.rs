@@ -544,6 +544,17 @@ pub struct SmallPatchError {
     pub written: bool,
 }
 
+impl SmallPatchError {
+    /// Whether the sender tries the file again: compared again under a fresh
+    /// condition when it was stale, and otherwise copied whole. Only a file
+    /// that already matched, or that the receiver began writing in place,
+    /// fails as it is. A receiver that lists its own results leaves a
+    /// retried file's outcome to the retry.
+    pub fn retried(&self) -> bool {
+        !self.matched && !self.written
+    }
+}
+
 /// Contents and integrity hash for one successful `SmallRead`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallBlock {
