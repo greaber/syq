@@ -91,8 +91,10 @@ impl Plan {
     }
 }
 
-const PARTIAL_PREFIX: &str = ".syq-s3-";
-const PARTIAL_SUFFIX: &str = ".partial";
+use crate::fsops::{S3_PARTIAL_PREFIX as PARTIAL_PREFIX, S3_PARTIAL_SUFFIX as PARTIAL_SUFFIX};
+
+/// The name of a download's partial file. `syq clean-partials` selects it
+/// (`fsops::is_s3_partial_name`).
 pub(super) fn partial_name(random: &[u8]) -> String {
     format!(
         "{PARTIAL_PREFIX}{}{PARTIAL_SUFFIX}",
@@ -168,5 +170,17 @@ mod tests {
         assert!(recovery(b"old/.syq-swap-123-4/data"));
         assert!(recovery(b"old/.syq-s3-123.partial"));
         assert!(!recovery(b"old/normal.partial"));
+    }
+
+    #[test]
+    fn clean_partials_selects_the_names_downloads_give_partials() {
+        for random in [&b""[..], b"one", &[0xff; 32]] {
+            let name = partial_name(random);
+            assert!(
+                crate::fsops::is_s3_partial_name(OsStr::new(&name)),
+                "{name}"
+            );
+            assert!(recovery(name.as_bytes()), "{name}");
+        }
     }
 }
