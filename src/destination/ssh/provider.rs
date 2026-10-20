@@ -759,6 +759,10 @@ fn probe_forwarded(record: &Record, deadline: Instant, cancelled: &dyn Fn() -> b
 fn keeper(startup: Startup) -> Result<()> {
     let deadline = Instant::now() + SETUP;
     let domain = Domain::select(startup.scope.as_deref())?;
+    crate::process::running_service(
+        crate::process::Service::Connection("the SSH authorization provider connection"),
+        domain.explicit_path(),
+    );
     validate_record(&domain, &startup.record.provider, &startup.record)?;
     anyhow::ensure!(startup.lock_fd > 2, "invalid SSH provider startup lock");
     let lock = unsafe { File::from_raw_fd(startup.lock_fd) };

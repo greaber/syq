@@ -999,6 +999,10 @@ impl Drop for Index {
 
 fn keeper(startup: Startup) -> Result<()> {
     let domain = Domain::select(startup.scope.as_deref())?;
+    crate::process::running_service(
+        crate::process::Service::Connection("the approved SSH login"),
+        domain.explicit_path(),
+    );
     anyhow::ensure!(
         domain.is_default() == startup.scope_identity.is_none(),
         "SSH account startup is missing its persistence scope identity"
