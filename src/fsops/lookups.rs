@@ -123,11 +123,7 @@ impl PlanningLookups {
             }
             _ => None,
         };
-        let dev = match &found {
-            Lookup::Found(entry) => Some(entry.dev),
-            Lookup::Missing | Lookup::Unknown => None,
-        };
-        if let Some(looked) = looked.filter(|_| self.needed_for(root, parent.as_ref(), path, dev)) {
+        if let Some(looked) = looked.filter(|_| self.needed_for(root, parent.as_ref(), path)) {
             self.record(path, looked);
         }
         match found {
@@ -139,14 +135,14 @@ impl PlanningLookups {
     /// Whether the directory holding `path` is on a filesystem where this
     /// copy's publications need the record: a name directly beneath the
     /// root is in the root, and any other in the parent `look_up` held
-    /// open, on the device of the entry found (`dev`) or else of that
-    /// parent. A name whose parent did not open is not recorded.
+    /// open, judged by that parent's own device, where the name is
+    /// published; an entry found there can be another filesystem mounted
+    /// on it. A name whose parent did not open is not recorded.
     fn needed_for(
         &self,
         root: &Arc<Root>,
         parent: Option<&HeldMetadataParent>,
         path: &[u8],
-        dev: Option<u64>,
     ) -> bool {
         let profile = match path.iter().rposition(|byte| *byte == b'/') {
             None => root.profile(),
@@ -156,9 +152,7 @@ impl PlanningLookups {
                 else {
                     return false;
                 };
-                let Some(dev) =
-                    dev.or_else(|| *held.dev.get_or_init(|| cached_device(&held.directory)))
-                else {
+                let Some(dev) = *held.dev.get_or_init(|| cached_device(&held.directory)) else {
                     return false;
                 };
                 root.profile_on(dev, &held.directory)
@@ -258,7 +252,7 @@ impl PlanningLookups {
 /// The device `file` is on, from what the kernel already holds: on NFS a
 /// plain `fstat` can ask the server for fresh attributes, which the device
 /// needs none of.
-fn cached_device(file: &File) -> Option<u64> {
+pub(crate) fn cached_device(file: &File) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();

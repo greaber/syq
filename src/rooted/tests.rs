@@ -3009,3 +3009,19 @@ fn moved_aside_replacements_clean_up_and_report_what_happened() {
         }
     }
 }
+
+/// A profile read through a directory is kept only under the device that
+/// directory is on. A caller that pairs it with another device, as a lookup
+/// that found a filesystem mounted on an entry would, gets the directory's
+/// profile without that device inheriting it: a local filesystem mounted
+/// beneath NFS keeps its own no-replace rename.
+#[test]
+fn a_profile_is_kept_only_under_the_device_it_was_read_from() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = Root::open(temporary.path()).unwrap();
+    let directory = File::open(temporary.path()).unwrap();
+    let foreign = root.identity().dev ^ 0x5a5a_5a5a;
+    let read = root.profile_on(foreign, &directory);
+    assert_eq!(read, crate::fsops::profile(&directory));
+    assert_eq!(root.known_profile(foreign), None);
+}

@@ -378,7 +378,9 @@ impl Root {
     /// on for (see `fsops::Profile`): the verified capabilities of a known
     /// filesystem type, or the conservative profile for any other. Cached
     /// per device, with what the filesystem has refused since: on the
-    /// root's device a lookup is one atomic load.
+    /// root's device a lookup is one atomic load. A profile read through
+    /// `directory` is kept only under the device `directory` is on, so a
+    /// caller that names another device cannot give it this one's.
     pub(crate) fn profile_on(&self, dev: u64, directory: &File) -> crate::fsops::Profile {
         #[cfg(test)]
         if let Some(profile) = *self.test_profile.lock().unwrap() {
@@ -405,6 +407,9 @@ impl Root {
             return profile;
         }
         let read = crate::fsops::profile(directory);
+        if crate::fsops::lookups::cached_device(directory) != Some(dev) {
+            return read;
+        }
         *self
             .other_profiles
             .lock()
