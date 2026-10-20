@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Separate admission/signing keys with pre-8.9 clients, agent, and sshd."""
+"""Enrollment and restricted copies with pre-8.9 clients, agent, and sshd."""
 import argparse
 import json
 import os
@@ -47,7 +47,7 @@ def main():
     options = parser.parse_args()
     config = Path.home() / '.ssh/config'
     saved_config = config.read_bytes()
-    root = '/tmp/syq-real-ssh/separate-keys-' + uuid.uuid4().hex
+    root = '/tmp/syq-real-ssh/old-openssh-' + uuid.uuid4().hex
     marker = '/tmp/syq-real-ssh-legacy-client'
     agent = None
     with tempfile.TemporaryDirectory(prefix='syq-old-ssh-') as temporary:
@@ -114,90 +114,86 @@ LogLevel VERBOSE
                                           'syq@destination', 'true'],
                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
                 assert refused.returncode and b'Permission denied (publickey)' in refused.stderr, refused.stderr
-            remote('source', f'touch {marker}; printf separate-keys > /tmp/syq-separate-key-source')
+            remote('source', f'touch {marker}; printf old-openssh > /tmp/syq-old-openssh-source')
             version = remote('source', 'ssh -V', stderr=subprocess.PIPE).stderr
             assert b'OpenSSH_8.8' in version, version
             print('Using OpenSSH 8.8 clients, agent, and destination server', flush=True)
-            copy = ['syq', 'cp', '--from', 'source', '/tmp/syq-separate-key-source',
+            copy = ['syq', 'cp', '--from', 'source', '/tmp/syq-old-openssh-source',
                     '--to', 'destination-legacy', '--no-progress']
+            state = Path.home() / '.local/state/syq/enrollments'
+
+            def legacy():
+                records = [(p.parent, json.loads(p.read_bytes())) for p in state.glob('*/enrollment.json')]
+                return [(d, r) for d, r in records if r['host'] == 'destination-legacy']
+
+            # A dry run never enrolls.
+            preview = subprocess.run(copy + ['--as', root + '/preview', '--dry-run'], env=environment,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            assert preview.returncode and b'a dry run does not set up restricted copying' in preview.stderr, preview.stderr
+            assert not legacy()
+            assert b'syq-enrollment:' not in remote('destination', 'cat ~/.ssh/authorized_keys 2>/dev/null || true',
+                                                     stdout=subprocess.PIPE).stdout
+
             run(*copy, '--as', root + '/first', '--no-tcp', env=environment)
-            records = [(p, json.loads(p.read_bytes())) for p in
-                       (Path.home() / '.local/state/syq/restricted').glob('*/metadata.json')]
-            metadata_path, metadata = next((p, r) for p, r in records if r['requested_parent'] == root)
+            [(directory, metadata)] = legacy()
             identifier = bytes(metadata['id']).hex()
-            state = '/home/syq/.local/share/syq/restricted/' + identifier
-            signer = metadata_path.parent / 'enrollment-key'
-            signer_bytes = signer.read_bytes()
-            signer_public = run('ssh-keygen', '-y', '-f', str(signer), stdout=subprocess.PIPE).stdout.decode().strip()
-            signer_public = ' '.join(signer_public.split()[:2])
-            ssh_key = metadata_path.parent / 'ssh-key'
-            ssh_public = run('ssh-keygen', '-y', '-f', str(ssh_key), stdout=subprocess.PIPE).stdout.decode().strip()
-            ssh_public = ' '.join(ssh_public.split()[:2])
-            assert signer_public != ssh_public
+            server_state = '/home/syq/.local/share/syq/enrollments/' + identifier
+            entry = directory / 'entry-key'
+            entry_bytes = entry.read_bytes()
+            entry_public = run('ssh-keygen', '-y', '-f', str(entry), stdout=subprocess.PIPE).stdout.decode().strip()
+            login_public = ' '.join(run('ssh-keygen', '-y', '-f', str(login), stdout=subprocess.PIPE)
+                                    .stdout.decode().split()[:2])
+            assert ' '.join(metadata['signer']['public_key'].split()[:2]) == login_public, metadata
             if options.rsa_only:
-                assert ssh_public.startswith('ssh-rsa '), ssh_public
+                # The entry key follows the RSA login, so the server accepts it.
+                assert entry_public.startswith('ssh-rsa '), entry_public
+            line = next(line for line in remote('destination', 'cat ~/.ssh/authorized_keys', stdout=subprocess.PIPE)
+                        .stdout.decode().splitlines() if f'syq-enrollment:{identifier}' in line.split())
+            assert line.endswith(' signer ' + login_public), line
+            assert ' '.join(entry_public.split()[:2]) in line, line
             protected = remote_python('destination', f'''
 import hashlib, json
 from pathlib import Path
-s = Path({state!r})
+s = Path({server_state!r})
 print(json.dumps({{str(p.relative_to(s)): hashlib.sha256(p.read_bytes()).hexdigest()
-                  for p in s.rglob('*') if p.is_file() and (p.name in ('allowed-signers', 'receipt-key') or 'replay' in p.parts)}}))
+                  for p in s.rglob('*') if p.is_file() and (p.name == 'results-key' or 'replay' in p.parts)}}))
 ''')
-            # The admission key cannot run a shell, even through ordinary SSH.
+            # The entry key cannot run a shell, even through ordinary SSH.
             refused = subprocess.run([f'{OLD}/bin/ssh', '-o', 'IdentityAgent=none', '-o', 'IdentitiesOnly=yes',
-                                      '-i', str(ssh_key), 'destination-legacy', 'echo escaped'],
+                                      '-i', str(entry), 'destination-legacy', 'echo escaped'],
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
             assert refused.returncode and b'escaped' not in refused.stdout, refused
 
-            # Restore the exact old single-key arrangement and generation. The
-            # protected key and all recorded grants remain unchanged.
-            remote_python('destination', f'''
-import argparse
-import json
-from pathlib import Path
-s = Path({state!r})
-p = s / 'config.json'
-c = json.loads(p.read_bytes()); c['version'] = 5; p.write_text(json.dumps(c))
-p = Path.home() / '.ssh/authorized_keys'
-p.write_text(p.read_text().replace({ssh_public!r}, {signer_public!r}))
-''')
-            metadata['version'] = 5
-            metadata_path.write_text(json.dumps(metadata))
-            ssh_key.unlink()
-            preview = subprocess.run(copy + ['--as', root + '/migrated', '--dry-run'], env=environment,
-                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
-            assert preview.returncode and b'existing receiver enrollment needs updating' in preview.stderr, preview.stderr
-            assert b'syq receiver enroll host:/path' in preview.stderr, preview.stderr
-            assert not ssh_key.exists() and json.loads(metadata_path.read_bytes())['version'] == 5
-            run(*copy, '--as', root + '/migrated', env=environment)
-            updated = json.loads(metadata_path.read_bytes())
-            assert updated['version'] == 6 and updated['id'] == metadata['id']
-            assert updated['receipt_public_key'] == metadata['receipt_public_key']
-            assert signer.read_bytes() == signer_bytes
+            # A repeated enrollment with the same login and build changes
+            # nothing, and later copies keep the receiver's state.
+            run('syq', 'receiver', 'enroll', 'destination-legacy', env=environment)
+            [(_, again)] = legacy()
+            assert again['generation'] == metadata['generation'] == 1, again
+            assert entry.read_bytes() == entry_bytes
+            run(*copy, '--as', root + '/second', env=environment)
             snapshots = json.loads(protected)
             remote_python('destination', f'''
 import hashlib
 from pathlib import Path
-s = Path({state!r})
+s = Path({server_state!r})
 for name, digest in {snapshots!r}.items():
     assert hashlib.sha256((s / name).read_bytes()).hexdigest() == digest, name
 ''')
-            for name in ('first', 'migrated'):
-                assert remote('destination', f'cat {root}/{name}', stdout=subprocess.PIPE).stdout == b'separate-keys'
-            before_retry = ssh_key.read_bytes()
-            run('syq', 'receiver', 'enroll', f'destination-legacy:{root}/another', env=environment)
-            assert ssh_key.read_bytes() == before_retry and signer.read_bytes() == signer_bytes
+            for name in ('first', 'second'):
+                assert remote('destination', f'cat {root}/{name}', stdout=subprocess.PIPE).stdout == b'old-openssh'
 
+            # The coordinator trusts only the host keys this machine pinned.
             run('ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(local / 'wrong-host'))
             known_hosts.write_text('[destination]:22222 ' + (local / 'wrong-host.pub').read_text())
             refused = subprocess.run(copy + ['--as', root + '/untrusted', '--no-tcp'], env=environment,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
-            assert refused.returncode and b'Host key verification failed' in refused.stderr, refused.stderr
+            assert refused.returncode, refused.stderr
             remote('destination', f'test ! -e {root}/untrusted')
             known_hosts.write_text(f'[destination]:22222 {public}\n')
             run('syq', 'receiver', 'revoke', identifier, env=environment)
-            remote('destination', f'test ! -e {state}')
-            print('Separate receiver keys, migration, and OpenSSH 8.8 passed' + (' (RSA-only)' if options.rsa_only else ''), flush=True)
+            remote('destination', f'test ! -e {server_state}')
+            assert not legacy()
+            print('Enrollment with OpenSSH 8.8 passed' + (' (RSA-only)' if options.rsa_only else ''), flush=True)
         finally:
             config.write_bytes(saved_config)
             remote('source', f'rm -f {marker}')

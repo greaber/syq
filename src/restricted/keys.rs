@@ -133,14 +133,7 @@ impl LoginSigner {
                 },
             )?,
         };
-        Ok(ssh_key::SshSig::new(
-            self.public_key().key_data().clone(),
-            namespace,
-            hash,
-            signature,
-        )?
-        .to_pem(LineEnding::LF)?
-        .into_bytes())
+        delegation::armored_sshsig(self.public_key().key_data(), namespace, hash, &signature)
     }
 
     /// The signer for a login key enrollment recorded: through `agent` when

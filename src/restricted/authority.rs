@@ -343,13 +343,24 @@ impl ConfinedRoot {
                 parent.display()
             )
         })?;
-        reject_control_plane_path(real.as_os_str().as_bytes(), protected)?;
+        // Only being a protected path or inside one matters here: the copy
+        // writes beneath its destination, whose own check is in `new`.
+        if let Some(control) = protected
+            .iter()
+            .find(|control| path_is_at_or_below(real.as_os_str().as_bytes(), &control.path))
+        {
+            bail!(
+                "command-restricted destination is inside the receiver's protected {} {}; choose a destination outside the receiver control plane",
+                control.label,
+                Path::new(OsStr::from_bytes(&control.path)).display()
+            );
+        }
         let directory = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOCTTY | libc::O_CLOEXEC)
             .open(&real)
             .with_context(|| format!("open the destination's directory {}", real.display()))?;
-        reject_protected_ancestry(&directory, protected)?;
+        reject_protected_ancestry(&directory, &real, protected)?;
         Ok(Self {
             root: Root::from_directory(directory)?,
             named: parent.as_os_str().as_bytes().to_vec(),
@@ -374,9 +385,14 @@ impl ConfinedRoot {
 }
 
 /// Refuse a directory that is a protected path or lies anywhere beneath
-/// one, by the identities of the directory and of each directory above it,
-/// as the session finds them.
-fn reject_protected_ancestry(directory: &File, protected: &[ReceiverControlPath]) -> Result<()> {
+/// one, by the identities of the directory, as opened, and of each directory
+/// above its real path, as the session finds them. Looking at the
+/// directories above needs no search permission on the directory itself.
+fn reject_protected_ancestry(
+    directory: &File,
+    real: &Path,
+    protected: &[ReceiverControlPath],
+) -> Result<()> {
     let identities: Vec<_> = protected
         .iter()
         .filter_map(|control| {
@@ -385,36 +401,33 @@ fn reject_protected_ancestry(directory: &File, protected: &[ReceiverControlPath]
                 .map(|metadata| ((metadata.dev(), metadata.ino()), control))
         })
         .collect();
-    let mut current = directory.try_clone()?;
-    for _ in 0..4096 {
-        let metadata = current.metadata()?;
-        let identity = (metadata.dev(), metadata.ino());
-        if let Some((_, control)) = identities.iter().find(|(known, _)| *known == identity) {
-            bail!(
-                "command-restricted destination overlaps the receiver's protected {} {}; choose a destination outside the receiver control plane",
-                control.label,
-                Path::new(OsStr::from_bytes(&control.path)).display()
-            );
-        }
-        let fd = unsafe {
-            libc::openat(
-                current.as_raw_fd(),
-                c"..".as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOCTTY | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("open a directory above the destination");
-        }
-        let parent = unsafe { File::from_raw_fd(fd) };
-        let parent_metadata = parent.metadata()?;
-        if (parent_metadata.dev(), parent_metadata.ino()) == identity {
-            return Ok(());
-        }
-        current = parent;
+    let opened = directory.metadata()?;
+    let opened = (opened.dev(), opened.ino());
+    let named = fs::metadata(real)
+        .with_context(|| format!("inspect the destination's directory {}", real.display()))?;
+    if (named.dev(), named.ino()) != opened {
+        bail!(
+            "the destination's directory {} changed while it was opened",
+            real.display()
+        );
     }
-    bail!("the destination's directory is nested too deeply")
+    let mut ancestors = vec![opened];
+    for ancestor in real.ancestors().skip(1) {
+        let metadata =
+            fs::metadata(ancestor).with_context(|| format!("inspect {}", ancestor.display()))?;
+        ancestors.push((metadata.dev(), metadata.ino()));
+    }
+    if let Some((_, control)) = identities
+        .iter()
+        .find(|(identity, _)| ancestors.contains(identity))
+    {
+        bail!(
+            "command-restricted destination overlaps the receiver's protected {} {}; choose a destination outside the receiver control plane",
+            control.label,
+            Path::new(OsStr::from_bytes(&control.path)).display()
+        );
+    }
+    Ok(())
 }
 
 /// Shared capability inherited by the authorized SSH control process and all

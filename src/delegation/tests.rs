@@ -1303,6 +1303,63 @@ fn security_key_signature(
 }
 
 #[test]
+fn fido_ecdsa_signatures_keep_their_flags_through_encoding() {
+    use signature::Signer as _;
+    let software = PrivateKey::random(
+        &mut ssh_key::rand_core::OsRng,
+        ssh_key::Algorithm::Ecdsa {
+            curve: ssh_key::EcdsaCurve::NistP256,
+        },
+    )
+    .unwrap();
+    let ssh_key::public::EcdsaPublicKey::NistP256(point) =
+        software.public_key().key_data().ecdsa().unwrap().clone()
+    else {
+        unreachable!()
+    };
+    let key = ssh_key::PublicKey::new(
+        ssh_key::public::SkEcdsaSha2NistP256::new(point, "ssh:").into(),
+        "",
+    );
+    for flags in [0u8, 1, 5] {
+        let data =
+            ssh_key::SshSig::signed_data(SSHSIG_NAMESPACE, HashAlg::Sha512, b"grant").unwrap();
+        let mut signed = Sha256::digest(b"ssh:").to_vec();
+        signed.push(flags);
+        signed.extend_from_slice(&3u32.to_be_bytes());
+        signed.extend_from_slice(&Sha256::digest(&data));
+        let ecdsa: ssh_key::Signature = software.try_sign(&signed).unwrap();
+        let mut bytes = ecdsa.as_bytes().to_vec();
+        bytes.push(flags);
+        bytes.extend_from_slice(&3u32.to_be_bytes());
+        let signature =
+            ssh_key::Signature::new(ssh_key::Algorithm::SkEcdsaSha2NistP256, bytes).unwrap();
+        let armored = armored_sshsig(
+            key.key_data(),
+            SSHSIG_NAMESPACE,
+            HashAlg::Sha512,
+            &signature,
+        )
+        .unwrap();
+        validate_canonical_sshsig(&armored).unwrap();
+        let decoded = ssh_key::SshSig::from_pem(&armored).unwrap();
+        assert_eq!(security_key_flags(&decoded).unwrap(), flags);
+        TrustedSigner::new(&key, Some(flags), None)
+            .unwrap()
+            .verify(SSHSIG_NAMESPACE, b"grant", &armored, NOW)
+            .unwrap();
+        // A PIN the signature does not show is refused.
+        assert_eq!(
+            TrustedSigner::new(&key, Some(flags | SK_USER_VERIFICATION), None)
+                .unwrap()
+                .verify(SSHSIG_NAMESPACE, b"grant", &armored, NOW)
+                .is_ok(),
+            flags & SK_USER_VERIFICATION != 0
+        );
+    }
+}
+
+#[test]
 fn security_key_grants_need_the_touch_and_pin_the_enrollment_recorded() {
     let fixture = Fixture::ordinary();
     let mut request = 70;

@@ -617,6 +617,33 @@ fn a_destination_is_resolved_afresh_by_every_copy() {
         "{error:#}"
     );
     ConfinedRoot::resolve(named, &protected).unwrap();
+    // A directory above a protected one is fine: the copy writes only
+    // beneath its destination.
+    ConfinedRoot::resolve(
+        protected_directory.join("sibling").as_os_str().as_bytes(),
+        &[ReceiverControlPath {
+            path: protected_directory
+                .join("inside")
+                .as_os_str()
+                .as_bytes()
+                .to_vec(),
+            label: "test control directory",
+        }],
+    )
+    .unwrap();
+    let error = ConfinedRoot::resolve(
+        protected_directory
+            .join("inside/archive")
+            .as_os_str()
+            .as_bytes(),
+        &protected,
+    )
+    .err()
+    .unwrap();
+    assert!(
+        error.to_string().contains("test control directory"),
+        "{error:#}"
+    );
 }
 
 #[test]

@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Exercise receiver key protection with real OpenSSH in the disposable lab."""
+"""The user's login key signs restricted copies, with real OpenSSH in the lab.
+
+Each kind of login key enrolls the destination account and signs a copy:
+key files, encrypted keys in the agent, agent-only keys, FIDO keys through
+the agent with the lab's provider, and a certificate login. Keys that cannot
+sign are refused before anything is installed. A new login key replaces only
+the trusted signer, a connection started before a refresh cannot start a new
+copy, and a copy running through a refresh finishes.
+"""
 import json
 import os
-import pty
-import select
 from pathlib import Path
 import shlex
 import signal
@@ -11,146 +17,123 @@ import subprocess
 import tempfile
 import time
 
+PROVIDER = '/usr/local/lib/syq-test-sk.so'
+SOURCE_FILE = '/tmp/syq-real-ssh-key-source'
+STATE = Path.home() / '.local/state/syq/enrollments'
+
 
 def run(*args, **kwargs):
     return subprocess.run(args, check=True, timeout=90, **kwargs)
 
 
+def attempt(*args, **kwargs):
+    return subprocess.run(args, timeout=90, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
+
+
 def remote(command, **kwargs):
-    return run('ssh', 'destination', command, **kwargs)
+    # The lab's own login, whatever this test does to the SSH configuration.
+    return run('ssh', '-F', '/dev/null', '-i', str(Path.home() / '.ssh/id_ed25519'),
+               '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none', '-o', 'BatchMode=yes',
+               '-o', 'UserKnownHostsFile=/home/syq/.ssh/known_hosts', 'syq@destination', command, **kwargs)
 
 
-def enroll_interactively(arguments, environment, prompt=b'Enter passphrase for '):
-    """Exercise OpenSSH's terminal passphrase or PIN prompt without askpass."""
-    pid, terminal = pty.fork()
-    if pid == 0:
+def remote_text(command):
+    return remote(command, stdout=subprocess.PIPE).stdout.decode()
+
+
+def wait_for(label, probe, seconds=30):
+    deadline = time.monotonic() + seconds
+    progress = 0
+    last = None
+    while time.monotonic() < deadline:
+        done, last = probe()
+        if done:
+            return last
+        if time.monotonic() >= progress:
+            print(f'Waiting for {label}: {last}', flush=True)
+            progress = time.monotonic() + 2
+        time.sleep(.1)
+    raise AssertionError(f'{label} timed out; last state: {last}')
+
+
+def enrollment():
+    """The enrolling machine's record for syq@destination, if any."""
+    records = [(path.parent, json.loads(path.read_bytes()))
+               for path in STATE.glob('*/enrollment.json')]
+    matches = [(directory, record) for directory, record in records if record['host'] == 'destination']
+    assert len(matches) <= 1, matches
+    return matches[0] if matches else (None, None)
+
+
+def revoke_destination():
+    _, record = enrollment()
+    if record is not None:
+        run('syq', 'receiver', 'revoke', bytes(record['id']).hex())
+
+
+def local_state():
+    return sorted(str(path.relative_to(STATE)) for path in STATE.rglob('*')) if STATE.exists() else []
+
+
+def line_for(record):
+    identifier = bytes(record['id']).hex()
+    lines = [line for line in remote_text('cat ~/.ssh/authorized_keys').splitlines()
+             if f'syq-enrollment:{identifier}' in line.split()]
+    assert len(lines) == 1, lines
+    return lines[0]
+
+
+def key_words(public):
+    return ' '.join(public.split()[:2])
+
+
+def key_bits(public):
+    return int(run('ssh-keygen', '-lf', '-', input=public.encode(), stdout=subprocess.PIPE).stdout.split()[0])
+
+
+class Lab:
+    def __init__(self, root):
+        self.root = root
+        self.config = Path.home() / '.ssh/config'
+        self.original_config = self.config.read_bytes()
+        self.original_authorized = remote('cat ~/.ssh/authorized_keys 2>/dev/null || true',
+                                          stdout=subprocess.PIPE).stdout
+        self.agents = []
+        self.askpass = root / 'askpass'
+        self.askpass.write_text("#!/bin/sh\nprintf '%s\\n' fixture-unlock\n")
+        self.askpass.chmod(0o700)
+
+    def agent(self, name, askpass=False):
+        socket = self.root / f'{name}.sock'
+        environment = dict(os.environ)
         for variable in ('SSH_ASKPASS', 'SSH_ASKPASS_REQUIRE', 'DISPLAY'):
             environment.pop(variable, None)
-        os.execvpe(arguments[0], arguments, environment)
-    output = bytearray()
-    answered = 0
-    deadline = time.monotonic() + 45
-    progress = time.monotonic() + 5
-    status = None
-    try:
-        while time.monotonic() < deadline:
-            if select.select([terminal], [], [], .1)[0]:
-                try:
-                    data = os.read(terminal, 4096)
-                except OSError:
-                    data = b''
-                output.extend(data)
-                prompts = output.count(prompt)
-                if prompts > answered:
-                    os.write(terminal, b'fixture-unlock\n')
-                    answered = prompts
-            waited, observed = os.waitpid(pid, os.WNOHANG)
-            if waited:
-                status = observed
-                break
-            if time.monotonic() >= progress:
-                print(f'Waiting for terminal enrollment; prompts answered: {answered}', flush=True)
-                progress = time.monotonic() + 5
-        assert status is not None, ('terminal enrollment timed out', output.decode(errors='replace'))
-        assert answered >= 1, f'normal SSH prompt was not exercised: {prompt!r}'
-        return subprocess.CompletedProcess(arguments, os.waitstatus_to_exitcode(status), b'', bytes(output))
-    finally:
-        if status is None:
-            os.killpg(pid, signal.SIGKILL)
-            os.waitpid(pid, 0)
-        os.close(terminal)
+        if askpass:
+            environment.update(SSH_ASKPASS=str(self.askpass), SSH_ASKPASS_REQUIRE='force', DISPLAY='fixture')
+        process = subprocess.Popen(['ssh-agent', '-D', '-P', PROVIDER, '-a', str(socket)],
+                                   start_new_session=True, stdout=subprocess.DEVNULL, env=environment)
+        self.agents.append(process)
+        wait_for(f'agent {name}', lambda: (socket.exists(), process.poll()))
+        return socket
 
+    def add(self, socket, *arguments):
+        environment = dict(os.environ, SSH_AUTH_SOCK=str(socket), SSH_ASKPASS=str(self.askpass),
+                           SSH_ASKPASS_REQUIRE='force', DISPLAY='fixture')
+        run('ssh-add', *arguments, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-def check_broker_agents(parent, login_entry, environment):
-    """Require each agent's own identity with either host coordinating."""
-    original = remote('cat ~/.ssh/authorized_keys', stdout=subprocess.PIPE).stdout
-    try:
-        # The fixture's initial setup key otherwise also authenticates to the
-        # destination and would hide accidental use of the source's agent.
-        remote('cat > ~/.ssh/authorized_keys', input=(login_entry + '\n').encode())
-        run('ssh', 'source', 'true', env=environment)
-        remote('true', env=environment)
-        for coordinator in ('src', 'dst'):
-            destination = f'{parent}/broker-{coordinator}'
-            print(f'Checking distinct agents with {coordinator} coordinating', flush=True)
-            run('syq', 'cp', '--from', 'source', '/tmp/syq-real-ssh-key-source',
-                '--to', 'destination', '--as', destination, '--no-tcp', '--no-progress',
-                '--peer-auth', 'broker', '--coordinate-at', coordinator, env=environment)
-            assert remote('cat ' + shlex.quote(destination), stdout=subprocess.PIPE).stdout == b'matching-key-copy\n'
-    finally:
-        remote('cat > ~/.ssh/authorized_keys', input=original)
-
-
-def main():
-    config = Path.home() / '.ssh/config'
-    original = config.read_bytes()
-    provider = '/usr/local/lib/syq-test-sk.so'
-    original_agent = os.environ['SSH_AUTH_SOCK']
-    with tempfile.TemporaryDirectory(prefix='receiver-keys-') as temporary:
-        root = Path(temporary)
-        unavailable = root / 'unavailable'
-        os.environ.update(SSH_SK_PROVIDER=provider, SYQ_TEST_SK_UNAVAILABLE=str(unavailable),
-                          SSH_AUTH_SOCK=str(root / 'agent.sock'),
-                          SYQ_TEST_IDENTITY_AGENT=str(root / 'agent.sock'))
-        agents = []
-        # This agent deliberately has no PIN prompt helper, even if the lab
-        # was started from an environment that configured one.
-        agent_environment = dict(os.environ)
-        for variable in ('SSH_ASKPASS', 'SSH_ASKPASS_REQUIRE', 'DISPLAY'):
-            agent_environment.pop(variable, None)
-        agent = subprocess.Popen(['ssh-agent', '-D', '-P', provider, '-a', os.environ['SSH_AUTH_SOCK']],
-                                 start_new_session=True, stdout=subprocess.DEVNULL, env=agent_environment)
-        agents.append(agent)
-        askpass = root / 'askpass'
-        askpass.write_text("#!/bin/sh\nprintf '%s\\n' fixture-unlock\n")
-        askpass.chmod(0o700)
-        os.environ.update(SSH_ASKPASS=str(askpass), SSH_ASKPASS_REQUIRE='force', DISPLAY='fixture')
-        try:
-            deadline = time.monotonic() + 5
-            while not Path(os.environ['SSH_AUTH_SOCK']).exists():
-                assert time.monotonic() < deadline and agent.poll() is None, 'test agent failed to start'
-                time.sleep(.05)
-            run('ssh-add', str(Path.home() / '.ssh/id_ed25519'))
-            run('ssh', 'source', "printf 'matching-key-copy\\n' >/tmp/syq-real-ssh-key-source")
-            for index, (kind, bits, protected, flags) in enumerate([
-                ('ed25519', None, False, None), ('ed25519', None, True, None),
-                ('rsa', 2048, True, None), ('rsa', 4096, False, None),
-                ('ecdsa', 256, True, None), ('ecdsa', 384, False, None), ('ed25519-sk', None, False, 0),
-                ('ed25519-sk', None, False, 1), ('ecdsa-sk', None, False, 0),
-                ('ed25519-sk', None, False, 5),
-            ]):
-                print(f'Checking {kind}, bits={bits}, encrypted={protected}, flags={flags}', flush=True)
-                key = root / f'login-{index}'
-                args = ['ssh-keygen', '-q', '-t', kind, '-C', 'syq-test-login', '-f', str(key),
-                        '-N', 'fixture-unlock' if protected else '']
-                if bits:
-                    args += ['-b', str(bits)]
-                if flags is not None:
-                    args += ['-w', provider]
-                    if not flags & 1:
-                        args += ['-O', 'no-touch-required']
-                    if flags & 4:
-                        args += ['-O', 'verify-required']
-                run(*args)
-                key.chmod(0o400)
-                public = key.with_suffix('.pub').read_text().strip()
-                options = []
-                if flags is not None and not flags & 1:
-                    options += ['no-touch-required']
-                if flags is not None and flags & 4:
-                    options += ['verify-required']
-                entry = (','.join(options) + ' ' if options else '') + public
-                config.write_bytes(original)
-                remote('cat >> ~/.ssh/authorized_keys', input=(entry + '\n').encode())
-                parent = f'/tmp/syq-real-ssh/key-protection-{index}'
-                remote('mkdir -p ' + shlex.quote(parent))
-                config.write_text(f'''Host destination
+    def use(self, key, socket, certificate=None):
+        """Log in to the destination with `key`, through the agent at `socket`."""
+        certificate_line = f'    CertificateFile {certificate}\n' if certificate else ''
+        self.config.write_text(f'''Host destination
     User syq
     IdentitiesOnly yes
     IdentityFile {key}
-    SecurityKeyProvider {provider}
-    IdentityAgent $SYQ_TEST_IDENTITY_AGENT
-    BatchMode yes
+{certificate_line}    SecurityKeyProvider {PROVIDER}
+    IdentityAgent {socket}
+    # Passphrases and PINs come from the askpass program, never a terminal.
+    BatchMode no
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
     StrictHostKeyChecking yes
     UserKnownHostsFile /home/syq/.ssh/known_hosts
     GlobalKnownHostsFile /dev/null
@@ -158,121 +141,317 @@ Host source
     User syq
     IdentitiesOnly yes
     IdentityFile /home/syq/.ssh/id_ed25519
-    IdentityAgent {root / 'agent.sock'}
+    IdentityAgent {self.main}
     BatchMode yes
     StrictHostKeyChecking yes
     UserKnownHostsFile /home/syq/.ssh/known_hosts
     GlobalKnownHostsFile /dev/null
 ''')
-                arguments = ['syq', 'receiver', 'enroll', f'destination:{parent}/copy']
-                # The selected per-host agent must work both without the
-                # environment default and when that default points elsewhere.
-                environment = dict(os.environ)
-                if index % 2:
-                    environment.pop('SSH_AUTH_SOCK', None)
-                else:
-                    environment['SSH_AUTH_SOCK'] = str(root / 'wrong-agent.sock')
-                if flags is not None and flags & 4:
-                    # Direct SSH can ask in the terminal; the already-running
-                    # agent cannot. Reject before writing authorization/state.
-                    config.write_text(config.read_text().replace('BatchMode yes', 'BatchMode no'))
-                    before_auth = remote('cat ~/.ssh/authorized_keys', stdout=subprocess.PIPE).stdout
-                    state = Path.home() / '.local/state/syq/restricted'
-                    before_state = set(state.iterdir())
-                    before_keys = run('ssh-add', '-L', stdout=subprocess.PIPE).stdout
-                    rejected = enroll_interactively(arguments, environment, b'Enter PIN for ')
-                    assert rejected.returncode and b'SSH agent cannot sign with the new hardware receiver key' in rejected.stderr, rejected.stderr
-                    assert remote('cat ~/.ssh/authorized_keys', stdout=subprocess.PIPE).stdout == before_auth
-                    assert set(state.iterdir()) == before_state, 'failed probe left enrollment state'
-                    assert run('ssh-add', '-L', stdout=subprocess.PIPE).stdout == before_keys, 'failed probe left an agent identity'
-                    print('PIN enrollment without agent askpass rejected before installation', flush=True)
 
-                    # An agent started with a working PIN helper supports both
-                    # enrollment and copying with the same PIN-required handle.
-                    pin_socket = root / 'pin-agent.sock'
-                    pin_agent = subprocess.Popen(['ssh-agent', '-D', '-P', provider, '-a', str(pin_socket)],
-                                                 start_new_session=True, stdout=subprocess.DEVNULL)
-                    agents.append(pin_agent)
-                    deadline = time.monotonic() + 5
-                    while not pin_socket.exists():
-                        assert time.monotonic() < deadline and pin_agent.poll() is None, 'PIN agent failed to start'
-                        time.sleep(.05)
-                    os.environ['SYQ_TEST_IDENTITY_AGENT'] = str(pin_socket)
-                    environment['SYQ_TEST_IDENTITY_AGENT'] = str(pin_socket)
-                    run('ssh-add', '-S', provider, str(key), env=dict(os.environ, SSH_AUTH_SOCK=str(pin_socket)))
-                    enrolled = subprocess.run(arguments, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
-                elif kind == 'ed25519' and protected:
-                    config.write_text(config.read_text().replace('BatchMode yes', 'BatchMode no'))
-                    enrolled = enroll_interactively(arguments, environment)
-                else:
-                    run('ssh-add', '-S', provider, str(key))
-                    enrolled = subprocess.run(arguments, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
-                if kind == 'ecdsa' and protected:
-                    assert enrolled.returncode and b'ECDSA is unsupported' in enrolled.stderr, enrolled.stderr
-                    continue
-                assert enrolled.returncode == 0, enrolled.stderr.decode(errors='replace')
-                records = [(p, json.loads(p.read_bytes())) for p in
-                           (Path.home() / '.local/state/syq/restricted').glob('*/metadata.json')]
-                metadata_path, metadata = next((p, r) for p, r in records if r['requested_parent'] == parent)
-                identifier = bytes(metadata['id']).hex()
-                stored = (metadata_path.parent / 'enrollment-key').read_bytes()
-                assert stored.startswith(b'SYQ-RECEIVER-KEY-1\n') == protected
-                assert metadata.get('security_key_flags') == flags
-                auth = remote('cat ~/.ssh/authorized_keys', stdout=subprocess.PIPE).stdout.decode()
-                installed = next(line for line in auth.splitlines() if f'syq-enrollment:{identifier}' in line)
-                ssh_public = run('ssh-keygen', '-y', '-f', str(metadata_path.parent / 'ssh-key'),
-                                 stdout=subprocess.PIPE).stdout.decode().strip()
-                expected_algorithm = ('ssh-rsa' if kind == 'rsa' else
-                                      f'ecdsa-sha2-nistp{bits or 256}' if kind.startswith('ecdsa') else 'ssh-ed25519')
-                assert ssh_public in installed and ssh_public.split()[0] == expected_algorithm, installed
-                assert 'no-touch-required' not in installed and 'verify-required' not in installed
-                signers = remote(f'cat ~/.local/share/syq/restricted/{identifier}/allowed-signers',
-                                 stdout=subprocess.PIPE).stdout.decode()
-                assert ssh_public.split()[1] not in signers, 'SSH key can sign grants'
-                if kind == 'rsa':
-                    if protected:
-                        encoded = json.loads(stored.split(b'\n', 1)[1])['header']['public_key']
-                    else:
-                        encoded = run('ssh-keygen', '-y', '-f', str(metadata_path.parent / 'enrollment-key'),
-                                      stdout=subprocess.PIPE).stdout.decode()
-                    size = int(run('ssh-keygen', '-lf', '-', input=encoded.encode(), stdout=subprocess.PIPE).stdout.split()[0])
-                    assert size == max(3072, bits), size
-                    admission_size = int(run('ssh-keygen', '-lf', '-', input=ssh_public.encode(), stdout=subprocess.PIPE).stdout.split()[0])
-                    assert admission_size == size, (admission_size, size)
-                copy = ['syq', 'cp', '--from', 'source', '/tmp/syq-real-ssh-key-source',
-                        '--to', 'destination', '--as', parent + '/copy', '--no-tcp', '--no-progress']
-                run(*copy, env=environment)
-                assert remote('cat ' + shlex.quote(parent + '/copy'), stdout=subprocess.PIPE).stdout == b'matching-key-copy\n'
-                if flags is not None and flags & 4:
-                    check_broker_agents(parent, entry, environment)
-                if flags is not None:
-                    unavailable.touch()
-                    failed = subprocess.run(copy, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
-                    assert failed.returncode != 0, 'copy succeeded with the test device unavailable'
-                    unavailable.unlink()
-                if protected:
-                    selected_config = config.read_text()
-                    config.write_text(selected_config.replace('IdentityAgent $SYQ_TEST_IDENTITY_AGENT', 'IdentityAgent none'))
-                    disabled = subprocess.run(copy, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
-                    assert disabled.returncode and b'an SSH agent is required' in disabled.stderr, disabled.stderr
-                    config.write_text(selected_config)
-                    before = stored
-                    run('syq', 'receiver', 'enroll', f'destination:{parent}/another')
-                    assert (metadata_path.parent / 'enrollment-key').read_bytes() == before
-                    # Losing access to the protecting key does not prevent revoke
-                    # through another authorized login identity.
-                    run('ssh-add', '-d', str(key.with_suffix('.pub')))
-                    key.unlink()
-                    config.write_bytes(original)
-                run('syq', 'receiver', 'revoke', identifier)
-                os.environ['SYQ_TEST_IDENTITY_AGENT'] = str(root / 'agent.sock')
-            print('Receiver key protection passed', flush=True)
+    def authorize(self, line):
+        remote('cat >> ~/.ssh/authorized_keys', input=(line + '\n').encode())
+
+    def restore(self):
+        self.config.write_bytes(self.original_config)
+        remote('cat > ~/.ssh/authorized_keys', input=self.original_authorized)
+        for process in self.agents:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=10)
+
+
+def keygen(path, kind, bits=None, passphrase='', flags=None):
+    arguments = ['ssh-keygen', '-q', '-t', kind, '-C', 'syq-test-login', '-f', str(path), '-N', passphrase]
+    if bits:
+        arguments += ['-b', str(bits)]
+    if flags is not None:
+        arguments += ['-w', PROVIDER]
+        if not flags & 1:
+            arguments += ['-O', 'no-touch-required']
+        if flags & 4:
+            arguments += ['-O', 'verify-required']
+    run(*arguments)
+    path.chmod(0o400)
+    return path.with_suffix('.pub').read_text().strip()
+
+
+def copy(destination, *extra, check=True):
+    arguments = ['syq', 'cp', '--from', 'source', SOURCE_FILE, '--to', 'destination',
+                 '--as', destination, '--no-tcp', '--no-progress', *extra]
+    if not check:
+        return attempt(*arguments)
+    run(*arguments)
+    assert remote_text('cat ' + shlex.quote(destination)) == 'login-key-copy\n'
+
+
+def refused_before_installation(label, arguments, expected):
+    """Enrollment fails with `expected` and leaves both machines unchanged."""
+    authorized = remote('cat ~/.ssh/authorized_keys', stdout=subprocess.PIPE).stdout
+    before = local_state()
+    result = attempt(*arguments)
+    assert result.returncode, f'{label}: enrollment succeeded'
+    assert expected in result.stderr, (label, result.stderr.decode(errors='replace'))
+    assert remote('cat ~/.ssh/authorized_keys', stdout=subprocess.PIPE).stdout == authorized, label
+    assert local_state() == before, (label, before, local_state())
+    print(f'{label}: refused before installation', flush=True)
+
+
+def login_kinds(lab, parent):
+    # (label, kind, bits, encrypted, FIDO flags, in the agent, entry key, entry bits)
+    for label, kind, bits, encrypted, flags, in_agent, entry, entry_bits in [
+        ('Ed25519 key file', 'ed25519', None, False, None, False, 'ssh-ed25519', None),
+        ('encrypted Ed25519 in the agent', 'ed25519', None, True, None, True, 'ssh-ed25519', None),
+        ('encrypted RSA 2048 in the agent', 'rsa', 2048, True, None, True, 'ssh-rsa', 3072),
+        ('RSA 4096 key file', 'rsa', 4096, False, None, False, 'ssh-rsa', 4096),
+        ('encrypted ECDSA P-256 in the agent', 'ecdsa', 256, True, None, True, 'ecdsa-sha2-nistp256', None),
+        ('ECDSA P-384 key file', 'ecdsa', 384, False, None, False, 'ecdsa-sha2-nistp384', None),
+        ('FIDO Ed25519 without touch', 'ed25519-sk', None, False, 0, True, 'ssh-ed25519', None),
+        ('FIDO Ed25519 with touch', 'ed25519-sk', None, False, 1, True, 'ssh-ed25519', None),
+        ('FIDO ECDSA without touch', 'ecdsa-sk', None, False, 0, True, 'ecdsa-sha2-nistp256', None),
+        ('FIDO Ed25519 with touch and PIN', 'ed25519-sk', None, False, 5, True, 'ssh-ed25519', None),
+    ]:
+        print(f'Checking {label}', flush=True)
+        revoke_destination()
+        key = lab.root / ('login-' + label.replace(' ', '-'))
+        public = keygen(key, kind, bits, 'fixture-unlock' if encrypted else '', flags)
+        options = []
+        if flags is not None and not flags & 1:
+            options.append('no-touch-required')
+        if flags is not None and flags & 4:
+            options.append('verify-required')
+        lab.authorize((','.join(options) + ' ' if options else '') + public)
+        socket = lab.agent(label.replace(' ', '-'), askpass=False)
+        lab.use(key, socket)
+        enroll = ['syq', 'receiver', 'enroll', 'destination']
+        if encrypted:
+            # Without the agent, syq does not ask for the passphrase.
+            refused_before_installation(label, enroll, b'ssh-add')
+        if flags is not None and flags & 4:
+            # Only OpenSSH's own helper reaches the authenticator, so a FIDO
+            # key must be in the agent, even when the login used its handle.
+            refused_before_installation(label, enroll, b'only through your SSH agent')
+            # An agent that cannot ask for the PIN cannot sign, not even the
+            # login.
+            lab.add(socket, '-S', PROVIDER, str(key))
+            refused_before_installation(label, enroll, b'restricted enrollment SSH')
+            socket = lab.agent(label.replace(' ', '-') + '-pin', askpass=True)
+            lab.use(key, socket)
+        if in_agent:
+            lab.add(socket, *(['-S', PROVIDER] if flags is not None else []), str(key))
+        run(*enroll)
+        directory, record = enrollment()
+        assert key_words(record['signer']['public_key']) == key_words(public), record
+        if flags is not None:
+            assert record['signer']['security_key_flags'] == flags, record
+        else:
+            assert 'security_key_flags' not in record['signer'], record
+        assert (record.get('identity_file') is not None) == (not encrypted and flags is None), record
+        line = line_for(record)
+        assert line.endswith(' signer ' + key_words(public)), line
+        assert 'no-touch-required' not in line and 'verify-required' not in line, line
+        entry_public = run('ssh-keygen', '-y', '-f', str(directory / 'entry-key'),
+                           stdout=subprocess.PIPE).stdout.decode()
+        assert key_words(entry_public) in line, line
+        assert entry_public.split()[0] == entry, (label, entry_public)
+        if entry_bits:
+            assert key_bits(entry_public) == entry_bits, (label, entry_public)
+        assert '.local/lib/syq/' in line and '--generation=1"' in line, line
+        copy(f'{parent}/{label.replace(" ", "-")}')
+        if flags is not None:
+            # The authenticator signs every copy's grant.
+            unavailable = Path(os.environ['SYQ_TEST_SK_UNAVAILABLE'])
+            unavailable.touch()
+            failed = copy(f'{parent}/unavailable', check=False)
+            unavailable.unlink()
+            assert failed.returncode, 'copy succeeded with the test device unavailable'
+
+
+def refused_keys(lab):
+    revoke_destination()
+    socket = lab.agent('limited', askpass=True)
+    # A key added with `ssh-add -h` signs only logins at named hosts.
+    key = lab.root / 'limited'
+    public = keygen(key, 'ed25519')
+    lab.authorize(public)
+    lab.add(socket, '-H', str(Path.home() / '.ssh/known_hosts'), '-h', 'syq@destination', str(key))
+    lab.use(key, socket)
+    run('ssh', 'destination', 'true')
+    refused_before_installation('ssh-add -h key', ['syq', 'receiver', 'enroll', 'destination'], b'ssh-add -h')
+
+    # An agent-only key: no file, as with PIV or PKCS#11 keys.
+    key = lab.root / 'agent-only'
+    public = keygen(key, 'ed25519')
+    lab.authorize(public)
+    socket = lab.agent('agent-only', askpass=True)
+    lab.add(socket, str(key))
+    # Only the public key remains, which selects the agent's key.
+    key.unlink()
+    lab.use(key, socket)
+    run('syq', 'receiver', 'enroll', 'destination')
+    _, record = enrollment()
+    assert key_words(record['signer']['public_key']) == key_words(public)
+    assert record.get('identity_file') is None
+    print('agent-only key enrolled', flush=True)
+
+
+def certificate_login(lab, parent):
+    revoke_destination()
+    ca = lab.root / 'ca'
+    ca_public = keygen(ca, 'ed25519')
+    lab.authorize('cert-authority ' + ca_public)
+    key = lab.root / 'certified'
+    keygen(key, 'ed25519')
+    run('ssh-keygen', '-q', '-s', str(ca), '-I', 'syq-test', '-n', 'syq', '-V', '-1m:+1h',
+        str(key.with_suffix('.pub')))
+    certificate = Path(str(key) + '-cert.pub')
+    details = run('ssh-keygen', '-L', '-f', str(certificate), stdout=subprocess.PIPE).stdout.decode()
+    assert 'Valid: from' in details, details
+    socket = lab.agent('certificate', askpass=True)
+    lab.add(socket, str(key))
+    lab.use(key, socket, certificate)
+    run('syq', 'receiver', 'enroll', 'destination')
+    _, record = enrollment()
+    expiry = record['signer'].get('valid_before')
+    assert expiry and expiry > time.time(), record
+    copy(f'{parent}/certificate')
+    print('certificate login enrolled and copied', flush=True)
+
+
+def rotation_and_generations(lab, parent):
+    revoke_destination()
+    first = lab.root / 'rotation-first'
+    second = lab.root / 'rotation-second'
+    third = lab.root / 'rotation-third'
+    publics = {path: keygen(path, 'ed25519') for path in (first, second, third)}
+    for public in publics.values():
+        lab.authorize(public)
+    socket = lab.agent('rotation', askpass=True)
+    lab.add(socket, str(first))
+    lab.use(first, socket)
+    copy(f'{parent}/rotation-one')
+    directory, record = enrollment()
+    entry_key = (directory / 'entry-key').read_bytes()
+    assert record['generation'] == 1
+
+    # The recorded login key can no longer sign: the next copy enrolls the
+    # current login's key, in place of only the trusted signer.
+    lab.add(socket, '-d', str(first.with_suffix('.pub')))
+    first.rename(first.with_suffix('.hidden'))
+    lab.add(socket, str(second))
+    lab.use(second, socket)
+    copy(f'{parent}/rotation-two')
+    rotated_directory, rotated = enrollment()
+    assert rotated['id'] == record['id'] and rotated_directory == directory
+    assert (directory / 'entry-key').read_bytes() == entry_key
+    assert rotated['generation'] == 2, rotated
+    line = line_for(rotated)
+    assert line.endswith(' signer ' + key_words(publics[second])), line
+    assert key_words(publics[first]) not in line
+    print('a new login key replaced only the trusted signer', flush=True)
+
+    # A connection started before a refresh still runs its old forced
+    # command, and cannot start a new copy.
+    entry = directory / 'entry-key'
+    control = lab.root / 'old-connection'
+    entry_ssh = ['ssh', '-F', '/dev/null', '-i', str(entry), '-o', 'IdentitiesOnly=yes',
+                 '-o', 'IdentityAgent=none', '-o', 'BatchMode=yes',
+                 '-o', 'UserKnownHostsFile=/home/syq/.ssh/known_hosts', '-o', 'StrictHostKeyChecking=yes']
+    run(*entry_ssh, '-o', 'ControlMaster=yes', '-o', f'ControlPath={control}', '-o', 'ControlPersist=60',
+        '-N', '-f', 'syq@destination')
+    try:
+        lab.add(socket, str(third))
+        lab.use(third, socket)
+        run('syq', 'receiver', 'enroll', 'destination')
+        _, refreshed = enrollment()
+        assert refreshed['generation'] == 3, refreshed
+        command = 'syq --server --restricted-grant=AAAA'
+        old = attempt(*entry_ssh, '-o', f'ControlPath={control}', '-o', 'ControlMaster=no',
+                      'syq@destination', command)
+        assert old.returncode and b'outdated receiver' in old.stderr, old.stderr
+        new = attempt(*entry_ssh, '-o', 'ControlPath=none', 'syq@destination', command)
+        assert new.returncode and b'outdated receiver' not in new.stderr, new.stderr
+        print('a connection from before a refresh cannot start a new copy', flush=True)
+    finally:
+        subprocess.run([*entry_ssh, '-o', f'ControlPath={control}', '-O', 'exit', 'syq@destination'],
+                       timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # A copy running through a refresh finishes.
+    run('ssh', 'source', 'head -c 24M /dev/zero > /tmp/syq-real-ssh-rotation-large')
+    destination = f'{parent}/rotation-large'
+    with tempfile.TemporaryFile() as output:
+        process = subprocess.Popen(
+            ['syq', 'cp', '--from', 'source', '/tmp/syq-real-ssh-rotation-large', '--to', 'destination',
+             '--as', destination, '--no-tcp', '--no-progress', '--no-compress',
+             '--resource-limits', 'bandwidth=4M', '--performance-tuning', 'workers=2'],
+            stdout=output, stderr=output, start_new_session=True)
+        try:
+            probe = 'python3 -c ' + shlex.quote(f'''
+from pathlib import Path
+print(any(p.stat().st_size > 0 for p in Path({parent!r}).glob('.rotation-large.syq-tmp.*')))
+''')
+            wait_for('the large copy to start writing',
+                     lambda: (remote_text(probe).strip() == 'True', process.poll()))
+            lab.add(socket, '-d', str(third.with_suffix('.pub')))
+            lab.add(socket, str(second))
+            lab.use(second, socket)
+            run('syq', 'receiver', 'enroll', 'destination')
+            _, again = enrollment()
+            assert again['generation'] == 4, again
+            assert process.wait(timeout=60) == 0
+        except BaseException:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            output.seek(0)
+            print(output.read().decode(errors='replace'), flush=True)
+            raise
+    size = remote_text('stat -c %s ' + shlex.quote(destination)).strip()
+    assert size == str(24 << 20), size
+    print('a copy running through a refresh finished', flush=True)
+
+
+def remount(parent):
+    # Each copy resolves its destination when it starts: replacing the
+    # directory, as a remount does, needs no new enrollment.
+    mount = f'{parent}/mounted'
+    remote(f'mkdir -p {mount}')
+    copy(f'{mount}/before')
+    _, before = enrollment()
+    remote(f'mv {mount} {parent}/unmounted && mkdir {mount}')
+    copy(f'{mount}/after')
+    _, after = enrollment()
+    assert after['id'] == before['id'] and after['generation'] == before['generation']
+    print('a replaced destination directory kept the enrollment working', flush=True)
+
+
+def main():
+    original_agent = os.environ['SSH_AUTH_SOCK']
+    original_environment = dict(os.environ)
+    with tempfile.TemporaryDirectory(prefix='receiver-keys-') as temporary:
+        root = Path(temporary)
+        os.environ.update(SSH_SK_PROVIDER=PROVIDER, SYQ_TEST_SK_UNAVAILABLE=str(root / 'unavailable'))
+        lab = Lab(root)
+        os.environ.update(SSH_ASKPASS=str(lab.askpass), SSH_ASKPASS_REQUIRE='force', DISPLAY='fixture')
+        parent = '/tmp/syq-real-ssh/login-keys'
+        try:
+            lab.main = lab.agent('main', askpass=True)
+            lab.add(lab.main, str(Path.home() / '.ssh/id_ed25519'))
+            os.environ['SSH_AUTH_SOCK'] = str(lab.main)
+            remote(f'rm -rf {parent} && mkdir -p {parent}')
+            run('ssh', 'source', f"printf 'login-key-copy\\n' > {SOURCE_FILE}")
+            login_kinds(lab, parent)
+            refused_keys(lab)
+            certificate_login(lab, parent)
+            rotation_and_generations(lab, parent)
+            remount(parent)
+            print('Login keys sign restricted copies', flush=True)
         finally:
-            config.write_bytes(original)
-            os.environ['SSH_AUTH_SOCK'] = original_agent
-            for agent in agents:
-                os.killpg(agent.pid, signal.SIGKILL)
-                agent.wait(timeout=10)
+            try:
+                revoke_destination()
+            finally:
+                lab.restore()
+                os.environ.clear()
+                os.environ.update(original_environment)
+                os.environ['SSH_AUTH_SOCK'] = original_agent
 
 
 if __name__ == '__main__':

@@ -1199,6 +1199,42 @@ impl TrustedSigner {
     }
 }
 
+/// The armored SSHSIG of `signature`, made by `key` over a message hashed
+/// with `hash` in `namespace`. Syq writes the blob itself: ssh-key 0.6.7
+/// leaves a FIDO ECDSA signature's flags and counter inside its signature
+/// string, which neither it nor OpenSSH can read back.
+pub(crate) fn armored_sshsig(
+    key: &ssh_key::public::KeyData,
+    namespace: &str,
+    hash: HashAlg,
+    signature: &ssh_key::Signature,
+) -> Result<Vec<u8>> {
+    use ssh_agent_lib::ssh_encoding::Encode as _;
+    let mut encoded = Vec::new();
+    signature.algorithm().as_str().encode(&mut encoded)?;
+    let bytes = signature.as_bytes();
+    match signature.algorithm() {
+        ssh_key::Algorithm::SkEd25519 | ssh_key::Algorithm::SkEcdsaSha2NistP256 => {
+            // The flags byte and the 4-byte counter follow the signature.
+            let split = bytes
+                .len()
+                .checked_sub(5)
+                .context("truncated FIDO signature")?;
+            bytes[..split].encode(&mut encoded)?;
+            encoded.extend_from_slice(&bytes[split..]);
+        }
+        _ => bytes.encode(&mut encoded)?,
+    }
+    let mut blob = b"SSHSIG".to_vec();
+    1u32.encode(&mut blob)?;
+    key.encode_prefixed(&mut blob)?;
+    namespace.encode(&mut blob)?;
+    b"".as_slice().encode(&mut blob)?;
+    hash.as_str().encode(&mut blob)?;
+    encoded.encode(&mut blob)?;
+    Ok(canonical_sshsig_armor(&blob))
+}
+
 /// The flags of a FIDO signature: user presence and user verification.
 pub(crate) fn security_key_flags(signature: &ssh_key::SshSig) -> Result<u8> {
     if !matches!(
