@@ -236,6 +236,15 @@ fn rsa_login_keys_over_4096_bits_sign_and_verify_and_small_ones_are_refused() {
         .trusted
         .verify(NAMESPACE, b"grant", &signature, now())
         .unwrap();
+    // A SHA-1 RSA signature ("ssh-rsa") never reaches verification:
+    // ssh-key neither builds nor decodes one, and syq checks only SHA-256
+    // and SHA-512 RSA signatures.
+    let parsed = ssh_key::SshSig::from_pem(&signature).unwrap();
+    assert!(ssh_key::Signature::new(
+        Algorithm::Rsa { hash: None },
+        parsed.signature().as_bytes().to_vec()
+    )
+    .is_err());
     // Under 2,048 bits, refused with a clear message before anything else.
     let small = directory.path().join("small");
     keygen(&small, "rsa", Some("1024"), "");
