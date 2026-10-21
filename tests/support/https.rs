@@ -12,10 +12,12 @@ use std::{
     time::Duration,
 };
 
+type Requests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
 pub struct Server {
     address: SocketAddr,
     pub ca: String,
-    pub requests: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+    pub requests: Requests,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
