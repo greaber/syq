@@ -226,6 +226,7 @@ pub(super) fn client(
 ) -> SharedHttpClient {
     use ureq::unversioned::transport::{ConnectProxyConnector, Connector as _, RustlsConnector};
     let config = ureq::Agent::config_builder()
+        .tls_config(crate::tls::config())
         .http_status_as_error(false)
         .max_redirects(0)
         .timeout_resolve(Some(Duration::from_secs(15)))
