@@ -27,7 +27,8 @@ pub(crate) fn with_inheritance_guard<T>(operation: impl FnOnce() -> T) -> T {
 /// path syq started from while it runs. On Linux, /proc/self/exe still names
 /// the running image; the child gets the original path as argv[0], and
 /// `restore_self_started_name` gives it the file's name. macOS has no
-/// equivalent, so there the child runs whatever file the path names now.
+/// equivalent, so there a path that names another file is refused
+/// (`require_started_file`) rather than started.
 pub(crate) fn self_command() -> std::io::Result<Command> {
     let path = std::env::current_exe()?;
     #[cfg(target_os = "linux")]
@@ -41,9 +42,161 @@ pub(crate) fn self_command() -> std::io::Result<Command> {
         command.arg0(std::ffi::OsStr::from_bytes(path));
         command
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    let command = {
+        require_started_file(&path)?;
+        Command::new(path)
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let command = Command::new(path);
     Ok(command)
+}
+
+/// macOS: refuse to start `path` once it names another build than the one
+/// this process runs, as after an upgrade or rebuild replaced or removed it.
+/// The file this process runs is read from the kernel at the first start, so
+/// syq's own startup pays nothing; each start then costs one stat of the
+/// path. Only where that shows another file is the file asked for its build
+/// identity: a reinstall of this same build, which syq treats as compatible
+/// everywhere, is started, and remembered so that later starts need only the
+/// stat. Where the kernel does not say, the path is started as before.
+#[cfg(target_os = "macos")]
+fn require_started_file(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    static RUNNING: std::sync::OnceLock<Option<(u32, u64)>> = std::sync::OnceLock::new();
+    static SAME_BUILD: std::sync::Mutex<Option<(u32, u64)>> = std::sync::Mutex::new(None);
+    let Some(running) = *RUNNING.get_or_init(running_file) else {
+        return Ok(());
+    };
+    // st_dev is 32 bits on macOS; the kernel reports it unsigned.
+    let identity = |path| std::fs::metadata(path).map(|m| (m.dev() as u32, m.ino()));
+    let current = match identity(path) {
+        Ok(current) => current,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(replaced(path)),
+        // Starting it reports anything else.
+        Err(_) => return Ok(()),
+    };
+    let same_build = || SAME_BUILD.lock().unwrap_or_else(|error| error.into_inner());
+    if current == running || *same_build() == Some(current) {
+        return Ok(());
+    }
+    // The file asked must still be the file started.
+    if reports_this_build(path) && identity(path).is_ok_and(|after| after == current) {
+        *same_build() = Some(current);
+        return Ok(());
+    }
+    Err(replaced(path))
+}
+
+/// Whether the executable at `path` reports this build's identity, as syq
+/// checks a helper's or an update's.
+#[cfg(target_os = "macos")]
+fn reports_this_build(path: &std::path::Path) -> bool {
+    let mut probe = Command::new(path);
+    probe.arg("--build-identity");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    capture_output_bounded(&mut probe, deadline, &|| false, 4096).is_ok_and(|output| {
+        output.status.success()
+            && output.stdout.strip_suffix(b"\n") == Some(env!("SYQ_BUILD_IDENTITY").as_bytes())
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn replaced(path: &std::path::Path) -> std::io::Error {
+    std::io::Error::other(replaced_message(path, RECEIVING.get()))
+}
+
+/// A receiving connection (`--receive-service`): the server it serves, and
+/// its persistence domain's explicit path. Of syq's long-lived processes,
+/// only it starts syq processes of its own, the return helpers each request
+/// runs, so only it is restarted rather than rerun.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Receiving {
+    endpoint: String,
+    scope: Option<std::path::PathBuf>,
+}
+
+#[cfg(target_os = "macos")]
+static RECEIVING: std::sync::OnceLock<Receiving> = std::sync::OnceLock::new();
+
+/// Note that this process is the receiving connection to `endpoint` in the
+/// persistence domain at `scope` (`None` for the default one), so that a
+/// refused start says how to restart it. Call once, as it starts.
+pub(crate) fn running_receiving_connection(endpoint: String, scope: Option<&std::path::Path>) {
+    #[cfg(target_os = "macos")]
+    let _ = RECEIVING.set(Receiving {
+        endpoint,
+        scope: scope.map(std::path::Path::to_path_buf),
+    });
+    #[cfg(not(target_os = "macos"))]
+    let _ = (endpoint, scope);
+}
+
+/// What a refused start says: a command is rerun, and a receiving
+/// connection restarted by connecting again, which replaces a connection
+/// from another version and keeps the domain's settings.
+#[cfg(any(target_os = "macos", test))]
+fn replaced_message(path: &std::path::Path, receiving: Option<&Receiving>) -> String {
+    let Some(Receiving { endpoint, scope }) = receiving else {
+        return format!(
+            "syq at {} was replaced by another version while this command was running; \
+             rerun the command",
+            path.display()
+        );
+    };
+    let scope = scope.as_ref().map_or_else(String::new, |scope| {
+        format!(" --pscope {}", shell_words::quote(&scope.to_string_lossy()))
+    });
+    format!(
+        "syq at {} was upgraded while the receiving connection to {endpoint} was running; \
+         restart it with `syq persist connect {}{scope}`",
+        path.display(),
+        shell_words::quote(endpoint)
+    )
+}
+
+/// macOS: the device and inode of the file this process runs, as the kernel
+/// recorded them when it mapped this code, which stay right after that file
+/// is replaced or removed.
+#[cfg(target_os = "macos")]
+fn running_file() -> Option<(u32, u64)> {
+    // <sys/proc_info.h>; libc does not declare this flavor.
+    const PROC_PIDREGIONPATHINFO: libc::c_int = 8;
+    #[repr(C)]
+    struct RegionInfo {
+        protection_inheritance_flags: [u32; 4],
+        offset: u64,
+        counts: [u32; 14],
+        address: u64,
+        size: u64,
+    }
+    #[repr(C)]
+    struct RegionWithPathInfo {
+        region: RegionInfo,
+        vnode: libc::vnode_info_path,
+    }
+    let address = running_file as *const () as u64;
+    let mut info = std::mem::MaybeUninit::<RegionWithPathInfo>::zeroed();
+    let size = std::mem::size_of::<RegionWithPathInfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            PROC_PIDREGIONPATHINFO,
+            address,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    // The kernel returns the region holding the address, or the next one.
+    let region = &info.region;
+    let stat = &info.vnode.vip_vi.vi_stat;
+    (region.address <= address && address - region.address < region.size && stat.vst_ino != 0)
+        .then_some((stat.vst_dev, stat.vst_ino))
 }
 
 #[cfg(target_os = "linux")]
@@ -284,6 +437,65 @@ mod tests {
         });
         assert!(finished_rx.recv_timeout(Duration::from_secs(5)).unwrap());
         assert!(child.join().unwrap().success());
+    }
+
+    /// The kernel's record of the running file is this test binary, so its
+    /// own path may start, and another file or a missing one may not.
+    #[test]
+    fn only_the_running_file_starts() {
+        use std::os::unix::fs::MetadataExt;
+        let executable = std::env::current_exe().unwrap();
+        let metadata = std::fs::metadata(&executable).unwrap();
+        assert_eq!(
+            running_file(),
+            Some((metadata.dev() as u32, metadata.ino()))
+        );
+        require_started_file(&executable).unwrap();
+        let directory = crate::test_support::tempdir().unwrap();
+        let other = directory.path().join("syq");
+        std::fs::write(&other, b"another build").unwrap();
+        for path in [other.clone(), directory.path().join("missing")] {
+            let error = require_started_file(&path).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("was replaced by another version while this command was running"),
+                "{error}"
+            );
+        }
+    }
+}
+
+/// A refused start tells a command to rerun and a receiving connection how
+/// to restart.
+#[cfg(test)]
+mod replaced_message_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn commands_rerun_and_receiving_connections_connect_again() {
+        let path = Path::new("/opt/syq/bin/syq");
+        assert_eq!(
+            replaced_message(path, None),
+            "syq at /opt/syq/bin/syq was replaced by another version while this command \
+             was running; rerun the command"
+        );
+        let receiving = |scope: Option<&str>| Receiving {
+            endpoint: "alice@server".into(),
+            scope: scope.map(PathBuf::from),
+        };
+        assert_eq!(
+            replaced_message(path, Some(&receiving(None))),
+            "syq at /opt/syq/bin/syq was upgraded while the receiving connection to \
+             alice@server was running; restart it with `syq persist connect alice@server`"
+        );
+        assert_eq!(
+            replaced_message(path, Some(&receiving(Some("/tmp/my scope")))),
+            "syq at /opt/syq/bin/syq was upgraded while the receiving connection to \
+             alice@server was running; restart it with \
+             `syq persist connect alice@server --pscope '/tmp/my scope'`"
+        );
     }
 }
 

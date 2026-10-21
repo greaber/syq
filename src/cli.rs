@@ -1785,7 +1785,7 @@ struct NativeRmCommand {
     name = "syq clean-partials",
     version,
     about = "Delete syq partial files below the selected directories.",
-    long_about = "Delete new-format syq partial files recursively, leaving other files and directories intact. Stop copies writing into these trees first. Older partial formats are not selected. Symlinks are not followed.",
+    long_about = "Delete new-format syq partial files recursively, including those S3 downloads leave, leaving other files and directories intact. Stop copies writing into these trees first. Older partial formats are not selected. Symlinks are not followed.",
     before_help = "Examples:\n  syq clean-partials --dry-run backup\n  syq clean-partials --on nas /backup"
 )]
 struct CleanPartialsCommand {

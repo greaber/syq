@@ -14,6 +14,13 @@ cleanup() {
         kill -TERM "$return_copy_pid" 2>/dev/null || true
         wait "$return_copy_pid" 2>/dev/null || true
     fi
+    if [ -n "${upgrade_old_pid:-}" ]; then
+        kill -TERM "$upgrade_old_pid" 2>/dev/null || true
+        wait "$upgrade_old_pid" 2>/dev/null || true
+    fi
+    if [ -n "${upgrade_scope:-}" ]; then
+        syq persist off --pscope "$upgrade_scope" >/dev/null 2>&1 || true
+    fi
     syq persist off >/dev/null 2>&1 || true
     if [ -n "${SSH_AGENT_PID:-}" ]; then
         ssh-agent -k >/dev/null 2>&1 || true
@@ -326,6 +333,113 @@ assert not any(name.endswith(".recv") for name in entries), entries
 PYEPHEMERAL
 syq persist status --json | python3 -c 'import json,sys; assert json.load(sys.stdin)["enabled"] is False'
 syq persist off --pscope "$ephemeral_connect_scope"
+
+printf 'case: connecting again replaces a scoped receiving connection from another build\n'
+# After an upgrade on macOS, a receiving connection from the old build gives
+# `syq persist connect SERVER --pscope PATH` as its restart. Running that
+# stops the old connection, starts one from this build, and keeps the domain
+# and its settings.
+upgrade_scope=$(syq persist on --ephemeral)
+mkdir -p /tmp/syq-upgrade-receive
+syq persist receive on --pscope "$upgrade_scope" --notify off \
+    --root /tmp/syq-upgrade-receive --all-connections
+syq persist connect source --pscope "$upgrade_scope"
+cp "$upgrade_scope/receive.json" /tmp/syq-upgrade-settings.json
+rm -f /tmp/syq-upgrade-old-ready
+# Stand in for the old build: stop this build's connection, then answer on its
+# control with another build's identity until asked to stop.
+python3 - "$upgrade_scope" /tmp/syq-upgrade-old-ready "$(syq --build-identity)" \
+    >/tmp/syq-upgrade-old.log 2>&1 <<'PYOLD' &
+import fcntl, json, os, signal, socket, struct, sys, time
+from pathlib import Path
+
+scope, ready, build = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+records = [p for p in scope.iterdir() if p.name.endswith(".recv-json")]
+assert len(records) == 1, records
+control = str(records[0])[: -len(".recv-json")]
+
+
+def read_frame(conn):
+    data = b""
+    while len(data) < 4 or len(data) < 4 + struct.unpack(">I", data[:4])[0]:
+        chunk = conn.recv(65536)
+        if not chunk:
+            raise EOFError("short frame")
+        data += chunk
+    return json.loads(data[4:])
+
+
+def write_frame(conn, message):
+    data = json.dumps(message).encode()
+    conn.sendall(struct.pack(">I", len(data)) + data)
+
+
+with socket.socket(socket.AF_UNIX) as conn:
+    conn.settimeout(5)
+    conn.connect(control + ".recv")
+    write_frame(conn, {"version": 2, "stop": False})
+    state = read_frame(conn)
+assert state["identity"] == build, state
+os.kill(state["pid"], signal.SIGTERM)
+lock = open(control + ".recv-lock", "r+")
+deadline = time.monotonic() + 15
+while True:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if not os.path.exists(control + ".recv"):
+            break
+        fcntl.flock(lock, fcntl.LOCK_UN)
+    except BlockingIOError:
+        pass
+    assert time.monotonic() < deadline, "this build's receiving connection did not stop"
+    time.sleep(0.02)
+listener = socket.socket(socket.AF_UNIX)
+listener.bind(control + ".recv")
+os.chmod(control + ".recv", 0o600)
+listener.listen(8)
+listener.settimeout(60)
+ready.touch()
+while True:
+    conn, _ = listener.accept()
+    with conn:
+        conn.settimeout(5)
+        stop = read_frame(conn).get("stop")
+        write_frame(conn, {
+            "version": 2, "identity": "other-build", "pid": 0,
+            "endpoint": "source", "name": "",
+            "connection": {"phase": "online", "error": None, "ssh_pid": None},
+        })
+    if stop:
+        # Like the service, remove the socket before releasing the lock.
+        os.unlink(control + ".recv")
+        lock.close()
+        print("stopped")
+        break
+PYOLD
+upgrade_old_pid=$!
+upgrade_deadline=$(($(date +%s) + 30))
+while [ ! -e /tmp/syq-upgrade-old-ready ]; do
+    if ! kill -0 "$upgrade_old_pid" 2>/dev/null || [ "$(date +%s)" -ge "$upgrade_deadline" ]; then
+        cat /tmp/syq-upgrade-old.log >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+# The restart the old build's message gives.
+syq persist connect source --pscope "$upgrade_scope"
+wait "$upgrade_old_pid"
+upgrade_old_pid=
+test "$(cat /tmp/syq-upgrade-old.log)" = stopped
+cmp "$upgrade_scope/receive.json" /tmp/syq-upgrade-settings.json
+syq persist status --json --pscope "$upgrade_scope" | python3 -c '
+import json, sys
+state = json.load(sys.stdin)
+connection = next(c for c in state["connections"] if c["endpoint"] == "source")
+assert connection["state"] == "ready", connection
+assert connection["receiving"]["phase"] == "online", connection
+'
+syq persist off --pscope "$upgrade_scope"
+upgrade_scope=
 
 printf 'case: named return destination works from independent server shells without agent forwarding\n'
 receive_root=/tmp/syq-real-ssh-receive

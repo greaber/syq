@@ -646,7 +646,10 @@ the copy. Every supplied expected hash must match the shared contents: omitted
 hashes impose no requirement, identical hashes are checked once, and different
 algorithms are checked together in one read. Different values for the same
 algorithm are rejected before copying the group. Hardlinks across destination
-filesystems fail visibly. Multiply linked symlinks and special files are currently unsupported,
+filesystems fail visibly. On a filesystem without hard links, such as FAT,
+exFAT or an rclone mount, syq copies one name of each group and reports each
+other name as failed, with the missing hard links as the reason.
+Multiply linked symlinks and special files are currently unsupported,
 as are hardlink requests with descriptors, streams, and S3. `-a` retains its
 existing meaning; add `-H` explicitly.
 

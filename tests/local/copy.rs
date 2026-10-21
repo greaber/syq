@@ -743,3 +743,99 @@ fn local_receiver_starts_from_the_running_build_after_its_file_is_replaced() {
     );
     assert_eq!(read(&t.path("dst/file")), b"contents");
 }
+
+/// Start a local copy from a copy of syq, rename `replacement` over that
+/// file as an upgrade or reinstall does, then let the copy start its
+/// receiver. Returns the copy's status and stderr.
+#[cfg(target_os = "macos")]
+fn copy_after_replacing_syq(t: &Tmp, replacement: &Path) -> (std::process::ExitStatus, String) {
+    write(&t.path("src/file"), b"contents");
+    let program = t.path("bin/syq");
+    executable_support::copy_executable(Path::new(env!("CARGO_BIN_EXE_syq")), &program, 0o755);
+    let errors = File::create(t.path("stderr")).unwrap();
+    // The coordinator reads the whole manifest before it starts the receiver.
+    let mut child = Command::new(&program)
+        .args(["cp", "--mapping", "-", "-C", "src", "--into", "dst", "-q"])
+        .current_dir(t.path(""))
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(errors)
+        .start()
+        .unwrap();
+    fs::rename(replacement, &program).unwrap();
+    let mut manifest = child.stdin.take().unwrap();
+    manifest
+        .write_all(entry_line("file", "file", None).as_bytes())
+        .unwrap();
+    drop(manifest);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+            let _ = child.wait();
+            panic!(
+                "copy did not finish after its file was replaced: {}",
+                String::from_utf8_lossy(&read(&t.path("stderr")))
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    (
+        status,
+        String::from_utf8_lossy(&read(&t.path("stderr"))).into_owned(),
+    )
+}
+
+/// macOS has no /proc/self/exe, so once an upgrade or rebuild replaces
+/// syq's file with another build while a copy runs, the copy refuses to
+/// start its local receiver from that path and says to rerun. The new file
+/// is only asked for its build identity.
+#[cfg(target_os = "macos")]
+#[test]
+fn local_receiver_is_not_started_from_another_build() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("bin")).unwrap();
+    let replacement = t.path("bin/replacement");
+    let calls = t.path("calls");
+    executable_support::write_executable(
+        &replacement,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+             if [ \"$1\" = --build-identity ]; then echo other-build; exit 0; fi\n\
+             exit 97\n",
+            calls.display()
+        )
+        .as_bytes(),
+        0o755,
+    );
+    let (status, stderr) = copy_after_replacing_syq(&t, &replacement);
+    assert!(!status.success(), "{status:?}: {stderr}");
+    assert!(
+        stderr.contains(
+            "was replaced by another version while this command was running; rerun the command"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(read(&calls), b"--build-identity\n");
+    assert!(!t.path("dst/file").exists());
+}
+
+/// Reinstalling the same build (another copy of the same version, as a
+/// package manager or a copy leaves) gives the file a new inode. The copy
+/// checks the new file's build identity, starts its receiver from it, and
+/// completes.
+#[cfg(target_os = "macos")]
+#[test]
+fn local_receiver_starts_from_a_reinstalled_same_build() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("bin")).unwrap();
+    let replacement = t.path("bin/replacement");
+    executable_support::copy_executable(Path::new(env!("CARGO_BIN_EXE_syq")), &replacement, 0o755);
+    let (status, stderr) = copy_after_replacing_syq(&t, &replacement);
+    assert!(status.success(), "{status:?}: {stderr}");
+    assert_eq!(read(&t.path("dst/file")), b"contents");
+}

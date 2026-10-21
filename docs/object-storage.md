@@ -95,7 +95,9 @@ objects.
   A retried download copies the parts it already has from the earlier
   `.syq-s3-*.partial` file into a new one, which needs room for both. Without
   that room, the file fails and keeps the earlier partial, so a later run
-  can resume once there is space; remove that partial to start over instead.
+  can resume once there is space; remove that partial, or run
+  [`syq clean-partials`](commands/clean-partials.md) on the destination, to
+  start over instead.
   If the copy fails for another reason, syq warns, removes the earlier
   partial and downloads the object again.
   If you abandon an upload, remove its unfinished parts with provider tools or a
