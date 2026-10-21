@@ -294,6 +294,15 @@ fn released_enrollment_state_is_never_read_or_touched() {
     write(&misplaced.join("config.json"), receiver, 0o600);
     assert!(read_receiver_config(&misplaced).is_err());
 
+    // `syq receiver list` points at the docs, and changes nothing.
+    let notice = released_enrollment_notice(home).unwrap();
+    assert!(notice.contains("0.4.0 to 0.7.1"), "{notice}");
+    assert!(
+        notice.contains("#enrollments-from-older-versions"),
+        "{notice}"
+    );
+    assert!(released_enrollment_notice(&home.join("missing")).is_none());
+
     // The enrolling machine lists only current enrollments.
     let base = home.join(".local/state/syq/enrollments");
     private(&base.join(released));
@@ -548,6 +557,47 @@ fn lost_server_state_means_a_new_enrollment_that_replaces_the_old_line() {
 }
 
 #[test]
+fn a_lost_reply_to_a_replacement_enrollment_is_retried_not_duplicated() {
+    let (_, home) = current_account().unwrap();
+    let temporary = tempfile::tempdir_in(home).unwrap();
+    fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let replaced = || ReplacedEnrollment {
+        id: EnrollmentId::random(),
+        entry_public_key: generate_test_key("old")
+            .unwrap()
+            .public_key()
+            .to_openssh()
+            .unwrap(),
+    };
+    // No earlier attempt: a new enrollment.
+    let fresh = replacement_plan(temporary.path(), None, replaced()).unwrap();
+    assert!(fresh.entry_key.is_none() && !fresh.refresh && fresh.replaces.is_some());
+    // An earlier attempt whose reply was lost: the same ID and entry key.
+    let id = EnrollmentId::random();
+    let directory = temporary.path().join(id.to_string());
+    ensure_directory(&directory, 0o700).unwrap();
+    let entry = generate_test_key("entry").unwrap();
+    store_entry_key(&directory, &entry).unwrap();
+    let pending = PendingEnrollment {
+        version: CONFIG_VERSION,
+        id,
+        host: "host-b".into(),
+        port: None,
+        target_login: "backup".into(),
+    };
+    let retried = replacement_plan(
+        temporary.path(),
+        Some((pending, directory.clone())),
+        replaced(),
+    )
+    .unwrap();
+    assert_eq!(retried.id, id);
+    assert_eq!(retried.directory, directory);
+    assert_eq!(retried.entry_key.unwrap().public_key(), entry.public_key());
+    assert!(!retried.refresh && retried.replaces.is_some());
+}
+
+#[test]
 fn a_receiver_from_an_older_line_refuses_new_copies() {
     let login = generate_test_key("login").unwrap();
     let config = ReceiverEnrollment {
@@ -675,6 +725,7 @@ fn enrollment_state_names_no_device_or_inode_and_sessions_compare_none() {
             signer: delegation::TrustedSigner::new(login.public_key(), None, Some(1_900_000_000))
                 .unwrap(),
             identity_file: Some(home.join("id_ed25519")),
+            receiving_state: Vec::new(),
         },
     )
     .unwrap();
@@ -718,12 +769,24 @@ fn enrollment_state_names_no_device_or_inode_and_sessions_compare_none() {
 #[test]
 fn protected_destinations_are_refused_from_their_names_before_enrolling() {
     let home = Path::new("/home/backup");
-    let source = Location::parse("host-a:data").unwrap();
+    // What the server's login reported: no XDG variables, no TMPDIR.
+    let receiving = server_receiving_state(home, "1000", "Linux", ("", "", ""));
     let refused = |placement: &str, destination: &str| {
+        let contents = placement == "contents";
+        let source = Location::parse(if contents {
+            "host-a:data/"
+        } else {
+            "host-a:data"
+        })
+        .unwrap();
         let mut args = Args::try_parse_from([
             "syq rsync",
             "-r",
-            "host-a:data",
+            if contents {
+                "host-a:data/"
+            } else {
+                "host-a:data"
+            },
             &format!("host-b:{destination}"),
         ])
         .unwrap();
@@ -736,7 +799,7 @@ fn protected_destinations_are_refused_from_their_names_before_enrolling() {
             std::slice::from_ref(&source),
             destination.as_bytes(),
             "backup",
-            home,
+            (home, &receiving),
         )
         .err()
         .map(|error| error.to_string())
@@ -784,20 +847,130 @@ fn protected_destinations_are_refused_from_their_names_before_enrolling() {
             "~/.syq-receiver-identity",
             "background receiving control state",
         ),
-        // Copying named sources into the home directory writes beside them.
-        ("into", "~", "SSH configuration directory"),
+        (
+            "into",
+            "/tmp/syq-persist-1000",
+            "background receiving control state",
+        ),
+        (
+            "as",
+            "/tmp/syq-persist-1000/global",
+            "background receiving control state",
+        ),
+        // Contents copied into a directory reach everything beneath it.
+        ("contents", "~", "SSH configuration directory"),
+        (
+            "contents",
+            "~/.config",
+            "background receiving control state",
+        ),
+        ("contents", "/tmp", "background receiving control state"),
     ] {
         let error =
             refused(placement, destination).unwrap_or_else(|| panic!("{destination} was accepted"));
         assert!(error.contains(label), "{destination}: {error}");
     }
+    // Named sources copied into a directory change only that directory and
+    // the sources' own names in it, so a directory above a protected one is
+    // fine.
     for (placement, destination) in [
         ("into", "~/archive"),
         ("into", "/srv/archive"),
         ("as", ".ssh-backup"),
         ("into", "~/.config/other"),
+        ("into", "~"),
+        ("into", "/tmp"),
+        ("into", "~/.config"),
+        ("into", "~/.local/state"),
+        ("into", "~/.local/lib"),
+        ("contents", "/tmp/other"),
     ] {
         assert_eq!(refused(placement, destination), None, "{destination}");
+    }
+    // Where the server's environment moves its receiving state.
+    let moved = server_receiving_state(
+        home,
+        "1000",
+        "Linux",
+        ("/srv/config", "/run/user/1000", "/var/tmp"),
+    );
+    assert_eq!(
+        moved,
+        [
+            home.join(".syq-receiver-identity"),
+            PathBuf::from("/srv/config/syq"),
+            PathBuf::from("/run/user/1000/syq-persist-1000"),
+        ]
+    );
+    assert_eq!(
+        server_receiving_state(home, "501", "Darwin", ("", "", "/var/folders/x"))[2],
+        Path::new("/tmp/syq-persist-501")
+    );
+    assert_eq!(
+        server_receiving_state(home, "7", "Linux", ("relative", "relative", "/var/tmp"))[1..],
+        [
+            home.join(".config/syq"),
+            PathBuf::from("/var/tmp/syq-persist-7")
+        ]
+    );
+}
+
+#[test]
+fn receivers_refuse_protected_paths_beneath_a_recursive_destination_only() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let parent = temporary.path().join("parent");
+    let target = parent.join("target");
+    fs::create_dir_all(target.join("inner")).unwrap();
+    let protected = vec![ReceiverControlPath {
+        path: target.join("inner").as_os_str().as_bytes().to_vec(),
+        label: "test control directory",
+    }];
+    let authority = |source: &str, placement: Placement, destination: &Path| {
+        let mut args = Args::try_parse_from(["syq rsync", "-r", source, "host-b:/unused"]).unwrap();
+        args.normalize();
+        args.placement = placement;
+        let location = Location::parse(source).unwrap();
+        let named = destination.as_os_str().as_bytes();
+        let grant = grant_for(
+            &args,
+            std::slice::from_ref(&location),
+            (EnrollmentId::random(), 1),
+            "receiver",
+            named,
+        )
+        .unwrap();
+        ConfinedRoot::resolve(named, &protected).and_then(|confined| {
+            RestrictedAuthority::new(
+                confined,
+                grant,
+                GrantConstraints::default(),
+                [0; 32],
+                generate_results_key(EnrollmentId::random()).unwrap(),
+                Instant::now() + std::time::Duration::from_secs(60),
+                &protected,
+            )
+        })
+    };
+    // Named sources into the directory above the protected one.
+    authority("host-a:data", Placement::Into, &target).unwrap();
+    // Its contents could reach the protected directory.
+    let error = authority("host-a:data/", Placement::Into, &target)
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("test control directory"),
+        "{error:#}"
+    );
+    // At or beneath it, whatever the placement.
+    for (source, placement, destination) in [
+        ("host-a:data", Placement::Into, target.join("inner")),
+        ("host-a:file", Placement::As, target.join("inner/file")),
+    ] {
+        let error = authority(source, placement, &destination).err().unwrap();
+        assert!(
+            error.to_string().contains("test control directory"),
+            "{error:#}"
+        );
     }
 }
 
@@ -1381,8 +1554,12 @@ fn test_authority_with_options(
 
 #[test]
 fn restricted_destinations_cannot_overlap_receiver_control_paths() {
-    let protected =
-        receiver_control_paths(Path::new("/home/receiver"), None, ControlPaths::Elsewhere).unwrap();
+    let protected = receiver_control_paths(
+        Path::new("/home/receiver"),
+        None,
+        ControlPaths::Elsewhere(&[]),
+    )
+    .unwrap();
 
     reject_control_plane_path(b"/home/receiver/archive", &protected)
         .expect("an unrelated destination remains available");
@@ -1568,6 +1745,7 @@ fn pending_enrollment_keeps_its_key_until_active_metadata_is_durable() {
             .unwrap(),
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
         identity_file: None,
+        receiving_state: Vec::new(),
     };
     complete_local_enrollment(&directory, &metadata).unwrap();
     assert!(!directory.join(PENDING_FILE).exists());
@@ -1921,7 +2099,7 @@ fn existence_authority(
 /// The signed grant bounds what the receiver widens: nothing unless approved;
 /// under `rsync`, directories the copy includes, to change their entries but
 /// never to enter one it could not read; under `all`, also the directory the
-/// copy goes into, here the enrolled root, whose identity the receiver pins.
+/// copy goes into, here the confinement root, whose identity the receiver pins.
 /// Never a directory above the root, nor one beside the copy.
 #[test]
 fn restricted_widening_follows_the_approved_mode() {
@@ -2028,7 +2206,7 @@ fn restricted_widening_follows_the_approved_mode() {
 }
 
 /// Under an approved `all`, a restricted receiver gives the owned directories
-/// from its enrolled root down to the destination, the root included, the
+/// from its confinement root down to the destination, the root included, the
 /// search permission reaching it needs, as an ordinary receiver does, and
 /// restores them when asked. It never walks above the root, and refuses a
 /// destination named outside it.
@@ -10043,8 +10221,55 @@ fn small_copies_publish_through_a_restricted_receiver() {
     }
 }
 
+/// A destination named through a link to its directory, whose own link
+/// names where it leads by an absolute path: the receiver compares that
+/// path with where the directory really is, not the name the grant uses.
+#[test]
+fn follow_dst_compares_absolute_link_targets_with_the_real_directory() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let parent = temporary.path().join("parent");
+    let real = parent.join("data/real");
+    fs::create_dir_all(&real).unwrap();
+    symlink(&parent, temporary.path().join("alias")).unwrap();
+    symlink(&real, parent.join("target")).unwrap();
+    let named = temporary.path().join("alias/target");
+    let mut args =
+        Args::try_parse_from(["syq rsync", "-r", "host-a:data/", "host-b:/unused"]).unwrap();
+    args.normalize();
+    let source = Location::parse("host-a:data/").unwrap();
+    let grant = grant_for(
+        &args,
+        std::slice::from_ref(&source),
+        (EnrollmentId::random(), 1),
+        "receiver",
+        named.as_os_str().as_bytes(),
+    )
+    .unwrap();
+    let authority = RestrictedAuthority::new(
+        ConfinedRoot::resolve(named.as_os_str().as_bytes(), &[]).unwrap(),
+        grant,
+        GrantConstraints {
+            extra_options: crate::delegation::ExtraCopyOptions {
+                follow_dst: true,
+                ..Default::default()
+            },
+            ..GrantConstraints::default()
+        },
+        [0; 32],
+        generate_results_key(EnrollmentId::random()).unwrap(),
+        Instant::now() + std::time::Duration::from_secs(60),
+        &[],
+    )
+    .unwrap();
+    let mut put = small_put(&named.join("file"));
+    let settlement = authority.authorize(&mut put, false).unwrap();
+    let response = authority.test_ops().handle(&put);
+    authority.settle(settlement, &response);
+    assert_eq!(fs::read(real.join("file")).unwrap(), b"new", "{response:?}");
+}
+
 /// With `--follow-dst`, a destination reached through symlinks is the
-/// directory they lead to inside the enrolled root: the receiver works
+/// directory they lead to inside the confinement root: the receiver works
 /// beneath it, under the signed destination's name. A link that leads
 /// outside the root, into the receiver's control plane, to nothing, or
 /// round in a loop is refused when the grant is redeemed.
@@ -10119,10 +10344,13 @@ fn follow_dst_copies_into_the_directory_a_destination_link_leads_to() {
     symlink("loop-b", root.join("loop-a")).unwrap();
     symlink("loop-a", root.join("loop-b")).unwrap();
     for (target, refusal) in [
-        (b"../outside".to_vec(), "outside the enrolled root"),
+        (
+            b"../outside".to_vec(),
+            "outside the directory the destination is in",
+        ),
         (
             path_bytes(&temporary.path().join("outside")),
-            "outside the enrolled root",
+            "outside the directory the destination is in",
         ),
         (b".ssh".to_vec(), "protected SSH configuration"),
         (
@@ -10130,7 +10358,7 @@ fn follow_dst_copies_into_the_directory_a_destination_link_leads_to() {
             "leads to missing, which does not exist",
         ),
         (b"loop-a".to_vec(), "too many symlinks"),
-        (b".".to_vec(), "the enrolled root itself"),
+        (b".".to_vec(), "the directory it is in"),
     ] {
         let error = format!("{:#}", authority(&target, options).err().unwrap());
         assert!(error.contains(refusal), "{target:?}: {error}");
@@ -10190,7 +10418,7 @@ fn follow_dst_creates_a_destination_that_does_not_exist_yet() {
         follow_dst: true,
         ..Default::default()
     };
-    // No symlink: the destination is the enrolled root's missing child.
+    // No symlink: the destination is the confinement root's missing child.
     let authority = test_authority_with_options(
         &root,
         DeletionPolicy::Forbid,
@@ -10232,7 +10460,7 @@ fn follow_dst_creates_a_destination_that_does_not_exist_yet() {
     assert_eq!(found.signed_components, 1);
 }
 
-/// An enrolled root of `/` names everything beneath it, so restricted
+/// An confinement root of `/` names everything beneath it, so restricted
 /// lookups work there, and an absolute destination symlink resolves inside
 /// it.
 #[test]

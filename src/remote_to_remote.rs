@@ -666,6 +666,18 @@ fn direct_command(
     cmd
 }
 
+/// The SSH command for this machine's connection to the coordinator. When
+/// the coordinator gets an entry key, that connection forwards nothing: no
+/// X11, no GSSAPI credentials, and no port forwarding from the user's
+/// configuration. It may still reuse this machine's master connection.
+fn coordinator_rsh(rsh: &[String], entry_key: bool) -> Vec<String> {
+    let mut command = rsh.to_vec();
+    if entry_key && rsh.first().is_some_and(|program| program.ends_with("ssh")) {
+        command.extend(["-x", "-k", "-o", "ClearAllForwardings=yes"].map(String::from));
+    }
+    command
+}
+
 fn source_setup_rsh(rsh: &[String], explicit_rsh: bool) -> Vec<String> {
     let mut setup = rsh.to_vec();
     if !explicit_rsh {
@@ -802,7 +814,9 @@ const MAX_ENTRY_KEY_BYTES: usize = 16 * 1024;
 /// Materialize the laptop's trusted destination keys and the entry key on
 /// the coordinator, in a private temporary directory that lives through all
 /// workers; ordinary OpenSSH verifies every connection with them.
-pub(crate) fn prepare_receiver_ssh(args: &mut Args) -> Result<Option<tempfile::TempDir>> {
+pub(crate) fn prepare_receiver_ssh(
+    args: &mut Args,
+) -> Result<Option<crate::private_broker::SignalCleanedDir>> {
     let entry_key = args
         .entry_key_stdin
         .take()
@@ -849,7 +863,7 @@ fn prepare_receiver_ssh_with(
     args: &mut Args,
     known_hosts: &str,
     entry_key: &[u8],
-) -> Result<tempfile::TempDir> {
+) -> Result<crate::private_broker::SignalCleanedDir> {
     anyhow::ensure!(
         args.restricted_grant
             .as_deref()
@@ -877,7 +891,8 @@ fn prepare_receiver_ssh_with(
             "receiver SSH command is missing {required}"
         );
     }
-    let directory = crate::private_broker::private_temp_dir("syq-receiver-hosts-")?;
+    // An interrupted copy removes the entry key too; only SIGKILL leaves it.
+    let directory = crate::private_broker::SignalCleanedDir::new("syq-receiver-hosts-")?;
     let path = directory.path().join("known_hosts");
     std::fs::write(&path, known_hosts)?;
     crate::agent_broker::validate_openssh_option_path(&path, "receiver known-hosts file")?;
@@ -1059,7 +1074,7 @@ fn run_remote(
     if args.detach && args.rsh.is_none() && !same_host && args.peer_auth != PeerAuth::OwnCredentials
     {
         bail!(
-            "a constrained agent exists only while syq is attached; --detach requires --peer-auth own-credentials and credentials on {coordinator_host}, or an explicit --rsh policy"
+            "--detach needs --peer-auth own-credentials with credentials on {coordinator_host}, or an explicit --rsh policy: a restricted copy and the authentication broker both need this syq to stay attached"
         );
     }
 
@@ -1199,6 +1214,7 @@ fn run_remote(
         );
     }
     let coordinator_target = endpoint_display(coordinator);
+    let rsh = coordinator_rsh(&rsh, entry_key.is_some());
     let spec = if let Some(bridge) = &peer_bridge {
         bridge.coordinator.clone()
     } else if matches!(

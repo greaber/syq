@@ -187,7 +187,7 @@ for name, digest in {snapshots!r}.items():
             known_hosts.write_text('[destination]:22222 ' + (local / 'wrong-host.pub').read_text())
             refused = subprocess.run(copy + ['--as', root + '/untrusted', '--no-tcp'], env=environment,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
-            assert refused.returncode, refused.stderr
+            assert refused.returncode and b'Host key verification failed' in refused.stderr, refused.stderr
             remote('destination', f'test ! -e {root}/untrusted')
             known_hosts.write_text(f'[destination]:22222 {public}\n')
             run('syq', 'receiver', 'revoke', identifier, env=environment)

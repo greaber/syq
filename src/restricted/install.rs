@@ -162,11 +162,37 @@ fn install_receiver(home: &Path) -> Result<PathBuf> {
 
 /// Which machine's paths `receiver_control_paths` lists.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum ControlPaths {
+pub(super) enum ControlPaths<'a> {
     /// This machine's, including receiving state its environment locates.
     Here,
-    /// Another machine's, known only by its home directory.
-    Elsewhere,
+    /// Another machine's, known by its home directory and where it keeps
+    /// its receiving state.
+    Elsewhere(&'a [PathBuf]),
+}
+
+/// Where a server keeps its receiving state, computed as its syq does from
+/// what its login environment reports: the receiver identity, the receive
+/// configuration's directory, and the persistence runtime directory.
+pub(super) fn server_receiving_state(
+    home: &Path,
+    uid: &str,
+    os: &str,
+    (config_home, runtime_dir, tmpdir): (&str, &str, &str),
+) -> Vec<PathBuf> {
+    let absolute = |value: &str| value.starts_with('/').then(|| PathBuf::from(value));
+    let config = absolute(config_home)
+        .unwrap_or_else(|| home.join(".config"))
+        .join("syq");
+    let runtime = absolute(runtime_dir)
+        .unwrap_or_else(|| {
+            if os == "Darwin" || tmpdir.is_empty() {
+                PathBuf::from("/tmp")
+            } else {
+                PathBuf::from(tmpdir)
+            }
+        })
+        .join(format!("syq-persist-{uid}"));
+    vec![home.join(".syq-receiver-identity"), config, runtime]
 }
 
 /// The paths every receiver refuses to write, by name and by the identity
@@ -177,7 +203,7 @@ pub(super) enum ControlPaths {
 pub(super) fn receiver_control_paths(
     home: &Path,
     executable: Option<&Path>,
-    machine: ControlPaths,
+    machine: ControlPaths<'_>,
 ) -> Result<Vec<ReceiverControlPath>> {
     let mut protected = vec![
         (home.join(".ssh"), "SSH configuration directory"),
@@ -214,29 +240,20 @@ pub(super) fn receiver_control_paths(
     ] {
         protected.push((home.join(directory), "named destination authority state"));
     }
-    if machine == ControlPaths::Elsewhere {
-        // Where another machine keeps its receiving state unless its
-        // environment moves it; the receiver itself checks where it is.
-        protected.push((
-            home.join(".syq-receiver-identity"),
-            "background receiving control state",
-        ));
-        protected.push((
-            home.join(".config/syq"),
-            "background receiving control state",
-        ));
-    }
-    for path in [
-        crate::destination::receiver_identity_directory().ok(),
-        crate::receive_service::config_path(&crate::persistence::Domain::default())
-            .ok()
-            .and_then(|path| path.parent().map(Path::to_path_buf)),
-        Some(crate::persistence::runtime_parent_path()),
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|_| machine == ControlPaths::Here)
-    {
+    let receiving = match machine {
+        ControlPaths::Here => [
+            crate::destination::receiver_identity_directory().ok(),
+            crate::receive_service::config_path(&crate::persistence::Domain::default())
+                .ok()
+                .and_then(|path| path.parent().map(Path::to_path_buf)),
+            Some(crate::persistence::runtime_parent_path()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        ControlPaths::Elsewhere(receiving) => receiving.to_vec(),
+    };
+    for path in receiving {
         protected.push((path, "background receiving control state"));
     }
     Ok(protected

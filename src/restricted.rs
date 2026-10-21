@@ -172,6 +172,10 @@ struct LocalEnrollment {
     /// The login key's unencrypted key file, for signing without an agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     identity_file: Option<PathBuf>,
+    /// Where the server keeps its receiving state, for refusing a
+    /// destination there before anything changes on the server.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    receiving_state: Vec<PathBuf>,
 }
 
 /// An enrollment whose installation has started but not yet been confirmed,

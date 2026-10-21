@@ -120,7 +120,7 @@ const MAX_DESTINATION_LINKS: usize = 40;
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ResolvedDestination {
     /// The deepest existing directory on the resolved path, relative to the
-    /// enrolled root, as components.
+    /// confinement root, as components.
     pub(super) existing: Vec<Vec<u8>>,
     /// How many of the signed destination's components lead to `existing`:
     /// the rest do not exist yet, and the copy creates them inside it.
@@ -163,7 +163,9 @@ pub(super) fn resolve_destination_links(
             b"." => continue,
             b".." => {
                 if resolved.pop().is_none() {
-                    bail!("a destination symlink leads outside the enrolled root");
+                    bail!(
+                        "a destination symlink leads outside the directory the destination is in"
+                    );
                 }
                 continue;
             }
@@ -199,7 +201,9 @@ pub(super) fn resolve_destination_links(
         let rest = if target.starts_with(b"/") {
             let inside =
                 crate::fsops::destination_relative_to(root_path, &target).with_context(|| {
-                    format!("the destination symlink {link} leads outside the enrolled root")
+                    format!(
+                        "the destination symlink {link} leads outside the directory the destination is in"
+                    )
                 })?;
             resolved.clear();
             inside
@@ -308,14 +312,47 @@ fn existing_directory_components(root: &Root, destination: &[u8]) -> Result<(Vec
     Ok((existing, true))
 }
 
+/// Refuse a path the copy may change when it is a protected path or lies
+/// beneath one, or, when the copy may also change what is beneath it
+/// (`descendants`), when a protected path lies beneath it.
+pub(super) fn reject_control_plane_scope(
+    path: &[u8],
+    descendants: bool,
+    protected: &[ReceiverControlPath],
+) -> Result<()> {
+    if descendants {
+        return reject_control_plane_path(path, protected);
+    }
+    if let Some(control) = protected
+        .iter()
+        .find(|control| path_is_at_or_below(path, &control.path))
+    {
+        bail!(
+            "command-restricted destination {} overlaps the receiver's protected {} {}; choose a destination outside the receiver control plane",
+            Path::new(OsStr::from_bytes(path)).display(),
+            control.label,
+            Path::new(OsStr::from_bytes(&control.path)).display()
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn reject_control_plane_scopes(
     copy: &CopyOperation,
     protected: &[ReceiverControlPath],
 ) -> Result<()> {
     for scope in &copy.mutation_scopes {
-        reject_control_plane_path(&scope.path, protected)?;
+        reject_control_plane_scope(&scope.path, scope.descendants, protected)?;
     }
     Ok(())
+}
+
+/// Whether the copy may change what lies beneath its destination, rather
+/// than only the destination directory itself.
+fn destination_has_descendants(copy: &CopyOperation) -> bool {
+    copy.mutation_scopes
+        .iter()
+        .any(|scope| scope.path == copy.destination && scope.descendants)
 }
 
 /// The directory a copy's destination is in, resolved and opened when the
@@ -434,7 +471,7 @@ fn reject_protected_ancestry(
 /// of its token-authenticated TCP workers. HostA may choose protocol messages,
 /// but it cannot remove or replace this receiver-side authority.
 pub(crate) struct RestrictedAuthority {
-    /// The enrolled root (or a receiving machine's container), opened once
+    /// The confinement root (or a receiving machine's container), opened once
     /// and verified by identity when the grant is redeemed. Every
     /// connection of the copy uses it as its destination root, and every
     /// lookup here resolves beneath it.
@@ -590,12 +627,17 @@ impl RestrictedAuthority {
         let relative = relative.as_os_str().as_bytes();
         // Where the destination really is, by name, beside the checks of the
         // names the grant uses and of identities below.
-        reject_control_plane_path(&crate::fsops::join(&confined.real, relative), protected)?;
+        let descendants = destination_has_descendants(&copy);
+        reject_control_plane_scope(
+            &crate::fsops::join(&confined.real, relative),
+            descendants,
+            protected,
+        )?;
         let real_root = confined.real.clone();
         let mut held_path = confined.named.clone();
         let mut root = std::sync::Arc::new(confined.root);
         // `--follow-dst`: a destination reached through symlinks is the
-        // directory they resolve to inside the enrolled root. That
+        // directory they resolve to inside the confinement root. That
         // directory, or the deepest existing one the copy creates the rest
         // of the destination inside, is the root every connection works
         // beneath, named in requests by the matching part of the signed
@@ -603,7 +645,9 @@ impl RestrictedAuthority {
         let followed = if extra_options.follow_dst
             && copy.policy.placement != DestinationPlacement::ExactPath
         {
-            resolve_destination_links(&root, &held_path, relative)?
+            // An absolute link target names where the directory really
+            // is, whatever name the grant uses for it.
+            resolve_destination_links(&root, &real_root, relative)?
         } else {
             None
         };
@@ -614,7 +658,7 @@ impl RestrictedAuthority {
                 .collect();
             let whole = found.signed_components == signed.len();
             if whole && found.existing.is_empty() {
-                bail!("signed destination resolves to the enrolled root itself");
+                bail!("signed destination resolves to the directory it is in");
             }
             // The path the links resolve to, with the directories the copy
             // creates, by its names as well as by identity: a control
@@ -623,8 +667,13 @@ impl RestrictedAuthority {
                 crate::fsops::join(&real_root, &found.existing.join(&b'/')),
                 |path, component| crate::fsops::join(&path, component),
             );
-            reject_control_plane_path(&resolved, protected)?;
-            reject_control_plane_directory(&root, &found.existing, whole, protected)?;
+            reject_control_plane_scope(&resolved, descendants, protected)?;
+            reject_control_plane_directory(
+                &root,
+                &found.existing,
+                whole && descendants,
+                protected,
+            )?;
             let directory = root
                 .open_directory(&crate::rooted::RelativePath::new(
                     &found.existing.join(&b'/'),
@@ -643,7 +692,7 @@ impl RestrictedAuthority {
             // The destination's directory as it stands, judged by identity
             // too: a name the strings above miss cannot reach the control
             // plane either.
-            reject_control_plane_directory(&root, &found.0, found.1, protected)?;
+            reject_control_plane_directory(&root, &found.0, found.1 && descendants, protected)?;
         }
         let file_data_limit = (max_file_data_bytes_per_second > 0)
             .then(|| crate::bwlimit::BandwidthLimit::new(max_file_data_bytes_per_second));
@@ -812,7 +861,7 @@ impl RestrictedAuthority {
     }
 
     /// Check the signed placement-root precondition once, against the
-    /// enrolled root, before any request is served. `New` is then kept true
+    /// confinement root, before any request is served. `New` is then kept true
     /// by `constrain_creation`, which forces no-replace creation of the root.
     pub(super) fn check_root_existence(&self) -> Result<()> {
         // Either answer will do, so nothing is looked up: the destination
@@ -1097,7 +1146,7 @@ impl RestrictedAuthority {
     /// The directory the copy goes into without filling it, which only an
     /// approved `all` widens: the destination of named sources, or the
     /// directory an exact target is in. The signed destination lies beneath
-    /// the enrolled root, so this is the root or a directory inside it, never
+    /// the confinement root, so this is the root or a directory inside it, never
     /// one above it.
     fn outer_directory(&self) -> Option<Vec<u8>> {
         match self.copy.policy.placement {
@@ -1115,7 +1164,7 @@ impl RestrictedAuthority {
     }
 
     /// Pin the directory the copy goes into as this authority finds it now,
-    /// beneath the enrolled root; the sender cannot observe it.
+    /// beneath the confinement root; the sender cannot observe it.
     fn outer_directory_condition(
         &self,
         path: &[u8],
@@ -2211,7 +2260,7 @@ impl RestrictedAuthority {
         let relative =
             crate::fsops::destination_relative_to(&self.root_path, path).with_context(|| {
                 format!(
-                    "receiver metadata target {} is outside enrolled root {}",
+                    "receiver metadata target {} is outside {}, the directory the destination is in",
                     String::from_utf8_lossy(path),
                     String::from_utf8_lossy(&self.root_path)
                 )
@@ -3469,7 +3518,7 @@ impl RestrictedAuthority {
                             _ => (
                                 self.root_path.clone(),
                                 self.rooted_metadata(&self.root_path)?
-                                    .context("the enrolled root is missing")?,
+                                    .context("the directory the destination is in is missing")?,
                             ),
                         }
                     }
@@ -3571,7 +3620,7 @@ impl RestrictedAuthority {
                 ..
             } => {
                 // Only an approved `all` widens the directories on the way to
-                // the destination, and only from the enrolled root down: the
+                // the destination, and only from the confinement root down: the
                 // walk goes to the signed destination, beneath that root, and
                 // follows no symlink.
                 anyhow::ensure!(
@@ -3583,7 +3632,7 @@ impl RestrictedAuthority {
                     let root = &self.root_path;
                     anyhow::ensure!(
                         path != root && path_is_at_or_below(path, root),
-                        "the destination's ancestors outside the enrolled root are never widened"
+                        "nothing above the directory the destination is in is widened"
                     );
                 }
                 *path = self.destination.clone();

@@ -119,7 +119,7 @@ pub(crate) enum GrantOperation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CopyOperation {
     /// Canonically spelled absolute target path. This is only a signed name;
-    /// receiver authorization resolves it beneath the enrolled root handle.
+    /// receiver authorization resolves it beneath the confinement root handle.
     pub destination: Vec<u8>,
     /// Exact receiver-side mutation roots derived locally from the source
     /// spellings. A scope may authorize the named object alone or its subtree.
@@ -416,7 +416,7 @@ impl FilterPolicy {
 }
 
 /// Signed precondition on the placement root itself. The receiver checks it
-/// once against the enrolled root when the grant is redeemed, and `New`
+/// once against the confinement root when the grant is redeemed, and `New`
 /// additionally forces no-replace creation of that root, so a remote source
 /// coordinator cannot turn `--into-new` into an update of an existing tree.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -450,14 +450,14 @@ pub(crate) struct ExtraCopyOptions {
     /// existing directories still take the copy's metadata.
     pub keep_files: bool,
     /// `--follow-dst` with `--into`: when the destination is a symlink, the
-    /// copy goes into the directory it resolves to inside the enrolled root.
+    /// copy goes into the directory it resolves to inside the confinement root.
     pub follow_dst: bool,
 }
 
 /// Which existing destination directories the receiver may briefly give the
 /// owner permission the copy needs, as `--widen-dirs` names them: none, the
 /// ones the copy includes, or also the directory the copy goes into. Never
-/// one above the enrolled root.
+/// one above the confinement root.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum DirectoryWidening {
     #[default]
@@ -1142,6 +1142,16 @@ impl TrustedSigner {
             (false, Some(_)) => bail!("a touch and PIN policy applies only to a FIDO login key"),
             (false, None) => {}
         }
+        if let Some(bits) = rsa_bits(key.key_data()) {
+            if bits < MIN_RSA_BITS {
+                bail!("RSA login keys need at least {MIN_RSA_BITS} bits; this one has {bits}");
+            }
+            if bits > MAX_RSA_BITS {
+                bail!(
+                    "syq checks RSA login keys of up to {MAX_RSA_BITS} bits; this one has {bits}"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1177,7 +1187,8 @@ impl TrustedSigner {
         if signature.public_key() != key.key_data() {
             bail!("the signature was made by a key this receiver does not trust");
         }
-        key.verify(namespace, payload, &signature)
+        let signed = ssh_key::SshSig::signed_data(namespace, signature.hash_alg(), payload)?;
+        verify_signature(key.key_data(), &signed, signature.signature())
             .map_err(|_| anyhow!("the signature does not verify with the trusted login key"))?;
         if let Some(required) = self.security_key_flags {
             let flags = security_key_flags(&signature)?;
@@ -1197,6 +1208,56 @@ impl TrustedSigner {
         }
         Ok(())
     }
+}
+
+/// The largest RSA login key syq checks signatures from.
+pub(crate) const MAX_RSA_BITS: usize = 16384;
+/// The smallest RSA login key a receiver trusts.
+pub(crate) const MIN_RSA_BITS: usize = 2048;
+
+/// The size of an RSA key's modulus in bits.
+pub(crate) fn rsa_bits(key: &ssh_key::public::KeyData) -> Option<usize> {
+    let modulus = key.rsa()?.n.as_positive_bytes()?;
+    Some(modulus.first().map_or(0, |first| {
+        modulus.len() * 8 - first.leading_zeros() as usize
+    }))
+}
+
+/// Check `signature` over `data` with `key`. RSA goes through the rsa crate
+/// directly: ssh-key 0.6.7 builds RSA public keys with
+/// `rsa::RsaPublicKey::new`, which refuses moduli over 4,096 bits, so
+/// signatures from larger login keys would never verify.
+pub(crate) fn verify_signature(
+    key: &ssh_key::public::KeyData,
+    data: &[u8],
+    signature: &ssh_key::Signature,
+) -> Result<()> {
+    use signature::Verifier as _;
+    let Some(rsa_key) = key.rsa() else {
+        return key
+            .verify(data, signature)
+            .map_err(|_| anyhow!("the signature does not verify"));
+    };
+    let public = rsa::RsaPublicKey::new_with_max_size(
+        rsa::BigUint::from_bytes_be(rsa_key.n.as_positive_bytes().context("RSA modulus")?),
+        rsa::BigUint::from_bytes_be(rsa_key.e.as_positive_bytes().context("RSA exponent")?),
+        MAX_RSA_BITS,
+    )
+    .context("unsupported RSA key")?;
+    let rsa_signature = rsa::pkcs1v15::Signature::try_from(signature.as_bytes())
+        .map_err(|_| anyhow!("malformed RSA signature"))?;
+    let verified = match signature.algorithm() {
+        ssh_key::Algorithm::Rsa {
+            hash: Some(HashAlg::Sha256),
+        } => rsa::pkcs1v15::VerifyingKey::<sha2_compat::Sha256>::new(public)
+            .verify(data, &rsa_signature),
+        ssh_key::Algorithm::Rsa {
+            hash: Some(HashAlg::Sha512),
+        } => rsa::pkcs1v15::VerifyingKey::<sha2_compat::Sha512>::new(public)
+            .verify(data, &rsa_signature),
+        algorithm => bail!("an RSA key cannot have made a {algorithm} signature"),
+    };
+    verified.map_err(|_| anyhow!("the signature does not verify"))
 }
 
 /// The armored SSHSIG of `signature`, made by `key` over a message hashed

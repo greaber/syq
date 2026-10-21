@@ -1,7 +1,6 @@
 //! The SSH agent protocol for the user's login key: listing identities and
 //! signing. Requests go only to the agent the user's configuration selects.
 use super::*;
-use signature::Verifier as _;
 use ssh_agent_lib::proto::{PublicCredential, Request, Response, SignRequest};
 use ssh_agent_lib::ssh_encoding::{Decode as _, Encode as _};
 use std::os::unix::net::UnixStream;
@@ -104,8 +103,7 @@ pub(super) fn sign(socket: &Path, key: &PublicKey, data: &[u8]) -> Result<ssh_ke
             signature = ssh_key::Signature::new(signature.algorithm(), padded)?;
         }
     }
-    key.key_data()
-        .verify(data, &signature)
+    delegation::verify_signature(key.key_data(), data, &signature)
         .context("the SSH agent's signature does not verify")?;
     Ok(signature)
 }

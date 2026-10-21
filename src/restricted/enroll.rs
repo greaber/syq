@@ -324,13 +324,13 @@ pub(super) fn configured_agent(
 
 /// What one enrollment session sets up: a new enrollment, a retry of one
 /// whose installation was not confirmed, or a refresh of an existing one.
-struct Plan {
-    id: EnrollmentId,
-    directory: PathBuf,
+pub(super) struct Plan {
+    pub(super) id: EnrollmentId,
+    pub(super) directory: PathBuf,
     /// The entry key, unless a new enrollment makes one for the login key.
-    entry_key: Option<PrivateKey>,
-    refresh: bool,
-    replaces: Option<ReplacedEnrollment>,
+    pub(super) entry_key: Option<PrivateKey>,
+    pub(super) refresh: bool,
+    pub(super) replaces: Option<ReplacedEnrollment>,
 }
 
 enum Session {
@@ -341,7 +341,7 @@ enum Session {
 /// What a copy checks once a session knows the server's home directory,
 /// before anything is installed: that its destination is not a path the
 /// receiver protects.
-pub(super) type DestinationCheck<'a> = Option<&'a dyn Fn(&Path) -> Result<()>>;
+pub(super) type DestinationCheck<'a> = Option<&'a dyn Fn(&Path, &[PathBuf]) -> Result<()>>;
 
 /// The enrollment for `login@host:port`, set up when there is none, and
 /// refreshed when it runs another build or `refresh` asks to find the
@@ -418,11 +418,16 @@ pub(super) fn enroll(
                     id: old_id,
                     entry_public_key: old_key.public_key().to_openssh()?,
                 };
+                let pending = load_pending_enrollments()?
+                    .into_iter()
+                    .find(|(pending, _)| {
+                        account(&pending.host, pending.port, &pending.target_login)
+                    });
                 match run_session(
                     &target,
                     jump,
                     (host, port, login),
-                    new_plan(&base, Some(replaced)),
+                    replacement_plan(&base, pending, replaced)?,
                     check,
                 )? {
                     (Session::Installed(installed), directory) => {
@@ -439,6 +444,27 @@ pub(super) fn enroll(
             }
         };
     Ok((metadata, directory, Some(signer)))
+}
+
+/// The enrollment that replaces one whose server state was lost: one whose
+/// installation started before and was never confirmed, as when the reply
+/// to an earlier replacement was lost, else a new one. Reusing it keeps a
+/// lost reply from leaving another enrollment behind on the server.
+pub(super) fn replacement_plan(
+    base: &Path,
+    pending: Option<(PendingEnrollment, PathBuf)>,
+    replaced: ReplacedEnrollment,
+) -> Result<Plan> {
+    Ok(match pending {
+        Some((pending, directory)) => Plan {
+            id: pending.id,
+            entry_key: Some(load_entry_key(&directory)?),
+            directory,
+            refresh: false,
+            replaces: Some(replaced),
+        },
+        None => new_plan(base, Some(replaced)),
+    })
 }
 
 fn new_plan(base: &Path, replaces: Option<ReplacedEnrollment>) -> Plan {
@@ -505,7 +531,7 @@ fn install_over_route(
     let trace_path = temporary.path().join("ssh.log");
     let stage = stage_name(plan.id)?;
     let remote = format!(
-        "set -eu; uname -s; uname -m; printf '%s\\n' \"$HOME\"; if test -f \"$HOME/.ssh/authorized_keys\"; then wc -c <\"$HOME/.ssh/authorized_keys\"; cat \"$HOME/.ssh/authorized_keys\"; else printf '0\\n'; fi; IFS= read -r request; {}; printf '%s' \"$request\" | \"$p\" --restricted-install",
+        "set -eu; uname -s; uname -m; printf '%s\\n' \"$HOME\" \"$(id -u)\" \"${{XDG_CONFIG_HOME-}}\" \"${{XDG_RUNTIME_DIR-}}\" \"${{TMPDIR-}}\"; if test -f \"$HOME/.ssh/authorized_keys\"; then wc -c <\"$HOME/.ssh/authorized_keys\"; cat \"$HOME/.ssh/authorized_keys\"; else printf '0\\n'; fi; IFS= read -r request; {}; printf '%s' \"$request\" | \"$p\" --restricted-install",
         stage_commands(&stage)
     );
     let mut command = Command::new("ssh");
@@ -546,6 +572,16 @@ fn install_over_route(
         let os = read_enrollment_line(&mut stdout)?;
         let arch = read_enrollment_line(&mut stdout)?;
         let home = read_enrollment_line(&mut stdout)?;
+        let uid = read_enrollment_line(&mut stdout)?;
+        let config_home = read_enrollment_line(&mut stdout)?;
+        let runtime_dir = read_enrollment_line(&mut stdout)?;
+        let tmpdir = read_enrollment_line(&mut stdout)?;
+        let receiving = server_receiving_state(
+            Path::new(&home),
+            &uid,
+            &os,
+            (&config_home, &runtime_dir, &tmpdir),
+        );
         let length: usize = read_enrollment_line(&mut stdout)?
             .parse()
             .context("authorized_keys byte count")?;
@@ -554,10 +590,10 @@ fn install_over_route(
         }
         let mut authorized = vec![0u8; length];
         stdout.read_exact(&mut authorized)?;
-        Ok((os, arch, home, authorized))
+        Ok((os, arch, home, receiving, authorized))
     })();
     drop(foreground);
-    let (os, arch, home, authorized) = match platform {
+    let (os, arch, home, receiving, authorized) = match platform {
         Ok(platform) => platform,
         Err(error) => {
             drop(input);
@@ -581,7 +617,7 @@ fn install_over_route(
     let prepared = (|| -> Result<_> {
         // A destination the receiver would refuse leaves no enrollment.
         if let Some(check) = check {
-            check(Path::new(&home))?;
+            check(Path::new(&home), &receiving)?;
         }
         let trace =
             fs::read_to_string(&trace_path).context("read enrollment SSH authentication trace")?;
@@ -591,6 +627,7 @@ fn install_over_route(
             &authorized,
             agent.as_deref(),
             plan.id.to_string().as_bytes(),
+            login,
         )?;
         let platform = crate::remote_helper::Target::for_bootstrap(&os, &arch)
             .context("unsupported receiver platform")?;
@@ -689,6 +726,7 @@ fn install_over_route(
                 results_public_key,
                 signer: login_key.trusted.clone(),
                 identity_file: login_key.identity_file.clone(),
+                receiving_state: receiving.clone(),
             };
             complete_local_enrollment(&plan.directory, &metadata)?;
             Ok(Session::Installed(Box::new((metadata, login_key.signer))))

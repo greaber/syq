@@ -126,6 +126,27 @@ fn enrollment_account(value: &str) -> Result<(String, String)> {
     Ok((policy.login_user, host.to_owned()))
 }
 
+/// Where the documentation says how to remove enrollments from older
+/// versions.
+const RELEASED_ENROLLMENTS_DOCS: &str =
+    "https://greaber.github.io/syq/remote-reference.html#enrollments-from-older-versions";
+
+/// A notice when `home` holds state from enrollments syq 0.4.0 to 0.7.1
+/// made, which this version neither lists nor removes: their enrolling
+/// machine's records or a server's state.
+pub(super) fn released_enrollment_notice(home: &Path) -> Option<String> {
+    [".local/state/syq/restricted", ".local/share/syq/restricted"]
+        .into_iter()
+        .map(|path| home.join(path))
+        .find(|path| path.exists())
+        .map(|path| {
+            format!(
+                "syq: {} holds enrollments made by syq 0.4.0 to 0.7.1, which this version does not list or use; to remove them, see {RELEASED_ENROLLMENTS_DOCS}",
+                path.display()
+            )
+        })
+}
+
 /// `syq receiver enroll|list|revoke`: the receiver enrollment system is one
 /// subcommand with its verbs beneath it.
 pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>> {
@@ -147,6 +168,9 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
     };
     match command {
         "list" => Some((|| {
+            if let Some(notice) = released_enrollment_notice(&current_account()?.1) {
+                crate::output::diagnostic!("{notice}");
+            }
             let active = load_local_enrollments()?;
             let active_ids = active
                 .iter()

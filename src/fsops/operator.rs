@@ -111,7 +111,7 @@ pub(crate) fn prepare_destination_path(
     })
 }
 
-/// The same for `relative` beneath `root`, the enrolled root of a restricted
+/// The same for `relative` beneath `root`, the confinement root of a restricted
 /// receiver: nothing above `root` is looked up or widened, and no symlink is
 /// followed. `root` itself may gain search permission.
 pub(crate) fn prepare_destination_path_beneath(

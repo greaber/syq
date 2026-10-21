@@ -269,7 +269,7 @@ pub(super) fn refuse_protected_destination(
     sources: &[Location],
     requested: &[u8],
     login: &str,
-    home: &Path,
+    (home, receiving): (&Path, &[PathBuf]),
 ) -> Result<()> {
     let destination = normalize_absolute(std::ffi::OsStr::from_bytes(requested), home)?
         .into_os_string()
@@ -281,7 +281,7 @@ pub(super) fn refuse_protected_destination(
         login,
         &destination,
     )?;
-    let protected = receiver_control_paths(home, None, ControlPaths::Elsewhere)?;
+    let protected = receiver_control_paths(home, None, ControlPaths::Elsewhere(receiving))?;
     let GrantOperation::Copy(copy) = &grant.operation;
     reject_control_plane_scopes(copy, &protected)
 }
@@ -312,8 +312,14 @@ pub(crate) fn prepare_transfer(
     )?;
     // A destination the receiver would refuse is refused before anything
     // is set up or refreshed on the server.
-    let check = |home: &Path| {
-        refuse_protected_destination(args, sources, &destination.path, destination_login, home)
+    let check = |home: &Path, receiving: &[PathBuf]| {
+        refuse_protected_destination(
+            args,
+            sources,
+            &destination.path,
+            destination_login,
+            (home, receiving),
+        )
     };
     let enroll_now = |refresh: bool| {
         enroll(
@@ -331,7 +337,7 @@ pub(crate) fn prepare_transfer(
             && metadata.target_login == destination_login
     });
     if let Some((metadata, _)) = &found {
-        check(Path::new(&metadata.remote_home))?;
+        check(Path::new(&metadata.remote_home), &metadata.receiving_state)?;
     }
     let (metadata, directory, signer) = match found {
         Some((metadata, directory)) if metadata.release == crate::identity::build() => {
@@ -384,7 +390,7 @@ pub(crate) fn prepare_transfer(
         destination_login,
         &destination_path,
     )?;
-    check(Path::new(&metadata.remote_home))?;
+    check(Path::new(&metadata.remote_home), &metadata.receiving_state)?;
     let request_id = grant.request_id;
     let (recipient_secret, recipient_public_key) =
         crate::destination_results::generate_recipient()?;

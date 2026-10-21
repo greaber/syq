@@ -376,7 +376,7 @@ def rotation_and_generations(lab, parent):
                        timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # A copy running through a refresh finishes.
-    run('ssh', 'source', 'head -c 24M /dev/zero > /tmp/syq-real-ssh-rotation-large')
+    run('ssh', 'source', 'head -c 32M /dev/zero > /tmp/syq-real-ssh-rotation-large')
     destination = f'{parent}/rotation-large'
     with tempfile.TemporaryFile() as output:
         process = subprocess.Popen(
@@ -397,7 +397,28 @@ print(any(p.stat().st_size > 0 for p in Path({parent!r}).glob('.rotation-large.s
             run('syq', 'receiver', 'enroll', 'destination')
             _, again = enrollment()
             assert again['generation'] == 4, again
-            assert process.wait(timeout=60) == 0
+            # Drop the copy's worker connections: the workers that replace
+            # them start from the refreshed line, at the new generation, and
+            # join the running copy.
+            dropped = remote_text('python3 -c ' + shlex.quote('''
+import os, signal
+dropped = 0
+for pid in filter(str.isdigit, os.listdir('/proc')):
+    try:
+        environment = open(f'/proc/{pid}/environ', 'rb').read()
+        status = open(f'/proc/{pid}/status').read()
+    except OSError:
+        continue
+    if b'--restricted-worker=' in environment:
+        os.kill(int(status.split('PPid:')[1].split()[0]), signal.SIGKILL)
+        dropped += 1
+print(dropped)
+''')).strip()
+            assert int(dropped) >= 1, dropped
+            assert process.wait(timeout=90) == 0
+            output.seek(0)
+            log = output.read().decode(errors='replace')
+            assert 'reopening' in log, log
         except BaseException:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -405,8 +426,8 @@ print(any(p.stat().st_size > 0 for p in Path({parent!r}).glob('.rotation-large.s
             print(output.read().decode(errors='replace'), flush=True)
             raise
     size = remote_text('stat -c %s ' + shlex.quote(destination)).strip()
-    assert size == str(24 << 20), size
-    print('a copy running through a refresh finished', flush=True)
+    assert size == str(32 << 20), size
+    print('a worker joined a copy running through a refresh', flush=True)
 
 
 def remount(parent):

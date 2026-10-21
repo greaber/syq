@@ -987,11 +987,85 @@ fn receiver_ssh_uses_the_entry_key_alone_and_pinned_host_keys() {
     // A command that would also use an agent never gets the key.
     args.rsh = Some(template.replace("IdentityAgent=none", "IdentityAgent=SSH_AUTH_SOCK"));
     assert!(prepare_receiver_ssh_with(&mut args, &known_hosts, entry_key.as_bytes()).is_err());
-    // The broker's command has no entry key placeholder to fill.
+    // The broker's command uses an agent, so it never gets the key.
     args.rsh = Some(constrained_destination_rsh(
         2222,
         "ssh-ed25519",
         DestinationAuthentication::Broker,
     ));
     assert!(prepare_receiver_ssh_with(&mut args, &known_hosts, entry_key.as_bytes()).is_err());
+}
+
+#[test]
+fn the_coordinator_connection_forwards_nothing_when_it_gets_an_entry_key() {
+    let ssh = vec!["ssh".to_owned()];
+    let with_key = coordinator_rsh(&ssh, true);
+    assert_eq!(
+        with_key,
+        ["ssh", "-x", "-k", "-o", "ClearAllForwardings=yes"]
+    );
+    // Both the direct command and helper setup start from it; a master
+    // connection may still carry it.
+    assert!(source_setup_rsh(&with_key, false).ends_with(&["-a".to_owned()]));
+    assert_eq!(coordinator_rsh(&ssh, false), ssh);
+    // An explicit non-ssh command is the user's own policy.
+    let custom = vec!["my-transport".to_owned()];
+    assert_eq!(coordinator_rsh(&custom, true), custom);
+}
+
+#[test]
+fn an_interrupted_coordinator_removes_its_entry_key() {
+    use clap::Parser;
+    const CHILD: &str = "SYQ_TEST_ENTRY_KEY_CHILD";
+    if let Some(report) = std::env::var_os(CHILD) {
+        let mut args = Args::parse_from(["syq", "src", "dst"]);
+        args.restricted_grant = Some("signed-grant".into());
+        args.rsh = Some(constrained_destination_rsh(
+            2222,
+            "ssh-ed25519",
+            DestinationAuthentication::Receiver,
+        ));
+        let host = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let entry = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap()
+        .to_openssh(ssh_key::LineEnding::LF)
+        .unwrap();
+        let directory = prepare_receiver_ssh_with(
+            &mut args,
+            &format!(
+                "{RECEIVER_HOST_ALIAS} {}\n",
+                host.public_key().to_openssh().unwrap()
+            ),
+            entry.as_bytes(),
+        )
+        .unwrap();
+        assert!(directory.path().join("entry-key").is_file());
+        std::fs::write(&report, directory.path().as_os_str().as_encoded_bytes()).unwrap();
+        unsafe { libc::raise(libc::SIGTERM) };
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        unreachable!("SIGTERM did not end the coordinator");
+    }
+    let temporary = crate::test_support::tempdir().unwrap();
+    let report = temporary.path().join("directory");
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "remote_to_remote::tests::an_interrupted_coordinator_removes_its_entry_key",
+            "--nocapture",
+        ])
+        .env(CHILD, &report)
+        .stdin(Stdio::null())
+        .status_guarded()
+        .unwrap();
+    use std::os::unix::process::ExitStatusExt as _;
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+    let directory = std::path::PathBuf::from(std::fs::read_to_string(&report).unwrap());
+    assert!(!directory.exists(), "{} survived", directory.display());
 }

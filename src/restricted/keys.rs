@@ -153,12 +153,19 @@ impl LoginSigner {
             return Ok(None);
         }
         let key = trusted.key()?;
+        // An agent that cannot be reached says nothing about the key: report
+        // it rather than enroll another login key in its place.
+        let mut unreachable = None;
         if let Some(socket) = agent {
-            if agent::has_key(socket, &key).unwrap_or(false) {
-                return Ok(Some(Self::Agent {
-                    socket: socket.to_path_buf(),
-                    key,
-                }));
+            match agent::has_key(socket, &key) {
+                Ok(true) => {
+                    return Ok(Some(Self::Agent {
+                        socket: socket.to_path_buf(),
+                        key,
+                    }))
+                }
+                Ok(false) => {}
+                Err(error) => unreachable = Some((socket, error)),
             }
         }
         if let Some(path) = identity_file {
@@ -173,6 +180,12 @@ impl LoginSigner {
                     return Ok(Some(Self::File(Box::new(private))));
                 }
             }
+        }
+        if let Some((socket, error)) = unreachable {
+            return Err(error.context(format!(
+                "cannot use the SSH agent at {} to find the login key restricted copying trusts; check SSH_AUTH_SOCK or the IdentityAgent setting",
+                socket.display()
+            )));
         }
         Ok(None)
     }
@@ -332,6 +345,59 @@ fn read_certificate(path: &Path) -> Option<ssh_key::Certificate> {
     ssh_key::Certificate::from_openssh(text.trim()).ok()
 }
 
+/// The certificate that authenticated a login, among those for its key in
+/// the agent and beside its key file. OpenSSH's trace names neither which
+/// of several certificates for one key it offered nor their IDs, so syq
+/// keeps the user certificates valid now, prefers those naming the login
+/// account as a principal, and refuses when what is left disagrees about
+/// what a receiver would record: the expiry and the touch and PIN options.
+fn authenticated_certificate(
+    certificates: Vec<ssh_key::Certificate>,
+    login: &str,
+    now: i64,
+) -> Result<ssh_key::Certificate> {
+    let now = u64::try_from(now).unwrap_or(0);
+    let valid: Vec<_> = certificates
+        .into_iter()
+        .filter(|certificate| {
+            certificate.cert_type().is_user()
+                && certificate.valid_after() <= now
+                && now < certificate.valid_before()
+        })
+        .collect();
+    if valid.is_empty() {
+        bail!("syq cannot find a currently valid certificate for the key that logged in; load the certificate into your SSH agent with its key (ssh-add), then retry");
+    }
+    let naming: Vec<_> = valid
+        .iter()
+        .filter(|certificate| {
+            certificate.valid_principals().is_empty()
+                || certificate
+                    .valid_principals()
+                    .iter()
+                    .any(|principal| principal == login)
+        })
+        .cloned()
+        .collect();
+    let candidates = if naming.is_empty() { valid } else { naming };
+    let recorded = |certificate: &ssh_key::Certificate| {
+        (
+            certificate.valid_before(),
+            certificate
+                .critical_options()
+                .contains_key("verify-required"),
+            certificate.extensions().contains_key("no-touch-required"),
+        )
+    };
+    if candidates
+        .iter()
+        .any(|certificate| recorded(certificate) != recorded(&candidates[0]))
+    {
+        bail!("several currently valid certificates for the login key are loaded, and syq cannot tell which one logged in; keep only the one you log in with (ssh-add -d removes the others from your agent), then retry");
+    }
+    Ok(candidates[0].clone())
+}
+
 /// Find the key that authenticated the login `trace` records, among the
 /// identities of `agent` or in its file, and check that it can sign before
 /// anything is installed: the probe signature catches keys added with
@@ -339,13 +405,16 @@ fn read_certificate(path: &Path) -> Option<ssh_key::Certificate> {
 /// askpass for a PIN, and PKCS#11 keys used without an agent.
 ///
 /// A FIDO key's touch and PIN policy combines the server's `authorized_keys`
-/// options for the key (`authorized`) with the flags of its key handle, or,
-/// when syq cannot read the handle, the flags of the probe signature.
+/// options for the key, or for a certificate login the certificate's own
+/// options merged with its authority's line as sshd merges them, with the
+/// flags of its key handle, or, when syq cannot read the handle, the flags
+/// of the probe signature.
 pub(super) fn discover(
     trace: &str,
     authorized: &[u8],
     agent: Option<&Path>,
     probe: &[u8],
+    login_user: &str,
 ) -> Result<LoginKey> {
     let login = login_from_trace(trace)?;
     let matches = |key: &ssh_key::public::KeyData| {
@@ -355,7 +424,7 @@ pub(super) fn discover(
             == login.fingerprint
     };
     let mut in_agent = None;
-    let mut valid_before = None;
+    let mut certificates = Vec::new();
     if let Some(socket) = agent {
         // An agent that is not running holds nothing.
         for blob in agent::identities(socket).unwrap_or_default() {
@@ -364,8 +433,8 @@ pub(super) fn discover(
                     in_agent = Some(key);
                 }
             } else if let Ok(certificate) = ssh_key::Certificate::from_bytes(&blob) {
-                if matches(certificate.public_key()) && login.certificate {
-                    valid_before = Some(certificate.valid_before());
+                if matches(certificate.public_key()) {
+                    certificates.push(certificate);
                 }
             }
         }
@@ -380,23 +449,38 @@ pub(super) fn discover(
         {
             file_key = Some(key);
         }
-        if login.certificate && valid_before.is_none() {
-            valid_before = [
-                Path::new(login.name.as_deref().unwrap_or_default()),
-                certificate.as_path(),
-            ]
-            .into_iter()
-            .filter_map(read_certificate)
-            .find(|certificate| matches(certificate.public_key()))
-            .map(|certificate| certificate.valid_before());
+        for path in [
+            Path::new(login.name.as_deref().unwrap_or_default()),
+            certificate.as_path(),
+        ] {
+            if let Some(found) = read_certificate(path).filter(|found| matches(found.public_key()))
+            {
+                if !certificates.contains(&found) {
+                    certificates.push(found);
+                }
+            }
         }
     }
-    if login.certificate && valid_before.is_none() {
-        bail!("syq cannot find the certificate that logged in; load it into your SSH agent with its key (ssh-add), then retry");
-    }
+    let certificate = if login.certificate {
+        if certificates.is_empty() {
+            bail!("syq cannot find the certificate that logged in; load it into your SSH agent with its key (ssh-add), then retry");
+        }
+        Some(authenticated_certificate(
+            certificates,
+            login_user,
+            super::now()?,
+        )?)
+    } else {
+        None
+    };
     let key = in_agent
         .clone()
         .or_else(|| file_key.as_ref().map(|key| key.public_key().clone()))
+        .or_else(|| {
+            certificate
+                .as_ref()
+                .map(|certificate| PublicKey::new(certificate.public_key().clone(), ""))
+        })
         .with_context(|| {
             format!(
                 "syq cannot find the key that logged in ({}): it is not in your SSH agent{} and syq found no key file for it. Load it with ssh-add (ssh-add -s PROVIDER for a PKCS#11 key), then retry",
@@ -416,13 +500,17 @@ pub(super) fn discover(
         (None, Some(private)) if !private.is_encrypted() && software_key(&key) => {
             LoginSigner::File(Box::new(private.clone()))
         }
-        (None, Some(private)) if private.is_encrypted() => bail!(
+        (None, _) if !software_key(&key) => bail!(
+            "the FIDO login key {} works only through your SSH agent; load it with ssh-add, then retry",
+            files.as_ref().map_or_else(String::new, |(path, _)| path.display().to_string())
+        ),
+        (None, Some(_)) => bail!(
             "the login key {} is passphrase-protected; load it into your SSH agent with ssh-add, then retry",
             files.as_ref().map_or_else(String::new, |(path, _)| path.display().to_string())
         ),
-        (None, _) => bail!(
-            "the FIDO login key {} works only through your SSH agent; load it with ssh-add, then retry",
-            files.as_ref().map_or_else(String::new, |(path, _)| path.display().to_string())
+        (None, None) => bail!(
+            "syq cannot find the key that logged in ({}) in your SSH agent; load it with ssh-add, then retry",
+            login.fingerprint
         ),
     };
     let security_key = matches!(
@@ -448,13 +536,38 @@ pub(super) fn discover(
                     .map(|key| key.flags())
                     .or_else(|| key.key_data().sk_ecdsa_p256().map(|key| key.flags()))
             });
-        let options = matching_authorization(authorized, &key)?.unwrap_or_default();
+        let has = |options: &[String], name: &str| options.iter().any(|option| option == name);
+        let (no_touch, verify) = match &certificate {
+            // sshd lets a certificate login skip the touch only when both
+            // the certificate and its authority's line allow it, and asks
+            // for a PIN when either does.
+            Some(certificate) => {
+                let authority = PublicKey::new(certificate.signature_key().clone(), "");
+                let line =
+                    matching_authorization(authorized, &authority, true)?.unwrap_or_default();
+                (
+                    has(&line, "no-touch-required")
+                        && certificate.extensions().contains_key("no-touch-required"),
+                    has(&line, "verify-required")
+                        || certificate
+                            .critical_options()
+                            .contains_key("verify-required"),
+                )
+            }
+            None => {
+                let line = matching_authorization(authorized, &key, false)?.unwrap_or_default();
+                (
+                    has(&line, "no-touch-required"),
+                    has(&line, "verify-required"),
+                )
+            }
+        };
         let mut required =
             handle_flags.unwrap_or(probe_flags) & (SK_USER_PRESENCE | SK_USER_VERIFICATION);
-        if !options.iter().any(|option| option == "no-touch-required") {
+        if !no_touch {
             required |= SK_USER_PRESENCE;
         }
-        if options.iter().any(|option| option == "verify-required") {
+        if verify {
             required |= SK_USER_VERIFICATION;
         }
         if probe_flags & required != required {
@@ -473,7 +586,11 @@ pub(super) fn discover(
     };
     Ok(LoginKey {
         signer,
-        trusted: TrustedSigner::new(&key, security_key_flags, valid_before)?,
+        trusted: TrustedSigner::new(
+            &key,
+            security_key_flags,
+            certificate.map(|certificate| certificate.valid_before()),
+        )?,
         identity_file,
     })
 }
@@ -528,8 +645,14 @@ fn authorization_options(options: &str) -> Result<Vec<String>> {
 }
 
 /// The options of the `authorized_keys` line that authorizes `public`, or
-/// `None` when no line names it (a certificate login, for one).
-fn matching_authorization(authorized: &[u8], public: &PublicKey) -> Result<Option<Vec<String>>> {
+/// `None` when no line names it. With `authority`, only `cert-authority`
+/// lines count, which authorize certificates `public` signed; without it,
+/// they do not.
+fn matching_authorization(
+    authorized: &[u8],
+    public: &PublicKey,
+    authority: bool,
+) -> Result<Option<Vec<String>>> {
     let mut found = None;
     for raw in authorized.split(|byte| *byte == b'\n') {
         // Public-key fields and policy option names are ASCII. A comment or
@@ -559,6 +682,9 @@ fn matching_authorization(authorized: &[u8], public: &PublicKey) -> Result<Optio
             .map(authorization_options)
             .transpose()?
             .unwrap_or_default();
+        if options.iter().any(|option| option == "cert-authority") != authority {
+            continue;
+        }
         if found.is_some() {
             bail!("several authorized_keys lines name the FIDO login key; syq cannot tell which touch and PIN policy applies");
         }
