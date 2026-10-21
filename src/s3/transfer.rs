@@ -2011,7 +2011,7 @@ impl Engine {
                 let mut exact = None;
                 if !selector.0.is_empty() && !prefix {
                     if self.options.route.is_server_copy() {
-                        copy_source = self.copy_head(source_bucket, &selector.0).await?;
+                        copy_source = self.copy_head(source_bucket, &selector.0, false).await?;
                         exact = copy_source.as_ref().map(|(object, _)| object.clone());
                     } else {
                         let _slot = self.tuning.requests.acquire().await;
@@ -2020,7 +2020,7 @@ impl Engine {
                     if exact.is_none() && self.args.native_mapping.is_some() {
                         let marker = format!("{}/", selector.0);
                         if self.options.route.is_server_copy() {
-                            copy_source = self.copy_head(source_bucket, &marker).await?;
+                            copy_source = self.copy_head(source_bucket, &marker, false).await?;
                             exact = copy_source.as_ref().map(|(object, _)| object.clone());
                         } else {
                             let _slot = self.tuning.requests.acquire().await;

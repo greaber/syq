@@ -552,35 +552,20 @@ fn serve(
                     path.starts_with("/source/data/"),
                     "unnecessary destination HEAD: {path}"
                 );
-                if fault.ends_with("unsupported") && headers.contains_key("x-amz-checksum-mode") {
-                    assert!(
-                        !gate.0.swap(true, Ordering::SeqCst),
-                        "unsupported checksum mode retried on another object"
-                    );
-                    reply(&mut socket, 501, &[], b"", true);
-                } else if fault.ends_with("denied")
-                    && path.ends_with("/a")
-                    && headers.contains_key("x-amz-checksum-mode")
-                {
-                    reply(&mut socket, 403, &[], b"", true);
-                } else {
-                    if fault.ends_with("denied") && path.ends_with("/b") {
-                        assert!(
-                            headers.contains_key("x-amz-checksum-mode"),
-                            "one object's permission failure disabled other checksum reads"
-                        );
-                    }
-                    reply(
-                        &mut socket,
-                        200,
-                        &[
-                            ("Content-Length".into(), "4".into()),
-                            ("ETag".into(), "\"source\"".into()),
-                        ],
-                        b"",
-                        true,
-                    );
-                }
+                // No destination here can match by checksum: none is listed
+                // with the source's size, or it is kept anyway. Only-existing
+                // copies list nothing, so syq cannot tell before the HEADs.
+                assert!(fault.ends_with("missing") || !headers.contains_key("x-amz-checksum-mode"));
+                reply(
+                    &mut socket,
+                    200,
+                    &[
+                        ("Content-Length".into(), "4".into()),
+                        ("ETag".into(), "\"source\"".into()),
+                    ],
+                    b"",
+                    true,
+                );
             }
         } else if method == "GET" {
             let keys: &[&str] = if path.starts_with("/source?") || path.starts_with("/source/?") {
@@ -761,11 +746,23 @@ fn serve(
                 reply(&mut socket, status, &[], b"", true);
                 return;
             }
+            if fault == "server-copy-compare-recheck-down"
+                && path.starts_with("/source/")
+                && headers.contains_key("x-amz-checksum-mode")
+            {
+                reply(&mut socket, 503, &[], b"", true);
+                return;
+            }
+            // Like S3, report checksums only when asked for them.
+            let checksums = headers.contains_key("x-amz-checksum-mode");
             let source = path.starts_with("/source/");
             if source || comparison {
                 let same_etag = !matches!(
                     fault,
-                    "server-copy-compare-checksum" | "server-copy-compare-composite"
+                    "server-copy-compare-checksum"
+                        | "server-copy-compare-composite"
+                        | "server-copy-compare-crc"
+                        | "server-copy-compare-hash"
                 );
                 let mut fields = vec![
                     (
@@ -803,12 +800,17 @@ fn serve(
                         },
                     ),
                 ];
-                if matches!(
-                    fault,
-                    "server-copy-compare-checksum"
-                        | "server-copy-compare-composite"
-                        | "server-copy-compare-conflict"
-                ) {
+                if checksums
+                    && matches!(
+                        fault,
+                        "server-copy-compare-checksum"
+                            | "server-copy-compare-composite"
+                            | "server-copy-compare-conflict"
+                            | "server-copy-compare-crc"
+                            | "server-copy-compare-hash-differs"
+                            | "server-copy-compare-recheck-down"
+                    )
+                {
                     fields.push((
                         "x-amz-checksum-type".into(),
                         if fault.ends_with("composite") {
@@ -817,14 +819,21 @@ fn serve(
                             "FULL_OBJECT".into()
                         },
                     ));
-                    fields.push((
-                        "x-amz-checksum-sha256".into(),
-                        if !source && fault.ends_with("conflict") {
-                            "BBBB".into()
-                        } else {
-                            "AAAA".into()
-                        },
-                    ));
+                    if fault.ends_with("crc") {
+                        // CRCs never decide, even when they agree.
+                        for name in ["crc64nvme", "crc32c", "crc32", "sha1"] {
+                            fields.push((format!("x-amz-checksum-{name}"), "AAAA".into()));
+                        }
+                    } else {
+                        fields.push((
+                            "x-amz-checksum-sha256".into(),
+                            if !source && fault.ends_with("conflict") {
+                                "BBBB".into()
+                            } else {
+                                "AAAA".into()
+                            },
+                        ));
+                    }
                 }
                 if fault.contains("mapping-metadata") {
                     fields.push(("x-amz-meta-project".into(), "keep".into()));
@@ -837,6 +846,29 @@ fn serve(
                 }
                 if fault.ends_with("tags-denied") || fault.ends_with("-known-unsupported") {
                     fields.push(("x-amz-tagging-count".into(), "1".into()));
+                }
+                if matches!(
+                    fault,
+                    "server-copy-compare-hash" | "server-copy-compare-hash-differs"
+                ) {
+                    // Syq's own hashes decide, whatever the ETags say.
+                    let hash = if !source && fault.ends_with("differs") {
+                        "0".repeat(64)
+                    } else {
+                        "1".repeat(64)
+                    };
+                    for (name, value) in [
+                        ("format", "1"),
+                        ("kind", "file"),
+                        ("mode", "420"),
+                        ("uid", "0"),
+                        ("gid", "0"),
+                        ("mtime", "10"),
+                        ("mtime-nsec", "0"),
+                        ("blake3", &hash),
+                    ] {
+                        fields.push((format!("x-amz-meta-syq-{name}"), value.into()));
+                    }
                 }
                 if fault == "server-copy-compare-time-tie" {
                     for (name, value) in [
@@ -1035,7 +1067,9 @@ fn serve(
                         fault,
                         "server-copy-compare-etag"
                             | "server-copy-compare-checksum"
+                            | "server-copy-compare-hash"
                             | "server-copy-compare-unavailable"
+                            | "server-copy-compare-recheck-down"
                     ),
                     "unchanged object was copied"
                 );
@@ -5338,16 +5372,28 @@ fn server_copy_never_reads_or_relays_object_contents() {
 }
 
 #[test]
-fn server_copy_compares_remote_checksums_etags_and_metadata_without_body_reads() {
+fn server_copy_compares_hashes_checksums_etags_and_metadata_without_body_reads() {
+    // The source is looked up while planning, then the destination with its
+    // checksums. Syq's hashes decide when both objects have one. Otherwise,
+    // when the destination has a full-object SHA-256, the source is looked up
+    // again for its own, and SHA-256 on both decides before ETags. CRC and
+    // SHA-1 never decide. A copy follows only when the contents are not known
+    // to match.
     for (fault, requests) in [
         ("server-copy-compare-etag", 2),
-        ("server-copy-compare-checksum", 2),
+        ("server-copy-compare-checksum", 3),
         ("server-copy-compare-composite", 3),
-        ("server-copy-compare-conflict", 3),
+        ("server-copy-compare-conflict", 4),
+        ("server-copy-compare-crc", 3),
+        ("server-copy-compare-hash", 2),
+        ("server-copy-compare-hash-differs", 3),
         ("server-copy-compare-metadata", 2),
-        ("server-copy-compare-unavailable", 4),
-        ("server-copy-compare-bad-request", 4),
+        // Checksum reads the service refuses fall back to plain HEADs.
+        ("server-copy-compare-unavailable", 3),
+        ("server-copy-compare-bad-request", 3),
         ("server-copy-compare-unsupported", 3),
+        // A failed second lookup decides nothing; the ETags still match.
+        ("server-copy-compare-recheck-down", 3),
     ] {
         let temp = crate::test_support::tempdir().unwrap();
         let server = Server::start(fault);
@@ -5366,6 +5412,35 @@ fn server_copy_compares_remote_checksums_etags_and_metadata_without_body_reads()
         );
         assert!(output.status.success(), "{fault}: {}", output_text(&output));
         assert_eq!(server.requests.load(Ordering::Relaxed), requests, "{fault}");
+    }
+    // A destination kept regardless needs no checksums, and its skip cannot
+    // fail on looking up the source again.
+    for fault in [
+        "server-copy-compare-checksum",
+        "server-copy-compare-recheck-down",
+    ] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let server = Server::start(fault);
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--if-exists=keep",
+                "--from",
+                "s3://source",
+                "original",
+                "--to",
+                "s3://destination",
+                "--as",
+                "copied",
+            ],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{fault}: {}",
+            output_text(&output)
+        );
+        assert_eq!(server.requests.load(Ordering::Relaxed), 2, "{fault}");
     }
 }
 
@@ -5453,8 +5528,6 @@ fn server_copy_reuses_destination_discovery_and_prunes_beneath_file_keys() {
         ("server-tree-fresh", "--dry-run", 5),
         ("server-tree-prune", "--prune", 8),
         ("server-tree-prune", "--prune-before", 8),
-        ("server-tree-unsupported", "--dry-run", 6),
-        ("server-tree-denied", "--dry-run", 6),
     ] {
         let server = Server::start(fault);
         let temp = crate::test_support::tempdir().unwrap();

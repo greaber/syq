@@ -165,8 +165,12 @@ Changes to source encryption alone do not trigger a copy. Source storage class
 changes apply only when explicitly selected; copying a storage class can affect
 storage costs and require restoring an archived object first.
 
-Syq uses stored size/time, whole-file hashes, provider checksums, or ETags to
-identify matching contents. Otherwise, the default policy replaces the destination.
+When both objects carry the whole-file hash syq stores with its uploads and
+copies, those hashes decide whether the contents match. Otherwise, when the
+provider reports a full-object SHA-256 checksum for both, those decide.
+Otherwise, equal ETags or equal stored sizes and modification times count as
+matching. CRC and SHA-1 checksums are not used. When the contents do not
+match, the default policy replaces the destination.
 Use `--if-exists=error-if-different` to reject copies whose contents cannot be
 established as matching. Syq does not
 download both bodies to compare them on this route. `--hash`, `--hash-or-copy`,
