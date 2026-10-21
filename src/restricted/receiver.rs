@@ -33,26 +33,17 @@ pub(crate) fn run_receiver(enrollment: &str, generation: &str) -> Result<()> {
     }
     let envelope = decode_receiver_command(&original)?;
     let (state, config) = receiver_state(enrollment)?;
-    require_current_receiver(&config, generation, crate::identity::build())?;
     let observed_state = fs::symlink_metadata(&state).context("inspect receiver enrollment")?;
     let (_, home) = current_account()?;
     let canonical_home = fs::canonicalize(&home)
         .with_context(|| format!("resolve receiver home {}", home.display()))?;
     let protected = receiver_control_paths(&canonical_home, None, ControlPaths::Here)?;
-    let replay = delegation::ReplayStore::open(&state.join("replay"))?;
-    let observed_at = Instant::now();
-    let signer_name = signer_name(enrollment, config.generation);
-    let context = delegation::ReceiverContext {
-        enrollment_id: enrollment,
-        target_login: &config.target_login,
-        expected_signer: &signer_name,
-        clock: delegation::ClockObservation {
-            unix_seconds: now()?,
-            monotonic: observed_at,
-        },
-        clock_skew_seconds: CLOCK_SKEW_SECONDS,
-    };
-    let verified = delegation::verify_and_redeem(&envelope, &context, &config.signer, &replay)?;
+    let verified = admit(
+        &state,
+        &config,
+        (generation, crate::identity::build()),
+        &envelope,
+    )?;
     let (grant, extensions, grant_digest, deadline) = verified.into_parts();
     let results_key = load_results_key(&state)?;
     let GrantOperation::Copy(copy) = &grant.operation;
@@ -76,6 +67,31 @@ pub(crate) fn run_receiver(enrollment: &str, generation: &str) -> Result<()> {
         deadline,
     )?;
     crate::server::run_restricted(authority)
+}
+
+/// Admit a new copy's grant: refused by a receiver of another generation or
+/// build, then checked against the trusted login key and its policy, and
+/// only then recorded as used.
+pub(super) fn admit(
+    state: &Path,
+    config: &ReceiverEnrollment,
+    (generation, build): (u64, &str),
+    envelope: &[u8],
+) -> Result<delegation::VerifiedGrant> {
+    require_current_receiver(config, generation, build)?;
+    let replay = delegation::ReplayStore::open(&state.join("replay"))?;
+    let signer_name = signer_name(config.id, config.generation);
+    let context = delegation::ReceiverContext {
+        enrollment_id: config.id,
+        target_login: &config.target_login,
+        expected_signer: &signer_name,
+        clock: delegation::ClockObservation {
+            unix_seconds: now()?,
+            monotonic: Instant::now(),
+        },
+        clock_skew_seconds: CLOCK_SKEW_SECONDS,
+    };
+    delegation::verify_and_redeem(envelope, &context, &config.signer, &replay)
 }
 
 /// A connection started from an older line still runs the forced command it

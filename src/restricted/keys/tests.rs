@@ -187,6 +187,18 @@ fn key_files_sign_grants_that_only_the_trusted_key_verifies() {
     }
 }
 
+/// A DSA login key, which OpenSSH no longer accepts, is refused when syq
+/// would record it, with a message naming its kind.
+#[test]
+fn login_keys_syq_cannot_check_are_refused() {
+    let dsa = PublicKey::from_openssh(
+        "ssh-dss AAAAB3NzaC1kc3MAAACBAMLOMqyNJogNSxDVsebmNC/8GSOOleFtBkM0DiyClYIXnAT9pdGptUBCityCpF+eU6m3kXuzESZR4ajwbZp86aQZbkIJTgu57z9hkkvYPUAPKSDs+m1H23EI7hXVm2+LgIVmmbH7B2RVsEpGYHTGMtMRVBbP9RCtI0EoJwEKqID1AAAAFQD+MCvi51mmOxWc4C54B7E5yLIekQAAAIBUF+Yd6dG00SJVSB7SKC3ATZnaU9HaPmODAsdz7Vbydhumwoj8zRA2pQ+nX8r83JXRN/7hz4YiO7FtDUDoiMAuCmZvHXCLMyzF9CG8ZU9QqeW9eTDDh4mXOrfYDijr7VUl4zkkWKl8cPxAB08jogiJtYzvsRat0b6LIZUhPUVH1AAAAIBDyqGLuc/SZkQXXZ1L9EK+LD7FMMsSnChWj6YqEz8CDproNpyKBNccVVdRqS8mwTs2SHSzdDPovmGVIW74NyTr8eRYFVNu93iAr4Qi6dIFFqSpcKbl/aElOWJqh3DDrOYF9Ce4A8ShZZzBh5ZijF57dwljvdWJLqO9DX9lQoq5dQ==",
+    )
+    .unwrap();
+    let error = TrustedSigner::new(&dsa, None, None).unwrap_err();
+    assert!(error.to_string().contains("ssh-dss"), "{error:#}");
+}
+
 #[test]
 fn rsa_login_keys_over_4096_bits_sign_and_verify_and_small_ones_are_refused() {
     let agent = Agent::start();
@@ -581,6 +593,37 @@ fn certificate_expiry_comes_from_the_certificate_that_logged_in() {
         Some(authenticated.valid_before()),
         "an unrelated certificate in the agent must not extend this login's authority"
     );
+
+    // A host certificate for the same key is never a login's.
+    let mut host = Command::new("ssh-keygen");
+    host.args(["-q", "-h", "-s"])
+        .arg(&ca)
+        .args(["-I", "host", "-n", "backup", "-V", "-1m:+52w"]);
+    run(host.arg(&public_path), "certify the test key as a host");
+    assert!(agent.ssh_add(&[path.as_os_str()]));
+    let login = discover(
+        &trace(name, &public, true),
+        b"",
+        Some(&agent.socket),
+        b"probe",
+        "backup",
+    )
+    .unwrap();
+    assert_eq!(
+        login.trusted.valid_before,
+        Some(authenticated.valid_before())
+    );
+    // A login with the plain key has no expiry, whatever certificates for
+    // it are loaded.
+    let login = discover(
+        &trace(path.to_str().unwrap(), &public, false),
+        b"",
+        Some(&agent.socket),
+        b"probe",
+        "backup",
+    )
+    .unwrap();
+    assert_eq!(login.trusted.valid_before, None);
 
     // An expired certificate, or one not valid yet, left in the agent is
     // never the one recorded.

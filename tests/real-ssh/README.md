@@ -296,5 +296,6 @@ a PIN, and with the device unavailable), and a certificate login. It checks
 that keys which cannot sign, such as keys added with `ssh-add -h`, are refused
 before anything is installed; that a new login key replaces only the trusted
 signer; that a connection opened before a refresh cannot start a new copy
-while a copy running through it finishes; and that replacing the destination
-directory, as a remount does, needs no new enrollment.
+while a copy running through it finishes, with workers that join it after
+the refresh; and that replacing the destination directory, as a remount
+does, needs no new enrollment.

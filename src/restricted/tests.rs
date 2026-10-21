@@ -308,6 +308,24 @@ fn released_enrollment_state_is_never_read_or_touched() {
     private(&base.join(released));
     write(&base.join(released).join(ENROLLMENT_FILE), local, 0o600);
     assert!(load_local_enrollments_in(&base).unwrap().is_empty());
+
+    // Revoking the new enrollment removes only its own line and state.
+    revoke_for_account(
+        &RevokeRequest {
+            version: CONFIG_VERSION,
+            id,
+            target_login: account.clone(),
+            entry_public_key: entry.public_key().to_openssh().unwrap(),
+        },
+        &account,
+        home,
+    )
+    .unwrap();
+    assert_eq!(fs::read_to_string(&authorized_keys).unwrap(), original);
+    assert!(!enrollment_state(home, id).exists());
+    assert_eq!(fs::read(old_state.join("config.json")).unwrap(), receiver);
+    assert_eq!(fs::read(old_local.join("metadata.json")).unwrap(), local);
+    assert_eq!(fs::read(&old_receiver).unwrap(), b"released receiver");
 }
 /// A temporary home in the real account's home, with a private `.ssh`.
 fn enrollment_home() -> (String, tempfile::TempDir) {
@@ -354,6 +372,34 @@ fn installed(response: InstallResponse) -> (u64, bool) {
         }
         InstallResponse::StateMissing { .. } => panic!("install reported missing state"),
     }
+}
+
+/// The entry key only starts the receiver, so it must be a key hostA can
+/// use alone, and never the login key: a refused request installs nothing.
+#[test]
+fn the_entry_key_is_a_software_key_other_than_the_login_key() {
+    let (account, home) = enrollment_home();
+    let home = home.path();
+    let login = generate_test_key("login").unwrap();
+    let same = install_request(&account, EnrollmentId::random(), &login, &login, false);
+    let error = install_for_account(&same, &account, home).err().unwrap();
+    assert!(error.to_string().contains("must differ"), "{error:#}");
+    let entry = generate_test_key("entry").unwrap();
+    let mut fido = install_request(&account, EnrollmentId::random(), &entry, &login, false);
+    let ssh_key::public::KeyData::Ed25519(public) = entry.public_key().key_data().clone() else {
+        unreachable!("test keys are Ed25519");
+    };
+    fido.entry_public_key = ssh_key::PublicKey::new(
+        ssh_key::public::KeyData::SkEd25519(ssh_key::public::SkEd25519::new(public, "ssh:")),
+        "",
+    )
+    .to_openssh()
+    .unwrap();
+    let error = install_for_account(&fido, &account, home).err().unwrap();
+    assert!(error.to_string().contains("software"), "{error:#}");
+    assert!(!home.join(".ssh/authorized_keys").exists());
+    assert!(!home.join(".local/share/syq").exists());
+    assert!(!home.join(BINARY_STORE).exists());
 }
 
 #[test]
@@ -646,6 +692,102 @@ fn a_receiver_from_an_older_line_refuses_new_copies() {
     for field in ["dev", "ino", "root"] {
         assert!(!encoded.contains(&format!("\"{field}")), "{encoded}");
     }
+}
+
+/// A receiver records a grant as used only after the build, the
+/// generation and the signature are checked: a refused grant leaves the
+/// record of used grants as it was.
+#[test]
+fn a_grant_is_recorded_only_after_every_check_passes() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let state = temporary.path().join("state");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(state.join("replay"))
+        .unwrap();
+    let login = generate_test_key("login").unwrap();
+    let mut config = ReceiverEnrollment {
+        version: CONFIG_VERSION,
+        id: EnrollmentId::random(),
+        target_login: "backup".into(),
+        generation: 2,
+        release: "v0.8.0".into(),
+        receiver_path: "/home/backup/.local/lib/syq/v0.8.0/linux-x86_64/syq".into(),
+        entry_public_key: generate_test_key("entry")
+            .unwrap()
+            .public_key()
+            .to_openssh()
+            .unwrap(),
+        signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
+    };
+    let args = Args::parse_args(
+        &["cp", "--from", "a", "x", "--to", "b", "--into", "/b"].map(std::ffi::OsString::from),
+    )
+    .unwrap();
+    let source = Location::parse("a:x").unwrap();
+    let sign = |key: &PrivateKey, generation: u64, namespace: &str| {
+        let grant = grant_for(
+            &args,
+            std::slice::from_ref(&source),
+            (config.id, generation),
+            "backup",
+            b"/b",
+        )
+        .unwrap();
+        delegation::sign_grant_with(grant, GrantConstraints::default(), |payload| {
+            keys::LoginSigner::File(Box::new(key.clone())).sign(namespace, payload)
+        })
+        .unwrap()
+    };
+    let recorded = || fs::read_dir(state.join("replay")).unwrap().count();
+    let current = (2, "v0.8.0");
+    let valid = sign(&login, 2, delegation::SSHSIG_NAMESPACE);
+    let refused = [
+        // A connection from an older line, or a receiver of another build.
+        (valid.clone(), (1, "v0.8.0"), "outdated receiver"),
+        (valid.clone(), (2, "v0.7.9"), "outdated receiver"),
+        // A grant from before a refresh.
+        (
+            sign(&login, 1, delegation::SSHSIG_NAMESPACE),
+            current,
+            "signer",
+        ),
+        // Another key, and the login key in another namespace.
+        (
+            sign(
+                &generate_test_key("other").unwrap(),
+                2,
+                delegation::SSHSIG_NAMESPACE,
+            ),
+            current,
+            "does not trust",
+        ),
+        (
+            sign(&login, 2, keys::PROBE_NAMESPACE),
+            current,
+            "another purpose",
+        ),
+    ];
+    for (envelope, receiver, expected) in refused {
+        let Err(error) = admit(&state, &config, receiver, &envelope) else {
+            panic!("a grant was admitted: {expected}");
+        };
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+        assert_eq!(recorded(), 0);
+    }
+    // A certificate that has expired.
+    config.signer =
+        delegation::TrustedSigner::new(login.public_key(), None, Some(1_000_000)).unwrap();
+    let error = admit(&state, &config, current, &valid).err().unwrap();
+    assert!(format!("{error:#}").contains("expired"), "{error:#}");
+    assert_eq!(recorded(), 0);
+
+    config.signer = delegation::TrustedSigner::new(login.public_key(), None, None).unwrap();
+    admit(&state, &config, current, &valid).unwrap();
+    assert_ne!(recorded(), 0);
+    let error = admit(&state, &config, current, &valid).err().unwrap();
+    assert!(format!("{error:#}").contains("already"), "{error:#}");
 }
 
 /// Every key of a JSON document, at any depth.
@@ -2296,7 +2438,7 @@ fn restricted_widening_follows_the_approved_mode() {
 /// restores them when asked. It never walks above the root, and refuses a
 /// destination named outside it.
 #[test]
-fn restricted_all_widens_ancestors_beneath_the_enrolled_root() {
+fn restricted_all_widens_ancestors_beneath_the_confinement_root() {
     if unsafe { libc::geteuid() } == 0 {
         return;
     }
@@ -10545,11 +10687,11 @@ fn follow_dst_creates_a_destination_that_does_not_exist_yet() {
     assert_eq!(found.signed_components, 1);
 }
 
-/// An confinement root of `/` names everything beneath it, so restricted
+/// A confinement root of `/` names everything beneath it, so restricted
 /// lookups work there, and an absolute destination symlink resolves inside
 /// it.
 #[test]
-fn an_enrolled_root_of_slash_names_paths_beneath_it() {
+fn a_confinement_root_of_slash_names_paths_beneath_it() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     fs::create_dir_all(root.join("target")).unwrap();

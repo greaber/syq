@@ -54,7 +54,9 @@ syq receiver enroll [OPTIONS] <[USER@]HOST>
 
 Prints one tab-separated line per enrollment: its ID, `active` or `pending`,
 and the account. Active enrollments add the receiver's release and the
-fingerprint of the login key it trusts.
+fingerprint of the login key it trusts. When this machine still holds
+enrollments from syq 0.4.0 to 0.7.1, a notice says where to read how to
+remove them.
 
 <!-- CLI: receiver list -->
 ```text

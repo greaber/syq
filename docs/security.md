@@ -257,8 +257,8 @@ HostB's receiver opens the directory the destination is in when the copy
 starts, resolving it as the account would, and refuses it when it is one of
 the protected paths or lies inside one, whatever names lead to it. A
 protected path that does not exist yet is known only by its name, so a copy
-that reaches it under another name, such as through a bind mount, can create
-it. The receiver then does everything the copy asks beneath that directory,
+that reaches it under another name, such as through a bind mount or in
+another letter case on a filesystem that ignores case, can create it. The receiver then does everything the copy asks beneath that directory,
 without following symlinks. Renaming or replacing a directory on the way to it during the copy
 does not redirect the copy. With `--follow-dst`, the receiver itself follows
 a symlink at the destination, and only to a directory inside the one the

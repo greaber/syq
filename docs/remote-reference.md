@@ -36,9 +36,15 @@ Setup installs three things on the server:
   server's key for signing its reports.
 
 Your machine keeps the entry key and its own record in
-`~/.local/state/syq/enrollments/ID`. Transfers cannot overwrite the receiver's
-SSH configuration, syq's stored programs, or enrollment state. Manage that
-state with `syq receiver` commands; it is not a disposable cache.
+`~/.local/state/syq/enrollments/ID`. Manage that state with `syq receiver`
+commands; it is not a disposable cache.
+
+Copies cannot write the receiver's protected paths: the account's
+`~/.ssh`, syq's stored programs, enrollment state on either side, and syq's
+receiving state, such as `~/.config/syq`. A copy into one of them is refused,
+and so is one that copies a directory's contents into, or deletes in, a
+directory that holds one, such as your home directory. Copying named files or
+directories into such a directory is fine.
 
 ### Which key signs
 
