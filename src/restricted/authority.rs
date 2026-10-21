@@ -248,20 +248,68 @@ pub(super) fn resolve_destination_links(
     }))
 }
 
+/// The identities of the receiver's protected paths that exist, and of the
+/// directories above each, found once for a copy. A control path that is a
+/// symlink is judged where it really is, and one that does not exist yet by
+/// the directories above where it would be.
+pub(super) struct ProtectedIdentities<'a> {
+    paths: Vec<((u64, u64), &'a ReceiverControlPath)>,
+    above: Vec<((u64, u64), &'a ReceiverControlPath)>,
+}
+
+impl<'a> ProtectedIdentities<'a> {
+    pub(super) fn find(protected: &'a [ReceiverControlPath]) -> Self {
+        let identity = |path: &Path| {
+            fs::metadata(path)
+                .ok()
+                .map(|metadata| (metadata.dev(), metadata.ino()))
+        };
+        let mut paths = Vec::new();
+        let mut above = Vec::new();
+        for control in protected {
+            let control_path = Path::new(OsStr::from_bytes(&control.path));
+            if let Some(found) = identity(control_path) {
+                paths.push((found, control));
+            }
+            let real = real_location(control_path);
+            for ancestor in control_path
+                .ancestors()
+                .chain(real.iter().flat_map(|real| real.ancestors()))
+            {
+                if let Some(found) = identity(ancestor) {
+                    above.push((found, control));
+                }
+            }
+        }
+        Self { paths, above }
+    }
+
+    /// Refuse `chain`, the identities from the root down to what exists of
+    /// a path the copy may change, when any of them is a protected path, or
+    /// when `holds` and the last of them holds one.
+    fn check(&self, chain: &[(u64, u64)], holds: bool) -> Result<()> {
+        if let Some((_, control)) = self.paths.iter().find(|(found, _)| chain.contains(found)) {
+            return Err(inside_protected(None, control));
+        }
+        let last = chain.last().expect("the root is always in the chain");
+        if let Some((_, control)) = self.above.iter().find(|(found, _)| holds && found == last) {
+            return Err(holds_protected(None, control));
+        }
+        Ok(())
+    }
+}
+
 /// Refuse a destination whose directory is, contains or lies inside one of
 /// the receiver's protected control paths, judged by identity: `existing`
 /// is the deepest existing directory of the destination, relative to
 /// `root`, and `whole` says whether it is the destination itself rather
 /// than one the copy creates the destination inside. Names a path is
-/// spelled with, through symlinks or a root of `/`, do not matter, and a
-/// control path that is a symlink is judged where it really is. A control
-/// path that does not exist yet is protected by its ancestors: a
-/// destination that contains where it would be is refused.
+/// spelled with, through symlinks or a root of `/`, do not matter.
 pub(super) fn reject_control_plane_directory(
     root: &Root,
     existing: &[Vec<u8>],
     whole: bool,
-    protected: &[ReceiverControlPath],
+    protected: &ProtectedIdentities<'_>,
 ) -> Result<()> {
     // The identities from the root down to the directory.
     let mut chain = Vec::with_capacity(existing.len() + 1);
@@ -271,31 +319,59 @@ pub(super) fn reject_control_plane_directory(
         let metadata = directory.metadata()?;
         chain.push((metadata.dev(), metadata.ino()));
     }
-    let destination = *chain.last().expect("the root is always in the chain");
-    for control in protected {
-        let control_path = Path::new(OsStr::from_bytes(&control.path));
-        // The destination is the control path or lies beneath it.
-        let inside = fs::metadata(control_path)
-            .is_ok_and(|metadata| chain.contains(&(metadata.dev(), metadata.ino())));
-        // The destination is the control path or one of its ancestors,
-        // spelled as configured or where the path really is.
-        let real = real_location(control_path);
-        let contains = whole
-            && control_path
-                .ancestors()
-                .chain(real.iter().flat_map(|real| real.ancestors()))
-                .any(|ancestor| {
-                    fs::metadata(ancestor)
-                        .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == destination)
-                });
-        if inside {
-            return Err(inside_protected(None, control));
+    protected.check(&chain, whole)
+}
+
+/// Refuse a path the copy may change, `relative` to `root`, by the identity
+/// of what exists of it now: when it, or a directory on the way to it, is a
+/// protected path, or, when the copy may change what is beneath it
+/// (`descendants`), when it holds one. Nothing is followed; the walk stops
+/// at the first name that is missing, is not a directory, or cannot be
+/// looked at, as the copy itself cannot go beyond it either. `seen` keeps
+/// what earlier paths found, so each named entry costs one lookup.
+fn reject_protected_scope(
+    root: &Root,
+    relative: &[u8],
+    descendants: bool,
+    protected: &ProtectedIdentities<'_>,
+    seen: &mut HashMap<Vec<u8>, Option<(u64, u64, bool)>>,
+) -> Result<()> {
+    let root_identity = root.identity();
+    let mut chain = vec![(root_identity.dev, root_identity.ino)];
+    let components: Vec<&[u8]> = relative
+        .split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty())
+        .collect();
+    let mut prefix = Vec::new();
+    let mut whole = true;
+    for (index, component) in components.iter().enumerate() {
+        if !prefix.is_empty() {
+            prefix.push(b'/');
         }
-        if contains {
-            return Err(holds_protected(None, control));
+        prefix.extend_from_slice(component);
+        let found = match seen.get(&prefix) {
+            Some(found) => *found,
+            None => {
+                let found = crate::rooted::RelativePath::new(&prefix)
+                    .and_then(|path| root.metadata_optional(&path))
+                    .ok()
+                    .flatten()
+                    .map(|metadata| (metadata.dev, metadata.ino, metadata.is_dir()));
+                seen.insert(prefix.clone(), found);
+                found
+            }
+        };
+        let Some((dev, ino, directory)) = found else {
+            whole = false;
+            break;
+        };
+        chain.push((dev, ino));
+        if !directory {
+            whole = index + 1 == components.len();
+            break;
         }
     }
-    Ok(())
+    protected.check(&chain, whole && descendants)
 }
 
 /// Where `path` really is: its deepest existing ancestor with every symlink
@@ -649,7 +725,9 @@ impl RestrictedAuthority {
         )?;
         let real_root = confined.real.clone();
         let mut held_path = confined.named.clone();
+        let mut held_real = real_root.clone();
         let mut root = std::sync::Arc::new(confined.root);
+        let identities = ProtectedIdentities::find(protected);
         // `--follow-dst`: a destination reached through symlinks is the
         // directory they resolve to inside the confinement root. That
         // directory, or the deepest existing one the copy creates the rest
@@ -686,7 +764,7 @@ impl RestrictedAuthority {
                 &root,
                 &found.existing,
                 whole && descendants,
-                protected,
+                &identities,
             )?;
             let directory = root
                 .open_directory(&crate::rooted::RelativePath::new(
@@ -702,11 +780,30 @@ impl RestrictedAuthority {
             root = std::sync::Arc::new(Root::from_directory(directory)?);
             held_path =
                 crate::fsops::join(&held_path, &signed[..found.signed_components].join(&b'/'));
+            held_real = crate::fsops::join(&real_root, &found.existing.join(&b'/'));
         } else if let Ok(found) = existing_directory_components(&root, relative) {
             // The destination's directory as it stands, judged by identity
             // too: a name the strings above miss cannot reach the control
             // plane either.
-            reject_control_plane_directory(&root, &found.0, found.1 && descendants, protected)?;
+            reject_control_plane_directory(&root, &found.0, found.1 && descendants, &identities)?;
+        }
+        // Every path the copy may change, where it really is: by name
+        // beneath the directory the root really is, and by the identity of
+        // what already exists of it, whatever names lead there.
+        let mut seen = HashMap::new();
+        for scope in &copy.mutation_scopes {
+            if !path_is_at_or_below(&scope.path, &held_path) {
+                continue;
+            }
+            let relative = scope.path[held_path.len()..]
+                .strip_prefix(b"/")
+                .unwrap_or(&scope.path[held_path.len()..]);
+            reject_control_plane_scope(
+                &crate::fsops::join(&held_real, relative),
+                scope.descendants,
+                protected,
+            )?;
+            reject_protected_scope(&root, relative, scope.descendants, &identities, &mut seen)?;
         }
         let file_data_limit = (max_file_data_bytes_per_second > 0)
             .then(|| crate::bwlimit::BandwidthLimit::new(max_file_data_bytes_per_second));

@@ -1145,6 +1145,101 @@ fn receivers_refuse_protected_paths_beneath_a_recursive_destination_only() {
     }
 }
 
+/// Every path a copy may change is judged where it really is: through a
+/// symlink above the destination, and by the identity of a named entry
+/// that already exists, whatever name reaches it.
+#[test]
+fn named_entries_are_checked_where_they_really_are() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let real = temporary.path().join("real");
+    let alias = temporary.path().join("alias");
+    let spelled = temporary.path().join("spelled");
+    fs::create_dir_all(real.join("home/.ssh")).unwrap();
+    fs::create_dir_all(real.join("home/.config")).unwrap();
+    fs::create_dir_all(real.join("home/backup")).unwrap();
+    symlink(&real, &alias).unwrap();
+    symlink(&real, &spelled).unwrap();
+    let control = |path: PathBuf, label| ReceiverControlPath {
+        path: path.as_os_str().as_bytes().to_vec(),
+        label,
+    };
+    let authority = |protected: &[ReceiverControlPath], source: &str, destination: &Path| {
+        let mut args = Args::try_parse_from(["syq rsync", "-r", source, "host-b:/unused"]).unwrap();
+        args.normalize();
+        args.placement = Placement::Into;
+        let location = Location::parse(source).unwrap();
+        let named = destination.as_os_str().as_bytes();
+        let grant = grant_for(
+            &args,
+            std::slice::from_ref(&location),
+            (EnrollmentId::random(), 1),
+            "receiver",
+            named,
+        )
+        .unwrap();
+        ConfinedRoot::resolve(named, protected).and_then(|confined| {
+            RestrictedAuthority::new(
+                confined,
+                grant,
+                GrantConstraints::default(),
+                [0; 32],
+                generate_results_key(EnrollmentId::random()).unwrap(),
+                Instant::now() + std::time::Duration::from_secs(60),
+                protected,
+            )
+        })
+    };
+    let refused = |protected: &[ReceiverControlPath], source: &str, destination: &Path| {
+        authority(protected, source, destination)
+            .err()
+            .map(|error| format!("{error:#}"))
+            .unwrap_or_else(|| panic!("{source} into {} was accepted", destination.display()))
+    };
+    let ssh = [control(
+        real.join("home/.ssh"),
+        "SSH configuration directory",
+    )];
+    // A named `.ssh` into a destination reached through a symlink above it.
+    let error = refused(&ssh, "host-a:.ssh", &alias.join("home"));
+    assert!(
+        error.contains("protected SSH configuration directory"),
+        "{error}"
+    );
+    // A named directory that holds the protected one, through the symlink.
+    fs::create_dir_all(real.join("srv/home/.ssh")).unwrap();
+    let deeper = [control(
+        real.join("srv/home/.ssh"),
+        "SSH configuration directory",
+    )];
+    let error = refused(&deeper, "host-a:home", &alias.join("srv"));
+    assert!(error.contains("holds the receiver's protected"), "{error}");
+    // The protected path spelled through a symlink, as /tmp is on macOS,
+    // and the named entry reached by its real name: the same directory.
+    let spelled_ssh = [control(
+        spelled.join("home/.ssh"),
+        "SSH configuration directory",
+    )];
+    let error = refused(&spelled_ssh, "host-a:.ssh", &real.join("home"));
+    assert!(
+        error.contains("protected SSH configuration directory"),
+        "{error}"
+    );
+    // A protected path that does not exist yet, reached through the symlink.
+    let config = [control(
+        real.join("home/.config/syq"),
+        "receiving configuration directory",
+    )];
+    let error = refused(&config, "host-a:syq", &alias.join("home/.config"));
+    assert!(
+        error.contains("protected receiving configuration directory"),
+        "{error}"
+    );
+    // Other named entries beside the protected ones are fine.
+    authority(&ssh, "host-a:backup", &alias.join("home")).unwrap();
+    authority(&ssh, "host-a:notes", &alias.join("home")).unwrap();
+    authority(&config, "host-a:other", &alias.join("home/.config")).unwrap();
+}
+
 #[test]
 fn a_destination_is_resolved_afresh_by_every_copy() {
     // The directory a destination goes in is opened when each copy starts,
