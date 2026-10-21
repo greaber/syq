@@ -531,6 +531,32 @@ fn serve(
             if path == "/source/data" {
                 reply(&mut socket, 404, &[], b"", true);
             } else if path.starts_with("/destination/")
+                && (fault.ends_with("unsupported") || fault.ends_with("denied"))
+            {
+                // Destinations listed at the source's size are compared, so
+                // their HEADs ask for checksums while the service allows it.
+                let checksums = headers.contains_key("x-amz-checksum-mode");
+                if fault.ends_with("unsupported") {
+                    assert!(
+                        !(checksums && path.ends_with("/b")),
+                        "unsupported checksum mode retried on another object"
+                    );
+                }
+                let mut fields = vec![("Content-Length".into(), "4".into())];
+                if fault.ends_with("denied") && path.ends_with("/b") {
+                    assert!(
+                        checksums,
+                        "one object's permission failure disabled other checksum reads"
+                    );
+                    // Only the matching SHA-256 shows that b need not be copied.
+                    fields.push(("ETag".into(), "\"other\"".into()));
+                    fields.push(("x-amz-checksum-type".into(), "FULL_OBJECT".into()));
+                    fields.push(("x-amz-checksum-sha256".into(), "AAAA".into()));
+                } else {
+                    fields.push(("ETag".into(), "\"source\"".into()));
+                }
+                reply(&mut socket, 200, &fields, b"", true);
+            } else if path.starts_with("/destination/")
                 && (fault.ends_with("skipped") || fault.ends_with("missing"))
             {
                 if fault.ends_with("missing") {
@@ -552,20 +578,38 @@ fn serve(
                     path.starts_with("/source/data/"),
                     "unnecessary destination HEAD: {path}"
                 );
-                // No destination here can match by checksum: none is listed
-                // with the source's size, or it is kept anyway. Only-existing
-                // copies list nothing, so syq cannot tell before the HEADs.
-                assert!(fault.ends_with("missing") || !headers.contains_key("x-amz-checksum-mode"));
-                reply(
-                    &mut socket,
-                    200,
-                    &[
+                let checksums = headers.contains_key("x-amz-checksum-mode");
+                if fault.ends_with("unsupported") && checksums {
+                    // A service that does not implement checksum reads is
+                    // remembered: no other object asks again.
+                    assert!(
+                        !gate.0.swap(true, Ordering::SeqCst),
+                        "unsupported checksum mode retried on another object"
+                    );
+                    reply(&mut socket, 501, &[], b"", true);
+                } else if fault.ends_with("denied") && path.ends_with("/a") && checksums {
+                    // A denial can depend on the object, as with KMS keys.
+                    reply(&mut socket, 403, &[], b"", true);
+                } else {
+                    // No other destination here can match by checksum: none is
+                    // listed with the source's size, or it is kept anyway.
+                    // Only-existing copies list nothing, so syq cannot tell
+                    // before the HEADs.
+                    assert!(fault.ends_with("missing") || fault.ends_with("denied") || !checksums);
+                    let mut fields = vec![
                         ("Content-Length".into(), "4".into()),
                         ("ETag".into(), "\"source\"".into()),
-                    ],
-                    b"",
-                    true,
-                );
+                    ];
+                    if fault.ends_with("denied") && path.ends_with("/b") {
+                        assert!(
+                            checksums,
+                            "one object's permission failure disabled other checksum reads"
+                        );
+                        fields.push(("x-amz-checksum-type".into(), "FULL_OBJECT".into()));
+                        fields.push(("x-amz-checksum-sha256".into(), "AAAA".into()));
+                    }
+                    reply(&mut socket, 200, &fields, b"", true);
+                }
             }
         } else if method == "GET" {
             let keys: &[&str] = if path.starts_with("/source?") || path.starts_with("/source/?") {
@@ -577,6 +621,8 @@ fn serve(
                 );
                 if fault.ends_with("skipped") || fault.ends_with("missing") {
                     &["out/a/part1", "out/b/part1"]
+                } else if fault.ends_with("unsupported") || fault.ends_with("denied") {
+                    &["out/a", "out/b"]
                 } else if fault.ends_with("prune") || fault.ends_with("changed") {
                     &["out/a/part1"]
                 } else {
@@ -598,6 +644,10 @@ fn serve(
                     "/destination/out/a" | "/destination/out/b"
                 ),
                 "{path}"
+            );
+            assert!(
+                !fault.ends_with("unsupported") && !fault.ends_with("denied"),
+                "matching object was copied: {path}"
             );
             assert_eq!(headers.get("if-none-match").map(String::as_str), None);
             assert_eq!(headers["x-amz-copy-source-if-match"], "\"source\"");
@@ -5528,6 +5578,11 @@ fn server_copy_reuses_destination_discovery_and_prunes_beneath_file_keys() {
         ("server-tree-fresh", "--dry-run", 5),
         ("server-tree-prune", "--prune", 8),
         ("server-tree-prune", "--prune-before", 8),
+        // Both listings, the HEAD of the selector, and per object the source
+        // and destination HEADs. The first object's refused checksum read
+        // falls back to a plain HEAD.
+        ("server-tree-unsupported", "--if-exists=update", 8),
+        ("server-tree-denied", "--if-exists=update", 8),
     ] {
         let server = Server::start(fault);
         let temp = crate::test_support::tempdir().unwrap();
