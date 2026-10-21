@@ -1149,21 +1149,23 @@ fn entry_keys_follow_the_login_algorithm_and_stay_software_keys() {
             entry.public_key()
         );
     }
-    // RSA keeps the login key's size and never goes below 3,072 bits.
-    let rsa: PrivateKey = ssh_key::private::RsaKeypair::random(&mut rng, 2048)
-        .unwrap()
-        .into();
-    let entry = generate_entry_key(rsa.public_key(), id).unwrap();
-    let modulus = entry
-        .public_key()
-        .key_data()
-        .rsa()
-        .unwrap()
-        .n
-        .as_positive_bytes()
-        .unwrap()
-        .len();
-    assert_eq!(modulus * 8, 3072);
+    // RSA entry keys have 3,072 bits, or the login key's size up to 4,096:
+    // only the modulus size of the login key matters.
+    let entry_bits = |login_bits: usize| {
+        let mut modulus = vec![0xff; login_bits / 8];
+        modulus[login_bits / 8 - 1] = 0xfd;
+        let login = PublicKey::new(
+            ssh_key::public::KeyData::Rsa(ssh_key::public::RsaPublicKey {
+                e: ssh_key::Mpint::from_positive_bytes(&[1, 0, 1]).unwrap(),
+                n: ssh_key::Mpint::from_positive_bytes(&modulus).unwrap(),
+            }),
+            "",
+        );
+        let entry = generate_entry_key(&login, id).unwrap();
+        delegation::rsa_bits(entry.public_key().key_data()).unwrap()
+    };
+    assert_eq!(entry_bits(2048), 3072);
+    assert_eq!(entry_bits(16384), 4096);
     // An entry key is never a FIDO handle or encrypted.
     assert!(parse_entry_key(
         security_key(1)

@@ -89,26 +89,54 @@ pub(super) fn path_is_at_or_below(path: &[u8], prefix: &[u8]) -> bool {
         || (path.starts_with(prefix) && (prefix == b"/" || path.get(prefix.len()) == Some(&b'/')))
 }
 
-pub(super) fn paths_overlap(left: &[u8], right: &[u8]) -> bool {
-    path_is_at_or_below(left, right) || path_is_at_or_below(right, left)
-}
-
 pub(super) fn reject_control_plane_path(
     path: &[u8],
     protected: &[ReceiverControlPath],
 ) -> Result<()> {
-    if let Some(control) = protected
-        .iter()
-        .find(|control| paths_overlap(path, &control.path))
-    {
-        bail!(
-            "command-restricted destination {} overlaps the receiver's protected {} {}; choose a destination outside the receiver control plane",
-            Path::new(OsStr::from_bytes(path)).display(),
-            control.label,
-            Path::new(OsStr::from_bytes(&control.path)).display()
-        );
+    for control in protected {
+        if path_is_at_or_below(path, &control.path) {
+            return Err(inside_protected(Some(path), control));
+        }
+        if path_is_at_or_below(&control.path, path) {
+            return Err(holds_protected(Some(path), control));
+        }
     }
     Ok(())
+}
+
+/// A destination that is one of the receiver's protected paths, or lies
+/// inside one.
+pub(super) fn inside_protected(
+    destination: Option<&[u8]>,
+    control: &ReceiverControlPath,
+) -> anyhow::Error {
+    anyhow!(
+        "command-restricted destination {}is the receiver's protected {} {} or lies inside it; choose another destination",
+        destination.map_or(String::new(), |path| format!(
+            "{} ",
+            Path::new(OsStr::from_bytes(path)).display()
+        )),
+        control.label,
+        Path::new(OsStr::from_bytes(&control.path)).display()
+    )
+}
+
+/// A destination whose contents the copy may change, holding one of the
+/// receiver's protected paths: the copy could write into it or delete it.
+/// A subdirectory of the destination holds none.
+pub(super) fn holds_protected(
+    destination: Option<&[u8]>,
+    control: &ReceiverControlPath,
+) -> anyhow::Error {
+    let destination = destination.map_or_else(
+        || "the destination".to_owned(),
+        |path| Path::new(OsStr::from_bytes(path)).display().to_string(),
+    );
+    anyhow!(
+        "command-restricted destination {destination} holds the receiver's protected {} {}, which this copy could change; copy into a subdirectory of {destination} instead",
+        control.label,
+        Path::new(OsStr::from_bytes(&control.path)).display()
+    )
 }
 
 /// Most symlinks `resolve_destination_links` follows, as the kernel bounds
@@ -260,12 +288,11 @@ pub(super) fn reject_control_plane_directory(
                     fs::metadata(ancestor)
                         .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == destination)
                 });
-        if inside || contains {
-            bail!(
-                "command-restricted destination overlaps the receiver's protected {} {}; choose a destination outside the receiver control plane",
-                control.label,
-                control_path.display()
-            );
+        if inside {
+            return Err(inside_protected(None, control));
+        }
+        if contains {
+            return Err(holds_protected(None, control));
         }
     }
     Ok(())
@@ -327,12 +354,7 @@ pub(super) fn reject_control_plane_scope(
         .iter()
         .find(|control| path_is_at_or_below(path, &control.path))
     {
-        bail!(
-            "command-restricted destination {} overlaps the receiver's protected {} {}; choose a destination outside the receiver control plane",
-            Path::new(OsStr::from_bytes(path)).display(),
-            control.label,
-            Path::new(OsStr::from_bytes(&control.path)).display()
-        );
+        return Err(inside_protected(Some(path), control));
     }
     Ok(())
 }
@@ -386,11 +408,7 @@ impl ConfinedRoot {
             .iter()
             .find(|control| path_is_at_or_below(real.as_os_str().as_bytes(), &control.path))
         {
-            bail!(
-                "command-restricted destination is inside the receiver's protected {} {}; choose a destination outside the receiver control plane",
-                control.label,
-                Path::new(OsStr::from_bytes(&control.path)).display()
-            );
+            return Err(inside_protected(None, control));
         }
         let directory = OpenOptions::new()
             .read(true)
@@ -458,11 +476,7 @@ fn reject_protected_ancestry(
         .iter()
         .find(|(identity, _)| ancestors.contains(identity))
     {
-        bail!(
-            "command-restricted destination overlaps the receiver's protected {} {}; choose a destination outside the receiver control plane",
-            control.label,
-            Path::new(OsStr::from_bytes(&control.path)).display()
-        );
+        return Err(inside_protected(None, control));
     }
     Ok(())
 }

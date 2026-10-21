@@ -41,9 +41,14 @@ commands; it is not a disposable cache.
 
 Copies cannot write the receiver's protected paths: the account's
 `~/.ssh`, syq's stored programs, enrollment state on either side, and syq's
-receiving state, such as `~/.config/syq`. A copy into one of them is refused,
-and so is one that copies a directory's contents into, or deletes in, a
-directory that holds one, such as your home directory. Copying named files or
+receiving state, such as `~/.config/syq` and its runtime directory
+`$XDG_RUNTIME_DIR/syq-persist-UID`. Without `XDG_RUNTIME_DIR`, the runtime
+directory is `/tmp/syq-persist-UID` on macOS and `$TMPDIR/syq-persist-UID`
+elsewhere, which is also in `/tmp` when `TMPDIR` is unset. A copy into one of
+them is refused, and so is one that copies a directory's contents into, or
+deletes in, a directory that holds one, such as your home directory, or
+`/tmp` when it holds the runtime directory, because it could change syq's own
+files there. Copy into a subdirectory instead. Copying named files or
 directories into such a directory is fine.
 
 ### Which key signs

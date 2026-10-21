@@ -170,6 +170,13 @@ pub(super) enum ControlPaths<'a> {
     Elsewhere(&'a [PathBuf]),
 }
 
+/// What each entry of `server_receiving_state` holds.
+const RECEIVING_STATE_LABELS: [&str; 3] = [
+    "receiver identity directory",
+    "receiving configuration directory",
+    "persistence runtime directory",
+];
+
 /// Where a server keeps its receiving state, computed as its syq does from
 /// what its login environment reports: the receiver identity, the receive
 /// configuration's directory, and the persistence runtime directory.
@@ -240,21 +247,27 @@ pub(super) fn receiver_control_paths(
     ] {
         protected.push((home.join(directory), "named destination authority state"));
     }
-    let receiving = match machine {
-        ControlPaths::Here => [
+    // In the order `server_receiving_state` lists them.
+    let receiving: Vec<_> = match machine {
+        ControlPaths::Here => vec![
             crate::destination::receiver_identity_directory().ok(),
             crate::receive_service::config_path(&crate::persistence::Domain::default())
                 .ok()
                 .and_then(|path| path.parent().map(Path::to_path_buf)),
             Some(crate::persistence::runtime_parent_path()),
-        ]
-        .into_iter()
-        .flatten()
-        .collect(),
-        ControlPaths::Elsewhere(receiving) => receiving.to_vec(),
+        ],
+        ControlPaths::Elsewhere(receiving) => receiving.iter().cloned().map(Some).collect(),
     };
-    for path in receiving {
-        protected.push((path, "background receiving control state"));
+    for (index, path) in receiving.into_iter().enumerate() {
+        if let Some(path) = path {
+            protected.push((
+                path,
+                RECEIVING_STATE_LABELS
+                    .get(index)
+                    .copied()
+                    .unwrap_or("background receiving control state"),
+            ));
+        }
     }
     Ok(protected
         .into_iter()

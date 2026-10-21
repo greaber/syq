@@ -247,8 +247,10 @@ The protection has several parts:
 An enrollment covers the whole account. Each copy's grant names its
 destination, which can be anywhere the account can write except the
 receiver's protected paths: the account's SSH configuration, syq's stored
-programs, enrollment state on either side, and receiving state. A file
-written elsewhere in the account, such as a shell startup file, can run code
+programs, enrollment state on either side, and receiving state, including
+syq's runtime directory (see [Enrollment](remote-reference.md#enrollment) for
+the list, and for the copies into a directory holding one that are refused).
+A file written elsewhere in the account, such as a shell startup file, can run code
 as the account, so a grant is as strong as a login. That is
 acceptable because only your login key can sign one, and you choose each
 destination.

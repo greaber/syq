@@ -1001,39 +1001,46 @@ fn protected_destinations_are_refused_from_their_names_before_enrolling() {
             "~/.syq-destinations-v3",
             "named destination authority state",
         ),
-        (
-            "into",
-            "~/.config/syq",
-            "background receiving control state",
-        ),
+        ("into", "~/.config/syq", "receiving configuration directory"),
         (
             "into",
             "~/.syq-receiver-identity",
-            "background receiving control state",
+            "receiver identity directory",
         ),
         (
             "into",
             "/tmp/syq-persist-1000",
-            "background receiving control state",
+            "persistence runtime directory",
         ),
         (
             "as",
             "/tmp/syq-persist-1000/global",
-            "background receiving control state",
+            "persistence runtime directory",
         ),
         // Contents copied into a directory reach everything beneath it.
         ("contents", "~", "SSH configuration directory"),
-        (
-            "contents",
-            "~/.config",
-            "background receiving control state",
-        ),
-        ("contents", "/tmp", "background receiving control state"),
+        ("contents", "~/.config", "receiving configuration directory"),
+        ("contents", "/tmp", "persistence runtime directory"),
     ] {
         let error =
             refused(placement, destination).unwrap_or_else(|| panic!("{destination} was accepted"));
-        assert!(error.contains(label), "{destination}: {error}");
+        assert!(
+            error.contains(&format!("protected {label}")),
+            "{destination}: {error}"
+        );
     }
+    // A destination inside a protected path is refused as such; one that
+    // holds a protected path says why and what to do instead.
+    let inside = refused("into", "~/.ssh").unwrap();
+    assert!(
+        inside.contains("is the receiver's protected SSH configuration directory /home/backup/.ssh or lies inside it"),
+        "{inside}"
+    );
+    let holds = refused("contents", "/tmp").unwrap();
+    assert!(
+        holds.contains("/tmp holds the receiver's protected persistence runtime directory /tmp/syq-persist-1000, which this copy could change; copy into a subdirectory of /tmp instead"),
+        "{holds}"
+    );
     // Named sources copied into a directory change only that directory and
     // the sources' own names in it, so a directory above a protected one is
     // fine.

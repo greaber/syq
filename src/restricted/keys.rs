@@ -33,10 +33,11 @@ pub(crate) fn validate_entry_public_key(key: &PublicKey) -> Result<()> {
     Ok(())
 }
 
-/// A new entry key of the login key's kind: RSA keeps at least the login
-/// key's size and never less than 3,072 bits, ECDSA keeps its curve, and
-/// Ed25519 and the FIDO types map to software Ed25519 or ECDSA P-256, so the
-/// server accepts the entry key as it accepts the login.
+/// A new entry key of the login key's kind, so the server accepts it as it
+/// accepts the login: ECDSA keeps its curve, Ed25519 and the FIDO types map
+/// to software Ed25519 or ECDSA P-256, and RSA has 3,072 bits, or the login
+/// key's size up to 4,096. The entry key only gets past sshd, and a larger
+/// one would only make enrolling slower.
 pub(super) fn generate_entry_key(login: &PublicKey, id: EnrollmentId) -> Result<PrivateKey> {
     let mut rng = ssh_key::rand_core::OsRng;
     let mut key: PrivateKey = match login.algorithm() {
@@ -51,7 +52,7 @@ pub(super) fn generate_entry_key(login: &PublicKey, id: EnrollmentId) -> Result<
             let bits = modulus.first().map_or(0, |first| {
                 modulus.len() * 8 - first.leading_zeros() as usize
             });
-            ssh_key::private::RsaKeypair::random(&mut rng, bits.max(3072))?.into()
+            ssh_key::private::RsaKeypair::random(&mut rng, bits.clamp(3072, 4096))?.into()
         }
         Algorithm::Ecdsa { curve } => PrivateKey::random(&mut rng, Algorithm::Ecdsa { curve })?,
         Algorithm::SkEcdsaSha2NistP256 => PrivateKey::random(
