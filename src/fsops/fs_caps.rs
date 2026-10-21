@@ -368,12 +368,17 @@ pub(crate) fn reports_owners_faithfully(file: &File) -> bool {
 
 /// Whether the filesystem at `path` shows every file with an owner and mode
 /// set when it was mounted, rather than kept per file, so neither says who
-/// can change a file: FAT, exFAT, NTFS (ntfs3), SMB and VirtualBox shared
-/// folders on Linux; FAT, exFAT, NTFS and SMB volumes, and volumes mounted to
-/// ignore ownership, on macOS. NFS and FUSE keep the owners their servers
-/// report, so they are not included. Decided from the filesystem type with
-/// one `statfs`; a path that cannot be inspected counts as keeping owners.
-/// Debug builds given `SYQ_TEST_FIXED_OWNERS` count every filesystem.
+/// can change a file. On Linux: FAT, exFAT, NTFS through the kernel's ntfs3,
+/// SMB, VirtualBox shared folders, NTFS and exFAT through FUSE drivers such as
+/// ntfs-3g and exfat-fuse (`fuseblk`), and WSL's Windows drives (drvfs). On
+/// macOS: FAT, exFAT, NTFS and SMB volumes, and volumes mounted to ignore
+/// ownership. NFS, other FUSE filesystems such as SSHFS, and other 9p shares
+/// keep the owners their servers report, so they are not included.
+///
+/// This is one `statfs`, plus the mount's entry in `/proc/self/mountinfo`
+/// for FUSE and 9p, whose one type covers filesystems of both kinds. A path
+/// that cannot be inspected counts as keeping owners. Debug builds given
+/// `SYQ_TEST_FIXED_OWNERS` count every filesystem.
 pub(crate) fn fixed_owners_and_modes(path: &std::path::Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     #[cfg(debug_assertions)]
@@ -391,7 +396,12 @@ pub(crate) fn fixed_owners_and_modes(path: &std::path::Path) -> bool {
     let stats = unsafe { stats.assume_init() };
     #[cfg(target_os = "linux")]
     {
-        linux_fixed_owners_and_modes(stats.f_type as u32)
+        let kind = stats.f_type as u32;
+        linux_fixed_owners_and_modes(kind)
+            || ((kind == libc::FUSE_SUPER_MAGIC as u32 || kind == V9FS_MAGIC)
+                && mount_fields_at(&path).is_some_and(|(kind, options)| {
+                    linux_mount_fixes_owners_and_modes(&kind, &options)
+                }))
     }
     #[cfg(target_os = "macos")]
     {
@@ -418,6 +428,34 @@ fn linux_fixed_owners_and_modes(file_system_type: u32) -> bool {
             | 0x517b // SMB
             | 0x786f_4256 // vboxsf
     )
+}
+
+/// 9p's filesystem type, which libc does not name.
+#[cfg(target_os = "linux")]
+const V9FS_MAGIC: u32 = 0x0102_1997;
+
+/// Of the FUSE and 9p mounts, the ones with fixed owners and modes: block
+/// devices served by FUSE (`fuseblk`: ntfs-3g, exfat-fuse) and WSL's drvfs,
+/// which WSL 2 mounts as 9p with `aname=drvfs`.
+#[cfg(target_os = "linux")]
+fn linux_mount_fixes_owners_and_modes(kind: &[u8], options: &[u8]) -> bool {
+    kind == b"fuseblk"
+        || kind == b"drvfs"
+        || (kind == b"9p"
+            && options
+                .split(|byte| *byte == b',')
+                .any(|option| option.starts_with(b"aname=drvfs")))
+}
+
+/// The type and superblock options of the mount holding `path`.
+#[cfg(target_os = "linux")]
+fn mount_fields_at(path: &std::ffi::CStr) -> Option<(Vec<u8>, Vec<u8>)> {
+    use std::os::unix::ffi::OsStrExt;
+    let file = File::open(std::ffi::OsStr::from_bytes(path.to_bytes())).ok()?;
+    let mount = super::mount_id(&file).or_else(|| super::btrfs::fdinfo_mount_id(&file))?;
+    let mounts = std::fs::read("/proc/self/mountinfo").ok()?;
+    let (kind, _, options) = mount_fields(&mounts, mount)?;
+    Some((kind.to_vec(), options.to_vec()))
 }
 
 #[cfg(target_os = "macos")]
@@ -587,6 +625,13 @@ fn mount_has_option(file: &File, key: FileSystemKey, option: &[u8]) -> bool {
 /// The superblock options of one mount in `/proc/self/mountinfo`.
 #[cfg(target_os = "linux")]
 fn super_options(mounts: &[u8], mount: u64) -> Option<&[u8]> {
+    mount_fields(mounts, mount).map(|(_, _, options)| options)
+}
+
+/// The filesystem type, source and superblock options of one mount in
+/// `/proc/self/mountinfo`.
+#[cfg(target_os = "linux")]
+fn mount_fields(mounts: &[u8], mount: u64) -> Option<(&[u8], &[u8], &[u8])> {
     for line in mounts.split(|byte| *byte == b'\n') {
         let mut fields = line.split(|byte| byte.is_ascii_whitespace());
         let id = fields
@@ -596,9 +641,7 @@ fn super_options(mounts: &[u8], mount: u64) -> Option<&[u8]> {
         if id != Some(mount) || !fields.any(|field| field == b"-") {
             continue;
         }
-        fields.next(); // filesystem type
-        fields.next(); // mount source
-        return fields.next();
+        return Some((fields.next()?, fields.next()?, fields.next()?));
     }
     None
 }
@@ -807,6 +850,38 @@ mod tests {
         ] {
             assert!(!linux_fixed_owners_and_modes(kind), "{kind:#x}");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fuse_block_drivers_and_wsl_drives_have_fixed_owners_but_sshfs_does_not() {
+        for (kind, options) in [
+            (&b"fuseblk"[..], &b"rw,user_id=0,group_id=0,allow_other"[..]),
+            (
+                b"9p",
+                b"rw,aname=drvfs;path=C:\\;uid=1000;gid=1000,trans=fd",
+            ),
+            (b"drvfs", b"rw,case=off"),
+        ] {
+            assert!(linux_mount_fixes_owners_and_modes(kind, options));
+        }
+        for (kind, options) in [
+            (&b"fuse.sshfs"[..], &b"rw,user_id=1000,group_id=1000"[..]),
+            (b"9p", b"rw,trans=virtio,version=9p2000.L"),
+        ] {
+            assert!(!linux_mount_fixes_owners_and_modes(kind, options));
+        }
+        let mounts = b"36 35 98:0 / /mnt rw,noatime master:1 - fuseblk /dev/sdb1 rw,user_id=0\n\
+37 35 0:41 / /mnt/c rw - 9p C:\\134 rw,aname=drvfs;path=C:\\;uid=1000,trans=fd\n";
+        assert_eq!(
+            mount_fields(mounts, 36),
+            Some((&b"fuseblk"[..], &b"/dev/sdb1"[..], &b"rw,user_id=0"[..]))
+        );
+        assert_eq!(
+            mount_fields(mounts, 37).map(|fields| fields.0),
+            Some(&b"9p"[..])
+        );
+        assert_eq!(mount_fields(mounts, 38), None);
     }
 
     #[cfg(target_os = "macos")]

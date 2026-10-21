@@ -845,17 +845,25 @@ fn use_version_refuses_a_stored_release_others_could_change() {
         assert!(!out.status.success(), "{case}: {out:?}");
         assert!(out.stdout.is_empty(), "{case}: {out:?}");
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let expected = format!(
-            "syq: cannot start syq 0.7.0 from the binary store: {} must be a ",
-            named.to_string_lossy().trim_end_matches('/')
-        );
+        let named_text = named.to_string_lossy();
+        let named_text = named_text.trim_end_matches('/');
+        let expected = if case == "release directory is a symbolic link" {
+            format!(
+                "syq: cannot start syq 0.7.0 from the binary store: {named_text} is a symbolic link, but only the store root {} may be one; replace it with a directory, or remove it and syq will install the release again",
+                fixture.stored("").to_string_lossy().trim_end_matches('/')
+            )
+        } else {
+            format!("syq: cannot start syq 0.7.0 from the binary store: {named_text} must be a ")
+        };
         assert!(stderr.starts_with(&expected), "{case}: {stderr}");
-        assert!(
-            stderr.contains(
-                "fix its permissions, or delete it and syq will install the release again"
-            ),
-            "{case}: {stderr}"
-        );
+        if case != "release directory is a symbolic link" {
+            assert!(
+                stderr.contains(
+                    "fix its permissions, or delete it and syq will install the release again"
+                ),
+                "{case}: {stderr}"
+            );
+        }
         assert!(
             !stderr.contains("integrity verification"),
             "{case}: {stderr}"
@@ -905,6 +913,29 @@ fn use_version_follows_a_linked_store_root_and_checks_its_target() {
         )),
         "{stderr}"
     );
+
+    // A link to another user's directory names that directory's owner: the
+    // link chose it, not HOME.
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+    let owner = Command::new("id").arg("-un").output().unwrap();
+    let owner = String::from_utf8(owner.stdout).unwrap();
+    let out = fixture
+        .command_builder(&fixture.installed, &["--use-version=0.7.0", "--version"])
+        .env("SYQ_TEST_OWN_UID", "4294967294")
+        .capture_output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "{} links to {}, which belongs to {owner}; link it to a directory you own, or remove the link and syq will install the release again",
+            lib.join("syq").display(),
+            fs::canonicalize(&target).unwrap().display(),
+            owner = owner.trim()
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("HOME"), "{stderr}");
 }
 
 /// A store that belongs to someone else, as when root runs syq with another
@@ -961,6 +992,34 @@ fn use_version_does_not_create_a_store_in_another_users_home() {
         "{stderr}"
     );
     assert!(!fixture.home.join(".local").exists());
+}
+
+/// On a filesystem that fixes owners when it is mounted, a home directory
+/// showing another owner is not refused: the owner means nothing there. A
+/// release is installed, verified on every run, and installed again when its
+/// executable is removed.
+#[test]
+fn use_version_installs_under_a_home_whose_filesystem_fixes_owners() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    let run = || {
+        fixture
+            .command_builder(&fixture.installed, &["--use-version=0.7.0", "--version"])
+            .env("SYQ_TEST_OWN_UID", "4294967294")
+            .env("SYQ_TEST_FIXED_OWNERS", "1")
+            .capture_output()
+            .unwrap()
+    };
+    let out = run();
+    assert_success(&out);
+    assert_eq!(out.stdout, b"syq 0.7.0\n");
+    let stored = fixture.release_directory("0.7.0").join("syq");
+    let release = fs::read(&stored).unwrap();
+    assert_success(&run());
+    fs::remove_file(&stored).unwrap();
+    let out = run();
+    assert_success(&out);
+    assert_eq!(out.stdout, b"syq 0.7.0\n");
+    assert_eq!(fs::read(&stored).unwrap(), release);
 }
 
 /// Where the filesystem fixes owners and modes when it is mounted (FAT, exFAT,

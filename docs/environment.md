@@ -91,13 +91,25 @@ store and nobody else can write them, as syq creates them. `~/.local/lib/syq`
 itself may be a symbolic link, for example to a larger disk; the directory it
 leads to must meet the same rule. Otherwise syq stops and names the problem:
 fix the permissions, or delete what it names and syq installs the release
-again. If the store, or the home directory it would be created in, belongs to
-another user, as when you run syq as root with another user's `HOME`, syq
-refuses to use or create it: run syq as that user or with your own `HOME`.
-On filesystems that do not keep Unix owners and modes, such as FAT, exFAT,
-NTFS and SMB shares, syq checks a stored release against its signed manifest
-on every run instead, which takes longer. The store trusts the directories
-above it; see [Downloaded executables](security.md#downloaded-executables).
+again.
+
+If the store, or the home directory it would be created in, belongs to another
+user, syq refuses to use or create it: run syq as that user, or with `HOME` set
+to your own home directory. This happens when you run syq as root with another
+user's `HOME`, for example in a container that runs as root with someone
+else's home directory mounted, as CI jobs often do.
+
+Some filesystems show every file with the same owner and mode, set when they
+are mounted, so these cannot show who may change a release. On them, syq
+checks a stored release against its signed manifest on every run instead,
+which takes longer, and does not refuse a home directory for its owner. They
+are FAT; exFAT, through the Linux kernel driver, exfat-fuse or macOS; NTFS,
+through the Linux kernel's ntfs3, the ntfs-3g FUSE driver or macOS; SMB shares;
+VirtualBox shared folders; WSL's Windows drives such as `/mnt/c`; and macOS
+volumes set to ignore ownership.
+
+The store trusts the directories above it; see
+[Downloaded executables](security.md#downloaded-executables).
 
 Earlier releases kept their helpers in `~/.cache/syq/helpers`. Syq no longer
 reads that directory, and you can delete it on each machine. Those releases

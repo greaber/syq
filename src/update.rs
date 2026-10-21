@@ -433,7 +433,15 @@ fn stored_release(store: &Path, directory: &Path) -> Result<StoredRelease> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
         };
-        if metadata.uid() != user && !metadata.file_type().is_symlink() {
+        let kind = if is_directory { "directory" } else { "file" };
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "{} is a symbolic link, but only the store root {} may be one; replace it with a {kind}, or remove it and syq will install the release again",
+                path.display(),
+                store.display()
+            );
+        }
+        if metadata.uid() != user {
             // Deleting it would only let this account recreate it and lock
             // its owner out, as root running with another user's HOME would.
             let owner = crate::completion_details::account_name(metadata.uid(), false);
@@ -442,9 +450,7 @@ fn stored_release(store: &Path, directory: &Path) -> Result<StoredRelease> {
                 path.display()
             );
         }
-        let problem = if metadata.file_type().is_symlink() {
-            "is a symbolic link"
-        } else if is_directory && !metadata.is_dir() {
+        let problem = if is_directory && !metadata.is_dir() {
             "is not a directory"
         } else if !is_directory && !metadata.is_file() {
             "is not a regular file"
@@ -454,22 +460,36 @@ fn stored_release(store: &Path, directory: &Path) -> Result<StoredRelease> {
             return Ok(true);
         };
         bail!(
-            "{} must be a {} that you own and nobody else can write, but it {problem}; fix its permissions, or delete it and syq will install the release again",
+            "{} must be a {kind} that you own and nobody else can write, but it {problem}; fix its permissions, or delete it and syq will install the release again",
             path.display(),
-            if is_directory { "directory" } else { "file" },
         )
     };
     let mut path = match fs::symlink_metadata(store) {
-        Ok(metadata) if metadata.file_type().is_symlink() => match fs::canonicalize(store) {
-            Ok(root) => root,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
-                "{} is a symbolic link to a missing directory; create that directory, or remove the link and syq will install the release again",
-                store.display()
-            ),
-            Err(error) => {
-                return Err(error).with_context(|| format!("resolve {}", store.display()))
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let target = match fs::canonicalize(store) {
+                Ok(target) => target,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
+                    "{} is a symbolic link to a missing directory; create that directory, or remove the link and syq will install the release again",
+                    store.display()
+                ),
+                Err(error) => {
+                    return Err(error).with_context(|| format!("resolve {}", store.display()))
+                }
+            };
+            // The link, not HOME, chose this directory.
+            let owner = fs::metadata(&target)
+                .with_context(|| format!("inspect {}", target.display()))?
+                .uid();
+            if owner != user {
+                let owner = crate::completion_details::account_name(owner, false);
+                bail!(
+                    "{} links to {}, which belongs to {owner}; link it to a directory you own, or remove the link and syq will install the release again",
+                    store.display(),
+                    target.display()
+                );
             }
-        },
+            target
+        }
         _ => store.to_path_buf(),
     };
     if !check(&path, true)? {
@@ -563,6 +583,8 @@ fn create_store_directory(store: &Path, directory: &Path) -> Result<()> {
 /// Refuse to put anything in the store under a home directory that belongs to
 /// another user, as when root runs syq with that user's `HOME`. The store
 /// would belong to the wrong user, and its owner would be locked out of it.
+/// Where the filesystem fixes owners when it is mounted, the owner it shows
+/// means nothing, so there is nothing to refuse.
 fn require_own_home(store: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let depth = Path::new(crate::user_dirs::BINARY_STORE_IN_HOME)
@@ -574,7 +596,7 @@ fn require_own_home(store: &Path) -> Result<()> {
     let owner = fs::metadata(home)
         .with_context(|| format!("inspect {}", home.display()))?
         .uid();
-    if owner != crate::rooted::own_uid() {
+    if owner != crate::rooted::own_uid() && !crate::fsops::fixed_owners_and_modes(home) {
         let owner = crate::completion_details::account_name(owner, false);
         bail!(
             "HOME ({}) belongs to {owner}; run syq as {owner}, or set HOME to your own home directory",
