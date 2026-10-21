@@ -811,7 +811,8 @@ fn serve(
                     fault,
                     "server-copy-compare-checksum"
                         | "server-copy-compare-composite"
-                        | "server-copy-compare-crc"
+                        | "server-copy-compare-crc32"
+                        | "server-copy-compare-crc64"
                         | "server-copy-compare-hash"
                 );
                 let mut fields = vec![
@@ -829,7 +830,11 @@ fn serve(
                     ),
                     (
                         "ETag".into(),
-                        if source || same_etag {
+                        if source && fault == "server-copy-compare-crc64" {
+                            // Uploaded in parts; the destination was copied in
+                            // one request, so the ETags can never match.
+                            "\"source-etag-3\"".into()
+                        } else if source || same_etag {
                             "\"source-etag\"".into()
                         } else {
                             "\"different-etag\"".into()
@@ -856,7 +861,9 @@ fn serve(
                         "server-copy-compare-checksum"
                             | "server-copy-compare-composite"
                             | "server-copy-compare-conflict"
-                            | "server-copy-compare-crc"
+                            | "server-copy-compare-crc32"
+                            | "server-copy-compare-crc64"
+                            | "server-copy-compare-crc64-differs"
                             | "server-copy-compare-hash-differs"
                             | "server-copy-compare-recheck-down"
                     )
@@ -869,11 +876,20 @@ fn serve(
                             "FULL_OBJECT".into()
                         },
                     ));
-                    if fault.ends_with("crc") {
-                        // CRCs never decide, even when they agree.
-                        for name in ["crc64nvme", "crc32c", "crc32", "sha1"] {
+                    if fault.ends_with("crc32") {
+                        // 32-bit CRCs and SHA-1 never decide, even when they agree.
+                        for name in ["crc32c", "crc32", "sha1"] {
                             fields.push((format!("x-amz-checksum-{name}"), "AAAA".into()));
                         }
+                    } else if fault.contains("crc64") {
+                        fields.push((
+                            "x-amz-checksum-crc64nvme".into(),
+                            if !source && fault.ends_with("differs") {
+                                "BBBB".into()
+                            } else {
+                                "AAAA".into()
+                            },
+                        ));
                     } else {
                         fields.push((
                             "x-amz-checksum-sha256".into(),
@@ -1120,6 +1136,7 @@ fn serve(
                             | "server-copy-compare-hash"
                             | "server-copy-compare-unavailable"
                             | "server-copy-compare-recheck-down"
+                            | "server-copy-compare-crc64"
                     ),
                     "unchanged object was copied"
                 );
@@ -5434,7 +5451,12 @@ fn server_copy_compares_hashes_checksums_etags_and_metadata_without_body_reads()
         ("server-copy-compare-checksum", 3),
         ("server-copy-compare-composite", 3),
         ("server-copy-compare-conflict", 4),
-        ("server-copy-compare-crc", 3),
+        ("server-copy-compare-crc32", 3),
+        // A multipart source copied in one request: the ETags differ, but the
+        // source is looked up again, and its CRC64NVME matches.
+        ("server-copy-compare-crc64", 3),
+        // Equal ETags, but different CRC64NVME: the destination is replaced.
+        ("server-copy-compare-crc64-differs", 4),
         ("server-copy-compare-hash", 2),
         ("server-copy-compare-hash-differs", 3),
         ("server-copy-compare-metadata", 2),

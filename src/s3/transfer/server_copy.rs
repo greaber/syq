@@ -36,17 +36,23 @@ fn syq_hashes<'a>(source: &'a Object, old: &'a Object) -> Option<(&'a str, &'a s
         .flatten()
 }
 
-/// A SHA-256 the provider keeps for the whole object, rather than one
-/// combined from parts.
-fn full_object_sha256(head: &HeadObjectOutput) -> Option<&str> {
-    (head.checksum_type() == Some(&ChecksumType::FullObject))
-        .then(|| head.checksum_sha256())
-        .flatten()
+/// Checksums the provider keeps for the whole object, rather than combined
+/// from parts, that can decide whether contents match: SHA-256, then
+/// CRC64NVME. A 64-bit CRC is long enough that unrelated contents do not
+/// match by chance, and AWS now adds it to new objects by default, including
+/// one copied in a single request from a multipart source, whose ETag never
+/// matches. The 32-bit CRCs collide too easily, and SHA-1 is rarely
+/// present; neither decides.
+fn full_object_checksums(head: &HeadObjectOutput) -> [Option<&str>; 2] {
+    if head.checksum_type() != Some(&ChecksumType::FullObject) {
+        return [None, None];
+    }
+    [head.checksum_sha256(), head.checksum_crc64_nvme()]
 }
 
-/// Whether provider SHA-256 checksums could decide a comparison, so the HEADs
-/// must ask for them.
-fn sha256_could_decide(source: &Object, old: &Object) -> bool {
+/// Whether provider checksums could decide a comparison, so the HEADs must
+/// ask for them.
+fn checksums_could_decide(source: &Object, old: &Object) -> bool {
     source.kind() == ObjectKind::File
         && old.kind() == ObjectKind::File
         && source.size == old.size
@@ -55,10 +61,9 @@ fn sha256_could_decide(source: &Object, old: &Object) -> bool {
 
 /// Whether an existing destination object holds the source's contents.
 /// Syq's own whole-file hashes decide when both objects carry one of the same
-/// kind. Otherwise full-object SHA-256 checksums the provider keeps decide
-/// when both objects have one. Otherwise equal ETags count, and so does
-/// `quick_check`: matching stored size and modification time. CRC and SHA-1
-/// checksums never decide.
+/// kind. Otherwise the first full-object checksum the provider reports for
+/// both, SHA-256 or else CRC64NVME, decides. Otherwise equal ETags count, and
+/// so does `quick_check`: matching stored size and modification time.
 fn same_contents(
     (source, source_head): (&Object, &HeadObjectOutput),
     (old, old_head): (&Object, &HeadObjectOutput),
@@ -73,11 +78,13 @@ fn same_contents(
     if let Some((a, b)) = syq_hashes(source, old) {
         return a == b;
     }
-    if let (Some(a), Some(b)) = (
-        full_object_sha256(source_head),
-        full_object_sha256(old_head),
-    ) {
-        return a == b;
+    let pairs = full_object_checksums(source_head)
+        .into_iter()
+        .zip(full_object_checksums(old_head));
+    for pair in pairs {
+        if let (Some(a), Some(b)) = pair {
+            return a == b;
+        }
     }
     source.etag == old.etag || quick_check
 }
@@ -439,8 +446,8 @@ impl Engine {
             // decides nothing: compare without it.
             let rechecked = if planned
                 && !self.copy_checksum_unsupported.load(Relaxed)
-                && sha256_could_decide(&source, old)
-                && full_object_sha256(old_head).is_some()
+                && checksums_could_decide(&source, old)
+                && full_object_checksums(old_head).iter().any(Option::is_some)
             {
                 match self.copy_head(source_bucket, &job.key, true).await {
                     Ok(Some((now, head))) if now.etag == source.etag && now.size == source.size => {
@@ -1104,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn syq_hashes_then_provider_sha256_decide_matching_contents_and_crcs_never_do() {
+    fn syq_hashes_then_sha256_then_crc64nvme_decide_matching_contents() {
         let object = |etag: &str, hash: Option<(&str, HashAlgorithm)>| Object {
             key: "data".into(),
             size: 4,
@@ -1128,14 +1135,22 @@ mod tests {
             HeadObjectOutput::builder()
                 .checksum_type(kind)
                 .set_checksum_sha256(sha256.map(str::to_owned))
-                .set_checksum_crc64_nvme(crc.map(str::to_owned))
                 .set_checksum_crc32_c(crc.map(str::to_owned))
                 .set_checksum_crc32(crc.map(str::to_owned))
                 .set_checksum_sha1(crc.map(str::to_owned))
                 .build()
         };
         let sha = |value| full(ChecksumType::FullObject, Some(value), None);
+        // 32-bit CRCs and SHA-1, without CRC64NVME.
         let crc = |value| full(ChecksumType::FullObject, None, Some(value));
+        let crc64 = |sha256: Option<&str>, value: &str| {
+            HeadObjectOutput::builder()
+                .checksum_type(ChecksumType::FullObject)
+                .set_checksum_sha256(sha256.map(str::to_owned))
+                .checksum_crc64_nvme(value)
+                .checksum_crc32("same")
+                .build()
+        };
         for (case, source, old, quick, same) in [
             (
                 "equal hashes match whatever else differs",
@@ -1186,14 +1201,48 @@ mod tests {
                 false,
             ),
             (
-                "equal CRCs and SHA-1 never decide",
+                "a multipart source and its single-request copy match by CRC64NVME",
+                (object("a-3", None), crc64(None, "c")),
+                (object("b", None), crc64(None, "c")),
+                false,
+                true,
+            ),
+            (
+                "different CRC64NVME differ whatever the ETags and times say",
+                (object("a", None), crc64(None, "c")),
+                (object("a", None), crc64(None, "d")),
+                true,
+                false,
+            ),
+            (
+                "SHA-256 decides before CRC64NVME",
+                (object("a", None), crc64(Some("x"), "c")),
+                (object("a", None), crc64(Some("y"), "c")),
+                false,
+                false,
+            ),
+            (
+                "a composite CRC64NVME never decides",
+                (
+                    object("a", None),
+                    HeadObjectOutput::builder()
+                        .checksum_type(ChecksumType::Composite)
+                        .checksum_crc64_nvme("c")
+                        .build(),
+                ),
+                (object("b", None), crc64(None, "c")),
+                false,
+                false,
+            ),
+            (
+                "equal 32-bit CRCs and SHA-1 never decide",
                 (object("a", None), crc("c")),
                 (object("b", None), crc("c")),
                 false,
                 false,
             ),
             (
-                "different CRCs never decide either",
+                "different 32-bit CRCs never decide either",
                 (object("a", None), crc("c")),
                 (object("a", None), crc("d")),
                 false,
@@ -1234,15 +1283,15 @@ mod tests {
             (&object("a", blake3("h")), &none),
             true
         ));
-        // Checksums are worth asking for only when SHA-256 could decide.
-        assert!(sha256_could_decide(
+        // Checksums are worth asking for only when they could decide.
+        assert!(checksums_could_decide(
             &object("a", None),
             &object("b", blake3("h"))
         ));
-        assert!(!sha256_could_decide(
+        assert!(!checksums_could_decide(
             &object("a", blake3("h")),
             &object("b", blake3("i"))
         ));
-        assert!(!sha256_could_decide(&larger, &object("b", None)));
+        assert!(!checksums_could_decide(&larger, &object("b", None)));
     }
 }

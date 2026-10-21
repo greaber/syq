@@ -166,11 +166,14 @@ changes apply only when explicitly selected; copying a storage class can affect
 storage costs and require restoring an archived object first.
 
 When both objects carry the whole-file hash syq stores with its uploads and
-copies, those hashes decide whether the contents match. Otherwise, when the
-provider reports a full-object SHA-256 checksum for both, those decide.
+copies, those hashes decide whether the contents match. Otherwise, a
+whole-object checksum the provider reports for both decides: SHA-256, or else
+CRC64NVME, which AWS adds to new objects by default. That lets a rerun skip an
+object uploaded in parts and copied in one request, whose ETags never match.
 Otherwise, equal ETags or equal stored sizes and modification times count as
-matching. CRC and SHA-1 checksums are not used. When the contents do not
-match, the default policy replaces the destination.
+matching. The 32-bit CRCs, SHA-1, and checksums combined from parts are not
+used: matching 32-bit CRCs are not rare enough to show that contents match.
+When the contents do not match, the default policy replaces the destination.
 Use `--if-exists=error-if-different` to reject copies whose contents cannot be
 established as matching. Syq does not
 download both bodies to compare them on this route. `--hash`, `--hash-or-copy`,
