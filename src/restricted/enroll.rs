@@ -11,6 +11,16 @@ pub(super) fn local_state_base() -> Result<PathBuf> {
 
 pub(super) const ENROLLMENT_FILE: &str = "enrollment.json";
 pub(super) const PENDING_FILE: &str = "pending.json";
+/// Present while a refresh of an active enrollment has not been confirmed.
+/// The server may have applied it, as when the reply was lost, so the next
+/// copy logs in to finish it even if the recorded key can still sign.
+pub(super) const REFRESH_FILE: &str = "refreshing";
+
+/// Whether an active enrollment must log in again before a copy uses it:
+/// it runs another build, or a refresh of it was never confirmed.
+pub(super) fn needs_refresh(metadata: &LocalEnrollment, directory: &Path) -> bool {
+    metadata.release != crate::identity::build() || directory.join(REFRESH_FILE).exists()
+}
 
 /// The records named `file` in the enrollment directories below `base`, of
 /// this version only: state that released versions wrote lives elsewhere
@@ -83,7 +93,8 @@ pub(super) fn complete_local_enrollment(
     )?;
     let directory = open_directory(directory)?;
     lock_directory(&directory)?;
-    remove_leaf_locked(&directory, PENDING_FILE)
+    remove_leaf_locked(&directory, PENDING_FILE)?;
+    remove_leaf_locked(&directory, REFRESH_FILE)
 }
 
 /// Remove an enrollment's local state, after it was revoked or its server
@@ -370,7 +381,7 @@ pub(super) fn enroll(
         .into_iter()
         .find(|(metadata, _)| account(&metadata.host, metadata.port, &metadata.target_login));
     if let Some((metadata, directory)) = &active {
-        if !refresh && metadata.release == crate::identity::build() {
+        if !refresh && !needs_refresh(metadata, directory) {
             return Ok((metadata.clone(), directory.clone(), None));
         }
     }
@@ -397,6 +408,11 @@ pub(super) fn enroll(
             None => new_plan(&base, None),
         },
     };
+    if plan.refresh {
+        // Until the server's reply arrives, the server may hold a newer
+        // signer and generation than this machine's record.
+        atomic_write(&plan.directory, REFRESH_FILE, b"", 0o600)?;
+    }
     let lost = (plan.refresh, plan.id, plan.directory.clone());
     let (metadata, directory, signer) =
         match run_session(&target, jump, (host, port, login), plan, check)? {

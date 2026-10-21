@@ -402,6 +402,39 @@ fn the_entry_key_is_a_software_key_other_than_the_login_key() {
     assert!(!home.join(BINARY_STORE).exists());
 }
 
+/// A refresh recreates a deleted record of used grants, under a new
+/// generation: grants signed before it name the old one and are refused,
+/// so none can be redeemed again against the empty record.
+#[test]
+fn a_deleted_record_of_used_grants_is_recreated_under_a_new_generation() {
+    let (account, home) = enrollment_home();
+    let home = home.path();
+    let id = EnrollmentId::random();
+    let entry = generate_test_key("entry").unwrap();
+    let login = generate_test_key("login").unwrap();
+    let request = install_request(&account, id, &entry, &login, false);
+    assert_eq!(
+        installed(install_for_account(&request, &account, home).unwrap()),
+        (1, true)
+    );
+    let replay = enrollment_state(home, id).join("replay");
+    fs::remove_dir(&replay).unwrap();
+    let refresh = install_request(&account, id, &entry, &login, true);
+    assert_eq!(
+        installed(install_for_account(&refresh, &account, home).unwrap()),
+        (2, true)
+    );
+    assert!(replay.is_dir());
+    assert_eq!(fs::metadata(&replay).unwrap().mode() & 0o777, 0o700);
+    let line = fs::read_to_string(home.join(".ssh/authorized_keys")).unwrap();
+    assert!(line.contains("--generation=2\""), "{line}");
+    // With the record in place, a refresh changes nothing.
+    assert_eq!(
+        installed(install_for_account(&refresh, &account, home).unwrap()),
+        (2, false)
+    );
+}
+
 #[test]
 fn rotation_rewrites_only_the_signer_and_raises_the_generation() {
     let (account, home) = enrollment_home();
@@ -788,6 +821,14 @@ fn a_grant_is_recorded_only_after_every_check_passes() {
     assert_ne!(recorded(), 0);
     let error = admit(&state, &config, current, &valid).err().unwrap();
     assert!(format!("{error:#}").contains("already"), "{error:#}");
+    // Without the record, nothing is admitted, and the error names the fix.
+    fs::remove_dir_all(state.join("replay")).unwrap();
+    let fresh = sign(&login, 2, delegation::SSHSIG_NAMESPACE);
+    let error = admit(&state, &config, current, &fresh).err().unwrap();
+    assert!(
+        format!("{error:#}").contains("syq receiver enroll backup@HOST"),
+        "{error:#}"
+    );
 }
 
 /// Every key of a JSON document, at any depth.
@@ -2020,7 +2061,7 @@ fn results_keys_are_distinct_and_persist_for_an_enrollment() {
     assert!(state.join(RESULTS_KEY_FILE).is_file());
 }
 #[test]
-fn pending_enrollment_keeps_its_key_until_active_metadata_is_durable() {
+fn local_records_track_pending_enrollments_and_unconfirmed_refreshes() {
     let (_, home) = current_account().unwrap();
     let temporary = tempfile::tempdir_in(home).unwrap();
     fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -2083,6 +2124,18 @@ fn pending_enrollment_keeps_its_key_until_active_metadata_is_durable() {
     let listed = load_local_enrollments_in(temporary.path()).unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].0.id, id);
+
+    // A refresh whose reply never arrived, as when a rotation's reply is
+    // lost: the server may already trust the new key, so the next copy
+    // logs in to finish it even though the recorded key still signs.
+    assert!(!needs_refresh(&metadata, &directory));
+    atomic_write(&directory, REFRESH_FILE, b"", 0o600).unwrap();
+    assert!(needs_refresh(&metadata, &directory));
+    complete_local_enrollment(&directory, &metadata).unwrap();
+    assert!(!needs_refresh(&metadata, &directory));
+    let mut other_build = metadata.clone();
+    other_build.release = "v0.0.0-other".into();
+    assert!(needs_refresh(&other_build, &directory));
 }
 #[test]
 fn prune_lookup_is_confined_to_authorized_observation_paths() {

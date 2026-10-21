@@ -79,7 +79,12 @@ pub(super) fn admit(
     envelope: &[u8],
 ) -> Result<delegation::VerifiedGrant> {
     require_current_receiver(config, generation, build)?;
-    let replay = delegation::ReplayStore::open(&state.join("replay"))?;
+    let replay = delegation::ReplayStore::open(&state.join("replay")).with_context(|| {
+        format!(
+            "this server cannot read its record of used authorizations for enrollment {}; run `syq receiver enroll {}@HOST` on your machine to recreate it",
+            config.id, config.target_login
+        )
+    })?;
     let signer_name = signer_name(config.id, config.generation);
     let context = delegation::ReceiverContext {
         enrollment_id: config.id,

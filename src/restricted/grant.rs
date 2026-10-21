@@ -340,7 +340,7 @@ pub(crate) fn prepare_transfer(
         check(Path::new(&metadata.remote_home), &metadata.receiving_state)?;
     }
     let (metadata, directory, signer) = match found {
-        Some((metadata, directory)) if metadata.release == crate::identity::build() => {
+        Some((metadata, directory)) if !needs_refresh(&metadata, &directory) => {
             (metadata, directory, None)
         }
         _ if !allow_enrollment => bail!(

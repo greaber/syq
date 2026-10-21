@@ -667,13 +667,16 @@ fn direct_command(
 }
 
 /// The SSH command for this machine's connection to the coordinator. When
-/// the coordinator gets an entry key, that connection forwards nothing: no
-/// X11, no GSSAPI credentials, and no port forwarding from the user's
-/// configuration. It may still reuse this machine's master connection.
+/// the coordinator gets an entry key, that session asks for no X11
+/// forwarding and none of the port forwardings in the user's configuration.
+/// It may reuse, or become, syq's master connection to the coordinator
+/// (`ControlMaster=auto`), so it leaves alone what belongs to the master's
+/// login, such as GSSAPI credential delegation, which later copies sharing
+/// the master may rely on.
 fn coordinator_rsh(rsh: &[String], entry_key: bool) -> Vec<String> {
     let mut command = rsh.to_vec();
     if entry_key && rsh.first().is_some_and(|program| program.ends_with("ssh")) {
-        command.extend(["-x", "-k", "-o", "ClearAllForwardings=yes"].map(String::from));
+        command.extend(["-x", "-o", "ClearAllForwardings=yes"].map(String::from));
     }
     command
 }

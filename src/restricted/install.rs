@@ -439,10 +439,15 @@ pub(super) fn install_for_account(
     let entry_at = |generation: u64| {
         AuthorizedKeyEntry::enrollment(request.id, &receiver_path, generation, &entry_key, &signer)
     };
+    // A deleted record of used grants is recreated below, under a new
+    // generation, so no grant signed before can be redeemed against it.
+    let replay_present =
+        fs::symlink_metadata(state.join("replay")).is_ok_and(|metadata| metadata.is_dir());
     if let Some(existing) = &existing {
         if existing.release == release
             && existing.receiver_path == receiver
             && request.replaces.is_none()
+            && replay_present
         {
             let (_, change) =
                 enrollment::set_enrollment_line(&original, &entry_at(existing.generation)?)?;

@@ -1000,10 +1000,9 @@ fn receiver_ssh_uses_the_entry_key_alone_and_pinned_host_keys() {
 fn the_coordinator_connection_forwards_nothing_when_it_gets_an_entry_key() {
     let ssh = vec!["ssh".to_owned()];
     let with_key = coordinator_rsh(&ssh, true);
-    assert_eq!(
-        with_key,
-        ["ssh", "-x", "-k", "-o", "ClearAllForwardings=yes"]
-    );
+    // No `-k`: this connection may become the master later copies share,
+    // and GSSAPI delegation belongs to the master's login.
+    assert_eq!(with_key, ["ssh", "-x", "-o", "ClearAllForwardings=yes"]);
     // Both the direct command and helper setup start from it; a master
     // connection may still carry it.
     assert!(source_setup_rsh(&with_key, false).ends_with(&["-a".to_owned()]));
