@@ -96,17 +96,14 @@ again.
 If the store, or the home directory it would be created in, belongs to another
 user, syq refuses to use or create it: run syq as that user, or with `HOME` set
 to your own home directory. This happens when you run syq as root with another
-user's `HOME`, for example in a container that runs as root with someone
-else's home directory mounted, as CI jobs often do.
+user's `HOME`, for example in a CI container that runs as root with another
+user's home directory mounted.
 
-Some filesystems show every file with the same owner and mode, set when they
-are mounted, so these cannot show who may change a release. On them, syq
-checks a stored release against its signed manifest on every run instead,
-which takes longer, and does not refuse a home directory for its owner. They
-are FAT; exFAT, through the Linux kernel driver, exfat-fuse or macOS; NTFS,
-through the Linux kernel's ntfs3, the ntfs-3g FUSE driver or macOS; SMB shares;
-VirtualBox shared folders; WSL's Windows drives such as `/mnt/c`; and macOS
-volumes set to ignore ownership.
+On filesystems that show the same owner and mode for every file, such as FAT,
+exFAT, NTFS, SMB shares and WSL's `/mnt/c`, owners and modes cannot show who
+may change a release. There syq checks a stored release against its signed
+manifest on every run instead, which takes longer, and does not refuse a home
+directory because of the owner it shows.
 
 The store trusts the directories above it; see
 [Downloaded executables](security.md#downloaded-executables).
