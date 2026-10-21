@@ -209,7 +209,7 @@ fn rsa_login_keys_over_4096_bits_sign_and_verify_and_small_ones_are_refused() {
     let public = PublicKey::read_openssh_file(&large.with_extension("pub")).unwrap();
     let name = large.to_str().unwrap();
     // From the key file.
-    let login = discover(&trace(name, &public, false), b"", None, b"probe", "backup").unwrap();
+    let login = discover(&trace(name, &public, false), b"", None, b"probe").unwrap();
     assert!(matches!(login.signer, LoginSigner::File(_)));
     let signature = login.signer.sign(NAMESPACE, b"grant").unwrap();
     login
@@ -227,7 +227,6 @@ fn rsa_login_keys_over_4096_bits_sign_and_verify_and_small_ones_are_refused() {
         b"",
         Some(&agent.socket),
         b"probe",
-        "backup",
     )
     .unwrap();
     assert!(matches!(login.signer, LoginSigner::Agent { .. }));
@@ -254,7 +253,6 @@ fn rsa_login_keys_over_4096_bits_sign_and_verify_and_small_ones_are_refused() {
         b"",
         None,
         b"probe",
-        "backup",
     )
     .err()
     .unwrap();
@@ -277,7 +275,6 @@ fn discovery_signs_with_an_unencrypted_key_file_and_records_it() {
             b"",
             None,
             b"probe",
-            "backup",
         )
         .unwrap();
         assert!(matches!(login.signer, LoginSigner::File(_)));
@@ -298,7 +295,6 @@ fn discovery_signs_with_an_unencrypted_key_file_and_records_it() {
         b"",
         None,
         b"p",
-        "backup"
     )
     .is_err());
     assert!(LoginSigner::find(
@@ -326,25 +322,12 @@ fn encrypted_keys_sign_through_the_agent_and_fail_clearly_without_it() {
         let public = PublicKey::read_openssh_file(&path.with_extension("pub")).unwrap();
         let name = path.to_str().unwrap();
         // Not in the agent: the passphrase is not syq's to ask for.
-        let error = discover(
-            &trace(name, &public, false),
-            b"",
-            Some(&agent.socket),
-            b"p",
-            "backup",
-        )
-        .err()
-        .unwrap();
+        let error = discover(&trace(name, &public, false), b"", Some(&agent.socket), b"p")
+            .err()
+            .unwrap();
         assert!(error.to_string().contains("ssh-add"), "{kind}: {error:#}");
         assert!(agent.ssh_add(&[path.as_os_str()]), "{kind}: ssh-add failed");
-        let login = discover(
-            &trace(name, &public, false),
-            b"",
-            Some(&agent.socket),
-            b"p",
-            "backup",
-        )
-        .unwrap();
+        let login = discover(&trace(name, &public, false), b"", Some(&agent.socket), b"p").unwrap();
         assert!(matches!(login.signer, LoginSigner::Agent { .. }), "{kind}");
         assert_eq!(login.identity_file, None, "{kind}");
         let signature = login.signer.sign(NAMESPACE, b"grant").unwrap();
@@ -411,7 +394,6 @@ fn agent_only_keys_sign_and_keys_limited_to_logins_are_refused() {
         b"",
         Some(&agent.socket),
         b"probe",
-        "backup",
     )
     .unwrap();
     assert!(matches!(login.signer, LoginSigner::Agent { .. }));
@@ -445,7 +427,6 @@ fn agent_only_keys_sign_and_keys_limited_to_logins_are_refused() {
         b"",
         Some(&agent.socket),
         b"probe",
-        "backup",
     )
     .err()
     .unwrap();
@@ -458,7 +439,6 @@ fn agent_only_keys_sign_and_keys_limited_to_logins_are_refused() {
         b"",
         Some(&agent.socket),
         b"probe",
-        "backup",
     )
     .err()
     .unwrap();
@@ -502,7 +482,6 @@ fn certificate_logins_trust_the_key_until_the_certificate_expires() {
             b"",
             Some(&agent.socket),
             b"probe",
-            "backup",
         )
         .unwrap_or_else(|error| panic!("{label}: {error:#}"));
         // The certificate's key signs, and the trusted key carries its expiry.
@@ -547,7 +526,6 @@ fn certificate_logins_trust_the_key_until_the_certificate_expires() {
         b"",
         None,
         b"probe",
-        "backup",
     )
     .err()
     .unwrap();
@@ -569,9 +547,11 @@ fn certify(ca: &Path, public_key: &Path, principal: &str, validity: &str, option
 }
 
 #[test]
-fn certificate_expiry_comes_from_the_certificate_that_logged_in() {
+fn certificates_never_extend_what_the_login_allowed() {
     // Reviewer reproducer: a one-hour login must not record a one-year
-    // expiry from another principal's certificate for the same key.
+    // expiry from another principal's certificate for the same key. Every
+    // valid certificate for the key may have logged in, so the earliest
+    // expiry is recorded.
     let agent = Agent::start();
     let directory = crate::test_support::tempdir().unwrap();
     let ca = directory.path().join("ca");
@@ -594,7 +574,6 @@ fn certificate_expiry_comes_from_the_certificate_that_logged_in() {
         b"",
         Some(&agent.socket),
         b"probe",
-        "backup",
     )
     .unwrap();
     assert_eq!(
@@ -615,7 +594,6 @@ fn certificate_expiry_comes_from_the_certificate_that_logged_in() {
         b"",
         Some(&agent.socket),
         b"probe",
-        "backup",
     )
     .unwrap();
     assert_eq!(
@@ -629,7 +607,6 @@ fn certificate_expiry_comes_from_the_certificate_that_logged_in() {
         b"",
         Some(&agent.socket),
         b"probe",
-        "backup",
     )
     .unwrap();
     assert_eq!(login.trusted.valid_before, None);
@@ -645,7 +622,6 @@ fn certificate_expiry_comes_from_the_certificate_that_logged_in() {
         b"",
         Some(&agent.socket),
         b"probe",
-        "backup",
     )
     .unwrap();
     assert_eq!(
@@ -653,23 +629,52 @@ fn certificate_expiry_comes_from_the_certificate_that_logged_in() {
         Some(authenticated.valid_before())
     );
 
-    // Two valid certificates for the login account that disagree are
-    // ambiguous: syq refuses rather than guess.
+    // Another valid certificate for the login account that ends later
+    // changes nothing.
     certify(&ca, &public_path, "backup", "-1m:+2h", &[]);
     assert!(agent.ssh_add(&[path.as_os_str()]));
-    let error = discover(
+    let login = discover(
         &trace(name, &public, true),
         b"",
         Some(&agent.socket),
         b"probe",
-        "backup",
     )
-    .err()
     .unwrap();
-    assert!(
-        error.to_string().contains("cannot tell which one"),
-        "{error:#}"
+    assert_eq!(
+        login.trusted.valid_before,
+        Some(authenticated.valid_before())
     );
+
+    // Second reviewer reproducer: sshd maps principals, here through the
+    // authority's `principals=` option, so a one-hour role certificate can
+    // log in while a year-long certificate naming the account itself would
+    // be rejected. The one-hour expiry is recorded.
+    let role = directory.path().join("role");
+    keygen(&role, "ed25519", None, "");
+    let role_public_path = role.with_extension("pub");
+    certify(&ca, &role_public_path, "backup-role", "-1m:+1h", &[]);
+    let role_certificate = directory.path().join("role-cert.pub");
+    let role_authenticated = directory.path().join("role-authenticated-cert.pub");
+    fs::copy(&role_certificate, &role_authenticated).unwrap();
+    let role_expiry = read_certificate(&role_authenticated)
+        .unwrap()
+        .valid_before();
+    assert!(agent.ssh_add(&[role.as_os_str()]));
+    certify(&ca, &role_public_path, "backup", "-1m:+52w", &[]);
+    assert!(agent.ssh_add(&[role.as_os_str()]));
+    let ca_public = fs::read_to_string(ca.with_extension("pub")).unwrap();
+    let login = discover(
+        &trace(
+            role_authenticated.to_str().unwrap(),
+            &PublicKey::read_openssh_file(&role_public_path).unwrap(),
+            true,
+        ),
+        format!("cert-authority,principals=\"backup-role\" {ca_public}").as_bytes(),
+        Some(&agent.socket),
+        b"probe",
+    )
+    .unwrap();
+    assert_eq!(login.trusted.valid_before, Some(role_expiry));
 
     // Only expired certificates: refused with a clear message.
     let lone = directory.path().join("lone");
@@ -682,7 +687,6 @@ fn certificate_expiry_comes_from_the_certificate_that_logged_in() {
         b"",
         None,
         b"probe",
-        "backup",
     )
     .err()
     .unwrap();
@@ -752,7 +756,6 @@ fn fido_certificates_keep_their_touch_and_pin_requirements() {
             authorized.as_bytes(),
             Some(&socket),
             b"probe",
-            "backup",
         )
         .unwrap_or_else(|error| panic!("{options:?} {line:?}: {error:#}"));
         assert_eq!(
@@ -798,11 +801,61 @@ fn fido_certificates_keep_their_touch_and_pin_requirements() {
             format!("{line} {ca_public}").as_bytes(),
             Some(&socket),
             b"probe",
-            "backup",
         )
         .unwrap_or_else(|error| panic!("{options:?} {line:?}: {error:#}"));
         assert_eq!(login.trusted.security_key_flags, Some(expected), "{line:?}");
     }
+    // Several valid certificates in the agent: any of them may have logged
+    // in, so the touch is skipped only when every one allows it, a PIN is
+    // needed when any asks, and the earliest expiry is kept.
+    let mut issued = Vec::new();
+    for (options, validity) in [
+        (&["no-touch-required"][..], "-1m:+1h"),
+        (&[][..], "-1m:+2h"),
+        (&["no-touch-required", "verify-required"][..], "-1m:+3h"),
+    ] {
+        let _ = fs::remove_file(&certificate_path);
+        certify(
+            &ca,
+            &handle.with_extension("pub"),
+            "backup",
+            validity,
+            options,
+        );
+        issued.push(read_certificate(&certificate_path).unwrap());
+    }
+    let _ = fs::remove_file(&certificate_path);
+    let line = format!("cert-authority,no-touch-required {ca_public}");
+    let login_with = |certificates: &[ssh_key::Certificate], signing: u8| {
+        let (_agent, socket) =
+            security_key_agent_with(untouched.public_key().clone(), signing, certificates);
+        discover(
+            &trace("fido-certificate", untouched.public_key(), true),
+            line.as_bytes(),
+            Some(&socket),
+            b"probe",
+        )
+        .map(|login| login.trusted)
+        .map_err(|error| format!("{error:#}"))
+    };
+    let trusted = login_with(&issued[..1], 0).unwrap();
+    assert_eq!(trusted.security_key_flags, Some(0));
+    // The second certificate needs a touch.
+    let error = login_with(&issued[..2], 0).unwrap_err();
+    assert!(error.contains("without the touch"), "{error}");
+    let trusted = login_with(&issued[..2], 1).unwrap();
+    assert_eq!(
+        (trusted.security_key_flags, trusted.valid_before),
+        (Some(1), Some(issued[0].valid_before()))
+    );
+    // The third certificate needs a PIN, and neither needs a touch.
+    let error = login_with(&[issued[0].clone(), issued[2].clone()], 0).unwrap_err();
+    assert!(error.contains("without the PIN"), "{error}");
+    let trusted = login_with(&[issued[0].clone(), issued[2].clone()], 4).unwrap();
+    assert_eq!(
+        (trusted.security_key_flags, trusted.valid_before),
+        (Some(4), Some(issued[0].valid_before()))
+    );
 }
 
 /// A FIDO key whose signatures carry `flags`, as an OpenSSH key handle.
@@ -833,6 +886,16 @@ fn security_key_signature(flags: u8, data: &[u8]) -> ssh_key::Signature {
 /// touch and PIN flags `flags`; OpenSSH's own agent and the lab's FIDO
 /// provider are covered by the real-SSH lab.
 fn security_key_agent(key: PublicKey, flags: u8) -> (tempfile::TempDir, PathBuf) {
+    security_key_agent_with(key, flags, &[])
+}
+
+/// `security_key_agent`, also listing `certificates` for the key.
+fn security_key_agent_with(
+    key: PublicKey,
+    flags: u8,
+    certificates: &[ssh_key::Certificate],
+) -> (tempfile::TempDir, PathBuf) {
+    let certificates = certificates.to_vec();
     let directory = crate::test_support::short_tempdir().unwrap();
     let socket = directory.path().join("a");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -841,10 +904,17 @@ fn security_key_agent(key: PublicKey, flags: u8) -> (tempfile::TempDir, PathBuf)
             let Ok(mut stream) = stream else { return };
             while let Ok(Some(frame)) = crate::agent_broker::read_frame(&mut stream) {
                 let response = match Request::decode(&mut frame.as_slice()) {
-                    Ok(Request::RequestIdentities) => Response::IdentitiesAnswer(vec![Identity {
-                        credential: PublicCredential::Key(key.key_data().clone()),
-                        comment: "fido".into(),
-                    }]),
+                    Ok(Request::RequestIdentities) => Response::IdentitiesAnswer(
+                        std::iter::once(PublicCredential::Key(key.key_data().clone()))
+                            .chain(certificates.iter().map(|certificate| {
+                                PublicCredential::Cert(Box::new(certificate.clone()))
+                            }))
+                            .map(|credential| Identity {
+                                credential,
+                                comment: "fido".into(),
+                            })
+                            .collect(),
+                    ),
                     Ok(Request::SignRequest(request)) => {
                         Response::SignResponse(security_key_signature(flags, &request.data))
                     }
@@ -913,7 +983,6 @@ fn security_key_policy_comes_from_the_line_the_handle_or_the_probe() {
             line(options).as_bytes(),
             Some(&socket),
             b"probe",
-            "backup",
         );
         match (result, expected) {
             (Ok(login), Some(expected)) => {
@@ -946,7 +1015,6 @@ fn security_key_policy_comes_from_the_line_the_handle_or_the_probe() {
         line("").as_bytes(),
         None,
         b"probe",
-        "backup",
     )
     .err()
     .unwrap();
@@ -958,7 +1026,6 @@ fn security_key_policy_comes_from_the_line_the_handle_or_the_probe() {
         format!("{}{}", line(""), line("verify-required")).as_bytes(),
         Some(&socket),
         b"probe",
-        "backup"
     )
     .is_err());
 }

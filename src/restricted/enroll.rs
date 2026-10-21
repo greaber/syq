@@ -625,7 +625,6 @@ fn install_over_route(
             &authorized,
             agent.as_deref(),
             plan.id.to_string().as_bytes(),
-            login,
         )?;
         let platform = crate::remote_helper::Target::for_bootstrap(&os, &arch)
             .context("unsupported receiver platform")?;

@@ -69,17 +69,19 @@ so is an RSA key with fewer than 2048 or more than 16384 bits.
   says `no-touch-required`, and a PIN when that line says `verify-required` or
   the key itself always asks for one. For a certificate login, the
   certificate's options count as sshd counts them: the touch is skipped only
-  when both the certificate and its authority's line allow it, and a PIN is
-  needed when either asks for one. A PIN needs an `SSH_ASKPASS` program the
+  when both the certificate and its authority's `cert-authority` line allow
+  it, and a PIN is needed when either asks for one. A certificate whose
+  authority the server trusts some other way, such as `TrustedUserCAKeys`,
+  always needs a touch, so a key that cannot be touched cannot set up
+  restricted copying that way. A PIN needs an `SSH_ASKPASS` program the
   agent can run; the agent cannot use syq's terminal.
 - **Certificates:** the certificate's key signs, and the receiver stops
   accepting copies when the certificate expires. The next copy after that
   logs in again and records the new certificate's expiry. SSH does not report
   which of several certificates for one key it logged in with, so syq looks at
-  the certificates for that key in your agent and beside its key file that are
-  valid now, preferring those that name your login as a principal. If those
-  differ in expiry or in their touch and PIN options, setup stops and asks you
-  to keep only the one you log in with.
+  every certificate for that key in your agent and beside its key file that is
+  valid now, and records what they allow together: the earliest expiry, and
+  a touch or PIN when any of them needs one.
 - **Other logins** cannot set up restricted copying: passwords,
   keyboard-interactive, Kerberos, host-based, and logins that need a second
   factor. A key alone would drop the second factor. Use

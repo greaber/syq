@@ -346,17 +346,18 @@ fn read_certificate(path: &Path) -> Option<ssh_key::Certificate> {
     ssh_key::Certificate::from_openssh(text.trim()).ok()
 }
 
-/// The certificate that authenticated a login, among those for its key in
-/// the agent and beside its key file. OpenSSH's trace names neither which
-/// of several certificates for one key it offered nor their IDs, so syq
-/// keeps the user certificates valid now, prefers those naming the login
-/// account as a principal, and refuses when what is left disagrees about
-/// what a receiver would record: the expiry and the touch and PIN options.
-fn authenticated_certificate(
+/// The certificates that may have authenticated a login: the user
+/// certificates for its key, in the agent and beside its key file, that are
+/// valid now. OpenSSH's trace names neither which of several certificates
+/// it offered nor their IDs, and principals do not tell either, since sshd
+/// can map them (`AuthorizedPrincipalsFile`, `principals=`). So syq records
+/// what all of them allow together: the earliest expiry and the strictest
+/// touch and PIN policy. The record can end sooner, or ask for more, than
+/// the login did, never later or for less.
+fn valid_certificates(
     certificates: Vec<ssh_key::Certificate>,
-    login: &str,
     now: i64,
-) -> Result<ssh_key::Certificate> {
+) -> Result<Vec<ssh_key::Certificate>> {
     let now = u64::try_from(now).unwrap_or(0);
     let valid: Vec<_> = certificates
         .into_iter()
@@ -369,34 +370,7 @@ fn authenticated_certificate(
     if valid.is_empty() {
         bail!("syq cannot find a currently valid certificate for the key that logged in; load the certificate into your SSH agent with its key (ssh-add), then retry");
     }
-    let naming: Vec<_> = valid
-        .iter()
-        .filter(|certificate| {
-            certificate.valid_principals().is_empty()
-                || certificate
-                    .valid_principals()
-                    .iter()
-                    .any(|principal| principal == login)
-        })
-        .cloned()
-        .collect();
-    let candidates = if naming.is_empty() { valid } else { naming };
-    let recorded = |certificate: &ssh_key::Certificate| {
-        (
-            certificate.valid_before(),
-            certificate
-                .critical_options()
-                .contains_key("verify-required"),
-            certificate.extensions().contains_key("no-touch-required"),
-        )
-    };
-    if candidates
-        .iter()
-        .any(|certificate| recorded(certificate) != recorded(&candidates[0]))
-    {
-        bail!("several currently valid certificates for the login key are loaded, and syq cannot tell which one logged in; keep only the one you log in with (ssh-add -d removes the others from your agent), then retry");
-    }
-    Ok(candidates[0].clone())
+    Ok(valid)
 }
 
 /// Find the key that authenticated the login `trace` records, among the
@@ -415,7 +389,6 @@ pub(super) fn discover(
     authorized: &[u8],
     agent: Option<&Path>,
     probe: &[u8],
-    login_user: &str,
 ) -> Result<LoginKey> {
     let login = login_from_trace(trace)?;
     let matches = |key: &ssh_key::public::KeyData| {
@@ -462,24 +435,20 @@ pub(super) fn discover(
             }
         }
     }
-    let certificate = if login.certificate {
+    let certificates = if login.certificate {
         if certificates.is_empty() {
             bail!("syq cannot find the certificate that logged in; load it into your SSH agent with its key (ssh-add), then retry");
         }
-        Some(authenticated_certificate(
-            certificates,
-            login_user,
-            super::now()?,
-        )?)
+        valid_certificates(certificates, super::now()?)?
     } else {
-        None
+        Vec::new()
     };
     let key = in_agent
         .clone()
         .or_else(|| file_key.as_ref().map(|key| key.public_key().clone()))
         .or_else(|| {
-            certificate
-                .as_ref()
+            certificates
+                .first()
                 .map(|certificate| PublicKey::new(certificate.public_key().clone(), ""))
         })
         .with_context(|| {
@@ -538,30 +507,34 @@ pub(super) fn discover(
                     .or_else(|| key.key_data().sk_ecdsa_p256().map(|key| key.flags()))
             });
         let has = |options: &[String], name: &str| options.iter().any(|option| option == name);
-        let (no_touch, verify) = match &certificate {
+        let (no_touch, verify) = if certificates.is_empty() {
+            let line = matching_authorization(authorized, &key, false)?.unwrap_or_default();
+            (
+                has(&line, "no-touch-required"),
+                has(&line, "verify-required"),
+            )
+        } else {
             // sshd lets a certificate login skip the touch only when both
             // the certificate and its authority's line allow it, and asks
-            // for a PIN when either does.
-            Some(certificate) => {
+            // for a PIN when either does. Any certificate may have logged
+            // in, so the touch is skipped only when every one allows it.
+            // An authority sshd trusts some other way, such as
+            // `TrustedUserCAKeys`, has no line here, so its certificates
+            // always need a touch.
+            let mut no_touch = true;
+            let mut verify = false;
+            for certificate in &certificates {
                 let authority = PublicKey::new(certificate.signature_key().clone(), "");
                 let line =
                     matching_authorization(authorized, &authority, true)?.unwrap_or_default();
-                (
-                    has(&line, "no-touch-required")
-                        && certificate.extensions().contains_key("no-touch-required"),
-                    has(&line, "verify-required")
-                        || certificate
-                            .critical_options()
-                            .contains_key("verify-required"),
-                )
+                no_touch &= has(&line, "no-touch-required")
+                    && certificate.extensions().contains_key("no-touch-required");
+                verify |= has(&line, "verify-required")
+                    || certificate
+                        .critical_options()
+                        .contains_key("verify-required");
             }
-            None => {
-                let line = matching_authorization(authorized, &key, false)?.unwrap_or_default();
-                (
-                    has(&line, "no-touch-required"),
-                    has(&line, "verify-required"),
-                )
-            }
+            (no_touch, verify)
         };
         let mut required =
             handle_flags.unwrap_or(probe_flags) & (SK_USER_PRESENCE | SK_USER_VERIFICATION);
@@ -590,7 +563,10 @@ pub(super) fn discover(
         trusted: TrustedSigner::new(
             &key,
             security_key_flags,
-            certificate.map(|certificate| certificate.valid_before()),
+            certificates
+                .iter()
+                .map(|certificate| certificate.valid_before())
+                .min(),
         )?,
         identity_file,
     })
