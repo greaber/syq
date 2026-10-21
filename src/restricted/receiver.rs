@@ -3,10 +3,10 @@ use super::*;
 /// The enrollment's state directory and its configuration, for the account
 /// this receiver runs as.
 fn receiver_state(id: EnrollmentId) -> Result<(PathBuf, ReceiverEnrollment)> {
-    let (_, home) = current_account()?;
+    let (login, home) = current_account()?;
     let state = enrollment_state(&home, id);
     let config = read_receiver_config(&state)?.with_context(|| {
-        format!("this server has no state for enrollment {id}; enroll again from your machine")
+        format!("this server has no state for enrollment {id}; run `syq receiver enroll {login}@HOST` on your machine to set restricted copying up again")
     })?;
     if config.id != id {
         bail!("restricted receiver configuration does not match enrollment");

@@ -395,6 +395,28 @@ fn rotation_rewrites_only_the_signer_and_raises_the_generation() {
     );
     assert_eq!(fs::read_to_string(&authorized_keys).unwrap(), line);
 
+    // A new certificate for the same key, or a new touch or PIN policy,
+    // changes only the recorded signer. The line, and so the generation and
+    // the connections it admits, stay.
+    let original_signer = refresh.signer.clone();
+    refresh.signer =
+        delegation::TrustedSigner::new(first_login.public_key(), None, Some(4_000_000_000))
+            .unwrap();
+    assert_eq!(
+        installed(install_for_account(&refresh, &account, home).unwrap()),
+        (1, true)
+    );
+    assert_eq!(fs::read_to_string(&authorized_keys).unwrap(), line);
+    let config = read_receiver_config(&enrollment_state(home, id))
+        .unwrap()
+        .unwrap();
+    assert_eq!((config.generation, &config.signer), (1, &refresh.signer));
+    refresh.signer = original_signer;
+    assert_eq!(
+        installed(install_for_account(&refresh, &account, home).unwrap()),
+        (1, true)
+    );
+
     // A new login key replaces only the trusted signer: the entry key, and
     // so connections it admits, stay.
     let second_login = generate_test_key("second login").unwrap();
@@ -1196,6 +1218,69 @@ fn management_stage_is_scoped_to_one_shell_session() {
     );
     assert_eq!(output.status.code(), Some(23));
     assert!(!store.join(".syq-stage-test-failure").exists());
+}
+
+#[test]
+fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let home = temporary.path();
+    let run = |input: &[u8]| -> Vec<String> {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(install_remote_command(".syq-stage-test"))
+            .env("HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_guarded()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    // Lines 0 to 6 are the platform and state locations; line 7 lists the
+    // platforms the store has this build for, and line 8 starts
+    // authorized_keys.
+    let mut upload = b"{\"request\":1}\n\n".to_vec();
+    upload.extend_from_slice(b"#!/bin/sh\nprintf 'sent %s ' \"$*\"; cat\n");
+    let greeting = run(&upload);
+    assert_eq!(greeting[7].trim(), "");
+    assert_eq!(greeting[8], "0");
+    assert_eq!(greeting[9], r#"sent --restricted-install {"request":1}"#);
+
+    let build = home.join(BINARY_STORE).join(crate::identity::build());
+    crate::test_support::write_executable(
+        &build.join("linux-x86_64/syq"),
+        "#!/bin/sh\nprintf 'stored %s ' \"$*\"; cat\n",
+        0o700,
+    );
+    // Another build, and a file that is not executable, are not offered.
+    crate::test_support::write_executable(
+        &home.join(BINARY_STORE).join("v0.0.0-old/linux-aarch64/syq"),
+        "#!/bin/sh\nexit 1\n",
+        0o700,
+    );
+    fs::create_dir_all(build.join("macos-aarch64")).unwrap();
+    fs::write(build.join("macos-aarch64/syq"), "not a program").unwrap();
+    let greeting = run(b"{\"request\":2}\nlinux-x86_64\n");
+    assert_eq!(greeting[7].trim(), "linux-x86_64");
+    assert_eq!(greeting[9], r#"stored --restricted-install {"request":2}"#);
+    assert!(fs::read_dir(home.join(BINARY_STORE))
+        .unwrap()
+        .all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".syq-stage")));
 }
 /// Execute authorized Apply operations as a connection of `authority`'s
 /// copy executes them.

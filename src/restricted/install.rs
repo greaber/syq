@@ -427,15 +427,25 @@ pub(super) fn install_for_account(
         AuthorizedKeyEntry::enrollment(request.id, &receiver_path, generation, &entry_key, &signer)
     };
     if let Some(existing) = &existing {
-        if existing.signer == request.signer
-            && existing.release == release
+        if existing.release == release
             && existing.receiver_path == receiver
             && request.replaces.is_none()
         {
             let (_, change) =
                 enrollment::set_enrollment_line(&original, &entry_at(existing.generation)?)?;
             if change == AuthorizedKeysChange::Unchanged {
-                return Ok(respond(existing.generation, results_key(&state)?, false));
+                // The line already names this login key, so connections it
+                // opened stay valid. Only the key's policy or certificate
+                // expiry can differ, and receivers read them for each copy.
+                let changed = existing.signer != request.signer;
+                if changed {
+                    let config = ReceiverEnrollment {
+                        signer: request.signer.clone(),
+                        ..existing.clone()
+                    };
+                    atomic_write(&state, "config.json", &serde_json::to_vec(&config)?, 0o600)?;
+                }
+                return Ok(respond(existing.generation, results_key(&state)?, changed));
             }
         }
     }

@@ -561,7 +561,9 @@ directory you own suggests the mode that would have made it. Syq restores each d
 also when the copy fails, unless you request permissions. Other processes can
 see the temporary permissions, and a crash or forced termination can leave
 them in place. Root skips widening. A restricted receiver widens only as the approved
-mode allows, never above the directory it was set up for, and its approval
+mode allows, never above the directory that holds the `--into` directory or
+the `--as` target (on a receiving machine started with `--root`, the
+directory that holds its root), and its approval
 prompt says when a copy can open folders you own to read or change them:
 adding read shows the sender the names inside.
 

@@ -30,8 +30,7 @@ Setup installs three things on the server:
 - One line in `~/.ssh/authorized_keys`. Its key, the entry key, can only start
   syq's receiver. The line's comment names the login key the receiver trusts:
   `syq-enrollment:ID signer TYPE KEY`.
-- The receiver, at `~/.local/lib/syq/RELEASE/PLATFORM/syq`, where syq also
-  keeps its SSH helpers.
+- The receiver, at `~/.local/lib/syq/RELEASE/PLATFORM/syq`.
 - Private state in `~/.local/share/syq/enrollments/ID`: the login key the
   receiver trusts, the record of authorizations already used, and the
   server's key for signing its reports.
@@ -49,16 +48,27 @@ machine. Syq signs through your SSH agent (the one your SSH configuration's
 key's file when it is not passphrase-protected. Syq never asks for a
 passphrase: load passphrase-protected keys, FIDO keys, and PKCS#11 or PIV keys
 into your agent. Before installing anything, setup checks that the key can
-sign. A key added with `ssh-add -h`, which signs only logins, is refused.
+sign. A key added with `ssh-add -h`, which signs only logins, is refused, and
+so is an RSA key with fewer than 2048 or more than 16384 bits.
 
-- **FIDO keys** need one touch per copy. The receiver requires what your login
+- **FIDO keys** need one touch for each copy. A copy that sets up or refreshes
+  restricted copying needs about three: for the login, for the check that the
+  key can sign, and for the copy itself. The receiver requires what your login
   requires: a touch unless the server's `authorized_keys` line for your key
   says `no-touch-required`, and a PIN when that line says `verify-required` or
-  the key itself always asks for one. A PIN needs an `SSH_ASKPASS` program the
+  the key itself always asks for one. For a certificate login, the
+  certificate's options count as sshd counts them: the touch is skipped only
+  when both the certificate and its authority's line allow it, and a PIN is
+  needed when either asks for one. A PIN needs an `SSH_ASKPASS` program the
   agent can run; the agent cannot use syq's terminal.
 - **Certificates:** the certificate's key signs, and the receiver stops
   accepting copies when the certificate expires. The next copy after that
-  logs in again and records the new certificate's expiry.
+  logs in again and records the new certificate's expiry. SSH does not report
+  which of several certificates for one key it logged in with, so syq looks at
+  the certificates for that key in your agent and beside its key file that are
+  valid now, preferring those that name your login as a principal. If those
+  differ in expiry or in their touch and PIN options, setup stops and asks you
+  to keep only the one you log in with.
 - **Other logins** cannot set up restricted copying: passwords,
   keyboard-interactive, Kerberos, host-based, and logins that need a second
   factor. A key alone would drop the second factor. Use
@@ -75,6 +85,13 @@ on the server. To end it, run `syq receiver revoke ID`, or remove every
 `authorized_keys` line that contains the key; syq's line names it in its
 comment. `syq receiver list` shows the fingerprint of the key each enrollment
 trusts.
+
+Whether the receiver accepts a grant depends only on the login key's
+signature, its touch and PIN policy, and a certificate's expiry. Options such
+as `from=` or `expiry-time=` on your key's `authorized_keys` line, a
+certificate's other critical options, such as `source-address` or
+`force-command`, and revoking a certificate or its authority on the server do
+not stop a grant your key signs. Revoke the enrollment to stop them.
 
 After you change syq builds, the next copy logs in once to install the
 matching receiver and rewrite syq's line. An SSH connection opened before that
@@ -174,7 +191,7 @@ server or change the file-data route.
 
 The authentication broker allows 129 simultaneous clients by default. An
 explicit worker count or ceiling changes this to that count plus one control
-connection; restricted copies remain capped at 129 clients.
+connection.
 
 To make hostB pull from hostA using credentials already on hostB:
 

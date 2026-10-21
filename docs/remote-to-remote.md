@@ -50,7 +50,8 @@ whose key can only start syq's receiver, and installs syq in
 copy on your machine, and hostB checks that signature before writing
 anything. HostA receives that signed authorization and the receiver's entry
 key, which cannot authorize anything by itself. Later copies to any directory of that account
-reuse the setup. With a FIDO key, each copy needs one touch.
+reuse the setup. With a FIDO key, each copy needs one touch, and a copy that
+sets up or refreshes restricted copying needs about three.
 
 To set up hostB ahead of time, including before a dry run:
 

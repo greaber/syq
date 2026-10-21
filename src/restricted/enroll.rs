@@ -530,10 +530,7 @@ fn install_over_route(
     let temporary = crate::private_broker::private_temp_dir("syq-enroll-")?;
     let trace_path = temporary.path().join("ssh.log");
     let stage = stage_name(plan.id)?;
-    let remote = format!(
-        "set -eu; uname -s; uname -m; printf '%s\\n' \"$HOME\" \"$(id -u)\" \"${{XDG_CONFIG_HOME-}}\" \"${{XDG_RUNTIME_DIR-}}\" \"${{TMPDIR-}}\"; if test -f \"$HOME/.ssh/authorized_keys\"; then wc -c <\"$HOME/.ssh/authorized_keys\"; cat \"$HOME/.ssh/authorized_keys\"; else printf '0\\n'; fi; IFS= read -r request; {}; printf '%s' \"$request\" | \"$p\" --restricted-install",
-        stage_commands(&stage)
-    );
+    let remote = install_remote_command(&stage);
     let mut command = Command::new("ssh");
     command
         .args(["-vvv", "-o", "FingerprintHash=sha256", "-E"])
@@ -576,6 +573,7 @@ fn install_over_route(
         let config_home = read_enrollment_line(&mut stdout)?;
         let runtime_dir = read_enrollment_line(&mut stdout)?;
         let tmpdir = read_enrollment_line(&mut stdout)?;
+        let stored = read_enrollment_line(&mut stdout)?;
         let receiving = server_receiving_state(
             Path::new(&home),
             &uid,
@@ -590,10 +588,10 @@ fn install_over_route(
         }
         let mut authorized = vec![0u8; length];
         stdout.read_exact(&mut authorized)?;
-        Ok((os, arch, home, receiving, authorized))
+        Ok((os, arch, home, receiving, stored, authorized))
     })();
     drop(foreground);
-    let (os, arch, home, receiving, authorized) = match platform {
+    let (os, arch, home, receiving, stored, authorized) = match platform {
         Ok(platform) => platform,
         Err(error) => {
             drop(input);
@@ -631,7 +629,12 @@ fn install_over_route(
         )?;
         let platform = crate::remote_helper::Target::for_bootstrap(&os, &arch)
             .context("unsupported receiver platform")?;
-        let executable = management_executable(platform)?;
+        // A build the store has already installs itself: nothing is uploaded.
+        let executable = if stored.split_whitespace().any(|key| key == platform.key) {
+            None
+        } else {
+            Some(management_executable(platform)?)
+        };
         let entry_key = match &plan.entry_key {
             Some(key) => key.clone(),
             None => {
@@ -664,9 +667,9 @@ fn install_over_route(
             refresh: plan.refresh,
             replaces: plan.replaces.clone(),
         };
-        Ok((login_key, executable, request))
+        Ok((login_key, (platform.key, executable), request))
     })();
-    let (login_key, executable, request) = match prepared {
+    let (login_key, (platform_key, executable), request) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             drop(input);
@@ -677,7 +680,13 @@ fn install_over_route(
     let write = (|| -> Result<()> {
         serde_json::to_writer(&mut input, &request)?;
         input.write_all(b"\n")?;
-        input.write_all(&executable)?;
+        match &executable {
+            None => writeln!(input, "{}", platform_key)?,
+            Some(executable) => {
+                input.write_all(b"\n")?;
+                input.write_all(executable)?;
+            }
+        }
         Ok(())
     })();
     drop(input);
@@ -733,6 +742,19 @@ fn install_over_route(
         }
         _ => bail!("the enrollment response did not match the request"),
     }
+}
+
+/// The enrollment session's commands. The greeting reports the platform,
+/// where the account keeps syq's state, the platforms this build is stored
+/// for, and `authorized_keys`. The session then reads the request and the
+/// platform whose stored syq installs it; without one, the syq that follows.
+pub(super) fn install_remote_command(stage: &str) -> String {
+    format!(
+        "set -eu; uname -s; uname -m; printf '%s\\n' \"$HOME\" \"$(id -u)\" \"${{XDG_CONFIG_HOME-}}\" \"${{XDG_RUNTIME_DIR-}}\" \"${{TMPDIR-}}\"; s=\"$HOME/{store}/\"{build}; for f in \"$s\"/*/syq; do if test -f \"$f\" && test -x \"$f\"; then t=\"${{f%/syq}}\"; printf '%s ' \"${{t##*/}}\"; fi; done; printf '\\n'; if test -f \"$HOME/.ssh/authorized_keys\"; then wc -c <\"$HOME/.ssh/authorized_keys\"; cat \"$HOME/.ssh/authorized_keys\"; else printf '0\\n'; fi; IFS= read -r request; IFS= read -r stored; if test -n \"$stored\"; then printf '%s' \"$request\" | \"$s/$stored/syq\" --restricted-install; else {stage}; printf '%s' \"$request\" | \"$p\" --restricted-install; fi",
+        store = BINARY_STORE,
+        build = shell_words::quote(crate::identity::build()),
+        stage = stage_commands(stage),
+    )
 }
 
 fn read_enrollment_line(input: &mut impl std::io::BufRead) -> Result<String> {

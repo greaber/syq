@@ -255,9 +255,11 @@ destination.
 
 HostB's receiver opens the directory the destination is in when the copy
 starts, resolving it as the account would, and refuses it when it is one of
-the protected paths or lies inside one, whatever names lead to it. It then
-does everything the copy asks beneath that directory, without following
-symlinks. Renaming or replacing a directory on the way to it during the copy
+the protected paths or lies inside one, whatever names lead to it. A
+protected path that does not exist yet is known only by its name, so a copy
+that reaches it under another name, such as through a bind mount, can create
+it. The receiver then does everything the copy asks beneath that directory,
+without following symlinks. Renaming or replacing a directory on the way to it during the copy
 does not redirect the copy. With `--follow-dst`, the receiver itself follows
 a symlink at the destination, and only to a directory inside the one the
 destination is in and outside its protected paths.
@@ -410,8 +412,10 @@ private key stays on your machine and grants no SSH login access.
 ### Copying between servers
 
 A connected server can ask your laptop to authorize a copy to another server.
-The copy uses your laptop's SSH access and the restricted receiver protections
-described in [Copies between servers](#copies-between-servers). File data goes
+Such a copy does not use an enrollment: syq uses your laptop's SSH access to
+the destination to start a receiver there for that copy alone. That receiver confines the copy to the approved destination, refuses
+the protected paths, and reports its changes, as described in
+[Copies between servers](#copies-between-servers). File data goes
 directly between the servers over encrypted TCP or SSH. When SSH data is needed,
 syq gives the source a temporary key whose destination authorization forces it
 into this copy's live worker connection, with terminal access, forwarding and
