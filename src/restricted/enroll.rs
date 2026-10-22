@@ -236,7 +236,12 @@ pub(super) fn run_management_over_route(
     action: ManagementAction,
     input: &[u8],
 ) -> Result<Vec<u8>> {
-    let platform = run_ssh(target, route.clone(), "set -eu; uname -s; uname -m", &[])?;
+    let platform = run_ssh(
+        target,
+        route.clone(),
+        &in_sh("set -eu; uname -s; uname -m"),
+        &[],
+    )?;
     let platform = std::str::from_utf8(&platform).context("receiver platform is not UTF-8")?;
     let mut lines = platform.lines();
     let os = lines
@@ -249,7 +254,7 @@ pub(super) fn run_management_over_route(
         .with_context(|| format!("restricted enrollment does not support {os} {arch}"))?;
     let bytes = management_executable(platform)?;
     let stage = stage_name(id)?;
-    let command = management_remote_command(&stage, action, input)?;
+    let command = in_sh(&management_remote_command(&stage, action, input)?);
     // Upload and invocation share one SSH session. The remote shell installs
     // its cleanup trap before reading the binary and retains it until the
     // management helper exits, so there is no inter-session orphan window or
@@ -546,7 +551,7 @@ fn install_over_route(
     let temporary = crate::private_broker::private_temp_dir("syq-enroll-")?;
     let trace_path = temporary.path().join("ssh.log");
     let stage = stage_name(plan.id)?;
-    let remote = install_remote_command(&stage);
+    let remote = in_sh(&install_remote_command(&stage));
     let mut command = Command::new("ssh");
     command
         .args(["-vvv", "-o", "FingerprintHash=sha256", "-E"])
@@ -644,11 +649,14 @@ fn install_over_route(
         )?;
         let platform = crate::remote_helper::Target::for_bootstrap(&os, &arch)
             .context("unsupported receiver platform")?;
-        // A build the store has already installs itself: nothing is uploaded.
-        let executable = if stored.split_whitespace().any(|key| key == platform.key) {
+        // A stored build that is exactly the one this machine would upload
+        // installs itself: nothing is uploaded.
+        let executable = management_executable(platform)?;
+        let digest = sha256_hex(&executable);
+        let executable = if matching_stored_build(&stored, platform.key, &digest) {
             None
         } else {
-            Some(management_executable(platform)?)
+            Some(executable)
         };
         let entry_key = match &plan.entry_key {
             Some(key) => key.clone(),
@@ -682,9 +690,9 @@ fn install_over_route(
             refresh: plan.refresh,
             replaces: plan.replaces.clone(),
         };
-        Ok((login_key, (platform.key, executable), request))
+        Ok((login_key, (platform.key, digest, executable), request))
     })();
-    let (login_key, (platform_key, executable), request) = match prepared {
+    let (login_key, (platform_key, digest, executable), request) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             drop(input);
@@ -696,9 +704,9 @@ fn install_over_route(
         serde_json::to_writer(&mut input, &request)?;
         input.write_all(b"\n")?;
         match &executable {
-            None => writeln!(input, "{}", platform_key)?,
+            None => writeln!(input, "{platform_key}\n{digest}")?,
             Some(executable) => {
-                input.write_all(b"\n")?;
+                input.write_all(b"\n\n")?;
                 input.write_all(executable)?;
             }
         }
@@ -759,39 +767,74 @@ fn install_over_route(
     }
 }
 
-/// The enrollment session's commands. The greeting reports the platform,
-/// where the account keeps syq's state, the platforms the store has this
-/// build for, and `authorized_keys`. The session then reads the request and
-/// the platform whose stored syq installs it; without one, the syq that
+/// The enrollment session's commands, for `sh`. The greeting reports the
+/// platform, where the account keeps syq's state, the platforms the store
+/// has this build for with the SHA-256 of each, and `authorized_keys`. The
+/// session then reads the request, the platform whose stored syq installs
+/// it with the hash that syq must have, and, without one, the syq that
 /// follows.
 ///
-/// A stored build is offered, and started, only when it passes the binary
-/// store's rules before it runs: its directories and file belong to the
-/// account and nobody else can write them, and only the store's root may be
-/// a symbolic link. One that fails them is not offered, so this machine
-/// uploads a fresh syq, whose installer then refuses the stored build with
-/// the store's own message. The checks are POSIX `sh`, `test` and `find`.
+/// A stored build is offered only when it passes the binary store's rules:
+/// its directories and file belong to the account and nobody else can write
+/// them, and only the store's root may be a symbolic link. Owners and modes
+/// show nothing on a filesystem that fixes them when it is mounted, such as
+/// SMB or exFAT, so the enrolling machine also compares the hash with the
+/// build it would upload, and the session hashes the build again just
+/// before starting it: only the exact build runs. Without a SHA-256 tool, no
+/// build is offered. The checks use `test -O` and `test -L`, which dash,
+/// bash, zsh and busybox `sh` all have though POSIX does not require `-O`,
+/// `find -perm`, and the SHA-256 tools the helper bootstrap uses. The script
+/// is one line, so any login shell can pass it to `sh -c`.
 pub(super) fn install_remote_command(stage: &str) -> String {
-    format!(
-        r#"set -eu
-uname -s; uname -m
-printf '%s\n' "$HOME" "$(id -u)" "${{XDG_CONFIG_HOME-}}" "${{XDG_RUNTIME_DIR-}}" "${{TMPDIR-}}"
-r="$HOME/{store}"; s="$r/"{build}
-private() {{ [ -O "$1" ] || return 1; w=$(find ${{2:+"$2"}} "$1" -prune \( -perm -020 -o -perm -002 \) -print) || return 1; [ -z "$w" ]; }}
-stored() {{ [ -n "$1" ] && [ -d "$r" ] && private "$r" -H || return 1; for q in "$s" "$s/$1" "$s/$1/syq"; do [ ! -L "$q" ] && private "$q" || return 1; done; [ -f "$s/$1/syq" ] && [ -x "$s/$1/syq" ]; }}
-for f in "$s"/*/syq; do t=${{f%/syq}}; t=${{t##*/}}; if stored "$t"; then printf '%s ' "$t"; fi; done; printf '\n'
-if test -f "$HOME/.ssh/authorized_keys"; then wc -c <"$HOME/.ssh/authorized_keys"; cat "$HOME/.ssh/authorized_keys"; else printf '0\n'; fi
-IFS= read -r request; IFS= read -r target
-if [ -n "$target" ]; then
-    stored "$target" || {{ echo "syq: the stored syq for $target changed during setup; retry" >&2; exit 1; }}
-    printf '%s' "$request" | "$s/$target/syq" --restricted-install
-else
-    {stage}; printf '%s' "$request" | "$p" --restricted-install
-fi"#,
-        store = crate::user_dirs::BINARY_STORE_IN_HOME,
-        build = shell_words::quote(crate::identity::build()),
-        stage = stage_commands(stage),
-    )
+    [
+        "set -eu".to_owned(),
+        "uname -s".to_owned(),
+        "uname -m".to_owned(),
+        "printf '%s\\n' \"$HOME\" \"$(id -u)\" \"${XDG_CONFIG_HOME-}\" \"${XDG_RUNTIME_DIR-}\" \"${TMPDIR-}\"".to_owned(),
+        format!(
+            "r=\"$HOME/{store}\"; s=\"$r/\"{build}",
+            store = crate::user_dirs::BINARY_STORE_IN_HOME,
+            build = shell_words::quote(crate::identity::build()),
+        ),
+        "private() { [ -O \"$1\" ] || return 1; w=$(find ${2:+\"$2\"} \"$1\" -prune \\( -perm -020 -o -perm -002 \\) -print) || return 1; [ -z \"$w\" ]; }".to_owned(),
+        "stored() { [ -n \"$1\" ] && [ -d \"$r\" ] && private \"$r\" -H || return 1; for q in \"$s\" \"$s/$1\" \"$s/$1/syq\"; do [ ! -L \"$q\" ] && private \"$q\" || return 1; done; [ -f \"$s/$1/syq\" ] && [ -x \"$s/$1/syq\" ]; }".to_owned(),
+        "digest() { if command -v sha256sum >/dev/null 2>&1; then o=$(sha256sum < \"$1\") || return 1; elif command -v shasum >/dev/null 2>&1; then o=$(shasum -a 256 < \"$1\") || return 1; elif command -v openssl >/dev/null 2>&1; then o=$(openssl dgst -sha256 < \"$1\") || return 1; o=${o##* }; else return 1; fi; printf '%s' \"${o%%[[:space:]]*}\"; }".to_owned(),
+        "for f in \"$s\"/*/syq; do t=${f%/syq}; t=${t##*/}; if stored \"$t\" && h=$(digest \"$s/$t/syq\") && [ -n \"$h\" ]; then printf '%s:%s ' \"$t\" \"$h\"; fi; done".to_owned(),
+        "printf '\\n'".to_owned(),
+        "if test -f \"$HOME/.ssh/authorized_keys\"; then wc -c <\"$HOME/.ssh/authorized_keys\"; cat \"$HOME/.ssh/authorized_keys\"; else printf '0\\n'; fi".to_owned(),
+        "IFS= read -r request; IFS= read -r target; IFS= read -r expected".to_owned(),
+        format!(
+            "if [ -n \"$target\" ]; then if ! stored \"$target\" || [ \"$(digest \"$s/$target/syq\" || :)\" != \"$expected\" ]; then echo \"syq: the stored syq for $target changed during setup; retry\" >&2; exit 1; fi; printf '%s' \"$request\" | \"$s/$target/syq\" --restricted-install; else {stage}; printf '%s' \"$request\" | \"$p\" --restricted-install; fi",
+            stage = stage_commands(stage),
+        ),
+    ]
+    .join("; ")
+}
+
+/// A command for the account's login shell to run with `sh`, whatever that
+/// login shell is: zsh, for one, stops at a glob that matches nothing, and
+/// fish and tcsh do not take `sh` syntax at all.
+pub(super) fn in_sh(command: &str) -> String {
+    format!("sh -c {}", shell_words::quote(command))
+}
+
+/// The SHA-256 of `bytes` in lowercase hexadecimal, as `sha256sum` prints it.
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The stored build to install with, from the greeting's `TARGET:SHA256`
+/// list: the one for `platform` whose hash is `expected`, the hash of the
+/// build this machine would otherwise upload.
+pub(super) fn matching_stored_build(listed: &str, platform: &str, expected: &str) -> bool {
+    listed
+        .split_whitespace()
+        .filter_map(|entry| entry.split_once(':'))
+        .any(|(target, digest)| target == platform && digest == expected)
 }
 
 fn read_enrollment_line(input: &mut impl std::io::BufRead) -> Result<String> {

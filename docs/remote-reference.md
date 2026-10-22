@@ -32,8 +32,9 @@ Setup installs three things on the server:
   `syq-enrollment:ID signer TYPE KEY`.
 - The receiver: this build of syq in the server's binary store, at
   `~/.local/lib/syq/RELEASE/PLATFORM/syq`, where syq's SSH helper for the same
-  build lives too. When the store already has this build, setup uses it as
-  it is; see [stored releases and helpers](environment.md#stored-releases-and-helpers)
+  build lives too. When the store already has exactly this build, the same
+  SHA-256, setup uses it instead of uploading one; see
+  [stored releases and helpers](environment.md#stored-releases-and-helpers)
   for the rules it follows.
 - Private state in `~/.local/share/syq/enrollments/ID`: the login key the
   receiver trusts, the record of authorizations already used, and the

@@ -303,17 +303,28 @@ def untrusted_stored_build():
     stored = stored[0]
     marker = '/tmp/syq-real-ssh-untrusted-build-started'
     saved = '/tmp/syq-real-ssh-stored-build'
+    # The stored syq may be running, so it is replaced by renaming a new
+    # file over it, never rewritten in place.
+    replace = f'mv -f {stored}.new {stored}'
     remote(f'rm -f {marker} && cp -p {stored} {saved} && '
-           f"printf '#!/bin/sh\\ntouch {marker}\\nexit 1\\n' > {stored} && chmod 770 {stored}")
+           f"printf '#!/bin/sh\\ntouch {marker}\\nexit 1\\n' > {stored}.new && "
+           f'chmod 770 {stored}.new && {replace}')
     try:
         result = attempt('syq', 'receiver', 'enroll', 'destination')
         assert result.returncode, 'enrollment used a group-writable stored build'
         assert b'writable by group or others' in result.stderr, result.stderr.decode(errors='replace')
         assert remote_text(f'test -e {marker} && echo started || echo absent').strip() == 'absent'
+        # A private stored build that is not exactly this build, as any
+        # build looks on a filesystem that fixes owners and modes, is not
+        # started either: setup uploads this build, which replaces it.
+        remote(f'chmod 700 {stored}')
+        run('syq', 'receiver', 'enroll', 'destination')
+        assert remote_text(f'test -e {marker} && echo started || echo absent').strip() == 'absent'
+        remote(f'cmp {stored} {saved}')
     finally:
-        remote(f'cp -p {saved} {stored} && chmod 700 {stored} && rm -f {saved} {marker}')
+        remote(f'cp -p {saved} {stored}.new && chmod 700 {stored}.new && {replace} && rm -f {saved} {marker}')
     run('syq', 'receiver', 'enroll', 'destination')
-    print('a group-writable stored build was refused without starting it', flush=True)
+    print('stored builds that are not exactly this one were never started', flush=True)
 
 
 def certificate_login(lab, parent):

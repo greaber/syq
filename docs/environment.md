@@ -94,7 +94,9 @@ itself may be a symbolic link, for example to a larger disk; the directory it
 leads to must meet the same rule. Otherwise syq stops and names the problem:
 fix the permissions, or delete what it names and syq installs the release
 again. Setting up restricted copying on a server applies the same rule to the
-receiver it would use there.
+receiver it would use there, and uses a stored build only when it is exactly
+the build being set up, by SHA-256; otherwise it uploads and stores that
+build.
 
 If the store, or the home directory it would be created in, belongs to another
 user, syq refuses to use or create it: run syq as that user, or with `HOME` set
@@ -107,7 +109,8 @@ exFAT, NTFS, SMB shares and WSL's `/mnt/c`, owners and modes cannot show who
 may change a release. There syq checks a stored release against its signed
 manifest on every run instead, which takes longer, and does not refuse a home
 directory because of the owner it shows. Setting up restricted copying there
-installs the receiver again each time.
+compares a stored receiver's SHA-256 as everywhere, and writes the receiver
+into the store again each time.
 
 The store trusts the directories above it; see
 [Downloaded executables](security.md#downloaded-executables).

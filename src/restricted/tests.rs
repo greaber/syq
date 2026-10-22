@@ -425,6 +425,11 @@ fn the_receiver_install_follows_the_binary_store_rules() {
     let stored = fs::read(&receiver).unwrap();
     install(home).unwrap();
     assert_eq!(fs::read(&receiver).unwrap(), stored);
+    // A private stored build that is not exactly this one is replaced.
+    crate::test_support::write_executable(&home.join("other-build"), "#!/bin/sh\nexit 1\n", 0o700);
+    fs::rename(home.join("other-build"), &receiver).unwrap();
+    install(home).unwrap();
+    assert_eq!(fs::read(&receiver).unwrap(), stored);
     // A stored build others could change is refused, not replaced.
     fs::set_permissions(&receiver, fs::Permissions::from_mode(0o770)).unwrap();
     let error = format!("{:#}", install(home).unwrap_err());
@@ -1373,6 +1378,53 @@ fn named_entries_are_checked_where_they_really_are() {
     authority(&config, "host-a:other", &alias.join("home/.config")).unwrap();
 }
 
+/// The authority looks up the named entries of many named sources
+/// together, and the copy's own lookups take over what that settled, so a
+/// directory on NFS is listed once for the copy, not once for each.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_copys_lookups_reuse_the_authoritys_directory_listings() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let destination = temporary.path().join("destination");
+    fs::create_dir_all(&destination).unwrap();
+    let mut argv = vec!["syq rsync".to_owned(), "-r".to_owned()];
+    let mut sources = Vec::new();
+    for index in 0..40 {
+        fs::write(destination.join(format!("f{index}")), b"x").unwrap();
+        argv.push(format!("host-a:f{index}"));
+        sources.push(Location::parse(&format!("host-a:f{index}")).unwrap());
+    }
+    argv.push("host-b:/unused".into());
+    let mut args = Args::try_parse_from(&argv).unwrap();
+    args.normalize();
+    args.placement = Placement::Into;
+    let named = destination.as_os_str().as_bytes();
+    let grant = grant_for(
+        &args,
+        &sources,
+        (EnrollmentId::random(), 1),
+        "receiver",
+        named,
+    )
+    .unwrap();
+    let protected = Vec::new();
+    let authority = RestrictedAuthority::new(
+        ConfinedRoot::resolve(named, &protected).unwrap(),
+        grant,
+        GrantConstraints::default(),
+        [0; 32],
+        generate_results_key(EnrollmentId::random()).unwrap(),
+        Instant::now() + std::time::Duration::from_secs(60),
+        &protected,
+    )
+    .unwrap();
+    assert_eq!(authority.settled_listings, vec![b"destination".to_vec()]);
+    assert_eq!(
+        authority.test_ops().settled_listings(),
+        vec![b"destination".to_vec()]
+    );
+}
+
 #[test]
 fn a_destination_is_resolved_afresh_by_every_copy() {
     // The directory a destination goes in is opened when each copy starts,
@@ -1601,10 +1653,11 @@ fn management_stage_is_scoped_to_one_shell_session() {
 fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
     let temporary = crate::test_support::tempdir().unwrap();
     let home = temporary.path();
-    let session = |input: &[u8]| -> std::process::Output {
-        let mut child = Command::new("/bin/sh")
+    // The session as the account's login shell runs it: `shell -c COMMAND`.
+    let session_in = |shell: &str, home: &Path, input: &[u8]| -> std::process::Output {
+        let mut child = Command::new(shell)
             .arg("-c")
-            .arg(install_remote_command(".syq-stage-test"))
+            .arg(in_sh(&install_remote_command(".syq-stage-test")))
             .env("HOME", home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1614,8 +1667,7 @@ fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
         child.stdin.take().unwrap().write_all(input).unwrap();
         child.wait_with_output().unwrap()
     };
-    let run = |input: &[u8]| -> Vec<String> {
-        let output = session(input);
+    let lines = |output: std::process::Output| -> Vec<String> {
         assert!(
             output.status.success(),
             "{}",
@@ -1627,26 +1679,35 @@ fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
             .map(str::to_owned)
             .collect()
     };
+    let session = |input: &[u8]| session_in("/bin/sh", home, input);
+    let run = |input: &[u8]| lines(session(input));
     // Lines 0 to 6 are the platform and state locations; line 7 lists the
-    // platforms the store has this build for, and line 8 starts
-    // authorized_keys.
-    let mut upload = b"{\"request\":1}\n\n".to_vec();
+    // platforms the store has this build for, each with its SHA-256, and
+    // line 8 starts authorized_keys. The session then reads the request,
+    // the stored build's platform and hash, and without them the syq to run.
+    let mut upload = b"{\"request\":1}\n\n\n".to_vec();
     upload.extend_from_slice(b"#!/bin/sh\nprintf 'sent %s ' \"$*\"; cat\n");
     let greeting = run(&upload);
     assert_eq!(greeting[7].trim(), "");
     assert_eq!(greeting[8], "0");
     assert_eq!(greeting[9], r#"sent --restricted-install {"request":1}"#);
+    // A login shell that stops at a glob matching nothing, as zsh does,
+    // runs the session through `sh` all the same.
+    if Path::new("/bin/zsh").exists() {
+        let empty = crate::test_support::tempdir().unwrap();
+        let greeting = lines(session_in("/bin/zsh", empty.path(), &upload));
+        assert_eq!(greeting[7].trim(), "");
+        assert_eq!(greeting[9], r#"sent --restricted-install {"request":1}"#);
+    }
 
     let store = home.join(crate::user_dirs::BINARY_STORE_IN_HOME);
     let build = store.join(crate::identity::build());
     let private = |path: &Path| {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     };
-    crate::test_support::write_executable(
-        &build.join("linux-x86_64/syq"),
-        "#!/bin/sh\nprintf 'stored %s ' \"$*\"; cat\n",
-        0o700,
-    );
+    let stored_program = "#!/bin/sh\nprintf 'stored %s ' \"$*\"; cat\n";
+    crate::test_support::write_executable(&build.join("linux-x86_64/syq"), stored_program, 0o700);
+    let stored_hash = sha256_hex(stored_program.as_bytes());
     // Another build, and a file that is not executable, are not offered.
     crate::test_support::write_executable(
         &store.join("v0.0.0-old/linux-aarch64/syq"),
@@ -1672,11 +1733,22 @@ fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
     ] {
         private(&directory);
     }
-    let greeting = run(b"{\"request\":2}\nlinux-x86_64\n");
-    assert_eq!(greeting[7].trim(), "linux-x86_64");
+    let greeting = run(format!("{{\"request\":2}}\nlinux-x86_64\n{stored_hash}\n").as_bytes());
+    assert_eq!(greeting[7].trim(), format!("linux-x86_64:{stored_hash}"));
+    assert!(matching_stored_build(
+        &greeting[7],
+        "linux-x86_64",
+        &stored_hash
+    ));
+    assert!(!matching_stored_build(&greeting[7], "linux-x86_64", "0"));
+    assert!(!matching_stored_build(
+        &greeting[7],
+        "linux-aarch64",
+        &stored_hash
+    ));
     assert_eq!(greeting[9], r#"stored --restricted-install {"request":2}"#);
-    for target in ["linux-aarch64", "macos-x86_64"] {
-        let output = session(format!("{{\"request\":3}}\n{target}\n").as_bytes());
+    let refused = |target: &str, hash: &str| {
+        let output = session(format!("{{\"request\":3}}\n{target}\n{hash}\n").as_bytes());
         assert!(!output.status.success(), "{target}");
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("changed during setup"),
@@ -1684,14 +1756,22 @@ fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(!started.exists(), "{target} was started");
+    };
+    for target in ["linux-aarch64", "macos-x86_64"] {
+        refused(target, &sha256_hex(marker.as_bytes()));
     }
+    // A build that passes the owner and mode checks, as every build does on
+    // a filesystem that fixes them, runs only when it is the exact build.
+    crate::test_support::write_executable(&build.join("macos-arm64/syq"), &marker, 0o700);
+    private(&build.join("macos-arm64"));
+    refused("macos-arm64", &stored_hash);
     // The store's root alone may lead elsewhere, to the account's own
     // directory.
     let moved = home.join("moved-store");
     fs::rename(&store, &moved).unwrap();
     symlink(&moved, &store).unwrap();
-    let greeting = run(b"{\"request\":4}\nlinux-x86_64\n");
-    assert_eq!(greeting[7].trim(), "linux-x86_64");
+    let greeting = run(format!("{{\"request\":4}}\nlinux-x86_64\n{stored_hash}\n").as_bytes());
+    assert!(greeting[7].contains(&format!("linux-x86_64:{stored_hash}")));
     assert_eq!(greeting[9], r#"stored --restricted-install {"request":4}"#);
     assert!(fs::read_dir(&moved).unwrap().all(|entry| !entry
         .unwrap()

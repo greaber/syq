@@ -568,6 +568,9 @@ pub(crate) struct RestrictedAuthority {
     pub(super) root: std::sync::Arc<Root>,
     /// The path requests name `root` by.
     pub(super) root_path: Vec<u8>,
+    /// Destination directories the authority's own lookups listed, or found
+    /// they need not list, so the copy's lookups do not list them again.
+    pub(super) settled_listings: Vec<proto::PathBytes>,
     pub(super) destination: Vec<u8>,
     pub(super) copy: CopyOperation,
     pub(super) filters: FilterPolicy,
@@ -814,6 +817,8 @@ impl RestrictedAuthority {
         let mut lookups = crate::fsops::FsOps::new();
         lookups.install_restricted_destination(root.clone(), &held_path);
         let found = lookups.stat_many(&looked_up, false);
+        // The copy's own lookups do not list these directories again.
+        let settled_listings = lookups.settled_listings();
         let mut seen: HashMap<Vec<u8>, Option<(u64, u64, bool)>> = looked_up
             .into_iter()
             .zip(found)
@@ -848,6 +853,7 @@ impl RestrictedAuthority {
             }),
             root,
             root_path: held_path,
+            settled_listings,
             destination: copy.destination.clone(),
             copy,
             filters,
@@ -2414,6 +2420,7 @@ impl RestrictedAuthority {
         ops.set_owned_objects(self.owned_objects());
         ops.set_stage_scope(self.stage_scope());
         ops.install_restricted_destination(self.root.clone(), &self.root_path);
+        ops.settle_listings(&self.settled_listings);
         ops.set_planning_lookups(self.lookups.clone());
     }
 

@@ -117,13 +117,14 @@ pub(super) fn store_receiver_path(home: &Path) -> PathBuf {
 }
 
 /// Put this executable in the store as its build's receiver, unless the
-/// store has it already, as the store's other users do: a stored build,
-/// whether a receiver or an SSH helper, runs as it is when its directories
-/// and file are the account's own and nobody else can change them, and is
-/// refused otherwise. Nothing is created under a home directory that
-/// belongs to another user. Where the filesystem fixes owners and modes when
-/// it is mounted, they cannot show who may change a stored build, so this
-/// one replaces it.
+/// store has exactly it already. As for the store's other users, a stored
+/// build whose directories or file someone else could change is refused,
+/// and nothing is created under a home directory that belongs to another
+/// user. A private stored build that is not this executable byte for byte,
+/// such as a damaged copy or another compile of the same source, is
+/// replaced, so syq's line runs exactly the build that set it up. Where the
+/// filesystem fixes owners and modes when it is mounted, they cannot show
+/// who may change a stored build, so it is written again in any case.
 fn install_receiver(home: &Path) -> Result<PathBuf> {
     let store = home.join(crate::user_dirs::BINARY_STORE_IN_HOME);
     let receiver = store_receiver_path(home);
@@ -131,20 +132,21 @@ fn install_receiver(home: &Path) -> Result<PathBuf> {
         .parent()
         .expect("the receiver is in a build directory")
         .to_path_buf();
+    let running = std::env::current_exe().context("resolve the running syq")?;
+    let contents = fs::read(&running)
+        .with_context(|| format!("read the running syq {}", running.display()))?;
     if !crate::fsops::fixed_owners_and_modes(&store) {
         let stored =
             crate::update::stored_release(&store, &directory, &[crate::update::STORED_EXECUTABLE])
                 .context("cannot use the receiver in the binary store")?;
         if stored == crate::update::StoredRelease::Complete
             && delegation::validate_regular_executable(&receiver, "stored receiver").is_ok()
+            && fs::read(&receiver).is_ok_and(|stored| stored == contents)
         {
             return Ok(receiver);
         }
     }
     crate::update::create_store_directory(&store, &directory)?;
-    let running = std::env::current_exe().context("resolve the running syq")?;
-    let contents = fs::read(&running)
-        .with_context(|| format!("read the running syq {}", running.display()))?;
     let opened = open_directory(&directory)?;
     lock_directory(&opened)?;
     atomic_replace_executable_locked(&opened, crate::update::STORED_EXECUTABLE, &contents)?;
