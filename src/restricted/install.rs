@@ -105,57 +105,49 @@ pub(super) fn enrollment_state(home: &Path, id: EnrollmentId) -> PathBuf {
     path_in(home, &SERVER_STATE).join(id.to_string())
 }
 
-/// The store of versioned syq executables in a home directory. Each release
-/// has its own directory, shared by every syq that uses the home.
-pub(super) const BINARY_STORE: &str = ".local/lib/syq";
-
 /// This build's executable in the store of `home`, for the platform it runs
 /// on.
 pub(super) fn store_receiver_path(home: &Path) -> PathBuf {
     let target = crate::remote_helper::Target::key_for_platform(&crate::identity::platform())
         .unwrap_or("self");
-    home.join(BINARY_STORE)
+    home.join(crate::user_dirs::BINARY_STORE_IN_HOME)
         .join(crate::identity::build())
         .join(target)
-        .join("syq")
+        .join(crate::update::STORED_EXECUTABLE)
 }
 
-/// Put this executable in the store as its release's receiver, unless the
-/// store has it already: a stored release was checked when it arrived and
-/// runs as it is.
+/// Put this executable in the store as its build's receiver, unless the
+/// store has it already, as the store's other users do: a stored build,
+/// whether a receiver or an SSH helper, runs as it is when its directories
+/// and file are the account's own and nobody else can change them, and is
+/// refused otherwise. Nothing is created under a home directory that
+/// belongs to another user. Where the filesystem fixes owners and modes when
+/// it is mounted, they cannot show who may change a stored build, so this
+/// one replaces it.
 fn install_receiver(home: &Path) -> Result<PathBuf> {
+    let store = home.join(crate::user_dirs::BINARY_STORE_IN_HOME);
     let receiver = store_receiver_path(home);
-    if delegation::validate_regular_executable(&receiver, "stored receiver").is_ok() {
-        return Ok(receiver);
+    let directory = receiver
+        .parent()
+        .expect("the receiver is in a build directory")
+        .to_path_buf();
+    if !crate::fsops::fixed_owners_and_modes(&store) {
+        let stored =
+            crate::update::stored_release(&store, &directory, &[crate::update::STORED_EXECUTABLE])
+                .context("cannot use the receiver in the binary store")?;
+        if stored == crate::update::StoredRelease::Complete
+            && delegation::validate_regular_executable(&receiver, "stored receiver").is_ok()
+        {
+            return Ok(receiver);
+        }
     }
-    // Directories above the store follow the umask, as other programs'
-    // files there do; the store's own directories are the owner's alone.
-    let mut directory = home.to_path_buf();
-    for component in [".local", "lib"] {
-        directory.push(component);
-        ensure_directory(&directory, 0o777)?;
-    }
-    for component in Path::new(BINARY_STORE)
-        .strip_prefix(".local/lib")
-        .expect("the store is below .local/lib")
-        .iter()
-        .chain(
-            receiver
-                .parent()
-                .and_then(|parent| parent.strip_prefix(home.join(BINARY_STORE)).ok())
-                .expect("the receiver is in the store")
-                .iter(),
-        )
-    {
-        directory.push(component);
-        ensure_directory(&directory, 0o700)?;
-    }
+    crate::update::create_store_directory(&store, &directory)?;
     let running = std::env::current_exe().context("resolve the running syq")?;
     let contents = fs::read(&running)
         .with_context(|| format!("read the running syq {}", running.display()))?;
     let opened = open_directory(&directory)?;
     lock_directory(&opened)?;
-    atomic_replace_executable_locked(&opened, "syq", &contents)?;
+    atomic_replace_executable_locked(&opened, crate::update::STORED_EXECUTABLE, &contents)?;
     delegation::validate_regular_executable(&receiver, "stored receiver")?;
     Ok(receiver)
 }
@@ -214,7 +206,10 @@ pub(super) fn receiver_control_paths(
 ) -> Result<Vec<ReceiverControlPath>> {
     let mut protected = vec![
         (home.join(".ssh"), "SSH configuration directory"),
-        (home.join(BINARY_STORE), "store of syq executables"),
+        (
+            home.join(crate::user_dirs::BINARY_STORE_IN_HOME),
+            "store of syq executables",
+        ),
         (path_in(home, &SERVER_STATE), "enrollment state directory"),
         (path_in(home, &LOCAL_STATE), "enrollment state directory"),
         (

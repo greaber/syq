@@ -399,7 +399,59 @@ fn the_entry_key_is_a_software_key_other_than_the_login_key() {
     assert!(error.to_string().contains("software"), "{error:#}");
     assert!(!home.join(".ssh/authorized_keys").exists());
     assert!(!home.join(".local/share/syq").exists());
-    assert!(!home.join(BINARY_STORE).exists());
+    assert!(!home.join(crate::user_dirs::BINARY_STORE_IN_HOME).exists());
+}
+
+/// The receiver lives in the binary store and follows its rules: a stored
+/// build runs as it is only when its directories and file are the
+/// account's own and nobody else can change them, and the store's root
+/// alone may be a link to another directory of the account's.
+#[test]
+fn the_receiver_install_follows_the_binary_store_rules() {
+    let (account, home) = enrollment_home();
+    let home = home.path();
+    let login = generate_test_key("login").unwrap();
+    let install = |home: &Path| {
+        let entry = generate_test_key("entry").unwrap();
+        let request = install_request(&account, EnrollmentId::random(), &entry, &login, false);
+        install_for_account(&request, &account, home).map(installed)
+    };
+    install(home).unwrap();
+    let receiver = store_receiver_path(home);
+    let build = receiver.parent().unwrap().to_path_buf();
+    assert_eq!(fs::metadata(&build).unwrap().mode() & 0o777, 0o700);
+    // Another syq sharing the home, such as an SSH helper of this build, is
+    // the receiver as it stands.
+    let stored = fs::read(&receiver).unwrap();
+    install(home).unwrap();
+    assert_eq!(fs::read(&receiver).unwrap(), stored);
+    // A stored build others could change is refused, not replaced.
+    fs::set_permissions(&receiver, fs::Permissions::from_mode(0o770)).unwrap();
+    let error = format!("{:#}", install(home).unwrap_err());
+    assert!(error.contains("writable by group or others"), "{error}");
+    fs::set_permissions(&receiver, fs::Permissions::from_mode(0o700)).unwrap();
+    // So is a build directory that is a link.
+    let moved = home.join("moved-build");
+    fs::rename(&build, &moved).unwrap();
+    symlink(&moved, &build).unwrap();
+    let error = format!("{:#}", install(home).unwrap_err());
+    assert!(error.contains("is a symbolic link"), "{error}");
+    fs::remove_file(&build).unwrap();
+    fs::rename(&moved, &build).unwrap();
+    // The store's root may lead to another directory of the account's.
+    let (_, other) = enrollment_home();
+    let other = other.path();
+    let elsewhere = other.join("store-elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    fs::create_dir_all(other.join(".local/lib")).unwrap();
+    symlink(
+        &elsewhere,
+        other.join(crate::user_dirs::BINARY_STORE_IN_HOME),
+    )
+    .unwrap();
+    install(other).unwrap();
+    assert!(store_receiver_path(other).is_file());
+    assert!(fs::read_dir(&elsewhere).unwrap().next().is_some());
 }
 
 /// A refresh recreates a deleted record of used grants, under a new
@@ -1542,7 +1594,9 @@ fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
     assert_eq!(greeting[8], "0");
     assert_eq!(greeting[9], r#"sent --restricted-install {"request":1}"#);
 
-    let build = home.join(BINARY_STORE).join(crate::identity::build());
+    let build = home
+        .join(crate::user_dirs::BINARY_STORE_IN_HOME)
+        .join(crate::identity::build());
     crate::test_support::write_executable(
         &build.join("linux-x86_64/syq"),
         "#!/bin/sh\nprintf 'stored %s ' \"$*\"; cat\n",
@@ -1550,7 +1604,9 @@ fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
     );
     // Another build, and a file that is not executable, are not offered.
     crate::test_support::write_executable(
-        &home.join(BINARY_STORE).join("v0.0.0-old/linux-aarch64/syq"),
+        &home
+            .join(crate::user_dirs::BINARY_STORE_IN_HOME)
+            .join("v0.0.0-old/linux-aarch64/syq"),
         "#!/bin/sh\nexit 1\n",
         0o700,
     );
@@ -1559,13 +1615,15 @@ fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
     let greeting = run(b"{\"request\":2}\nlinux-x86_64\n");
     assert_eq!(greeting[7].trim(), "linux-x86_64");
     assert_eq!(greeting[9], r#"stored --restricted-install {"request":2}"#);
-    assert!(fs::read_dir(home.join(BINARY_STORE))
-        .unwrap()
-        .all(|entry| !entry
+    assert!(
+        fs::read_dir(home.join(crate::user_dirs::BINARY_STORE_IN_HOME))
             .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with(".syq-stage")));
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".syq-stage"))
+    );
 }
 /// Execute authorized Apply operations as a connection of `authority`'s
 /// copy executes them.

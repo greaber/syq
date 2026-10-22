@@ -30,7 +30,11 @@ Setup installs three things on the server:
 - One line in `~/.ssh/authorized_keys`. Its key, the entry key, can only start
   syq's receiver. The line's comment names the login key the receiver trusts:
   `syq-enrollment:ID signer TYPE KEY`.
-- The receiver, at `~/.local/lib/syq/RELEASE/PLATFORM/syq`.
+- The receiver: this build of syq in the server's binary store, at
+  `~/.local/lib/syq/RELEASE/PLATFORM/syq`, where syq's SSH helper for the same
+  build lives too. When the store already has this build, setup uses it as
+  it is; see [stored releases and helpers](environment.md#stored-releases-and-helpers)
+  for the rules it follows.
 - Private state in `~/.local/share/syq/enrollments/ID`: the login key the
   receiver trusts, the record of authorizations already used, and the
   server's key for signing its reports.

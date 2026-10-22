@@ -211,7 +211,7 @@ impl ManagementAction {
 fn stage_commands(stage: &str) -> String {
     format!(
         "d=\"$HOME/{store}\"; p=\"$d/{stage}\"; mkdir -p -- \"$HOME/.local/lib\"; umask 077; mkdir -p -- \"$d\"; trap 'rm -f -- \"$p\"' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; cat >\"$p\"; chmod 700 \"$p\"",
-        store = BINARY_STORE,
+        store = crate::user_dirs::BINARY_STORE_IN_HOME,
     )
 }
 
@@ -766,7 +766,7 @@ fn install_over_route(
 pub(super) fn install_remote_command(stage: &str) -> String {
     format!(
         "set -eu; uname -s; uname -m; printf '%s\\n' \"$HOME\" \"$(id -u)\" \"${{XDG_CONFIG_HOME-}}\" \"${{XDG_RUNTIME_DIR-}}\" \"${{TMPDIR-}}\"; s=\"$HOME/{store}/\"{build}; for f in \"$s\"/*/syq; do if test -f \"$f\" && test -x \"$f\"; then t=\"${{f%/syq}}\"; printf '%s ' \"${{t##*/}}\"; fi; done; printf '\\n'; if test -f \"$HOME/.ssh/authorized_keys\"; then wc -c <\"$HOME/.ssh/authorized_keys\"; cat \"$HOME/.ssh/authorized_keys\"; else printf '0\\n'; fi; IFS= read -r request; IFS= read -r stored; if test -n \"$stored\"; then printf '%s' \"$request\" | \"$s/$stored/syq\" --restricted-install; else {stage}; printf '%s' \"$request\" | \"$p\" --restricted-install; fi",
-        store = BINARY_STORE,
+        store = crate::user_dirs::BINARY_STORE_IN_HOME,
         build = shell_words::quote(crate::identity::build()),
         stage = stage_commands(stage),
     )

@@ -55,7 +55,6 @@ Default locations include:
 | `~/.syq-destinations-v3/` | Registered receiving names on a server |
 | `~/.local/state/syq/enrollments/` | Your restricted-copy enrollments, with their entry keys |
 | `~/.local/share/syq/enrollments/` | A server's enrollment state |
-| `~/.local/lib/syq/` | A server's restricted receivers, one directory per release |
 
 Copies can proceed when optional caches cannot be written, and syq does not
 create a missing home directory to hold them. Copies do need a little space for
@@ -79,7 +78,8 @@ directory per release and one below it per platform:
 That covers releases you select with
 [`--use-version`](install.md#choose-a-version-for-a-script), helpers syq
 downloads to upload to an SSH server, and, on the server, the helper syq
-installs there. A home directory shared by several machines keeps a separate
+installs there, which is also the receiver for
+[restricted copies](remote-reference.md#enrollment) by that build. A home directory shared by several machines keeps a separate
 executable for each platform. A development build uses its build identity in
 place of the release. The store is always in your home directory; XDG
 variables do not move it.
@@ -93,7 +93,8 @@ store and nobody else can write them, as syq creates them. `~/.local/lib/syq`
 itself may be a symbolic link, for example to a larger disk; the directory it
 leads to must meet the same rule. Otherwise syq stops and names the problem:
 fix the permissions, or delete what it names and syq installs the release
-again.
+again. Setting up restricted copying on a server applies the same rule to the
+receiver it would use there.
 
 If the store, or the home directory it would be created in, belongs to another
 user, syq refuses to use or create it: run syq as that user, or with `HOME` set
@@ -105,7 +106,8 @@ On filesystems that show the same owner and mode for every file, such as FAT,
 exFAT, NTFS, SMB shares and WSL's `/mnt/c`, owners and modes cannot show who
 may change a release. There syq checks a stored release against its signed
 manifest on every run instead, which takes longer, and does not refuse a home
-directory because of the owner it shows.
+directory because of the owner it shows. Setting up restricted copying there
+installs the receiver again each time.
 
 The store trusts the directories above it; see
 [Downloaded executables](security.md#downloaded-executables).
