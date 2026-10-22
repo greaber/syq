@@ -273,6 +273,38 @@ pub(super) fn receiver_control_paths(
         .collect())
 }
 
+/// Remove `name` from the private directory `state` when it is there,
+/// so a new one can be made: deleted when this account can, else renamed
+/// aside, as one another owner left there can be.
+fn set_aside_unusable(state: &Path, name: &str) -> Result<()> {
+    let path = state.join(name);
+    let metadata = match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+        Ok(metadata) => metadata,
+    };
+    let removed = if metadata.is_dir() {
+        fs::remove_dir_all(&path)
+    } else {
+        fs::remove_file(&path)
+    };
+    if removed.is_ok() {
+        return Ok(());
+    }
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce).context("name the unusable record")?;
+    let aside = state.join(format!(
+        "{name}.unusable-{:016x}",
+        u64::from_le_bytes(nonce)
+    ));
+    fs::rename(&path, &aside).with_context(|| {
+        format!(
+            "{} cannot be used or removed; remove it, then run `syq receiver enroll` again",
+            path.display()
+        )
+    })
+}
+
 /// Read a request of at most the state-file size from standard input.
 fn read_request<T: serde::de::DeserializeOwned>(label: &str) -> Result<T> {
     let mut encoded = Vec::new();
@@ -434,15 +466,17 @@ pub(super) fn install_for_account(
     let entry_at = |generation: u64| {
         AuthorizedKeyEntry::enrollment(request.id, &receiver_path, generation, &entry_key, &signer)
     };
-    // A deleted record of used grants is recreated below, under a new
-    // generation, so no grant signed before can be redeemed against it.
-    let replay_present =
-        fs::symlink_metadata(state.join("replay")).is_ok_and(|metadata| metadata.is_dir());
+    // A record of used grants the receiver cannot use, because it was
+    // deleted, or has another owner or mode, as after a restore from a
+    // backup, is recreated below under a new generation, so no grant signed
+    // before can be redeemed against the new record.
+    let replay = state.join("replay");
+    let replay_usable = delegation::validate_private_directory_path(&replay).is_ok();
     if let Some(existing) = &existing {
         if existing.release == release
             && existing.receiver_path == receiver
             && request.replaces.is_none()
-            && replay_present
+            && replay_usable
         {
             let (_, change) =
                 enrollment::set_enrollment_line(&original, &entry_at(existing.generation)?)?;
@@ -475,7 +509,10 @@ pub(super) fn install_for_account(
     // state, or a line for an older generation that refuses new copies,
     // which a retry completes.
     ensure_directory(&state, 0o700)?;
-    ensure_directory(&state.join("replay"), 0o700)?;
+    if !replay_usable {
+        set_aside_unusable(&state, "replay")?;
+    }
+    ensure_directory(&replay, 0o700)?;
     let results_public_key = results_key(&state)?;
     let config = ReceiverEnrollment {
         version: CONFIG_VERSION,

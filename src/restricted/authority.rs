@@ -790,20 +790,46 @@ impl RestrictedAuthority {
         // Every path the copy may change, where it really is: by name
         // beneath the directory the root really is, and by the identity of
         // what already exists of it, whatever names lead there.
-        let mut seen = HashMap::new();
-        for scope in &copy.mutation_scopes {
-            if !path_is_at_or_below(&scope.path, &held_path) {
-                continue;
-            }
-            let relative = scope.path[held_path.len()..]
-                .strip_prefix(b"/")
-                .unwrap_or(&scope.path[held_path.len()..]);
+        let scopes: Vec<(&[u8], bool)> = copy
+            .mutation_scopes
+            .iter()
+            .filter(|scope| path_is_at_or_below(&scope.path, &held_path))
+            .map(|scope| {
+                let relative = &scope.path[held_path.len()..];
+                (
+                    relative.strip_prefix(b"/").unwrap_or(relative),
+                    scope.descendants,
+                )
+            })
+            .collect();
+        // Look the paths up together, as the copy's own lookups do: on a
+        // network filesystem that is a listing of the directory they share
+        // and lookups in parallel, not one round trip after another for
+        // each of thousands of named sources.
+        let looked_up: Vec<proto::PathBytes> = scopes
+            .iter()
+            .filter(|(relative, _)| !relative.is_empty())
+            .map(|(relative, _)| relative.to_vec())
+            .collect();
+        let mut lookups = crate::fsops::FsOps::new();
+        lookups.install_restricted_destination(root.clone(), &held_path);
+        let found = lookups.stat_many(&looked_up, false);
+        let mut seen: HashMap<Vec<u8>, Option<(u64, u64, bool)>> = looked_up
+            .into_iter()
+            .zip(found)
+            .map(|(relative, entry)| {
+                let identity =
+                    entry.map(|entry| (entry.dev, entry.ino, entry.kind == proto::Kind::Dir));
+                (relative, identity)
+            })
+            .collect();
+        for (relative, descendants) in scopes {
             reject_control_plane_scope(
                 &crate::fsops::join(&held_real, relative),
-                scope.descendants,
+                descendants,
                 protected,
             )?;
-            reject_protected_scope(&root, relative, scope.descendants, &identities, &mut seen)?;
+            reject_protected_scope(&root, relative, descendants, &identities, &mut seen)?;
         }
         let file_data_limit = (max_file_data_bytes_per_second > 0)
             .then(|| crate::bwlimit::BandwidthLimit::new(max_file_data_bytes_per_second));

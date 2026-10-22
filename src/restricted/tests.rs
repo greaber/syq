@@ -454,11 +454,11 @@ fn the_receiver_install_follows_the_binary_store_rules() {
     assert!(fs::read_dir(&elsewhere).unwrap().next().is_some());
 }
 
-/// A refresh recreates a deleted record of used grants, under a new
+/// A refresh recreates a deleted or unusable record of used grants, under a new
 /// generation: grants signed before it name the old one and are refused,
 /// so none can be redeemed again against the empty record.
 #[test]
-fn a_deleted_record_of_used_grants_is_recreated_under_a_new_generation() {
+fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
     let (account, home) = enrollment_home();
     let home = home.path();
     let id = EnrollmentId::random();
@@ -485,6 +485,23 @@ fn a_deleted_record_of_used_grants_is_recreated_under_a_new_generation() {
         installed(install_for_account(&refresh, &account, home).unwrap()),
         (2, false)
     );
+    // A record the receiver refuses, as after a restore from a backup with
+    // another mode, or something else in its place, is recreated the same
+    // way.
+    fs::set_permissions(&replay, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(delegation::ReplayStore::open(&replay).is_err());
+    assert_eq!(
+        installed(install_for_account(&refresh, &account, home).unwrap()),
+        (3, true)
+    );
+    delegation::ReplayStore::open(&replay).unwrap();
+    fs::remove_dir(&replay).unwrap();
+    fs::write(&replay, b"not a record").unwrap();
+    assert_eq!(
+        installed(install_for_account(&refresh, &account, home).unwrap()),
+        (4, true)
+    );
+    delegation::ReplayStore::open(&replay).unwrap();
 }
 
 #[test]
