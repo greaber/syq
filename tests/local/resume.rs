@@ -2008,6 +2008,52 @@ fn clean_partials_selects_only_current_regular_files() {
     run_native_ok(&["clean-partials", &t.s("tree")]);
 }
 
+/// S3 downloads leave `.syq-s3-HASH.partial` beside the file they resume.
+/// Only regular files with that exact name are removed.
+#[test]
+fn clean_partials_removes_s3_download_partials() {
+    let t = Tmp::new();
+    let hash = "0123456789abcdef".repeat(4);
+    let partial = format!(".syq-s3-{hash}.partial");
+    write(&t.path(&format!("tree/{partial}")), b"downloaded parts");
+    write(
+        &t.path(&format!("tree/nested/{partial}")),
+        b"downloaded parts",
+    );
+    for kept in [
+        ".syq-s3-123.partial".to_owned(),
+        format!(".syq-s3-{}.partial", hash.to_uppercase()),
+        format!(".syq-s3-{hash}0.partial"),
+        format!("syq-s3-{hash}.partial"),
+        format!(".syq-s3-{hash}.partial.old"),
+    ] {
+        write(&t.path(&format!("tree/{kept}")), b"keep");
+    }
+    // A directory or symlink with the name is not a partial.
+    fs::create_dir_all(t.path(&format!("tree/named/{partial}"))).unwrap();
+    fs::create_dir_all(t.path("tree/linked")).unwrap();
+    std::os::unix::fs::symlink(
+        format!("../nested/{partial}"),
+        t.path(&format!("tree/linked/{partial}")),
+    )
+    .unwrap();
+    let before = listing(&t.path("tree"));
+    let preview = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["clean-partials", "--dry-run", &t.s("tree")])
+        .run()
+        .unwrap();
+    assert_output_ok(&preview);
+    let preview = String::from_utf8_lossy(&preview.stdout);
+    assert!(preview.contains("would remove 2 entries"), "{preview}");
+    assert_eq!(listing(&t.path("tree")), before);
+    run_native_ok(&["clean-partials", &t.s("tree")]);
+    assert!(!t.path(&format!("tree/{partial}")).exists());
+    assert!(!t.path(&format!("tree/nested/{partial}")).exists());
+    let mut expected = before;
+    expected.retain(|entry| entry != &partial && entry != &format!("nested/{partial}"));
+    assert_eq!(listing(&t.path("tree")), expected);
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn resume_uses_the_private_stage_when_candidate_changes_or_disappears() {

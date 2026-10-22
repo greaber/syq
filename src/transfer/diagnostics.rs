@@ -53,7 +53,7 @@ pub(super) fn remote_helper_mode(spec: &RemoteSpec, interface: Interface) -> &'s
         if *spec.helper_install.lock().unwrap() {
             "managed; installed now"
         } else {
-            "managed helper cache"
+            "managed; already installed"
         }
     } else if spec.restricted_grant.is_some() {
         "restricted grant"

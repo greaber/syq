@@ -1162,6 +1162,7 @@ fn run(domain: &Domain, control: &Path) -> Result<()> {
         return Ok(());
     }
     let spec = read_spec(control)?;
+    crate::process::running_receiving_connection(spec.endpoint.label(), domain.explicit_path());
     let scope_meta = fs::metadata(scope)?;
     let scope_identity = (scope_meta.dev(), scope_meta.ino());
     let socket = suffixed(control, SOCKET);

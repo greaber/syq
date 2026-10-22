@@ -18,9 +18,12 @@ Add `--on server` to clean a remote tree. For results output, see
 
 `clean-partials` removes regular files named `.FILENAME.syq-tmp.RANDOM`, with
 16 random characters at the end. The filename portion may be shortened or
-omitted. It does not follow symlinks or remove old partial-name formats.
-A regular file deliberately named like a partial is also selected, so preview
-before deleting.
+omitted. It also removes the `.syq-s3-HASH.partial` files that
+[S3 downloads](../object-storage.md) leave beside the files they download,
+where `HASH` is 64 hexadecimal digits; removing one means a later download of
+that file starts over. It does not follow symlinks or remove old partial-name
+formats. A regular file deliberately named like a partial is also selected, so
+preview before deleting.
 
 Interrupted replacements, replacements that race with another program, and
 macOS clones can leave `.syq-swap-...` entries containing displaced files or
@@ -46,7 +49,7 @@ syq clean-partials [OPTIONS] <TREE>...
 
 | Argument / option | Meaning |
 |---|---|
-| `-n, --dry-run` | Preview without changing copy/removal data; remote setup may still cache the helper or install syq; requested results files are still written |
+| `-n, --dry-run` | Preview without changing copy/removal data; remote setup may still install the helper or syq; requested results files are still written |
 | `-v, --verbose...` | List removed paths |
 | `-q, --quiet` | Suppress non-error messages |
 

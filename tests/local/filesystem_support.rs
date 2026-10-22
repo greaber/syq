@@ -136,6 +136,66 @@ fn hard_links_publish_where_link_counts_are_untrusted() {
     }
 }
 
+/// Where the destination has no hard links (FAT, exFAT), each name that
+/// cannot be linked fails with that cause and the names involved, rather than
+/// with the step that failed. The representative is still copied.
+#[test]
+fn hard_links_report_a_filesystem_without_them() {
+    let message = "b cannot be linked to a: the destination filesystem does not support hard links";
+    let t = Tmp::new();
+    fs::create_dir(t.path("src")).unwrap();
+    write(&t.path("src/a"), b"linked");
+    fs::hard_link(t.path("src/a"), t.path("src/b")).unwrap();
+    for existing in [false, true] {
+        let dst = t.path(&format!("dst-{existing}"));
+        fs::create_dir(&dst).unwrap();
+        if existing {
+            write(&dst.join("b"), b"old");
+        }
+        let output = native_with_env(
+            &[
+                "rsync",
+                "-rtH",
+                &t.s("src/"),
+                &format!("{}/", dst.display()),
+            ],
+            &["SYQ_TEST_NO_HARD_LINKS"],
+        );
+        assert_eq!(output.status.code(), Some(23), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("hardlink b: {message}")),
+            "{stderr}"
+        );
+        assert_eq!(read(&dst.join("a")), b"linked");
+        assert_eq!(
+            names(&dst),
+            if existing {
+                &["a", "b"][..]
+            } else {
+                &["a"][..]
+            }
+        );
+    }
+    // A copy that only adds names fails the same way.
+    let output = native_with_env(
+        &[
+            "cp",
+            "--copy-metadata=hardlinks",
+            "--if-exists=error",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("new"),
+        ],
+        &["SYQ_TEST_NO_HARD_LINKS"],
+    );
+    assert_eq!(output.status.code(), Some(23), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(message), "{stderr}");
+    assert_eq!(names(&t.path("new")), ["a"]);
+}
+
 /// Where setting a symlink's times would set its target's (SSHFS), the
 /// link's times are left alone: the copy succeeds, a dangling link does not
 /// fail it, and the target keeps its own time.

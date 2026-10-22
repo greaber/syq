@@ -42,7 +42,9 @@ cargo build --locked --release
 Use test data and a disposable destination. Run `./target/release/syq`
 explicitly to test your build. Source builds upload their running executable
 for SSH copies, so the remote OS, CPU, and system libraries must be compatible.
-Rebuild after edits and rerun the copy. Source builds do not support self-update.
+Rebuild after edits and rerun the copy. Each build identity gets its own
+directory in the server's `~/.local/lib/syq`, and syq does not remove them, so
+delete old ones when you are done. Source builds do not support self-update.
 
 ## Choose official helpers
 

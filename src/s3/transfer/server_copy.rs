@@ -27,30 +27,66 @@ fn same_metadata(a: &HeadObjectOutput, b: &HeadObjectOutput) -> bool {
             == super::super::metadata_fields::storage_class(b)
 }
 
-fn full_checksum_match(a: &HeadObjectOutput, b: &HeadObjectOutput) -> Option<bool> {
-    // Composite checksums depend on part boundaries. A different value cannot
-    // establish a content difference, so leave those to the ordinary quick check.
-    if a.checksum_type() != Some(&ChecksumType::FullObject)
-        || b.checksum_type() != Some(&ChecksumType::FullObject)
-    {
-        return None;
+/// Whether both objects carry a syq hash of the same kind, which then
+/// decides whether their contents match.
+fn syq_hashes<'a>(source: &'a Object, old: &'a Object) -> Option<(&'a str, &'a str)> {
+    let (a, b) = source.metadata.as_ref().zip(old.metadata.as_ref())?;
+    (a.hash_algorithm == b.hash_algorithm)
+        .then(|| a.hash.as_deref().zip(b.hash.as_deref()))
+        .flatten()
+}
+
+/// Checksums the provider keeps for the whole object, rather than combined
+/// from parts, that can decide whether contents match: SHA-256, then
+/// CRC64NVME. A 64-bit CRC is long enough that unrelated contents do not
+/// match by chance, and AWS now adds it to new objects by default, including
+/// one copied in a single request from a multipart source, whose ETag never
+/// matches. The 32-bit CRCs collide too easily, and SHA-1 is rarely
+/// present; neither decides.
+fn full_object_checksums(head: &HeadObjectOutput) -> [Option<&str>; 2] {
+    if head.checksum_type() != Some(&ChecksumType::FullObject) {
+        return [None, None];
     }
-    let mut found = false;
-    for (left, right) in [
-        (a.checksum_sha256(), b.checksum_sha256()),
-        (a.checksum_sha1(), b.checksum_sha1()),
-        (a.checksum_crc64_nvme(), b.checksum_crc64_nvme()),
-        (a.checksum_crc32_c(), b.checksum_crc32_c()),
-        (a.checksum_crc32(), b.checksum_crc32()),
-    ] {
-        if let (Some(left), Some(right)) = (left, right) {
-            found = true;
-            if left != right {
-                return Some(false);
-            }
+    [head.checksum_sha256(), head.checksum_crc64_nvme()]
+}
+
+/// Whether provider checksums could decide a comparison, so the HEADs must
+/// ask for them.
+fn checksums_could_decide(source: &Object, old: &Object) -> bool {
+    source.kind() == ObjectKind::File
+        && old.kind() == ObjectKind::File
+        && source.size == old.size
+        && syq_hashes(source, old).is_none()
+}
+
+/// Whether an existing destination object holds the source's contents.
+/// Syq's own whole-file hashes decide when both objects carry one of the same
+/// kind. Otherwise the first full-object checksum the provider reports for
+/// both, SHA-256 or else CRC64NVME, decides. Otherwise equal ETags count, and
+/// so does `quick_check`: matching stored size and modification time.
+fn same_contents(
+    (source, source_head): (&Object, &HeadObjectOutput),
+    (old, old_head): (&Object, &HeadObjectOutput),
+    quick_check: bool,
+) -> bool {
+    if source.kind() != old.kind() || source.size != old.size {
+        return false;
+    }
+    if source.kind() == ObjectKind::Dir {
+        return true;
+    }
+    if let Some((a, b)) = syq_hashes(source, old) {
+        return a == b;
+    }
+    let pairs = full_object_checksums(source_head)
+        .into_iter()
+        .zip(full_object_checksums(old_head));
+    for pair in pairs {
+        if let (Some(a), Some(b)) = pair {
+            return a == b;
         }
     }
-    found.then_some(true)
+    source.etag == old.etag || quick_check
 }
 
 fn copy_destination_key(job: &Download) -> String {
@@ -169,17 +205,20 @@ impl Engine {
         }
     }
 
+    /// With `checksums`, also ask for the provider's checksums, unless the
+    /// service has shown it does not support that.
     pub(super) async fn copy_head(
         &self,
         bucket: &str,
         key: &str,
+        checksums: bool,
     ) -> Result<Option<(Object, HeadObjectOutput)>> {
         let _slot = self.tuning.requests.acquire().await;
         let Some(output) = client::head_output(
             &self.client,
             bucket,
             key,
-            Some(&self.copy_checksum_unsupported),
+            checksums.then_some(&self.copy_checksum_unsupported),
         )
         .await?
         else {
@@ -301,21 +340,23 @@ impl Engine {
         let key = copy_destination_key(job);
         local::key_path(key.trim_end_matches('/').as_bytes())?;
         anyhow::ensure!(key.len() <= 1024, "S3 key exceeds 1024 bytes");
+        // Provider checksums can matter only against an existing destination
+        // of the same size that is not kept regardless.
+        let listed = self.upload_keys.get().map(|keys| keys.get(&key).copied());
+        let comparable =
+            !self.args.ignore_existing && listed.is_none_or(|size| size == Some(job.size));
         let destination = async {
-            if self
-                .upload_keys
-                .get()
-                .is_some_and(|keys| !keys.contains_key(&key))
-            {
+            if listed == Some(None) {
                 Ok(None)
             } else {
-                self.copy_head(&self.options.bucket, &key).await
+                self.copy_head(&self.options.bucket, &key, comparable).await
             }
         };
+        let planned = job.copy_source.is_some();
         let source = async {
             match job.copy_source.take() {
                 Some(source) => Ok(Some(*source)),
-                None => self.copy_head(source_bucket, &job.key).await,
+                None => self.copy_head(source_bucket, &job.key, comparable).await,
             }
         };
         let (source, existing) = tokio::try_join!(source, destination)?;
@@ -399,25 +440,33 @@ impl Engine {
             if self.args.update && source.kind() != ObjectKind::Dir && old_time > source_time {
                 return Ok(CopyPreparation::Skipped);
             }
-            matching_contents = source.kind() == old.kind()
-                && source.size == old.size
-                && (source.kind() == ObjectKind::Dir
-                    || source
-                        .metadata
-                        .as_ref()
-                        .zip(old.metadata.as_ref())
-                        .is_some_and(|(a, b)| {
-                            a.hash.is_some()
-                                && a.hash_algorithm == b.hash_algorithm
-                                && a.hash == b.hash
-                        })
-                    || full_checksum_match(&source_head, old_head)
-                        .unwrap_or(source.etag == old.etag)
-                    || (!self.args.checksum
-                        && source.metadata.is_some()
-                        && old.metadata.is_some()
-                        && source_time == old_time
-                        && explicit.mtime.is_none()));
+            // A source looked up while planning, before its destination was
+            // known, has no checksums. Ask for them only when they can change
+            // the outcome. A lookup that fails, or finds the source changed,
+            // decides nothing: compare without it.
+            let rechecked = if planned
+                && !self.copy_checksum_unsupported.load(Relaxed)
+                && checksums_could_decide(&source, old)
+                && full_object_checksums(old_head).iter().any(Option::is_some)
+            {
+                match self.copy_head(source_bucket, &job.key, true).await {
+                    Ok(Some((now, head))) if now.etag == source.etag && now.size == source.size => {
+                        Some(head)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            matching_contents = same_contents(
+                (&source, rechecked.as_ref().unwrap_or(&source_head)),
+                (old, old_head),
+                !self.args.checksum
+                    && source.metadata.is_some()
+                    && old.metadata.is_some()
+                    && source_time == old_time
+                    && explicit.mtime.is_none(),
+            );
             anyhow::ensure!(
                 source.kind() == ObjectKind::Dir
                     || matching_contents
@@ -1059,5 +1108,190 @@ mod tests {
             .map(|i| (format!("target/{i}"), false))
             .collect();
         check_overlap(&sources, &targets).unwrap();
+    }
+
+    #[test]
+    fn syq_hashes_then_sha256_then_crc64nvme_decide_matching_contents() {
+        let object = |etag: &str, hash: Option<(&str, HashAlgorithm)>| Object {
+            key: "data".into(),
+            size: 4,
+            etag: etag.into(),
+            version: None,
+            metadata: hash.map(|(hash, algorithm)| Metadata {
+                kind: ObjectKind::File,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 10,
+                nsec: 0,
+                hash: Some(hash.into()),
+                hash_algorithm: algorithm,
+            }),
+            mtime: 10,
+        };
+        let blake3 = |hash| Some((hash, HashAlgorithm::Blake3));
+        let none = HeadObjectOutput::builder().build();
+        let full = |kind: ChecksumType, sha256: Option<&str>, crc: Option<&str>| {
+            HeadObjectOutput::builder()
+                .checksum_type(kind)
+                .set_checksum_sha256(sha256.map(str::to_owned))
+                .set_checksum_crc32_c(crc.map(str::to_owned))
+                .set_checksum_crc32(crc.map(str::to_owned))
+                .set_checksum_sha1(crc.map(str::to_owned))
+                .build()
+        };
+        let sha = |value| full(ChecksumType::FullObject, Some(value), None);
+        // 32-bit CRCs and SHA-1, without CRC64NVME.
+        let crc = |value| full(ChecksumType::FullObject, None, Some(value));
+        let crc64 = |sha256: Option<&str>, value: &str| {
+            HeadObjectOutput::builder()
+                .checksum_type(ChecksumType::FullObject)
+                .set_checksum_sha256(sha256.map(str::to_owned))
+                .checksum_crc64_nvme(value)
+                .checksum_crc32("same")
+                .build()
+        };
+        for (case, source, old, quick, same) in [
+            (
+                "equal hashes match whatever else differs",
+                (object("a", blake3("h")), sha("x")),
+                (object("b", blake3("h")), sha("y")),
+                false,
+                true,
+            ),
+            (
+                "different hashes differ whatever else agrees",
+                (object("a", blake3("h")), sha("x")),
+                (object("a", blake3("i")), sha("x")),
+                true,
+                false,
+            ),
+            (
+                "SHA-256 decides when a hash is missing: equal",
+                (object("a", blake3("h")), sha("x")),
+                (object("b", None), sha("x")),
+                false,
+                true,
+            ),
+            (
+                "SHA-256 decides when a hash is missing: different",
+                (object("a", None), sha("x")),
+                (object("a", None), sha("y")),
+                true,
+                false,
+            ),
+            (
+                "hashes of different kinds leave it to SHA-256",
+                (object("a", blake3("h")), sha("x")),
+                (object("b", Some(("i", HashAlgorithm::Sha256))), sha("x")),
+                false,
+                true,
+            ),
+            (
+                "a composite SHA-256 depends on parts and never decides",
+                (
+                    object("a", None),
+                    full(ChecksumType::Composite, Some("x"), None),
+                ),
+                (
+                    object("b", None),
+                    full(ChecksumType::Composite, Some("x"), None),
+                ),
+                false,
+                false,
+            ),
+            (
+                "a multipart source and its single-request copy match by CRC64NVME",
+                (object("a-3", None), crc64(None, "c")),
+                (object("b", None), crc64(None, "c")),
+                false,
+                true,
+            ),
+            (
+                "different CRC64NVME differ whatever the ETags and times say",
+                (object("a", None), crc64(None, "c")),
+                (object("a", None), crc64(None, "d")),
+                true,
+                false,
+            ),
+            (
+                "SHA-256 decides before CRC64NVME",
+                (object("a", None), crc64(Some("x"), "c")),
+                (object("a", None), crc64(Some("y"), "c")),
+                false,
+                false,
+            ),
+            (
+                "a composite CRC64NVME never decides",
+                (
+                    object("a", None),
+                    HeadObjectOutput::builder()
+                        .checksum_type(ChecksumType::Composite)
+                        .checksum_crc64_nvme("c")
+                        .build(),
+                ),
+                (object("b", None), crc64(None, "c")),
+                false,
+                false,
+            ),
+            (
+                "equal 32-bit CRCs and SHA-1 never decide",
+                (object("a", None), crc("c")),
+                (object("b", None), crc("c")),
+                false,
+                false,
+            ),
+            (
+                "different 32-bit CRCs never decide either",
+                (object("a", None), crc("c")),
+                (object("a", None), crc("d")),
+                false,
+                true,
+            ),
+            (
+                "without hashes or SHA-256, equal ETags match",
+                (object("a", None), none.clone()),
+                (object("a", None), none.clone()),
+                false,
+                true,
+            ),
+            (
+                "without hashes or SHA-256, different ETags differ",
+                (object("a", None), none.clone()),
+                (object("b", None), sha("x")),
+                false,
+                false,
+            ),
+            (
+                "the stored-time quick check applies without hashes or SHA-256",
+                (object("a", blake3("h")), none.clone()),
+                (object("b", None), none.clone()),
+                true,
+                true,
+            ),
+        ] {
+            assert_eq!(
+                same_contents((&source.0, &source.1), (&old.0, &old.1), quick),
+                same,
+                "{case}"
+            );
+        }
+        let mut larger = object("a", blake3("h"));
+        larger.size += 1;
+        assert!(!same_contents(
+            (&larger, &none),
+            (&object("a", blake3("h")), &none),
+            true
+        ));
+        // Checksums are worth asking for only when they could decide.
+        assert!(checksums_could_decide(
+            &object("a", None),
+            &object("b", blake3("h"))
+        ));
+        assert!(!checksums_could_decide(
+            &object("a", blake3("h")),
+            &object("b", blake3("i"))
+        ));
+        assert!(!checksums_could_decide(&larger, &object("b", None)));
     }
 }

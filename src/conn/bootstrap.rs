@@ -116,7 +116,7 @@ impl RemoteSpec {
                 );
             }
             // The upload script runs the temporary helper and checks its build
-            // identity before renaming it into the cache. OS/CPU agreement alone
+            // identity before renaming it into the store. OS/CPU agreement alone
             // does not guarantee compatible dynamic libraries or CPU features.
             return self.upload_helper(bootstrap.target, &binary);
         }

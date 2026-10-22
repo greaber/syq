@@ -1,10 +1,12 @@
 //! Release/build-identified remote helper discovery and installation commands.
 //!
 //! Official clients name their exact release; development clients carry a Git
-//! identity and upload their own executable to compatible hosts. A cache hit adds no extra
-//! ssh round trip: the normal remote command computes the target name and execs
-//! the cached binary directly. On a miss, `conn` probes the target and either
-//! authorizes a release download or uploads a matching executable.
+//! identity and upload their own executable to compatible hosts. Helpers live in
+//! the server's binary store, `~/.local/lib/syq/<identity>/<target>/syq`, the
+//! layout `--use-version` uses locally. An installed helper adds no extra ssh
+//! round trip: the normal remote command computes the target name and execs it
+//! directly. When it is missing, `conn` probes the target and either authorizes
+//! a release download or uploads a matching executable.
 
 #[cfg(test)]
 use crate::process::CommandExt as _;
@@ -15,11 +17,10 @@ pub const HELPER_NOT_EXECUTABLE_EXIT: i32 = 126;
 pub const REMOTE_DOWNLOAD_FALLBACK_EXIT: i32 = 75;
 /// Direct download completed, but its digest did not match the signed manifest.
 pub const REMOTE_DOWNLOAD_INTEGRITY_EXIT: i32 = 76;
-/// The remote cache itself could not be written or finalized; upload cannot fix it.
+/// The remote store itself could not be written or finalized; upload cannot fix it.
 pub const INSTALL_FAILED_EXIT: i32 = 77;
-const DOWNLOAD_CACHE_GENERATION: &str = "release";
 
-/// Launcher failures for which installing the matching helper can repair the cache.
+/// Launcher failures for which installing the matching helper can repair the store.
 pub fn needs_install(code: Option<i32>) -> bool {
     matches!(code, Some(HELPER_MISSING_EXIT | HELPER_NOT_EXECUTABLE_EXIT))
 }
@@ -64,7 +65,7 @@ impl Target {
         })
     }
 
-    /// The cache target of a helper that reported `platform` in its
+    /// The store target of a helper that reported `platform` in its
     /// handshake (see `identity::platform`).
     pub fn key_for_platform(platform: &str) -> Option<&'static str> {
         let (os, arch) = platform.split_once('-')?;
@@ -96,10 +97,32 @@ pub fn helper_identity() -> &'static str {
     crate::identity::build()
 }
 
-/// Keep cache layout versioning separate from peer identity so cache changes
-/// do not affect wire compatibility.
-fn cache_key() -> String {
-    format!("{}-{DOWNLOAD_CACHE_GENERATION}", helper_identity())
+/// The shell expression for this build's helper directory for one target. Each
+/// release tag or development build identity has its own directory, shared
+/// with `--use-version` when a home directory is shared.
+fn helper_directory(target: &str) -> String {
+    format!(
+        "$HOME/{store}/{identity}/{target}",
+        store = crate::user_dirs::BINARY_STORE_IN_HOME,
+        identity = helper_identity(),
+    )
+}
+
+/// Shell commands that create a helper directory `$dir` in the binary store.
+/// Directories above the store follow the umask, like other programs' files
+/// there; the store's own directories are owner-only, as on the client.
+fn create_helper_directory() -> String {
+    let above = std::path::Path::new(crate::user_dirs::BINARY_STORE_IN_HOME)
+        .parent()
+        .expect("the binary store has a parent directory")
+        .display()
+        .to_string();
+    format!(
+        r#"if ! mkdir -p "$HOME/{above}" || ! (umask 077 && mkdir -p "$dir"); then
+    echo "syq: cannot create the remote helper directory" >&2
+    exit {INSTALL_FAILED_EXIT}
+fi"#
+    )
 }
 
 pub fn probe_command() -> &'static str {
@@ -118,10 +141,10 @@ printf "syq-helper-target:%s:%s\n" "$(uname -s)" "$(uname -m)"
 printf "syq-helper-tools:%s:%s:%s\n" "$downloader" "$hasher" "$decompressor"'"#
 }
 
-/// Run this release's helper from its deterministic cache path.  The target
-/// selection deliberately lives in this command so a cache hit needs no probe
-/// connection before the real server connection. Once a handshake has named
-/// the host's platform, later sessions pass `target` and skip `uname`.
+/// Run this release's helper from its deterministic store path. The target
+/// selection deliberately lives in this command so an installed helper needs
+/// no probe connection before the real server connection. Once a handshake has
+/// named the host's platform, later sessions pass `target` and skip `uname`.
 pub fn launcher(args: &[String], target: Option<&str>) -> String {
     let select = match target {
         Some(target) => format!("target={target}"),
@@ -142,10 +165,10 @@ esac"#,
     };
     let script = format!(
         r#"{select}
-program="$HOME/.cache/syq/helpers/{release}/$target/syq"
+program="{directory}/syq"
 [ -x "$program" ] || exit {HELPER_MISSING_EXIT}
 exec "$program" "$@""#,
-        release = cache_key(),
+        directory = helper_directory("$target"),
     );
     format!(
         "sh -c {} syq {}",
@@ -167,7 +190,6 @@ fn install_command() -> &'static str {
 }
 
 pub fn download_script(target: Target) -> String {
-    let release = cache_key();
     let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
     let archive_url = format!("{RELEASE_BASE_URL}/{tag}/{}.gz", target.asset);
     let manifest_url = format!("{RELEASE_BASE_URL}/{tag}/syq-release-manifest.json");
@@ -175,22 +197,19 @@ pub fn download_script(target: Target) -> String {
     let expected_identity = helper_identity();
     format!(
         r#"set -u
-dir="$HOME/.cache/syq/helpers/{release}/{target_key}"
+dir="{directory}"
 program="$dir/syq"
 tmp="$dir/.syq.$$.tmp"
 archive="$tmp.gz"
 manifest="$tmp.json"
-if ! mkdir -p "$dir"; then
-    echo "syq: cannot create the remote helper cache" >&2
-    exit {install_failed_exit}
-fi
+{create_directory}
 cleanup() {{ rm -f "$tmp" "$archive" "$manifest"; }}
 trap cleanup EXIT HUP INT TERM
 download() {{
     source=$1
     destination=$2
     if ! : > "$destination"; then
-        echo "syq: cannot write the remote helper cache" >&2
+        echo "syq: cannot write the remote helper directory" >&2
         exit {install_failed_exit}
     fi
     if command -v curl >/dev/null 2>&1; then
@@ -303,7 +322,8 @@ fi
 cleanup
 trap - EXIT HUP INT TERM
 {install_command}"#,
-        target_key = target.key,
+        directory = helper_directory(target.key),
+        create_directory = create_helper_directory(),
         archive_url = shell_words::quote(&archive_url),
         manifest_url = shell_words::quote(&manifest_url),
         expected_version = shell_words::quote(&expected_version),
@@ -318,20 +338,16 @@ trap - EXIT HUP INT TERM
 /// Install a verified release asset or the client executable over authenticated SSH.
 /// This path deliberately needs no remote downloader, hasher, or decompressor.
 pub fn upload_script(target: Target) -> String {
-    let release = cache_key();
     let expected_version = format!("syq {}", env!("CARGO_PKG_VERSION"));
     let expected_identity = helper_identity();
     format!(
         r#"set -u
 install_umask=$(umask)
-umask 077
-dir="$HOME/.cache/syq/helpers/{release}/{target_key}"
+dir="{directory}"
 program="$dir/syq"
 tmp="$dir/.syq.$$.upload"
-if ! mkdir -p "$dir"; then
-    echo "syq: cannot create the remote helper cache" >&2
-    exit {install_failed_exit}
-fi
+{create_directory}
+umask 077
 cleanup() {{ rm -f "$tmp"; }}
 trap cleanup EXIT HUP INT TERM
 if ! cat > "$tmp"; then
@@ -366,7 +382,8 @@ cleanup
 trap - EXIT HUP INT TERM
 umask "$install_umask"
 {install_command}"#,
-        target_key = target.key,
+        directory = helper_directory(target.key),
+        create_directory = create_helper_directory(),
         expected_version = shell_words::quote(&expected_version),
         expected_identity = shell_words::quote(expected_identity),
         install_failed_exit = INSTALL_FAILED_EXIT,
@@ -431,8 +448,11 @@ mod tests {
     #[test]
     fn launcher_uses_versioned_path_and_quotes_arguments() {
         let command = launcher(&["--server".into(), "argument with spaces".into()], None);
-        assert!(command.contains(&cache_key()));
-        assert!(command.contains(DOWNLOAD_CACHE_GENERATION));
+        assert!(command.contains(&format!(
+            "$HOME/.local/lib/syq/{}/$target/syq",
+            helper_identity()
+        )));
+        assert!(!command.contains(".cache"));
         assert!(command.contains("linux-x86_64"));
         assert!(command.contains("'argument with spaces'"));
         assert_eq!(command.matches("uname").count(), 1);
@@ -446,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn handshake_platforms_map_to_cache_targets() {
+    fn handshake_platforms_map_to_store_targets() {
         for (platform, key) in [
             ("linux-x86_64", "linux-x86_64"),
             ("linux-aarch64", "linux-aarch64"),
@@ -561,12 +581,12 @@ mod tests {
             error.contains("does not report a build identity on Linux riscv64"),
             "{error}"
         );
-        let cache = root
+        let directory = root
             .path()
-            .join(".cache/syq/helpers")
-            .join(cache_key())
+            .join(".local/lib/syq")
+            .join(helper_identity())
             .join("self");
-        assert_eq!(std::fs::read_dir(cache).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(directory).unwrap().count(), 0);
     }
 
     #[test]

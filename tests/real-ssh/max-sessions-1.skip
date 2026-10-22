@@ -6,6 +6,7 @@
 # listed here with a shared-session requirement or no destination interaction.
 privileged copies keep root security checks
 ephemeral connect only reuses forward SSH and leaves receiving off
+connecting again replaces a scoped receiving connection from another build
 return copies await local approval and denial leaves no destination
 approval allows the pending 128-worker copy once
 disconnected requests cannot be approved later

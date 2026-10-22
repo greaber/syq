@@ -222,6 +222,23 @@ pub(crate) fn partial_path_with_name_max(
     Ok(parent.join(OsString::from_vec(component)))
 }
 
+/// An S3 download writes its partial file beside the destination as
+/// `.syq-s3-HASH.partial`, with a 64-digit lowercase hex hash.
+pub(crate) const S3_PARTIAL_PREFIX: &str = ".syq-s3-";
+pub(crate) const S3_PARTIAL_SUFFIX: &str = ".partial";
+
+pub(crate) fn is_s3_partial_name(name: &OsStr) -> bool {
+    name.as_bytes()
+        .strip_prefix(S3_PARTIAL_PREFIX.as_bytes())
+        .and_then(|rest| rest.strip_suffix(S3_PARTIAL_SUFFIX.as_bytes()))
+        .is_some_and(|hash| {
+            hash.len() == 64
+                && hash
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+}
+
 pub(super) const RECOVERY_PREFIX: &str = ".syq-swap-";
 
 pub(crate) fn recovery_name(process: u32, counter: u64) -> String {

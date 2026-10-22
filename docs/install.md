@@ -33,15 +33,17 @@ syq --use-version 0.7.1 cp photos --into backup
 ```
 
 Syq downloads and verifies that release the first time it is needed, keeps it
-alongside other versions, and runs it with your command's arguments and
-environment. Your normal installation stays unchanged. Later calls run the
-stored release offline, like any installed program, without checking it again.
-If a stored release is damaged, delete its version directory, for example
-`~/.cache/syq/helpers/v0.7.1/` for 0.7.1 ([local state](environment.md#local-state)),
-and the next call downloads it again.
-The first download needs network access and a writable cache; an unavailable
-release or unsupported platform is an error. `latest` and version ranges are
-not accepted.
+in `~/.local/lib/syq` alongside other versions, and runs it with your command's
+arguments and environment. Your normal installation stays unchanged. Later
+calls run the stored release offline, like any installed program, without
+checking it again.
+
+Stored releases stay until you delete them. To remove a release, or replace a
+damaged one, delete its directory, for example `~/.local/lib/syq/v0.7.1/` for
+0.7.1 ([stored releases](environment.md#stored-releases-and-helpers)); the next
+call that needs it downloads it again. The first download needs network access
+and a writable home directory; an unavailable release or unsupported platform
+is an error. `latest` and version ranges are not accepted.
 
 Official and source builds support this option. The syq you invoke must
 understand `--use-version`; the selected release does not need to. That release interprets the command and controls its remote helpers
@@ -92,9 +94,12 @@ prerelease and development-build identities cannot be used in expressions.
 
 ## Automatic installation on SSH servers
 
-Syq installs its SSH helper on the server when needed. Official releases also
+Syq installs its SSH helper on the server when needed, in the server's
+`~/.local/lib/syq`, and leaves it there for later copies. Official releases also
 try to make `syq` available at `~/.local/bin/syq` for commands you run there.
-Existing commands and shell startup files are left alone.
+Existing commands and shell startup files are left alone. See
+[stored releases and helpers](environment.md#stored-releases-and-helpers) for
+removing old releases.
 
 Use `syq --self-update` on the server to update that command, or the standalone
 installer above if it is missing. See [SSH helper installation](environment.md#ssh-helper-installation)
@@ -110,6 +115,16 @@ read its results.
 
 Use `syq --self-update` for a standalone installation, or `brew upgrade syq`
 for Homebrew.
+
+A command that is already running when you update keeps running its own
+version. On macOS, if it then needs to start another syq process, such as the
+receiver of a local copy, and the update installed a different version, it
+stops with a message to rerun the command instead of starting the new version;
+reinstalling the same version does not stop it. A receiving connection started
+before the update refuses in the same way and names the command that restarts
+it, `syq persist connect SERVER`, which replaces a receiving connection from
+another version and keeps your settings. See
+[Updating connections](persistence-reference.md#updating-connections).
 
 Standalone and Homebrew installs may print an update reminder in a terminal,
 at most once a day after a successful command, naming the upgrade command for

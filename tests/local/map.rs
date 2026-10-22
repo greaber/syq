@@ -99,11 +99,11 @@ fn remote_manifest_cannot_inject_digest_protocol_framing() {
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"framing fallback");
     assert_eq!(
-        read(&cached_remote_helper(&t)),
+        read(&stored_remote_helper(&t)),
         read(Path::new(env!("CARGO_BIN_EXE_syq")))
     );
     assert_eq!(
-        read(&cached_local_helper(&t)),
+        read(&stored_local_helper(&t)),
         read(Path::new(env!("CARGO_BIN_EXE_syq")))
     );
     let stderr = String::from_utf8_lossy(&out.stderr);

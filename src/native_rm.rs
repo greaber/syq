@@ -784,8 +784,7 @@ fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
         };
         if job.partials_only
             && !identity.is_dir()
-            && (identity.kind() != Kind::File
-                || !crate::fsops::is_partial_name(OsStr::from_bytes(&component)))
+            && (identity.kind() != Kind::File || !is_cleanable_partial(&component))
         {
             continue;
         }
@@ -1061,6 +1060,13 @@ fn check_removed_directory(
 #[cfg(not(target_os = "linux"))]
 fn require_unlinked_directory(_directory: &File) -> Result<()> {
     Ok(())
+}
+
+/// Names `clean-partials` removes when they are regular files: copies'
+/// partial files and S3 downloads' partial files.
+fn is_cleanable_partial(name: &[u8]) -> bool {
+    let name = OsStr::from_bytes(name);
+    crate::fsops::is_partial_name(name) || crate::fsops::is_s3_partial_name(name)
 }
 
 fn join_label(parent: &[u8], child: &[u8]) -> PathBytes {
