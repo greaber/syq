@@ -543,6 +543,14 @@ threads and open files, filesystem or network requests, and disk space. A
 change can be faster while using several times the memory or CPU, and timing
 alone hides that.
 
+Measure peak memory exactly. `ru_maxrss` (what `wait4` and `/usr/bin/time`
+report) reads the kernel's per-CPU RSS counters without their pending deltas.
+Each CPU can hold back up to twice the CPU count in pages, so on a 96-CPU
+Linux host a reading can be about 768 KiB low for each CPU the process ran on,
+and few-run medians jump between values that far apart with no real change. Read `VmHWM` and `VmRSS` from
+`/proc/PID/status`, or `/proc/PID/smaps_rollup`, before the process exits, or
+compare enough samples to see the clusters.
+
 When new code replaces or bypasses an existing path, first list what the
 existing path does for performance and resource use: preallocation, cloning
 or in-kernel copies, read-ahead and access hints, request sizes, memory bounds
