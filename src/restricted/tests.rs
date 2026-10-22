@@ -502,6 +502,29 @@ fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
         (4, true)
     );
     delegation::ReplayStore::open(&replay).unwrap();
+
+    // Interrupted right after the record is recreated: the new generation
+    // is already the receiver's, so the old line, still in authorized_keys,
+    // admits no grant against the empty record.
+    fs::remove_dir(&replay).unwrap();
+    INTERRUPT_AFTER_RECORD.with(|interrupt| interrupt.set(true));
+    let interrupted = install_for_account(&refresh, &account, home);
+    INTERRUPT_AFTER_RECORD.with(|interrupt| interrupt.set(false));
+    assert!(interrupted.is_err());
+    assert!(replay.is_dir());
+    let config = read_receiver_config(&enrollment_state(home, id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(config.generation, 5);
+    let line = fs::read_to_string(home.join(".ssh/authorized_keys")).unwrap();
+    assert!(line.contains("--generation=4\""), "{line}");
+    let error = require_current_receiver(&config, 4, &config.release).unwrap_err();
+    assert!(error.to_string().contains("outdated receiver"), "{error}");
+    // The retry writes a line for a generation after it.
+    assert_eq!(
+        installed(install_for_account(&refresh, &account, home).unwrap()),
+        (6, true)
+    );
 }
 
 #[test]

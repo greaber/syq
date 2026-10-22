@@ -509,10 +509,6 @@ pub(super) fn install_for_account(
     // state, or a line for an older generation that refuses new copies,
     // which a retry completes.
     ensure_directory(&state, 0o700)?;
-    if !replay_usable {
-        set_aside_unusable(&state, "replay")?;
-    }
-    ensure_directory(&replay, 0o700)?;
     let results_public_key = results_key(&state)?;
     let config = ReceiverEnrollment {
         version: CONFIG_VERSION,
@@ -524,9 +520,29 @@ pub(super) fn install_for_account(
         entry_public_key: request.entry_public_key.clone(),
         signer: request.signer.clone(),
     };
+    // The new generation is durable before a record of used grants is
+    // recreated: receivers admit grants only for the current generation, so
+    // an interruption after this leaves no generation whose grants could be
+    // redeemed again against an empty record.
     atomic_write(&state, "config.json", &serde_json::to_vec(&config)?, 0o600)?;
+    if !replay_usable {
+        set_aside_unusable(&state, "replay")?;
+    }
+    ensure_directory(&replay, 0o700)?;
+    #[cfg(test)]
+    if INTERRUPT_AFTER_RECORD.with(std::cell::Cell::get) {
+        bail!("interrupted after recreating the record of used grants");
+    }
     atomic_write_locked(&directory, "authorized_keys", &updated, 0o600, false)?;
     Ok(respond(generation, results_public_key, true))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Stop an install right after it creates the record of used grants,
+    /// as an interruption would.
+    pub(super) static INTERRUPT_AFTER_RECORD: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn remote_revoke() -> Result<()> {
