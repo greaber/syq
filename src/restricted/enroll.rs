@@ -760,12 +760,34 @@ fn install_over_route(
 }
 
 /// The enrollment session's commands. The greeting reports the platform,
-/// where the account keeps syq's state, the platforms this build is stored
-/// for, and `authorized_keys`. The session then reads the request and the
-/// platform whose stored syq installs it; without one, the syq that follows.
+/// where the account keeps syq's state, the platforms the store has this
+/// build for, and `authorized_keys`. The session then reads the request and
+/// the platform whose stored syq installs it; without one, the syq that
+/// follows.
+///
+/// A stored build is offered, and started, only when it passes the binary
+/// store's rules before it runs: its directories and file belong to the
+/// account and nobody else can write them, and only the store's root may be
+/// a symbolic link. One that fails them is not offered, so this machine
+/// uploads a fresh syq, whose installer then refuses the stored build with
+/// the store's own message. The checks are POSIX `sh`, `test` and `find`.
 pub(super) fn install_remote_command(stage: &str) -> String {
     format!(
-        "set -eu; uname -s; uname -m; printf '%s\\n' \"$HOME\" \"$(id -u)\" \"${{XDG_CONFIG_HOME-}}\" \"${{XDG_RUNTIME_DIR-}}\" \"${{TMPDIR-}}\"; s=\"$HOME/{store}/\"{build}; for f in \"$s\"/*/syq; do if test -f \"$f\" && test -x \"$f\"; then t=\"${{f%/syq}}\"; printf '%s ' \"${{t##*/}}\"; fi; done; printf '\\n'; if test -f \"$HOME/.ssh/authorized_keys\"; then wc -c <\"$HOME/.ssh/authorized_keys\"; cat \"$HOME/.ssh/authorized_keys\"; else printf '0\\n'; fi; IFS= read -r request; IFS= read -r stored; if test -n \"$stored\"; then printf '%s' \"$request\" | \"$s/$stored/syq\" --restricted-install; else {stage}; printf '%s' \"$request\" | \"$p\" --restricted-install; fi",
+        r#"set -eu
+uname -s; uname -m
+printf '%s\n' "$HOME" "$(id -u)" "${{XDG_CONFIG_HOME-}}" "${{XDG_RUNTIME_DIR-}}" "${{TMPDIR-}}"
+r="$HOME/{store}"; s="$r/"{build}
+private() {{ [ -O "$1" ] || return 1; w=$(find ${{2:+"$2"}} "$1" -prune \( -perm -020 -o -perm -002 \) -print) || return 1; [ -z "$w" ]; }}
+stored() {{ [ -n "$1" ] && [ -d "$r" ] && private "$r" -H || return 1; for q in "$s" "$s/$1" "$s/$1/syq"; do [ ! -L "$q" ] && private "$q" || return 1; done; [ -f "$s/$1/syq" ] && [ -x "$s/$1/syq" ]; }}
+for f in "$s"/*/syq; do t=${{f%/syq}}; t=${{t##*/}}; if stored "$t"; then printf '%s ' "$t"; fi; done; printf '\n'
+if test -f "$HOME/.ssh/authorized_keys"; then wc -c <"$HOME/.ssh/authorized_keys"; cat "$HOME/.ssh/authorized_keys"; else printf '0\n'; fi
+IFS= read -r request; IFS= read -r target
+if [ -n "$target" ]; then
+    stored "$target" || {{ echo "syq: the stored syq for $target changed during setup; retry" >&2; exit 1; }}
+    printf '%s' "$request" | "$s/$target/syq" --restricted-install
+else
+    {stage}; printf '%s' "$request" | "$p" --restricted-install
+fi"#,
         store = crate::user_dirs::BINARY_STORE_IN_HOME,
         build = shell_words::quote(crate::identity::build()),
         stage = stage_commands(stage),

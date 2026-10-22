@@ -292,6 +292,28 @@ def refused_keys(lab):
     assert key_words(record['signer']['public_key']) == key_words(public)
     assert record.get('identity_file') is None
     print('agent-only key enrolled', flush=True)
+    untrusted_stored_build()
+
+
+def untrusted_stored_build():
+    """A stored build others could change is never started: setup refuses it."""
+    identity = run('syq', '--build-identity', stdout=subprocess.PIPE).stdout.decode().strip()
+    stored = remote_text(f'ls -d ~/.local/lib/syq/{shlex.quote(identity)}/*/syq').split()
+    assert len(stored) == 1, stored
+    stored = stored[0]
+    marker = '/tmp/syq-real-ssh-untrusted-build-started'
+    saved = '/tmp/syq-real-ssh-stored-build'
+    remote(f'rm -f {marker} && cp -p {stored} {saved} && '
+           f"printf '#!/bin/sh\\ntouch {marker}\\nexit 1\\n' > {stored} && chmod 770 {stored}")
+    try:
+        result = attempt('syq', 'receiver', 'enroll', 'destination')
+        assert result.returncode, 'enrollment used a group-writable stored build'
+        assert b'writable by group or others' in result.stderr, result.stderr.decode(errors='replace')
+        assert remote_text(f'test -e {marker} && echo started || echo absent').strip() == 'absent'
+    finally:
+        remote(f'cp -p {saved} {stored} && chmod 700 {stored} && rm -f {saved} {marker}')
+    run('syq', 'receiver', 'enroll', 'destination')
+    print('a group-writable stored build was refused without starting it', flush=True)
 
 
 def certificate_login(lab, parent):

@@ -1601,7 +1601,7 @@ fn management_stage_is_scoped_to_one_shell_session() {
 fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
     let temporary = crate::test_support::tempdir().unwrap();
     let home = temporary.path();
-    let run = |input: &[u8]| -> Vec<String> {
+    let session = |input: &[u8]| -> std::process::Output {
         let mut child = Command::new("/bin/sh")
             .arg("-c")
             .arg(install_remote_command(".syq-stage-test"))
@@ -1612,7 +1612,10 @@ fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
             .spawn_guarded()
             .unwrap();
         child.stdin.take().unwrap().write_all(input).unwrap();
-        let output = child.wait_with_output().unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let run = |input: &[u8]| -> Vec<String> {
+        let output = session(input);
         assert!(
             output.status.success(),
             "{}",
@@ -1634,9 +1637,11 @@ fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
     assert_eq!(greeting[8], "0");
     assert_eq!(greeting[9], r#"sent --restricted-install {"request":1}"#);
 
-    let build = home
-        .join(crate::user_dirs::BINARY_STORE_IN_HOME)
-        .join(crate::identity::build());
+    let store = home.join(crate::user_dirs::BINARY_STORE_IN_HOME);
+    let build = store.join(crate::identity::build());
+    let private = |path: &Path| {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    };
     crate::test_support::write_executable(
         &build.join("linux-x86_64/syq"),
         "#!/bin/sh\nprintf 'stored %s ' \"$*\"; cat\n",
@@ -1644,26 +1649,56 @@ fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
     );
     // Another build, and a file that is not executable, are not offered.
     crate::test_support::write_executable(
-        &home
-            .join(crate::user_dirs::BINARY_STORE_IN_HOME)
-            .join("v0.0.0-old/linux-aarch64/syq"),
+        &store.join("v0.0.0-old/linux-aarch64/syq"),
         "#!/bin/sh\nexit 1\n",
         0o700,
     );
     fs::create_dir_all(build.join("macos-aarch64")).unwrap();
     fs::write(build.join("macos-aarch64/syq"), "not a program").unwrap();
+    // A stored build others could change, or one reached through a link
+    // below the store's root, is neither offered nor started.
+    let started = home.join("started");
+    let marker = format!("#!/bin/sh\ntouch '{}'\n", started.display());
+    crate::test_support::write_executable(&build.join("linux-aarch64/syq"), &marker, 0o770);
+    crate::test_support::write_executable(&home.join("elsewhere/syq"), &marker, 0o700);
+    private(&home.join("elsewhere"));
+    symlink(home.join("elsewhere"), build.join("macos-x86_64")).unwrap();
+    for directory in [
+        store.clone(),
+        build.clone(),
+        build.join("linux-x86_64"),
+        build.join("linux-aarch64"),
+        build.join("macos-aarch64"),
+    ] {
+        private(&directory);
+    }
     let greeting = run(b"{\"request\":2}\nlinux-x86_64\n");
     assert_eq!(greeting[7].trim(), "linux-x86_64");
     assert_eq!(greeting[9], r#"stored --restricted-install {"request":2}"#);
-    assert!(
-        fs::read_dir(home.join(crate::user_dirs::BINARY_STORE_IN_HOME))
-            .unwrap()
-            .all(|entry| !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".syq-stage"))
-    );
+    for target in ["linux-aarch64", "macos-x86_64"] {
+        let output = session(format!("{{\"request\":3}}\n{target}\n").as_bytes());
+        assert!(!output.status.success(), "{target}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("changed during setup"),
+            "{target}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!started.exists(), "{target} was started");
+    }
+    // The store's root alone may lead elsewhere, to the account's own
+    // directory.
+    let moved = home.join("moved-store");
+    fs::rename(&store, &moved).unwrap();
+    symlink(&moved, &store).unwrap();
+    let greeting = run(b"{\"request\":4}\nlinux-x86_64\n");
+    assert_eq!(greeting[7].trim(), "linux-x86_64");
+    assert_eq!(greeting[9], r#"stored --restricted-install {"request":4}"#);
+    assert!(fs::read_dir(&moved).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".syq-stage")));
+    assert!(!started.exists());
 }
 /// Execute authorized Apply operations as a connection of `authority`'s
 /// copy executes them.
