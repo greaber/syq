@@ -108,14 +108,14 @@ fn remote_helper_integrity_mismatch_warns_and_uploads_verified_binary() {
     assert_eq!(read(&t.path("dst")), b"integrity fallback");
     assert_eq!(
         read(&t.path("remote-home/.local/bin/syq")),
-        read(&cached_remote_helper(&t))
+        read(&stored_remote_helper(&t))
     );
     assert_eq!(
-        read(&cached_remote_helper(&t)),
+        read(&stored_remote_helper(&t)),
         read(Path::new(env!("CARGO_BIN_EXE_syq")))
     );
     assert_eq!(
-        read(&cached_local_helper(&t)),
+        read(&stored_local_helper(&t)),
         read(Path::new(env!("CARGO_BIN_EXE_syq")))
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -135,7 +135,7 @@ fn remote_helper_integrity_mismatch_warns_and_uploads_verified_binary() {
     );
     assert!(!stderr.contains("checksum mismatch"), "{stderr}");
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
-    let cache_entries: Vec<_> = fs::read_dir(cached_remote_helper(&t).parent().unwrap())
+    let cache_entries: Vec<_> = fs::read_dir(stored_remote_helper(&t).parent().unwrap())
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect();
@@ -166,7 +166,7 @@ fn helper_install_and_upload_fallback_survive_broken_stderr() {
     assert_output_ok(&output);
     assert_eq!(read(&t.path("dst")), read(&t.path("src")));
     assert_eq!(
-        read(&cached_remote_helper(&t)),
+        read(&stored_remote_helper(&t)),
         read(Path::new(env!("CARGO_BIN_EXE_syq")))
     );
 }

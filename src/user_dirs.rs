@@ -1,5 +1,6 @@
 //! Per-user base directories for syq's caches, settings, and runtime files,
-//! including receiving approval settings and the install receipt.
+//! including receiving approval settings and the install receipt, and the
+//! store of versioned executables.
 //!
 //! An XDG base directory variable is used only when it holds an absolute
 //! path. The XDG Base Directory specification treats a relative value as
@@ -26,6 +27,18 @@ pub(crate) fn config_dir() -> Option<PathBuf> {
 /// default in the home directory; callers choose their own fallback.
 pub(crate) fn runtime_dir() -> Option<PathBuf> {
     base_dir("XDG_RUNTIME_DIR", None)
+}
+
+/// Where the store of versioned executables lives in a home directory, on
+/// this machine and on SSH servers alike.
+pub(crate) const BINARY_STORE_IN_HOME: &str = ".local/lib/syq";
+
+/// The store of versioned executables: `.local/lib/syq` in the home directory
+/// when that exists. No XDG variable moves it. The specification defines no
+/// directory for executables, and SSH servers find the store from `HOME`
+/// alone, so one path serves every syq that shares a home directory.
+pub(crate) fn binary_store() -> Option<PathBuf> {
+    resolve(None, std::env::var_os("HOME"), Some(BINARY_STORE_IN_HOME))
 }
 
 fn base_dir(variable: &str, in_home: Option<&str>) -> Option<PathBuf> {

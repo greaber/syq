@@ -500,7 +500,11 @@ fn remote_syq_command(t: &Tmp, rsh: &Path, args: &[&str]) -> Command {
     .env("XDG_CONFIG_HOME", t.path("config"))
     .env("XDG_CACHE_HOME", t.path("cache"));
     if let Ok(key) = fs::read_to_string(t.path("release-public-key")) {
-        cmd.env("SYQ_TEST_RELEASE_PUBLIC_KEY", key.trim())
+        // Release helpers downloaded here are kept in the home directory's
+        // binary store, so give them a home of their own.
+        fs::create_dir_all(t.path("home")).unwrap();
+        cmd.env("HOME", t.path("home"))
+            .env("SYQ_TEST_RELEASE_PUBLIC_KEY", key.trim())
             .env("SYQ_TEST_RELEASE_BUILD", "1")
             .env(
                 "SYQ_TEST_RELEASE_DOWNLOADS",
@@ -568,18 +572,21 @@ fn helper_target() -> &'static str {
     }
 }
 
-fn cached_remote_helper(t: &Tmp) -> PathBuf {
+/// This build's helper in the fake server's binary store.
+fn stored_remote_helper(t: &Tmp) -> PathBuf {
     let identity = binary_identity("--build-identity");
     let target = helper_target();
     t.path(&format!(
-        "remote-home/.cache/syq/helpers/{identity}-release/{target}/syq"
+        "remote-home/.local/lib/syq/{identity}/{target}/syq"
     ))
 }
 
-fn cached_local_helper(t: &Tmp) -> PathBuf {
+/// The release helper the client downloaded for uploading, in its own home's
+/// binary store.
+fn stored_local_helper(t: &Tmp) -> PathBuf {
     let target = helper_target();
     t.path(&format!(
-        "cache/syq/helpers/v{}/{target}/syq",
+        "home/.local/lib/syq/v{}/{target}/syq",
         env!("CARGO_PKG_VERSION")
     ))
 }

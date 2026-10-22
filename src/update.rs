@@ -326,40 +326,40 @@ fn helper_from_release(target: Target, release: &VerifiedRelease) -> Result<Trus
 
 /// Return a verified, uncompressed helper. The archive and binary hashes both
 /// come from the signed manifest, so this is safe for a different target from
-/// the client and never uploads the running executable. The local cache only
-/// saves later downloads: when it cannot be read or written, the helper is
-/// downloaded and verified in memory instead.
+/// the client and never uploads the running executable. Keeping the download
+/// in the binary store only saves later downloads: when the store cannot be
+/// read or written, the helper is downloaded and verified in memory instead.
 pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<Vec<u8>> {
-    let cache_path = helper_cache_path(helper).ok();
-    if let Some(binary) = cache_path
+    let store = binary_store().ok();
+    let path = store
         .as_deref()
-        .and_then(|path| cached_helper(path, helper))
-    {
+        .map(|store| stored_helper_path(store, helper));
+    if let Some(binary) = path.as_deref().and_then(|path| stored_helper(path, helper)) {
         return Ok(binary);
     }
     let binary = download_helper(helper, REMOTE_HELPER)?;
-    if let Some(path) = &cache_path {
-        if let Err(error) = store_helper(path, &binary, REMOTE_HELPER) {
+    if let (Some(store), Some(path)) = (&store, &path) {
+        if let Err(error) = store_helper(store, path, &binary, REMOTE_HELPER) {
             crate::output::diagnostic!(
-                "syq: warning: cannot cache the downloaded remote helper ({error:#}); continuing without caching it"
+                "syq: warning: cannot store the downloaded remote helper ({error:#}); continuing without storing it"
             );
         }
     }
     Ok(binary)
 }
 
-/// A cached helper to upload, read once within its signed size and verified in
+/// A stored helper to upload, read once within its signed size and verified in
 /// memory, so the bytes sent are the bytes checked. One that fails the check
 /// is discarded so it is downloaded again.
-fn cached_helper(path: &Path, helper: &TrustedCurrentHelper) -> Option<Vec<u8>> {
+fn stored_helper(path: &Path, helper: &TrustedCurrentHelper) -> Option<Vec<u8>> {
     if !path.is_file() {
         return None;
     }
-    match read_verified(path, &helper.binary, "cached remote helper") {
+    match read_verified(path, &helper.binary, "stored remote helper") {
         Ok(binary) => Some(binary),
         Err(error) => {
             crate::output::diagnostic!(
-                "syq: warning: cached remote helper failed integrity verification ({error}); discarding it"
+                "syq: warning: stored remote helper failed integrity verification ({error}); discarding it"
             );
             let _ = fs::remove_file(path);
             None
@@ -381,57 +381,138 @@ fn read_verified(path: &Path, expected: &ReleaseFile, description: &str) -> Resu
 
 /// The stored release for `--use-version` when it cannot be started directly.
 /// An existing executable is hashed against the signed manifest, since it may
-/// have been stored without a manifest or by someone else; one that is missing
-/// or does not match is downloaded, verified, and stored.
-fn stored_release_path(helper: &TrustedCurrentHelper) -> Result<PathBuf> {
-    let cache_path = helper_cache_path(helper)?;
-    if cache_path.is_file() {
-        match verify_file_as(&cache_path, &helper.binary, "cached syq release") {
-            Ok(()) => return Ok(cache_path),
+/// have been stored without a manifest, for example as a remote helper, or by
+/// someone else; one that is missing or does not match is downloaded,
+/// verified, and stored.
+fn stored_release_path(store: &Path, helper: &TrustedCurrentHelper) -> Result<PathBuf> {
+    let path = stored_helper_path(store, helper);
+    if path.is_file() {
+        match verify_file_as(&path, &helper.binary, "stored syq release") {
+            Ok(()) => return Ok(path),
             Err(error) => {
                 crate::output::diagnostic!(
-                    "syq: warning: cached syq release failed integrity verification ({error}); discarding it"
+                    "syq: warning: stored syq release failed integrity verification ({error}); discarding it"
                 );
-                let _ = fs::remove_file(&cache_path);
+                let _ = fs::remove_file(&path);
             }
         }
     }
     let binary = download_helper(helper, SYQ_RELEASE)?;
-    store_helper(&cache_path, &binary, SYQ_RELEASE)?;
-    Ok(cache_path)
+    store_helper(store, &path, &binary, SYQ_RELEASE)?;
+    Ok(path)
 }
 
-/// Whether a stored release can be started without verifying it again: its
-/// files, and every directory from the cache root down to theirs, are real
-/// files and directories rather than symbolic links, owned by this user, and
-/// not writable by group or others. Otherwise someone else may have put them
-/// there, for example under a shared `XDG_CACHE_HOME`.
-fn privately_stored(root: &Path, directory: &Path, files: &[&Path]) -> bool {
+/// Whether the store holds all of a release's files.
+#[derive(Debug, PartialEq, Eq)]
+enum StoredRelease {
+    Complete,
+    Incomplete,
+}
+
+/// Check a release's directories, from the store root down, and its files.
+/// Each one that exists must be a real directory or file, not a symbolic link,
+/// owned by this user, that group and others cannot write; syq creates them
+/// that way. The store root alone may be a symbolic link, for example to a
+/// larger disk, and then the directory it leads to gets the same check.
+/// Anything else is refused rather than verified and run, because whoever
+/// could change it could also change it again between a check and the `exec`.
+///
+/// The directories above the store are trusted: anyone who can write them can
+/// replace the store, just as anyone who can write `~/.local/bin` can replace
+/// syq, so they should be writable only by the user.
+fn stored_release(store: &Path, directory: &Path) -> Result<StoredRelease> {
     use std::os::unix::fs::MetadataExt;
-    let Ok(below) = directory.strip_prefix(root) else {
-        return false;
+    let below = directory
+        .strip_prefix(store)
+        .context("a release directory is outside the binary store")?;
+    let user = crate::rooted::own_uid();
+    // Whether `path` exists, after refusing it if it is not private.
+    let check = |path: &Path, is_directory: bool| -> Result<bool> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+        };
+        let kind = if is_directory { "directory" } else { "file" };
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "{} is a symbolic link, but only the store root {} may be one; replace it with a {kind}, or remove it and syq will install the release again",
+                path.display(),
+                store.display()
+            );
+        }
+        if metadata.uid() != user {
+            // Deleting it would only let this account recreate it and lock
+            // its owner out, as root running with another user's HOME would.
+            let owner = crate::completion_details::account_name(metadata.uid(), false);
+            bail!(
+                "{} belongs to {owner}; run syq as {owner}, or with HOME set to your own home directory",
+                path.display()
+            );
+        }
+        let problem = if is_directory && !metadata.is_dir() {
+            "is not a directory"
+        } else if !is_directory && !metadata.is_file() {
+            "is not a regular file"
+        } else if metadata.mode() & 0o022 != 0 {
+            "is writable by group or others"
+        } else {
+            return Ok(true);
+        };
+        bail!(
+            "{} must be a {kind} that you own and nobody else can write, but it {problem}; fix its permissions, or delete it and syq will install the release again",
+            path.display(),
+        )
     };
-    let user = unsafe { libc::geteuid() };
-    let private = |path: &Path, is_directory: bool| {
-        fs::symlink_metadata(path).is_ok_and(|metadata| {
-            let kind = if is_directory {
-                metadata.is_dir()
-            } else {
-                metadata.is_file()
+    let mut path = match fs::symlink_metadata(store) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let target = match fs::canonicalize(store) {
+                Ok(target) => target,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
+                    "{} is a symbolic link to a missing directory; create that directory, or remove the link and syq will install the release again",
+                    store.display()
+                ),
+                Err(error) => {
+                    return Err(error).with_context(|| format!("resolve {}", store.display()))
+                }
             };
-            kind && metadata.uid() == user && metadata.mode() & 0o022 == 0
-        })
+            // The link, not HOME, chose this directory.
+            let owner = fs::metadata(&target)
+                .with_context(|| format!("inspect {}", target.display()))?
+                .uid();
+            if owner != user {
+                let owner = crate::completion_details::account_name(owner, false);
+                bail!(
+                    "{} links to {}, which belongs to {owner}; link it to a directory you own, or remove the link and syq will install the release again",
+                    store.display(),
+                    target.display()
+                );
+            }
+            target
+        }
+        _ => store.to_path_buf(),
     };
-    let mut path = root.to_path_buf();
-    private(&path, true)
-        && below.components().all(|component| {
-            path.push(component);
-            private(&path, true)
-        })
-        && files.iter().all(|file| private(file, false))
+    if !check(&path, true)? {
+        return Ok(StoredRelease::Incomplete);
+    }
+    for component in below.components() {
+        path.push(component);
+        if !check(&path, true)? {
+            return Ok(StoredRelease::Incomplete);
+        }
+    }
+    let mut complete = true;
+    for name in [MANIFEST_NAME, STORED_EXECUTABLE] {
+        complete &= check(&path.join(name), false)?;
+    }
+    Ok(if complete {
+        StoredRelease::Complete
+    } else {
+        StoredRelease::Incomplete
+    })
 }
 
-// What a cached executable is for, as named in messages about it.
+// What a stored executable is for, as named in messages about it.
 const REMOTE_HELPER: &str = "remote helper";
 const SYQ_RELEASE: &str = "syq release";
 
@@ -461,12 +542,12 @@ fn download_helper(helper: &TrustedCurrentHelper, what: &str) -> Result<Vec<u8>>
 
 /// Store an executable. This checks nothing itself: callers pass only bytes
 /// that `download_helper` verified. It is written to a temporary file, synced,
-/// and renamed into place, so the cache never holds a partly written executable.
-fn store_helper(cache_path: &Path, binary: &[u8], what: &str) -> Result<()> {
-    let parent = cache_path
+/// and renamed into place, so the store never holds a partly written executable.
+fn store_helper(store: &Path, path: &Path, binary: &[u8], what: &str) -> Result<()> {
+    let parent = path
         .parent()
-        .ok_or_else(|| anyhow!("the {what} cache path has no parent directory"))?;
-    create_private_dir(parent)?;
+        .ok_or_else(|| anyhow!("the {what} path has no parent directory"))?;
+    create_store_directory(store, parent)?;
     let temporary = TempFile::new(parent, ".bin")?;
     let mut output = temporary.writer()?;
     output
@@ -477,39 +558,95 @@ fn store_helper(cache_path: &Path, binary: &[u8], what: &str) -> Result<()> {
         .with_context(|| format!("sync the {what}"))?;
     drop(output);
     let temporary = temporary.seal_executable()?;
-    fs::rename(temporary.path(), cache_path)
-        .with_context(|| format!("cache verified {what} at {}", cache_path.display()))?;
+    fs::rename(temporary.path(), path)
+        .with_context(|| format!("store verified {what} at {}", path.display()))?;
     sync_parent(parent)
+}
+
+/// Create a directory in the binary store. Directories above the store follow
+/// the umask, like other programs' files there. The store's own directories
+/// are owner-only, so a release stored in them passes the `privately_stored`
+/// check even under a group-writable umask.
+fn create_store_directory(store: &Path, directory: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    require_own_home(store)?;
+    if let Some(above) = store.parent() {
+        fs::create_dir_all(above).with_context(|| format!("create {}", above.display()))?;
+    }
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)
+        .with_context(|| format!("create {}", directory.display()))
+}
+
+/// Refuse to put anything in the store under a home directory that belongs to
+/// another user, as when root runs syq with that user's `HOME`. The store
+/// would belong to the wrong user, and its owner would be locked out of it.
+/// Where the filesystem fixes owners when it is mounted, the owner it shows
+/// means nothing, so there is nothing to refuse.
+fn require_own_home(store: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let depth = Path::new(crate::user_dirs::BINARY_STORE_IN_HOME)
+        .components()
+        .count();
+    let Some(home) = store.ancestors().nth(depth) else {
+        return Ok(());
+    };
+    let owner = fs::metadata(home)
+        .with_context(|| format!("inspect {}", home.display()))?
+        .uid();
+    if owner != crate::rooted::own_uid() && !crate::fsops::fixed_owners_and_modes(home) {
+        let owner = crate::completion_details::account_name(owner, false);
+        bail!(
+            "HOME ({}) belongs to {owner}; run syq as {owner}, or set HOME to your own home directory",
+            home.display()
+        );
+    }
+    Ok(())
 }
 
 /// An explicit version selection stores the release beside its signed
 /// manifest. A download is checked against the manifest's signature, sizes, and
 /// hashes, and the release must report the expected version and build identity,
-/// before the manifest is stored. Finding both files in a private cache
-/// therefore means the release passed those checks, so later runs start it
-/// directly without reading either file or checking online for freshness:
-/// release tags are immutable, and selecting a release deliberately permits
-/// running an older version. Anything else gets the full checks again. This
-/// does not replace the normal installation.
+/// before the manifest is stored. Finding both files in a private store
+/// (`stored_release`) therefore means the release passed those checks, so later
+/// runs start it directly without reading either file or checking online for
+/// freshness: release tags are immutable, and selecting a release deliberately
+/// permits running an older version. A release with a missing file is
+/// completed with the full checks; one that is not private is refused; and one
+/// on a filesystem that cannot show who may change it (FAT, exFAT, NTFS, SMB)
+/// is verified in full on every run. This does not replace the normal
+/// installation.
 pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
     let target = Target::local().context("official releases do not support this platform")?;
     let tag = format!("v{version}");
-    let root = release_cache_root()?;
-    let directory = release_directory(&root, &tag, target);
+    let store = binary_store()?;
+    let directory = release_directory(&store, &tag, target);
     let manifest_path = directory.join(MANIFEST_NAME);
-    let executable = directory.join(CACHED_EXECUTABLE);
-    if privately_stored(&root, &directory, &[&manifest_path, &executable]) {
-        return Ok(executable);
+    let executable = directory.join(STORED_EXECUTABLE);
+    // Where owners and modes are fixed when the filesystem is mounted, they
+    // cannot show that only this user can change the release, so it is
+    // verified in full on every run instead, as before stored releases were
+    // started directly.
+    if !crate::fsops::fixed_owners_and_modes(&store) {
+        match stored_release(&store, &directory)
+            .with_context(|| format!("cannot start syq {version} from the binary store"))?
+        {
+            StoredRelease::Complete => return Ok(executable),
+            // Refuse before downloading anything that could not be stored.
+            StoredRelease::Incomplete => require_own_home(&store)?,
+        }
     }
     // Only explicit selection opts every build into the official trust anchor.
     let key = embedded_public_key()
         .unwrap_or_else(|_| Cow::Borrowed(include_str!("release-public-key.txt").trim()));
-    let cached = match fs::read(&manifest_path) {
+    let stored = match fs::read(&manifest_path) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error).context("read cached release manifest"),
+        Err(error) => return Err(error).context("read stored release manifest"),
     };
-    let bytes = match &cached {
+    let bytes = match &stored {
         Some(bytes) => bytes.clone(),
         None => fetch_bytes(
             &format!("{}/{tag}/{MANIFEST_NAME}", release_downloads()),
@@ -528,8 +665,8 @@ pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
         version: found,
     };
     let helper = helper_from_release(target, &release)?;
-    let executable = stored_release_path(&helper)?;
-    if cached.is_none() {
+    let executable = stored_release_path(&store, &helper)?;
+    if stored.is_none() {
         verify_executable(&executable, &release)?;
         let temporary = TempFile::new(&directory, ".json")?;
         let mut file = temporary.writer()?;
@@ -1145,25 +1282,27 @@ fn config_dir() -> Result<PathBuf> {
     Ok(base.join("syq"))
 }
 
-/// The executable's name in its release cache directory.
-const CACHED_EXECUTABLE: &str = "syq";
+/// The executable's name in its release directory.
+const STORED_EXECUTABLE: &str = "syq";
 
-fn helper_cache_path(helper: &TrustedCurrentHelper) -> Result<PathBuf> {
-    Ok(release_cache_directory(&helper.tag, helper.target)?.join(CACHED_EXECUTABLE))
+/// The store of versioned executables, `~/.local/lib/syq`. It holds releases
+/// selected with `--use-version` and helpers downloaded for SSH servers, in
+/// the same layout that servers use for their own helpers. Unlike a cache,
+/// nothing in it is removed automatically.
+fn binary_store() -> Result<PathBuf> {
+    crate::user_dirs::binary_store()
+        .ok_or_else(|| anyhow!("cannot locate the syq binary store: no home directory"))
 }
 
-fn release_cache_directory(tag: &str, target: Target) -> Result<PathBuf> {
-    Ok(release_directory(&release_cache_root()?, tag, target))
+/// One directory per release tag, and below it one per target, so a home
+/// directory shared by machines of different platforms keeps each one's
+/// executable apart.
+fn release_directory(store: &Path, tag: &str, target: Target) -> PathBuf {
+    store.join(tag).join(target.key)
 }
 
-fn release_cache_root() -> Result<PathBuf> {
-    crate::user_dirs::cache_dir().ok_or_else(|| {
-        anyhow!("cannot locate the release cache: no home directory or absolute XDG_CACHE_HOME")
-    })
-}
-
-fn release_directory(root: &Path, tag: &str, target: Target) -> PathBuf {
-    root.join("syq/helpers").join(tag).join(target.key)
+fn stored_helper_path(store: &Path, helper: &TrustedCurrentHelper) -> PathBuf {
+    release_directory(store, &helper.tag, helper.target).join(STORED_EXECUTABLE)
 }
 
 fn canonical_current_exe() -> Result<PathBuf> {
@@ -1497,7 +1636,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_upload_helper_keeps_a_match_and_discards_a_mismatch() {
+    fn stored_upload_helper_keeps_a_match_and_discards_a_mismatch() {
         let dir = crate::test_support::tempdir().unwrap();
         let path = dir.path().join("syq");
         let contents = b"cached helper";
@@ -1514,13 +1653,13 @@ mod tests {
             },
             archive: manifest().artifacts["linux-x86_64"].archive.clone(),
         };
-        assert_eq!(cached_helper(&path, &helper), None);
+        assert_eq!(stored_helper(&path, &helper), None);
         fs::write(&path, contents).unwrap();
-        assert_eq!(cached_helper(&path, &helper).unwrap(), contents);
+        assert_eq!(stored_helper(&path, &helper).unwrap(), contents);
         assert_eq!(fs::read(&path).unwrap(), contents);
         for corrupt in [&b"cached helpe!"[..], b"cached helper!"] {
             fs::write(&path, corrupt).unwrap();
-            assert_eq!(cached_helper(&path, &helper), None);
+            assert_eq!(stored_helper(&path, &helper), None);
             assert!(!path.exists());
         }
     }

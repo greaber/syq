@@ -32,7 +32,7 @@ helpers, or other programs; the rest of the environment is passed through.
 | `SYQ_TUNING_HISTORY_SIZE` | History retention target, default `10M` |
 | `SYQ_DEBUG` | Add internal diagnostics to stderr |
 | `SYQ_S3_DIAGNOSTICS=1` | Add S3 request diagnostics to stderr |
-| `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR` | Relocate cache, preference, and runtime files. Syq ignores a relative value, as the XDG specification requires. |
+| `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR` | Relocate cache, preference, and runtime files. Syq ignores a relative value, as the XDG specification requires. They do not move [stored releases](#stored-releases-and-helpers). |
 
 Diagnostic formats can change between versions. For scripts, use
 [automation results](automation.md). Usual system variables such as `HOME`,
@@ -47,10 +47,10 @@ Default locations include:
 | `~/.cache/syq/tuning.json` | Learned connection counts in the legacy format |
 | `~/.cache/syq/tuning.history-v1.sqlite` | Local tuning timelines and filesystem startup hints |
 | `~/.cache/syq/completion-endpoints.json` | Hosts offered by completion |
-| `~/.cache/syq/helpers/` | Downloaded SSH helpers and releases selected with `--use-version` |
 | `~/.config/syq/persistence.json` | Whether persistence is enabled |
 | `~/.config/syq/receive.json` | Receiving profiles |
 | `~/.config/syq/install.json`, `last-update-check` | Install receipt and update-check timing |
+| `~/.local/lib/syq/` | [Stored releases and helpers](#stored-releases-and-helpers) |
 | `$XDG_RUNTIME_DIR/syq-persist-UID/` | Persistent connection sockets |
 | `~/.syq-destinations-v3/` | Registered receiving names on a server |
 | `~/.local/share/syq/restricted/` | Receiver enrollment state |
@@ -65,16 +65,62 @@ persistence. See [Enrollment](remote-reference.md#enrollment)
 for receiver state and [Names and profiles](persistence-reference.md#names-and-profiles)
 for backing up or replacing a receiving identity.
 
+## Stored releases and helpers
+
+Syq keeps the executables of exact releases in `~/.local/lib/syq`, with one
+directory per release and one below it per platform:
+
+```text
+~/.local/lib/syq/v0.7.1/linux-x86_64/syq
+```
+
+That covers releases you select with
+[`--use-version`](install.md#choose-a-version-for-a-script), helpers syq
+downloads to upload to an SSH server, and, on the server, the helper syq
+installs there. A home directory shared by several machines keeps a separate
+executable for each platform. A development build uses its build identity in
+place of the release. The store is always in your home directory; XDG
+variables do not move it.
+
+Syq does not remove old releases from the store. To remove one you no longer
+use, delete its directory, for example `~/.local/lib/syq/v0.7.1`; syq
+downloads or installs it again if it is needed later.
+
+Syq starts a stored release only when you own its directories and files in the
+store and nobody else can write them, as syq creates them. `~/.local/lib/syq`
+itself may be a symbolic link, for example to a larger disk; the directory it
+leads to must meet the same rule. Otherwise syq stops and names the problem:
+fix the permissions, or delete what it names and syq installs the release
+again.
+
+If the store, or the home directory it would be created in, belongs to another
+user, syq refuses to use or create it: run syq as that user, or with `HOME` set
+to your own home directory. This happens when you run syq as root with another
+user's `HOME`, for example in a CI container that runs as root with another
+user's home directory mounted.
+
+On filesystems that show the same owner and mode for every file, such as FAT,
+exFAT, NTFS, SMB shares and WSL's `/mnt/c`, owners and modes cannot show who
+may change a release. There syq checks a stored release against its signed
+manifest on every run instead, which takes longer, and does not refuse a home
+directory because of the owner it shows.
+
+The store trusts the directories above it; see
+[Downloaded executables](security.md#downloaded-executables).
+
+Earlier releases kept their helpers in `~/.cache/syq/helpers`. Syq no longer
+reads that directory, and you can delete it on each machine. Those releases
+still use it themselves, including when you select one with `--use-version`.
+
 ## SSH helper installation
 
-SSH helpers are installed under `~/.cache/syq/helpers/` on the server too.
-If that directory cannot be created, select an installed helper with
-`--syq-path`, or use `--no-bootstrap` when a matching syq is on the server's
-`PATH`.
+SSH helpers are installed under `~/.local/lib/syq/` on the server too. If that
+directory cannot be created, select an installed helper with `--syq-path`, or
+use `--no-bootstrap` when a matching syq is on the server's `PATH`.
 
 When an official release installs a helper, it also tries to install the command
 at `~/.local/bin/syq`. Completion and background connections can trigger this
-step. Failure to install the command does not stop the copy. Reusing a cached
-helper does not repeat the command installation; use the standalone installer
-if the command is missing. Development builds and connections using
+step. Failure to install the command does not stop the copy. Reusing an
+installed helper does not repeat the command installation; use the standalone
+installer if the command is missing. Development builds and connections using
 `--syq-path` or `--no-bootstrap` do not install the command.

@@ -99,7 +99,7 @@ pub(crate) fn describe(directory: &Path, entries: &[CompletionEntry]) -> Vec<Str
         .collect()
 }
 
-fn account_name(id: u32, group: bool) -> String {
+pub(crate) fn account_name(id: u32, group: bool) -> String {
     // Reentrant NSS calls: completion can run alongside connection cleanup.
     // Bound scratch storage and use the numeric ID if lookup fails.
     let mut size = 1024;

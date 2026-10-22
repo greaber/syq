@@ -11,7 +11,7 @@ pub const fn build() -> &'static str {
 
 /// The platform this executable was built for, reported by remote helpers in
 /// the wire handshake. This avoids a separate `uname` ssh round trip on a
-/// managed-helper cache hit.
+/// managed helper that is already installed.
 pub fn platform() -> String {
     #[cfg(debug_assertions)]
     if let Some(platform) = std::env::var_os("SYQ_TEST_PLATFORM") {

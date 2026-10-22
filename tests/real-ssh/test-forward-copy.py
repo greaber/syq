@@ -205,7 +205,7 @@ for auth in [(), ("--auth-from", "auto")]:
     remote("test ! -e " + path + "/subdir/chunks.bin")
 
 print("case: a missing helper is installed once after its launcher reports the cache miss", flush=True)
-helpers = remote('find "$HOME/.cache/syq/helpers" -type f -name syq').splitlines()
+helpers = remote('find "$HOME/.local/lib/syq" -type f -name syq').splitlines()
 assert len(helpers) == 1, helpers
 helper = shlex.quote(helpers[0])
 remote("rm " + helper)

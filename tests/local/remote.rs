@@ -430,7 +430,7 @@ exit 22
         );
     }
     assert_eq!(
-        fs::metadata(cached_remote_helper(&t)).unwrap().mode() & 0o777,
+        fs::metadata(stored_remote_helper(&t)).unwrap().mode() & 0o777,
         0o700
     );
 
@@ -537,7 +537,7 @@ exit 23
         "{stderr}"
     );
     assert_eq!(read(&t.path("curl.log")), b"fetch\n");
-    assert!(!cached_local_helper(&t).exists());
+    assert!(!stored_local_helper(&t).exists());
 }
 
 #[test]
@@ -1960,7 +1960,7 @@ fn rsync_rejects_remote_to_remote() {
 fn native_direct_remote_to_remote_forwards_copy_policies() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    let helper = cached_remote_helper(&t);
+    let helper = stored_remote_helper(&t);
     fs::create_dir_all(helper.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), &helper).unwrap();
 
@@ -2037,7 +2037,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
 
 /// Make the fake remote launcher find this exact build as its helper.
 fn pin_remote_helper(t: &Tmp) {
-    let helper = cached_remote_helper(t);
+    let helper = stored_remote_helper(t);
     fs::create_dir_all(helper.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), &helper).unwrap();
 }
@@ -2610,7 +2610,7 @@ fn native_direct_remote_forwards_overwrite_policies() {
     ] {
         let t = Tmp::new();
         let rsh = fake_rsh(&t);
-        let helper = cached_remote_helper(&t);
+        let helper = stored_remote_helper(&t);
         fs::create_dir_all(helper.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), &helper).unwrap();
         write(&t.path("src/file"), b"source");
@@ -2808,7 +2808,7 @@ fn native_direct_missing_destination_skips_descendant_lookups() {
     ] {
         let t = Tmp::new();
         let rsh = fake_rsh(&t);
-        let helper = cached_remote_helper(&t);
+        let helper = stored_remote_helper(&t);
         fs::create_dir_all(helper.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), &helper).unwrap();
         write(&t.path("src/nested/file"), b"payload");
