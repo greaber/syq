@@ -118,8 +118,9 @@ when no syq line in `authorized_keys` names it.
 
 If the server loses an enrollment's state, its receiver refuses every copy.
 `syq receiver enroll` then sets up a new enrollment in its place and removes
-the old line. If only the record of authorizations already used is lost,
-`syq receiver enroll` recreates it and rewrites syq's line, and
+the old line. If only the record of authorizations already used is lost, or
+unusable, for example with another owner or mode after a restore from a
+backup, `syq receiver enroll` recreates it and rewrites syq's line, and
 authorizations signed before then are refused.
 
 ### Enrollments from older versions
