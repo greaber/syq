@@ -97,6 +97,11 @@ impl TrustedCurrentHelper {
     pub fn archive_sha256(&self) -> &str {
         &self.archive.sha256
     }
+
+    /// The SHA-256 of the helper itself, as the signed manifest states it.
+    pub fn binary_sha256(&self) -> &str {
+        &self.binary.sha256
+    }
 }
 
 #[derive(Clone, Copy)]

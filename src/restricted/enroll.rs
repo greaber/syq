@@ -273,24 +273,57 @@ fn stage_name(id: EnrollmentId) -> Result<String> {
 }
 
 pub(super) fn management_executable(target: crate::remote_helper::Target) -> Result<Vec<u8>> {
-    // A source build opting into release helpers must use the verified upstream
-    // helper even on its own platform. Official releases keep their offline path.
-    if (crate::identity::uses_release_helpers() && !crate::identity::is_release_build())
-        || !target.can_upload_self()
-    {
-        if crate::identity::uses_release_helpers() {
-            let helper = crate::update::trusted_current_helper(target)?;
-            return crate::update::verified_current_helper(&helper);
+    ManagementBuild::select(target)?.bytes()
+}
+
+/// The syq this machine installs on a server of a given platform: this
+/// executable, or the official release's helper.
+pub(super) enum ManagementBuild {
+    Local(Vec<u8>),
+    Release(Box<crate::update::TrustedCurrentHelper>),
+}
+
+impl ManagementBuild {
+    pub(super) fn select(target: crate::remote_helper::Target) -> Result<Self> {
+        // A source build opting into release helpers must use the verified
+        // upstream helper even on its own platform. Official releases keep
+        // their offline path.
+        if (crate::identity::uses_release_helpers() && !crate::identity::is_release_build())
+            || !target.can_upload_self()
+        {
+            if crate::identity::uses_release_helpers() {
+                return Ok(Self::Release(Box::new(
+                    crate::update::trusted_current_helper(target)?,
+                )));
+            }
+            bail!("cannot install a source-built restricted receiver for {} from {}; use an official release or enroll from a compatible host", target.key, crate::identity::platform());
         }
-        bail!("cannot install a source-built restricted receiver for {} from {}; use an official release or enroll from a compatible host", target.key, crate::identity::platform());
+        // Same-platform enrollment and revocation retain their existing
+        // offline upload path, including official releases.
+        #[cfg(target_os = "linux")]
+        let executable = PathBuf::from("/proc/self/exe");
+        #[cfg(not(target_os = "linux"))]
+        let executable = std::env::current_exe().context("resolve local syq executable")?;
+        Ok(Self::Local(read_local_management_executable(&executable)?))
     }
-    // Same-platform enrollment and revocation retain their existing offline
-    // upload path, including official releases.
-    #[cfg(target_os = "linux")]
-    let executable = PathBuf::from("/proc/self/exe");
-    #[cfg(not(target_os = "linux"))]
-    let executable = std::env::current_exe().context("resolve local syq executable")?;
-    read_local_management_executable(&executable)
+
+    /// Its SHA-256: of this executable's bytes, or as the release's signed
+    /// manifest states it, without downloading the helper.
+    pub(super) fn sha256(&self) -> String {
+        match self {
+            Self::Local(bytes) => sha256_hex(bytes),
+            Self::Release(helper) => helper.binary_sha256().to_owned(),
+        }
+    }
+
+    /// Its bytes: a release helper is downloaded and verified, or taken
+    /// from this machine's store, only now.
+    pub(super) fn bytes(self) -> Result<Vec<u8>> {
+        match self {
+            Self::Local(bytes) => Ok(bytes),
+            Self::Release(helper) => crate::update::verified_current_helper(&helper),
+        }
+    }
 }
 
 pub(super) fn read_local_management_executable(path: &Path) -> Result<Vec<u8>> {
@@ -649,15 +682,14 @@ fn install_over_route(
         )?;
         let platform = crate::remote_helper::Target::for_bootstrap(&os, &arch)
             .context("unsupported receiver platform")?;
-        // A stored build that is exactly the one this machine would upload
-        // installs itself: nothing is uploaded.
-        let executable = management_executable(platform)?;
-        let digest = sha256_hex(&executable);
-        let executable = if matching_stored_build(&stored, platform.key, &digest) {
-            None
-        } else {
-            Some(executable)
-        };
+        // A stored build for this platform is offered to the session with
+        // the SHA-256 of the build this machine would install: the session
+        // starts the stored one only when it is exactly that build.
+        let build = ManagementBuild::select(platform)?;
+        let offer = stored
+            .split_whitespace()
+            .any(|key| key == platform.key)
+            .then(|| (platform.key, build.sha256()));
         let entry_key = match &plan.entry_key {
             Some(key) => key.clone(),
             None => {
@@ -690,9 +722,9 @@ fn install_over_route(
             refresh: plan.refresh,
             replaces: plan.replaces.clone(),
         };
-        Ok((login_key, (platform.key, digest, executable), request))
+        Ok((login_key, (offer, build), request))
     })();
-    let (login_key, (platform_key, digest, executable), request) = match prepared {
+    let (login_key, (offer, build), request) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             drop(input);
@@ -701,14 +733,28 @@ fn install_over_route(
         }
     };
     let write = (|| -> Result<()> {
+        let mut build = Some(build);
         serde_json::to_writer(&mut input, &request)?;
-        input.write_all(b"\n")?;
-        match &executable {
-            None => writeln!(input, "{platform_key}\n{digest}")?,
-            Some(executable) => {
-                input.write_all(b"\n\n")?;
-                input.write_all(executable)?;
+        match &offer {
+            Some((target, digest)) => writeln!(input, "\n{target}\n{digest}")?,
+            None => {
+                input.write_all(b"\n\n\n")?;
+                // Nothing to compare: the session needs this build.
+                let bytes = build.take().expect("the build is sent once").bytes()?;
+                input.write_all(&bytes)?;
             }
+        }
+        input.flush()?;
+        // The session says whether it started the stored build or needs
+        // this one, which is fetched only then.
+        match read_enrollment_line(&mut stdout)?.as_str() {
+            "stored" => {}
+            "upload" => {
+                if let Some(build) = build.take() {
+                    input.write_all(&build.bytes()?)?;
+                }
+            }
+            _ => bail!("the enrollment session gave an unexpected answer"),
         }
         Ok(())
     })();
@@ -769,22 +815,23 @@ fn install_over_route(
 
 /// The enrollment session's commands, for `sh`. The greeting reports the
 /// platform, where the account keeps syq's state, the platforms the store
-/// has this build for with the SHA-256 of each, and `authorized_keys`. The
-/// session then reads the request, the platform whose stored syq installs
-/// it with the hash that syq must have, and, without one, the syq that
-/// follows.
+/// has this build for, and `authorized_keys`. The session then reads the
+/// request and, when the enrolling machine offers a stored build, its
+/// platform and the SHA-256 of the build that machine would install. It
+/// answers `stored` when it starts that stored build, or `upload` when it
+/// reads the syq that follows and starts that instead.
 ///
-/// A stored build is offered only when it passes the binary store's rules:
+/// A stored build is listed only when it passes the binary store's rules:
 /// its directories and file belong to the account and nobody else can write
 /// them, and only the store's root may be a symbolic link. Owners and modes
 /// show nothing on a filesystem that fixes them when it is mounted, such as
-/// SMB or exFAT, so the enrolling machine also compares the hash with the
-/// build it would upload, and the session hashes the build again just
-/// before starting it: only the exact build runs. Without a SHA-256 tool, no
-/// build is offered. The checks use `test -O` and `test -L`, which dash,
-/// bash, zsh and busybox `sh` all have though POSIX does not require `-O`,
-/// `find -perm`, and the SHA-256 tools the helper bootstrap uses. The script
-/// is one line, so any login shell can pass it to `sh -c`.
+/// SMB or exFAT, so the session also hashes the stored build just before it
+/// would start it and starts it only when it is exactly the offered build;
+/// without a SHA-256 tool, it asks for the upload. The checks use `test -O`
+/// and `test -L`, which dash, bash, zsh and busybox `sh` all have though
+/// POSIX does not require `-O`, `find -perm`, and the SHA-256 tools the
+/// helper bootstrap uses. The script is one line, so any login shell can
+/// pass it to `sh -c`.
 pub(super) fn install_remote_command(stage: &str) -> String {
     [
         "set -eu".to_owned(),
@@ -799,12 +846,12 @@ pub(super) fn install_remote_command(stage: &str) -> String {
         "private() { [ -O \"$1\" ] || return 1; w=$(find ${2:+\"$2\"} \"$1\" -prune \\( -perm -020 -o -perm -002 \\) -print) || return 1; [ -z \"$w\" ]; }".to_owned(),
         "stored() { [ -n \"$1\" ] && [ -d \"$r\" ] && private \"$r\" -H || return 1; for q in \"$s\" \"$s/$1\" \"$s/$1/syq\"; do [ ! -L \"$q\" ] && private \"$q\" || return 1; done; [ -f \"$s/$1/syq\" ] && [ -x \"$s/$1/syq\" ]; }".to_owned(),
         "digest() { if command -v sha256sum >/dev/null 2>&1; then o=$(sha256sum < \"$1\") || return 1; elif command -v shasum >/dev/null 2>&1; then o=$(shasum -a 256 < \"$1\") || return 1; elif command -v openssl >/dev/null 2>&1; then o=$(openssl dgst -sha256 < \"$1\") || return 1; o=${o##* }; else return 1; fi; printf '%s' \"${o%%[[:space:]]*}\"; }".to_owned(),
-        "for f in \"$s\"/*/syq; do t=${f%/syq}; t=${t##*/}; if stored \"$t\" && h=$(digest \"$s/$t/syq\") && [ -n \"$h\" ]; then printf '%s:%s ' \"$t\" \"$h\"; fi; done".to_owned(),
+        "for f in \"$s\"/*/syq; do t=${f%/syq}; t=${t##*/}; if stored \"$t\"; then printf '%s ' \"$t\"; fi; done".to_owned(),
         "printf '\\n'".to_owned(),
         "if test -f \"$HOME/.ssh/authorized_keys\"; then wc -c <\"$HOME/.ssh/authorized_keys\"; cat \"$HOME/.ssh/authorized_keys\"; else printf '0\\n'; fi".to_owned(),
         "IFS= read -r request; IFS= read -r target; IFS= read -r expected".to_owned(),
         format!(
-            "if [ -n \"$target\" ]; then if ! stored \"$target\" || [ \"$(digest \"$s/$target/syq\" || :)\" != \"$expected\" ]; then echo \"syq: the stored syq for $target changed during setup; retry\" >&2; exit 1; fi; printf '%s' \"$request\" | \"$s/$target/syq\" --restricted-install; else {stage}; printf '%s' \"$request\" | \"$p\" --restricted-install; fi",
+            "if [ -n \"$target\" ] && stored \"$target\" && h=$(digest \"$s/$target/syq\") && [ \"$h\" = \"$expected\" ]; then echo stored; printf '%s' \"$request\" | \"$s/$target/syq\" --restricted-install; else echo upload; {stage}; printf '%s' \"$request\" | \"$p\" --restricted-install; fi",
             stage = stage_commands(stage),
         ),
     ]
@@ -825,16 +872,6 @@ pub(super) fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-/// The stored build to install with, from the greeting's `TARGET:SHA256`
-/// list: the one for `platform` whose hash is `expected`, the hash of the
-/// build this machine would otherwise upload.
-pub(super) fn matching_stored_build(listed: &str, platform: &str, expected: &str) -> bool {
-    listed
-        .split_whitespace()
-        .filter_map(|entry| entry.split_once(':'))
-        .any(|(target, digest)| target == platform && digest == expected)
 }
 
 fn read_enrollment_line(input: &mut impl std::io::BufRead) -> Result<String> {

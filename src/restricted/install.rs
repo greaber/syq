@@ -117,14 +117,16 @@ pub(super) fn store_receiver_path(home: &Path) -> PathBuf {
 }
 
 /// Put this executable in the store as its build's receiver, unless the
-/// store has exactly it already. As for the store's other users, a stored
+/// store has a copy of it already. As for the store's other users, a stored
 /// build whose directories or file someone else could change is refused,
 /// and nothing is created under a home directory that belongs to another
-/// user. A private stored build that is not this executable byte for byte,
-/// such as a damaged copy or another compile of the same source, is
-/// replaced, so syq's line runs exactly the build that set it up. Where the
-/// filesystem fixes owners and modes when it is mounted, they cannot show
-/// who may change a stored build, so it is written again in any case.
+/// user. A private stored build whose bytes differ from this executable,
+/// such as a damaged copy or a compile of the same source on another
+/// machine, is replaced by this one: the build identity is what syq relies
+/// on to be compatible, and the bytes the line runs are the last ones
+/// installed. Where the filesystem fixes owners and modes when it is
+/// mounted, they cannot show who may change a stored build, so it is
+/// written again in any case.
 fn install_receiver(home: &Path) -> Result<PathBuf> {
     let store = home.join(crate::user_dirs::BINARY_STORE_IN_HOME);
     let receiver = store_receiver_path(home);
@@ -133,25 +135,65 @@ fn install_receiver(home: &Path) -> Result<PathBuf> {
         .expect("the receiver is in a build directory")
         .to_path_buf();
     let running = std::env::current_exe().context("resolve the running syq")?;
-    let contents = fs::read(&running)
-        .with_context(|| format!("read the running syq {}", running.display()))?;
     if !crate::fsops::fixed_owners_and_modes(&store) {
         let stored =
             crate::update::stored_release(&store, &directory, &[crate::update::STORED_EXECUTABLE])
                 .context("cannot use the receiver in the binary store")?;
         if stored == crate::update::StoredRelease::Complete
             && delegation::validate_regular_executable(&receiver, "stored receiver").is_ok()
-            && fs::read(&receiver).is_ok_and(|stored| stored == contents)
+            && same_executable(&running, &receiver)?
         {
             return Ok(receiver);
         }
     }
     crate::update::create_store_directory(&store, &directory)?;
+    let contents = fs::read(&running)
+        .with_context(|| format!("read the running syq {}", running.display()))?;
     let opened = open_directory(&directory)?;
     lock_directory(&opened)?;
     atomic_replace_executable_locked(&opened, crate::update::STORED_EXECUTABLE, &contents)?;
     delegation::validate_regular_executable(&receiver, "stored receiver")?;
     Ok(receiver)
+}
+
+/// Whether `stored` holds the running executable: the same file, as when
+/// the stored build is the one running, or the same bytes, compared a
+/// block at a time so neither is held in memory whole.
+pub(super) fn same_executable(running: &Path, stored: &Path) -> Result<bool> {
+    let mut left = File::open(running)
+        .with_context(|| format!("open the running syq {}", running.display()))?;
+    let Ok(mut right) = File::open(stored) else {
+        return Ok(false);
+    };
+    let (left_metadata, right_metadata) = (left.metadata()?, right.metadata()?);
+    if (left_metadata.dev(), left_metadata.ino()) == (right_metadata.dev(), right_metadata.ino()) {
+        return Ok(true);
+    }
+    if left_metadata.len() != right_metadata.len() {
+        return Ok(false);
+    }
+    let fill = |file: &mut File, buffer: &mut [u8]| -> std::io::Result<usize> {
+        let mut filled = 0;
+        while filled < buffer.len() {
+            match file.read(&mut buffer[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(filled)
+    };
+    let (mut ours, mut theirs) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
+    loop {
+        let read = fill(&mut left, &mut ours)?;
+        if fill(&mut right, &mut theirs)? != read || ours[..read] != theirs[..read] {
+            return Ok(false);
+        }
+        if read == 0 {
+            return Ok(true);
+        }
+    }
 }
 
 /// Which machine's paths `receiver_control_paths` lists.
