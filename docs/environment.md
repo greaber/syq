@@ -26,6 +26,7 @@ helpers, or other programs; the rest of the environment is passed through.
 
 | Variable | Purpose |
 |---|---|
+| `SSL_CERT_FILE`, `SSL_CERT_DIR` | Replace the system CA roots for HTTPS; see [HTTPS certificates](security.md#https-certificates) |
 | `SYQ_NO_UPDATE_CHECK`, `DO_NOT_TRACK` | Disable update reminders; see [Updates](install.md#updates) |
 | `SYQ_TUNING_CACHE` | Select the connection-count cache; an empty value disables it. See [Remembered connection counts](tuning.md#remembered-connection-counts) |
 | `SYQ_TUNING_HISTORY` | Select the local tuning history; empty disables it. See [Tuning history](tuning.md#inspect-tuning-history) |

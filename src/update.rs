@@ -1133,7 +1133,7 @@ fn fetch_into(url: &str, sink: &mut dyn DownloadSink, mode: FetchMode, limit: u6
         FetchMode::Interactive => (Duration::from_secs(10), None, 3),
         FetchMode::BackgroundCheck => (Duration::from_secs(2), Some(Duration::from_secs(5)), 1),
     };
-    let agent = ureq::Agent::config_builder()
+    let agent = crate::tls::config_builder()
         .https_only(true)
         .timeout_connect(Some(connect_timeout))
         .timeout_global(global_timeout)
@@ -1181,7 +1181,7 @@ fn fetch_into(url: &str, sink: &mut dyn DownloadSink, mode: FetchMode, limit: u6
             }
         }
     }
-    Err(last_error.unwrap()).with_context(|| format!("download {url}"))
+    Err(crate::tls::download_error(last_error.unwrap())).with_context(|| format!("download {url}"))
 }
 
 fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {

@@ -25,7 +25,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::Duration,
 };
@@ -117,7 +117,7 @@ impl Intercept for FileBody {
 #[derive(Clone, Debug)]
 struct Connector {
     fallback: SharedHttpConnector,
-    agent: ureq::Agent,
+    agent: Arc<OnceLock<ureq::Agent>>,
     cancellation: Arc<Cancellation>,
 }
 impl HttpConnector for Connector {
@@ -139,6 +139,7 @@ impl Connector {
                 .call(HttpRequest::try_from(request).expect("unchanged SDK request"));
         };
         let agent = self.agent.clone();
+        let cancellation = self.cancellation.clone();
         file.active.count.fetch_add(1, Ordering::AcqRel);
         let ticket = Ticket(file.active.clone());
         HttpConnectorFuture::new(async move {
@@ -174,7 +175,9 @@ impl Connector {
                     } else {
                         ureq::SendBody::from_owned_reader(source.take(file.length))
                     };
-                    let response = agent.run(builder.body(body)?)?;
+                    let response = agent
+                        .get_or_init(|| upload_agent(cancellation))
+                        .run(builder.body(body)?)?;
                     file.source.check(&check)?;
                     let (parts, mut body) = response.into_parts();
                     let mut bytes = Vec::new();
@@ -224,8 +227,20 @@ pub(super) fn client(
     fallback: SharedHttpClient,
     cancellation: Arc<Cancellation>,
 ) -> SharedHttpClient {
+    // Keep the pool per client, but do not load roots on SDK-only requests.
+    let agent = Arc::new(OnceLock::new());
+    http_client_fn(move |settings, components| {
+        SharedHttpConnector::new(Connector {
+            fallback: fallback.http_connector(settings, components),
+            agent: agent.clone(),
+            cancellation: cancellation.clone(),
+        })
+    })
+}
+
+fn upload_agent(cancellation: Arc<Cancellation>) -> ureq::Agent {
     use ureq::unversioned::transport::{ConnectProxyConnector, Connector as _, RustlsConnector};
-    let config = ureq::Agent::config_builder()
+    let config = crate::tls::config_builder()
         .http_status_as_error(false)
         .max_redirects(0)
         .timeout_resolve(Some(Duration::from_secs(15)))
@@ -234,20 +249,13 @@ pub(super) fn client(
         .max_idle_connections_per_host(256)
         .output_buffer_size(64 * 1024)
         .build();
-    let agent = ureq::Agent::with_parts(
+    ureq::Agent::with_parts(
         config,
         ().chain(ConnectProxyConnector::default())
-            .chain(cancel::TcpConnector(cancellation.clone()))
+            .chain(cancel::TcpConnector(cancellation))
             .chain(RustlsConnector::default()),
         ureq::unversioned::resolver::DefaultResolver::default(),
-    );
-    http_client_fn(move |settings, components| {
-        SharedHttpConnector::new(Connector {
-            fallback: fallback.http_connector(settings, components),
-            agent: agent.clone(),
-            cancellation: cancellation.clone(),
-        })
-    })
+    )
 }
 
 // The synchronous connector reads the confined source itself. Giving the SDK
