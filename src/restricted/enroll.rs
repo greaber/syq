@@ -279,7 +279,7 @@ pub(super) fn management_executable(target: crate::remote_helper::Target) -> Res
 /// The syq this machine installs on a server of a given platform: this
 /// executable, or the official release's helper.
 pub(super) enum ManagementBuild {
-    Local(Vec<u8>),
+    Local(File),
     Release(Box<crate::update::TrustedCurrentHelper>),
 }
 
@@ -304,47 +304,91 @@ impl ManagementBuild {
         let executable = PathBuf::from("/proc/self/exe");
         #[cfg(not(target_os = "linux"))]
         let executable = std::env::current_exe().context("resolve local syq executable")?;
-        Ok(Self::Local(read_local_management_executable(&executable)?))
+        Ok(Self::Local(open_local_management_executable(&executable)?))
     }
 
-    /// Its SHA-256: of this executable's bytes, or as the release's signed
-    /// manifest states it, without downloading the helper.
-    pub(super) fn sha256(&self) -> String {
+    /// Its SHA-256: of this executable, read a block at a time, or as the
+    /// release's signed manifest states it, without downloading the helper.
+    pub(super) fn sha256(&self) -> Result<String> {
         match self {
-            Self::Local(bytes) => sha256_hex(bytes),
-            Self::Release(helper) => helper.binary_sha256().to_owned(),
+            Self::Local(file) => sha256_file(file),
+            Self::Release(helper) => Ok(helper.binary_sha256().to_owned()),
         }
     }
 
-    /// Its bytes: a release helper is downloaded and verified, or taken
-    /// from this machine's store, only now.
+    /// Its bytes, only for an upload: this executable read whole, or the
+    /// release helper downloaded and verified, or taken from this machine's
+    /// store.
     pub(super) fn bytes(self) -> Result<Vec<u8>> {
         match self {
-            Self::Local(bytes) => Ok(bytes),
+            Self::Local(file) => read_all(&file),
             Self::Release(helper) => crate::update::verified_current_helper(&helper),
         }
     }
 }
 
+#[cfg(test)]
 pub(super) fn read_local_management_executable(path: &Path) -> Result<Vec<u8>> {
-    let executable = fs::canonicalize(path)
-        .with_context(|| format!("canonicalize local syq executable {}", path.display()))?;
-    let mut binary = File::open(&executable)
-        .with_context(|| format!("open local syq executable {}", executable.display()))?;
+    read_all(&open_local_management_executable(path)?)
+}
+
+/// The local syq to upload, opened once: on Linux `/proc/self/exe` opens
+/// the running executable itself, whatever has replaced its path since.
+pub(super) fn open_local_management_executable(path: &Path) -> Result<File> {
+    let binary = File::open(path)
+        .with_context(|| format!("open local syq executable {}", path.display()))?;
     let metadata = binary
         .metadata()
-        .with_context(|| format!("inspect local syq executable {}", executable.display()))?;
+        .with_context(|| format!("inspect local syq executable {}", path.display()))?;
     if !metadata.is_file() {
         bail!(
             "local syq executable {} must be a regular file",
-            executable.display()
+            fs::canonicalize(path)
+                .unwrap_or_else(|_| path.to_path_buf())
+                .display()
         );
     }
-    let mut bytes = Vec::new();
-    binary
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("read local syq executable {}", executable.display()))?;
-    Ok(bytes)
+    Ok(binary)
+}
+
+/// Read `file` from its start, whatever was read from it before.
+fn read_all(file: &File) -> Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt as _;
+    let mut bytes = Vec::with_capacity(file.metadata()?.len() as usize);
+    let mut buffer = vec![0u8; 1 << 16];
+    loop {
+        match file.read_at(&mut buffer, bytes.len() as u64) {
+            Ok(0) => return Ok(bytes),
+            Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error).context("read local syq executable"),
+        }
+    }
+}
+
+/// The SHA-256 of `file`, read a block at a time from its start.
+fn sha256_file(file: &File) -> Result<String> {
+    use sha2::Digest as _;
+    use std::os::unix::fs::FileExt as _;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = vec![0u8; 1 << 16];
+    let mut offset = 0u64;
+    loop {
+        match file.read_at(&mut buffer, offset) {
+            Ok(0) => break,
+            Ok(read) => {
+                hasher.update(&buffer[..read]);
+                offset += read as u64;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error).context("hash local syq executable"),
+        }
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 pub(super) fn endpoint(login: &str, host: &str, port: Option<u16>) -> Result<SshEndpoint> {
@@ -689,7 +733,8 @@ fn install_over_route(
         let offer = stored
             .split_whitespace()
             .any(|key| key == platform.key)
-            .then(|| (platform.key, build.sha256()));
+            .then(|| build.sha256().map(|digest| (platform.key, digest)))
+            .transpose()?;
         let entry_key = match &plan.entry_key {
             Some(key) => key.clone(),
             None => {
@@ -866,6 +911,7 @@ pub(super) fn in_sh(command: &str) -> String {
 }
 
 /// The SHA-256 of `bytes` in lowercase hexadecimal, as `sha256sum` prints it.
+#[cfg(test)]
 pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest as _;
     sha2::Sha256::digest(bytes)

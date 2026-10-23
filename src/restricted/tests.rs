@@ -1622,6 +1622,20 @@ fn local_management_executable_check_is_scoped_to_the_open_file() {
     assert!(error.to_string().contains("must be a regular file"));
 }
 
+/// The enrolling machine hashes its own build a block at a time to offer a
+/// stored copy, and reads it whole only for an upload.
+#[test]
+fn the_local_build_is_hashed_without_reading_it_whole() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let path = temporary.path().join("syq");
+    let contents: Vec<u8> = (0..200_000).map(|byte| (byte % 253) as u8).collect();
+    fs::write(&path, &contents).unwrap();
+    let build = ManagementBuild::Local(open_local_management_executable(&path).unwrap());
+    assert_eq!(build.sha256().unwrap(), sha256_hex(&contents));
+    assert_eq!(build.sha256().unwrap(), sha256_hex(&contents));
+    assert_eq!(build.bytes().unwrap(), contents);
+}
+
 #[test]
 fn management_stage_is_scoped_to_one_shell_session() {
     fn invoke(home: &Path, stage: &str, script: &[u8], request: &[u8]) -> std::process::Output {
