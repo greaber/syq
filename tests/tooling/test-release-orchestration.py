@@ -178,6 +178,7 @@ class PathScopeTests(Scratch):
     def test_integration_targets(self):
         self.assertScope(self.scope("tests/local/transfer.rs"), integration_targets="local")
         self.assertScope(self.scope("tests/support/temp.rs"), integration_targets="all")
+        self.assertScope(self.scope("tests/tls.rs"), integration_targets="tls")
 
     def test_sdk_matrix(self):
         # The SDK matrix runs Python when it is affected; the no-work case keeps one stub.

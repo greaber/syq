@@ -78,19 +78,49 @@ fn release_download_uses_system_ca_file_and_directory() {
 }
 
 #[test]
-fn release_download_rejects_untrusted_ca_and_wrong_hostname() {
+fn release_download_rejects_untrusted_ca() {
     let temp = test_support::tempdir().unwrap();
-    let server = Server::start("wrong.example");
+    let server = Server::start("127.0.0.1");
     let unrelated = Server::start("127.0.0.1");
     let certificates = temp.path().join("ca.pem");
-    for ca in [&unrelated.ca, &server.ca] {
-        std::fs::write(&certificates, ca).unwrap();
-        let output = server.download(temp.path(), &certificates);
+    std::fs::write(&certificates, &unrelated.ca).unwrap();
+    let output = server.download(temp.path(), &certificates);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("invalid peer certificate"),
+        "{output:?}"
+    );
+    assert!(server.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn release_download_rejects_wrong_hostname() {
+    let temp = test_support::tempdir().unwrap();
+    let server = Server::start("wrong.example");
+    let certificates = temp.path().join("ca.pem");
+    std::fs::write(&certificates, &server.ca).unwrap();
+    let output = server.download(temp.path(), &certificates);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("not valid for name"), "{output:?}");
+    assert!(server.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn release_download_reports_empty_ca_overrides() {
+    let temp = test_support::tempdir().unwrap();
+    let server = Server::start("127.0.0.1");
+    let empty_bundle = temp.path().join("empty.pem");
+    std::fs::write(&empty_bundle, b"").unwrap();
+    for certificates in [Path::new(""), empty_bundle.as_path()] {
+        let output = server.download(temp.path(), certificates);
         assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let error = String::from_utf8_lossy(&output.stderr);
         assert!(
-            !String::from_utf8_lossy(&output.stderr).contains("parse signed release manifest"),
+            error.contains("no trusted CA certificates were loaded"),
             "{output:?}"
         );
+        assert!(error.contains("SSL_CERT_FILE"), "{output:?}");
     }
     assert!(server.requests.lock().unwrap().is_empty());
 }
@@ -102,6 +132,12 @@ fn missing_ca_bundle_rejects_https_but_does_not_block_local_copy() {
     let certificates = temp.path().join("missing.pem");
     let output = server.download(temp.path(), &certificates);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("no trusted CA certificates were loaded"),
+        "{output:?}"
+    );
+    assert!(error.contains("missing.pem"), "{output:?}");
     assert!(server.requests.lock().unwrap().is_empty());
     std::fs::write(temp.path().join("source"), b"local data").unwrap();
     let output = server

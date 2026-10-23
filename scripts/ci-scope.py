@@ -275,6 +275,7 @@ def classify(paths, preparation_only):
             (("tests/s3.rs", "tests/s3/*"), "s3"),
             (("tests/build_identity.rs",), "build_identity"),
             (("tests/temp_paths.rs",), "temp_paths"),
+            (("tests/tls.rs",), "tls"),
             (("tests/macos_exfat.rs",), "macos_exfat"),
             (("tests/support/*", "tests/fixtures/*"), "all"),
         ]:

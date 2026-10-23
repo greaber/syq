@@ -215,9 +215,12 @@ does not perform online certificate revocation checks.
 
 For a private CA or a restricted trust store, set `SSL_CERT_FILE` to a PEM
 bundle or `SSL_CERT_DIR` to a colon-separated list of directories containing
-PEM certificates. When either variable has a nonempty value, syq uses only the
-certificates from those paths. Missing files or empty bundles do not fall back
-to a bundled list. Restart a running syq process to load changes to its trust store.
+PEM certificates. A set `SSL_CERT_FILE` or a nonempty `SSL_CERT_DIR` replaces
+system roots with the certificates from those paths. Even `SSL_CERT_FILE=""`
+selects an empty path and loads no roots unless `SSL_CERT_DIR` supplies them;
+an empty `SSL_CERT_DIR` is ignored. Unset both variables to restore system trust.
+Missing files or empty bundles do not fall back to a bundled list. Restart a
+running syq process to load changes to its trust store.
 These settings do not change SSH host-key checks or release signature checks.
 
 ## Copies between servers
