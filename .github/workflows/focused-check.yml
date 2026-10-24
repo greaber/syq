@@ -33,6 +33,11 @@ on:
 permissions:
   contents: read
 
+# CI builds start from a clean checkout, so incremental compilation data only
+# costs build time and cache space.
+env:
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   check:
     # scripts/branch-status.py identifies a check by its job name. It keeps
@@ -65,7 +70,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            !target/debug/incremental
           key: cargo-${{ inputs.runner == 'macos-intel' && 'ci-macos_intel-fast-v1' || inputs.runner == 'macos' && 'macos-suite' || 'ci-rust' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ inputs.runner == 'macos-intel' && 'ci-macos_intel-fast-v1' || inputs.runner == 'macos' && 'macos-suite' || 'ci-rust' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-

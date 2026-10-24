@@ -49,6 +49,9 @@ permissions:
 # the tests, the wheel, and the cached dependencies share one build.
 env:
   MACOSX_DEPLOYMENT_TARGET: "11.0"
+  # CI builds start from a clean checkout, so incremental compilation data
+  # only costs build time and cache space.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   focused-test:
@@ -70,7 +73,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            !target/debug/incremental
           key: cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
@@ -184,7 +186,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            !target/debug/incremental
           key: cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
@@ -206,6 +207,7 @@ jobs:
       - run: rustup component add clippy
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Native tests
+        id: native-tests
         run: cargo nextest run --locked --all-targets
       # These ignored tests need the runner's live network or root. Nightly and
       # manual suites run them; post-merge runs skip them.
@@ -302,9 +304,12 @@ jobs:
           env -u PYTHONPATH uv run --isolated --python "$UV_PYTHON" \
             --with "$1" \
             python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
+      # Saved once the native tests have run, even if a later step failed.
       - name: Save Cargo dependencies and build output
         if: >-
+          !cancelled() &&
           github.ref == 'refs/heads/master' &&
+          (steps.native-tests.outcome == 'success' || steps.native-tests.outcome == 'failure') &&
           steps.cargo-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -313,7 +318,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            !target/debug/incremental
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   clone-benchmark:
@@ -336,7 +340,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            !target/debug/incremental
           key: cargo-macos-clone-benchmark-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-macos-clone-benchmark-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
@@ -365,7 +368,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            !target/debug/incremental
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # Only a run that executed every step certifies a release.

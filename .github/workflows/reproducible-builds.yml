@@ -17,6 +17,9 @@ jobs:
   source-crate:
     name: validate source crate
     runs-on: ubuntu-latest
+    env:
+      # Incremental compilation data only costs time and cache space here.
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -33,7 +36,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            !target/debug/incremental
           key: cargo-source-crate-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-source-crate-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
@@ -57,7 +59,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            !target/debug/incremental
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:

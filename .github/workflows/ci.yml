@@ -28,7 +28,10 @@ permissions:
   contents: read
   actions: read
 
+# CI builds start from a clean checkout, so incremental compilation data only
+# costs build time and cache space.
 env:
+  CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -156,7 +159,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            !target/debug/incremental
           key: cargo-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
@@ -189,6 +191,7 @@ jobs:
         if: needs.scope.outputs.native == 'true'
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test native targets
+        id: native-tests
         if: needs.scope.outputs.native == 'true'
         env:
           INTEGRATION_TARGETS: ${{ needs.scope.outputs.integration_targets }}
@@ -292,11 +295,15 @@ jobs:
           (needs.scope.outputs.native == 'true' &&
            needs.scope.outputs.full_suite == 'true')
         run: git ls-files -z -- '*.sh' | xargs -0 shellcheck
-      # Runs that lint and test every target save the complete set.
+      # Full-suite runs on master (nightly and manual) save the entry, so it
+      # holds every target's dependencies. It is saved once the native tests
+      # have run, even if a test or a later check failed.
       - name: Save Cargo dependencies and build output
         if: >-
+          !cancelled() &&
           github.ref == 'refs/heads/master' &&
-          needs.scope.outputs.native == 'true' &&
+          needs.scope.outputs.full_suite == 'true' &&
+          (steps.native-tests.outcome == 'success' || steps.native-tests.outcome == 'failure') &&
           steps.cargo-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -305,7 +312,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            !target/debug/incremental
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   sdk-languages:
@@ -356,7 +362,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            !target/debug/incremental
           key: cargo-ci-sdks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-ci-sdks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
@@ -431,7 +436,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            !target/debug/incremental
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # Keep the public check name consumed by generated-SDK validation and release
@@ -485,7 +489,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            !target/debug/incremental
           key: cargo-ci-linux-arm64-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-ci-linux-arm64-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
@@ -523,7 +526,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            !target/debug/incremental
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # An actual Intel runner catches host-architecture cfg and libc differences
@@ -558,7 +560,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            !target/debug/incremental
           key: cargo-ci-macos_intel-fast-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-ci-macos_intel-fast-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
@@ -580,7 +581,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            !target/debug/incremental
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # Preserve the `macos` check for Intel. Apple Silicon is certified once by
@@ -648,7 +648,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            !target/debug/incremental
           key: cargo-ci-object-storage-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-ci-object-storage-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
@@ -670,7 +669,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            !target/debug/incremental
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # The lab image is built once and shared by the parallel real-SSH jobs.
@@ -809,7 +807,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            !target/debug/incremental
           key: cargo-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-

@@ -11,6 +11,11 @@ permissions:
   contents: read
   actions: read
 
+# CI builds start from a clean checkout, so incremental compilation data only
+# costs build time and cache space.
+env:
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   scope:
     runs-on: ubuntu-latest
@@ -97,7 +102,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target/cargo
-            !target/cargo/debug/incremental
           key: cargo-rsync-compat-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-rsync-compat-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
@@ -125,7 +129,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target/cargo
-            !target/cargo/debug/incremental
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
       - name: Restore compatibility-cache ownership
         if: always()
