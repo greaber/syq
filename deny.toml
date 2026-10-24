@@ -11,8 +11,8 @@ targets = [
 unmaintained = "workspace"
 yanked = "warn"
 ignore = [
-  { id = "RUSTSEC-2023-0071", reason = "rsa never decrypts in syq; it signs only grants from the user's own unencrypted RSA login key file on their machine (agent-held keys are signed by the agent), so the timing side channel would need local measurement by someone who could already read that file; no fixed rsa release exists" },
-  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 (via ssh-key's p256/p384/p521) does private-key work only when syq signs grants from the user's own unencrypted ECDSA login key file on their machine; verification uses public data. Revisit when ssh-key 0.7 (crypto-bigint >= 0.7.6) is released" },
+  { id = "RUSTSEC-2023-0071", reason = "Accepted residual risk: rsa never decrypts in syq, but it signs grants in-process with the user's unencrypted RSA login key file on the enrolling machine (agent-held keys sign in the agent; verification uses public data). Exploiting the timing side channel needs precise timing of those local signing operations. No fixed rsa release exists" },
+  { id = "RUSTSEC-2026-0387", reason = "Accepted residual risk: crypto-bigint 0.5 (via ssh-key's p256/p384/p521) runs private-key arithmetic in-process on the enrolling machine when syq signs grants with an unencrypted ECDSA login key file and when it generates an ECDSA entry key at enrollment (agent-held keys sign in the agent; verification uses public data). Exploiting it needs precise timing of those local operations. Drop this when ssh-key 0.7 (crypto-bigint >= 0.7.6) is released" },
 ]
 
 [licenses]
