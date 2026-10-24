@@ -200,7 +200,7 @@ fn record_reuse_event(event: &str, label: &Path) -> io::Result<()> {
 
 /// Run `f` with this thread's fingerprints leaving out change times, as on
 /// a filesystem whose change times are too coarse to show a write.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn with_coarse_change_times<R>(f: impl FnOnce() -> R) -> R {
     COARSE_CHANGE_TIMES.set(true);
     let result = f();
