@@ -600,9 +600,16 @@ fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Res
     };
     let descriptor_session = DescriptorSessionSlot::default();
     let pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    // Unbuffered: the deadline waits on the descriptor, which must not hide
+    // bytes another buffer already read.
+    let input = std::fs::File::from(
+        std::os::fd::AsFd::as_fd(&io::stdin())
+            .try_clone_to_owned()
+            .context("take the copy's input")?,
+    );
     let result = serve(
         crate::destination::HandshakeInput::new(
-            io::stdin(),
+            input,
             pending.clone(),
             RESTRICTED_START_TIMEOUT,
             RESTRICTED_HELLO_TIMEOUT,

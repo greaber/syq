@@ -171,28 +171,27 @@ pub(crate) fn admit_session(enrollment: &str, generation: &str) -> Result<Sessio
                 .context("hand the restricted SSH worker to the receiver")?;
             Ok(Session::Worker)
         }
-        Admission::Copy(directive) => {
-            let authority = admit(
-                &state,
-                &config,
-                (generation, crate::identity::build()),
-                &directive,
-            )?;
-            drop(slot);
-            Ok(Session::Copy(authority))
-        }
+        Admission::Copy(directive) => Ok(Session::Copy(admit(
+            &state,
+            &config,
+            (generation, crate::identity::build()),
+            &directive,
+            slot,
+        )?)),
     }
 }
 
 /// Admit a new copy's directive and set up its authority: refused by a
 /// receiver of another generation or build, then checked against the
 /// trusted login key and its policy, its rules derived from its command, and
-/// only then recorded as used.
-pub(super) fn admit(
+/// only then recorded as used. The session's `slot` is released once the
+/// directive is verified.
+fn admit(
     state: &Path,
     config: &ReceiverEnrollment,
     (generation, build): (u64, &str),
     directive: &[u8],
+    slot: UnverifiedSlot,
 ) -> Result<std::sync::Arc<RestrictedAuthority>> {
     let observed_state = fs::symlink_metadata(state).context("inspect receiver enrollment")?;
     let (_, home) = current_account()?;
@@ -201,6 +200,7 @@ pub(super) fn admit(
     let protected = receiver_control_paths(&canonical_home, None, ControlPaths::Here)?;
     let ((grant, constraints), verified) =
         verify(state, config, (generation, build), directive, &home)?;
+    drop(slot);
     let results_key = load_results_key(state)?;
     let root = ConfinedRoot::resolve(&grant.copy.destination, &protected)?;
     let authority = std::sync::Arc::new(RestrictedAuthority::new(
