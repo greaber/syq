@@ -11,7 +11,8 @@ targets = [
 unmaintained = "workspace"
 yanked = "warn"
 ignore = [
-  { id = "RUSTSEC-2023-0071", reason = "rsa is used only to parse SSH public credentials and verify signatures; syq never performs the vulnerable RSA private-key decryption or signing operations" },
+  { id = "RUSTSEC-2023-0071", reason = "rsa never decrypts in syq; it signs only grants from the user's own unencrypted RSA login key file on their machine (agent-held keys are signed by the agent), so the timing side channel would need local measurement by someone who could already read that file; no fixed rsa release exists" },
+  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 (via ssh-key's p256/p384/p521) does private-key work only when syq signs grants from the user's own unencrypted ECDSA login key file on their machine; verification uses public data. Revisit when ssh-key 0.7 (crypto-bigint >= 0.7.6) is released" },
 ]
 
 [licenses]
