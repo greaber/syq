@@ -9374,7 +9374,7 @@ fn both_receivers_hold_leases_on_the_files_they_compared() {
         if !trusted {
             eprintln!("note: the test filesystem's leases are not trusted");
         }
-        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let key = generate_results_key(EnrollmentId::random()).unwrap();
         let (secret, policy) = results_policy();
         let mut receiver =
             ParityReceiver::new(&root, restricted, true, PublicationPolicy::AtomicStaged);
