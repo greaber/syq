@@ -449,7 +449,7 @@ for pid in filter(str.isdigit, os.listdir('/proc')):
         started = int(open(f'/proc/{pid}/stat').read().rsplit(') ', 1)[1].split()[19])
     except OSError:
         continue
-    if b'--restricted-receiver' in command:
+    if command.split(b'\\0')[1:2] == [b'--restricted-receiver']:
         sessions.append((started, int(status.split('PPid:')[1].split()[0])))
 for _, parent in sorted(sessions)[1:]:
     os.kill(parent, signal.SIGKILL)
