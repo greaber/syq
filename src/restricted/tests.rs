@@ -1,4 +1,10 @@
 use super::*;
+use crate::cli::{Existence, Placement};
+use crate::delegation::{CopyLimits, CopyOptions, CopyPolicy, PublicationPolicy};
+use crate::directive::{
+    copy_operation, filter_destination_roots, normalize_absolute, validate_restricted_args,
+    DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES,
+};
 use crate::process::CommandExt as _;
 use clap::Parser;
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -718,61 +724,90 @@ fn lost_server_state_means_a_new_enrollment_that_replaces_the_old_line() {
     assert!(after.contains(&format!("syq-enrollment:{new_id}")));
     assert!(!after.contains(&format!("syq-enrollment:{id}")));
 
-    // A grant for the lost enrollment, or for an older generation, is refused.
+    // A directive for the lost enrollment, or for an older generation, is
+    // refused.
     let config = read_receiver_config(&enrollment_state(home, new_id))
         .unwrap()
         .unwrap();
-    let source = Location::parse("host-a:source").unwrap();
-    let args = {
-        let mut args =
-            Args::try_parse_from(["syq rsync", "-r", "host-a:source", "host-b:/backup"]).unwrap();
-        args.normalize();
-        args
-    };
     let replay_path = enrollment_state(home, new_id).join("replay");
     let replay = delegation::ReplayStore::open(&replay_path).unwrap();
-    let signer = keys::LoginSigner::File(Box::new(login.clone()));
-    for (grant_id, generation, accepted) in [(id, 1, false), (new_id, 2, false), (new_id, 1, true)]
+    for (directive_id, generation, accepted) in
+        [(id, 1, false), (new_id, 2, false), (new_id, 1, true)]
     {
-        let grant = grant_for(
-            &args,
-            std::slice::from_ref(&source),
-            (grant_id, generation),
-            &account,
-            b"/backup",
-        )
-        .unwrap();
-        let encoded = delegation::sign_grant_with(
-            grant,
-            GrantConstraints {
-                tcp_congestion: None,
-                mapping: None,
-                hashing: None,
-                max_file_data_bytes_per_second: 0,
-                filters: FilterPolicy::default(),
-                root_existence: RootExistence::Any,
-                receipt_policy: results_policy().1,
-                extra_options: Default::default(),
-            },
-            |payload| signer.sign(delegation::SSHSIG_NAMESPACE, payload),
-        )
-        .unwrap();
-        let expected_signer = signer_name(new_id, config.generation);
-        let context = delegation::ReceiverContext {
-            enrollment_id: new_id,
-            target_login: &account,
-            expected_signer: &expected_signer,
-            clock: delegation::ClockObservation {
-                unix_seconds: now().unwrap(),
-                monotonic: Instant::now(),
-            },
-            clock_skew_seconds: CLOCK_SKEW_SECONDS,
-        };
+        let directive = test_directive(directive_id, generation, &account);
+        let encoded = sign_test_directive(&directive, &login, crate::directive::NAMESPACE);
         assert_eq!(
-            delegation::verify_and_redeem(&encoded, &context, &config.signer, &replay).is_ok(),
+            delegation::verify_and_redeem(
+                &encoded,
+                &receiver_context(&config),
+                &config.signer,
+                &replay,
+                |_| Ok(())
+            )
+            .is_ok(),
             accepted,
-            "{grant_id} {generation}"
+            "{directive_id} {generation}"
         );
+    }
+}
+
+/// A directive for a route-5 copy to `account`'s `/backup`.
+pub(super) fn test_directive(
+    enrollment: EnrollmentId,
+    generation: u64,
+    account: &str,
+) -> crate::directive::Directive {
+    crate::directive::issue(
+        crate::directive::Binding {
+            enrollment,
+            generation,
+            account: account.into(),
+            role: crate::directive::Role::Destination,
+        },
+        [
+            "cp", "--from", "host-a", "--src", "source", "--to", "host-b", "--into", "/backup",
+        ]
+        .map(|arg| arg.as_bytes().to_vec())
+        .to_vec(),
+        String::new(),
+        Default::default(),
+        [7; 32],
+    )
+    .unwrap()
+}
+
+pub(super) fn sign_test_directive(
+    directive: &crate::directive::Directive,
+    key: &PrivateKey,
+    namespace: &str,
+) -> Vec<u8> {
+    crate::directive::sign(directive, |payload| {
+        keys::LoginSigner::File(Box::new(key.clone())).sign(namespace, payload)
+    })
+    .unwrap()
+}
+
+/// The rules of a copy for a test authority, approved by no one.
+pub(super) fn test_grant(copy: CopyOperation) -> Grant {
+    Grant {
+        enrollment_id: EnrollmentId::random(),
+        request_id: RequestId::fresh(1_900_000_000).unwrap(),
+        copy,
+    }
+}
+
+/// What the receiver of `config` expects of a directive now.
+fn receiver_context(config: &ReceiverEnrollment) -> delegation::ReceiverContext<'_> {
+    delegation::ReceiverContext {
+        enrollment_id: config.id,
+        generation: config.generation,
+        target_login: &config.target_login,
+        build: &config.release,
+        clock: delegation::ClockObservation {
+            unix_seconds: crate::directive::now().unwrap(),
+            monotonic: Instant::now(),
+        },
+        clock_skew_seconds: CLOCK_SKEW_SECONDS,
     }
 }
 
@@ -846,11 +881,12 @@ fn a_receiver_from_an_older_line_refuses_new_copies() {
     }
 }
 
-/// A receiver records a grant as used only after the build, the
-/// generation and the signature are checked: a refused grant leaves the
-/// record of used grants as it was.
+/// A receiver records a directive as used only after the build, the
+/// generation, the binding, the signature and the derivation of its rules
+/// are checked: a refused directive leaves the record of used directives as
+/// it was.
 #[test]
-fn a_grant_is_recorded_only_after_every_check_passes() {
+fn a_directive_is_recorded_only_after_every_check_passes() {
     let temporary = crate::test_support::tempdir().unwrap();
     let state = temporary.path().join("state");
     fs::DirBuilder::new()
@@ -859,12 +895,13 @@ fn a_grant_is_recorded_only_after_every_check_passes() {
         .create(state.join("replay"))
         .unwrap();
     let login = generate_test_key("login").unwrap();
+    let build = crate::identity::build();
     let mut config = ReceiverEnrollment {
         version: CONFIG_VERSION,
         id: EnrollmentId::random(),
         target_login: "backup".into(),
         generation: 2,
-        release: "v0.8.0".into(),
+        release: build.into(),
         receiver_path: "/home/backup/.local/lib/syq/v0.8.0/linux-x86_64/syq".into(),
         entry_public_key: generate_test_key("entry")
             .unwrap()
@@ -873,57 +910,74 @@ fn a_grant_is_recorded_only_after_every_check_passes() {
             .unwrap(),
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
     };
-    let args = Args::parse_args(
-        &["cp", "--from", "a", "x", "--to", "b", "--into", "/b"].map(std::ffi::OsString::from),
-    )
-    .unwrap();
-    let source = Location::parse("a:x").unwrap();
-    let sign = |key: &PrivateKey, generation: u64, namespace: &str| {
-        let grant = grant_for(
-            &args,
-            std::slice::from_ref(&source),
-            (config.id, generation),
-            "backup",
-            b"/b",
-        )
-        .unwrap();
-        delegation::sign_grant_with(grant, GrantConstraints::default(), |payload| {
-            keys::LoginSigner::File(Box::new(key.clone())).sign(namespace, payload)
-        })
-        .unwrap()
+    let home = temporary.path();
+    let directive = |change: &dyn Fn(&mut crate::directive::Directive)| {
+        let mut directive = test_directive(config.id, 2, "backup");
+        change(&mut directive);
+        directive
+    };
+    let signed = |change: &dyn Fn(&mut crate::directive::Directive)| {
+        sign_test_directive(&directive(change), &login, crate::directive::NAMESPACE)
     };
     let recorded = || fs::read_dir(state.join("replay")).unwrap().count();
-    let current = (2, "v0.8.0");
-    let valid = sign(&login, 2, delegation::SSHSIG_NAMESPACE);
+    let current = (2, build);
+    let valid = signed(&|_| {});
     let refused = [
         // A connection from an older line, or a receiver of another build.
-        (valid.clone(), (1, "v0.8.0"), "outdated receiver"),
+        (valid.clone(), (1, build), "outdated receiver"),
         (valid.clone(), (2, "v0.7.9"), "outdated receiver"),
-        // A grant from before a refresh.
+        // A directive from before a refresh, for another build or account.
         (
-            sign(&login, 1, delegation::SSHSIG_NAMESPACE),
+            signed(&|directive| directive.binding.generation = 1),
             current,
-            "signer",
+            "now at generation",
         ),
-        // Another key, and the login key in another namespace.
         (
-            sign(
+            signed(&|directive| directive.build = "v0.7.9".into()),
+            current,
+            "approved for a receiver of syq v0.7.9",
+        ),
+        (
+            signed(&|directive| directive.binding.account = "root".into()),
+            current,
+            "different account",
+        ),
+        // Another key, and the login key in another namespace: the probe's,
+        // and that of the typed grants of earlier builds.
+        (
+            sign_test_directive(
+                &directive(&|_| {}),
                 &generate_test_key("other").unwrap(),
-                2,
-                delegation::SSHSIG_NAMESPACE,
+                crate::directive::NAMESPACE,
             ),
             current,
             "does not trust",
         ),
         (
-            sign(&login, 2, keys::PROBE_NAMESPACE),
+            sign_test_directive(&directive(&|_| {}), &login, keys::PROBE_NAMESPACE),
             current,
             "another purpose",
         ),
+        (
+            sign_test_directive(&directive(&|_| {}), &login, "syq-grant@greaber.github"),
+            current,
+            "another purpose",
+        ),
+        // A signed command whose rules cannot be derived: a copy to this
+        // machine.
+        (
+            signed(&|directive| {
+                directive.command = ["cp", "--from", "host-a", "--src", "x", "--into", "/b"]
+                    .map(|arg| arg.as_bytes().to_vec())
+                    .to_vec()
+            }),
+            current,
+            "copies to this machine",
+        ),
     ];
-    for (envelope, receiver, expected) in refused {
-        let Err(error) = admit(&state, &config, receiver, &envelope) else {
-            panic!("a grant was admitted: {expected}");
+    for (encoded, receiver, expected) in refused {
+        let Err(error) = verify(&state, &config, receiver, &encoded, home) else {
+            panic!("a directive was admitted: {expected}");
         };
         assert!(format!("{error:#}").contains(expected), "{error:#}");
         assert_eq!(recorded(), 0);
@@ -931,19 +985,26 @@ fn a_grant_is_recorded_only_after_every_check_passes() {
     // A certificate that has expired.
     config.signer =
         delegation::TrustedSigner::new(login.public_key(), None, Some(1_000_000)).unwrap();
-    let error = admit(&state, &config, current, &valid).err().unwrap();
+    let error = verify(&state, &config, current, &valid, home)
+        .err()
+        .unwrap();
     assert!(format!("{error:#}").contains("expired"), "{error:#}");
     assert_eq!(recorded(), 0);
 
     config.signer = delegation::TrustedSigner::new(login.public_key(), None, None).unwrap();
-    admit(&state, &config, current, &valid).unwrap();
+    let ((grant, _), _) = verify(&state, &config, current, &valid, home).unwrap();
+    assert_eq!(grant.copy.destination, b"/backup");
     assert_ne!(recorded(), 0);
-    let error = admit(&state, &config, current, &valid).err().unwrap();
+    let error = verify(&state, &config, current, &valid, home)
+        .err()
+        .unwrap();
     assert!(format!("{error:#}").contains("already"), "{error:#}");
     // Without the record, nothing is admitted, and the error names the fix.
     fs::remove_dir_all(state.join("replay")).unwrap();
-    let fresh = sign(&login, 2, delegation::SSHSIG_NAMESPACE);
-    let error = admit(&state, &config, current, &fresh).err().unwrap();
+    let fresh = signed(&|_| {});
+    let error = verify(&state, &config, current, &fresh, home)
+        .err()
+        .unwrap();
     assert!(
         format!("{error:#}").contains("syq receiver enroll backup@HOST"),
         "{error:#}"
@@ -1096,37 +1157,21 @@ fn protected_destinations_are_refused_from_their_names_before_enrolling() {
     // What the server's login reported: no XDG variables, no TMPDIR.
     let receiving = server_receiving_state(home, "1000", "Linux", ("", "", ""));
     let refused = |placement: &str, destination: &str| {
-        let contents = placement == "contents";
-        let source = Location::parse(if contents {
-            "host-a:data/"
-        } else {
-            "host-a:data"
-        })
-        .unwrap();
-        let mut args = Args::try_parse_from([
-            "syq rsync",
-            "-r",
-            if contents {
-                "host-a:data/"
-            } else {
-                "host-a:data"
-            },
-            &format!("host-b:{destination}"),
-        ])
-        .unwrap();
-        args.normalize();
-        if placement == "as" {
-            args.placement = Placement::As;
-        }
-        refuse_protected_destination(
-            &args,
-            std::slice::from_ref(&source),
-            destination.as_bytes(),
-            "backup",
-            (home, &receiving),
-        )
-        .err()
-        .map(|error| error.to_string())
+        let mut directive = test_directive(EnrollmentId::random(), 1, "backup");
+        let source: &[&str] = match placement {
+            "contents" => &["--srcs-in", "data"],
+            _ => &["--src", "data"],
+        };
+        let placement = if placement == "as" { "--as" } else { "--into" };
+        directive.command = ["cp", "--from", "host-a"]
+            .iter()
+            .chain(source)
+            .chain(&["--to", "host-b", placement, destination])
+            .map(|arg| arg.as_bytes().to_vec())
+            .collect();
+        checked_destination(&directive, (home, &receiving))
+            .err()
+            .map(|error| format!("{error:#}"))
     };
     for (placement, destination, label) in [
         ("into", "~/.ssh", "SSH configuration directory"),
@@ -1262,18 +1307,11 @@ fn receivers_refuse_protected_paths_beneath_a_recursive_destination_only() {
         args.placement = placement;
         let location = Location::parse(source).unwrap();
         let named = destination.as_os_str().as_bytes();
-        let grant = grant_for(
-            &args,
-            std::slice::from_ref(&location),
-            (EnrollmentId::random(), 1),
-            "receiver",
-            named,
-        )
-        .unwrap();
+        let grant = copy_operation(&args, std::slice::from_ref(&location), named).unwrap();
         ConfinedRoot::resolve(named, &protected).and_then(|confined| {
             RestrictedAuthority::new(
                 confined,
-                grant,
+                test_grant(grant),
                 GrantConstraints::default(),
                 [0; 32],
                 generate_results_key(EnrollmentId::random()).unwrap(),
@@ -1329,18 +1367,11 @@ fn named_entries_are_checked_where_they_really_are() {
         args.placement = Placement::Into;
         let location = Location::parse(source).unwrap();
         let named = destination.as_os_str().as_bytes();
-        let grant = grant_for(
-            &args,
-            std::slice::from_ref(&location),
-            (EnrollmentId::random(), 1),
-            "receiver",
-            named,
-        )
-        .unwrap();
+        let grant = copy_operation(&args, std::slice::from_ref(&location), named).unwrap();
         ConfinedRoot::resolve(named, protected).and_then(|confined| {
             RestrictedAuthority::new(
                 confined,
-                grant,
+                test_grant(grant),
                 GrantConstraints::default(),
                 [0; 32],
                 generate_results_key(EnrollmentId::random()).unwrap(),
@@ -1421,18 +1452,11 @@ fn the_copys_lookups_reuse_the_authoritys_directory_listings() {
     args.normalize();
     args.placement = Placement::Into;
     let named = destination.as_os_str().as_bytes();
-    let grant = grant_for(
-        &args,
-        &sources,
-        (EnrollmentId::random(), 1),
-        "receiver",
-        named,
-    )
-    .unwrap();
+    let grant = copy_operation(&args, &sources, named).unwrap();
     let protected = Vec::new();
     let authority = RestrictedAuthority::new(
         ConfinedRoot::resolve(named, &protected).unwrap(),
-        grant,
+        test_grant(grant),
         GrantConstraints::default(),
         [0; 32],
         generate_results_key(EnrollmentId::random()).unwrap(),
@@ -2097,14 +2121,8 @@ fn test_authority_with_options(
     }
     let grant = Grant {
         enrollment_id: id,
-        target_login: "receiver".into(),
-        signer: signer_name(id, 1),
         request_id: RequestId::fresh(1_900_000_000).unwrap(),
-        issued_at: 1,
-        not_before: 1,
-        start_by: 100,
-        finish_by: 100,
-        operation: GrantOperation::Copy(CopyOperation {
+        copy: CopyOperation {
             destination: destination.as_os_str().as_bytes().to_vec(),
             mutation_scopes: vec![MutationScope {
                 path: destination.as_os_str().as_bytes().to_vec(),
@@ -2127,7 +2145,6 @@ fn test_authority_with_options(
                 preserve_devices: false,
                 compare_existing_by_content: false,
                 dry_run: false,
-                verify_only: false,
                 compressed_transport: true,
                 tcp_port_lo: 47_600,
                 tcp_port_hi: 47_699,
@@ -2140,7 +2157,7 @@ fn test_authority_with_options(
                 max_connections: TEST_AUTHORITY_MAX_CONNECTIONS,
                 max_deletions: u64::from(deletion != DeletionPolicy::Forbid) * 2,
             },
-        }),
+        },
     };
     let (results_key, receipt_policy) = match results {
         Some((key, policy)) => (key, policy),
@@ -2262,20 +2279,80 @@ fn relative_destination_resolution_rejects_parent_components() {
 }
 
 #[test]
-fn receiver_command_accepts_only_one_encoded_signed_grant() {
-    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"signed grant");
-    assert_eq!(
-        decode_receiver_command(&format!("syq --server --restricted-grant={encoded}")).unwrap(),
-        b"signed grant"
-    );
-    assert!(
-        decode_receiver_command(&format!("syq --server --restricted-grant={encoded} extra"))
-            .is_err()
-    );
-    assert!(decode_receiver_command(&format!(
-        "env X=1 syq --server --restricted-grant={encoded}"
-    ))
-    .is_err());
+fn a_session_reads_exactly_one_bounded_first_frame() {
+    use std::io::Write as _;
+    let deadline = || Instant::now() + std::time::Duration::from_secs(5);
+    for admission in [
+        Admission::Copy(b"signed directive".to_vec()),
+        Admission::Worker("w-ticket:secret".into()),
+    ] {
+        let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        writer.write_all(&admission.frame().unwrap()).unwrap();
+        writer.write_all(b"SYQ preamble").unwrap();
+        assert_eq!(Admission::read(&mut reader, deadline()).unwrap(), admission);
+        // What follows the frame stays for the session.
+        let mut rest = [0; 12];
+        reader.read_exact(&mut rest).unwrap();
+        assert_eq!(&rest, b"SYQ preamble");
+    }
+    let refused = |bytes: &[u8], within: std::time::Duration| {
+        let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        writer.write_all(bytes).unwrap();
+        Admission::read(&mut reader, Instant::now() + within)
+            .unwrap_err()
+            .to_string()
+    };
+    let long = std::time::Duration::from_secs(5);
+    // Lengths outside the bounds are refused before anything else is read.
+    assert!(refused(&[0, 0, 0, 0], long).contains("unsupported length"));
+    assert!(refused(&u32::MAX.to_be_bytes(), long).contains("unsupported length"));
+    // An unknown kind, and trailing bytes inside the frame.
+    assert!(refused(&[0, 0, 0, 2, 2, 0], long).contains("decode"));
+    let mut trailing = Admission::Worker("w".into()).frame().unwrap();
+    trailing.push(0);
+    trailing[3] += 1;
+    assert!(refused(&trailing, long).contains("trailing"));
+    // A session that sends nothing, or only part of its frame, is dropped at
+    // the deadline.
+    let short = std::time::Duration::from_millis(200);
+    let started = Instant::now();
+    refused(&[], short);
+    refused(&[0, 0, 0, 9, 0], short);
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+}
+
+#[test]
+fn unverified_sessions_share_a_few_slots_until_the_deadline() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let state = temporary.path().join("state");
+    fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+    let deadline = |milliseconds| Instant::now() + std::time::Duration::from_millis(milliseconds);
+    let first = UnverifiedSlot::take(&state, 2, deadline(1000)).unwrap();
+    let second = UnverifiedSlot::take(&state, 2, deadline(1000)).unwrap();
+    let started = Instant::now();
+    let error = UnverifiedSlot::take(&state, 2, deadline(200))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("2 other connections"), "{error}");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+    // A slot frees when its session is verified or ends, and a session
+    // waiting for one takes it.
+    let waiting = {
+        let state = state.clone();
+        std::thread::spawn(move || UnverifiedSlot::take(&state, 2, deadline(5000)).map(drop))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    drop(first);
+    waiting.join().unwrap().unwrap();
+    drop(second);
+    // A slot that is not a private regular file is refused.
+    fs::set_permissions(
+        state.join("session-slot-0"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert!(UnverifiedSlot::take(&state, 2, deadline(100)).is_err());
 }
 
 #[test]
@@ -2662,7 +2739,7 @@ fn signed_in_place_policies_admit_in_place_and_staged_file_mutations() {
     // requests are admitted too. The policy of earlier releases is read
     // as the narrower one. A staged policy admits no in-place request.
     for (policy, admits_in_place) in [
-        (PublicationPolicy::InPlace, true),
+        (PublicationPolicy::InPlaceNew, true),
         (PublicationPolicy::InPlaceNew, true),
         (PublicationPolicy::AtomicStaged, false),
     ] {
@@ -3551,15 +3628,8 @@ fn timestamp_selection_preserves_independent_existing_authority() {
         (true, ExistingDestinationPolicy::MustExist),
     ] {
         args.existing = existing;
-        let grant = grant_for(
-            &args,
-            &sources,
-            (EnrollmentId::random(), 1),
-            "receiver",
-            b"/destination",
-        )
-        .unwrap();
-        let GrantOperation::Copy(copy) = grant.operation;
+        let grant = copy_operation(&args, &sources, b"/destination").unwrap();
+        let copy = grant;
         assert_eq!(copy.policy.existing, policy);
         assert!(args.update);
     }
@@ -4786,7 +4856,7 @@ fn unfinished_in_place_files_are_reported_failed() {
             1024,
             0,
             FilterPolicy::default(),
-            PublicationPolicy::InPlace,
+            PublicationPolicy::InPlaceNew,
             ExistingDestinationPolicy::Replace,
             DestinationPlacement::ExactPath,
             RootExistence::Any,
@@ -4919,7 +4989,7 @@ fn a_refused_write_to_an_unfinished_file_lists_it_once() {
         1024,
         0,
         FilterPolicy::default(),
-        PublicationPolicy::InPlace,
+        PublicationPolicy::InPlaceNew,
         ExistingDestinationPolicy::Replace,
         DestinationPlacement::ExactPath,
         RootExistence::Any,
@@ -5001,7 +5071,7 @@ fn in_place_final_step_honors_the_fingerprint_the_receiver_takes_after_the_write
             1024,
             0,
             FilterPolicy::default(),
-            PublicationPolicy::InPlace,
+            PublicationPolicy::InPlaceNew,
             ExistingDestinationPolicy::Replace,
             DestinationPlacement::ExactPath,
             RootExistence::Any,
@@ -5300,16 +5370,6 @@ fn signed_root_existence_is_checked_at_redemption_and_forced_on_creation() {
         RootExistence::Existing,
     )
     .unwrap();
-
-    // The one existing-object policy the receiver cannot enforce is
-    // refused when the grant is redeemed rather than trusted.
-    assert!(existence_authority(
-        &root,
-        ExistingDestinationPolicy::UpdateIfOlder,
-        DestinationPlacement::ExactPath,
-        RootExistence::Any,
-    )
-    .is_err());
 }
 
 #[test]
@@ -5890,7 +5950,7 @@ fn receiver_enforces_authorized_hashing_and_supplies_omitted_expectation() {
     assert!(authority.authorize(&mut small_put(&target), false).is_err());
 }
 
-/// A grant that allows no changes, a preview or verify-only one, never lets
+/// A grant that allows no changes, a preview, never lets
 /// the receiver create a file to learn whom its files show. Once the
 /// destination's results have ended, the request is refused.
 #[test]
@@ -5899,11 +5959,10 @@ fn grants_that_allow_no_changes_create_no_owner_probe() {
     let root = temporary.path().join("root");
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
-    for case in ["preview", "verify", "after results ended", "copy"] {
+    for case in ["preview", "after results ended", "copy"] {
         let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
         match case {
             "preview" => authority.copy.options.dry_run = true,
-            "verify" => authority.copy.options.verify_only = true,
             "after results ended" => authority.state.lock().unwrap().results_closing = true,
             _ => {}
         }
@@ -6247,15 +6306,8 @@ fn worker_authorizations_use_128_or_a_smaller_resource_limit() {
         argv.extend(setting.map(std::ffi::OsString::from));
         let args = Args::parse_args(&argv).unwrap();
         validate_restricted_args(&args).unwrap();
-        let grant = grant_for(
-            &args,
-            std::slice::from_ref(&source),
-            (EnrollmentId::random(), 1),
-            "backup",
-            b"/backup",
-        )
-        .unwrap();
-        let GrantOperation::Copy(copy) = grant.operation;
+        let grant = copy_operation(&args, std::slice::from_ref(&source), b"/backup").unwrap();
+        let copy = grant;
         assert_eq!(copy.limits.max_connections, expected);
     }
     let args = Args::parse_args(
@@ -6325,17 +6377,14 @@ fn ceiling_ranges_are_checked_before_any_enrollment_side_effect() {
     }
 
     // A zero deletion budget signs a grant that forbids deletion outright.
-    let id = EnrollmentId::random();
     let source = Location::parse("host-a:source").unwrap();
-    let grant = grant_for(
+    let grant = copy_operation(
         &parse(&["--delete", "--max-delete", "0"]),
         std::slice::from_ref(&source),
-        (id, 1),
-        "backup",
         b"/backup",
     )
     .unwrap();
-    let GrantOperation::Copy(copy) = &grant.operation;
+    let copy = &grant;
     assert_eq!(copy.policy.deletion, DeletionPolicy::Forbid);
     assert_eq!(copy.limits.max_deletions, 0);
 }
@@ -6359,20 +6408,14 @@ fn restricted_routes_accept_a_persistence_scope_and_a_zero_size_limit() {
     validate_restricted_args(&scoped).unwrap();
     let empty_only = parse(&["--max-size", "0"]);
     validate_restricted_args(&empty_only).unwrap();
-    let id = EnrollmentId::random();
-    let grant = grant_for(
+    let copy = copy_operation(
         &empty_only,
         &[Location::parse("host-a:source").unwrap()],
-        (id, 1),
-        "backup",
         b"/backup",
     )
     .unwrap();
-    let GrantOperation::Copy(copy) = &grant.operation;
     assert_eq!(copy.limits.max_file_bytes, 0);
-    let key = generate_results_key(id).unwrap();
-    let signed = delegation::sign_grant(grant, GrantConstraints::default(), &key).unwrap();
-    delegation::SignedGrantEnvelope::decode(&signed).unwrap();
+    delegation::validate_rules(&copy, &mut GrantConstraints::default()).unwrap();
 }
 
 #[test]
@@ -6431,21 +6474,13 @@ fn native_comparison_block_size_sets_the_signed_receiver_limit() {
     )
     .unwrap();
     let source = Location::parse("host-a:source").unwrap();
-    let grant = grant_for(
-        &args,
-        &[source],
-        (EnrollmentId::random(), 1),
-        "backup",
-        b"/backup",
-    )
-    .unwrap();
-    let GrantOperation::Copy(copy) = grant.operation;
+    let grant = copy_operation(&args, &[source], b"/backup").unwrap();
+    let copy = grant;
     assert_eq!(copy.limits.hash_block_bytes, 64 << 10);
 }
 
 #[test]
 fn explicit_ceilings_are_signed_and_deletion_defaults_to_the_entry_ceiling() {
-    let id = EnrollmentId::random();
     let source = Location::parse("host-a:source").unwrap();
     let parse = |options: &[&str]| {
         let mut argv = vec!["syq rsync", "-r"];
@@ -6456,26 +6491,21 @@ fn explicit_ceilings_are_signed_and_deletion_defaults_to_the_entry_ceiling() {
         args
     };
 
-    // Defaults are the wide built-in ceilings and the 24-hour validity.
+    // Defaults are the wide built-in ceilings, and a directive's 24-hour
+    // validity and 7-day finish window.
     let default_args = parse(&[]);
-    let default_grant = grant_for(
-        &default_args,
-        std::slice::from_ref(&source),
-        (id, 1),
-        "backup",
-        b"/backup",
-    )
-    .unwrap();
-    let GrantOperation::Copy(default_copy) = &default_grant.operation;
+    let default_copy =
+        copy_operation(&default_args, std::slice::from_ref(&source), b"/backup").unwrap();
     assert_eq!(default_copy.limits.max_entries, DEFAULT_MAX_ENTRIES);
     assert_eq!(default_copy.limits.max_total_bytes, DEFAULT_MAX_BYTES);
     assert_eq!(default_copy.limits.max_file_bytes, DEFAULT_MAX_BYTES);
+    let directive = test_directive(EnrollmentId::random(), 1, "backup");
     assert_eq!(
-        default_grant.start_by - default_grant.not_before,
-        GRANT_VALIDITY_SECONDS
+        directive.start_by - directive.not_before,
+        crate::directive::VALIDITY_SECONDS
     );
     assert_eq!(
-        default_grant.finish_by - default_grant.issued_at,
+        directive.finish_by - directive.issued_at,
         FINISH_WINDOW_SECONDS
     );
 
@@ -6484,65 +6514,45 @@ fn explicit_ceilings_are_signed_and_deletion_defaults_to_the_entry_ceiling() {
     let mut ceilings = parse(&["--max-size", "3M"]);
     ceilings.receiver_max_entries = Some(12);
     ceilings.receiver_max_bytes = Some(2 << 20);
-    let grant = grant_for(
-        &ceilings,
-        std::slice::from_ref(&source),
-        (id, 1),
-        "backup",
-        b"/backup",
-    )
-    .unwrap();
-    let GrantOperation::Copy(copy) = &grant.operation;
+    let grant = copy_operation(&ceilings, std::slice::from_ref(&source), b"/backup").unwrap();
+    let copy = &grant;
     assert_eq!(copy.limits.max_entries, 12);
     assert_eq!(copy.limits.max_total_bytes, 2 << 20);
     assert_eq!(copy.limits.max_file_bytes, 2 << 20);
-    assert_eq!(grant.issued_at - grant.not_before, CLOCK_SKEW_SECONDS);
+    assert_eq!(
+        directive.issued_at - directive.not_before,
+        CLOCK_SKEW_SECONDS
+    );
 
     // Without --max-delete, pruning may remove as many entries as the copy
     // may touch; a stated budget is capped by the entry ceiling so the
     // grant stays self-consistent.
     let mut unbounded = parse(&["--delete"]);
     unbounded.receiver_max_entries = Some(30);
-    let grant = grant_for(
-        &unbounded,
-        std::slice::from_ref(&source),
-        (id, 1),
-        "backup",
-        b"/backup",
-    )
-    .unwrap();
-    let GrantOperation::Copy(copy) = &grant.operation;
+    let grant = copy_operation(&unbounded, std::slice::from_ref(&source), b"/backup").unwrap();
+    let copy = &grant;
     assert_eq!(copy.policy.deletion, DeletionPolicy::DeleteDestinationOnly);
     assert_eq!(copy.limits.max_deletions, 30);
     let mut bounded = parse(&["--delete", "--max-delete", "40"]);
     bounded.receiver_max_entries = Some(30);
-    let grant = grant_for(
-        &bounded,
-        std::slice::from_ref(&source),
-        (id, 1),
-        "backup",
-        b"/backup",
-    )
-    .unwrap();
-    let GrantOperation::Copy(copy) = &grant.operation;
+    let grant = copy_operation(&bounded, std::slice::from_ref(&source), b"/backup").unwrap();
+    let copy = &grant;
     assert_eq!(copy.policy.deletion, DeletionPolicy::DeleteDestinationOnly);
     assert_eq!(copy.limits.max_deletions, 30);
     // A read-only run plans no deletion, so it needs no budget.
     let preview = parse(&["--delete", "--dry-run"]);
-    let grant = grant_for(&preview, &[source], (id, 1), "backup", b"/backup").unwrap();
-    let GrantOperation::Copy(copy) = &grant.operation;
+    let grant = copy_operation(&preview, &[source], b"/backup").unwrap();
+    let copy = &grant;
     assert_eq!(copy.policy.deletion, DeletionPolicy::Forbid);
 }
 
 #[test]
 fn signed_scopes_distinguish_named_children_from_directory_contents() {
-    let id = EnrollmentId::random();
     let mut named_args =
         Args::try_parse_from(["syq rsync", "-r", "host-a:source", "host-b:/backup"]).unwrap();
     named_args.normalize();
     let named_source = Location::parse("host-a:source").unwrap();
-    let named = grant_for(&named_args, &[named_source], (id, 1), "backup", b"/backup").unwrap();
-    let GrantOperation::Copy(named) = named.operation;
+    let named = copy_operation(&named_args, &[named_source], b"/backup").unwrap();
     assert_eq!(
         named.mutation_scopes,
         vec![
@@ -6561,15 +6571,7 @@ fn signed_scopes_distinguish_named_children_from_directory_contents() {
         Args::try_parse_from(["syq rsync", "-r", "host-a:source/", "host-b:/backup"]).unwrap();
     contents_args.normalize();
     let contents_source = Location::parse("host-a:source/").unwrap();
-    let contents = grant_for(
-        &contents_args,
-        &[contents_source],
-        (id, 1),
-        "backup",
-        b"/backup",
-    )
-    .unwrap();
-    let GrantOperation::Copy(contents) = contents.operation;
+    let contents = copy_operation(&contents_args, &[contents_source], b"/backup").unwrap();
     assert_eq!(
         contents.mutation_scopes,
         vec![MutationScope {
@@ -6582,9 +6584,7 @@ fn signed_scopes_distinguish_named_children_from_directory_contents() {
         Args::try_parse_from(["syq rsync", "host-a:file", "host-b:/backup"]).unwrap();
     nonrecursive_args.normalize();
     let file = Location::parse("host-a:file").unwrap();
-    let nonrecursive =
-        grant_for(&nonrecursive_args, &[file], (id, 1), "backup", b"/backup").unwrap();
-    let GrantOperation::Copy(nonrecursive) = nonrecursive.operation;
+    let nonrecursive = copy_operation(&nonrecursive_args, &[file], b"/backup").unwrap();
     assert!(nonrecursive
         .mutation_scopes
         .iter()
@@ -8545,7 +8545,7 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
             fs::set_permissions(target.join(name), fs::Permissions::from_mode(mode)).unwrap();
         }
         let publication = if inplace {
-            PublicationPolicy::InPlace
+            PublicationPolicy::InPlaceNew
         } else {
             PublicationPolicy::AtomicStaged
         };
@@ -9536,7 +9536,7 @@ fn in_place_updates_need_a_grant_for_them() {
     };
     for (publication, allowed) in [
         (PublicationPolicy::AtomicStaged, false),
-        (PublicationPolicy::InPlace, false),
+        (PublicationPolicy::InPlaceNew, false),
         (PublicationPolicy::InPlaceNew, false),
         (PublicationPolicy::InPlaceUpdate, true),
     ] {
@@ -9696,7 +9696,7 @@ fn both_receivers_restore_set_id_bits_after_writing_in_place() {
         fs::write(target.join("program"), b"old program").unwrap();
         fs::set_permissions(target.join("program"), fs::Permissions::from_mode(0o4755)).unwrap();
         let mut receiver =
-            ParityReceiver::new(&root, restricted, false, PublicationPolicy::InPlace);
+            ParityReceiver::new(&root, restricted, false, PublicationPolicy::InPlaceNew);
         let path = path_bytes(&target.join("program"));
         let data = b"new program".to_vec();
         receiver.send(Request::Prepare {
@@ -9778,7 +9778,7 @@ fn both_receivers_limit_a_new_in_place_file_by_a_narrower_default_acl() {
             return;
         }
         let mut receiver =
-            ParityReceiver::new(&root, restricted, false, PublicationPolicy::InPlace);
+            ParityReceiver::new(&root, restricted, false, PublicationPolicy::InPlaceNew);
         let path = path_bytes(&target.join("new"));
         let data = b"new contents".to_vec();
         let scanned = proto::ScannedDestination::Absent;
@@ -10280,7 +10280,7 @@ fn a_new_file_under_an_in_place_grant_is_staged_and_published_without_replacing(
         1024,
         0,
         FilterPolicy::default(),
-        PublicationPolicy::InPlace,
+        PublicationPolicy::InPlaceNew,
         ExistingDestinationPolicy::Replace,
         DestinationPlacement::ExactPath,
         RootExistence::New,
@@ -10379,7 +10379,7 @@ fn a_refused_in_place_preparation_keeps_a_new_file_staged() {
         1024,
         0,
         FilterPolicy::default(),
-        PublicationPolicy::InPlace,
+        PublicationPolicy::InPlaceNew,
         ExistingDestinationPolicy::Replace,
         DestinationPlacement::ExactPath,
         RootExistence::New,
@@ -10452,7 +10452,7 @@ fn a_new_file_inside_an_in_place_grant_is_staged_and_replaces_nothing() {
         1024,
         0,
         FilterPolicy::default(),
-        PublicationPolicy::InPlace,
+        PublicationPolicy::InPlaceNew,
         ExistingDestinationPolicy::Replace,
         DestinationPlacement::DirectoryContents,
         RootExistence::Any,
@@ -10556,7 +10556,7 @@ fn an_in_place_as_new_root_that_exists_is_refused_and_unchanged() {
             1024,
             0,
             FilterPolicy::default(),
-            PublicationPolicy::InPlace,
+            PublicationPolicy::InPlaceNew,
             ExistingDestinationPolicy::Replace,
             DestinationPlacement::ExactPath,
             RootExistence::New,
@@ -11069,17 +11069,15 @@ fn follow_dst_compares_absolute_link_targets_with_the_real_directory() {
         Args::try_parse_from(["syq rsync", "-r", "host-a:data/", "host-b:/unused"]).unwrap();
     args.normalize();
     let source = Location::parse("host-a:data/").unwrap();
-    let grant = grant_for(
+    let grant = copy_operation(
         &args,
         std::slice::from_ref(&source),
-        (EnrollmentId::random(), 1),
-        "receiver",
         named.as_os_str().as_bytes(),
     )
     .unwrap();
     let authority = RestrictedAuthority::new(
         ConfinedRoot::resolve(named.as_os_str().as_bytes(), &[]).unwrap(),
-        grant,
+        test_grant(grant),
         GrantConstraints {
             extra_options: crate::delegation::ExtraCopyOptions {
                 follow_dst: true,
@@ -11214,7 +11212,7 @@ fn follow_dst_is_signed_for_into_placements() {
         argv.extend(options.iter().map(std::ffi::OsString::from));
         let args = Args::parse_args(&argv).unwrap();
         validate_restricted_args(&args).unwrap();
-        let constraints = crate::restricted::grant::extra_copy_options(&args);
+        let constraints = crate::directive::extra_copy_options(&args);
         assert_eq!(constraints.follow_dst, follow, "{options:?}");
     }
     let args = Args::parse_args(
@@ -11462,7 +11460,7 @@ fn files_count_against_the_entry_limit_from_their_first_change() {
             0,
             FilterPolicy::default(),
             if inplace {
-                PublicationPolicy::InPlace
+                PublicationPolicy::InPlaceNew
             } else {
                 PublicationPolicy::AtomicStaged
             },
@@ -11766,7 +11764,7 @@ fn an_in_place_preparation_that_only_looks_changes_nothing() {
         1024,
         0,
         FilterPolicy::default(),
-        PublicationPolicy::InPlace,
+        PublicationPolicy::InPlaceNew,
     );
     let mut ops = authority.test_ops();
     let changes = || authority.changes.load(std::sync::atomic::Ordering::Relaxed);

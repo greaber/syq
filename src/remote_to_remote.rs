@@ -806,6 +806,9 @@ pub(crate) const RECEIVER_KNOWN_HOSTS: &str = "SYQ_INTERNAL_NATIVE_RECEIVER_KNOW
 /// enrollment's entry key. The key never appears in arguments or the
 /// environment.
 pub(crate) const ENTRY_KEY_STDIN: &str = "SYQ_INTERNAL_NATIVE_ENTRY_KEY";
+/// Set with the entry key: this many bytes of the copy's signed directive
+/// follow it on the coordinator's input.
+pub(crate) const DIRECTIVE_STDIN: &str = "SYQ_INTERNAL_NATIVE_DIRECTIVE";
 const RECEIVER_HOST_ALIAS: &str = "syq-enrolled-receiver";
 /// The identity of the coordinator's SSH command to the receiver until the
 /// coordinator puts its copy of the entry key there. An SSH command that
@@ -813,6 +816,40 @@ const RECEIVER_HOST_ALIAS: &str = "syq-enrolled-receiver";
 const ENTRY_KEY_PLACEHOLDER: &str = "IdentityFile=none";
 /// The longest entry key a coordinator reads: a 16,384-bit RSA key.
 const MAX_ENTRY_KEY_BYTES: usize = 16 * 1024;
+
+/// The coordinator's environment for its receiver, and the directive that
+/// follows the entry key on its input.
+pub(crate) type ReceiverInputs = (Vec<(&'static str, String)>, Option<Vec<u8>>);
+
+/// What the coordinator learns of the receiver from its environment, and
+/// the directive it reads from its input after the entry key. An enrolled
+/// receiver's entry key and directive never appear in the coordinator's
+/// command line or environment, only their lengths do; a copy between two
+/// servers that hostX approved passes only its marker.
+pub(crate) fn receiver_inputs(
+    restricted_grant: Option<&str>,
+    entry_key: Option<&[u8]>,
+) -> Result<ReceiverInputs> {
+    Ok(match (restricted_grant, entry_key) {
+        (Some(directive), Some(key)) => {
+            let directive = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(directive)
+                .context("decode the copy's directive")?;
+            (
+                vec![
+                    (ENTRY_KEY_STDIN, key.len().to_string()),
+                    (DIRECTIVE_STDIN, directive.len().to_string()),
+                ],
+                Some(directive),
+            )
+        }
+        (Some(marker), None) => (
+            vec![("SYQ_INTERNAL_NATIVE_RESTRICTED_GRANT", marker.to_owned())],
+            None,
+        ),
+        (None, _) => (Vec::new(), None),
+    })
+}
 
 /// Materialize the laptop's trusted destination keys and the entry key on
 /// the coordinator, in a private temporary directory that lives through all
@@ -824,8 +861,20 @@ pub(crate) fn prepare_receiver_ssh(
         .entry_key_stdin
         .take()
         .filter(|_| args.delegated)
-        .map(read_entry_key)
+        .map(|length| read_input("entry key", length, MAX_ENTRY_KEY_BYTES))
         .transpose()?;
+    if let Some(key) = &entry_key {
+        crate::restricted::parse_entry_key(key)?;
+        // The copy's directive follows the key; this coordinator presents
+        // it to the receiver as the first frame of its control connection.
+        let length = args
+            .directive_stdin
+            .take()
+            .context("an entry key comes with the copy's directive")?;
+        let directive = read_input("directive", length, crate::directive::MAX_SIGNED_BYTES)?;
+        args.restricted_grant =
+            Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(directive.as_slice()));
+    }
     let Some(known_hosts) = args.receiver_known_hosts.take() else {
         anyhow::ensure!(
             entry_key.is_none(),
@@ -838,28 +887,25 @@ pub(crate) fn prepare_receiver_ssh(
     prepare_receiver_ssh_with(args, &known_hosts, &entry_key).map(Some)
 }
 
-/// Read the entry key the requesting syq sends first on this coordinator's
-/// input, before any manifest.
-fn read_entry_key(length: usize) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+/// Read `length` bytes of what the requesting syq sends first on this
+/// coordinator's input, before any manifest: the entry key, then the
+/// directive.
+fn read_input(label: &str, length: usize, maximum: usize) -> Result<zeroize::Zeroizing<Vec<u8>>> {
     use std::os::fd::AsFd;
-    anyhow::ensure!(
-        (1..=MAX_ENTRY_KEY_BYTES).contains(&length),
-        "invalid entry key length"
-    );
-    // Read exactly the key from the descriptor, without buffering any of the
-    // input that follows it.
+    anyhow::ensure!((1..=maximum).contains(&length), "invalid {label} length");
+    // Read exactly these bytes from the descriptor, without buffering any of
+    // the input that follows them.
     let mut input = std::fs::File::from(
         std::io::stdin()
             .as_fd()
             .try_clone_to_owned()
             .context("take the requesting syq's input")?,
     );
-    let mut key = zeroize::Zeroizing::new(vec![0; length]);
+    let mut bytes = zeroize::Zeroizing::new(vec![0; length]);
     input
-        .read_exact(&mut key)
-        .context("the requesting syq ended before sending the entry key")?;
-    crate::restricted::parse_entry_key(&key)?;
-    Ok(key)
+        .read_exact(&mut bytes)
+        .with_context(|| format!("the requesting syq ended before sending the {label}"))?;
+    Ok(bytes)
 }
 
 fn prepare_receiver_ssh_with(
@@ -1144,6 +1190,7 @@ fn run_remote(
             .then(|| {
                 crate::restricted::prepare_transfer(
                     args,
+                    crate::approval_command::current()?,
                     srcs,
                     dst,
                     &coordinator_policy.login_user,
@@ -1167,13 +1214,13 @@ fn run_remote(
                 DestinationAuthentication::Receiver,
             ));
             restricted_destination_path = Some(prepared.destination);
-            restricted_grant = Some(prepared.grant);
+            restricted_grant = Some(prepared.directive);
             destination_results = Some(crate::destination_results::Expectation {
                 public_key: prepared.results_public_key.clone(),
                 binding: crate::destination_results::Binding {
                     enrollment_id: prepared.enrollment_id,
                     request_id: prepared.request_id,
-                    grant_digest: prepared.grant_digest,
+                    grant_digest: prepared.digest,
                 },
                 secret: prepared.recipient_secret,
                 records: results.is_some(),
@@ -1520,14 +1567,13 @@ fn run_remote(
                 .to_string(),
         ));
     }
-    if let Some(grant) = &restricted_grant {
-        internal_environment.push(("SYQ_INTERNAL_NATIVE_RESTRICTED_GRANT", grant.clone()));
-    }
+    let (receiver_environment, directive) = receiver_inputs(
+        restricted_grant.as_deref(),
+        entry_key.as_deref().map(Vec::as_slice),
+    )?;
+    internal_environment.extend(receiver_environment);
     if let Some(known_hosts) = receiver_known_hosts {
         internal_environment.push((RECEIVER_KNOWN_HOSTS, known_hosts));
-    }
-    if let Some(key) = &entry_key {
-        internal_environment.push((ENTRY_KEY_STDIN, key.len().to_string()));
     }
     // Results come back as lines on the coordinator's output, marked with a
     // token file names printed there cannot guess.
@@ -1691,11 +1737,14 @@ fn run_remote(
         let input = child.stdin.take().map(|mut stdin| {
             let mapping = args.mapping_contents.clone();
             let entry_key = entry_key.clone();
+            let directive = directive.clone();
             std::thread::spawn(move || {
-                // The entry key comes first; the coordinator reads exactly
-                // its length before anything else reads its input.
-                if let Some(key) = entry_key {
+                // The entry key and the directive come first; the
+                // coordinator reads exactly their lengths before anything
+                // else reads its input.
+                if let (Some(key), Some(directive)) = (entry_key, directive) {
                     stdin.write_all(&key)?;
+                    stdin.write_all(&directive)?;
                 }
                 if let Some(mapping) = mapping {
                     stdin.write_all(&mapping.contents)?;

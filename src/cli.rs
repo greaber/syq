@@ -538,7 +538,8 @@ pub struct Args {
     /// Whether --syq-pscope was supplied rather than selected by the user-level policy
     #[arg(skip)]
     pub pscope_explicit: bool,
-    /// Signed receiver grant forwarded to a native source-host coordinator
+    /// An enrolled receiver's signed directive (base64url), or the marker
+    /// of a route through a receiving machine
     #[arg(skip)]
     pub restricted_grant: Option<String>,
     /// Laptop-trusted destination keys for the restricted coordinator's SSH connections
@@ -549,6 +550,10 @@ pub struct Args {
     /// restricted receiver.
     #[arg(skip)]
     pub(crate) entry_key_stdin: Option<usize>,
+    /// The signed directive's length, which follows the entry key on the
+    /// coordinator's input.
+    #[arg(skip)]
+    pub(crate) directive_stdin: Option<usize>,
     /// Terminal width for a native remote coordinator's progress display
     #[arg(skip)]
     pub width: Option<usize>,
@@ -3228,6 +3233,8 @@ fn apply_internal_native_direct(args: &mut Args) -> Result<()> {
             })
             .transpose()
     };
+    // Only the marker of a copy between two servers that hostX approved
+    // travels here; an enrolled receiver's directive arrives on the input.
     args.restricted_grant = utf8("SYQ_INTERNAL_NATIVE_RESTRICTED_GRANT")?;
     args.results_token = utf8(crate::destination_results::relay::TOKEN_ENV)?;
     if let Some(token) = &args.results_token {
@@ -3242,6 +3249,13 @@ fn apply_internal_native_direct(args: &mut Args) -> Result<()> {
             bytes
                 .parse()
                 .map_err(|_| anyhow::anyhow!("invalid internal entry key length"))
+        })
+        .transpose()?;
+    args.directive_stdin = utf8(crate::remote_to_remote::DIRECTIVE_STDIN)?
+        .map(|bytes| {
+            bytes
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid internal directive length"))
         })
         .transpose()?;
     args.plan_source_host = utf8("SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST")?;

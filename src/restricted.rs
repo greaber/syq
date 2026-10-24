@@ -1,11 +1,12 @@
-//! End-to-end enrollment and signed restricted-transfer integration.
+//! Enrollments and the receivers that enforce restricted copies.
 
-use crate::cli::{Args, Existence, Location, Placement};
+use crate::cli::{Args, Location};
 use crate::delegation::{
-    self, CopyLimits, CopyOperation, CopyOptions, CopyPolicy, DeletionPolicy, DestinationPlacement,
-    DirectoryWidening, ExistingDestinationPolicy, FilterPolicy, Grant, GrantConstraints,
-    GrantOperation, MutationScope, PublicationPolicy, RequestId, RootExistence,
+    self, CopyOperation, DeletionPolicy, DestinationPlacement, DirectoryWidening,
+    ExistingDestinationPolicy, FilterPolicy, Grant, GrantConstraints, MutationScope, RequestId,
+    RootExistence,
 };
+use crate::directive::{CLOCK_SKEW_SECONDS, FINISH_WINDOW_SECONDS};
 use crate::enrollment::{
     self, AuthorizedKeyEntry, AuthorizedKeysChange, EnrollmentId, EnrollmentPublicKey,
     EnrollmentRoute, SshEndpoint,
@@ -30,13 +31,12 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 mod active;
 mod authority;
 mod enroll;
-mod grant;
 mod install;
+mod issue;
 mod keys;
 mod privilege;
 mod receiver;
@@ -50,8 +50,8 @@ pub(crate) use temporary_key::TemporaryKey;
 
 pub(crate) use authority::*;
 use enroll::*;
-pub(crate) use grant::*;
 pub(crate) use install::*;
+pub(crate) use issue::*;
 use keys::*;
 pub(crate) use privilege::{
     privileged_receiver_message, refuse_privileged_approved_receiver, refuse_privileged_receiver,
@@ -60,7 +60,7 @@ pub(crate) use receiver::*;
 pub(crate) use ssh::start as start_ssh_workers;
 use statefs::*;
 
-// Generation 7: one enrollment per account, whose grants the user's own login
+// Generation 7: one enrollment per account, whose directives the user's own login
 // key signs. Released enrollments (generations 3 to 6, from v0.4.0 to v0.7.1)
 // keep their state in other directories; this build never reads them.
 const CONFIG_VERSION: u16 = 7;
@@ -73,13 +73,6 @@ const LOCAL_STATE: [&str; 4] = [".local", "state", "syq", "enrollments"];
 
 const MAX_STATE_FILE: usize = 256 * 1024;
 const MAX_AUTHORIZED_KEYS: usize = 16 * 1024 * 1024;
-const DEFAULT_MAX_ENTRIES: u64 = 100_000_000;
-const DEFAULT_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024 * 1024;
-/// A grant must be redeemed within this long of being issued.
-const GRANT_VALIDITY_SECONDS: i64 = 24 * 60 * 60;
-/// A transfer must finish within this long of its grant being issued.
-const FINISH_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
-const CLOCK_SKEW_SECONDS: i64 = 60;
 
 /// An enrollment's protected state on the server, in
 /// `~/.local/share/syq/enrollments/<id>/config.json`. It records no device
@@ -97,7 +90,7 @@ pub(crate) struct ReceiverEnrollment {
     pub(crate) release: String,
     pub(crate) receiver_path: String,
     pub(crate) entry_public_key: String,
-    /// The login key that signs this enrollment's grants.
+    /// The login key that signs this enrollment's directives.
     pub(crate) signer: delegation::TrustedSigner,
 }
 
@@ -194,17 +187,18 @@ pub(crate) struct PreparedTransfer {
     /// The entry key, which the coordinating server uses for every SSH
     /// connection to the receiver.
     pub(crate) entry_key: PrivateKey,
-    /// The destination as the grant names it.
+    /// The destination as the directive's rules name it.
     pub(crate) destination: Vec<u8>,
-    pub(crate) grant: String,
+    /// The signed directive, base64url-encoded.
+    pub(crate) directive: String,
     pub(crate) enrollment_id: EnrollmentId,
-    /// The nonce the grant was signed with; the results must name it.
+    /// The directive's nonce; the results must name it.
     pub(crate) request_id: RequestId,
     /// Verifier for the header of hostB's results.
     pub(crate) results_public_key: String,
-    /// This copy's recipient key for hostB's results, named in the grant.
+    /// This copy's recipient key for hostB's results, named in the directive.
     pub(crate) recipient_secret: crate::destination_results::RecipientSecret,
-    pub(crate) grant_digest: [u8; 32],
+    pub(crate) digest: [u8; 32],
 }
 
 #[cfg(test)]

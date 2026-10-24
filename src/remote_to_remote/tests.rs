@@ -1068,3 +1068,113 @@ fn an_interrupted_coordinator_removes_its_entry_key() {
     let directory = std::path::PathBuf::from(std::fs::read_to_string(&report).unwrap());
     assert!(!directory.exists(), "{} survived", directory.display());
 }
+
+/// An enrolled receiver's entry key and directive reach the coordinator on
+/// its input; its command line and environment carry only their lengths.
+#[test]
+fn the_coordinator_gets_the_entry_key_and_directive_only_on_its_input() {
+    use base64::Engine as _;
+    let directive = b"SYQDIR1\0 signed directive".to_vec();
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&directive);
+    let key = b"-----BEGIN OPENSSH PRIVATE KEY-----\nkey\n";
+    let (environment, input) = receiver_inputs(Some(&encoded), Some(key)).unwrap();
+    assert_eq!(input.as_deref(), Some(directive.as_slice()));
+    assert_eq!(
+        environment,
+        [
+            (ENTRY_KEY_STDIN, key.len().to_string()),
+            (DIRECTIVE_STDIN, directive.len().to_string()),
+        ]
+    );
+    for (_, value) in &environment {
+        assert!(!value.contains(&encoded) && !value.contains("PRIVATE KEY"));
+    }
+    // A copy between two servers that hostX approved passes its marker.
+    let marker = crate::destination::peer_bridge::GRANT;
+    let (environment, input) = receiver_inputs(Some(marker), None).unwrap();
+    assert_eq!(
+        environment,
+        [("SYQ_INTERNAL_NATIVE_RESTRICTED_GRANT", marker.to_owned())]
+    );
+    assert!(input.is_none());
+    assert_eq!(receiver_inputs(None, None).unwrap(), (Vec::new(), None));
+}
+
+/// The coordinator reads exactly the entry key and the directive from its
+/// input, and leaves what follows, the manifest and the requester's marker,
+/// for the copy.
+#[test]
+fn the_coordinator_reads_the_entry_key_and_directive_from_its_input() {
+    use base64::Engine as _;
+    use clap::Parser;
+    const CHILD: &str = "SYQ_TEST_DIRECTIVE_INPUT_CHILD";
+    let entry =
+        ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ed25519)
+            .unwrap()
+            .to_openssh(ssh_key::LineEnding::LF)
+            .unwrap();
+    let directive = b"SYQDIR1\0 the copy's directive";
+    if std::env::var_os(CHILD).is_some() {
+        let host = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let mut args = Args::parse_from(["syq", "src", "dst"]);
+        args.delegated = true;
+        args.entry_key_stdin = Some(
+            std::env::var("SYQ_TEST_ENTRY_KEY_LENGTH")
+                .unwrap()
+                .parse()
+                .unwrap(),
+        );
+        args.directive_stdin = Some(directive.len());
+        args.receiver_known_hosts = Some(format!(
+            "{RECEIVER_HOST_ALIAS} {}\n",
+            host.public_key().to_openssh().unwrap()
+        ));
+        args.rsh = Some(constrained_destination_rsh(
+            2222,
+            "ssh-ed25519",
+            DestinationAuthentication::Receiver,
+        ));
+        let _directory = prepare_receiver_ssh(&mut args).unwrap().unwrap();
+        assert_eq!(
+            args.restricted_grant.as_deref(),
+            Some(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(directive)
+                    .as_str()
+            )
+        );
+        let mut rest = Vec::new();
+        std::io::stdin().read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"manifest");
+        return;
+    }
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "remote_to_remote::tests::the_coordinator_reads_the_entry_key_and_directive_from_its_input",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("SYQ_TEST_ENTRY_KEY_LENGTH", entry.len().to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn_guarded()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    input.write_all(entry.as_bytes()).unwrap();
+    input.write_all(directive).unwrap();
+    input.write_all(b"manifest").unwrap();
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

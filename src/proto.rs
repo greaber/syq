@@ -2338,6 +2338,9 @@ pub struct FrameWriter<W: Write> {
     w: BufWriter<W>,
     pub compress: bool,
     preamble_written: bool,
+    /// Bytes sent once before the preamble: an enrolled receiver's
+    /// admission frame.
+    admission: Vec<u8>,
     compression: crate::compression::Compressor,
 }
 
@@ -2355,10 +2358,17 @@ impl<W: Write> FrameWriter<W> {
     }
 
     pub fn new(w: W, compress: bool) -> Self {
+        Self::with_admission(w, compress, Vec::new())
+    }
+
+    /// A writer whose stream starts with `admission`, which an enrolled
+    /// receiver reads before the preamble.
+    pub(crate) fn with_admission(w: W, compress: bool, admission: Vec<u8>) -> Self {
         FrameWriter {
             w: BufWriter::with_capacity(1 << 20, w),
             compress,
             preamble_written: false,
+            admission,
             compression: Self::compressor(),
         }
     }
@@ -2370,6 +2380,7 @@ impl<W: Write> FrameWriter<W> {
             w: BufWriter::with_capacity(1 << 20, w),
             compress,
             preamble_written: true,
+            admission: Vec::new(),
             compression: Self::compressor(),
         }
     }
@@ -2390,6 +2401,7 @@ impl<W: Write> FrameWriter<W> {
                     ),
                 )
             })?;
+        self.w.write_all(&std::mem::take(&mut self.admission))?;
         self.w.write_all(WIRE_PREAMBLE_MAGIC)?;
         self.w.write_all(&identity_len.to_be_bytes())?;
         self.w.write_all(identity)?;

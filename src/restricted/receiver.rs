@@ -1,4 +1,6 @@
 use super::*;
+use std::os::fd::AsFd;
+use std::time::Duration;
 
 /// The enrollment's state directory and its configuration, for the account
 /// this receiver runs as.
@@ -14,70 +16,223 @@ fn receiver_state(id: EnrollmentId) -> Result<(PathBuf, ReceiverEnrollment)> {
     Ok((state, config))
 }
 
-/// The forced command of syq's line: `--restricted-receiver
-/// --enrollment=ID --generation=N`.
-pub(crate) fn run_receiver(enrollment: &str, generation: &str) -> Result<()> {
+/// How many sessions an entry key may have open on one enrollment before
+/// they have shown a verified directive or a running copy's worker ticket.
+/// Former coordinators keep the entry key, so this bounds what they can start
+/// without a fresh directive.
+const UNVERIFIED_SESSIONS: u64 = 8;
+/// How long a session has to take one of those slots and send its first
+/// frame.
+const ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
+/// The largest first frame a session may send.
+const MAX_ADMISSION_BYTES: usize = crate::directive::MAX_SIGNED_BYTES + 64;
+
+/// The first frame of every session an entry key starts, before any other
+/// byte. The command a client asks sshd for is only data: the line's forced
+/// command runs whatever it asked.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum Admission {
+    /// Start a copy with this signed directive.
+    Copy(Vec<u8>),
+    /// Join a running copy as an SSH worker, with its ticket.
+    Worker(String),
+}
+
+impl Admission {
+    /// The frame: a 4-byte big-endian length, then the postcard encoding.
+    pub(crate) fn frame(&self) -> Result<Vec<u8>> {
+        let body = postcard::to_stdvec(self).context("encode the admission frame")?;
+        if body.len() > MAX_ADMISSION_BYTES {
+            bail!("the admission frame exceeds its size limit");
+        }
+        Ok([(body.len() as u32).to_be_bytes().as_slice(), &body].concat())
+    }
+
+    /// Read exactly one frame from `input` by `deadline`, and nothing after
+    /// it: what follows belongs to the session.
+    pub(super) fn read(
+        input: &mut (impl Read + std::os::fd::AsRawFd),
+        deadline: Instant,
+    ) -> Result<Self> {
+        let mut input = crate::destination::DeadlineIo {
+            inner: input,
+            deadline,
+            cancelled: None,
+        };
+        let mut length = [0u8; 4];
+        input
+            .read_exact(&mut length)
+            .context("read the session's first frame")?;
+        let length = u32::from_be_bytes(length) as usize;
+        if length == 0 || length > MAX_ADMISSION_BYTES {
+            bail!("the session's first frame has an unsupported length");
+        }
+        let mut body = vec![0; length];
+        input
+            .read_exact(&mut body)
+            .context("read the session's first frame")?;
+        let (admission, rest): (Self, &[u8]) =
+            postcard::take_from_bytes(&body).context("decode the session's first frame")?;
+        if !rest.is_empty() {
+            bail!("the session's first frame has trailing bytes");
+        }
+        Ok(admission)
+    }
+}
+
+/// One of the enrollment's slots for sessions that have not been verified
+/// yet: a lock on one of the files `session-slot-N` in its state directory.
+/// Dropping it closes the file, which releases the lock, as exiting does.
+pub(super) struct UnverifiedSlot(#[allow(dead_code)] File);
+
+impl UnverifiedSlot {
+    /// Take a free slot of the `slots`, waiting for one until `deadline`.
+    pub(super) fn take(state: &Path, slots: u64, deadline: Instant) -> Result<Self> {
+        loop {
+            for slot in 0..slots {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(state.join(format!("session-slot-{slot}")))
+                    .context("open the enrollment's session slots")?;
+                let metadata = file.metadata()?;
+                if !metadata.is_file()
+                    || metadata.nlink() != 1
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.mode() & 0o7777 != 0o600
+                {
+                    bail!("the enrollment's session slots must be private, singly linked regular files");
+                }
+                // SAFETY: the descriptor stays open for the call.
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                    return Ok(Self(file));
+                }
+                let error = std::io::Error::last_os_error();
+                if !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) {
+                    return Err(error).context("lock a session slot");
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!(
+                    "{slots} other connections are already waiting to start a copy on this enrollment; try again, or replace its entry key with `syq receiver revoke` and enroll again if this persists"
+                );
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(20)));
+        }
+    }
+}
+
+/// What a session the forced command started may go on to do.
+pub(crate) enum Session {
+    /// Serve a copy a verified directive allows.
+    Copy(std::sync::Arc<RestrictedAuthority>),
+    /// This session's input and output were handed to the running copy its
+    /// worker ticket names, which has served them.
+    Worker,
+}
+
+/// Admit a session of the forced command of syq's line,
+/// `--restricted-receiver --enrollment=ID --generation=N`: take a slot,
+/// read the first frame, and then either verify a new copy's directive or
+/// hand the session to the running copy whose worker ticket it shows.
+pub(crate) fn admit_session(enrollment: &str, generation: &str) -> Result<Session> {
     refuse_privileged_receiver(Some(enrollment))?;
     let enrollment = EnrollmentId::parse(enrollment)?;
     let generation: u64 = generation
         .parse()
         .context("restricted receiver generation must be a number")?;
-    let original = std::env::var("SSH_ORIGINAL_COMMAND")
-        .context("restricted receiver requires SSH_ORIGINAL_COMMAND from sshd")?;
-    if let Some(ticket) = ssh::worker_command(&original)? {
-        // A worker joins a copy that is already running, which continues
-        // whatever has changed since it started.
-        let (_, home) = current_account()?;
-        ssh::enter_state_directory(&enrollment_state(&home, enrollment))?;
-        return ssh::connect(&ticket);
-    }
-    let envelope = decode_receiver_command(&original)?;
+    let deadline = Instant::now() + ADMISSION_TIMEOUT;
     let (state, config) = receiver_state(enrollment)?;
-    let observed_state = fs::symlink_metadata(&state).context("inspect receiver enrollment")?;
+    let slot = UnverifiedSlot::take(&state, UNVERIFIED_SESSIONS, deadline)?;
+    // Read exactly the frame from the session's input, unbuffered, so the
+    // copy's own protocol after it stays where the server reads it.
+    let mut input = File::from(
+        std::io::stdin()
+            .as_fd()
+            .try_clone_to_owned()
+            .context("take the session's input")?,
+    );
+    match Admission::read(&mut input, deadline)? {
+        Admission::Worker(ticket) => {
+            // A worker joins a copy that is already running, which continues
+            // whatever has changed since it started.
+            ssh::enter_state_directory(&state)?;
+            let socket = ssh::join(&ticket)?;
+            drop(slot);
+            crate::descriptor_broker::hand_over_standard_streams(socket)
+                .context("hand the restricted SSH worker to the receiver")?;
+            Ok(Session::Worker)
+        }
+        Admission::Copy(directive) => Ok(Session::Copy(admit(
+            &state,
+            &config,
+            (generation, crate::identity::build()),
+            &directive,
+            slot,
+        )?)),
+    }
+}
+
+/// Admit a new copy's directive and set up its authority: refused by a
+/// receiver of another generation or build, then checked against the
+/// trusted login key and its policy, its rules derived from its command, and
+/// only then recorded as used. The session's `slot` is released once the
+/// directive is verified.
+fn admit(
+    state: &Path,
+    config: &ReceiverEnrollment,
+    (generation, build): (u64, &str),
+    directive: &[u8],
+    slot: UnverifiedSlot,
+) -> Result<std::sync::Arc<RestrictedAuthority>> {
+    let observed_state = fs::symlink_metadata(state).context("inspect receiver enrollment")?;
     let (_, home) = current_account()?;
     let canonical_home = fs::canonicalize(&home)
         .with_context(|| format!("resolve receiver home {}", home.display()))?;
     let protected = receiver_control_paths(&canonical_home, None, ControlPaths::Here)?;
-    let verified = admit(
-        &state,
-        &config,
-        (generation, crate::identity::build()),
-        &envelope,
-    )?;
-    let (grant, extensions, grant_digest, deadline) = verified.into_parts();
-    let results_key = load_results_key(&state)?;
-    let GrantOperation::Copy(copy) = &grant.operation;
-    let root = ConfinedRoot::resolve(&copy.destination, &protected)?;
+    let ((grant, constraints), verified) =
+        verify(state, config, (generation, build), directive, &home)?;
+    drop(slot);
+    let results_key = load_results_key(state)?;
+    let root = ConfinedRoot::resolve(&grant.copy.destination, &protected)?;
     let authority = std::sync::Arc::new(RestrictedAuthority::new(
         root,
         grant,
-        extensions,
-        grant_digest,
+        constraints,
+        verified.digest,
         results_key,
-        deadline,
+        verified.execution_deadline,
         &protected,
     )?);
-    ssh::enter_state_directory(&state)?;
+    ssh::enter_state_directory(state)?;
     // Verification does not hold the lifecycle lock or permit mutations. A
     // revoke during verification is caught when this receiver tries to enter.
     active::watch(
         &home,
-        &state,
+        state,
         (observed_state.dev(), observed_state.ino()),
-        deadline,
+        verified.execution_deadline,
     )?;
-    crate::server::run_restricted(authority)
+    Ok(authority)
 }
 
-/// Admit a new copy's grant: refused by a receiver of another generation or
-/// build, then checked against the trusted login key and its policy, and
-/// only then recorded as used.
-pub(super) fn admit(
+/// Verify a directive and derive its rules, recording it as used only when
+/// everything passes.
+pub(super) fn verify(
     state: &Path,
     config: &ReceiverEnrollment,
     (generation, build): (u64, &str),
-    envelope: &[u8],
-) -> Result<delegation::VerifiedGrant> {
+    directive: &[u8],
+    home: &Path,
+) -> Result<((Grant, GrantConstraints), delegation::VerifiedDirective)> {
     require_current_receiver(config, generation, build)?;
     let replay = delegation::ReplayStore::open(&state.join("replay")).with_context(|| {
         format!(
@@ -85,18 +240,20 @@ pub(super) fn admit(
             config.id, config.target_login
         )
     })?;
-    let signer_name = signer_name(config.id, config.generation);
     let context = delegation::ReceiverContext {
         enrollment_id: config.id,
+        generation: config.generation,
         target_login: &config.target_login,
-        expected_signer: &signer_name,
+        build,
         clock: delegation::ClockObservation {
-            unix_seconds: now()?,
+            unix_seconds: crate::directive::now()?,
             monotonic: Instant::now(),
         },
         clock_skew_seconds: CLOCK_SKEW_SECONDS,
     };
-    delegation::verify_and_redeem(envelope, &context, &config.signer, &replay)
+    delegation::verify_and_redeem(directive, &context, &config.signer, &replay, |directive| {
+        crate::directive::destination_rules(directive, home)
+    })
 }
 
 /// A connection started from an older line still runs the forced command it
@@ -116,23 +273,6 @@ pub(super) fn require_current_receiver(
         );
     }
     Ok(())
-}
-
-pub(super) fn decode_receiver_command(original: &str) -> Result<Vec<u8>> {
-    if original.len() > 128 * 1024 {
-        bail!("restricted receiver command exceeds size limit");
-    }
-    let words = shell_words::split(original).context("parse restricted receiver command")?;
-    if words.len() != 3 || words[0] != "syq" || words[1] != "--server" {
-        bail!("the entry key accepts only a syq server request with one signed grant");
-    }
-    let encoded = words[2]
-        .strip_prefix("--restricted-grant=")
-        .context("restricted receiver command is missing its signed grant")?;
-    let envelope = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(encoded)
-        .context("decode restricted receiver grant")?;
-    Ok(envelope)
 }
 
 /// `[USER@]HOST` as `syq receiver enroll` takes it, with the login the

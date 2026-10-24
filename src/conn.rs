@@ -2305,15 +2305,25 @@ impl RemoteSpec {
                 return self.stream_connection(stream, compress, role);
             }
         }
-        let mut server_args = vec!["--server".into()];
-        if let Some(grant) = self
+        let server_args = vec!["--server".to_owned()];
+        // An enrolled receiver reads its admission frame before anything
+        // else: the control's directive, or a worker's ticket. Neither goes
+        // on a command line.
+        let admission = match self
             .restricted_grant
             .as_ref()
             .filter(|_| self.forwarded.is_none())
         {
-            if matches!(role, ConnectionRole::Control) {
-                server_args.push(format!("--restricted-grant={grant}"));
-            } else {
+            Some(directive) if matches!(role, ConnectionRole::Control) => {
+                use base64::Engine as _;
+                crate::restricted::Admission::Copy(
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(directive)
+                        .context("decode the copy's directive")?,
+                )
+                .frame()?
+            }
+            Some(_) => {
                 let ticket = self
                     .diagnostics
                     .lock()
@@ -2326,9 +2336,10 @@ impl RemoteSpec {
                     )?
                     .map_err(anyhow::Error::msg)
                     .context("restricted SSH data transport is unavailable")?;
-                server_args.push(format!("--restricted-worker={ticket}"));
+                crate::restricted::Admission::Worker(ticket).frame()?
             }
-        }
+            None => Vec::new(),
+        };
         let login = if matches!(role, ConnectionRole::Control) {
             None
         } else {
@@ -2459,7 +2470,7 @@ impl RemoteSpec {
             observation,
             child: Some(child),
             approved_login,
-            w: FrameWriter::new(writer, compress),
+            w: FrameWriter::with_admission(writer, compress, admission),
             rx: Some(rx),
             replies,
             deferred: Default::default(),
