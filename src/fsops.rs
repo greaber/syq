@@ -74,6 +74,7 @@ pub(crate) fn copy_donor_range(
 mod btrfs;
 mod entry;
 mod fs_caps;
+mod leases;
 mod limits;
 pub(crate) mod lookups;
 mod operator;
@@ -102,7 +103,16 @@ pub(crate) use paths::*;
 use sidecars::Sidecar;
 pub(crate) use sidecars::{sweep as sweep_sidecars, track as track_sidecars, Swept};
 #[cfg(test)]
+pub(crate) use small_batch::with_coarse_change_times;
+#[cfg(test)]
 pub(crate) use stages::count as held_stage_count;
+
+/// Whether this receiver trusts read leases on the filesystem of `file`
+/// (`leases`), for tests outside these modules.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn leases_trusted_on(file: &File) -> bool {
+    fs_caps::leases_show_writers(file)
+}
 pub(crate) use stages::new_scope as new_stage_scope;
 
 /// Let go of what the copy `scope` holds in this process when its control
@@ -878,6 +888,9 @@ pub struct FsOps {
     /// The patch whose new data is arriving in pieces, between `PatchBegin`
     /// and `PatchEnd`.
     patch_stream: Option<Box<small_batch::PatchStream>>,
+    /// What vouches for the files the current batch of groups compared on
+    /// this connection, until their patches come (`small_batch::Guard`).
+    compared_files: small_batch::ComparedFiles,
     inode_preservation: crate::inode_metadata::Selection,
     sparse: bool,
     descriptor_copy: crate::descriptor_copy::Session,
@@ -1231,6 +1244,7 @@ impl FsOps {
             inherited_acls: Default::default(),
             prepared_small_copy: None,
             patch_stream: None,
+            compared_files: Default::default(),
             operator_selection: None,
             destination_path_access: Default::default(),
             descriptor_session,

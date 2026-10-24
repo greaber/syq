@@ -52,6 +52,11 @@ use super::*;
 use crate::proto::PATCH_PIECE_BYTES;
 use crate::transfer_tuning::COMPARE_WINDOW;
 
+/// Each batch of groups gets its own number, so that a receiver can let go
+/// of what it holds for the files of an earlier one on the same connection
+/// (`Request::HashExistingBatch::batch`).
+static NEXT_COMPARE_BATCH: AtomicU64 = AtomicU64::new(1);
+
 /// Most piece data a worker reads ahead of sending it while streaming a
 /// patch: as much as a group's patches hold.
 const STREAM_BUFFER_BYTES: u64 = crate::proto::MAX_DIFFERING_FILE_BYTES;
@@ -361,6 +366,7 @@ impl Worker {
             .reply_queue()
             .map_or(COMPARE_WINDOW, |queue| queue.min(COMPARE_WINDOW));
         let source_queue = self.src.reply_queue().unwrap_or(1);
+        let compare_batch = NEXT_COMPARE_BATCH.fetch_add(1, Relaxed);
         let mut groups: Vec<Group> = Vec::new();
         // Patches to stream once the groups are done.
         let mut streams = Vec::new();
@@ -407,6 +413,7 @@ impl Worker {
                     self.dst.send(Request::HashExistingBatch {
                         block: self.patch_block(),
                         files: existing,
+                        batch: compare_batch,
                     })?;
                     destination.push_back((groups.len(), Stage::Hash, std::time::Instant::now()));
                     groups.push(Group {

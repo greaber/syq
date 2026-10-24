@@ -3351,6 +3351,7 @@ fn results_report_a_declined_metadata_change_as_the_replacement() {
     let mut hash = Request::HashExistingBatch {
         block,
         files: vec![existing_read(&small, 3)],
+        batch: 0,
     };
     let settlement = authority.authorize(&mut hash, false).unwrap();
     let response = authority.test_ops().handle(&hash);
@@ -5697,6 +5698,7 @@ fn grouped_comparison_keeps_and_patches_files_within_the_grant() {
     let mut hash = Request::HashExistingBatch {
         block,
         files: vec![existing_read(&same, 4), existing_read(&edited, 4)],
+        batch: 0,
     };
     let settlement = authority.authorize(&mut hash, false).unwrap();
     let response = authority.test_ops().handle(&hash);
@@ -5804,6 +5806,7 @@ fn compare_and_keep(
     let hash = Request::HashExistingBatch {
         block,
         files: paths.iter().map(|path| existing_read(path, 4)).collect(),
+        batch: 0,
     };
     let proto::Response::ExistingHashes(existing) = execute_authorized(authority, ops, hash) else {
         panic!("unexpected hash response")
@@ -5870,6 +5873,7 @@ fn a_linked_file_whose_times_change_is_replaced_name_by_name() {
     let hash = Request::HashExistingBatch {
         block,
         files: vec![existing_read(&a, 4)],
+        batch: 0,
     };
     let proto::Response::ExistingHashes(mut existing) =
         execute_authorized(&authority, &mut ops, hash)
@@ -5942,6 +5946,7 @@ fn a_stale_patch_holds_no_bytes_and_leaves_its_record_to_the_retry() {
     let hash = Request::HashExistingBatch {
         block,
         files: vec![existing_read(&a, 4), existing_read(&b, 4)],
+        batch: 0,
     };
     let proto::Response::ExistingHashes(existing) = execute_authorized(&authority, &mut ops, hash)
     else {
@@ -6010,7 +6015,11 @@ fn grouped_comparison_refuses_what_the_grant_does_not_authorize() {
     fs::write(&file, b"data").unwrap();
     let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
     let block = authority.copy.limits.hash_block_bytes;
-    let hash = |files| Request::HashExistingBatch { block, files };
+    let hash = |files| Request::HashExistingBatch {
+        block,
+        files,
+        batch: 0,
+    };
     let patch = |patch| Request::PatchSmallBatch(vec![patch]);
     let reused = |path: &Path| small_patch(path, 4, block, vec![Some([0; 32])], b"");
 
@@ -6025,6 +6034,7 @@ fn grouped_comparison_refuses_what_the_grant_does_not_authorize() {
     let mut allowed = Request::HashExistingBatch {
         block: small,
         files: vec![existing_read(&file, 4)],
+        batch: 0,
     };
     authority.authorize(&mut allowed, false).unwrap();
     let mut allowed = patch(small_patch(&file, 4, small, vec![Some([0; 32])], b""));
@@ -6043,6 +6053,7 @@ fn grouped_comparison_refuses_what_the_grant_does_not_authorize() {
             Request::HashExistingBatch {
                 block: 4096,
                 files: vec![existing_read(&file, 4)],
+                batch: 0,
             },
             "comparison block size is outside protocol limits",
         ),
@@ -6087,6 +6098,7 @@ fn grouped_comparison_refuses_what_the_grant_does_not_authorize() {
     let mut excessive = Request::HashExistingBatch {
         block: proto::MIN_HASH_BLOCK_BYTES,
         files: vec![existing_read(&file, half), existing_read(&file, half)],
+        batch: 0,
     };
     assert_eq!(
         authority
@@ -6742,6 +6754,7 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
     let hash = Request::HashExistingBatch {
         block,
         files: paths.iter().map(|path| existing_read(path, len)).collect(),
+        batch: 0,
     };
     let proto::Response::ExistingHashes(existing) = execute_authorized(&authority, &mut ops, hash)
     else {
@@ -7813,6 +7826,7 @@ fn both_receivers_settle_each_file_of_an_in_place_batch_alike() {
                 .iter()
                 .map(|name| existing_read(&target.join(name), new.len() as u64))
                 .collect(),
+            batch: 0,
         }) else {
             panic!("{case}: unexpected hash response");
         };
@@ -7917,6 +7931,198 @@ fn both_receivers_settle_each_file_of_an_in_place_batch_alike() {
                 results.records
             );
         }
+    }
+}
+
+/// The read leases this process holds on the inodes `files`, as
+/// `/proc/locks` lists them.
+#[cfg(target_os = "linux")]
+fn leases_held_on(files: &[&Path]) -> usize {
+    let inodes: Vec<u64> = files
+        .iter()
+        .filter_map(|file| fs::metadata(file).ok().map(|status| status.ino()))
+        .collect();
+    let pid = std::process::id().to_string();
+    fs::read_to_string("/proc/locks")
+        .unwrap()
+        .lines()
+        .filter(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            fields.get(1) == Some(&"LEASE")
+                && fields.get(4) == Some(&pid.as_str())
+                && fields
+                    .get(5)
+                    .and_then(|device| device.rsplit(':').next())
+                    .and_then(|inode| inode.parse::<u64>().ok())
+                    .is_some_and(|inode| inodes.contains(&inode))
+        })
+        .count()
+}
+
+/// Both receivers lease a file the copy may replace from its blocks before
+/// hashing it, on a filesystem where a lease shows every writer, and hold
+/// the lease for the file's patch. A writer that opens the file after its
+/// comparison waits only until the receiver lets the lease go; the patch's
+/// stage is then read back, and fails for the block the writer changed,
+/// although with coarse change times the file's fingerprint is as it was.
+/// A patch whose lease held keeps its stage unread. The lease of a kept
+/// file goes with its patch, and that of a file no patch comes for when the
+/// next batch begins or the connection ends.
+#[cfg(target_os = "linux")]
+#[test]
+fn both_receivers_hold_leases_on_the_files_they_compared() {
+    use std::os::unix::fs::FileExt as _;
+    let block = proto::MIN_HASH_BLOCK_BYTES as usize;
+    // Large enough to lease, while three patches fit one batch.
+    let old: Vec<u8> = (0..272 * block)
+        .map(|index| (index % 253) as u8 | 1)
+        .collect();
+    let mut new = old.clone();
+    new[20 * block] ^= 0xff;
+    let names = ["changed", "trusted", "kept", "unpatched"];
+    for restricted in [false, true] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        for name in names {
+            let contents = if name == "kept" { &new } else { &old };
+            fs::write(target.join(name), contents).unwrap();
+        }
+        let trusted = crate::fsops::leases_trusted_on(&File::open(target.join("kept")).unwrap());
+        if !trusted {
+            eprintln!("note: the test filesystem's leases are not trusted");
+        }
+        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let (secret, policy) = results_policy();
+        let mut receiver =
+            ParityReceiver::new(&root, restricted, true, PublicationPolicy::AtomicStaged);
+        let mut reader = None;
+        if restricted {
+            let mut authority = test_authority_with_results(
+                &root,
+                DeletionPolicy::Forbid,
+                64 << 20,
+                0,
+                FilterPolicy::default(),
+                PublicationPolicy::AtomicStaged,
+                ExistingDestinationPolicy::Replace,
+                DestinationPlacement::ExactPath,
+                RootExistence::Any,
+                Some((key, policy)),
+            )
+            .unwrap();
+            authority.copy.options.preserve_times = true;
+            authority.copy.limits.max_entries = 1000;
+            reader = Some(start_results(&authority, secret));
+            receiver.authority = Some(authority);
+        }
+        let case = format!("restricted={restricted} trusted={trusted}");
+        let held = |names: &[&str]| {
+            let paths: Vec<PathBuf> = names.iter().map(|name| target.join(name)).collect();
+            leases_held_on(&paths.iter().map(PathBuf::as_path).collect::<Vec<_>>())
+        };
+        let hash = |names: &[&str], batch| Request::HashExistingBatch {
+            block: block as u64,
+            files: names
+                .iter()
+                .map(|name| existing_read(&target.join(name), new.len() as u64))
+                .collect(),
+            batch,
+        };
+        crate::fsops::with_coarse_change_times(|| {
+            let proto::Response::ExistingHashes(hashed) = receiver.send(hash(&names, 1)) else {
+                panic!("{case}: unexpected hash response");
+            };
+            assert_eq!(held(&names), if trusted { 4 } else { 0 }, "{case}");
+            // A block the patch reuses changes after the comparison, the
+            // file keeping its length.
+            let started = std::time::Instant::now();
+            let writer = File::options()
+                .write(true)
+                .open(target.join("changed"))
+                .unwrap();
+            let waited = started.elapsed();
+            assert!(
+                waited < std::time::Duration::from_secs(5),
+                "{case}: the writer waited {waited:?}"
+            );
+            writer
+                .write_all_at(b"planted", 3 * block as u64 + 1)
+                .unwrap();
+            drop(writer);
+            let planted = fs::read(target.join("changed")).unwrap();
+            let hashed: Vec<_> = hashed.into_iter().map(Result::unwrap).collect();
+            let patch = |name: &str, hashed: &proto::ExistingHashes, changed: bool| {
+                let mut reuse: Vec<_> = hashed.hashes.iter().copied().map(Some).collect();
+                let data = if changed {
+                    reuse[20] = None;
+                    &new[20 * block..21 * block]
+                } else {
+                    &[][..]
+                };
+                let mut patch = small_patch(
+                    &target.join(name),
+                    new.len() as u64,
+                    block as u64,
+                    reuse,
+                    data,
+                );
+                patch.basis = hashed.fingerprint;
+                patch.meta.mtime = 1_600_000_000;
+                patch.flags = proto::flags::TIMES;
+                patch.unchanged_flags = patch.flags;
+                patch
+            };
+            let patches = vec![
+                patch("changed", &hashed[0], true),
+                patch("trusted", &hashed[1], true),
+                patch("kept", &hashed[2], false),
+            ];
+            let proto::Response::PatchedBatch(patched) =
+                receiver.send(Request::PatchSmallBatch(patches))
+            else {
+                panic!("{case}: unexpected patch response");
+            };
+            if trusted {
+                assert!(patched[0].is_err(), "{case}: {:?}", patched[0]);
+                assert!(
+                    fs::read(target.join("changed")).unwrap() == planted,
+                    "{case}"
+                );
+            }
+            assert!(patched[1].is_ok(), "{case}: {:?}", patched[1]);
+            assert!(fs::read(target.join("trusted")).unwrap() == new, "{case}");
+            assert!(
+                matches!(patched[2], Ok(proto::SmallPatched { kept: true, .. })),
+                "{case}: {:?}",
+                patched[2]
+            );
+        });
+        // The unpatched file's lease waits for its patch, until the next
+        // batch begins.
+        assert_eq!(held(&names), usize::from(trusted), "{case}");
+        receiver.send(hash(&[], 2));
+        assert_eq!(held(&names), 0, "{case}");
+        receiver.send(hash(&["unpatched"], 3));
+        assert_eq!(held(&["unpatched"]), usize::from(trusted), "{case}");
+        if let (Some(authority), Some(reader)) = (&receiver.authority, reader.as_mut()) {
+            let results = finish_results(authority, reader);
+            assert!(
+                results.has("transfer_file", b"trusted", "succeeded"),
+                "{case}: {:?}",
+                results.records
+            );
+            if trusted {
+                assert!(
+                    results.has("transfer_file", b"changed", "failed"),
+                    "{case}: {:?}",
+                    results.records
+                );
+            }
+        }
+        drop(receiver);
+        assert_eq!(held(&names), 0, "{case}: a lease outlived its connection");
     }
 }
 

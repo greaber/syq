@@ -1087,6 +1087,286 @@ fn a_patch_whose_payload_fails_its_check_is_copied_whole() {
     }
 }
 
+/// What vouched for each compared file, and for the blocks its stage took
+/// from it, as the receiver recorded them (`SYQ_TEST_REUSE_GUARDS`): one
+/// line per event, the event and then the file's name.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn reuse_guards(events: &Path) -> Vec<String> {
+    fs::read_to_string(events)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether the receiver trusted leases on the test filesystem. It does not
+/// on network and overlay filesystems, where a file keeps only its
+/// fingerprint to vouch for it, as before leases.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn leases_trusted(events: &[String], case: &str) -> bool {
+    let trusted = !events.iter().any(|event| event.starts_with("untrusted "));
+    if !trusted {
+        eprintln!("note: {case}: the test filesystem's leases are not trusted");
+    }
+    trusted
+}
+
+/// A file the copy replaces that differs from its source in its first
+/// `changed` bytes, of `len` bytes in all, at `src/name` and `dst/name`.
+/// Returns the source's contents.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn replaced_file(t: &Tmp, name: &str, len: usize, changed: usize, seed: u64) -> Vec<u8> {
+    let source = prng(len, seed);
+    let mut old = source.clone();
+    old[..changed].fill(b'x');
+    write(&t.path(&format!("src/{name}")), &source);
+    write(&t.path(&format!("dst/{name}")), &old);
+    set_mtime(&t.path(&format!("dst/{name}")), 1);
+    source
+}
+
+/// A copy that reuses blocks, one worker at a time, held once its first
+/// group has been compared (`ready`, `continuation`), on a filesystem whose
+/// change times are too coarse to show a write, recording what vouched for
+/// each file in `events`.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn held_after_comparison(t: &Tmp, route: &str, extra: &[&str]) -> (Command, PathBuf, PathBuf) {
+    let mut command = reusing_copy(t, route, extra);
+    let (ready, continuation) = (t.path("hashed"), t.path("continue"));
+    command
+        .env("SYQ_TEST_SMALL_HASHED_READY_FILE", &ready)
+        .env("SYQ_TEST_SMALL_HASHED_CONTINUE_FILE", &continuation)
+        .env("SYQ_TEST_REUSE_GUARDS", t.path("guards"))
+        .env("SYQ_TEST_COARSE_CHANGE_TIMES", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    (command, ready, continuation)
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn a_reused_block_written_after_its_comparison_does_not_reach_the_published_file() {
+    // A file the copy replaces is leased before it is compared. A program
+    // that then writes a block its patch reuses, keeping the file's length
+    // and, where change times are coarse, its fingerprint, breaks the lease
+    // and waits only until the receiver lets it go. The patch's stage, which
+    // took a copy of the file, is read back, and the published file has the
+    // source's bytes. So for a patch sent in a batch and for one streamed;
+    // an unchanged file of the same group is kept.
+    use std::os::unix::fs::FileExt as _;
+    for route in ["local", "push"] {
+        for streamed in [false, true] {
+            let case = format!("{route} streamed={streamed}");
+            let t = Tmp::new();
+            // A streamed patch carries more than 16 MiB, and reuses at least
+            // half its file, for its stage to take a copy of it.
+            let (len, changed, planted_at) = if streamed {
+                (48 << 20, 20 << 20, (40 << 20) + 5)
+            } else {
+                (2 << 20, 1 << 16, (1 << 20) + 5)
+            };
+            let source = replaced_file(&t, "file", len, changed, 990);
+            let same = prng((1 << 20) + 4096, 991);
+            if !streamed {
+                write(&t.path("src/same"), &same);
+                write(&t.path("dst/same"), &same);
+                set_mtime(&t.path("dst/same"), 1);
+            }
+            let (mut command, ready, continuation) = held_after_comparison(&t, route, &[]);
+            let mut child = command.start().unwrap();
+            wait_for_confinement_marker(&mut child, &ready, "the comparison");
+            let started = std::time::Instant::now();
+            let writer = OpenOptions::new()
+                .write(true)
+                .open(t.path("dst/file"))
+                .unwrap();
+            let waited = started.elapsed();
+            writer.write_all_at(b"planted", planted_at).unwrap();
+            drop(writer);
+            release_confinement_barrier(&continuation);
+            let out = child.wait_with_output().unwrap();
+            assert_output_ok(&out);
+            let events = reuse_guards(&t.path("guards"));
+            if !leases_trusted(&events, &case) {
+                continue;
+            }
+            assert!(
+                read(&t.path("dst/file")) == source,
+                "{case}: the planted bytes reached the published file"
+            );
+            // Far less than the kernel's break time, 45 s by default.
+            assert!(
+                waited < std::time::Duration::from_secs(5),
+                "{case}: the writer waited {waited:?}"
+            );
+            eprintln!("{case}: the writer's open waited {waited:?}");
+            assert!(events.contains(&"leased file".into()), "{case}: {events:?}");
+            assert!(
+                events.contains(&"checked file".into()),
+                "{case}: {events:?}"
+            );
+            if !streamed {
+                assert!(events.contains(&"leased same".into()), "{case}: {events:?}");
+                assert!(read(&t.path("dst/same")) == same, "{case}");
+            }
+            assert!(partial_files(&t.path("dst")).is_empty(), "{case}");
+        }
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn a_store_through_a_mapping_made_before_the_comparison_does_not_reach_the_published_file() {
+    // A program that has had the file mapped writable and shared since
+    // before the comparison stores into a block the patch reuses. Such a
+    // store changes nothing `stat` shows, but the mapping keeps the file's
+    // lease from being granted, so the patch's stage is read back, and the
+    // published file has the source's bytes.
+    use std::os::fd::AsRawFd as _;
+    for route in ["local", "push"] {
+        let t = Tmp::new();
+        let len = 2 << 20;
+        let source = replaced_file(&t, "file", len, 1 << 16, 992);
+        let mapped = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(t.path("dst/file"))
+            .unwrap();
+        // SAFETY: a fresh shared mapping of the whole file, unmapped below;
+        // only this test stores through it.
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                mapped.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        drop(mapped);
+        let (mut command, ready, continuation) = held_after_comparison(&t, route, &[]);
+        let mut child = command.start().unwrap();
+        wait_for_confinement_marker(&mut child, &ready, "the comparison");
+        let planted_at = (1 << 20) + 5;
+        // SAFETY: within the mapping made above.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                b"planted".as_ptr(),
+                mapping.cast::<u8>().add(planted_at),
+                7,
+            );
+        }
+        release_confinement_barrier(&continuation);
+        let out = child.wait_with_output().unwrap();
+        // SAFETY: the mapping made above.
+        assert_eq!(unsafe { libc::munmap(mapping, len) }, 0);
+        assert_output_ok(&out);
+        let events = reuse_guards(&t.path("guards"));
+        if !leases_trusted(&events, route) {
+            continue;
+        }
+        assert!(
+            read(&t.path("dst/file")) == source,
+            "{route}: the planted bytes reached the published file"
+        );
+        assert!(
+            events.contains(&"refused file".into()),
+            "{route}: {events:?}"
+        );
+        assert!(
+            events.contains(&"checked file".into()),
+            "{route}: {events:?}"
+        );
+        assert!(partial_files(&t.path("dst")).is_empty(), "{route}");
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn a_file_whose_lease_is_refused_has_its_stage_read_back() {
+    // A receiver may not lease a file another account owns, unless it has
+    // CAP_LEASE (here simulated). The blocks the patch's stage takes are
+    // read back, so a write after the comparison does not reach the
+    // published file; with no lease to break, the writer does not wait.
+    use std::os::unix::fs::FileExt as _;
+    let t = Tmp::new();
+    let source = replaced_file(&t, "file", 2 << 20, 1 << 16, 993);
+    let (mut command, ready, continuation) = held_after_comparison(&t, "local", &[]);
+    command.env("SYQ_TEST_LEASES", "refuse");
+    let mut child = command.start().unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "the comparison");
+    OpenOptions::new()
+        .write(true)
+        .open(t.path("dst/file"))
+        .unwrap()
+        .write_all_at(b"planted", (1 << 20) + 5)
+        .unwrap();
+    release_confinement_barrier(&continuation);
+    let out = child.wait_with_output().unwrap();
+    assert_output_ok(&out);
+    let events = reuse_guards(&t.path("guards"));
+    if !leases_trusted(&events, "refused") {
+        return;
+    }
+    assert!(
+        read(&t.path("dst/file")) == source,
+        "the planted bytes reached the published file"
+    );
+    assert_eq!(events, ["refused file", "checked file"]);
+    assert!(partial_files(&t.path("dst")).is_empty());
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn where_leases_are_not_trusted_a_files_fingerprint_vouches_for_it_as_before() {
+    // On a filesystem whose files can change without an open in this
+    // kernel, such as NFS, FUSE or overlayfs (here simulated), no lease is
+    // taken, and a stage built from a file that keeps its fingerprint is
+    // kept unread.
+    for route in ["local", "push"] {
+        let t = Tmp::new();
+        let source = replaced_file(&t, "file", 2 << 20, 1 << 16, 994);
+        let out = reusing_copy(&t, route, &[])
+            .env("SYQ_TEST_LEASES", "unsupported")
+            .env("SYQ_TEST_REUSE_GUARDS", t.path("guards"))
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(
+            reuse_guards(&t.path("guards")),
+            ["untrusted file", "fingerprint file"],
+            "{route}"
+        );
+        assert!(read(&t.path("dst/file")) == source, "{route}");
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn a_file_its_lease_vouches_for_is_trusted_unread() {
+    // With no writer, the lease is intact once the stage holds its copy of
+    // the file, which is kept unread; files under 1 MiB take no lease.
+    for route in ["local", "push"] {
+        let t = Tmp::new();
+        let source = replaced_file(&t, "file", 2 << 20, 1 << 16, 995);
+        let small = replaced_file(&t, "small", 512 << 10, 4096, 996);
+        let out = reusing_copy(&t, route, &[])
+            .env("SYQ_TEST_REUSE_GUARDS", t.path("guards"))
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        let events = reuse_guards(&t.path("guards"));
+        if !leases_trusted(&events, route) {
+            continue;
+        }
+        assert_eq!(events, ["leased file", "trusted file"], "{route}");
+        assert!(read(&t.path("dst/file")) == source, "{route}");
+        assert!(read(&t.path("dst/small")) == small, "{route}");
+    }
+}
+
 #[test]
 fn a_leftover_partial_sends_a_replaced_file_to_the_resuming_path() {
     let t = Tmp::new();

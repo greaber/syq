@@ -3542,7 +3542,7 @@ impl RestrictedAuthority {
             }
             // Each file is observed as HashAndHold observes one, and the
             // hashes of the whole batch share one response.
-            Request::HashExistingBatch { block, files } => {
+            Request::HashExistingBatch { block, files, .. } => {
                 for file in files.iter() {
                     self.check_comparison_request(*block, file.len)?;
                 }

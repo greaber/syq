@@ -132,6 +132,19 @@ place. These checks do not detect every concurrent change. `--in-place` lets
 destination readers see incomplete files, including after an interrupted
 copy.
 
+When syq replaces a destination file by reusing blocks of the existing one,
+it makes sure those blocks are still what it compared, even if another
+program writes the existing file in the meantime. On Linux, for files of
+1 MiB or more on ext4, XFS, Btrfs, ZFS and tmpfs, syq takes a read lease on
+the existing file before comparing it. If another program opens the file for
+writing before syq has copied the reused blocks, or already has it open for
+writing, syq reads those blocks back and checks them. That program's open
+waits up to about 20 ms; an open that does not wait fails and must be
+retried. On network and FUSE filesystems, another program writing a
+destination file while syq updates it can leave the published file with that
+program's bytes; running syq's receiver on the file server, by copying to it
+over SSH, avoids this.
+
 On Linux, and on NFS or SMB destinations mounted on macOS, normal file copies
 check for delayed write errors before replacing files. This catches failures
 such as a full NFS export reporting an error after accepting writes, and keeps
