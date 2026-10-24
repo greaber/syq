@@ -681,6 +681,16 @@ all its parts, so to clear a failed check, dispatch the same `suites` value
 again or rerun the failed run. The same applies to what you ask of subagents:
 do not have a subagent run slow suites before it reports.
 
+Dispatch the macOS suite (`gh workflow run macos.yml --ref <task-branch>`)
+only for platform-sensitive changes: code paths that differ on macOS,
+filesystem or process behavior, and packaging. Each run occupies a macOS
+runner for half an hour or more, and post-merge and nightly runs cover the
+rest. Do not rerun it after it passed at the same commit, or after a passing
+run on the branch, unless the later commits could change its result. On a task
+branch it runs SDK packaging and the release tooling suites only when the
+branch changes them or with `-f complete=true`, and a newer dispatch on the
+same branch cancels the older run.
+
 After synchronizing a branch with `master`, build; when conflicts touched
 code, also run the focused tests for that code. Use `--locked` for Cargo
 validation so a check cannot silently repair an uncommitted lockfile. For
@@ -738,9 +748,9 @@ actually ran; nextest rejects filters that match zero tests, while plain
 The helper selects the current remote branch, pins its checkout commit,
 prints the SHA and run URL, and watches that exact run through
 `gh run watch`; run it in the background when you do not need the result
-before replying. `--provider github` selects GitHub instead of Namespace; `--ref`
-explicitly tests another pushed branch or tag; `--timeout` changes the default
-15-minute limit. Only enable `--cargo-cache` for checks needing Rust builds.
+before replying. Checks run on GitHub-hosted runners; `--ref` explicitly tests
+another pushed branch or tag; `--timeout` changes the default 15-minute limit.
+Only enable `--cargo-cache` for checks needing Rust builds.
 No builds or test suites run implicitly, and these checks do not certify a
 full suite for release. Add reusable focused checks when repeated use
 justifies them rather than adding a permanent option for every repair.

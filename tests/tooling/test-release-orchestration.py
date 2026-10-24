@@ -440,44 +440,73 @@ class EventScopeTests(Scratch):
         Missing or renamed step boundaries fail this check."""
         lines = (ROOT / ".github/workflows/macos.yml").read_text().splitlines()
         start = next(index for index, line in enumerate(lines)
-                     if line.startswith("          scope=$(scripts/ci-scope.py"))
+                     if line.startswith("          event=$GITHUB_EVENT_PATH"))
         end = next(index for index in range(start, len(lines))
-                   if lines[index].startswith('          echo "needed=$needed" >> "$GITHUB_OUTPUT"'))
+                   if lines[index].endswith('tee -a "$GITHUB_OUTPUT"'))
         step = "\n".join(lines[start:end + 1])
-        self.assertTrue(step)
-        return step
+        self.assertIn("scripts/ci-scope.py", step)
+        return step.replace("scripts/ci-scope.py", str(SCRIPTS / "ci-scope.py"))
 
-    def macos_needed(self, event, *paths):
+    def macos_scope(self, event, *paths, ref="refs/heads/master", event_name="push",
+                    complete="", cwd=ROOT):
         output = self.work / "macos-output"
         output.write_text("")
-        env = dict(BASE_ENV, GITHUB_EVENT_PATH=str(event), GITHUB_OUTPUT=str(output))
+        env = dict(BASE_ENV, GITHUB_EVENT_PATH=str(event), GITHUB_OUTPUT=str(output),
+                   GITHUB_EVENT_NAME=event_name, GITHUB_REF=ref, RUNNER_TEMP=str(self.work),
+                   COMPLETE=complete)
         if paths:
             changed = self.work / "paths"
             changed.write_text("".join(path + "\n" for path in paths))
             env["SYQ_TEST_CHANGED_PATHS_FILE"] = str(changed)
-        subprocess.run(["bash", "-euo", "pipefail", "-c", self.macos_step()], cwd=ROOT, env=env,
-                       check=True)
-        return parse(output.read_text())["needed"]
+        subprocess.run(["bash", "-euo", "pipefail", "-c", self.macos_step()], cwd=cwd, env=env,
+                       check=True, stdout=subprocess.DEVNULL)
+        scope = parse(output.read_text())
+        return scope["needed"], scope["sdk"], scope["release_tooling"]
 
     def test_macos_classification_step(self):
         push = self.push(self.head, self.advanced_base)
         for expected, paths in [
-                ("false", ["docs/mappings.md", "sdk/python/NATIVE_API.md"]),
-                ("false", ["theme/docs.js", "book.toml"]),
-                ("false", ["tests/real-ssh/scenarios.sh", "docs/example.sh"]),
-                ("false", ["docs/mappings.md", "src/main.rs"]),
-                ("false", ["sdk/python/native-api.json"]),
-                ("false", ["sdk/python/src/syq/client.py"]),
-                ("false", ["tests/tooling/test-installer.py"]),
-                ("false", [".github/workflows/macos.yml"]),
-                ("true", ["src/tune/network/macos.rs"]),
-                ("true", ["tests/macos_exfat.rs"]),
-                ("false", ["unknown-input"])]:
+                (("false", "false", "false"), ["docs/mappings.md", "sdk/python/NATIVE_API.md"]),
+                (("false", "false", "false"), ["theme/docs.js", "book.toml"]),
+                (("false", "false", "false"), ["tests/real-ssh/scenarios.sh", "docs/example.sh"]),
+                (("false", "false", "false"), ["docs/mappings.md", "src/main.rs"]),
+                (("false", "true", "false"), ["sdk/python/native-api.json"]),
+                (("false", "true", "false"), ["sdk/python/src/syq/client.py"]),
+                (("false", "false", "true"), ["tests/tooling/test-installer.py"]),
+                (("false", "false", "true"), [".github/workflows/macos.yml"]),
+                (("true", "false", "false"), ["src/tune/network/macos.rs"]),
+                (("true", "true", "true"), ["src/tune/network/macos.rs", "scripts/setup.lock"]),
+                (("true", "false", "false"), ["tests/macos_exfat.rs"]),
+                (("false", "true", "true"), ["unknown-input"])]:
             with self.subTest(paths=paths):
-                self.assertEqual(self.macos_needed(push, *paths), expected)
-        # A manual release-validation run must still start the complete macOS suite.
+                self.assertEqual(self.macos_scope(push, *paths), expected)
+        # A manual release-validation run on master starts every step.
         dispatch = self.event("workflow-dispatch-event.json", DISPATCH_EVENT)
-        self.assertEqual(self.macos_needed(dispatch), "true")
+        self.assertEqual(self.macos_scope(dispatch, event_name="workflow_dispatch"),
+                         ("true", "true", "true"))
+
+    def test_macos_task_branch_runs_scope_its_own_changes(self):
+        dispatch = self.event("workflow-dispatch-event.json", DISPATCH_EVENT)
+        self.git(self.repo, "update-ref", "refs/remotes/origin/master", self.base)
+        tree = self.work / "task"
+        try:
+            self.git(self.repo, "worktree", "add", "-q", "--detach", str(tree), self.docs_head)
+            run = lambda **options: self.macos_scope(
+                dispatch, event_name="workflow_dispatch", ref="refs/heads/task", cwd=tree,
+                **options)
+            # A manual run always starts the suite, without unrelated steps.
+            self.assertEqual(run(), ("true", "false", "false"))
+            self.assertEqual(run(complete="true"), ("true", "true", "true"))
+            self.git(tree, "checkout", "-q", "--detach", self.head)
+            self.assertEqual(run(), ("true", "true", "false"))
+            (tree / "scripts").mkdir()
+            (tree / "scripts/release-preflight.py").write_text("release\n")
+            self.git(tree, "add", "scripts/release-preflight.py")
+            self.git(tree, "commit", "-qm", "release tooling")
+            self.assertEqual(run(), ("true", "true", "true"))
+        finally:
+            self.git(self.repo, "worktree", "remove", "--force", str(tree))
+            self.git(self.repo, "update-ref", "-d", "refs/remotes/origin/master")
 
 
 class NestedSuiteTests(unittest.TestCase):

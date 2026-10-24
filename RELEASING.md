@@ -388,7 +388,7 @@ A release requires successful full-suite certificates from `ci.yml`,
 `rsync-compat.yml`, and `macos.yml` for the candidate or unchanged test inputs
 under the release-preparation exception above. Version-only preparation does
 not automatically rerun native suites; changed dependencies or other build
-inputs do. Manual dispatch runs full suites unless `documentation_only` is selected. The stable `macos` check
+inputs do. Manual dispatch on master runs full suites unless `documentation_only` is selected. The stable `macos` check
 in `ci.yml` represents Intel validation; the separate macOS certificate establishes full
 Apple Silicon coverage. Old runs without the required certificates need one
 manual certification. Failed latest runs must be investigated, not replaced by
