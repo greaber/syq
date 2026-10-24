@@ -265,7 +265,7 @@ fn sibling_name<'a>(first: &RootedTarget, other: &'a RootedTarget) -> Option<&'a
 
 /// A patch reuses at least this much, and half its file, before its stage
 /// clones or copies the file it replaces rather than writing every block.
-const CLONE_MIN_REUSED: u64 = 1 << 20;
+pub(super) const CLONE_MIN_REUSED: u64 = 1 << 20;
 
 /// A stage of at least this many bytes is allocated before it is written,
 /// as a whole-file partial is. Otherwise a filesystem with delayed
@@ -1013,10 +1013,10 @@ impl FsOps {
     /// file at its name, as the per-file path writes its ranges, when the
     /// receiver can vouch for that (`vouch::update_refusal`), judged
     /// through the descriptor it writes, just before writing. The blocks
-    /// the patch reuses must still be the file's: the lease its comparison
-    /// took, let go just before (`shown`), shows that no one has opened it
-    /// for writing since; or else its fingerprint shows nothing has changed
-    /// it, unless the lease was broken; or they hash as compared again. The
+    /// the patch reuses must still be the file's: its fingerprint must
+    /// match even when its comparison's lease was intact, since a writer
+    /// could change it between releasing the lease and opening it here. A
+    /// broken lease or changed fingerprint requires hashing them again. The
     /// file is then finished as an in-place file is, and fails if its write
     /// or finish does, as it may hold some of its new contents by then. A
     /// file that does not meet the patch's target condition is stale, with
@@ -1068,11 +1068,12 @@ impl FsOps {
         if let Some((reason, _)) = refused {
             return Ok(Updated::Refused(reason));
         }
-        let unchanged = match shown {
-            Shown::Unwritten(dev, ino) if (dev, ino) == (opened.dev(), opened.ino()) => true,
-            Shown::Written => false,
-            _ => patch.basis == Some(fingerprint(&opened)),
-        };
+        let unchanged = patch.basis == Some(fingerprint(&opened))
+            && match shown {
+                Shown::Unwritten(dev, ino) => (dev, ino) == (opened.dev(), opened.ino()),
+                Shown::Written => false,
+                Shown::Nothing => true,
+            };
         if !unchanged
             && !self
                 .holds_reused_between(&file, patch, 0..patch.reuse.len())

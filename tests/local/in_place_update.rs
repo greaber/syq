@@ -1208,7 +1208,7 @@ fn trusted_reuse_guards(log: &Path, case: &str) -> Option<Vec<String>> {
 /// length and, with coarse change times, its fingerprint, breaks the lease:
 /// the receiver hashes those blocks again before it writes into the file,
 /// finds the change, and the file is copied again, with the source's bytes.
-/// One that no one wrote is updated in place on its lease's word.
+/// One that no one wrote is updated in place after its fingerprint check.
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
 fn a_file_written_after_its_group_was_compared_is_hashed_again_before_its_update() {
@@ -1278,6 +1278,75 @@ fn a_file_written_after_its_group_was_compared_is_hashed_again_before_its_update
         }
         assert!(read(&t.path("dst/untouched")) == sources[1], "{route}");
         assert_eq!(inode(&t.path("dst/untouched")), untouched, "{route}");
+        assert!(partial_files(&t.0).is_empty(), "{route}");
+    }
+}
+
+/// A comparison's intact lease must be released before opening its file
+/// for an in-place update. A truncate in that gap changes the fingerprint,
+/// so the receiver checks the reused blocks and retries instead of keeping
+/// holes that would become zeros in a successful copy.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn a_file_truncated_after_its_lease_is_released_gets_the_sources_bytes() {
+    for route in ["blocks", "ssh"] {
+        let t = Tmp::new();
+        let new = prng(2 << 20, 803);
+        let mut old = new.clone();
+        old[(5 << 16) + 9] ^= 1;
+        write(&t.path("src/file"), &new);
+        write(&t.path("dst/file"), &old);
+        for side in ["src", "dst"] {
+            fs::set_permissions(
+                t.path(&format!("{side}/file")),
+                fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
+        set_mtime(&t.path("src/file"), 1_700_000_000);
+        set_mtime(&t.path("dst/file"), 1_600_000_000);
+        let (ready, continuation, guards) = (t.path("ready"), t.path("continue"), t.path("guards"));
+        let mut child = rsync_inplace_command(
+            &t,
+            route,
+            &[],
+            &[
+                ("SYQ_TEST_SMALL_UPDATE_READY_FILE", &ready.to_string_lossy()),
+                (
+                    "SYQ_TEST_SMALL_UPDATE_CONTINUE_FILE",
+                    &continuation.to_string_lossy(),
+                ),
+                ("SYQ_TEST_REUSE_GUARDS", &guards.to_string_lossy()),
+                ("SYQ_TEST_COARSE_CHANGE_TIMES", "1"),
+            ],
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+        wait_for_confinement_marker(&mut child, &ready, "the write after releasing the lease");
+        // O_NONBLOCK would fail with EAGAIN if the read lease were still held.
+        OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(t.path("dst/file"))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        release_confinement_barrier(&continuation);
+        let out = child.wait_with_output().unwrap();
+        assert_output_ok(&out);
+        let Some(events) = trusted_reuse_guards(&guards, route) else {
+            continue;
+        };
+        assert!(
+            events.contains(&"leased file".to_owned()),
+            "{route}: {events:?}"
+        );
+        assert!(
+            read(&t.path("dst/file")) == new,
+            "{route}: the truncate left zeros in a successful copy"
+        );
         assert!(partial_files(&t.0).is_empty(), "{route}");
     }
 }

@@ -36,7 +36,7 @@ use std::fs::File;
 /// a patch reuses at least this much before its stage clones or copies the
 /// file it replaces (`small_batch::CLONE_MIN_REUSED`). A smaller patch reads
 /// and checks every block it reuses.
-pub(super) const LEASE_MIN_BYTES: u64 = 1 << 20;
+pub(super) const LEASE_MIN_BYTES: u64 = super::small_batch::CLONE_MIN_REUSED;
 
 #[cfg(target_os = "linux")]
 pub(super) use linux::{release_broken, ReadLease};
