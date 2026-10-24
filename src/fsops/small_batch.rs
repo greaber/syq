@@ -712,6 +712,9 @@ impl FsOps {
         len: u64,
         label: &Path,
     ) -> Result<()> {
+        // Named only in the events tests record.
+        #[cfg(not(debug_assertions))]
+        let _ = label;
         if len < leases::LEASE_MIN_BYTES || read.len < leases::LEASE_MIN_BYTES {
             return Ok(());
         }
