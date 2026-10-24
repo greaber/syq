@@ -522,14 +522,14 @@ class BranchStatusTests(unittest.TestCase):
 
     def test_checks_are_matched_by_workflow_and_job_name(self):
         self.dispatch("focused-check.yml", 21, "2026-02-01T00:00:00Z",
-                      {"check (linux, namespace, script aaa)": "failure"})
+                      {"check (linux, github, script aaa)": "failure"})
         self.dispatch("focused-check.yml", 22, "2026-02-02T00:00:00Z",
-                      {"check (linux, namespace, script bbb)": "success"})
+                      {"check (linux, github, script bbb)": "success"})
         self.dispatch("macos.yml", 23, "2026-02-03T00:00:00Z",
-                      {"check (linux, namespace, script aaa)": "success"})
+                      {"check (linux, github, script aaa)": "success"})
         report = json.loads(self.status("--json", expected=1))
         self.assertEqual([(entry["workflow"], entry["job"]) for entry in report["dispatched"]["failed"]],
-                         [("focused-check.yml", "check (linux, namespace, script aaa)")])
+                         [("focused-check.yml", "check (linux, github, script aaa)")])
 
     def test_other_branches_and_an_earlier_pull_request_are_ignored(self):
         self.dispatch("ci.yml", 31, "2026-02-01T00:00:00Z", {"s3": "failure"}, branch="other")
@@ -588,7 +588,7 @@ class BranchStatusTests(unittest.TestCase):
 
     def test_merged_focused_failure_waits_for_both_native_suites(self):
         self.dispatch("focused-check.yml", 51, "2026-02-01T00:00:00Z",
-                      {"check (macos, namespace, script ccc)": "failure"}, branch="merged-task")
+                      {"check (macos, github, script ccc)": "failure"}, branch="merged-task")
         self.merged = [{"number": 8, "url": "https://example.invalid/pull/8",
                         "headRefName": "merged-task", "mergedAt": "2026-02-02T00:00:00Z",
                         "isCrossRepository": False}]

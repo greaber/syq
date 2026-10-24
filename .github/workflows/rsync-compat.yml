@@ -85,16 +85,22 @@ jobs:
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
         run: brew install autoconf automake
-      - name: Cache Cargo dependencies and build output
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Cargo caches hold one entry per toolchain and dependency set. Only
+      # master saves them, so task branches neither fill the repository's
+      # cache budget nor replace master's entries.
+      - name: Restore Cargo dependencies and build output
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
             target/cargo
-          key: cargo-rsync-compat-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+            !target/cargo/debug/incremental
+          key: cargo-rsync-compat-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-rsync-compat-${{ runner.os }}-
+            cargo-rsync-compat-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Test compatibility harness
         run: python tests/rsync-compat/harness_test.py
       - name: Run classified upstream tests
@@ -108,6 +114,19 @@ jobs:
             python scripts/rsync-compat.py --require-tests --report-label root \
               --no-build-syq --syq-bin "$PWD/target/cargo/debug/syq" \
               --test-timeout 120 -j 4
+      - name: Save Cargo dependencies and build output
+        if: >-
+          github.ref == 'refs/heads/master' &&
+          steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/cargo
+            !target/cargo/debug/incremental
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
       - name: Restore compatibility-cache ownership
         if: always()
         run: sudo chown -R "$(id -u):$(id -g)" target/rsync-compat

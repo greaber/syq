@@ -10,13 +10,6 @@ on:
     branches: [master]
   workflow_dispatch:
     inputs:
-      runner:
-        description: Runner provider for this manual run
-        type: choice
-        default: namespace
-        options:
-          - github
-          - namespace
       benchmark:
         description: Also run the independent APFS timing benchmark
         type: boolean
@@ -50,38 +43,24 @@ jobs:
     # scripts/branch-status.py identifies a check by its job name.
     name: focused-test (${{ inputs.test_target || 'syq' }}, ${{ inputs.test_name }})
     if: github.event_name == 'workflow_dispatch' && inputs.test_name != ''
-    runs-on: ${{ inputs.runner != 'github' && 'namespace-profile-syq-macos' || 'macos-26' }}
+    runs-on: macos-26
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Attach Namespace Cargo cache
-        if: inputs.runner != 'github'
-        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-      - name: Show Namespace runner hardware
-        if: inputs.runner != 'github'
-        run: |
-          sw_vers
-          sysctl hw.model hw.ncpu hw.memsize machdep.cpu.brand_string
-          df -h .
+      # The suite's master runs save this entry.
       - name: Restore Cargo dependencies and build output
-        if: inputs.runner == 'github'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
             target
-          key: cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+            !target/debug/incremental
+          key: cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
-            cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
             cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Cache pinned development tools
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -155,38 +134,27 @@ jobs:
       cancel-in-progress: ${{ github.event_name == 'push' }}
     needs: scope
     if: needs.scope.outputs.needed == 'true'
-    runs-on: ${{ inputs.runner != 'github' && 'namespace-profile-syq-macos' || 'macos-26' }}
+    runs-on: macos-26
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Attach Namespace Cargo cache
-        if: inputs.runner != 'github'
-        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
+      # Cargo caches hold one entry per toolchain and dependency set. Only
+      # master saves them, so task branches neither fill the repository's
+      # cache budget nor replace master's entries.
+      - name: Restore Cargo dependencies and build output
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
             target
-      - name: Show Namespace runner hardware
-        if: inputs.runner != 'github'
-        run: |
-          sw_vers
-          sysctl hw.model hw.ncpu hw.memsize machdep.cpu.brand_string
-          df -h .
-      - name: Cache Cargo dependencies and build output
-        if: inputs.runner == 'github'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+            !target/debug/incremental
+          key: cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
-            cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
             cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Cache pinned development tools
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -295,10 +263,23 @@ jobs:
             fi
           done
           exit "$status"
+      - name: Save Cargo dependencies and build output
+        if: >-
+          github.ref == 'refs/heads/master' &&
+          steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+            !target/debug/incremental
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   clone-benchmark:
     if: github.event_name == 'workflow_dispatch' && inputs.benchmark
-    runs-on: ${{ inputs.runner != 'github' && 'namespace-profile-syq-macos' || 'macos-26' }}
+    runs-on: macos-26
     timeout-minutes: 30
     # Timing/resource failures must not invalidate release evidence. This job's
     # step result still records failure for anyone requesting benchmark results.
@@ -307,33 +288,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Attach Namespace Cargo cache
-        if: inputs.runner != 'github'
-        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
+      - name: Restore Cargo dependencies and build output
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
             target
-      - name: Show Namespace runner hardware
-        if: inputs.runner != 'github'
-        run: |
-          sw_vers
-          sysctl hw.model hw.ncpu hw.memsize machdep.cpu.brand_string
-          df -h .
-      - if: inputs.runner == 'github'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-macos-clone-benchmark-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+            !target/debug/incremental
+          key: cargo-macos-clone-benchmark-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-macos-clone-benchmark-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
-            cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
-            cargo-macos-clone-benchmark-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
-            cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
             cargo-macos-clone-benchmark-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
             cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Cache pinned development tools
@@ -349,6 +315,19 @@ jobs:
         run: |
           cargo build --release --locked --bin syq
           python3 scripts/benchmark-macos-clone.py target/release/syq
+      - name: Save Cargo dependencies and build output
+        if: >-
+          github.ref == 'refs/heads/master' &&
+          steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+            !target/debug/incremental
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   release-certification:
     needs: [scope, suite]

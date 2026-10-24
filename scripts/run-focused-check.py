@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a command or local Bash script on a CI runner and watch that exact run."""
+"""Run a command or local Bash script on a GitHub-hosted runner and watch that exact run."""
 
 import argparse
 import base64
@@ -19,15 +19,12 @@ def output(*args, **kwargs):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runner", choices=("linux", "macos", "macos-intel"), required=True)
-    parser.add_argument("--provider", choices=("namespace", "github"), default="namespace")
     parser.add_argument("--ref", help="Pushed branch/tag; defaults to the current branch")
     parser.add_argument("--script", type=Path, help="Local Bash file, including any setup")
     parser.add_argument("--cargo-cache", action="store_true")
     parser.add_argument("--timeout", type=int, default=15, help="Runner timeout in minutes (1–90)")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="Command after --")
     args = parser.parse_args()
-    if args.runner == "macos-intel" and args.provider != "github":
-        parser.error("macos-intel requires --provider github")
     command = args.command
     if command[:1] == ["--"]:
         command = command[1:]
@@ -51,7 +48,6 @@ def main():
         "ref": ref,
         "inputs": {
             "runner": args.runner,
-            "provider": args.provider,
             "revision": revision,
             "script": script,
             "cargo_cache": str(args.cargo_cache).lower(),
@@ -66,7 +62,11 @@ def main():
         "--jq", ".content")).decode()
     if "\n      label:\n" in workflow:
         payload["inputs"]["label"] = "script " + hashlib.sha256(script.encode()).hexdigest()[:12]
-    print(f"Checking {repo}@{revision} on {args.provider}/{args.runner}", flush=True)
+    # Older branches still declare a provider input that defaults to runners
+    # this repository no longer has.
+    if "\n      provider:\n" in workflow:
+        payload["inputs"]["provider"] = "github"
+    print(f"Checking {repo}@{revision} on {args.runner}", flush=True)
     response = json.loads(output(
         "gh", "api", f"repos/{repo}/actions/workflows/focused-check.yml/dispatches",
         "-H", "X-GitHub-Api-Version: 2026-03-10", "--input", "-",

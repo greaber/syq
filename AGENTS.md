@@ -738,9 +738,9 @@ actually ran; nextest rejects filters that match zero tests, while plain
 The helper selects the current remote branch, pins its checkout commit,
 prints the SHA and run URL, and watches that exact run through
 `gh run watch`; run it in the background when you do not need the result
-before replying. `--provider github` selects GitHub instead of Namespace; `--ref`
-explicitly tests another pushed branch or tag; `--timeout` changes the default
-15-minute limit. Only enable `--cargo-cache` for checks needing Rust builds.
+before replying. Checks run on GitHub-hosted runners; `--ref` explicitly tests
+another pushed branch or tag; `--timeout` changes the default 15-minute limit.
+Only enable `--cargo-cache` for checks needing Rust builds.
 No builds or test suites run implicitly, and these checks do not certify a
 full suite for release. Add reusable focused checks when repeated use
 justifies them rather than adding a permanent option for every repair.
