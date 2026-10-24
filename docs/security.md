@@ -254,9 +254,9 @@ The protection has several parts:
    connections can wait at once. A server that keeps the entry key from an
    earlier copy can keep all eight busy and so block new copies, until you
    revoke the enrollment and enroll again, which replaces the entry key.
-   Your login key and SSH agent stay on your laptop; no agent is forwarded. The entry key is stored unencrypted on your
-   laptop. Keep it dedicated to the receiver: authorizing it elsewhere would
-   give hostA that access too.
+   Your login key and SSH agent stay on your laptop; no agent is forwarded.
+   The entry key is stored unencrypted on your laptop. Keep it dedicated to
+   the receiver: authorizing it elsewhere would give hostA that access too.
 3. **Sign the particular copy with your login key.** Your laptop signs the
    copy's command, as you ran it, with its expiry, using the key you log in
    to hostB with. HostB's receiver checks the signature against that key,
