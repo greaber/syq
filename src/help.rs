@@ -12,7 +12,7 @@ fn advanced_description(path: &str) -> Option<&'static str> {
     match path {
         "syq map" => Some("Print source-to-destination mappings as NDJSON"),
         "syq receiver" => Some("Manage manual receiver enrollment and recovery"),
-        "syq receiver enroll" => Some("Manually enroll or refresh a receiver"),
+        "syq receiver enroll" => Some("Manually enroll or refresh a server account"),
         "syq persist destinations" => {
             Some("Inspect shared receiving names; --pscope does not filter them")
         }
@@ -389,14 +389,14 @@ pub(crate) fn receiver() -> Command {
             .subcommand_required(true)
             .subcommand(
                 Command::new("enroll")
-                    .about("Enroll a destination's existing parent, or refresh its receiver")
-                    .before_help("Copies normally enroll receivers automatically. Use this command for manual setup or refresh.")
-                    .long_about("Enroll a destination's existing parent, or refresh its receiver. Copies normally enroll receivers automatically. Use this command for manual setup or to refresh a receiver after rebuilding syq.")
+                    .about("Set up restricted copying on a server account, or refresh it")
+                    .before_help("Copies normally enroll accounts automatically. Use this command for manual setup or refresh.")
+                    .long_about("Set up restricted copying on a server account, or refresh it. Copies normally enroll accounts automatically. Use this command for manual setup, to refresh the account's receiver after changing syq builds, or to trust the login key you use now.")
                     .arg(
-                        Arg::new("target")
+                        Arg::new("account")
                             .required(true)
-                            .value_name("[USER@]HOST:DESTINATION")
-                            .help("Remote destination, e.g. alice@nas:/backup/photos"),
+                            .value_name("[USER@]HOST")
+                            .help("Server account, e.g. alice@nas"),
                     )
                     .arg(via()),
             )

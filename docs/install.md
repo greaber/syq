@@ -1,6 +1,8 @@
 # Install
 
-Syq runs on Linux and macOS, on x86-64 and ARM64.
+Syq runs on Linux and macOS, on x86-64 and ARM64. HTTPS downloads need a system
+CA trust store, usually provided by `ca-certificates` on Linux. See
+[HTTPS certificates](security.md#https-certificates) for private CAs.
 
 ## Standalone installer
 

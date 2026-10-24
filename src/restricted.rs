@@ -12,7 +12,7 @@ use crate::enrollment::{
 };
 use crate::proto::{self, Op, Request};
 use crate::rooted::{RelativePath, Root, RootIdentity, RootMetadata};
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use ssh_key::private::Ed25519Keypair;
@@ -38,7 +38,6 @@ mod enroll;
 mod grant;
 mod install;
 mod keys;
-mod login_agent;
 mod privilege;
 mod receiver;
 pub(crate) mod source;
@@ -46,7 +45,7 @@ mod ssh;
 mod statefs;
 mod temporary_key;
 
-pub(crate) use login_agent::ReceiverAgent;
+pub(crate) use keys::parse_entry_key;
 pub(crate) use temporary_key::TemporaryKey;
 
 pub(crate) use authority::*;
@@ -61,13 +60,17 @@ pub(crate) use receiver::*;
 pub(crate) use ssh::start as start_ssh_workers;
 use statefs::*;
 
-// Generation 6 separates SSH admission from grant signing. Older enrollments
-// retain their grant keys and replay records when the SSH key is installed.
-const CONFIG_VERSION: u16 = 6;
+// Generation 7: one enrollment per account, whose grants the user's own login
+// key signs. Released enrollments (generations 3 to 6, from v0.4.0 to v0.7.1)
+// keep their state in other directories; this build never reads them.
+const CONFIG_VERSION: u16 = 7;
 
-fn supported_config_version(version: u16) -> bool {
-    matches!(version, 4 | 5 | CONFIG_VERSION)
-}
+/// Where an enrolled server keeps each enrollment's protected state, below
+/// the account's home directory.
+const SERVER_STATE: [&str; 4] = [".local", "share", "syq", "enrollments"];
+/// Where the enrolling machine keeps its enrollments, below its home.
+const LOCAL_STATE: [&str; 4] = [".local", "state", "syq", "enrollments"];
+
 const MAX_STATE_FILE: usize = 256 * 1024;
 const MAX_AUTHORIZED_KEYS: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_ENTRIES: u64 = 100_000_000;
@@ -78,52 +81,68 @@ const GRANT_VALIDITY_SECONDS: i64 = 24 * 60 * 60;
 const FINISH_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
 const CLOCK_SKEW_SECONDS: i64 = 60;
 
+/// An enrollment's protected state on the server, in
+/// `~/.local/share/syq/enrollments/<id>/config.json`. It records no device
+/// or inode: each copy resolves its destination when it starts.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct ReceiverEnrollment {
     version: u16,
     pub(crate) id: EnrollmentId,
     pub(crate) target_login: String,
-    pub(crate) signer: String,
-    pub(crate) root: String,
-    pub(crate) root_dev: u64,
-    pub(crate) root_ino: u64,
-    pub(crate) ssh_keygen: String,
+    /// Raised each time syq's `authorized_keys` line changes. The line starts
+    /// the receiver with the generation it was written for, and a receiver
+    /// started for another generation refuses new copies.
+    pub(crate) generation: u64,
+    /// The build of the receiver the line runs.
+    pub(crate) release: String,
     pub(crate) receiver_path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    security_key_flags: Option<u8>,
+    pub(crate) entry_public_key: String,
+    /// The login key that signs this enrollment's grants.
+    pub(crate) signer: delegation::TrustedSigner,
 }
 
+/// The enrolling machine's request to set up or refresh an enrollment, sent
+/// over the user's own login to a staged copy of its syq.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct InstallRequest {
     version: u16,
     id: EnrollmentId,
     target_login: String,
-    requested_destination: String,
-    public_key: String,
-    ssh_public_key: String,
+    entry_public_key: String,
+    signer: delegation::TrustedSigner,
+    /// The enrollment exists already: its server state must still be there.
+    refresh: bool,
+    /// An enrollment whose server state was lost, which this one replaces.
+    /// Its line goes when its state is still missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    security_key_flags: Option<u8>,
-    /// The copy asking for the enrollment follows a symlink at its
-    /// destination (`--follow-dst`), so a link there is no reason to refuse.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    follows_destination: bool,
+    replaces: Option<ReplacedEnrollment>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct InstallResponse {
-    version: u16,
+struct ReplacedEnrollment {
     id: EnrollmentId,
-    target_login: String,
-    remote_home: String,
-    requested_parent: String,
-    canonical_root: String,
-    canonical_destination: String,
-    receiver_path: String,
-    /// OpenSSH public key of the signing key hostB generated for this
-    /// enrollment; the local side verifies the header of hostB's results
-    /// with it. Stored enrollments keep the field's original name.
-    receipt_public_key: String,
-    change: String,
+    entry_public_key: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "kebab-case")]
+enum InstallResponse {
+    Installed {
+        version: u16,
+        id: EnrollmentId,
+        target_login: String,
+        remote_home: String,
+        generation: u64,
+        release: String,
+        receiver_path: String,
+        /// The server's own key for the header of its results.
+        results_public_key: String,
+        /// Whether the line or state changed.
+        changed: bool,
+    },
+    /// A refresh found no server state: nothing changed, and the enrolling
+    /// machine enrolls under a new ID instead of re-creating the old one.
+    StateMissing { version: u16, id: EnrollmentId },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -131,13 +150,11 @@ struct RevokeRequest {
     version: u16,
     id: EnrollmentId,
     target_login: String,
-    public_key: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    ssh_public_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    security_key_flags: Option<u8>,
+    entry_public_key: String,
 }
 
+/// An enrollment on the enrolling machine, in
+/// `~/.local/state/syq/enrollments/<id>/enrollment.json`, beside its entry key.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct LocalEnrollment {
     version: u16,
@@ -147,14 +164,22 @@ struct LocalEnrollment {
     port: Option<u16>,
     target_login: String,
     remote_home: String,
-    requested_parent: String,
-    canonical_root: String,
+    generation: u64,
+    release: String,
     receiver_path: String,
-    receipt_public_key: String,
+    results_public_key: String,
+    signer: delegation::TrustedSigner,
+    /// The login key's unencrypted key file, for signing without an agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    security_key_flags: Option<u8>,
+    identity_file: Option<PathBuf>,
+    /// Where the server keeps its receiving state, for refusing a
+    /// destination there before anything changes on the server.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    receiving_state: Vec<PathBuf>,
 }
 
+/// An enrollment whose installation has started but not yet been confirmed,
+/// in `pending.json` beside its entry key. A later enrollment retries it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PendingEnrollment {
     version: u16,
@@ -163,14 +188,14 @@ struct PendingEnrollment {
     #[serde(default)]
     port: Option<u16>,
     target_login: String,
-    requested_destination: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    security_key_flags: Option<u8>,
 }
 
 pub(crate) struct PreparedTransfer {
-    pub(crate) ssh_key: PrivateKey,
-    pub(crate) canonical_destination: Vec<u8>,
+    /// The entry key, which the coordinating server uses for every SSH
+    /// connection to the receiver.
+    pub(crate) entry_key: PrivateKey,
+    /// The destination as the grant names it.
+    pub(crate) destination: Vec<u8>,
     pub(crate) grant: String,
     pub(crate) enrollment_id: EnrollmentId,
     /// The nonce the grant was signed with; the results must name it.

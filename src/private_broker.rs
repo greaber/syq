@@ -65,6 +65,28 @@ fn unregister_signal_cleanup(path: &Path) {
     }
 }
 
+/// An owner-only temporary directory that is removed when it is dropped,
+/// and also when a termination signal ends the process first.
+pub(crate) struct SignalCleanedDir(tempfile::TempDir);
+
+impl SignalCleanedDir {
+    pub(crate) fn new(prefix: &str) -> Result<Self> {
+        let directory = private_temp_dir(prefix)?;
+        register_signal_cleanup(directory.path())?;
+        Ok(Self(directory))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl Drop for SignalCleanedDir {
+    fn drop(&mut self) {
+        unregister_signal_cleanup(self.0.path());
+    }
+}
+
 /// Create an owner-only directory in the temporary directory.
 pub(crate) fn private_temp_dir(prefix: &str) -> io::Result<tempfile::TempDir> {
     // Request the mode at creation: tempfile otherwise uses 0777 minus the

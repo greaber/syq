@@ -97,6 +97,11 @@ impl TrustedCurrentHelper {
     pub fn archive_sha256(&self) -> &str {
         &self.archive.sha256
     }
+
+    /// The SHA-256 of the helper itself, as the signed manifest states it.
+    pub fn binary_sha256(&self) -> &str {
+        &self.binary.sha256
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -404,12 +409,13 @@ fn stored_release_path(store: &Path, helper: &TrustedCurrentHelper) -> Result<Pa
 
 /// Whether the store holds all of a release's files.
 #[derive(Debug, PartialEq, Eq)]
-enum StoredRelease {
+pub(crate) enum StoredRelease {
     Complete,
     Incomplete,
 }
 
-/// Check a release's directories, from the store root down, and its files.
+/// Check a release's directories, from the store root down, and its
+/// `files`.
 /// Each one that exists must be a real directory or file, not a symbolic link,
 /// owned by this user, that group and others cannot write; syq creates them
 /// that way. The store root alone may be a symbolic link, for example to a
@@ -420,7 +426,11 @@ enum StoredRelease {
 /// The directories above the store are trusted: anyone who can write them can
 /// replace the store, just as anyone who can write `~/.local/bin` can replace
 /// syq, so they should be writable only by the user.
-fn stored_release(store: &Path, directory: &Path) -> Result<StoredRelease> {
+pub(crate) fn stored_release(
+    store: &Path,
+    directory: &Path,
+    files: &[&str],
+) -> Result<StoredRelease> {
     use std::os::unix::fs::MetadataExt;
     let below = directory
         .strip_prefix(store)
@@ -502,7 +512,7 @@ fn stored_release(store: &Path, directory: &Path) -> Result<StoredRelease> {
         }
     }
     let mut complete = true;
-    for name in [MANIFEST_NAME, STORED_EXECUTABLE] {
+    for name in files {
         complete &= check(&path.join(name), false)?;
     }
     Ok(if complete {
@@ -567,7 +577,7 @@ fn store_helper(store: &Path, path: &Path, binary: &[u8], what: &str) -> Result<
 /// the umask, like other programs' files there. The store's own directories
 /// are owner-only, so a release stored in them passes the `privately_stored`
 /// check even under a group-writable umask.
-fn create_store_directory(store: &Path, directory: &Path) -> Result<()> {
+pub(crate) fn create_store_directory(store: &Path, directory: &Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     require_own_home(store)?;
     if let Some(above) = store.parent() {
@@ -630,7 +640,7 @@ pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
     // verified in full on every run instead, as before stored releases were
     // started directly.
     if !crate::fsops::fixed_owners_and_modes(&store) {
-        match stored_release(&store, &directory)
+        match stored_release(&store, &directory, &[MANIFEST_NAME, STORED_EXECUTABLE])
             .with_context(|| format!("cannot start syq {version} from the binary store"))?
         {
             StoredRelease::Complete => return Ok(executable),
@@ -1133,7 +1143,7 @@ fn fetch_into(url: &str, sink: &mut dyn DownloadSink, mode: FetchMode, limit: u6
         FetchMode::Interactive => (Duration::from_secs(10), None, 3),
         FetchMode::BackgroundCheck => (Duration::from_secs(2), Some(Duration::from_secs(5)), 1),
     };
-    let agent = ureq::Agent::config_builder()
+    let agent = crate::tls::config_builder()
         .https_only(true)
         .timeout_connect(Some(connect_timeout))
         .timeout_global(global_timeout)
@@ -1181,7 +1191,7 @@ fn fetch_into(url: &str, sink: &mut dyn DownloadSink, mode: FetchMode, limit: u6
             }
         }
     }
-    Err(last_error.unwrap()).with_context(|| format!("download {url}"))
+    Err(crate::tls::download_error(last_error.unwrap())).with_context(|| format!("download {url}"))
 }
 
 fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
@@ -1283,7 +1293,7 @@ fn config_dir() -> Result<PathBuf> {
 }
 
 /// The executable's name in its release directory.
-const STORED_EXECUTABLE: &str = "syq";
+pub(crate) const STORED_EXECUTABLE: &str = "syq";
 
 /// The store of versioned executables, `~/.local/lib/syq`. It holds releases
 /// selected with `--use-version` and helpers downloaded for SSH servers, in

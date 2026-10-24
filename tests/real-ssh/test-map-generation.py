@@ -17,8 +17,8 @@ def remote(code):
 
 
 def enrollments():
-    state = Path.home()/'.local/state/syq/restricted'
-    return {bytes(json.loads(path.read_bytes())['id']).hex() for path in state.glob('*/metadata.json')}
+    state = Path.home()/'.local/state/syq/enrollments'
+    return {bytes(json.loads(path.read_bytes())['id']).hex() for path in state.glob('*/enrollment.json')}
 
 
 root = '/tmp/syq-real-ssh/map-generation'
@@ -84,7 +84,7 @@ fd=os.open(os.fsencode({root!r})+b'/invalid-\\xff',os.O_CREAT|os.O_WRONLY,0o600)
     failed = run(['syq', 'map', '--from', 'source', '--srcs-in', root], ok=False)
     assert b'UTF-8' in failed.stderr
 finally:
-    # Copies to destination enroll a restricted receiver there. Revoke it so
+    # Copies to destination enroll the destination account. Revoke it so
     # later cases start without receiver state.
     for identifier in enrollments() - existing:
         run(['syq', 'receiver', 'revoke', identifier])

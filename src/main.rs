@@ -70,6 +70,7 @@ mod sys;
 mod tcp_records;
 #[cfg(test)]
 mod test_support;
+mod tls;
 mod transfer;
 mod transfer_observations;
 mod transfer_tuning;
@@ -236,16 +237,26 @@ fn main() {
         return;
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("--restricted-receiver") {
-        let enrollment = argv
-            .get(2)
-            .and_then(|argument| argument.to_str())
-            .and_then(|argument| argument.strip_prefix("--enrollment="));
-        if argv.len() != 3 || enrollment.is_none() {
-            crate::output::diagnostic!("syq: restricted receiver requires exactly --enrollment=ID");
+        let value = |index: usize, prefix: &str| {
+            argv.get(index)
+                .and_then(|argument| argument.to_str())
+                .and_then(|argument| argument.strip_prefix(prefix))
+        };
+        let (enrollment, generation) = (value(2, "--enrollment="), value(3, "--generation="));
+        let (Some(enrollment), Some(generation)) = (enrollment, generation) else {
+            crate::output::diagnostic!(
+                "syq: restricted receiver requires exactly --enrollment=ID --generation=N"
+            );
+            std::process::exit(2);
+        };
+        if argv.len() != 4 {
+            crate::output::diagnostic!(
+                "syq: restricted receiver requires exactly --enrollment=ID --generation=N"
+            );
             std::process::exit(2);
         }
         fsops::reserve_startup_descriptors();
-        if let Err(error) = restricted::run_receiver(enrollment.unwrap()) {
+        if let Err(error) = restricted::run_receiver(enrollment, generation) {
             crate::output::diagnostic!("syq restricted receiver: {error:#}");
             std::process::exit(1);
         }

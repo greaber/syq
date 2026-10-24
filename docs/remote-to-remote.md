@@ -26,10 +26,11 @@ for what this protects against.
 
 - SSH access from your machine to both servers, with their host keys already
   trusted. Connect with ordinary SSH once if either server is new to you.
-- An SSH agent on your machine and an SSH client that can forward a separate
-  agent socket (OpenSSH 8.2 or newer). HostB needs `ssh-keygen -Y verify`
-  for copy grants (OpenSSH 8.1 or newer); hardware keys need support for their
-  key type. HostA and hostB do not need the OpenSSH 8.9 agent extensions.
+- A login to hostB with an SSH key that can sign on your machine: a key file
+  without a passphrase, or a key loaded in your SSH agent. Passphrase-protected,
+  FIDO, and PKCS#11 or PIV keys must be in the agent. Password and multi-factor
+  logins cannot authorize these copies.
+- OpenSSH 7.2 or newer on hostB, with a writable `~/.ssh/authorized_keys`.
 - SSH connectivity from hostA to hostB. A reachable TCP data port
   on hostB, normally in `47600–47699`, enables encrypted TCP workers; see
   [Make TCP reachable](server-tuning.md#make-tcp-reachable). Otherwise
@@ -42,15 +43,20 @@ The copy stops if your laptop command ends, so keep it running until the copy fi
 
 ### First copy and access management
 
-The first copy sets up a restricted receiver on hostB automatically. It adds
-a restricted SSH key to `authorized_keys` and a separate public key for checking
-copy grants. Both private keys stay on your machine; only the SSH key is
-available to hostA through a dedicated agent. Later copies reuse this setup.
+The first copy to your hostB account sets up restricted copying there. It
+logs in with your usual SSH key, adds one line to hostB's `authorized_keys`
+whose key can only start syq's receiver, and installs syq in
+`~/.local/lib/syq` on hostB. From then on, the key you log in with signs each
+copy on your machine, and hostB checks that signature before writing
+anything. HostA receives that signed authorization and the receiver's entry
+key, which cannot authorize anything by itself. Later copies to any directory of that account
+reuse the setup. With a FIDO key, each copy needs one touch, and a copy that
+sets up or refreshes restricted copying needs about three.
 
-To prepare `/archive` on hostB ahead of time, including before a dry run:
+To set up hostB ahead of time, including before a dry run:
 
 ```sh
-syq receiver enroll hostB:/archive
+syq receiver enroll hostB
 syq cp --dry-run -v --from hostA --srcs-in data --to hostB --into /archive
 ```
 
@@ -64,7 +70,8 @@ syq receiver revoke ID
 Use the ID from `list`. Revocation stops active copies for that enrollment
 and removes its access; completed writes remain. If cleanup fails, retry
 `receiver revoke`. See [Enrollment](remote-reference.md#enrollment)
-for upgrades and sharing between installations.
+for which keys can sign, key changes, updates, and enrollments made by older
+versions.
 
 If your machine reaches hostB through hostA, add `--via hostA` to `enroll` or
 `revoke`.

@@ -13,7 +13,7 @@ fn enrollment_upload_selects_and_verifies_the_remote_platform() {
             &endpoint("receiver", "fixture", None).unwrap(),
             EnrollmentRoute::Direct,
             EnrollmentId::test_v4(1),
-            ManagementAction::Install,
+            ManagementAction::Revoke,
             b"{}",
         );
         assert_eq!(
@@ -77,7 +77,7 @@ fn enrollment_upload_selects_and_verifies_the_remote_platform() {
 for argument do command=$argument; done
 case "$command" in
     *'uname -s'*) printf '%s\n%s\n' "$SYQ_TEST_REMOTE_OS" "$SYQ_TEST_REMOTE_ARCH" ;;
-    *'--restricted-install'*) cat > "$SYQ_TEST_UPLOAD" ;;
+    *'--restricted-revoke'*) cat > "$SYQ_TEST_UPLOAD" ;;
     *) exit 91 ;;
 esac
 "#,
@@ -215,37 +215,1306 @@ fn signed_tcp_congestion_requires_the_exact_approved_algorithm() {
 }
 
 #[test]
-fn receiver_configuration_preserves_released_v041_bytes() {
-    // Unmodified output of the checksum-verified released v0.4.1
-    // --restricted-install, produced in a disposable account/container.
-    let encoded = include_bytes!("../../tests/fixtures/restricted-enrollment-v0.4.1.json");
-    let config: ReceiverEnrollment = serde_json::from_slice(encoded).unwrap();
-    assert_eq!(config.version, 3);
-    // The old representation is still readable, but cannot authorize a
-    // generation-4 receiver. Enrollment must be recreated after upgrade.
-    assert_ne!(config.version, CONFIG_VERSION);
-    assert_eq!(
-        config.id,
-        EnrollmentId::parse("00112233445546778899aabbccddeeff").unwrap()
+fn released_enrollment_state_is_never_read_or_touched() {
+    // Unmodified output from checksum-verified v0.7.1 in the disposable SSH lab.
+    let receiver = include_bytes!("../../tests/fixtures/restricted-enrollment-v0.7.1.json");
+    let local = include_bytes!("../../tests/fixtures/restricted-local-enrollment-v0.7.1.json");
+    let released = "8ae0ca10655849f7823a0bc50a8c83c2";
+    let (account, account_home) = current_account().unwrap();
+    let temporary = tempfile::Builder::new()
+        .prefix("syq-released-")
+        .tempdir_in(account_home)
+        .unwrap();
+    let home = temporary.path();
+    fs::set_permissions(home, fs::Permissions::from_mode(0o700)).unwrap();
+    let private = |path: &Path| {
+        fs::create_dir_all(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    let write = |path: &Path, contents: &[u8], mode: u32| {
+        fs::write(path, contents).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    };
+    // The released layout on both sides, as v0.7.1 wrote it.
+    let old_state = home.join(".local/share/syq/restricted").join(released);
+    let old_local = home.join(".local/state/syq/restricted").join(released);
+    private(&old_state);
+    private(&old_local);
+    write(&old_state.join("config.json"), receiver, 0o600);
+    write(&old_local.join("metadata.json"), local, 0o600);
+    private(&home.join(".local/libexec"));
+    let old_receiver = home.join(".local/libexec/syq-receiver");
+    write(&old_receiver, b"released receiver", 0o700);
+    private(&home.join(".ssh"));
+    let old_key = generate_test_key("released").unwrap();
+    let old_line = format!(
+        "restrict,command=\"{}/.local/libexec/syq-receiver --restricted-receiver --enrollment={released}\" {} syq-enrollment:{released}\n",
+        home.display(),
+        old_key.public_key().to_openssh().unwrap()
     );
-    assert_eq!(serde_json::to_vec(&config).unwrap(), encoded);
+    let original = format!("# unrelated\n{old_line}");
+    let authorized_keys = home.join(".ssh/authorized_keys");
+    write(&authorized_keys, original.as_bytes(), 0o600);
+
+    // A new enrollment for the same account goes beside it.
+    let login = generate_test_key("login").unwrap();
+    let entry = generate_test_key("entry").unwrap();
+    let id = EnrollmentId::random();
+    let request = InstallRequest {
+        version: CONFIG_VERSION,
+        id,
+        target_login: account.clone(),
+        entry_public_key: entry.public_key().to_openssh().unwrap(),
+        signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
+        refresh: false,
+        replaces: None,
+    };
+    let InstallResponse::Installed { generation, .. } =
+        install_for_account(&request, &account, home).unwrap()
+    else {
+        panic!("install did not install");
+    };
+    assert_eq!(generation, 1);
+    let updated = fs::read_to_string(&authorized_keys).unwrap();
+    assert!(updated.starts_with(&original), "{updated}");
+    assert_eq!(updated.lines().count(), 3);
+    assert_eq!(fs::read(old_state.join("config.json")).unwrap(), receiver);
+    assert_eq!(fs::read(old_local.join("metadata.json")).unwrap(), local);
+    assert_eq!(fs::read(&old_receiver).unwrap(), b"released receiver");
+    assert!(enrollment_state(home, id).join("config.json").is_file());
+
+    // The new receiver has no state for the released ID, and refuses
+    // released state wherever it finds it.
+    let released_id = EnrollmentId::parse(released).unwrap();
+    assert!(read_receiver_config(&enrollment_state(home, released_id))
+        .unwrap()
+        .is_none());
+    let misplaced = enrollment_state(home, released_id);
+    private(&misplaced);
+    write(&misplaced.join("config.json"), receiver, 0o600);
+    assert!(read_receiver_config(&misplaced).is_err());
+
+    // `syq receiver list` points at the docs, and changes nothing.
+    let notice = released_enrollment_notice(home).unwrap();
+    assert!(notice.contains("0.4.0 to 0.7.1"), "{notice}");
+    assert!(
+        notice.contains("#enrollments-from-older-versions"),
+        "{notice}"
+    );
+    assert!(released_enrollment_notice(&home.join("missing")).is_none());
+
+    // The enrolling machine lists only current enrollments.
+    let base = home.join(".local/state/syq/enrollments");
+    private(&base.join(released));
+    write(&base.join(released).join(ENROLLMENT_FILE), local, 0o600);
+    assert!(load_local_enrollments_in(&base).unwrap().is_empty());
+
+    // Revoking the new enrollment removes only its own line and state.
+    revoke_for_account(
+        &RevokeRequest {
+            version: CONFIG_VERSION,
+            id,
+            target_login: account.clone(),
+            entry_public_key: entry.public_key().to_openssh().unwrap(),
+        },
+        &account,
+        home,
+    )
+    .unwrap();
+    assert_eq!(fs::read_to_string(&authorized_keys).unwrap(), original);
+    assert!(!enrollment_state(home, id).exists());
+    assert_eq!(fs::read(old_state.join("config.json")).unwrap(), receiver);
+    assert_eq!(fs::read(old_local.join("metadata.json")).unwrap(), local);
+    assert_eq!(fs::read(&old_receiver).unwrap(), b"released receiver");
+}
+/// A temporary home in the real account's home, with a private `.ssh`.
+fn enrollment_home() -> (String, tempfile::TempDir) {
+    let (account, account_home) = current_account().unwrap();
+    let temporary = tempfile::Builder::new()
+        .prefix("syq-enroll-")
+        .tempdir_in(account_home)
+        .unwrap();
+    fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let ssh = temporary.path().join(".ssh");
+    fs::create_dir(&ssh).unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    (account, temporary)
+}
+
+fn install_request(
+    account: &str,
+    id: EnrollmentId,
+    entry: &PrivateKey,
+    login: &PrivateKey,
+    refresh: bool,
+) -> InstallRequest {
+    InstallRequest {
+        version: CONFIG_VERSION,
+        id,
+        target_login: account.to_owned(),
+        entry_public_key: entry.public_key().to_openssh().unwrap(),
+        signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
+        refresh,
+        replaces: None,
+    }
+}
+
+fn installed(response: InstallResponse) -> (u64, bool) {
+    match response {
+        InstallResponse::Installed {
+            generation,
+            changed,
+            release,
+            ..
+        } => {
+            assert_eq!(release, crate::identity::build());
+            (generation, changed)
+        }
+        InstallResponse::StateMissing { .. } => panic!("install reported missing state"),
+    }
+}
+
+/// The entry key only starts the receiver, so it must be a key hostA can
+/// use alone, and never the login key: a refused request installs nothing.
+#[test]
+fn the_entry_key_is_a_software_key_other_than_the_login_key() {
+    let (account, home) = enrollment_home();
+    let home = home.path();
+    let login = generate_test_key("login").unwrap();
+    let same = install_request(&account, EnrollmentId::random(), &login, &login, false);
+    let error = install_for_account(&same, &account, home).err().unwrap();
+    assert!(error.to_string().contains("must differ"), "{error:#}");
+    let entry = generate_test_key("entry").unwrap();
+    let mut fido = install_request(&account, EnrollmentId::random(), &entry, &login, false);
+    let ssh_key::public::KeyData::Ed25519(public) = entry.public_key().key_data().clone() else {
+        unreachable!("test keys are Ed25519");
+    };
+    fido.entry_public_key = ssh_key::PublicKey::new(
+        ssh_key::public::KeyData::SkEd25519(ssh_key::public::SkEd25519::new(public, "ssh:")),
+        "",
+    )
+    .to_openssh()
+    .unwrap();
+    let error = install_for_account(&fido, &account, home).err().unwrap();
+    assert!(error.to_string().contains("software"), "{error:#}");
+    assert!(!home.join(".ssh/authorized_keys").exists());
+    assert!(!home.join(".local/share/syq").exists());
+    assert!(!home.join(crate::user_dirs::BINARY_STORE_IN_HOME).exists());
+}
+
+/// The receiver lives in the binary store and follows its rules: a stored
+/// build runs as it is only when its directories and file are the
+/// account's own and nobody else can change them, and the store's root
+/// alone may be a link to another directory of the account's.
+#[test]
+fn the_receiver_install_follows_the_binary_store_rules() {
+    let (account, home) = enrollment_home();
+    let home = home.path();
+    let login = generate_test_key("login").unwrap();
+    let install = |home: &Path| {
+        let entry = generate_test_key("entry").unwrap();
+        let request = install_request(&account, EnrollmentId::random(), &entry, &login, false);
+        install_for_account(&request, &account, home).map(installed)
+    };
+    install(home).unwrap();
+    let receiver = store_receiver_path(home);
+    let build = receiver.parent().unwrap().to_path_buf();
+    assert_eq!(fs::metadata(&build).unwrap().mode() & 0o777, 0o700);
+    // Another syq sharing the home, such as an SSH helper of this build, is
+    // the receiver as it stands.
+    let stored = fs::read(&receiver).unwrap();
+    install(home).unwrap();
+    assert_eq!(fs::read(&receiver).unwrap(), stored);
+    // A private stored build that is not exactly this one is replaced.
+    crate::test_support::write_executable(&home.join("other-build"), "#!/bin/sh\nexit 1\n", 0o700);
+    fs::rename(home.join("other-build"), &receiver).unwrap();
+    install(home).unwrap();
+    assert_eq!(fs::read(&receiver).unwrap(), stored);
+    // A stored build others could change is refused, not replaced.
+    fs::set_permissions(&receiver, fs::Permissions::from_mode(0o770)).unwrap();
+    let error = format!("{:#}", install(home).unwrap_err());
+    assert!(error.contains("writable by group or others"), "{error}");
+    fs::set_permissions(&receiver, fs::Permissions::from_mode(0o700)).unwrap();
+    // So is a build directory that is a link.
+    let moved = home.join("moved-build");
+    fs::rename(&build, &moved).unwrap();
+    symlink(&moved, &build).unwrap();
+    let error = format!("{:#}", install(home).unwrap_err());
+    assert!(error.contains("is a symbolic link"), "{error}");
+    fs::remove_file(&build).unwrap();
+    fs::rename(&moved, &build).unwrap();
+    // The store's root may lead to another directory of the account's.
+    let (_, other) = enrollment_home();
+    let other = other.path();
+    let elsewhere = other.join("store-elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    fs::create_dir_all(other.join(".local/lib")).unwrap();
+    symlink(
+        &elsewhere,
+        other.join(crate::user_dirs::BINARY_STORE_IN_HOME),
+    )
+    .unwrap();
+    install(other).unwrap();
+    assert!(store_receiver_path(other).is_file());
+    assert!(fs::read_dir(&elsewhere).unwrap().next().is_some());
+}
+
+/// The installer compares a stored build with the running one a block at
+/// a time, and the same file needs no reading at all.
+#[test]
+fn a_stored_build_is_compared_without_holding_either_whole() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let block = 1 << 16;
+    let contents: Vec<u8> = (0..3 * block + 17).map(|byte| (byte % 251) as u8).collect();
+    let running = temporary.path().join("running");
+    fs::write(&running, &contents).unwrap();
+    assert!(same_executable(&running, &running).unwrap());
+    let copy = temporary.path().join("copy");
+    fs::write(&copy, &contents).unwrap();
+    assert!(same_executable(&running, &copy).unwrap());
+    let mut changed = contents.clone();
+    changed[2 * block + 5] ^= 1;
+    fs::write(&copy, &changed).unwrap();
+    assert!(!same_executable(&running, &copy).unwrap());
+    fs::write(&copy, &contents[..contents.len() - 1]).unwrap();
+    assert!(!same_executable(&running, &copy).unwrap());
+    assert!(!same_executable(&running, &temporary.path().join("missing")).unwrap());
+}
+
+/// A refresh recreates a deleted or unusable record of used grants, under a new
+/// generation: grants signed before it name the old one and are refused,
+/// so none can be redeemed again against the empty record.
+#[test]
+fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
+    let (account, home) = enrollment_home();
+    let home = home.path();
+    let id = EnrollmentId::random();
+    let entry = generate_test_key("entry").unwrap();
+    let login = generate_test_key("login").unwrap();
+    let request = install_request(&account, id, &entry, &login, false);
+    assert_eq!(
+        installed(install_for_account(&request, &account, home).unwrap()),
+        (1, true)
+    );
+    let replay = enrollment_state(home, id).join("replay");
+    fs::remove_dir(&replay).unwrap();
+    let refresh = install_request(&account, id, &entry, &login, true);
+    assert_eq!(
+        installed(install_for_account(&refresh, &account, home).unwrap()),
+        (2, true)
+    );
+    assert!(replay.is_dir());
+    assert_eq!(fs::metadata(&replay).unwrap().mode() & 0o777, 0o700);
+    let line = fs::read_to_string(home.join(".ssh/authorized_keys")).unwrap();
+    assert!(line.contains("--generation=2\""), "{line}");
+    // With the record in place, a refresh changes nothing.
+    assert_eq!(
+        installed(install_for_account(&refresh, &account, home).unwrap()),
+        (2, false)
+    );
+    // A record the receiver refuses, as after a restore from a backup with
+    // another mode, or something else in its place, is recreated the same
+    // way.
+    fs::set_permissions(&replay, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(delegation::ReplayStore::open(&replay).is_err());
+    assert_eq!(
+        installed(install_for_account(&refresh, &account, home).unwrap()),
+        (3, true)
+    );
+    delegation::ReplayStore::open(&replay).unwrap();
+    fs::remove_dir(&replay).unwrap();
+    fs::write(&replay, b"not a record").unwrap();
+    assert_eq!(
+        installed(install_for_account(&refresh, &account, home).unwrap()),
+        (4, true)
+    );
+    delegation::ReplayStore::open(&replay).unwrap();
+
+    // Interrupted right after the record is recreated: the new generation
+    // is already the receiver's, so the old line, still in authorized_keys,
+    // admits no grant against the empty record.
+    fs::remove_dir(&replay).unwrap();
+    INTERRUPT_AFTER_RECORD.with(|interrupt| interrupt.set(true));
+    let interrupted = install_for_account(&refresh, &account, home);
+    INTERRUPT_AFTER_RECORD.with(|interrupt| interrupt.set(false));
+    assert!(interrupted.is_err());
+    assert!(replay.is_dir());
+    let config = read_receiver_config(&enrollment_state(home, id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(config.generation, 5);
+    let line = fs::read_to_string(home.join(".ssh/authorized_keys")).unwrap();
+    assert!(line.contains("--generation=4\""), "{line}");
+    let error = require_current_receiver(&config, 4, &config.release).unwrap_err();
+    assert!(error.to_string().contains("outdated receiver"), "{error}");
+    // The retry writes a line for a generation after it.
+    assert_eq!(
+        installed(install_for_account(&refresh, &account, home).unwrap()),
+        (6, true)
+    );
 }
 
 #[test]
-fn receiver_and_local_state_preserve_released_v071_bytes() {
-    // Unmodified output from checksum-verified v0.7.1 in the disposable SSH lab.
-    let receiver = include_bytes!("../../tests/fixtures/restricted-enrollment-v0.7.1.json");
-    let config: ReceiverEnrollment = serde_json::from_slice(receiver).unwrap();
-    assert_eq!(config.version, 4);
-    assert!(supported_config_version(config.version));
-    assert_eq!(config.security_key_flags, None);
-    assert_eq!(serde_json::to_vec(&config).unwrap(), receiver);
-    let local = include_bytes!("../../tests/fixtures/restricted-local-enrollment-v0.7.1.json");
-    let metadata: LocalEnrollment = serde_json::from_slice(local).unwrap();
-    assert!(supported_config_version(metadata.version));
-    assert_eq!(metadata.id, config.id);
-    assert_eq!(metadata.security_key_flags, None);
-    assert_eq!(serde_json::to_vec(&metadata).unwrap(), local);
+fn rotation_rewrites_only_the_signer_and_raises_the_generation() {
+    let (account, home) = enrollment_home();
+    let home = home.path();
+    let id = EnrollmentId::random();
+    let entry = generate_test_key("entry").unwrap();
+    let first_login = generate_test_key("first login").unwrap();
+    let request = install_request(&account, id, &entry, &first_login, false);
+    assert_eq!(
+        installed(install_for_account(&request, &account, home).unwrap()),
+        (1, true)
+    );
+    let authorized_keys = home.join(".ssh/authorized_keys");
+    let line = fs::read_to_string(&authorized_keys).unwrap();
+    assert!(line.contains("--generation=1\""), "{line}");
+    let receiver = store_receiver_path(home);
+    assert!(line.starts_with(&format!("restrict,command=\"{}", receiver.display())));
+    assert!(receiver.is_file());
+    // The comment names the trusted login key.
+    let words: Vec<_> = first_login
+        .public_key()
+        .to_openssh()
+        .unwrap()
+        .split_whitespace()
+        .take(2)
+        .map(str::to_owned)
+        .collect();
+    assert!(line
+        .trim_end()
+        .ends_with(&format!("signer {} {}", words[0], words[1])));
+
+    // The same request again changes nothing.
+    let mut refresh = install_request(&account, id, &entry, &first_login, true);
+    assert_eq!(
+        installed(install_for_account(&refresh, &account, home).unwrap()),
+        (1, false)
+    );
+    assert_eq!(fs::read_to_string(&authorized_keys).unwrap(), line);
+
+    // A new certificate for the same key, or a new touch or PIN policy,
+    // changes only the recorded signer. The line, and so the generation and
+    // the connections it admits, stay.
+    let original_signer = refresh.signer.clone();
+    refresh.signer =
+        delegation::TrustedSigner::new(first_login.public_key(), None, Some(4_000_000_000))
+            .unwrap();
+    assert_eq!(
+        installed(install_for_account(&refresh, &account, home).unwrap()),
+        (1, true)
+    );
+    assert_eq!(fs::read_to_string(&authorized_keys).unwrap(), line);
+    let config = read_receiver_config(&enrollment_state(home, id))
+        .unwrap()
+        .unwrap();
+    assert_eq!((config.generation, &config.signer), (1, &refresh.signer));
+    refresh.signer = original_signer;
+    assert_eq!(
+        installed(install_for_account(&refresh, &account, home).unwrap()),
+        (1, true)
+    );
+
+    // A new login key replaces only the trusted signer: the entry key, and
+    // so connections it admits, stay.
+    let second_login = generate_test_key("second login").unwrap();
+    refresh.signer = delegation::TrustedSigner::new(second_login.public_key(), None, None).unwrap();
+    assert_eq!(
+        installed(install_for_account(&refresh, &account, home).unwrap()),
+        (2, true)
+    );
+    let rotated = fs::read_to_string(&authorized_keys).unwrap();
+    assert_eq!(rotated.lines().count(), 1);
+    assert!(rotated.contains("--generation=2\""));
+    assert!(rotated.contains(
+        entry
+            .public_key()
+            .to_openssh()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+    ));
+    assert!(!rotated.contains(&words[1]));
+    let config = read_receiver_config(&enrollment_state(home, id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(config.generation, 2);
+    assert_eq!(config.signer, refresh.signer);
+    assert_eq!(config.entry_public_key, request.entry_public_key);
+
+    // A receiver recorded for another build is refreshed too.
+    let mut stale = config.clone();
+    stale.release = "v0.0.0-old".into();
+    atomic_write(
+        &enrollment_state(home, id),
+        "config.json",
+        &serde_json::to_vec(&stale).unwrap(),
+        0o600,
+    )
+    .unwrap();
+    assert_eq!(
+        installed(install_for_account(&refresh, &account, home).unwrap()),
+        (3, true)
+    );
+
+    // Another entry key for the same enrollment is refused.
+    let other_entry = generate_test_key("other entry").unwrap();
+    let error = install_for_account(
+        &install_request(&account, id, &other_entry, &second_login, true),
+        &account,
+        home,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("different entry key"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn lost_server_state_means_a_new_enrollment_that_replaces_the_old_line() {
+    let (account, home) = enrollment_home();
+    let home = home.path();
+    let id = EnrollmentId::random();
+    let entry = generate_test_key("entry").unwrap();
+    let login = generate_test_key("login").unwrap();
+    install_for_account(
+        &install_request(&account, id, &entry, &login, false),
+        &account,
+        home,
+    )
+    .unwrap();
+    let authorized_keys = home.join(".ssh/authorized_keys");
+    let before = fs::read(&authorized_keys).unwrap();
+    fs::remove_dir_all(enrollment_state(home, id)).unwrap();
+
+    // A refresh finds no state and changes nothing: re-creating it would
+    // start an empty record of used grants.
+    let response = install_for_account(
+        &install_request(&account, id, &entry, &login, true),
+        &account,
+        home,
+    )
+    .unwrap();
+    assert!(matches!(response, InstallResponse::StateMissing { id: missing, .. } if missing == id));
+    assert_eq!(fs::read(&authorized_keys).unwrap(), before);
+    assert!(!enrollment_state(home, id).exists());
+
+    // The new enrollment removes the old one's line.
+    let new_id = EnrollmentId::random();
+    let new_entry = generate_test_key("new entry").unwrap();
+    let mut request = install_request(&account, new_id, &new_entry, &login, false);
+    request.replaces = Some(ReplacedEnrollment {
+        id,
+        entry_public_key: entry.public_key().to_openssh().unwrap(),
+    });
+    assert_eq!(
+        installed(install_for_account(&request, &account, home).unwrap()),
+        (1, true)
+    );
+    let after = fs::read_to_string(&authorized_keys).unwrap();
+    assert_eq!(after.lines().count(), 1);
+    assert!(after.contains(&format!("syq-enrollment:{new_id}")));
+    assert!(!after.contains(&format!("syq-enrollment:{id}")));
+
+    // A grant for the lost enrollment, or for an older generation, is refused.
+    let config = read_receiver_config(&enrollment_state(home, new_id))
+        .unwrap()
+        .unwrap();
+    let source = Location::parse("host-a:source").unwrap();
+    let args = {
+        let mut args =
+            Args::try_parse_from(["syq rsync", "-r", "host-a:source", "host-b:/backup"]).unwrap();
+        args.normalize();
+        args
+    };
+    let replay_path = enrollment_state(home, new_id).join("replay");
+    let replay = delegation::ReplayStore::open(&replay_path).unwrap();
+    let signer = keys::LoginSigner::File(Box::new(login.clone()));
+    for (grant_id, generation, accepted) in [(id, 1, false), (new_id, 2, false), (new_id, 1, true)]
+    {
+        let grant = grant_for(
+            &args,
+            std::slice::from_ref(&source),
+            (grant_id, generation),
+            &account,
+            b"/backup",
+        )
+        .unwrap();
+        let encoded = delegation::sign_grant_with(
+            grant,
+            GrantConstraints {
+                tcp_congestion: None,
+                mapping: None,
+                hashing: None,
+                max_file_data_bytes_per_second: 0,
+                filters: FilterPolicy::default(),
+                root_existence: RootExistence::Any,
+                receipt_policy: results_policy().1,
+                extra_options: Default::default(),
+            },
+            |payload| signer.sign(delegation::SSHSIG_NAMESPACE, payload),
+        )
+        .unwrap();
+        let expected_signer = signer_name(new_id, config.generation);
+        let context = delegation::ReceiverContext {
+            enrollment_id: new_id,
+            target_login: &account,
+            expected_signer: &expected_signer,
+            clock: delegation::ClockObservation {
+                unix_seconds: now().unwrap(),
+                monotonic: Instant::now(),
+            },
+            clock_skew_seconds: CLOCK_SKEW_SECONDS,
+        };
+        assert_eq!(
+            delegation::verify_and_redeem(&encoded, &context, &config.signer, &replay).is_ok(),
+            accepted,
+            "{grant_id} {generation}"
+        );
+    }
+}
+
+#[test]
+fn a_lost_reply_to_a_replacement_enrollment_is_retried_not_duplicated() {
+    let (_, home) = current_account().unwrap();
+    let temporary = tempfile::tempdir_in(home).unwrap();
+    fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let replaced = || ReplacedEnrollment {
+        id: EnrollmentId::random(),
+        entry_public_key: generate_test_key("old")
+            .unwrap()
+            .public_key()
+            .to_openssh()
+            .unwrap(),
+    };
+    // No earlier attempt: a new enrollment.
+    let fresh = replacement_plan(temporary.path(), None, replaced()).unwrap();
+    assert!(fresh.entry_key.is_none() && !fresh.refresh && fresh.replaces.is_some());
+    // An earlier attempt whose reply was lost: the same ID and entry key.
+    let id = EnrollmentId::random();
+    let directory = temporary.path().join(id.to_string());
+    ensure_directory(&directory, 0o700).unwrap();
+    let entry = generate_test_key("entry").unwrap();
+    store_entry_key(&directory, &entry).unwrap();
+    let pending = PendingEnrollment {
+        version: CONFIG_VERSION,
+        id,
+        host: "host-b".into(),
+        port: None,
+        target_login: "backup".into(),
+    };
+    let retried = replacement_plan(
+        temporary.path(),
+        Some((pending, directory.clone())),
+        replaced(),
+    )
+    .unwrap();
+    assert_eq!(retried.id, id);
+    assert_eq!(retried.directory, directory);
+    assert_eq!(retried.entry_key.unwrap().public_key(), entry.public_key());
+    assert!(!retried.refresh && retried.replaces.is_some());
+}
+
+#[test]
+fn a_receiver_from_an_older_line_refuses_new_copies() {
+    let login = generate_test_key("login").unwrap();
+    let config = ReceiverEnrollment {
+        version: CONFIG_VERSION,
+        id: EnrollmentId::random(),
+        target_login: "backup".into(),
+        generation: 4,
+        release: "v0.8.0".into(),
+        receiver_path: "/home/backup/.local/lib/syq/v0.8.0/linux-x86_64/syq".into(),
+        entry_public_key: generate_test_key("entry")
+            .unwrap()
+            .public_key()
+            .to_openssh()
+            .unwrap(),
+        signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
+    };
+    require_current_receiver(&config, 4, "v0.8.0").unwrap();
+    for (generation, build) in [(3, "v0.8.0"), (4, "v0.7.9"), (5, "v0.8.0")] {
+        let error = require_current_receiver(&config, generation, build).unwrap_err();
+        assert!(error.to_string().contains("outdated receiver"), "{error}");
+    }
+    // The state names no device or inode.
+    let encoded = serde_json::to_string(&config).unwrap();
+    for field in ["dev", "ino", "root"] {
+        assert!(!encoded.contains(&format!("\"{field}")), "{encoded}");
+    }
+}
+
+/// A receiver records a grant as used only after the build, the
+/// generation and the signature are checked: a refused grant leaves the
+/// record of used grants as it was.
+#[test]
+fn a_grant_is_recorded_only_after_every_check_passes() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let state = temporary.path().join("state");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(state.join("replay"))
+        .unwrap();
+    let login = generate_test_key("login").unwrap();
+    let mut config = ReceiverEnrollment {
+        version: CONFIG_VERSION,
+        id: EnrollmentId::random(),
+        target_login: "backup".into(),
+        generation: 2,
+        release: "v0.8.0".into(),
+        receiver_path: "/home/backup/.local/lib/syq/v0.8.0/linux-x86_64/syq".into(),
+        entry_public_key: generate_test_key("entry")
+            .unwrap()
+            .public_key()
+            .to_openssh()
+            .unwrap(),
+        signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
+    };
+    let args = Args::parse_args(
+        &["cp", "--from", "a", "x", "--to", "b", "--into", "/b"].map(std::ffi::OsString::from),
+    )
+    .unwrap();
+    let source = Location::parse("a:x").unwrap();
+    let sign = |key: &PrivateKey, generation: u64, namespace: &str| {
+        let grant = grant_for(
+            &args,
+            std::slice::from_ref(&source),
+            (config.id, generation),
+            "backup",
+            b"/b",
+        )
+        .unwrap();
+        delegation::sign_grant_with(grant, GrantConstraints::default(), |payload| {
+            keys::LoginSigner::File(Box::new(key.clone())).sign(namespace, payload)
+        })
+        .unwrap()
+    };
+    let recorded = || fs::read_dir(state.join("replay")).unwrap().count();
+    let current = (2, "v0.8.0");
+    let valid = sign(&login, 2, delegation::SSHSIG_NAMESPACE);
+    let refused = [
+        // A connection from an older line, or a receiver of another build.
+        (valid.clone(), (1, "v0.8.0"), "outdated receiver"),
+        (valid.clone(), (2, "v0.7.9"), "outdated receiver"),
+        // A grant from before a refresh.
+        (
+            sign(&login, 1, delegation::SSHSIG_NAMESPACE),
+            current,
+            "signer",
+        ),
+        // Another key, and the login key in another namespace.
+        (
+            sign(
+                &generate_test_key("other").unwrap(),
+                2,
+                delegation::SSHSIG_NAMESPACE,
+            ),
+            current,
+            "does not trust",
+        ),
+        (
+            sign(&login, 2, keys::PROBE_NAMESPACE),
+            current,
+            "another purpose",
+        ),
+    ];
+    for (envelope, receiver, expected) in refused {
+        let Err(error) = admit(&state, &config, receiver, &envelope) else {
+            panic!("a grant was admitted: {expected}");
+        };
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+        assert_eq!(recorded(), 0);
+    }
+    // A certificate that has expired.
+    config.signer =
+        delegation::TrustedSigner::new(login.public_key(), None, Some(1_000_000)).unwrap();
+    let error = admit(&state, &config, current, &valid).err().unwrap();
+    assert!(format!("{error:#}").contains("expired"), "{error:#}");
+    assert_eq!(recorded(), 0);
+
+    config.signer = delegation::TrustedSigner::new(login.public_key(), None, None).unwrap();
+    admit(&state, &config, current, &valid).unwrap();
+    assert_ne!(recorded(), 0);
+    let error = admit(&state, &config, current, &valid).err().unwrap();
+    assert!(format!("{error:#}").contains("already"), "{error:#}");
+    // Without the record, nothing is admitted, and the error names the fix.
+    fs::remove_dir_all(state.join("replay")).unwrap();
+    let fresh = sign(&login, 2, delegation::SSHSIG_NAMESPACE);
+    let error = admit(&state, &config, current, &fresh).err().unwrap();
+    assert!(
+        format!("{error:#}").contains("syq receiver enroll backup@HOST"),
+        "{error:#}"
+    );
+}
+
+/// Every key of a JSON document, at any depth.
+fn json_keys(value: &serde_json::Value, keys: &mut std::collections::BTreeSet<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                keys.insert(key.clone());
+                json_keys(value, keys);
+            }
+        }
+        serde_json::Value::Array(values) => values.iter().for_each(|value| json_keys(value, keys)),
+        _ => {}
+    }
+}
+
+fn file_keys(path: &Path) -> std::collections::BTreeSet<String> {
+    let mut keys = Default::default();
+    json_keys(
+        &serde_json::from_slice(&fs::read(path).unwrap()).unwrap(),
+        &mut keys,
+    );
+    keys
+}
+
+#[test]
+fn enrollment_state_names_no_device_or_inode_and_sessions_compare_none() {
+    let expected = |names: &[&str]| -> std::collections::BTreeSet<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    };
+    // The server's state, as an install writes it.
+    let (account, home) = enrollment_home();
+    let home = home.path();
+    let id = EnrollmentId::random();
+    let entry = generate_test_key("entry").unwrap();
+    let login = generate_test_key("login").unwrap();
+    install_for_account(
+        &install_request(&account, id, &entry, &login, false),
+        &account,
+        home,
+    )
+    .unwrap();
+    let state = enrollment_state(home, id);
+    assert_eq!(
+        file_keys(&state.join("config.json")),
+        expected(&[
+            "version",
+            "id",
+            "target_login",
+            "generation",
+            "release",
+            "receiver_path",
+            "entry_public_key",
+            "signer",
+            "public_key",
+        ])
+    );
+
+    // The enrolling machine's records, pending and complete.
+    let directory = home.join("local").join(id.to_string());
+    fs::create_dir_all(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    store_entry_key(&directory, &entry).unwrap();
+    atomic_write(
+        &directory,
+        PENDING_FILE,
+        &serde_json::to_vec(&PendingEnrollment {
+            version: CONFIG_VERSION,
+            id,
+            host: "host-b".into(),
+            port: Some(2222),
+            target_login: account.clone(),
+        })
+        .unwrap(),
+        0o600,
+    )
+    .unwrap();
+    assert_eq!(
+        file_keys(&directory.join(PENDING_FILE)),
+        expected(&["version", "id", "host", "port", "target_login"])
+    );
+    complete_local_enrollment(
+        &directory,
+        &LocalEnrollment {
+            version: CONFIG_VERSION,
+            id,
+            host: "host-b".into(),
+            port: Some(2222),
+            target_login: account.clone(),
+            remote_home: home.to_string_lossy().into_owned(),
+            generation: 1,
+            release: crate::identity::build().into(),
+            receiver_path: store_receiver_path(home).to_string_lossy().into_owned(),
+            results_public_key: generate_results_key(id)
+                .unwrap()
+                .public_key()
+                .to_openssh()
+                .unwrap(),
+            signer: delegation::TrustedSigner::new(login.public_key(), None, Some(1_900_000_000))
+                .unwrap(),
+            identity_file: Some(home.join("id_ed25519")),
+            receiving_state: Vec::new(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        file_keys(&directory.join(ENROLLMENT_FILE)),
+        expected(&[
+            "version",
+            "id",
+            "host",
+            "port",
+            "target_login",
+            "remote_home",
+            "generation",
+            "release",
+            "receiver_path",
+            "results_public_key",
+            "signer",
+            "public_key",
+            "valid_before",
+            "identity_file",
+        ])
+    );
+
+    // A receiver session uses its state and the filesystem as it finds
+    // them: what an earlier session opened is nowhere to compare against.
+    let parent = home.join("mounted");
+    fs::create_dir(&parent).unwrap();
+    let destination = parent.join("archive");
+    let session = || {
+        let config = read_receiver_config(&state).unwrap().unwrap();
+        require_current_receiver(&config, 1, crate::identity::build()).unwrap();
+        ConfinedRoot::resolve(destination.as_os_str().as_bytes(), &[]).unwrap()
+    };
+    let first = session().identity();
+    fs::rename(&parent, home.join("unmounted")).unwrap();
+    fs::create_dir(&parent).unwrap();
+    let second = session().identity();
+    assert_ne!(first, second);
+}
+
+#[test]
+fn protected_destinations_are_refused_from_their_names_before_enrolling() {
+    let home = Path::new("/home/backup");
+    // What the server's login reported: no XDG variables, no TMPDIR.
+    let receiving = server_receiving_state(home, "1000", "Linux", ("", "", ""));
+    let refused = |placement: &str, destination: &str| {
+        let contents = placement == "contents";
+        let source = Location::parse(if contents {
+            "host-a:data/"
+        } else {
+            "host-a:data"
+        })
+        .unwrap();
+        let mut args = Args::try_parse_from([
+            "syq rsync",
+            "-r",
+            if contents {
+                "host-a:data/"
+            } else {
+                "host-a:data"
+            },
+            &format!("host-b:{destination}"),
+        ])
+        .unwrap();
+        args.normalize();
+        if placement == "as" {
+            args.placement = Placement::As;
+        }
+        refuse_protected_destination(
+            &args,
+            std::slice::from_ref(&source),
+            destination.as_bytes(),
+            "backup",
+            (home, &receiving),
+        )
+        .err()
+        .map(|error| error.to_string())
+    };
+    for (placement, destination, label) in [
+        ("into", "~/.ssh", "SSH configuration directory"),
+        ("as", ".ssh/authorized_keys", "SSH configuration directory"),
+        (
+            "as",
+            "/home/backup/.ssh/authorized_keys",
+            "SSH configuration directory",
+        ),
+        (
+            "into",
+            "/home/backup/.local/lib/syq",
+            "store of syq executables",
+        ),
+        (
+            "into",
+            "~/.local/share/syq/enrollments",
+            "enrollment state directory",
+        ),
+        (
+            "into",
+            ".local/state/syq/enrollments/x",
+            "enrollment state directory",
+        ),
+        (
+            "into",
+            "~/.local/libexec",
+            "released receiver executable directory",
+        ),
+        (
+            "into",
+            "~/.syq-destinations-v3",
+            "named destination authority state",
+        ),
+        ("into", "~/.config/syq", "receiving configuration directory"),
+        (
+            "into",
+            "~/.syq-receiver-identity",
+            "receiver identity directory",
+        ),
+        (
+            "into",
+            "/tmp/syq-persist-1000",
+            "persistence runtime directory",
+        ),
+        (
+            "as",
+            "/tmp/syq-persist-1000/global",
+            "persistence runtime directory",
+        ),
+        // Contents copied into a directory reach everything beneath it.
+        ("contents", "~", "SSH configuration directory"),
+        ("contents", "~/.config", "receiving configuration directory"),
+        ("contents", "/tmp", "persistence runtime directory"),
+    ] {
+        let error =
+            refused(placement, destination).unwrap_or_else(|| panic!("{destination} was accepted"));
+        assert!(
+            error.contains(&format!("protected {label}")),
+            "{destination}: {error}"
+        );
+    }
+    // A destination inside a protected path is refused as such; one that
+    // holds a protected path says why and what to do instead.
+    let inside = refused("into", "~/.ssh").unwrap();
+    assert!(
+        inside.contains("is the receiver's protected SSH configuration directory /home/backup/.ssh or lies inside it"),
+        "{inside}"
+    );
+    let holds = refused("contents", "/tmp").unwrap();
+    assert!(
+        holds.contains("/tmp holds the receiver's protected persistence runtime directory /tmp/syq-persist-1000, which this copy could change; copy into a subdirectory of /tmp instead"),
+        "{holds}"
+    );
+    // Named sources copied into a directory change only that directory and
+    // the sources' own names in it, so a directory above a protected one is
+    // fine.
+    for (placement, destination) in [
+        ("into", "~/archive"),
+        ("into", "/srv/archive"),
+        ("as", ".ssh-backup"),
+        ("into", "~/.config/other"),
+        ("into", "~"),
+        ("into", "/tmp"),
+        ("into", "~/.config"),
+        ("into", "~/.local/state"),
+        ("into", "~/.local/lib"),
+        ("contents", "/tmp/other"),
+    ] {
+        assert_eq!(refused(placement, destination), None, "{destination}");
+    }
+    // Where the server's environment moves its receiving state.
+    let moved = server_receiving_state(
+        home,
+        "1000",
+        "Linux",
+        ("/srv/config", "/run/user/1000", "/var/tmp"),
+    );
+    assert_eq!(
+        moved,
+        [
+            home.join(".syq-receiver-identity"),
+            PathBuf::from("/srv/config/syq"),
+            PathBuf::from("/run/user/1000/syq-persist-1000"),
+        ]
+    );
+    assert_eq!(
+        server_receiving_state(home, "501", "Darwin", ("", "", "/var/folders/x"))[2],
+        Path::new("/tmp/syq-persist-501")
+    );
+    assert_eq!(
+        server_receiving_state(home, "7", "Linux", ("relative", "relative", "/var/tmp"))[1..],
+        [
+            home.join(".config/syq"),
+            PathBuf::from("/var/tmp/syq-persist-7")
+        ]
+    );
+}
+
+#[test]
+fn receivers_refuse_protected_paths_beneath_a_recursive_destination_only() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let parent = temporary.path().join("parent");
+    let target = parent.join("target");
+    fs::create_dir_all(target.join("inner")).unwrap();
+    let protected = vec![ReceiverControlPath {
+        path: target.join("inner").as_os_str().as_bytes().to_vec(),
+        label: "test control directory",
+    }];
+    let authority = |source: &str, placement: Placement, destination: &Path| {
+        let mut args = Args::try_parse_from(["syq rsync", "-r", source, "host-b:/unused"]).unwrap();
+        args.normalize();
+        args.placement = placement;
+        let location = Location::parse(source).unwrap();
+        let named = destination.as_os_str().as_bytes();
+        let grant = grant_for(
+            &args,
+            std::slice::from_ref(&location),
+            (EnrollmentId::random(), 1),
+            "receiver",
+            named,
+        )
+        .unwrap();
+        ConfinedRoot::resolve(named, &protected).and_then(|confined| {
+            RestrictedAuthority::new(
+                confined,
+                grant,
+                GrantConstraints::default(),
+                [0; 32],
+                generate_results_key(EnrollmentId::random()).unwrap(),
+                Instant::now() + std::time::Duration::from_secs(60),
+                &protected,
+            )
+        })
+    };
+    // Named sources into the directory above the protected one.
+    authority("host-a:data", Placement::Into, &target).unwrap();
+    // Its contents could reach the protected directory.
+    let error = authority("host-a:data/", Placement::Into, &target)
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("test control directory"),
+        "{error:#}"
+    );
+    // At or beneath it, whatever the placement.
+    for (source, placement, destination) in [
+        ("host-a:data", Placement::Into, target.join("inner")),
+        ("host-a:file", Placement::As, target.join("inner/file")),
+    ] {
+        let error = authority(source, placement, &destination).err().unwrap();
+        assert!(
+            error.to_string().contains("test control directory"),
+            "{error:#}"
+        );
+    }
+}
+
+/// Every path a copy may change is judged where it really is: through a
+/// symlink above the destination, and by the identity of a named entry
+/// that already exists, whatever name reaches it.
+#[test]
+fn named_entries_are_checked_where_they_really_are() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let real = temporary.path().join("real");
+    let alias = temporary.path().join("alias");
+    let spelled = temporary.path().join("spelled");
+    fs::create_dir_all(real.join("home/.ssh")).unwrap();
+    fs::create_dir_all(real.join("home/.config")).unwrap();
+    fs::create_dir_all(real.join("home/backup")).unwrap();
+    symlink(&real, &alias).unwrap();
+    symlink(&real, &spelled).unwrap();
+    let control = |path: PathBuf, label| ReceiverControlPath {
+        path: path.as_os_str().as_bytes().to_vec(),
+        label,
+    };
+    let authority = |protected: &[ReceiverControlPath], source: &str, destination: &Path| {
+        let mut args = Args::try_parse_from(["syq rsync", "-r", source, "host-b:/unused"]).unwrap();
+        args.normalize();
+        args.placement = Placement::Into;
+        let location = Location::parse(source).unwrap();
+        let named = destination.as_os_str().as_bytes();
+        let grant = grant_for(
+            &args,
+            std::slice::from_ref(&location),
+            (EnrollmentId::random(), 1),
+            "receiver",
+            named,
+        )
+        .unwrap();
+        ConfinedRoot::resolve(named, protected).and_then(|confined| {
+            RestrictedAuthority::new(
+                confined,
+                grant,
+                GrantConstraints::default(),
+                [0; 32],
+                generate_results_key(EnrollmentId::random()).unwrap(),
+                Instant::now() + std::time::Duration::from_secs(60),
+                protected,
+            )
+        })
+    };
+    let refused = |protected: &[ReceiverControlPath], source: &str, destination: &Path| {
+        authority(protected, source, destination)
+            .err()
+            .map(|error| format!("{error:#}"))
+            .unwrap_or_else(|| panic!("{source} into {} was accepted", destination.display()))
+    };
+    let ssh = [control(
+        real.join("home/.ssh"),
+        "SSH configuration directory",
+    )];
+    // A named `.ssh` into a destination reached through a symlink above it.
+    let error = refused(&ssh, "host-a:.ssh", &alias.join("home"));
+    assert!(
+        error.contains("protected SSH configuration directory"),
+        "{error}"
+    );
+    // A named directory that holds the protected one, through the symlink.
+    fs::create_dir_all(real.join("srv/home/.ssh")).unwrap();
+    let deeper = [control(
+        real.join("srv/home/.ssh"),
+        "SSH configuration directory",
+    )];
+    let error = refused(&deeper, "host-a:home", &alias.join("srv"));
+    assert!(error.contains("holds the receiver's protected"), "{error}");
+    // The protected path spelled through a symlink, as /tmp is on macOS,
+    // and the named entry reached by its real name: the same directory.
+    let spelled_ssh = [control(
+        spelled.join("home/.ssh"),
+        "SSH configuration directory",
+    )];
+    let error = refused(&spelled_ssh, "host-a:.ssh", &real.join("home"));
+    assert!(
+        error.contains("protected SSH configuration directory"),
+        "{error}"
+    );
+    // A protected path that does not exist yet, reached through the symlink.
+    let config = [control(
+        real.join("home/.config/syq"),
+        "receiving configuration directory",
+    )];
+    let error = refused(&config, "host-a:syq", &alias.join("home/.config"));
+    assert!(
+        error.contains("protected receiving configuration directory"),
+        "{error}"
+    );
+    // Other named entries beside the protected ones are fine.
+    authority(&ssh, "host-a:backup", &alias.join("home")).unwrap();
+    authority(&ssh, "host-a:notes", &alias.join("home")).unwrap();
+    authority(&config, "host-a:other", &alias.join("home/.config")).unwrap();
+}
+
+/// The authority looks up the named entries of many named sources
+/// together, and the copy's own lookups take over what that settled, so a
+/// directory on NFS is listed once for the copy, not once for each.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_copys_lookups_reuse_the_authoritys_directory_listings() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let destination = temporary.path().join("destination");
+    fs::create_dir_all(&destination).unwrap();
+    let mut argv = vec!["syq rsync".to_owned(), "-r".to_owned()];
+    let mut sources = Vec::new();
+    for index in 0..40 {
+        fs::write(destination.join(format!("f{index}")), b"x").unwrap();
+        argv.push(format!("host-a:f{index}"));
+        sources.push(Location::parse(&format!("host-a:f{index}")).unwrap());
+    }
+    argv.push("host-b:/unused".into());
+    let mut args = Args::try_parse_from(&argv).unwrap();
+    args.normalize();
+    args.placement = Placement::Into;
+    let named = destination.as_os_str().as_bytes();
+    let grant = grant_for(
+        &args,
+        &sources,
+        (EnrollmentId::random(), 1),
+        "receiver",
+        named,
+    )
+    .unwrap();
+    let protected = Vec::new();
+    let authority = RestrictedAuthority::new(
+        ConfinedRoot::resolve(named, &protected).unwrap(),
+        grant,
+        GrantConstraints::default(),
+        [0; 32],
+        generate_results_key(EnrollmentId::random()).unwrap(),
+        Instant::now() + std::time::Duration::from_secs(60),
+        &protected,
+    )
+    .unwrap();
+    assert_eq!(authority.settled_listings, vec![b"destination".to_vec()]);
+    assert_eq!(
+        authority.test_ops().settled_listings(),
+        vec![b"destination".to_vec()]
+    );
+}
+
+#[test]
+fn a_destination_is_resolved_afresh_by_every_copy() {
+    // The directory a destination goes in is opened when each copy starts,
+    // so replacing it, as a remount does, changes nothing for the
+    // enrollment.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let parent = temporary.path().join("mounted");
+    fs::create_dir(&parent).unwrap();
+    let destination = parent.join("archive");
+    let named = destination.as_os_str().as_bytes();
+    let first = ConfinedRoot::resolve(named, &[]).unwrap();
+    let first_identity = first.identity();
+    drop(first);
+    fs::rename(&parent, temporary.path().join("unmounted")).unwrap();
+    fs::create_dir(&parent).unwrap();
+    let second = ConfinedRoot::resolve(named, &[]).unwrap();
+    assert_ne!(second.identity(), first_identity);
+    assert_eq!(second.identity(), Root::open(&parent).unwrap().identity());
+
+    // Through a link, the directory is where the link leads, and a
+    // protected directory is refused by identity whatever the names say.
+    let protected_directory = temporary.path().join("protected");
+    fs::create_dir_all(protected_directory.join("inside")).unwrap();
+    let protected = vec![ReceiverControlPath {
+        path: protected_directory.as_os_str().as_bytes().to_vec(),
+        label: "test control directory",
+    }];
+    symlink(
+        protected_directory.join("inside"),
+        temporary.path().join("link"),
+    )
+    .unwrap();
+    let through_link = temporary.path().join("link/archive");
+    let error = ConfinedRoot::resolve(through_link.as_os_str().as_bytes(), &protected)
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("test control directory"),
+        "{error:#}"
+    );
+    ConfinedRoot::resolve(named, &protected).unwrap();
+    // A directory above a protected one is fine: the copy writes only
+    // beneath its destination.
+    ConfinedRoot::resolve(
+        protected_directory.join("sibling").as_os_str().as_bytes(),
+        &[ReceiverControlPath {
+            path: protected_directory
+                .join("inside")
+                .as_os_str()
+                .as_bytes()
+                .to_vec(),
+            label: "test control directory",
+        }],
+    )
+    .unwrap();
+    let error = ConfinedRoot::resolve(
+        protected_directory
+            .join("inside/archive")
+            .as_os_str()
+            .as_bytes(),
+        &protected,
+    )
+    .err()
+    .unwrap();
+    assert!(
+        error.to_string().contains("test control directory"),
+        "{error:#}"
+    );
 }
 
 #[test]
@@ -275,17 +1544,6 @@ fn receiver_publication_is_atomic_private_and_executable() {
 }
 
 #[test]
-fn receiver_gc_detects_any_remaining_managed_enrollment() {
-    assert!(!contains_managed_enrollment(b"ssh-ed25519 unrelated\n"));
-    assert!(!contains_managed_enrollment(
-        b"  # revoked key syq-enrollment:old\n"
-    ));
-    assert!(contains_managed_enrollment(
-        b"restrict,command=\"syq\" ssh-ed25519 key syq-enrollment:id\n"
-    ));
-}
-
-#[test]
 fn revoke_validates_all_state_before_rewriting_authorized_keys() {
     for unsafe_enrollment in [false, true] {
         let (account, account_home) = current_account().unwrap();
@@ -297,7 +1555,7 @@ fn revoke_validates_all_state_before_rewriting_authorized_keys() {
         fs::set_permissions(home, fs::Permissions::from_mode(0o700)).unwrap();
 
         let id = EnrollmentId::test_v4(41);
-        let state_base = home.join(".local/share/syq/restricted");
+        let state_base = home.join(".local/share/syq/enrollments");
         fs::create_dir_all(&state_base).unwrap();
         fs::set_permissions(
             &state_base,
@@ -313,53 +1571,36 @@ fn revoke_validates_all_state_before_rewriting_authorized_keys() {
         fs::create_dir(&ssh).unwrap();
         fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let key = generate_enrollment_key(id).unwrap();
-        let public_key = key.public_key().to_openssh().unwrap();
-        let transport = EnrollmentPublicKey::parse(&public_key).unwrap();
-        let entry = AuthorizedKeyEntry::new(id, &receiver_install_path(home), &transport).unwrap();
-        let original = format!("{}\n", entry.line()).into_bytes();
+        let entry_key = generate_test_key("entry").unwrap();
+        let login = generate_test_key("login").unwrap();
+        let entry_public = entry_key.public_key().to_openssh().unwrap();
+        let line = AuthorizedKeyEntry::enrollment(
+            id,
+            &store_receiver_path(home),
+            1,
+            &EnrollmentPublicKey::parse(&entry_public).unwrap(),
+            &EnrollmentPublicKey::login(&login.public_key().to_openssh().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let original = format!("{}\n", line.line()).into_bytes();
         let authorized_keys = ssh.join("authorized_keys");
         fs::write(&authorized_keys, &original).unwrap();
         fs::set_permissions(&authorized_keys, fs::Permissions::from_mode(0o600)).unwrap();
 
         let request = RevokeRequest {
-            ssh_public_key: None,
-            security_key_flags: None,
             version: CONFIG_VERSION,
             id,
             target_login: account.clone(),
-            public_key,
+            entry_public_key: entry_public,
         };
         let error = revoke_for_account(&request, &account, home).unwrap_err();
-        assert!(error.to_string().contains("must have mode 0700"));
+        assert!(
+            error.to_string().contains("must have mode 0700"),
+            "{error:#}"
+        );
         assert_eq!(fs::read(authorized_keys).unwrap(), original);
     }
 }
-
-#[test]
-fn final_enrollment_cleanup_preserves_general_account_directories() {
-    let temporary = crate::test_support::tempdir().unwrap();
-    let home = temporary.path();
-    let local = home.join(".local");
-    let share = local.join("share");
-    let syq = share.join("syq");
-    let restricted = syq.join("restricted");
-    let libexec = local.join("libexec");
-    fs::create_dir_all(&restricted).unwrap();
-    fs::create_dir(&libexec).unwrap();
-    fs::set_permissions(&local, fs::Permissions::from_mode(0o750)).unwrap();
-    fs::set_permissions(&share, fs::Permissions::from_mode(0o751)).unwrap();
-    fs::set_permissions(&libexec, fs::Permissions::from_mode(0o710)).unwrap();
-
-    remove_final_enrollment_state_directories(home).unwrap();
-
-    assert!(!restricted.exists());
-    assert!(!syq.exists());
-    assert_eq!(fs::metadata(&local).unwrap().mode() & 0o7777, 0o750);
-    assert_eq!(fs::metadata(&share).unwrap().mode() & 0o7777, 0o751);
-    assert_eq!(fs::metadata(&libexec).unwrap().mode() & 0o7777, 0o710);
-}
-
 #[test]
 fn local_management_executable_check_is_scoped_to_the_open_file() {
     let temporary = crate::test_support::tempdir().unwrap();
@@ -381,10 +1622,24 @@ fn local_management_executable_check_is_scoped_to_the_open_file() {
     assert!(error.to_string().contains("must be a regular file"));
 }
 
+/// The enrolling machine hashes its own build a block at a time to offer a
+/// stored copy, and reads it whole only for an upload.
+#[test]
+fn the_local_build_is_hashed_without_reading_it_whole() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let path = temporary.path().join("syq");
+    let contents: Vec<u8> = (0..200_000).map(|byte| (byte % 253) as u8).collect();
+    fs::write(&path, &contents).unwrap();
+    let build = ManagementBuild::Local(open_local_management_executable(&path).unwrap());
+    assert_eq!(build.sha256().unwrap(), sha256_hex(&contents));
+    assert_eq!(build.sha256().unwrap(), sha256_hex(&contents));
+    assert_eq!(build.bytes().unwrap(), contents);
+}
+
 #[test]
 fn management_stage_is_scoped_to_one_shell_session() {
     fn invoke(home: &Path, stage: &str, script: &[u8], request: &[u8]) -> std::process::Output {
-        let remote = management_remote_command(stage, ManagementAction::Install, request)
+        let remote = management_remote_command(stage, ManagementAction::Revoke, request)
             .expect("build management command");
         let mut child = Command::new("/bin/sh")
             .arg("-c")
@@ -403,7 +1658,7 @@ fn management_stage_is_scoped_to_one_shell_session() {
     let request = br#"{"value":"' ; exit 91; #"}"#;
     let output = invoke(
         temporary.path(),
-        ".syq-receiver-test-success",
+        ".syq-stage-test-success",
         b"#!/bin/sh\ncat\n",
         request,
     );
@@ -413,25 +1668,149 @@ fn management_stage_is_scoped_to_one_shell_session() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, request);
-    assert!(!temporary
-        .path()
-        .join(".local/libexec/.syq-receiver-test-success")
-        .exists());
-    assert!(temporary.path().join(".local/libexec").is_dir());
+    let store = temporary.path().join(".local/lib/syq");
+    assert!(!store.join(".syq-stage-test-success").exists());
+    assert!(store.is_dir());
+    // The store's own directory is private; the ones above it are not
+    // syq's to restrict.
+    assert_eq!(fs::metadata(&store).unwrap().mode() & 0o777, 0o700);
 
     let output = invoke(
         temporary.path(),
-        ".syq-receiver-test-failure",
+        ".syq-stage-test-failure",
         b"#!/bin/sh\nexit 23\n",
         b"failure request",
     );
     assert_eq!(output.status.code(), Some(23));
-    assert!(!temporary
-        .path()
-        .join(".local/libexec/.syq-receiver-test-failure")
-        .exists());
+    assert!(!store.join(".syq-stage-test-failure").exists());
 }
 
+#[test]
+fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let home = temporary.path();
+    // The session as the account's login shell runs it: `shell -c COMMAND`.
+    let session_in = |shell: &str, home: &Path, input: &[u8]| -> std::process::Output {
+        let mut child = Command::new(shell)
+            .arg("-c")
+            .arg(in_sh(&install_remote_command(".syq-stage-test")))
+            .env("HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_guarded()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let lines = |output: std::process::Output| -> Vec<String> {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    let session = |input: &[u8]| session_in("/bin/sh", home, input);
+    let run = |input: &[u8]| lines(session(input));
+    // Lines 0 to 6 are the platform and state locations; line 7 lists the
+    // platforms the store has this build for, and line 8 starts
+    // authorized_keys. The session then reads the request and an offered
+    // stored build's platform and hash, answers on line 9 whether it starts
+    // that build or needs the syq that follows, and line 10 is what runs.
+    let sent = b"#!/bin/sh\nprintf 'sent %s ' \"$*\"; cat\n";
+    let mut upload = b"{\"request\":1}\n\n\n".to_vec();
+    upload.extend_from_slice(sent);
+    let greeting = run(&upload);
+    assert_eq!(greeting[7].trim(), "");
+    assert_eq!(greeting[8], "0");
+    assert_eq!(greeting[9], "upload");
+    assert_eq!(greeting[10], r#"sent --restricted-install {"request":1}"#);
+    // A login shell that stops at a glob matching nothing, as zsh does,
+    // runs the session through `sh` all the same.
+    if Path::new("/bin/zsh").exists() {
+        let empty = crate::test_support::tempdir().unwrap();
+        let greeting = lines(session_in("/bin/zsh", empty.path(), &upload));
+        assert_eq!(greeting[7].trim(), "");
+        assert_eq!(greeting[10], r#"sent --restricted-install {"request":1}"#);
+    }
+
+    let store = home.join(crate::user_dirs::BINARY_STORE_IN_HOME);
+    let build = store.join(crate::identity::build());
+    let private = |path: &Path| {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    let stored_program = "#!/bin/sh\nprintf 'stored %s ' \"$*\"; cat\n";
+    crate::test_support::write_executable(&build.join("linux-x86_64/syq"), stored_program, 0o700);
+    let stored_hash = sha256_hex(stored_program.as_bytes());
+    // Another build, and a file that is not executable, are not offered.
+    crate::test_support::write_executable(
+        &store.join("v0.0.0-old/linux-aarch64/syq"),
+        "#!/bin/sh\nexit 1\n",
+        0o700,
+    );
+    fs::create_dir_all(build.join("macos-aarch64")).unwrap();
+    fs::write(build.join("macos-aarch64/syq"), "not a program").unwrap();
+    // A stored build others could change, or one reached through a link
+    // below the store's root, is neither offered nor started.
+    let started = home.join("started");
+    let marker = format!("#!/bin/sh\ntouch '{}'\n", started.display());
+    crate::test_support::write_executable(&build.join("linux-aarch64/syq"), &marker, 0o770);
+    crate::test_support::write_executable(&home.join("elsewhere/syq"), &marker, 0o700);
+    private(&home.join("elsewhere"));
+    symlink(home.join("elsewhere"), build.join("macos-x86_64")).unwrap();
+    for directory in [
+        store.clone(),
+        build.clone(),
+        build.join("linux-x86_64"),
+        build.join("linux-aarch64"),
+        build.join("macos-aarch64"),
+    ] {
+        private(&directory);
+    }
+    let greeting = run(format!("{{\"request\":2}}\nlinux-x86_64\n{stored_hash}\n").as_bytes());
+    assert_eq!(greeting[7].trim(), "linux-x86_64");
+    assert_eq!(greeting[9], "stored");
+    assert_eq!(greeting[10], r#"stored --restricted-install {"request":2}"#);
+    // Anything else offered is not started: the session asks for this
+    // machine's build and runs that.
+    let refused = |target: &str, hash: &str| {
+        let mut input = format!("{{\"request\":3}}\n{target}\n{hash}\n").into_bytes();
+        input.extend_from_slice(sent);
+        let greeting = run(&input);
+        assert_eq!(greeting[9], "upload", "{target}");
+        assert_eq!(greeting[10], r#"sent --restricted-install {"request":3}"#);
+        assert!(!started.exists(), "{target} was started");
+    };
+    for target in ["linux-aarch64", "macos-x86_64"] {
+        refused(target, &sha256_hex(marker.as_bytes()));
+    }
+    // A build that passes the owner and mode checks, as every build does on
+    // a filesystem that fixes them, runs only when it is the exact build.
+    crate::test_support::write_executable(&build.join("macos-arm64/syq"), &marker, 0o700);
+    private(&build.join("macos-arm64"));
+    refused("macos-arm64", &stored_hash);
+    // The store's root alone may lead elsewhere, to the account's own
+    // directory.
+    let moved = home.join("moved-store");
+    fs::rename(&store, &moved).unwrap();
+    symlink(&moved, &store).unwrap();
+    let greeting = run(format!("{{\"request\":4}}\nlinux-x86_64\n{stored_hash}\n").as_bytes());
+    assert!(greeting[7]
+        .split_whitespace()
+        .any(|target| target == "linux-x86_64"));
+    assert_eq!(greeting[10], r#"stored --restricted-install {"request":4}"#);
+    assert!(fs::read_dir(&moved).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".syq-stage")));
+    assert!(!started.exists());
+}
 /// Execute authorized Apply operations as a connection of `authority`'s
 /// copy executes them.
 fn execute_ops(authority: &RestrictedAuthority, ops: &[Op]) -> Vec<Option<proto::WireError>> {
@@ -709,21 +2088,9 @@ fn test_authority_with_options(
     results: Option<(PrivateKey, crate::destination_results::ReceiptPolicy)>,
     (extra_options, protected): (crate::delegation::ExtraCopyOptions, &[ReceiverControlPath]),
 ) -> Result<RestrictedAuthority> {
-    let opened = Root::open(root).unwrap();
-    let identity = opened.identity();
+    let identity = Root::open(root).unwrap().identity();
     let id = EnrollmentId::random();
-    let config = ReceiverEnrollment {
-        security_key_flags: None,
-        version: CONFIG_VERSION,
-        id,
-        target_login: "receiver".into(),
-        signer: signer_name(id),
-        root: root.to_str().unwrap().into(),
-        root_dev: identity.dev,
-        root_ino: identity.ino,
-        ssh_keygen: "/usr/bin/ssh-keygen".into(),
-        receiver_path: "/usr/bin/syq".into(),
-    };
+    let confined = ConfinedRoot::opened(root, identity)?;
     let destination = root.join("target");
     if !filters.ignore.is_empty() && filters.destination_roots.is_empty() {
         filters.destination_roots = vec![destination.as_os_str().as_bytes().to_vec()];
@@ -731,7 +2098,7 @@ fn test_authority_with_options(
     let grant = Grant {
         enrollment_id: id,
         target_login: "receiver".into(),
-        signer: signer_name(id),
+        signer: signer_name(id, 1),
         request_id: RequestId::fresh(1_900_000_000).unwrap(),
         issued_at: 1,
         not_before: 1,
@@ -777,10 +2144,10 @@ fn test_authority_with_options(
     };
     let (results_key, receipt_policy) = match results {
         Some((key, policy)) => (key, policy),
-        None => (generate_receipt_key(id)?, results_policy().1),
+        None => (generate_results_key(id)?, results_policy().1),
     };
     RestrictedAuthority::new(
-        &config,
+        confined,
         grant,
         GrantConstraints {
             tcp_congestion: None,
@@ -803,8 +2170,8 @@ fn test_authority_with_options(
 fn restricted_destinations_cannot_overlap_receiver_control_paths() {
     let protected = receiver_control_paths(
         Path::new("/home/receiver"),
-        Path::new("/home/receiver/.local/libexec/syq-receiver"),
-        Some(Path::new("/usr/bin/ssh-keygen")),
+        None,
+        ControlPaths::Elsewhere(&[]),
     )
     .unwrap();
 
@@ -824,70 +2191,59 @@ fn restricted_destinations_cannot_overlap_receiver_control_paths() {
 
     for (path, label) in [
         (
-            b"/home/receiver/.local/libexec/syq-receiver".as_slice(),
-            "receiver executable directory",
+            b"/home/receiver/.local/lib/syq/v1.0.0/linux-x86_64/syq".as_slice(),
+            "store of syq executables",
         ),
         (
-            b"/home/receiver/.local/share/syq/restricted/enrollment".as_slice(),
+            b"/home/receiver/.local/share/syq/enrollments/enrollment".as_slice(),
             "enrollment state directory",
         ),
         (
-            b"/usr/bin/ssh-keygen".as_slice(),
-            "signature verifier executable",
+            b"/home/receiver/.local/state/syq/enrollments/enrollment".as_slice(),
+            "enrollment state directory",
+        ),
+        (
+            b"/home/receiver/.local/share/syq/restricted/enrollment".as_slice(),
+            "released enrollment state directory",
+        ),
+        (
+            b"/home/receiver/.local/libexec/syq-receiver".as_slice(),
+            "released receiver executable directory",
+        ),
+        (
+            b"/home/receiver/.syq-destinations-v3/x".as_slice(),
+            "named destination authority state",
         ),
     ] {
         let error = reject_control_plane_path(path, &protected).unwrap_err();
-        assert!(error.to_string().contains(label));
+        assert!(error.to_string().contains(label), "{error}");
     }
 }
-
 #[test]
-fn managed_crlf_and_commented_tombstones_normalize_without_touching_other_content() {
-    let marker = "syq-enrollment:00112233445566778899aabbccddeeff";
-    let original =
-        format!("# unrelated\r\n# restrict ssh-ed25519 AAAA {marker}\r\nssh-ed25519 BBBB user\r\n");
-    assert_eq!(
-        normalize_managed_authorized_keys(original.as_bytes(), marker),
-        b"# unrelated\nssh-ed25519 BBBB user\n"
-    );
-}
-
-#[test]
-fn enrolled_destinations_accept_any_leaf_bytes() {
+fn enrolled_destinations_accept_any_bytes() {
     use std::os::unix::ffi::OsStrExt as _;
-    let metadata = LocalEnrollment {
-        security_key_flags: None,
-        version: 1,
-        id: EnrollmentId::random(),
-        host: "hostB".into(),
-        port: None,
-        target_login: "backup".into(),
-        remote_home: "/home/backup".into(),
-        requested_parent: "/home/backup/archive".into(),
-        canonical_root: "/srv/archive".into(),
-        receiver_path: "/usr/bin/syq".into(),
-        receipt_public_key: String::new(),
-    };
-    // A destination whose leaf is not UTF-8 still resolves inside the
-    // enrollment's (UTF-8, administrative) scope.
+    // A destination whose name is not UTF-8 is named in the grant as it is.
     let mut requested = b"archive/leaf-".to_vec();
     requested.push(0xff);
-    let canonical = destination_for(&metadata, &requested).unwrap().unwrap();
-    let mut expected = b"/srv/archive/leaf-".to_vec();
+    let normalized = normalize_absolute(
+        std::ffi::OsStr::from_bytes(&requested),
+        Path::new("/home/backup"),
+    )
+    .unwrap();
+    let mut expected = b"/home/backup/archive/leaf-".to_vec();
     expected.push(0xff);
-    assert_eq!(canonical, expected);
-    assert_eq!(
-        std::ffi::OsStr::from_bytes(&canonical),
-        Path::new("/srv/archive")
-            .join(std::ffi::OsStr::from_bytes(b"leaf-\xff"))
-            .as_os_str()
-    );
-    // Outside the enrolled parent, no match.
-    assert!(destination_for(&metadata, b"elsewhere/leaf")
-        .unwrap()
-        .is_none());
+    assert_eq!(normalized.as_os_str().as_bytes(), expected);
+    for (requested, expected) in [
+        ("~", "/home/backup"),
+        ("~/a", "/home/backup/a"),
+        ("/srv/a/./b", "/srv/a/b"),
+    ] {
+        assert_eq!(
+            normalize_absolute(std::ffi::OsStr::new(requested), Path::new("/home/backup")).unwrap(),
+            Path::new(expected)
+        );
+    }
 }
-
 #[test]
 fn relative_destination_resolution_rejects_parent_components() {
     assert_eq!(
@@ -923,13 +2279,13 @@ fn receiver_command_accepts_only_one_encoded_signed_grant() {
 }
 
 #[test]
-fn receipt_keys_are_distinct_and_persist_for_an_enrollment() {
+fn results_keys_are_distinct_and_persist_for_an_enrollment() {
     let id = EnrollmentId::random();
-    let key = generate_receipt_key(id).unwrap();
+    let key = generate_results_key(id).unwrap();
     let public = key.public_key().to_openssh().unwrap();
     assert!(public.starts_with("ssh-ed25519 "));
-    assert!(public.ends_with(&format!("syq-receipt:{id}")));
-    let again = generate_receipt_key(id).unwrap();
+    assert!(public.ends_with(&format!("syq-results:{id}")));
+    let again = generate_results_key(id).unwrap();
     assert_ne!(again.public_key().to_openssh().unwrap(), public);
     ssh_key::PublicKey::from_openssh(&public).unwrap();
 
@@ -940,17 +2296,16 @@ fn receipt_keys_are_distinct_and_persist_for_an_enrollment() {
     fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let state = temporary.path().join("state");
     ensure_directory(&state, 0o700).unwrap();
-    let first = ensure_receipt_key(&state, id).unwrap();
-    let second = ensure_receipt_key(&state, id).unwrap();
+    let first = ensure_results_key(&state, id).unwrap();
+    let second = ensure_results_key(&state, id).unwrap();
     assert_eq!(
         first.public_key().to_openssh().unwrap(),
         second.public_key().to_openssh().unwrap()
     );
-    assert!(state.join(RECEIPT_KEY_FILE).is_file());
+    assert!(state.join(RESULTS_KEY_FILE).is_file());
 }
-
 #[test]
-fn pending_enrollment_keeps_its_key_until_active_metadata_is_durable() {
+fn local_records_track_pending_enrollments_and_unconfirmed_refreshes() {
     let (_, home) = current_account().unwrap();
     let temporary = tempfile::tempdir_in(home).unwrap();
     fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -958,56 +2313,74 @@ fn pending_enrollment_keeps_its_key_until_active_metadata_is_durable() {
     let directory = temporary.path().join(id.to_string());
     ensure_directory(&directory, 0o700).unwrap();
     let pending = PendingEnrollment {
-        security_key_flags: None,
         version: CONFIG_VERSION,
         id,
         host: "host-b".into(),
         port: None,
         target_login: "backup".into(),
-        requested_destination: "/archive/item".into(),
     };
-    let private_key = generate_enrollment_key(id).unwrap();
-    store_pending_files(&directory, &pending, &private_key).unwrap();
-    assert!(directory.join("pending.json").is_file());
+    let entry_key = generate_test_key("entry").unwrap();
+    store_entry_key(&directory, &entry_key).unwrap();
+    atomic_write(
+        &directory,
+        PENDING_FILE,
+        &serde_json::to_vec(&pending).unwrap(),
+        0o600,
+    )
+    .unwrap();
+    assert!(directory.join(PENDING_FILE).is_file());
     assert_eq!(
-        fs::metadata(directory.join("enrollment-key"))
-            .unwrap()
-            .mode()
-            & 0o777,
+        fs::metadata(directory.join("entry-key")).unwrap().mode() & 0o777,
         0o600
     );
     assert_eq!(
-        load_private_key(&directory)
-            .unwrap()
-            .public_key()
-            .to_openssh()
-            .unwrap(),
-        private_key.public_key().to_openssh().unwrap()
+        load_entry_key(&directory).unwrap().public_key(),
+        entry_key.public_key()
     );
+    assert!(load_local_enrollments_in(temporary.path())
+        .unwrap()
+        .is_empty());
 
+    let login = generate_test_key("login").unwrap();
     let metadata = LocalEnrollment {
-        security_key_flags: None,
         version: CONFIG_VERSION,
         id,
         host: pending.host,
         port: pending.port,
         target_login: pending.target_login,
         remote_home: "/home/backup".into(),
-        requested_parent: "/archive".into(),
-        canonical_root: "/archive".into(),
-        receiver_path: "/home/backup/.local/libexec/syq-receiver".into(),
-        receipt_public_key: generate_receipt_key(id)
+        generation: 1,
+        release: crate::identity::build().into(),
+        receiver_path: "/home/backup/.local/lib/syq/v1/linux-x86_64/syq".into(),
+        results_public_key: generate_results_key(id)
             .unwrap()
             .public_key()
             .to_openssh()
             .unwrap(),
+        signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
+        identity_file: None,
+        receiving_state: Vec::new(),
     };
     complete_local_enrollment(&directory, &metadata).unwrap();
-    assert!(!directory.join("pending.json").exists());
-    assert!(directory.join("metadata.json").is_file());
-    assert!(directory.join("enrollment-key").is_file());
-}
+    assert!(!directory.join(PENDING_FILE).exists());
+    assert!(directory.join(ENROLLMENT_FILE).is_file());
+    assert!(directory.join("entry-key").is_file());
+    let listed = load_local_enrollments_in(temporary.path()).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].0.id, id);
 
+    // A refresh whose reply never arrived, as when a rotation's reply is
+    // lost: the server may already trust the new key, so the next copy
+    // logs in to finish it even though the recorded key still signs.
+    assert!(!needs_refresh(&metadata, &directory));
+    atomic_write(&directory, REFRESH_FILE, b"", 0o600).unwrap();
+    assert!(needs_refresh(&metadata, &directory));
+    complete_local_enrollment(&directory, &metadata).unwrap();
+    assert!(!needs_refresh(&metadata, &directory));
+    let mut other_build = metadata.clone();
+    other_build.release = "v0.0.0-other".into();
+    assert!(needs_refresh(&other_build, &directory));
+}
 #[test]
 fn prune_lookup_is_confined_to_authorized_observation_paths() {
     let temporary = crate::test_support::tempdir().unwrap();
@@ -1352,7 +2725,7 @@ fn existence_authority(
 /// The signed grant bounds what the receiver widens: nothing unless approved;
 /// under `rsync`, directories the copy includes, to change their entries but
 /// never to enter one it could not read; under `all`, also the directory the
-/// copy goes into, here the enrolled root, whose identity the receiver pins.
+/// copy goes into, here the confinement root, whose identity the receiver pins.
 /// Never a directory above the root, nor one beside the copy.
 #[test]
 fn restricted_widening_follows_the_approved_mode() {
@@ -1459,12 +2832,12 @@ fn restricted_widening_follows_the_approved_mode() {
 }
 
 /// Under an approved `all`, a restricted receiver gives the owned directories
-/// from its enrolled root down to the destination, the root included, the
+/// from its confinement root down to the destination, the root included, the
 /// search permission reaching it needs, as an ordinary receiver does, and
 /// restores them when asked. It never walks above the root, and refuses a
 /// destination named outside it.
 #[test]
-fn restricted_all_widens_ancestors_beneath_the_enrolled_root() {
+fn restricted_all_widens_ancestors_beneath_the_confinement_root() {
     if unsafe { libc::geteuid() } == 0 {
         return;
     }
@@ -2181,7 +3554,7 @@ fn timestamp_selection_preserves_independent_existing_authority() {
         let grant = grant_for(
             &args,
             &sources,
-            EnrollmentId::random(),
+            (EnrollmentId::random(), 1),
             "receiver",
             b"/destination",
         )
@@ -2788,7 +4161,7 @@ fn existence_authority_with_results(
     policy: &crate::destination_results::ReceiptPolicy,
     deadline_ms: u64,
 ) -> RestrictedAuthority {
-    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let key = generate_results_key(EnrollmentId::random()).unwrap();
     let mut authority = test_authority_with_results(
         root,
         DeletionPolicy::DeleteDestinationOnly,
@@ -2983,7 +4356,7 @@ fn observation_only_prepare_releases_absent_reservation_and_skips_lifecycle() {
         DestinationPlacement::ExactPath,
         RootExistence::Any,
         Some((
-            generate_receipt_key(EnrollmentId::random()).unwrap(),
+            generate_results_key(EnrollmentId::random()).unwrap(),
             results_policy().1,
         )),
     )
@@ -3057,7 +4430,7 @@ fn older_observation_does_not_release_newer_real_reservation() {
         DestinationPlacement::ExactPath,
         RootExistence::Any,
         Some((
-            generate_receipt_key(EnrollmentId::random()).unwrap(),
+            generate_results_key(EnrollmentId::random()).unwrap(),
             results_policy().1,
         )),
     )
@@ -3108,7 +4481,7 @@ fn results_count_directories_as_an_ordinary_copy_does() {
         (DestinationPlacement::ExactPath, true),
     ] {
         let _ = fs::remove_dir_all(root.join("target"));
-        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let key = generate_results_key(EnrollmentId::random()).unwrap();
         let (secret, policy) = results_policy();
         let authority = test_authority_with_results(
             &root,
@@ -3164,7 +4537,7 @@ fn a_small_file_batch_with_links_reports_each_failed_write() {
     let written = target.join("written");
     let failed = target.join("failed");
     fs::create_dir_all(&target).unwrap();
-    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let key = generate_results_key(EnrollmentId::random()).unwrap();
     let (secret, policy) = results_policy();
     let authority = test_authority_with_results(
         &root,
@@ -3405,7 +4778,7 @@ fn unfinished_in_place_files_are_reported_failed() {
     let image = target.join("image");
     fs::create_dir_all(&target).unwrap();
     let in_place = |finished: bool| {
-        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let key = generate_results_key(EnrollmentId::random()).unwrap();
         let (secret, policy) = results_policy();
         let authority = test_authority_with_results(
             &root,
@@ -3538,7 +4911,7 @@ fn a_refused_write_to_an_unfinished_file_lists_it_once() {
     let target = root.join("target");
     let image = target.join("image");
     fs::create_dir_all(&target).unwrap();
-    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let key = generate_results_key(EnrollmentId::random()).unwrap();
     let (secret, policy) = results_policy();
     let authority = test_authority_with_results(
         &root,
@@ -4877,7 +6250,7 @@ fn worker_authorizations_use_128_or_a_smaller_resource_limit() {
         let grant = grant_for(
             &args,
             std::slice::from_ref(&source),
-            EnrollmentId::random(),
+            (EnrollmentId::random(), 1),
             "backup",
             b"/backup",
         )
@@ -4957,7 +6330,7 @@ fn ceiling_ranges_are_checked_before_any_enrollment_side_effect() {
     let grant = grant_for(
         &parse(&["--delete", "--max-delete", "0"]),
         std::slice::from_ref(&source),
-        id,
+        (id, 1),
         "backup",
         b"/backup",
     )
@@ -4990,14 +6363,14 @@ fn restricted_routes_accept_a_persistence_scope_and_a_zero_size_limit() {
     let grant = grant_for(
         &empty_only,
         &[Location::parse("host-a:source").unwrap()],
-        id,
+        (id, 1),
         "backup",
         b"/backup",
     )
     .unwrap();
     let GrantOperation::Copy(copy) = &grant.operation;
     assert_eq!(copy.limits.max_file_bytes, 0);
-    let key = generate_receipt_key(id).unwrap();
+    let key = generate_results_key(id).unwrap();
     let signed = delegation::sign_grant(grant, GrantConstraints::default(), &key).unwrap();
     delegation::SignedGrantEnvelope::decode(&signed).unwrap();
 }
@@ -5061,7 +6434,7 @@ fn native_comparison_block_size_sets_the_signed_receiver_limit() {
     let grant = grant_for(
         &args,
         &[source],
-        EnrollmentId::random(),
+        (EnrollmentId::random(), 1),
         "backup",
         b"/backup",
     )
@@ -5088,7 +6461,7 @@ fn explicit_ceilings_are_signed_and_deletion_defaults_to_the_entry_ceiling() {
     let default_grant = grant_for(
         &default_args,
         std::slice::from_ref(&source),
-        id,
+        (id, 1),
         "backup",
         b"/backup",
     )
@@ -5114,7 +6487,7 @@ fn explicit_ceilings_are_signed_and_deletion_defaults_to_the_entry_ceiling() {
     let grant = grant_for(
         &ceilings,
         std::slice::from_ref(&source),
-        id,
+        (id, 1),
         "backup",
         b"/backup",
     )
@@ -5133,7 +6506,7 @@ fn explicit_ceilings_are_signed_and_deletion_defaults_to_the_entry_ceiling() {
     let grant = grant_for(
         &unbounded,
         std::slice::from_ref(&source),
-        id,
+        (id, 1),
         "backup",
         b"/backup",
     )
@@ -5146,7 +6519,7 @@ fn explicit_ceilings_are_signed_and_deletion_defaults_to_the_entry_ceiling() {
     let grant = grant_for(
         &bounded,
         std::slice::from_ref(&source),
-        id,
+        (id, 1),
         "backup",
         b"/backup",
     )
@@ -5156,7 +6529,7 @@ fn explicit_ceilings_are_signed_and_deletion_defaults_to_the_entry_ceiling() {
     assert_eq!(copy.limits.max_deletions, 30);
     // A read-only run plans no deletion, so it needs no budget.
     let preview = parse(&["--delete", "--dry-run"]);
-    let grant = grant_for(&preview, &[source], id, "backup", b"/backup").unwrap();
+    let grant = grant_for(&preview, &[source], (id, 1), "backup", b"/backup").unwrap();
     let GrantOperation::Copy(copy) = &grant.operation;
     assert_eq!(copy.policy.deletion, DeletionPolicy::Forbid);
 }
@@ -5168,7 +6541,7 @@ fn signed_scopes_distinguish_named_children_from_directory_contents() {
         Args::try_parse_from(["syq rsync", "-r", "host-a:source", "host-b:/backup"]).unwrap();
     named_args.normalize();
     let named_source = Location::parse("host-a:source").unwrap();
-    let named = grant_for(&named_args, &[named_source], id, "backup", b"/backup").unwrap();
+    let named = grant_for(&named_args, &[named_source], (id, 1), "backup", b"/backup").unwrap();
     let GrantOperation::Copy(named) = named.operation;
     assert_eq!(
         named.mutation_scopes,
@@ -5188,7 +6561,14 @@ fn signed_scopes_distinguish_named_children_from_directory_contents() {
         Args::try_parse_from(["syq rsync", "-r", "host-a:source/", "host-b:/backup"]).unwrap();
     contents_args.normalize();
     let contents_source = Location::parse("host-a:source/").unwrap();
-    let contents = grant_for(&contents_args, &[contents_source], id, "backup", b"/backup").unwrap();
+    let contents = grant_for(
+        &contents_args,
+        &[contents_source],
+        (id, 1),
+        "backup",
+        b"/backup",
+    )
+    .unwrap();
     let GrantOperation::Copy(contents) = contents.operation;
     assert_eq!(
         contents.mutation_scopes,
@@ -5202,7 +6582,8 @@ fn signed_scopes_distinguish_named_children_from_directory_contents() {
         Args::try_parse_from(["syq rsync", "host-a:file", "host-b:/backup"]).unwrap();
     nonrecursive_args.normalize();
     let file = Location::parse("host-a:file").unwrap();
-    let nonrecursive = grant_for(&nonrecursive_args, &[file], id, "backup", b"/backup").unwrap();
+    let nonrecursive =
+        grant_for(&nonrecursive_args, &[file], (id, 1), "backup", b"/backup").unwrap();
     let GrantOperation::Copy(nonrecursive) = nonrecursive.operation;
     assert!(nonrecursive
         .mutation_scopes
@@ -5916,7 +7297,7 @@ fn a_stale_patch_holds_no_bytes_and_leaves_its_record_to_the_retry() {
     fs::create_dir_all(&target).unwrap();
     fs::write(&a, b"same").unwrap();
     fs::hard_link(&a, &b).unwrap();
-    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let key = generate_results_key(EnrollmentId::random()).unwrap();
     let (secret, policy) = results_policy();
     let mut authority = test_authority_with_results(
         &root,
@@ -6287,7 +7668,7 @@ fn grouped_patch_results_list_published_and_failed_files() {
     for path in [&kept, &published, &failed, &unkept] {
         fs::write(path, b"old").unwrap();
     }
-    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let key = generate_results_key(EnrollmentId::random()).unwrap();
     let (secret, policy) = results_policy();
     let authority = test_authority_with_results(
         &root,
@@ -6387,7 +7768,7 @@ fn a_failed_patch_is_listed_unless_the_senders_retry_settles_it() {
         let file = target.join("file");
         fs::create_dir_all(&target).unwrap();
         fs::write(&file, b"old").unwrap();
-        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let key = generate_results_key(EnrollmentId::random()).unwrap();
         let (secret, policy) = results_policy();
         let authority = test_authority_with_results(
             &root,
@@ -6490,7 +7871,7 @@ fn a_metadata_change_does_not_settle_a_failed_patch() {
         let file = target.join("file");
         fs::create_dir_all(&target).unwrap();
         fs::write(&file, b"old").unwrap();
-        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let key = generate_results_key(EnrollmentId::random()).unwrap();
         let (secret, policy) = results_policy();
         let mut authority = test_authority_with_results(
             &root,
@@ -6573,7 +7954,7 @@ fn data_corrupted_in_transit_is_listed_as_an_integrity_failure() {
     let root = temporary.path().join("root");
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
-    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let key = generate_results_key(EnrollmentId::random()).unwrap();
     let (secret, policy) = results_policy();
     let authority = test_authority_with_results(
         &root,
@@ -6725,7 +8106,7 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
     for name in ["refused", "published", "dropped", "outside-begin"] {
         fs::write(target.join(name), &old).unwrap();
     }
-    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let key = generate_results_key(EnrollmentId::random()).unwrap();
     let (secret, policy) = results_policy();
     // 8 MiB/s: a burst of 1 MiB.
     let authority = std::sync::Arc::new(
@@ -7620,7 +9001,7 @@ fn both_receivers_update_in_place_only_files_they_vouch_for() {
             fs::set_permissions(target.join(name), fs::Permissions::from_mode(0o644)).unwrap();
         }
         fs::hard_link(target.join("linked"), root.join("outside")).unwrap();
-        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let key = generate_results_key(EnrollmentId::random()).unwrap();
         let (secret, policy) = results_policy();
         let mut receiver =
             ParityReceiver::new(&root, restricted, true, PublicationPolicy::InPlaceUpdate);
@@ -7794,7 +9175,7 @@ fn both_receivers_settle_each_file_of_an_in_place_batch_alike() {
             .iter()
             .map(|name| fs::metadata(target.join(name)).unwrap().ino())
             .collect();
-        let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+        let key = generate_results_key(EnrollmentId::random()).unwrap();
         let (secret, policy) = results_policy();
         let mut receiver =
             ParityReceiver::new(&root, restricted, true, PublicationPolicy::InPlaceUpdate);
@@ -9237,31 +10618,6 @@ fn an_in_place_as_new_root_that_exists_is_refused_and_unchanged() {
 }
 
 #[test]
-fn separate_ssh_key_preserves_grant_key_and_survives_retry() {
-    let directory = crate::test_support::tempdir().unwrap();
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let grant = generate_enrollment_key(EnrollmentId::random()).unwrap();
-    let encoded = grant.to_openssh(LineEnding::LF).unwrap();
-    atomic_write(
-        directory.path(),
-        "enrollment-key",
-        encoded.as_bytes(),
-        0o600,
-    )
-    .unwrap();
-    let login = ensure_ssh_key(directory.path()).unwrap();
-    assert_ne!(login.public_key().key_data(), grant.public_key().key_data());
-    assert_eq!(ensure_ssh_key(directory.path()).unwrap(), login);
-    assert_eq!(
-        fs::read(directory.path().join("enrollment-key")).unwrap(),
-        encoded.as_bytes()
-    );
-    // A damaged or accidentally reused grant key must never be exposed.
-    atomic_write(directory.path(), "ssh-key", encoded.as_bytes(), 0o600).unwrap();
-    assert!(ensure_ssh_key(directory.path()).is_err());
-}
-
-#[test]
 fn a_refusal_racing_the_results_end_is_still_counted() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
@@ -9490,7 +10846,7 @@ fn files_the_keep_policy_keeps_are_neither_refused_nor_failed() {
     let root = temporary.path().join("root");
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
-    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let key = generate_results_key(EnrollmentId::random()).unwrap();
     let (secret, policy) = results_policy();
     let authority = test_authority_with_results(
         &root,
@@ -9546,7 +10902,7 @@ fn small_copies_publish_through_a_restricted_receiver() {
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
     fs::write(target.join("old"), b"stale contents").unwrap();
-    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let key = generate_results_key(EnrollmentId::random()).unwrap();
     let (secret, policy) = results_policy();
     let authority = std::sync::Arc::new(
         test_authority_with_results(
@@ -9697,8 +11053,55 @@ fn small_copies_publish_through_a_restricted_receiver() {
     }
 }
 
+/// A destination named through a link to its directory, whose own link
+/// names where it leads by an absolute path: the receiver compares that
+/// path with where the directory really is, not the name the grant uses.
+#[test]
+fn follow_dst_compares_absolute_link_targets_with_the_real_directory() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let parent = temporary.path().join("parent");
+    let real = parent.join("data/real");
+    fs::create_dir_all(&real).unwrap();
+    symlink(&parent, temporary.path().join("alias")).unwrap();
+    symlink(&real, parent.join("target")).unwrap();
+    let named = temporary.path().join("alias/target");
+    let mut args =
+        Args::try_parse_from(["syq rsync", "-r", "host-a:data/", "host-b:/unused"]).unwrap();
+    args.normalize();
+    let source = Location::parse("host-a:data/").unwrap();
+    let grant = grant_for(
+        &args,
+        std::slice::from_ref(&source),
+        (EnrollmentId::random(), 1),
+        "receiver",
+        named.as_os_str().as_bytes(),
+    )
+    .unwrap();
+    let authority = RestrictedAuthority::new(
+        ConfinedRoot::resolve(named.as_os_str().as_bytes(), &[]).unwrap(),
+        grant,
+        GrantConstraints {
+            extra_options: crate::delegation::ExtraCopyOptions {
+                follow_dst: true,
+                ..Default::default()
+            },
+            ..GrantConstraints::default()
+        },
+        [0; 32],
+        generate_results_key(EnrollmentId::random()).unwrap(),
+        Instant::now() + std::time::Duration::from_secs(60),
+        &[],
+    )
+    .unwrap();
+    let mut put = small_put(&named.join("file"));
+    let settlement = authority.authorize(&mut put, false).unwrap();
+    let response = authority.test_ops().handle(&put);
+    authority.settle(settlement, &response);
+    assert_eq!(fs::read(real.join("file")).unwrap(), b"new", "{response:?}");
+}
+
 /// With `--follow-dst`, a destination reached through symlinks is the
-/// directory they lead to inside the enrolled root: the receiver works
+/// directory they lead to inside the confinement root: the receiver works
 /// beneath it, under the signed destination's name. A link that leads
 /// outside the root, into the receiver's control plane, to nothing, or
 /// round in a loop is refused when the grant is redeemed.
@@ -9773,10 +11176,13 @@ fn follow_dst_copies_into_the_directory_a_destination_link_leads_to() {
     symlink("loop-b", root.join("loop-a")).unwrap();
     symlink("loop-a", root.join("loop-b")).unwrap();
     for (target, refusal) in [
-        (b"../outside".to_vec(), "outside the enrolled root"),
+        (
+            b"../outside".to_vec(),
+            "outside the directory the destination is in",
+        ),
         (
             path_bytes(&temporary.path().join("outside")),
-            "outside the enrolled root",
+            "outside the directory the destination is in",
         ),
         (b".ssh".to_vec(), "protected SSH configuration"),
         (
@@ -9784,7 +11190,7 @@ fn follow_dst_copies_into_the_directory_a_destination_link_leads_to() {
             "leads to missing, which does not exist",
         ),
         (b"loop-a".to_vec(), "too many symlinks"),
-        (b".".to_vec(), "the enrolled root itself"),
+        (b".".to_vec(), "the directory it is in"),
     ] {
         let error = format!("{:#}", authority(&target, options).err().unwrap());
         assert!(error.contains(refusal), "{target:?}: {error}");
@@ -9844,7 +11250,7 @@ fn follow_dst_creates_a_destination_that_does_not_exist_yet() {
         follow_dst: true,
         ..Default::default()
     };
-    // No symlink: the destination is the enrolled root's missing child.
+    // No symlink: the destination is the confinement root's missing child.
     let authority = test_authority_with_options(
         &root,
         DeletionPolicy::Forbid,
@@ -9886,11 +11292,11 @@ fn follow_dst_creates_a_destination_that_does_not_exist_yet() {
     assert_eq!(found.signed_components, 1);
 }
 
-/// An enrolled root of `/` names everything beneath it, so restricted
+/// A confinement root of `/` names everything beneath it, so restricted
 /// lookups work there, and an absolute destination symlink resolves inside
 /// it.
 #[test]
-fn an_enrolled_root_of_slash_names_paths_beneath_it() {
+fn a_confinement_root_of_slash_names_paths_beneath_it() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     fs::create_dir_all(root.join("target")).unwrap();

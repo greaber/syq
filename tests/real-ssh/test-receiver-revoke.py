@@ -21,10 +21,10 @@ def remote(command):
     return run("ssh", "destination", command, stdout=subprocess.PIPE, text=True).stdout.strip()
 
 
-def enrollment(parent):
+def enrollment():
     records = [json.loads(path.read_bytes()) for path in
-               (Path.home() / ".local/state/syq/restricted").glob("*/metadata.json")]
-    matches = [record for record in records if record["requested_parent"] == parent]
+               (Path.home() / ".local/state/syq/enrollments").glob("*/enrollment.json")]
+    matches = [record for record in records if record["host"] == "destination"]
     assert len(matches) == 1, matches
     return matches[0]
 
@@ -58,11 +58,11 @@ def main():
     remote("mkdir -p " + shlex.quote(root))
     run("ssh", "source", "python3 -c " + shlex.quote(
         f"from pathlib import Path; p = Path({source!r}); p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(b'x' * (32 << 20))"))
-    run("syq", "receiver", "enroll", f"destination:{root}/one")
-    before = enrollment(root)
+    run("syq", "receiver", "enroll", "destination")
+    before = enrollment()
     # EnrollmentId is serialized as bytes in the private JSON state.
     identifier = bytes(before["id"]).hex()
-    state = before["remote_home"] + "/.local/share/syq/restricted/" + identifier
+    state = before["remote_home"] + "/.local/share/syq/enrollments/" + identifier
     processes = []
     outputs = []
     try:
@@ -98,10 +98,10 @@ print(json.dumps([any(p.open('rb').read(4 << 20) == b'x' * (4 << 20) for p in ro
             print(output.read().decode(errors="replace"), end="", flush=True)
         remote("test ! -e " + shlex.quote(root + "/one") + " && test ! -e " + shlex.quote(root + "/two"))
         # Copies under a fresh enrollment can resume their partials normally.
-        run("syq", "receiver", "enroll", f"destination:{root}/one")
-        after = enrollment(root)
+        run("syq", "receiver", "enroll", "destination")
+        after = enrollment()
         assert after["id"] != before["id"], "revocation reused the old enrollment identity"
-        assert after["receipt_public_key"] != before["receipt_public_key"]
+        assert after["results_public_key"] != before["results_public_key"]
         for name in ("one", "two"):
             with tempfile.TemporaryDirectory(prefix="revoke-resume-results-") as temporary:
                 results = Path(temporary) / "results.ndjson"
