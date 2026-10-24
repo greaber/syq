@@ -139,7 +139,9 @@ of 1 MiB or more, syq takes a read lease on the existing file before comparing
 it. If another program opens the file for writing before syq has copied the
 reused blocks, or already has it open for writing, syq reads those blocks back
 and checks them. That program's open waits up to about 20 ms; an open that
-does not wait fails and must be retried. On macOS and on Linux filesystems
+does not wait fails and must be retried. If syq is suspended while it holds a
+lease, for example with Ctrl-Z, the open waits up to the kernel's lease-break
+time, 45 seconds by default. On macOS and on Linux filesystems
 outside that list, including OverlayFS, F2FS, network and FUSE filesystems,
 another program writing a destination file while syq updates it can leave the
 published file with that program's bytes. For network storage, copying over
