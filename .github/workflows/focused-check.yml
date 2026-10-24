@@ -51,6 +51,10 @@ jobs:
         run: |
           printf '%s\n' CARGO_PROFILE_DEV_OPT_LEVEL=0 CARGO_PROFILE_TEST_OPT_LEVEL=0 \
             >> "$GITHUB_ENV"
+      # C dependencies rebuild when this differs from the cached macOS build.
+      - name: Match the macOS suite's deployment target
+        if: inputs.runner == 'macos'
+        run: echo MACOSX_DEPLOYMENT_TARGET=11.0 >> "$GITHUB_ENV"
       # Restore only: master runs of the matching CI job save these entries.
       - name: Restore the matching CI job's Cargo cache
         if: inputs.cargo_cache

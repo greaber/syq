@@ -681,6 +681,16 @@ all its parts, so to clear a failed check, dispatch the same `suites` value
 again or rerun the failed run. The same applies to what you ask of subagents:
 do not have a subagent run slow suites before it reports.
 
+Dispatch the macOS suite (`gh workflow run macos.yml --ref <task-branch>`)
+only for platform-sensitive changes: code paths that differ on macOS,
+filesystem or process behavior, and packaging. Each run occupies a macOS
+runner for half an hour or more, and post-merge and nightly runs cover the
+rest. Do not rerun it after it passed at the same commit, or after a passing
+run on the branch, unless the later commits could change its result. On a task
+branch it runs SDK packaging and the release tooling suites only when the
+branch changes them or with `-f complete=true`, and a newer dispatch on the
+same branch cancels the older run.
+
 After synchronizing a branch with `master`, build; when conflicts touched
 code, also run the focused tests for that code. Use `--locked` for Cargo
 validation so a check cannot silently repair an uncommitted lockfile. For
