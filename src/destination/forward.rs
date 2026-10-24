@@ -86,7 +86,7 @@ pub(super) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
     {
         bail!("return authorization owns its SSH connection and requires encrypted direct data transport; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --no-tcp-encryption, --peer-auth, or --coordinate-at");
     }
-    crate::restricted::validate_restricted_args(args)?;
+    crate::directive::validate_restricted_args(args)?;
     let target = crate::remote_to_remote::endpoint_arg(destination, None, None);
     target_endpoint(&target)?;
     Ok(target)
@@ -243,7 +243,7 @@ impl Receiver {
             crate::approval_command::dry_run_prunes(&command)?,
         )?;
         let max_delete = super::deletion_ceiling(&request, self.max_delete);
-        crate::delegation::validate_return_request(&request)?;
+        crate::delegation::validate_rules(&request.copy, &mut request.constraints.clone())?;
         let count = self.forward_count.fetch_add(1, Ordering::AcqRel);
         let _slot = Slot(&self.forward_count);
         if count >= 8 {
@@ -739,7 +739,7 @@ impl<T: Write + AsRawFd> Write for DeadlineIo<'_, T> {
     }
 }
 
-pub(super) struct HandshakeInput<R> {
+pub(crate) struct HandshakeInput<R> {
     inner: R,
     pending: Arc<AtomicBool>,
     deadline: Instant,
@@ -747,7 +747,7 @@ pub(super) struct HandshakeInput<R> {
     started: bool,
 }
 impl<R> HandshakeInput<R> {
-    pub(super) fn new(
+    pub(crate) fn new(
         inner: R,
         pending: Arc<AtomicBool>,
         start_timeout: Duration,

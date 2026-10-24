@@ -695,13 +695,8 @@ impl RestrictedAuthority {
         } = extensions;
         let enrollment_id = grant.enrollment_id;
         let request_id = grant.request_id;
-        let GrantOperation::Copy(copy) = grant.operation;
+        let copy = grant.copy;
         reject_control_plane_scopes(&copy, protected)?;
-        if copy.policy.existing == ExistingDestinationPolicy::UpdateIfOlder {
-            // The comparison depends on a source mtime only the remote
-            // coordinator reports, so the receiver cannot enforce it.
-            bail!("update-if-older existing-object policy is not enforceable by the receiver");
-        }
         let filter_matcher = crate::scan::build_ignore(&filters.ignore)?;
         let filter_roots = filters.destination_roots.clone();
         let root_path = Path::new(std::ffi::OsStr::from_bytes(&confined.named));
@@ -1340,7 +1335,7 @@ impl RestrictedAuthority {
     /// Whether the grant allows changes at all now: not a read-only one, and
     /// not after its results ended.
     fn check_mutation_allowed(&self) -> Result<()> {
-        if self.copy.options.dry_run || self.copy.options.verify_only {
+        if self.copy.options.dry_run {
             bail!("signed read-only transfer forbids destination mutations");
         }
         if self.state.lock().unwrap().results_closing {
@@ -2148,9 +2143,6 @@ impl RestrictedAuthority {
                 });
                 Ok(())
             }
-            ExistingDestinationPolicy::UpdateIfOlder => {
-                bail!("update-if-older existing-object policy is not enforceable by the receiver")
-            }
         }
     }
 
@@ -2189,9 +2181,6 @@ impl RestrictedAuthority {
             // nothing hostA supplies names an inode on its own authority.
             ExistingDestinationPolicy::MustExist => self.pin_update(path, &label, condition),
             ExistingDestinationPolicy::Replace => Ok(()),
-            ExistingDestinationPolicy::UpdateIfOlder => {
-                bail!("update-if-older existing-object policy is not enforceable by the receiver")
-            }
         }
     }
 

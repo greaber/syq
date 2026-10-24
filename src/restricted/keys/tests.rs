@@ -8,10 +8,10 @@ use ssh_agent_lib::ssh_encoding::{Decode as _, Encode as _};
 use std::os::unix::net::UnixListener;
 use std::time::{Duration, Instant};
 
-const NAMESPACE: &str = delegation::SSHSIG_NAMESPACE;
+const NAMESPACE: &str = crate::directive::NAMESPACE;
 
 fn now() -> i64 {
-    super::super::now().unwrap()
+    crate::directive::now().unwrap()
 }
 
 /// The `ssh -vvv` lines that matter for a login with `name`, its key file

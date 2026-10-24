@@ -939,3 +939,26 @@ fn released_v071_preamble_rejects_copy_progress_before_decoding() {
         );
     }
 }
+
+/// An enrolled receiver reads its admission frame before the preamble: the
+/// writer sends it once, ahead of the first frame, and never again.
+#[test]
+fn an_admission_goes_once_before_the_preamble() {
+    let mut bytes = Vec::new();
+    let mut writer = FrameWriter::with_admission(&mut bytes, false, b"ADMISSION".to_vec());
+    writer.write_msg(&block_message(vec![1])).unwrap();
+    writer.write_msg(&block_message(vec![2])).unwrap();
+    drop(writer);
+    let plain = [block_frame(vec![1], false), {
+        let mut second = block_frame(vec![2], false);
+        second.drain(..local_preamble_len());
+        second
+    }]
+    .concat();
+    assert_eq!(bytes, [b"ADMISSION".as_slice(), &plain].concat());
+    let mut plain_writer = Vec::new();
+    FrameWriter::new(&mut plain_writer, false)
+        .write_preamble()
+        .unwrap();
+    assert!(plain_writer.starts_with(WIRE_PREAMBLE_MAGIC));
+}

@@ -248,32 +248,37 @@ The protection has several parts:
    copy you authorize and uses it for every connection to the receiver,
    checking hostB's host key against the keys your laptop trusts. The entry
    key can start the receiver but authorizes nothing: anyone holding it,
-   including a server that ran an earlier copy, still needs a newly signed grant
-   to copy files. Your login key and SSH agent stay on your
-   laptop; no agent is forwarded. The entry key is stored unencrypted on your
+   including a server that ran an earlier copy, still needs a copy you newly
+   signed to copy files. A connection made with the entry key has 10 seconds
+   to present one, or to join a copy already running, and at most eight such
+   connections can wait at once. A server that keeps the entry key from an
+   earlier copy can keep all eight busy and so block new copies, until you
+   revoke the enrollment and enroll again, which replaces the entry key.
+   Your login key and SSH agent stay on your laptop; no agent is forwarded. The entry key is stored unencrypted on your
    laptop. Keep it dedicated to the receiver: authorizing it elsewhere would
    give hostA that access too.
-3. **Sign the particular copy with your login key.** Your laptop signs a
-   grant stating the permitted destination paths, write and deletion
-   permissions, limits, and expiry, using the key you log in to hostB with.
-   HostB's receiver checks the signature against that key, including a FIDO
-   key's touch and PIN and a certificate's expiry, records that the
-   grant has been used, and enforces it throughout the transfer. HostA
-   cannot broaden the grant or redeem it again for a later copy. The
+3. **Sign the particular copy with your login key.** Your laptop signs the
+   copy's command, as you ran it, with its expiry, using the key you log in
+   to hostB with. HostB's receiver checks the signature against that key,
+   including a FIDO key's touch and PIN and a certificate's expiry, works out
+   the permitted destination paths, write and deletion permissions, and
+   limits from the command itself, as your laptop did, records that the copy
+   has started, and enforces those permissions throughout the transfer.
+   HostA cannot change the command or use it again for a later copy. The
    signature is made for syq copies alone and cannot pass as a login.
 4. **Check the outcome with hostB.** The receiver reports each change it
    makes, protected by a key hostB created during setup. HostA passes the
    reports to your laptop, which checks that they are hostB's and that hostA
    left none out, added none, and did not cut them short.
 
-An enrollment covers the whole account. Each copy's grant names its
+An enrollment covers the whole account. Each copy's command names its
 destination, which can be anywhere the account can write except the
 receiver's protected paths: the account's SSH configuration, syq's stored
 programs, enrollment state on either side, and receiving state, including
 syq's runtime directory (see [Enrollment](remote-reference.md#enrollment) for
 the list, and for the copies into a directory holding one that are refused).
 A file written elsewhere in the account, such as a shell startup file, can run code
-as the account, so a grant is as strong as a login. That is
+as the account, so a signed copy is as strong as a login. That is
 acceptable because only your login key can sign one, and you choose each
 destination.
 
@@ -329,8 +334,8 @@ HostA cannot:
   metadata, or give them new names with hard links, when the grant permits
   only creating new ones, or delete files without permission.
 - Exceed the signed byte, entry, or deletion limits.
-- Reuse the grant for another copy, use the entry key it keeps to start a
-  later copy without a newly signed grant, or use that key to run a
+- Reuse the signed copy for another copy, use the entry key it keeps to
+  start a later copy without one you newly signed, or use that key to run a
   shell.
 - Forge, alter, or cut short hostB's reports of its changes.
 

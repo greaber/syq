@@ -57,39 +57,6 @@ pub(super) fn load_results_key(state: &Path) -> Result<PrivateKey> {
     PrivateKey::from_openssh(&encoded).context("parse results signing key")
 }
 
-/// The signer a grant names: the enrollment at one generation, so a grant
-/// issued before a refresh is refused after it.
-pub(super) fn signer_name(id: EnrollmentId, generation: u64) -> String {
-    format!("syq-enrollment-{id}-generation-{generation}")
-}
-
-pub(super) fn normalize_absolute(path: &std::ffi::OsStr, home: &Path) -> Result<PathBuf> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let bytes = path.as_bytes();
-    let raw = if bytes == b"~" {
-        home.to_path_buf()
-    } else if let Some(rest) = bytes.strip_prefix(b"~/") {
-        home.join(std::ffi::OsStr::from_bytes(rest))
-    } else if bytes.starts_with(b"/") {
-        PathBuf::from(path)
-    } else {
-        home.join(path)
-    };
-    let mut normalized = PathBuf::from("/");
-    for component in raw.components() {
-        match component {
-            std::path::Component::RootDir => {}
-            std::path::Component::Normal(component) => normalized.push(component),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                bail!("restricted destination must not contain .. components")
-            }
-            std::path::Component::Prefix(_) => bail!("unsupported destination prefix"),
-        }
-    }
-    Ok(normalized)
-}
-
 pub(super) fn requested_parent(destination: &Path) -> &Path {
     destination.parent().unwrap_or_else(|| Path::new("/"))
 }

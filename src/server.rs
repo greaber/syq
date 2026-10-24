@@ -573,7 +573,23 @@ fn record_handed_connection_for_test() {
     );
 }
 
-pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Result<()> {
+/// The forced command of an enrollment's `authorized_keys` line, which runs
+/// for every session an entry key starts: admit the session, then serve the
+/// copy its verified directive allows. A worker's session is handed to the
+/// running copy it joins, which serves it.
+pub(crate) fn run_checker(enrollment: &str, generation: &str) -> Result<()> {
+    match crate::restricted::admit_session(enrollment, generation)? {
+        crate::restricted::Session::Worker => Ok(()),
+        crate::restricted::Session::Copy(authority) => run_restricted(authority),
+    }
+}
+
+/// How long a verified copy's control has to start its Hello, and then to
+/// finish it.
+const RESTRICTED_START_TIMEOUT: Duration = Duration::from_secs(60);
+const RESTRICTED_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Result<()> {
     let _termination = clean_up_on_termination();
     let (_workers, ticket) = match crate::restricted::start_ssh_workers(authority.clone()) {
         Ok((workers, ticket)) => (Some(workers), Ok(ticket)),
@@ -583,8 +599,14 @@ pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthori
         ),
     };
     let descriptor_session = DescriptorSessionSlot::default();
+    let pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let result = serve(
-        io::stdin(),
+        crate::destination::HandshakeInput::new(
+            io::stdin(),
+            pending.clone(),
+            RESTRICTED_START_TIMEOUT,
+            RESTRICTED_HELLO_TIMEOUT,
+        ),
         io::stdout().lock(),
         true,
         None,
@@ -592,7 +614,7 @@ pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthori
         None,
         ServeSession {
             owns_process: true,
-            handshake_pending: None,
+            handshake_pending: Some(pending),
             ssh_worker_ticket: Some(ticket),
             allow_tcp: true,
             metadata_control: false,

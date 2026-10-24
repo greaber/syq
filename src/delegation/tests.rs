@@ -1,5 +1,7 @@
 use super::*;
+use crate::directive::{Binding, Inputs, Role, NAMESPACE};
 use crate::process::CommandExt as _;
+use ssh_key::{LineEnding, PrivateKey};
 use std::fs;
 use std::os::unix::fs::DirBuilderExt;
 use std::process::{Command, Stdio};
@@ -8,8 +10,9 @@ use std::thread;
 use std::time::Duration;
 
 const NOW: i64 = 1_900_000_000;
-const SIGNER: &str = "alice@example.test";
 const TARGET: &str = "backup";
+const BUILD: &str = "test-build";
+const GENERATION: u64 = 3;
 
 struct TestDir(PathBuf);
 
@@ -96,8 +99,8 @@ impl Fixture {
         self.trusted.borrow().clone()
     }
 
-    fn signed(&self, grant: Grant) -> Vec<u8> {
-        signed_envelope(grant, &self.key, SSHSIG_NAMESPACE)
+    fn signed(&self, directive: Directive) -> Vec<u8> {
+        signed_directive(&directive, &self.key, crate::directive::NAMESPACE)
     }
 }
 
@@ -177,71 +180,41 @@ fn sign(payload: &[u8], key: &Path, namespace: &str) -> Vec<u8> {
     output.stdout
 }
 
-fn fixture_grant(request_byte: u8) -> Grant {
-    Grant {
-        enrollment_id: EnrollmentId::test_v4(7),
-        target_login: TARGET.to_owned(),
-        signer: SIGNER.to_owned(),
+fn fixture_directive(request_byte: u8) -> Directive {
+    Directive {
+        build: BUILD.to_owned(),
         request_id: RequestId([request_byte; 32]),
         issued_at: NOW,
         not_before: NOW - 30,
         start_by: NOW + 600,
         finish_by: NOW + 900,
-        operation: GrantOperation::Copy(CopyOperation {
-            destination: b"/srv/archive/project".to_vec(),
-            mutation_scopes: vec![MutationScope {
-                path: b"/srv/archive/project".to_vec(),
-                descendants: true,
-            }],
-            policy: CopyPolicy {
-                placement: DestinationPlacement::ExactPath,
-                existing: ExistingDestinationPolicy::Replace,
-                deletion: DeletionPolicy::Forbid,
-                publication: PublicationPolicy::AtomicStaged,
-            },
-            options: CopyOptions {
-                recursive: true,
-                preserve_symlinks: true,
-                preserve_permissions: true,
-                receiver_managed_modes: false,
-                preserve_times: true,
-                preserve_owner: false,
-                preserve_group: false,
-                preserve_devices: false,
-                compare_existing_by_content: true,
-                dry_run: false,
-                verify_only: true,
-                compressed_transport: false,
-                tcp_port_lo: 47_600,
-                tcp_port_hi: 47_699,
-            },
-            limits: CopyLimits {
-                max_entries: 10_000,
-                max_total_bytes: 1 << 30,
-                max_file_bytes: 1 << 29,
-                hash_block_bytes: 4 << 20,
-                max_connections: 8,
-                max_deletions: 0,
-            },
-        }),
+        binding: Binding {
+            enrollment: EnrollmentId::test_v4(7),
+            generation: GENERATION,
+            account: TARGET.to_owned(),
+            role: Role::Destination,
+        },
+        command: [
+            "cp", "--from", "source", "--src", "data", "--to", "backup", "--into", "/srv",
+        ]
+        .map(|arg| arg.as_bytes().to_vec())
+        .to_vec(),
+        cwd: "~/work".to_owned(),
+        inputs: Inputs::default(),
+        results_key: [4; 32],
     }
 }
 
-fn context<'a>(signer: &'a str, target: &'a str, now: i64, skew: i64) -> ReceiverContext<'a> {
-    context_at(signer, target, now, skew, Instant::now())
+fn context(target: &str, now: i64, skew: i64) -> ReceiverContext<'_> {
+    context_at(target, now, skew, Instant::now())
 }
 
-fn context_at<'a>(
-    signer: &'a str,
-    target: &'a str,
-    now: i64,
-    skew: i64,
-    observed_at: Instant,
-) -> ReceiverContext<'a> {
+fn context_at(target: &str, now: i64, skew: i64, observed_at: Instant) -> ReceiverContext<'_> {
     ReceiverContext {
         enrollment_id: EnrollmentId::test_v4(7),
+        generation: GENERATION,
         target_login: target,
-        expected_signer: signer,
+        build: BUILD,
         clock: ClockObservation {
             unix_seconds: now,
             monotonic: observed_at,
@@ -250,582 +223,131 @@ fn context_at<'a>(
     }
 }
 
-fn signed_envelope(grant: Grant, key: &Path, namespace: &str) -> Vec<u8> {
-    signed_envelope_with_rate(grant, 0, key, namespace)
+fn signed_directive(directive: &Directive, key: &Path, namespace: &str) -> Vec<u8> {
+    crate::directive::sign(directive, |payload| Ok(sign(payload, key, namespace)))
+        .expect("sign test directive")
 }
 
-fn signed_envelope_with_rate(
-    grant: Grant,
-    max_file_data_bytes_per_second: u64,
-    key: &Path,
-    namespace: &str,
-) -> Vec<u8> {
-    let payload = signing_payload_default(&grant, max_file_data_bytes_per_second)
-        .expect("make signing payload");
-    let signature = sign(&payload, key, namespace);
-    SignedGrantEnvelope::new(grant, max_file_data_bytes_per_second, signature)
-        .encode()
-        .expect("encode signed grant")
-}
-
-fn raw_envelope(grant: &Grant, signature: &[u8]) -> Vec<u8> {
-    raw_envelope_with_rate(grant, 0, signature)
-}
-
-fn raw_envelope_with_rate(
-    grant: &Grant,
-    max_file_data_bytes_per_second: u64,
-    signature: &[u8],
-) -> Vec<u8> {
-    let grant = canonical_body_bytes(
-        grant,
-        max_file_data_bytes_per_second,
-        &FilterPolicy::default(),
-        RootExistence::Any,
-        &test_receipt_policy(),
-        None,
-        None,
-        None,
-        &ExtraCopyOptions::default(),
-    )
-    .expect("encode test grant");
-    let mut out = Vec::new();
-    out.extend_from_slice(WIRE_MAGIC);
-    out.extend_from_slice(&(grant.len() as u32).to_be_bytes());
+/// The signed form of `directive` with `signature`, whatever made it.
+fn raw_directive(directive: &Directive, signature: &[u8]) -> Vec<u8> {
+    let body = postcard::to_stdvec(directive).expect("encode test directive");
+    let mut out = b"SYQDIR1\0".to_vec();
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
     out.extend_from_slice(&(signature.len() as u32).to_be_bytes());
-    out.extend_from_slice(&grant);
+    out.extend_from_slice(&body);
     out.extend_from_slice(signature);
     out
 }
 
-#[test]
-fn released_v041_grants_keep_their_bytes_signature_and_replay_identity() {
-    // Produced by v0.4.1's unchanged sign_grant/fixture_grant(44), using
-    // the deterministic test key below. Do not regenerate on protocol edits.
-    let encoded = include_bytes!("../../tests/fixtures/restricted-grant-v0.4.1.bin");
-    let decoded = SignedGrantEnvelope::decode(encoded).unwrap();
-    let GrantOperation::Copy(copy) = &decoded.grant.operation;
-    assert_eq!(copy.limits.max_connections, 8);
-    assert_eq!(decoded.tcp_congestion, None);
-    assert_eq!(decoded.encode().unwrap(), encoded);
-    let private = PrivateKey::new(
-        ssh_key::private::Ed25519Keypair::from_seed(&[42; 32]).into(),
-        "syq-test",
-    )
-    .unwrap();
-    assert_eq!(
-        sign_grant(fixture_grant(44), GrantConstraints::default(), &private).unwrap(),
-        encoded
-    );
-    let fixture = Fixture::ordinary();
-    fixture.trust(private.public_key());
-    let replay = fixture.replay("released-replay");
-    verify_and_redeem(
-        encoded,
-        &context(SIGNER, TARGET, NOW, 0),
-        &fixture.policy(),
-        &replay,
-    )
-    .unwrap();
-    assert!(verify_and_redeem(
-        encoded,
-        &context(SIGNER, TARGET, NOW, 0),
-        &fixture.policy(),
-        &replay
-    )
-    .is_err());
+/// The payload a signature over `directive` covers.
+fn payload_of(directive: &Directive) -> Vec<u8> {
+    [
+        b"SYQDIR1\0".as_slice(),
+        &postcard::to_stdvec(directive).unwrap(),
+    ]
+    .concat()
+}
+
+fn verify(
+    encoded: &[u8],
+    context: &ReceiverContext<'_>,
+    signer: &TrustedSigner,
+    replay: &ReplayStore,
+) -> Result<VerifiedDirective> {
+    verify_and_redeem(encoded, context, signer, replay, |_| Ok(())).map(|(_, verified)| verified)
+}
+
+fn redeemed(replay: &ReplayStore, request_byte: u8) -> bool {
+    replay
+        .path
+        .join(format!(
+            "redeemed-{}",
+            RequestId([request_byte; 32]).file_component()
+        ))
+        .exists()
 }
 
 #[test]
-fn congestion_extension_is_signed_and_cannot_be_removed_or_changed() {
-    let private = PrivateKey::new(
-        ssh_key::private::Ed25519Keypair::from_seed(&[42; 32]).into(),
-        "syq-test",
-    )
-    .unwrap();
-    let fixture = Fixture::ordinary();
-    fixture.trust(private.public_key());
-    let encoded = sign_grant(
-        fixture_grant(44),
-        GrantConstraints {
-            tcp_congestion: Some("cubic".into()),
-            ..Default::default()
-        },
-        &private,
-    )
-    .unwrap();
-    let decoded = SignedGrantEnvelope::decode(&encoded).unwrap();
-    assert_eq!(decoded.tcp_congestion.as_deref(), Some("cubic"));
-    let replay = fixture.replay("tcp-constraint-replay");
-    for algorithm in [None, Some("bbr".into())] {
-        let mut tampered = decoded.clone();
-        tampered.tcp_congestion = algorithm;
-        assert!(verify_and_redeem(
-            &tampered.encode().unwrap(),
-            &context(SIGNER, TARGET, NOW, 0),
-            &fixture.policy(),
-            &replay
-        )
-        .is_err());
-    }
-    let verified = verify_and_redeem(
-        &encoded,
-        &context(SIGNER, TARGET, NOW, 0),
-        &fixture.policy(),
-        &replay,
-    )
-    .unwrap();
-    assert_eq!(
-        verified.into_parts().1.tcp_congestion.as_deref(),
-        Some("cubic")
-    );
-}
-
-#[test]
-fn extra_copy_options_are_signed_in_an_extension_released_readers_reject() {
-    let private = PrivateKey::new(
-        ssh_key::private::Ed25519Keypair::from_seed(&[42; 32]).into(),
-        "syq-test",
-    )
-    .unwrap();
-    let fixture = Fixture::ordinary();
-    fixture.trust(private.public_key());
-    let options = ExtraCopyOptions {
-        hardlinks: true,
-        acls: true,
-        xattrs: true,
-        sparse: true,
-        ..Default::default()
-    };
-    let encoded = sign_grant(
-        fixture_grant(44),
-        GrantConstraints {
-            tcp_congestion: Some("cubic".into()),
-            extra_options: options,
-            ..Default::default()
-        },
-        &private,
-    )
-    .unwrap();
-    let decoded = SignedGrantEnvelope::decode(&encoded).unwrap();
-    assert_eq!(decoded.extra_options, options);
-    assert_eq!(decoded.tcp_congestion.as_deref(), Some("cubic"));
-    assert_eq!(decoded.encode().unwrap(), encoded);
-
-    // Released readers know only these extensions and refuse any other, so
-    // they never run a copy whose options they would drop.
-    let body_length = u32::from_be_bytes(encoded[8..12].try_into().unwrap()) as usize;
-    let body = &encoded[WIRE_HEADER_LEN..WIRE_HEADER_LEN + body_length];
-    let (_, extension): (GrantBody, &[u8]) = postcard::take_from_bytes(body).unwrap();
-    let (kind, _): (String, &[u8]) = postcard::take_from_bytes(extension).unwrap();
-    assert!(!["tcp-congestion-v1", "mapping-v1", "copy-hashing-v2"].contains(&kind.as_str()));
-
-    // Without these options, grants keep their released encodings.
-    let plain = sign_grant(
-        fixture_grant(44),
-        GrantConstraints {
-            tcp_congestion: Some("cubic".into()),
-            ..Default::default()
-        },
-        &private,
-    )
-    .unwrap();
-    let body_length = u32::from_be_bytes(plain[8..12].try_into().unwrap()) as usize;
-    let body = &plain[WIRE_HEADER_LEN..WIRE_HEADER_LEN + body_length];
-    let (_, extension): (GrantBody, &[u8]) = postcard::take_from_bytes(body).unwrap();
-    let (kind, _): (String, &[u8]) = postcard::take_from_bytes(extension).unwrap();
-    assert_eq!(kind, "tcp-congestion-v1");
-
-    let replay = fixture.replay("extra-options-replay");
-    for changed in [
-        ExtraCopyOptions::default(),
-        ExtraCopyOptions {
-            xattrs: false,
-            ..options
-        },
-    ] {
-        let mut tampered = decoded.clone();
-        tampered.extra_options = changed;
-        assert!(verify_and_redeem(
-            &tampered.encode().unwrap(),
-            &context(SIGNER, TARGET, NOW, 0),
-            &fixture.policy(),
-            &replay
-        )
-        .is_err());
-    }
-    let verified = verify_and_redeem(
-        &encoded,
-        &context(SIGNER, TARGET, NOW, 0),
-        &fixture.policy(),
-        &replay,
-    )
-    .unwrap();
-    assert_eq!(verified.into_parts().1.extra_options, options);
-
-    // ACLs change permissions, so they need permission preservation.
-    let mut grant = fixture_grant(46);
-    let GrantOperation::Copy(copy) = &mut grant.operation;
-    copy.options.preserve_permissions = false;
-    copy.options.receiver_managed_modes = true;
-    assert!(sign_grant(
-        grant,
-        GrantConstraints {
-            extra_options: ExtraCopyOptions {
-                acls: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        &private,
-    )
-    .is_err());
-}
-
-#[test]
-fn hashing_constraints_are_signed_and_preserve_legacy_encoding() {
-    use crate::hashing::{CopyHashing, Digest, HashAlgorithm, HashPolicy};
-    let private = PrivateKey::new(
-        ssh_key::private::Ed25519Keypair::from_seed(&[42; 32]).into(),
-        "syq-test",
-    )
-    .unwrap();
-    let fixture = Fixture::ordinary();
-    fixture.trust(private.public_key());
-    let hashing = CopyHashing {
-        policy: HashPolicy {
-            algorithm: HashAlgorithm::Xxh3,
-            transfer_integrity: false,
-            transfer_hash_type: None,
-        },
-        expected_hash: Some(Digest::hash_bytes(HashAlgorithm::Sha256, b"expected file")),
-    };
-    let encoded = sign_grant(
-        fixture_grant(45),
-        GrantConstraints {
-            hashing: Some(hashing.clone()),
-            ..Default::default()
-        },
-        &private,
-    )
-    .unwrap();
-    let decoded = SignedGrantEnvelope::decode(&encoded).unwrap();
-    assert_eq!(decoded.hashing, Some(hashing.clone()));
-    let replay = fixture.replay("hashing-replay");
-    let mut changed = hashing.clone();
-    changed.policy.transfer_integrity = true;
-    let mut other_payload = hashing.clone();
-    other_payload.policy.transfer_hash_type = Some(HashAlgorithm::Sha256);
-    let mut omitted = hashing.clone();
-    omitted.expected_hash = None;
-    for policy in [None, Some(changed), Some(other_payload), Some(omitted)] {
-        let mut tampered = decoded.clone();
-        tampered.hashing = policy;
-        assert!(verify_and_redeem(
-            &tampered.encode().unwrap(),
-            &context(SIGNER, TARGET, NOW, 0),
-            &fixture.policy(),
-            &replay
-        )
-        .is_err());
-    }
-    let verified = verify_and_redeem(
-        &encoded,
-        &context(SIGNER, TARGET, NOW, 0),
-        &fixture.policy(),
-        &replay,
-    )
-    .unwrap();
-    assert_eq!(verified.into_parts().1.hashing, Some(hashing));
-    // The released body's encoding is unchanged; the new feature is an
-    // extension an old reader rejects instead of silently dropping it.
-    let legacy = fixture.signed(fixture_grant(46));
-    let legacy_decoded = SignedGrantEnvelope::decode(&legacy).unwrap();
-    assert!(legacy_decoded.hashing.is_none());
-    assert_eq!(legacy_decoded.encode().unwrap(), legacy);
-}
-
-#[test]
-fn mapping_extension_is_signed_and_preserves_non_mapping_encoding() {
-    let private = PrivateKey::new(
-        ssh_key::private::Ed25519Keypair::from_seed(&[42; 32]).into(),
-        "syq-test",
-    )
-    .unwrap();
-    let fixture = Fixture::ordinary();
-    fixture.trust(private.public_key());
-    let mapping = crate::mapping::Authorization::from_contents(b"manifest bytes");
-    for tcp in [None, Some("cubic".to_string())] {
-        let encoded = sign_grant(
-            fixture_grant(44),
-            GrantConstraints {
-                mapping: Some(mapping.clone()),
-                tcp_congestion: tcp.clone(),
-                ..Default::default()
-            },
-            &private,
-        )
-        .unwrap();
-        let decoded = SignedGrantEnvelope::decode(&encoded).unwrap();
-        assert_eq!(decoded.mapping, Some(mapping.clone()));
-        assert_eq!(decoded.tcp_congestion, tcp);
-        // Released readers require byte-for-byte canonical re-encoding of
-        // their GrantBody and cannot discard trailing signed constraints.
-        let size = u32::from_be_bytes(encoded[8..12].try_into().unwrap()) as usize;
-        let body = &encoded[WIRE_HEADER_LEN..WIRE_HEADER_LEN + size];
-        let (old, _): (GrantBody, &[u8]) = postcard::take_from_bytes(body).unwrap();
-        assert_ne!(postcard::to_stdvec(&old).unwrap(), body);
-        let replay = fixture.replay(if tcp.is_some() {
-            "mapping-tcp-replay"
-        } else {
-            "mapping-replay"
-        });
-        for changed in [
-            None,
-            Some(crate::mapping::Authorization {
-                bytes: mapping.bytes + 1,
-                ..mapping.clone()
-            }),
-            Some(crate::mapping::Authorization {
-                digest: [0; 32],
-                ..mapping.clone()
-            }),
-        ] {
-            let mut tampered = decoded.clone();
-            tampered.mapping = changed;
-            assert!(verify_and_redeem(
-                &tampered.encode().unwrap(),
-                &context(SIGNER, TARGET, NOW, 0),
-                &fixture.policy(),
-                &replay
-            )
-            .is_err());
-        }
-        let verified = verify_and_redeem(
-            &encoded,
-            &context(SIGNER, TARGET, NOW, 0),
-            &fixture.policy(),
-            &replay,
-        )
-        .unwrap();
-        assert_eq!(verified.into_parts().1.mapping, Some(mapping.clone()));
-    }
-}
-
-#[test]
-fn signed_worker_allowances_round_trip_without_widening() {
-    let fixture = Fixture::ordinary();
-    for workers in [1, 8, 32, 64, 128] {
-        let mut grant = fixture_grant(1);
-        let GrantOperation::Copy(copy) = &mut grant.operation;
-        copy.limits.max_connections = workers;
-        let encoded = fixture.signed(grant);
-        let decoded = SignedGrantEnvelope::decode(&encoded).unwrap();
-        let GrantOperation::Copy(copy) = decoded.grant.operation;
-        assert_eq!(copy.limits.max_connections, workers);
-    }
-}
-
-#[test]
-fn canonical_typed_grant_round_trips_and_has_strict_bounds() {
-    let fixture = Fixture::ordinary();
-    let encoded = fixture.signed(fixture_grant(1));
-    let decoded = SignedGrantEnvelope::decode(&encoded).expect("decode canonical grant");
-    assert_eq!(decoded.grant, fixture_grant(1));
-    assert_eq!(decoded.max_file_data_bytes_per_second, 0);
-    let mut bad_magic = encoded.clone();
-    bad_magic[3] ^= 1;
-    assert!(SignedGrantEnvelope::decode(&bad_magic).is_err());
-
-    let mut trailing = encoded.clone();
-    trailing.push(0);
-    assert!(SignedGrantEnvelope::decode(&trailing).is_err());
-
-    let mut relative = fixture_grant(2);
-    let GrantOperation::Copy(copy) = &mut relative.operation;
-    copy.destination = b"relative/path".to_vec();
-    assert!(signing_payload_default(&relative, 0).is_err());
-
-    let mut unbounded = fixture_grant(3);
-    unbounded.start_by = unbounded.not_before + MAX_GRANT_VALIDITY_SECS + 1;
-    unbounded.finish_by = unbounded.start_by;
-    assert!(signing_payload_default(&unbounded, 0).is_err());
-
-    let mut endless = fixture_grant(3);
-    endless.finish_by = endless.issued_at + MAX_FINISH_WINDOW_SECS + 1;
-    assert!(signing_payload_default(&endless, 0).is_err());
-
-    let mut reversed = fixture_grant(3);
-    reversed.finish_by = reversed.start_by - 1;
-    assert!(signing_payload_default(&reversed, 0).is_err());
-
-    let mut excessive = fixture_grant(4);
-    let GrantOperation::Copy(copy) = &mut excessive.operation;
-    copy.limits.max_connections = MAX_CONNECTIONS + 1;
-    assert!(signing_payload_default(&excessive, 0).is_err());
-
-    let mut excessive = fixture_grant(4);
-    let GrantOperation::Copy(copy) = &mut excessive.operation;
-    copy.limits.max_total_bytes = u64::MAX;
-    assert!(signing_payload_default(&excessive, 0).is_err());
-}
-
-#[test]
-fn in_process_enrollment_key_signature_is_accepted_by_openssh() {
+fn an_in_process_signature_verifies_with_every_field_bound() {
     let fixture = Fixture::ordinary();
     let keypair = ssh_key::private::Ed25519Keypair::from_seed(&[42; 32]);
     let private = PrivateKey::new(keypair.into(), "syq-test").unwrap();
     fixture.trust(private.public_key());
-    let replay = fixture.replay("in-process-signature-replay");
-    let encoded = sign_grant(fixture_grant(44), GrantConstraints::default(), &private).unwrap();
-    SignedGrantEnvelope::decode(&encoded).unwrap();
-    verify_and_redeem(
-        &encoded,
-        &context(SIGNER, TARGET, NOW, 0),
-        &fixture.policy(),
-        &replay,
-    )
-    .expect("OpenSSH must accept the in-process SSHSIG");
-
-    let rate_limited = sign_grant(
-        fixture_grant(45),
-        GrantConstraints {
-            max_file_data_bytes_per_second: 4096,
-            ..GrantConstraints::default()
-        },
-        &private,
-    )
-    .unwrap();
-    let decoded = SignedGrantEnvelope::decode(&rate_limited).unwrap();
-    assert_eq!(decoded.max_file_data_bytes_per_second, 4096);
-    verify_and_redeem(
-        &rate_limited,
-        &context(SIGNER, TARGET, NOW, 0),
-        &fixture.policy(),
-        &fixture.replay("in-process-rate-signature-replay"),
-    )
-    .expect("OpenSSH must accept the signed rate extension");
-
-    let filters = FilterPolicy {
+    let mut directive = fixture_directive(44);
+    directive.inputs = Inputs {
         ignore: vec!["*.tmp".into(), "!keep.tmp".into()],
-        destination_roots: vec![b"/srv/archive/project".to_vec()],
-        delete_excluded: false,
+        mapping: Some(crate::mapping::Authorization {
+            bytes: 12,
+            digest: [9; 32],
+        }),
     };
-    let filtered = sign_grant(
-        fixture_grant(46),
-        GrantConstraints {
-            filters: filters.clone(),
-            ..GrantConstraints::default()
-        },
-        &private,
-    )
-    .unwrap();
-    let decoded = SignedGrantEnvelope::decode(&filtered).unwrap();
-    assert_eq!(decoded.filters, filters);
-    assert_eq!(decoded.root_existence, RootExistence::Any);
-    let verified = verify_and_redeem(
-        &filtered,
-        &context(SIGNER, TARGET, NOW, 0),
-        &fixture.policy(),
-        &fixture.replay("in-process-filter-signature-replay"),
-    )
-    .expect("OpenSSH must accept the signed filter extension");
-    assert_eq!(verified.into_parts().1.filters, filters);
-
-    let outside = FilterPolicy {
-        ignore: vec!["*.tmp".into()],
-        destination_roots: vec![b"/srv/outside".to_vec()],
-        delete_excluded: false,
+    let sign_in_process = |payload: &[u8]| {
+        Ok(private
+            .sign(NAMESPACE, HashAlg::Sha256, payload)?
+            .to_pem(LineEnding::LF)?
+            .into_bytes())
     };
-    assert!(sign_grant(
-        fixture_grant(47),
-        GrantConstraints {
-            filters: outside,
-            ..GrantConstraints::default()
-        },
-        &private
-    )
-    .is_err());
-
-    // A root-existence precondition survives verification unchanged.
-    let rooted = sign_grant(
-        fixture_grant(48),
-        GrantConstraints {
-            root_existence: RootExistence::New,
-            ..GrantConstraints::default()
-        },
-        &private,
-    )
-    .unwrap();
-    let decoded = SignedGrantEnvelope::decode(&rooted).unwrap();
-    assert_eq!(decoded.root_existence, RootExistence::New);
-    let verified = verify_and_redeem(
-        &rooted,
-        &context(SIGNER, TARGET, NOW, 0),
+    let encoded = crate::directive::sign(&directive, sign_in_process).unwrap();
+    let signed = crate::directive::Signed::decode(&encoded).unwrap();
+    assert_eq!(signed.directive, directive);
+    let (seen, verified) = verify_and_redeem(
+        &encoded,
+        &context(TARGET, NOW, 0),
         &fixture.policy(),
-        &fixture.replay("in-process-root-existence-signature-replay"),
+        &fixture.replay("in-process-replay"),
+        |verified| Ok(verified.clone()),
     )
-    .expect("OpenSSH must accept the signed root-existence extension");
-    assert_eq!(verified.into_parts().1.root_existence, RootExistence::New);
+    .expect("an in-process SSHSIG verifies");
+    assert_eq!(seen, directive);
+    assert_eq!(verified.digest, signed.digest());
 
-    // The grant binds the complete receipt delivery policy, including the
-    // per-transfer HPKE recipient key, into the signed grant transcript.
-    let expected_receipt_policy = crate::destination_results::ReceiptPolicy {
-        required: true,
-        hashed: true,
-        max_records: 32,
-        max_plaintext_bytes: 64 * 1024,
-        delivery: crate::destination_results::ReceiptDelivery::AttachedEncrypted {
-            suite:
-                crate::destination_results::HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
-            recipient_public_key: [4; 32],
-        },
-    };
-    let receipted = sign_grant(
-        fixture_grant(53),
-        GrantConstraints {
-            receipt_policy: expected_receipt_policy.clone(),
-            ..GrantConstraints::default()
-        },
-        &private,
-    )
-    .unwrap();
-    let decoded = SignedGrantEnvelope::decode(&receipted).unwrap();
-    assert_eq!(decoded.receipt_policy, expected_receipt_policy.clone());
-    let expected_hash = signed_grant_digest(&receipted).unwrap();
-    let verified = verify_and_redeem(
-        &receipted,
-        &context(SIGNER, TARGET, NOW, 0),
-        &fixture.policy(),
-        &fixture.replay("in-process-receipt-signature-replay"),
-    )
-    .expect("OpenSSH must accept the signed receipt policy");
-    let (_, extensions, digest, _) = verified.into_parts();
-    assert_eq!(extensions.receipt_policy, expected_receipt_policy);
-    assert_eq!(digest, expected_hash);
+    // Changing any field after signing breaks the signature.
+    let signature = signed.signature;
+    let tampered: [fn(&mut Directive); 7] = [
+        |d| d.command[7] = b"/etc".to_vec(),
+        |d| d.inputs.ignore.pop().map(drop).unwrap_or(()),
+        |d| d.inputs.mapping = None,
+        |d| d.results_key = [5; 32],
+        |d| d.cwd = "/".into(),
+        |d| d.finish_by += 1,
+        |d| d.binding.account = "root".into(),
+    ];
+    for (index, change) in tampered.into_iter().enumerate() {
+        let mut altered = directive.clone();
+        change(&mut altered);
+        let replay = fixture.replay(&format!("tamper-{index}"));
+        let result = verify(
+            &raw_directive(&altered, &signature),
+            &context(TARGET, NOW, 0),
+            &fixture.policy(),
+            &replay,
+        );
+        assert!(result.is_err(), "change {index} was accepted");
+        assert!(!redeemed(&replay, 44));
+    }
 }
 
 #[test]
 fn delete_excluded_filters_remain_valid_when_deletion_is_forbidden() {
-    let grant = fixture_grant(50);
-    let GrantOperation::Copy(copy) = &grant.operation;
+    let args = crate::approval_command::parse(&fixture_directive(50).command).unwrap();
+    let copy = crate::directive::copy_operation(&args, &args.locations[..1], b"/srv").unwrap();
     assert_eq!(copy.policy.deletion, DeletionPolicy::Forbid);
     let filters = FilterPolicy {
         ignore: vec!["*.tmp".into()],
-        destination_roots: vec![b"/srv/archive/project".to_vec()],
+        destination_roots: vec![b"/srv/data".to_vec()],
         delete_excluded: true,
     };
     // The unfiltered-scan policy still matters for a dry run or a zero
     // deletion budget; the receiver's deletion policy refuses removals.
-    filters.validate(&grant).unwrap();
+    filters.validate(&copy).unwrap();
 }
 
 #[test]
 fn malformed_and_noncanonical_sshsig_are_rejected() {
     let fixture = Fixture::ordinary();
-    let grant = fixture_grant(5);
-    let payload = signing_payload_default(&grant, 0).expect("payload");
-    let signature = sign(&payload, &fixture.key, SSHSIG_NAMESPACE);
+    let directive = fixture_directive(5);
+    let signature = sign(&payload_of(&directive), &fixture.key, NAMESPACE);
+    crate::directive::Signed::decode(&raw_directive(&directive, &signature)).unwrap();
 
     let mut malformed = signature.clone();
     let body_start = malformed
@@ -839,7 +361,7 @@ fn malformed_and_noncanonical_sshsig_are_rejected() {
         .expect("base64 character")
         + body_start;
     malformed[position] = b'!';
-    assert!(SignedGrantEnvelope::decode(&raw_envelope(&grant, &malformed)).is_err());
+    assert!(crate::directive::Signed::decode(&raw_directive(&directive, &malformed)).is_err());
 
     let lines: Vec<&[u8]> = signature.split(|byte| *byte == b'\n').collect();
     let mut encoded = Vec::new();
@@ -852,136 +374,104 @@ fn malformed_and_noncanonical_sshsig_are_rejected() {
         rewrapped.push(b'\n');
     }
     rewrapped.extend_from_slice(b"-----END SSH SIGNATURE-----\n");
-    assert!(SignedGrantEnvelope::decode(&raw_envelope(&grant, &rewrapped)).is_err());
+    assert!(crate::directive::Signed::decode(&raw_directive(&directive, &rewrapped)).is_err());
 }
 
 #[test]
-fn verifies_ordinary_key_and_binds_every_typed_field() {
+fn a_directive_for_another_receiver_is_refused_without_redeeming() {
     let fixture = Fixture::ordinary();
-    let replay = fixture.replay("replay");
-    let encoded = fixture.signed(fixture_grant(6));
-    verify_and_redeem(
-        &encoded,
-        &context(SIGNER, TARGET, NOW, 0),
-        &fixture.policy(),
-        &replay,
-    )
-    .expect("verify signed request");
-
-    let original = SignedGrantEnvelope::decode(&fixture.signed(fixture_grant(7)))
-        .expect("decode signed request");
-    let mut altered = original.grant;
-    let GrantOperation::Copy(copy) = &mut altered.operation;
-    copy.options.verify_only = false;
-    let tampered = raw_envelope(&altered, &original.signature);
-    assert!(verify_and_redeem(
-        &tampered,
-        &context(SIGNER, TARGET, NOW, 0),
-        &fixture.policy(),
-        &fixture.replay("tamper-replay"),
-    )
-    .is_err());
-
-    let rate_grant = fixture_grant(29);
-    let rate_limited =
-        signed_envelope_with_rate(rate_grant.clone(), 4096, &fixture.key, SSHSIG_NAMESPACE);
-    let decoded = SignedGrantEnvelope::decode(&rate_limited).expect("decode rate-limited grant");
-    assert_eq!(decoded.max_file_data_bytes_per_second, 4096);
-    let tampered_rate = raw_envelope_with_rate(&rate_grant, 8192, &decoded.signature);
-    assert!(verify_and_redeem(
-        &tampered_rate,
-        &context(SIGNER, TARGET, NOW, 0),
-        &fixture.policy(),
-        &fixture.replay("rate-tamper-replay"),
-    )
-    .is_err());
-}
-
-#[test]
-fn rejects_wrong_namespace_signer_target_and_enrollment_without_redeeming() {
-    let fixture = Fixture::ordinary();
-    let grant = fixture_grant(8);
-    let wrong_namespace =
-        signed_envelope(grant.clone(), &fixture.key, "other-protocol@example.test");
+    let directive = fixture_directive(8);
     let replay = fixture.replay("binding-replay");
-    assert!(verify_and_redeem(
+    let encoded = fixture.signed(directive.clone());
+    let refused = |context: ReceiverContext<'_>, expected: &str| {
+        let error = verify(&encoded, &context, &fixture.policy(), &replay).unwrap_err();
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+        assert!(!redeemed(&replay, 8));
+    };
+    refused(context("root", NOW, 0), "different account");
+    let mut other = context(TARGET, NOW, 0);
+    other.enrollment_id = EnrollmentId::test_v4(9);
+    refused(other, "different enrollment");
+    let mut refreshed = context(TARGET, NOW, 0);
+    refreshed.generation = GENERATION + 1;
+    refused(refreshed, "now at generation");
+    let mut rebuilt = context(TARGET, NOW, 0);
+    rebuilt.build = "other-build";
+    refused(rebuilt, "this receiver runs other-build");
+    let wrong_namespace = signed_directive(&directive, &fixture.key, "other-protocol@example.test");
+    let error = verify(
         &wrong_namespace,
-        &context(SIGNER, TARGET, NOW, 0),
+        &context(TARGET, NOW, 0),
         &fixture.policy(),
         &replay,
     )
-    .is_err());
-
-    let encoded = fixture.signed(grant.clone());
-    assert!(verify_and_redeem(
+    .unwrap_err();
+    assert!(error.to_string().contains("another purpose"), "{error:#}");
+    assert!(!redeemed(&replay, 8));
+    // A directive whose rules cannot be derived is not recorded either.
+    let error = verify_and_redeem(
         &encoded,
-        &context("mallory@example.test", TARGET, NOW, 0),
+        &context(TARGET, NOW, 0),
         &fixture.policy(),
         &replay,
+        |_| -> Result<()> { bail!("no rules") },
     )
-    .is_err());
-    assert!(verify_and_redeem(
+    .unwrap_err();
+    assert!(error.to_string().contains("no rules"), "{error:#}");
+    assert!(!redeemed(&replay, 8));
+    verify(
         &encoded,
-        &context(SIGNER, "root", NOW, 0),
+        &context(TARGET, NOW, 0),
         &fixture.policy(),
         &replay,
     )
-    .is_err());
-    let mut wrong_enrollment = context(SIGNER, TARGET, NOW, 0);
-    wrong_enrollment.enrollment_id = EnrollmentId::test_v4(9);
-    assert!(verify_and_redeem(&encoded, &wrong_enrollment, &fixture.policy(), &replay).is_err());
-    verify_and_redeem(
-        &encoded,
-        &context(SIGNER, TARGET, NOW, 0),
-        &fixture.policy(),
-        &replay,
-    )
-    .expect("failed binding checks must not consume request");
+    .expect("failed checks must not consume the directive");
+    assert!(redeemed(&replay, 8));
 }
 
 #[test]
 fn expiry_and_not_before_honor_only_bounded_clock_skew() {
     let fixture = Fixture::ordinary();
-    let encoded = fixture.signed(fixture_grant(9));
+    let encoded = fixture.signed(fixture_directive(9));
     let replay = fixture.replay("expired-replay");
-    assert!(verify_and_redeem(
+    assert!(verify(
         &encoded,
-        &context(SIGNER, TARGET, NOW + 620, 10),
+        &context(TARGET, NOW + 620, 10),
         &fixture.policy(),
-        &replay,
+        &replay
     )
     .is_err());
-    verify_and_redeem(
+    verify(
         &encoded,
-        &context(SIGNER, TARGET, NOW + 590, 10),
+        &context(TARGET, NOW + 590, 10),
         &fixture.policy(),
         &replay,
     )
     .expect("expiry inside clock-skew allowance");
 
-    let mut future = fixture_grant(10);
+    let mut future = fixture_directive(10);
     future.issued_at = NOW + 100;
     future.not_before = NOW + 100;
     future.start_by = NOW + 400;
     let encoded = fixture.signed(future);
     let replay = fixture.replay("future-replay");
-    assert!(verify_and_redeem(
+    assert!(verify(
         &encoded,
-        &context(SIGNER, TARGET, NOW, 90),
+        &context(TARGET, NOW, 90),
         &fixture.policy(),
-        &replay,
+        &replay
     )
     .is_err());
-    verify_and_redeem(
+    verify(
         &encoded,
-        &context(SIGNER, TARGET, NOW + 50, 60),
+        &context(TARGET, NOW + 50, 60),
         &fixture.policy(),
         &replay,
     )
     .expect("not-before inside clock-skew allowance");
-    let invalid_skew = context(SIGNER, TARGET, NOW, MAX_CLOCK_SKEW_SECS + 1);
+    let invalid_skew = context(TARGET, NOW, MAX_CLOCK_SKEW_SECS + 1);
     assert!(invalid_skew
-        .validate_at(&fixture_grant(11), invalid_skew.clock.monotonic)
+        .validate_at(&fixture_directive(11), invalid_skew.clock.monotonic)
         .is_err());
 }
 
@@ -989,26 +479,17 @@ fn expiry_and_not_before_honor_only_bounded_clock_skew() {
 fn execution_deadline_is_monotonic_and_bounded_by_finish_by() {
     let started = Instant::now();
     let verified = started + Duration::from_secs(3);
-
-    let mut bounded = fixture_grant(17);
-    bounded.finish_by = NOW + 20;
     assert_eq!(
-        execution_deadline(&bounded, 5, NOW + 3, verified).expect("finish-by deadline"),
+        execution_deadline(NOW + 20, 5, NOW + 3, verified).expect("finish-by deadline"),
         verified + Duration::from_secs(22)
     );
-
     let partially_elapsed = started + Duration::from_millis(1100);
-    let mut rounded = fixture_grant(19);
-    rounded.finish_by = NOW + 5;
     assert_eq!(
-        execution_deadline(&rounded, 0, NOW + 2, partially_elapsed)
+        execution_deadline(NOW + 5, 0, NOW + 2, partially_elapsed)
             .expect("subsecond verification is rounded conservatively"),
         partially_elapsed + Duration::from_secs(3)
     );
-
-    let mut finished = fixture_grant(20);
-    finished.finish_by = NOW + 1;
-    assert!(execution_deadline(&finished, 0, NOW + 2, started + Duration::from_secs(2),).is_err());
+    assert!(execution_deadline(NOW + 1, 0, NOW + 2, started + Duration::from_secs(2)).is_err());
 }
 
 #[test]
@@ -1018,7 +499,7 @@ fn queued_clock_observation_advances_validation_redeem_and_deadline() {
     let observed_at = Instant::now()
         .checked_sub(Duration::from_secs(3))
         .expect("monotonic observation in the recent past");
-    let context = context_at(SIGNER, TARGET, NOW, 0, observed_at);
+    let context = context_at(TARGET, NOW, 0, observed_at);
     assert!(
         context
             .wall_time_at(Instant::now())
@@ -1026,10 +507,10 @@ fn queued_clock_observation_advances_validation_redeem_and_deadline() {
             >= NOW + 3
     );
 
-    let encoded = fixture.signed(fixture_grant(22));
-    let verified = verify_and_redeem(&encoded, &context, &fixture.policy(), &replay)
+    let encoded = fixture.signed(fixture_directive(22));
+    let verified = verify(&encoded, &context, &fixture.policy(), &replay)
         .expect("verify with a queued but still-valid clock observation");
-    assert!(verified.execution_deadline() <= Instant::now() + Duration::from_secs(900));
+    assert!(verified.execution_deadline <= Instant::now() + Duration::from_secs(900));
     let redeem = fs::read(
         replay
             .path
@@ -1039,22 +520,19 @@ fn queued_clock_observation_advances_validation_redeem_and_deadline() {
     let redeemed_at = i64::from_be_bytes(redeem[8..16].try_into().expect("redeem timestamp"));
     assert!(redeemed_at >= NOW + 3);
 
-    let mut expired = fixture_grant(23);
+    let mut expired = fixture_directive(23);
     expired.start_by = NOW + 2;
     expired.finish_by = NOW + 2;
     let encoded = fixture.signed(expired);
     let expired_replay = fixture.replay("queued-expired-replay");
-    assert!(verify_and_redeem(&encoded, &context, &fixture.policy(), &expired_replay).is_err());
-    assert!(!expired_replay
-        .path
-        .join(format!("redeemed-{}", RequestId([23; 32]).file_component()))
-        .exists());
+    assert!(verify(&encoded, &context, &fixture.policy(), &expired_replay).is_err());
+    assert!(!redeemed(&expired_replay, 23));
 }
 
 #[test]
 fn duplicate_and_concurrent_redemption_allow_exactly_one_redeem() {
     let fixture = Fixture::ordinary();
-    let encoded = Arc::new(fixture.signed(fixture_grant(12)));
+    let encoded = Arc::new(fixture.signed(fixture_directive(12)));
     let replay = fixture.replay("concurrent-replay");
     let policy = fixture.policy();
     let barrier = Arc::new(Barrier::new(8));
@@ -1066,7 +544,7 @@ fn duplicate_and_concurrent_redemption_allow_exactly_one_redeem() {
         let barrier = Arc::clone(&barrier);
         threads.push(thread::spawn(move || {
             barrier.wait();
-            verify_and_redeem(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
+            verify(&encoded, &context(TARGET, NOW, 0), &policy, &replay)
         }));
     }
     let results: Vec<_> = threads
@@ -1083,20 +561,15 @@ fn duplicate_and_concurrent_redemption_allow_exactly_one_redeem() {
         "{failures:?}"
     );
     // The replay record is checked before the signature: a signer that
-    // could not verify the grant still reports the redemption.
+    // could not verify the directive still reports the redemption.
     let other = PrivateKey::new(
         ssh_key::private::Ed25519Keypair::from_seed(&[43; 32]).into(),
         "other",
     )
     .unwrap();
     let no_signature = TrustedSigner::new(other.public_key(), None, None).unwrap();
-    let error = verify_and_redeem(
-        &encoded,
-        &context(SIGNER, TARGET, NOW, 0),
-        &no_signature,
-        &replay,
-    )
-    .expect_err("duplicate request must fail");
+    let error = verify(&encoded, &context(TARGET, NOW, 0), &no_signature, &replay)
+        .expect_err("duplicate request must fail");
     assert!(error
         .to_string()
         .contains("signed request has already been redeemed"));
@@ -1203,6 +676,7 @@ fn private_state_checks_are_structural_not_ownership_walks() {
     assert!(read_private_regular(&state, "test state", 1024).is_err());
     assert!(read_private_regular(&directory.0, "test state", 1024).is_err());
 }
+
 #[test]
 fn request_ids_are_fresh_and_distinct_from_stable_copy_ids() {
     let first = RequestId::fresh(NOW).expect("fresh request ID");
@@ -1235,10 +709,10 @@ fn rejects_a_signature_by_any_key_but_the_trusted_one() {
     let directory = TestDir::new("other-key");
     let key = directory.join("other");
     generate_key(&key);
-    let encoded = signed_envelope(fixture_grant(60), &key, SSHSIG_NAMESPACE);
-    let error = verify_and_redeem(
+    let encoded = signed_directive(&fixture_directive(60), &key, NAMESPACE);
+    let error = verify(
         &encoded,
-        &context(SIGNER, TARGET, NOW, 0),
+        &context(TARGET, NOW, 0),
         &fixture.policy(),
         &fixture.replay("other-key-replay"),
     )
@@ -1247,27 +721,31 @@ fn rejects_a_signature_by_any_key_but_the_trusted_one() {
 }
 
 #[test]
-fn a_probe_or_other_namespace_signature_never_verifies_as_a_grant() {
+fn a_probe_grant_or_other_namespace_signature_never_verifies_as_a_directive() {
     let fixture = Fixture::ordinary();
     for namespace in [
         "syq-receiver-key-check-v1@greaber.github",
         "syq-receiver-key-wrap-v1@greaber.github",
+        // The typed grants of earlier builds.
+        "syq-grant@greaber.github",
         "git",
         "file",
     ] {
-        let encoded = signed_envelope(fixture_grant(61), &fixture.key, namespace);
+        let encoded = signed_directive(&fixture_directive(61), &fixture.key, namespace);
         let replay = fixture.replay(&format!("namespace-{}", namespace.len()));
-        let error = verify_and_redeem(
+        let error = verify(
             &encoded,
-            &context(SIGNER, TARGET, NOW, 0),
+            &context(TARGET, NOW, 0),
             &fixture.policy(),
             &replay,
         )
         .unwrap_err();
         assert!(error.to_string().contains("another purpose"), "{error:#}");
+        assert!(!redeemed(&replay, 61));
     }
 }
 
+/// A FIDO key's SSHSIG over `payload` in `namespace`, with `flags`.
 /// A FIDO key's SSHSIG over `payload` in `namespace`, with `flags`.
 fn security_key_signature(
     seed: u8,
@@ -1322,8 +800,7 @@ fn fido_ecdsa_signatures_keep_their_flags_through_encoding() {
         "",
     );
     for flags in [0u8, 1, 5] {
-        let data =
-            ssh_key::SshSig::signed_data(SSHSIG_NAMESPACE, HashAlg::Sha512, b"grant").unwrap();
+        let data = ssh_key::SshSig::signed_data(NAMESPACE, HashAlg::Sha512, b"grant").unwrap();
         let mut signed = Sha256::digest(b"ssh:").to_vec();
         signed.push(flags);
         signed.extend_from_slice(&3u32.to_be_bytes());
@@ -1334,25 +811,20 @@ fn fido_ecdsa_signatures_keep_their_flags_through_encoding() {
         bytes.extend_from_slice(&3u32.to_be_bytes());
         let signature =
             ssh_key::Signature::new(ssh_key::Algorithm::SkEcdsaSha2NistP256, bytes).unwrap();
-        let armored = armored_sshsig(
-            key.key_data(),
-            SSHSIG_NAMESPACE,
-            HashAlg::Sha512,
-            &signature,
-        )
-        .unwrap();
+        let armored =
+            armored_sshsig(key.key_data(), NAMESPACE, HashAlg::Sha512, &signature).unwrap();
         validate_canonical_sshsig(&armored).unwrap();
         let decoded = ssh_key::SshSig::from_pem(&armored).unwrap();
         assert_eq!(security_key_flags(&decoded).unwrap(), flags);
         TrustedSigner::new(&key, Some(flags), None)
             .unwrap()
-            .verify(SSHSIG_NAMESPACE, b"grant", &armored, NOW)
+            .verify(NAMESPACE, b"grant", &armored, NOW)
             .unwrap();
         // A PIN the signature does not show is refused.
         assert_eq!(
             TrustedSigner::new(&key, Some(flags | SK_USER_VERIFICATION), None)
                 .unwrap()
-                .verify(SSHSIG_NAMESPACE, b"grant", &armored, NOW)
+                .verify(NAMESPACE, b"grant", &armored, NOW)
                 .is_ok(),
             flags & SK_USER_VERIFICATION != 0
         );
@@ -1360,22 +832,20 @@ fn fido_ecdsa_signatures_keep_their_flags_through_encoding() {
 }
 
 #[test]
-fn security_key_grants_need_the_touch_and_pin_the_enrollment_recorded() {
+fn security_key_directives_need_the_touch_and_pin_the_enrollment_recorded() {
     let fixture = Fixture::ordinary();
     let mut request = 70;
     for flags in [0u8, 1, 4, 5] {
         for required in [0u8, 1, 4, 5] {
             request += 1;
-            let grant = fixture_grant(request);
-            let payload = signing_payload_default(&grant, 0).unwrap();
-            let (key, signature) = security_key_signature(9, flags, SSHSIG_NAMESPACE, &payload);
-            let encoded = SignedGrantEnvelope::new(grant, 0, signature)
-                .encode()
-                .unwrap();
+            let directive = fixture_directive(request);
+            let (key, signature) =
+                security_key_signature(9, flags, NAMESPACE, &payload_of(&directive));
+            let encoded = raw_directive(&directive, &signature);
             let signer = TrustedSigner::new(&key, Some(required), None).unwrap();
-            let result = verify_and_redeem(
+            let result = verify(
                 &encoded,
-                &context(SIGNER, TARGET, NOW, 0),
+                &context(TARGET, NOW, 0),
                 &signer,
                 &fixture.replay(&format!("sk-{flags}-{required}")),
             );
@@ -1390,7 +860,7 @@ fn security_key_grants_need_the_touch_and_pin_the_enrollment_recorded() {
         }
     }
     // A FIDO key needs a policy; a software key cannot have one.
-    let (key, _) = security_key_signature(9, 1, SSHSIG_NAMESPACE, b"");
+    let (key, _) = security_key_signature(9, 1, NAMESPACE, b"");
     assert!(TrustedSigner::new(&key, None, None).is_err());
     assert!(TrustedSigner::new(&key, Some(2), None).is_err());
     let software =
@@ -1414,10 +884,10 @@ fn a_certificate_login_key_is_trusted_until_the_certificate_expires() {
         (NOW as u64 - 61, 60, false),
     ] {
         let signer = TrustedSigner::new(&public, None, Some(valid_before)).unwrap();
-        let grant = fixture_grant(90 + (valid_before % 100) as u8);
-        let result = verify_and_redeem(
-            &fixture.signed(grant),
-            &context(SIGNER, TARGET, NOW, skew),
+        let directive = fixture_directive(90 + (valid_before % 100) as u8);
+        let result = verify(
+            &fixture.signed(directive),
+            &context(TARGET, NOW, skew),
             &signer,
             &fixture.replay(&format!("certificate-{valid_before}-{skew}")),
         );
@@ -1429,25 +899,5 @@ fn a_certificate_login_key_is_trusted_until_the_certificate_expires() {
         if let Err(error) = result {
             assert!(error.to_string().contains("expired"), "{error:#}");
         }
-    }
-}
-#[test]
-fn publication_policies_keep_their_encodings() {
-    // Released receivers know only the first two. `InPlaceNew` and
-    // `InPlaceUpdate` must not take the earlier `InPlace` encoding, which
-    // such a receiver would read as permission to write existing files in
-    // place without the checks `InPlaceUpdate` asks for: one from v0.7.1 or
-    // before fails to decode either and refuses the grant.
-    for (policy, byte) in [
-        (PublicationPolicy::AtomicStaged, 0u8),
-        (PublicationPolicy::InPlace, 1),
-        (PublicationPolicy::InPlaceNew, 2),
-        (PublicationPolicy::InPlaceUpdate, 3),
-    ] {
-        assert_eq!(postcard::to_allocvec(&policy).unwrap(), [byte]);
-        assert_eq!(
-            postcard::from_bytes::<PublicationPolicy>(&[byte]).unwrap(),
-            policy
-        );
     }
 }

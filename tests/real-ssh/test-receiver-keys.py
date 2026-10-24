@@ -397,12 +397,17 @@ def rotation_and_generations(lab, parent):
         run('syq', 'receiver', 'enroll', 'destination')
         _, refreshed = enrollment()
         assert refreshed['generation'] == 3, refreshed
-        command = 'syq --server --restricted-grant=AAAA'
+        # The first frame of a session that starts a copy: a 4-byte
+        # length, then the copy's directive, here not a valid one.
+        body = b'\x00\x04AAAA'
+        frame = len(body).to_bytes(4, 'big') + body
         old = attempt(*entry_ssh, '-o', f'ControlPath={control}', '-o', 'ControlMaster=no',
-                      'syq@destination', command)
+                      'syq@destination', 'syq --server', input=frame)
         assert old.returncode and b'outdated receiver' in old.stderr, old.stderr
-        new = attempt(*entry_ssh, '-o', 'ControlPath=none', 'syq@destination', command)
+        new = attempt(*entry_ssh, '-o', 'ControlPath=none', 'syq@destination', 'syq --server',
+                      input=frame)
         assert new.returncode and b'outdated receiver' not in new.stderr, new.stderr
+        assert b'not a syq directive' in new.stderr, new.stderr
         print('a connection from before a refresh cannot start a new copy', flush=True)
     finally:
         subprocess.run([*entry_ssh, '-o', f'ControlPath={control}', '-O', 'exit', 'syq@destination'],
@@ -432,20 +437,23 @@ print(any(p.stat().st_size > 0 for p in Path({parent!r}).glob('.rotation-large.s
             assert again['generation'] == 4, again
             # Drop the copy's worker connections: the workers that replace
             # them start from the refreshed line, at the new generation, and
-            # join the running copy.
+            # join the running copy. Every session runs the receiver; the
+            # copy's control started first, and the others are its workers.
             dropped = remote_text('python3 -c ' + shlex.quote('''
 import os, signal
-dropped = 0
+sessions = []
 for pid in filter(str.isdigit, os.listdir('/proc')):
     try:
-        environment = open(f'/proc/{pid}/environ', 'rb').read()
+        command = open(f'/proc/{pid}/cmdline', 'rb').read()
         status = open(f'/proc/{pid}/status').read()
+        started = int(open(f'/proc/{pid}/stat').read().rsplit(') ', 1)[1].split()[19])
     except OSError:
         continue
-    if b'--restricted-worker=' in environment:
-        os.kill(int(status.split('PPid:')[1].split()[0]), signal.SIGKILL)
-        dropped += 1
-print(dropped)
+    if b'--restricted-receiver' in command:
+        sessions.append((started, int(status.split('PPid:')[1].split()[0])))
+for _, parent in sorted(sessions)[1:]:
+    os.kill(parent, signal.SIGKILL)
+print(len(sessions) - 1)
 ''')).strip()
             assert int(dropped) >= 1, dropped
             assert process.wait(timeout=90) == 0
