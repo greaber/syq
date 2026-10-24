@@ -1372,6 +1372,11 @@ pub enum WireRequest<Data> {
     HashExistingBatch {
         block: u64,
         files: Vec<ExistingRead>,
+        /// The coordinator's batch of groups this request belongs to. The
+        /// patches of an earlier batch on the connection have all been sent,
+        /// so the receiver lets go of the leases it holds for files that
+        /// batch compared and no patch came for (`fsops::leases`).
+        batch: u64,
     },
     /// Read source files, returning only the blocks that differ from the
     /// destination's hashes. A file stops being compared, with `matching`

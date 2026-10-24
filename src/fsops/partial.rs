@@ -323,8 +323,26 @@ impl FsOps {
         meta: &Meta,
         flags: u8,
     ) -> Result<Option<(File, fs::Metadata)>> {
-        let error = match target.root.open_regular_read_write_known(&target.relative) {
+        let open = || target.root.open_regular_read_write_known(&target.relative);
+        let error = match open() {
             Ok(opened) => return Ok(Some(opened)),
+            // A lease refuses an open that does not wait, and starts to
+            // break. One of this receiver's own, which a comparison of the
+            // file on another connection may still hold, is let go at once,
+            // and the open tried again (`leases`).
+            Err(error)
+                if error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<io::Error>())
+                    .and_then(io::Error::raw_os_error)
+                    == Some(libc::EAGAIN) =>
+            {
+                super::leases::release_broken();
+                match open() {
+                    Ok(opened) => return Ok(Some(opened)),
+                    Err(error) => error,
+                }
+            }
             Err(error) => error,
         };
         let raw = error
@@ -3779,8 +3797,12 @@ impl FsOps {
                     CopyLocalOutcome::Copied => Response::Ok,
                     CopyLocalOutcome::Unsupported => Response::CopyLocalUnsupported,
                 }),
-            Request::HashExistingBatch { block, files } => Ok(Response::ExistingHashes(
-                self.hash_existing_batch(*block, files),
+            Request::HashExistingBatch {
+                block,
+                files,
+                batch,
+            } => Ok(Response::ExistingHashes(
+                self.hash_existing_batch(*block, files, *batch),
             )),
             Request::PatchSmallBatch(patches) => {
                 self.patch_small_batch(patches).map(Response::PatchedBatch)
