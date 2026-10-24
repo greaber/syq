@@ -193,25 +193,25 @@ def direct():
                 data=manifest([("file", "parent/item", "file")]))
             ssh("destination", f"from pathlib import Path; p=Path({readonly!r})/'parent'; assert (p/'item').read_bytes()==b'mapped contents'; assert p.stat().st_mode & 0o7777 == 0o2550; p.chmod(0o755)")
         # The grant names how far the receiver may widen. An exact target
-        # in a read-only enrolled directory needs `all`, which widens that
-        # directory, but nothing above it, and restores it; under `none` or
-        # `rsync` the copy fails and names `all`.
+        # in a read-only directory needs `all`, which widens that directory,
+        # but nothing above it, and restores it; under `none` or `rsync` the
+        # copy fails and names `all`.
         exact_root = root + "/readonly-exact"
         ssh("destination", f"from pathlib import Path; p=Path({exact_root!r}); p.mkdir(); p.chmod(0o555)")
-        run(["syq", "receiver", "enroll", "destination:" + exact_root + "/item"])
+        run(["syq", "receiver", "enroll", "destination"])
         for widen in ["none", "rsync", "all"]:
             result = run(prefix + ["file", "--to", "destination", "--as", exact_root + "/item", "--no-tcp", f"--widen-dirs={widen}"],
                          expected=0 if widen == "all" else 23)
             if widen != "all":
                 assert b"--widen-dirs=all may help" in result.stderr, result.stderr
         ssh("destination", f"from pathlib import Path; p=Path({exact_root!r}); assert (p/'item').read_bytes()==b'mapped contents'; assert p.stat().st_mode & 0o7777 == 0o555; p.chmod(0o755)")
-        # Under `all` the receiver also gives the directories from its
-        # enrolled root down to the destination the search permission
-        # reaching it needs, here the root itself, and nothing above it;
-        # under `rsync` the copy is refused and names `all`.
+        # Under `all` the receiver also gives the directories from the one
+        # the destination is in down to the destination the search
+        # permission reaching it needs, here that directory itself, and
+        # nothing above it; under `rsync` the copy is refused and names `all`.
         unsearchable = root + "/unsearchable-root"
         ssh("destination", f"from pathlib import Path; (Path({unsearchable!r})/'into').mkdir(parents=True)")
-        run(["syq", "receiver", "enroll", "destination:" + unsearchable + "/into"])
+        run(["syq", "receiver", "enroll", "destination"])
         ssh("destination", f"from pathlib import Path; Path({unsearchable!r}).chmod(0o600)")
         into = prefix + ["file", "--to", "destination", "--into", unsearchable + "/into", "--no-tcp"]
         refused = run(into + ["--widen-dirs=rsync"], expected=1)
@@ -235,9 +235,8 @@ def direct():
                         destination = preview_root + "/item"
                         data = None
                     # Enrollment is fixture setup, not something a signed
-                    # read-only preview may create. Exact-file placement uses
-                    # a different enrolled parent from container placement.
-                    run(["syq", "receiver", "enroll", "destination:" + destination])
+                    # read-only preview may create.
+                    run(["syq", "receiver", "enroll", "destination"])
                     before = ssh("destination", f"from pathlib import Path; p=Path({preview_root!r}); p.chmod({mode}); print(p.stat().st_ctime_ns)").stdout.strip()
                     command = prefix + sources + ["--to", "destination", placement, destination,
                                                    "--no-tcp", "--if-exists=update", "--dry-run"]

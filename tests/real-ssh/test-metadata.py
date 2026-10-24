@@ -210,11 +210,11 @@ print(' '.join(str(os.stat({destination!r} + '/dir/' + name).st_ino) for name in
     # Reading the copy above changed its access time; the rerun restores it
     # in place, so the group keeps its file and links the new name to it.
     assert after.split() == [before.strip()] * 3, (before, after)
-    # Later core cases expect the destination to have no enrollment.
+    # Later core cases expect the destination account to have no enrollment.
     import json
-    for record in (Path.home() / '.local/state/syq/restricted').glob('*/metadata.json'):
+    for record in (Path.home() / '.local/state/syq/enrollments').glob('*/enrollment.json'):
         enrollment = json.loads(record.read_bytes())
-        if enrollment['requested_parent'] == '/tmp/syq-real-ssh':
+        if enrollment['host'] == 'destination':
             subprocess.run(['syq', 'receiver', 'revoke', bytes(enrollment['id']).hex()],
                            check=True, timeout=30)
     print('Restricted receivers copy metadata as ordinary receivers do', flush=True)

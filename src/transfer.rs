@@ -3576,7 +3576,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // destination its meaning. Every connection later enters this exact inode
     // and receives only paths relative to it, so replacing the external
     // spelling after this check cannot redirect worker writes.
-    // A signed receiver instead retains and verifies its pre-enrolled root fd
+    // A signed receiver instead retains and verifies its root fd opened when the grant is redeemed
     // for every request; HostA is not authorized to manage this anchoring
     // state itself.
     let use_operator_anchor = args.restricted_grant.is_none();

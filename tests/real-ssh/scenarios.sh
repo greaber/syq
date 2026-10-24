@@ -295,11 +295,11 @@ syq rsync -a --no-progress --syq-no-tcp \
     destination:/tmp/syq-real-ssh/ordinary-push/ /tmp/syq-ordinary-pull/
 cmp /tmp/syq-ordinary-source/sub/file /tmp/syq-ordinary-pull/sub/file
 
-printf 'case: separate receiver keys, migration, and OpenSSH 8.8\n'
-python3 /usr/local/libexec/syq-test-receiver-separate-keys.py
+printf 'case: enrollment and restricted copies with OpenSSH 8.8\n'
+python3 /usr/local/libexec/syq-test-receiver-old-openssh.py
 
-printf 'case: separate receiver keys on an RSA-only destination\n'
-python3 /usr/local/libexec/syq-test-receiver-separate-keys.py --rsa-only
+printf 'case: enrollment and restricted copies on an RSA-only destination\n'
+python3 /usr/local/libexec/syq-test-receiver-old-openssh.py --rsa-only
 
 printf 'case: restricted SSH worker handshake, revocation, and resume\n'
 python3 /usr/local/libexec/syq-test-receiver-revoke.py --no-tcp
@@ -1022,24 +1022,38 @@ for small_case in unchanged updated; do
     test "$small_expected" = "$small_actual"
 done
 
-printf 'case: restricted enrollment refuses an SSH control-plane destination\n'
+printf 'case: restricted copies refuse an SSH control-plane destination\n'
 make_tree source /tmp/syq-real-ssh/protected-source protected
-if protected_output=$(syq cp --no-progress --performance-tuning workers=2 --copy-metadata=permissions \
-    --from source --srcs-in /tmp/syq-real-ssh/protected-source \
-    --to destination --into /home/syq/.ssh/sender-controlled 2>&1); then
-    echo 'copy into the restricted receiver control plane unexpectedly succeeded' >&2
-    exit 1
-fi
-case "$protected_output" in
-    *"protected SSH configuration directory"*) ;;
-    *)
-        echo 'control-plane refusal did not report the protected SSH directory:' >&2
-        printf '%s\n' "$protected_output" >&2
+# A refused destination leaves no enrollment on either machine.
+protected_server_state='cat ~/.ssh/authorized_keys 2>/dev/null; find ~/.local/share/syq/enrollments -mindepth 1 -maxdepth 1 2>/dev/null | sort'
+# shellcheck disable=SC2029
+protected_server_before=$(ssh destination "$protected_server_state" | sha256sum)
+protected_local_before=$(find "$home/.local/state/syq/enrollments" -mindepth 1 -maxdepth 1 2>/dev/null | sort | sha256sum)
+# The laptop expands a leading ~ with the server's home, so it stays literal.
+# shellcheck disable=SC2088
+for protected_destination in /home/syq/.ssh/sender-controlled '~/.local/lib/syq/sender-controlled' .local/share/syq/enrollments/sender-controlled; do
+    if protected_output=$(syq cp --no-progress --performance-tuning workers=2 --copy-metadata=permissions \
+        --from source --srcs-in /tmp/syq-real-ssh/protected-source \
+        --to destination --into "$protected_destination" 2>&1); then
+        echo 'copy into the restricted receiver control plane unexpectedly succeeded' >&2
         exit 1
-        ;;
-esac
+    fi
+    case "$protected_output" in
+        *"protected SSH configuration directory"*|*"protected store of syq executables"*|*"protected enrollment state directory"*) ;;
+        *)
+            echo 'control-plane refusal did not report the protected directory:' >&2
+            printf '%s\n' "$protected_output" >&2
+            exit 1
+            ;;
+    esac
+    # shellcheck disable=SC2029
+    ssh destination "cd && test ! -e $protected_destination"
+done
+# shellcheck disable=SC2029
+test "$(ssh destination "$protected_server_state" | sha256sum)" = "$protected_server_before"
+test "$(find "$home/.local/state/syq/enrollments" -mindepth 1 -maxdepth 1 2>/dev/null | sort | sha256sum)" = "$protected_local_before"
+# Released versions' state is never created.
 ssh destination '
-    test ! -e ~/.ssh/sender-controlled
     test ! -e ~/.local/share/syq/restricted
     test ! -e ~/.local/libexec/syq-receiver
 '
@@ -1092,8 +1106,8 @@ for small_case in new unchanged updated; do
 done
 
 printf 'case: --follow-dst copies into the directory a restricted destination link leads to\n'
-# The receiver resolves the link inside its enrolled root and writes into
-# the directory it leads to; the link stays a link.
+# The receiver resolves the link inside the directory the destination is in
+# and writes into the directory it leads to; the link stays a link.
 make_tree source /tmp/syq-real-ssh/follow-source follow
 ssh destination 'rm -rf /tmp/syq-real-ssh/follow-real /tmp/syq-real-ssh/follow-link &&
     install -d /tmp/syq-real-ssh/follow-real &&
@@ -1127,7 +1141,7 @@ syq persist off --pscope "$limits_scope" >/dev/null
 assert_same_tree source /tmp/syq-real-ssh/pscope-source \
     destination /tmp/syq-real-ssh/pscope-destination pscope
 
-printf 'case: receiver keys preserve login key protection\n'
+printf 'case: login keys sign restricted copies\n'
 python3 /usr/local/libexec/syq-test-receiver-keys.py
 
 printf 'case: enrollment revocation stops active restricted receivers\n'

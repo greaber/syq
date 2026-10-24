@@ -1,8 +1,9 @@
 # syq receiver
 
-Manage restricted destinations for direct server-to-server copies. See
-[access management](../remote-to-remote.md#first-copy-and-access-management)
-and [enrollment details](../remote-reference.md#enrollment) for setup and upgrades.
+Manage restricted copying on server accounts, for direct server-to-server
+copies. See [access management](../remote-to-remote.md#first-copy-and-access-management)
+and [enrollment details](../remote-reference.md#enrollment) for setup, key
+changes, and upgrades.
 
 <!-- CLI: receiver -->
 ```text
@@ -11,7 +12,7 @@ syq receiver <COMMAND>
 
 | Command | Purpose |
 |---|---|
-| [`receiver enroll`](#syq-receiver-enroll) | Manually enroll or refresh a receiver |
+| [`receiver enroll`](#syq-receiver-enroll) | Manually enroll or refresh a server account |
 | [`receiver list`](#syq-receiver-list) | List local active and pending enrollments |
 | [`receiver revoke`](#syq-receiver-revoke) | Stop active receivers and remove their enrollment from both machines |
 
@@ -26,19 +27,20 @@ syq receiver <COMMAND>
 
 ## syq receiver enroll
 
-The destination’s parent must exist. Repeating enrollment updates the receiver;
-stop active copies before updating it.
+Sets up restricted copying on a server account, or refreshes it: it installs
+the receiver for this syq build and trusts the key you log in with. Copies do
+this automatically when needed. Copies already running continue.
 
 <!-- CLI: receiver enroll -->
 ```text
-syq receiver enroll [OPTIONS] <[USER@]HOST:DESTINATION>
+syq receiver enroll [OPTIONS] <[USER@]HOST>
 ```
 
 **Arguments**
 
 | Argument / option | Meaning |
 |---|---|
-| `<[USER@]HOST:DESTINATION>` | Remote destination, e.g. alice@nas:/backup/photos |
+| `<[USER@]HOST>` | Server account, e.g. alice@nas |
 
 **Options**
 
@@ -49,6 +51,12 @@ syq receiver enroll [OPTIONS] <[USER@]HOST:DESTINATION>
 <!-- /CLI -->
 
 ## syq receiver list
+
+Prints one tab-separated line per enrollment: its ID, `active` or `pending`,
+and the account. Active enrollments add the receiver's release and the
+fingerprint of the login key it trusts. When this machine still holds
+enrollments from syq 0.4.0 to 0.7.1, a notice says where to read how to
+remove them.
 
 <!-- CLI: receiver list -->
 ```text
