@@ -380,13 +380,14 @@ it is intentional" is not that decision.
   gain. Startup latency and throughput are core to the product.
 - Do not flag a missing `CHANGELOG.md` entry on an ordinary PR. The changelog
   is brought up to date during release preparation.
-- Do not repeat checks the pull request lists as passed, or CI checks that
-  `scripts/pr-checks.py` shows as passed or unfinished; the implementing agent
-  owns those. Take CI state from that script, not from the description. Note
-  results whose SHA is older than the reviewed SHA when later commits could
-  change them, and report failed checks. Checks still running do not block
-  merge. If a check that matters for the change has not run, say which and
-  why; dispatch it in CI when that is practical.
+- Do not run test suites or dispatch CI during a review; the implementing
+  agent and CI own them. Take CI state from `scripts/pr-checks.py`, not from
+  the description. Note results whose SHA is older than the reviewed SHA when
+  later commits could change them, and report failed checks. Checks still
+  running do not block merge. If a check that matters for the change has not
+  run, say which and why, and leave dispatching it to the implementing agent.
+  Run code only to examine behavior that no existing test covers, such as a
+  focused reproduction of a suspected defect in a disposable directory.
 
 ## PR review freshness
 
