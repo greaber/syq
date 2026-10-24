@@ -140,10 +140,11 @@ the existing file before comparing it. If another program opens the file for
 writing before syq has copied the reused blocks, or already has it open for
 writing, syq reads those blocks back and checks them. That program's open
 waits up to about 20 ms; an open that does not wait fails and must be
-retried. On network and FUSE filesystems, another program writing a
-destination file while syq updates it can leave the published file with that
-program's bytes; running syq's receiver on the file server, by copying to it
-over SSH, avoids this.
+retried. On macOS, which offers no such leases, and on network and FUSE
+filesystems, another program writing a destination file while syq updates it
+can leave the published file with that program's bytes; for a network
+filesystem, running syq's receiver on the file server, by copying to it over
+SSH, avoids this.
 
 On Linux, and on NFS or SMB destinations mounted on macOS, normal file copies
 check for delayed write errors before replacing files. This catches failures
