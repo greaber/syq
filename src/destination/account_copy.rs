@@ -137,7 +137,6 @@ pub(crate) fn approved_operation(
         || args.delegated
         || args.restricted_grant.is_some()
         || args.return_source.is_some()
-        || args.return_destination.is_some()
     {
         return Ok(None);
     }

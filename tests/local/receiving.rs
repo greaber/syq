@@ -1646,8 +1646,8 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
         fs::remove_file(t.path("ssh-used")).unwrap();
     }
 
-    // Unsupported options and explicit SSH never ask a receiving machine.
-    for extra in [vec!["--auth-from", "ssh"], vec!["--into", "~//archive"]] {
+    // Explicit SSH never asks a receiving machine.
+    for extra in [vec!["--auth-from", "ssh"]] {
         let mut args = vec!["cp", "source", "--to", "backup"];
         args.extend(extra);
         let output = run(&args);
@@ -1707,10 +1707,12 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     assert_eq!(messages[0]["secret"], "laptop");
     assert_eq!(messages[0]["message"], "Ping");
     assert_eq!(messages[1]["secret"], "laptop");
-    assert_eq!(
-        messages[1]["message"]["Forward"]["request"]["copy"]["policy"]["existing"],
-        "Replace"
-    );
+    // The request carries the command, from which the laptop derives the
+    // rules, and only what the command read from files beside it.
+    let forward = &messages[1]["message"]["Forward"];
+    assert_eq!(forward["command"][0], serde_json::json!(b"cp"));
+    assert_eq!(forward["inputs"]["ignore"], serde_json::json!([]));
+    assert!(forward.get("request").is_none(), "{forward}");
     for pair in messages[2..8].chunks_exact(2) {
         assert_eq!(pair[0]["secret"], "laptop");
         assert_eq!(pair[0]["message"], "Ping");

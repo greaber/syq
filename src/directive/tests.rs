@@ -17,7 +17,7 @@ fn directive(args: &[&str]) -> Directive {
         },
         command(args),
         "~/work".into(),
-        Inputs::default(),
+        (Inputs::default(), None),
         [4; 32],
     )
     .unwrap();
@@ -115,6 +115,7 @@ fn unknown_variants_are_refused() {
         command: Vec<Vec<u8>>,
         cwd: String,
         inputs: Inputs,
+        caps: Option<Caps>,
         results_key: [u8; 32],
     }
     let known = directive(ROUTE_5);
@@ -132,6 +133,7 @@ fn unknown_variants_are_refused() {
         command: known.command.clone(),
         cwd: known.cwd.clone(),
         inputs: known.inputs.clone(),
+        caps: known.caps,
         results_key: known.results_key,
     };
     let body = |role| postcard::to_stdvec(&future(role)).unwrap();

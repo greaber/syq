@@ -1,5 +1,5 @@
 use super::*;
-use crate::cli::{Existence, Placement};
+use crate::cli::{Existence, Location, Placement};
 use crate::delegation::{CopyLimits, CopyOptions, CopyPolicy, PublicationPolicy};
 use crate::directive::{
     copy_operation, filter_destination_roots, normalize_absolute, validate_restricted_args,
@@ -6452,7 +6452,6 @@ fn receivers_refuse_root_and_effective_capabilities() {
 fn only_enrolled_grants_leave_bandwidth_to_the_sender() {
     assert!(enrolled_grant("c2lnbmVkLWdyYW50"));
     assert!(!enrolled_grant("named-v2:route"));
-    assert!(!enrolled_grant(crate::destination::RETURN_GRANT));
     assert!(!enrolled_grant(crate::destination::peer_bridge::GRANT));
 }
 

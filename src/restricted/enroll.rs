@@ -439,12 +439,13 @@ pub(super) type DestinationCheck<'a> = Option<&'a dyn Fn(&Path, &[PathBuf]) -> R
 /// The enrollment for `login@host:port`, set up when there is none, and
 /// refreshed when it runs another build or `refresh` asks to find the
 /// login key again. Returns the login key's signer when this logged in to
-/// the server.
+/// the server. With `batch`, SSH neither prompts nor accepts a host key the
+/// user has not trusted.
 pub(super) fn enroll(
     host: &str,
     port: Option<u16>,
     login: &str,
-    jump: Option<&SshEndpoint>,
+    (jump, batch): (Option<&SshEndpoint>, bool),
     refresh: bool,
     check: DestinationCheck<'_>,
 ) -> Result<(LocalEnrollment, PathBuf, Option<LoginSigner>)> {
@@ -497,7 +498,7 @@ pub(super) fn enroll(
     }
     let lost = (plan.refresh, plan.id, plan.directory.clone());
     let (metadata, directory, signer) =
-        match run_session(&target, jump, (host, port, login), plan, check)? {
+        match run_session(&target, (jump, batch), (host, port, login), plan, check)? {
             (Session::Installed(installed), directory) => {
                 let (metadata, signer) = *installed;
                 (metadata, directory, signer)
@@ -523,7 +524,7 @@ pub(super) fn enroll(
                     });
                 match run_session(
                     &target,
-                    jump,
+                    (jump, batch),
                     (host, port, login),
                     replacement_plan(&base, pending, replaced)?,
                     check,
@@ -580,7 +581,7 @@ fn new_plan(base: &Path, replaces: Option<ReplacedEnrollment>) -> Plan {
 /// through `jump`.
 fn run_session(
     target: &SshEndpoint,
-    jump: Option<&SshEndpoint>,
+    (jump, batch): (Option<&SshEndpoint>, bool),
     account: (&str, Option<u16>, &str),
     plan: Plan,
     check: DestinationCheck<'_>,
@@ -591,7 +592,13 @@ fn run_session(
         "remains pending for a safe retry"
     };
     let id = plan.id;
-    let direct = install_over_route(target, EnrollmentRoute::Direct, account, &plan, check);
+    let direct = install_over_route(
+        target,
+        EnrollmentRoute::Direct,
+        account,
+        (&plan, batch),
+        check,
+    );
     let session = match (direct, jump) {
         (Ok(session), _) => session,
         (Err(direct_error), Some(jump)) if is_enrollment_transport_failure(&direct_error) => {
@@ -599,7 +606,7 @@ fn run_session(
                 target,
                 EnrollmentRoute::ProxyJump { jump },
                 account,
-                &plan,
+                (&plan, batch),
                 check,
             )
             .with_context(|| {
@@ -621,7 +628,7 @@ fn install_over_route(
     target: &SshEndpoint,
     route: EnrollmentRoute<'_>,
     (host, port, login): (&str, Option<u16>, &str),
-    plan: &Plan,
+    (plan, batch): (&Plan, bool),
     check: DestinationCheck<'_>,
 ) -> Result<Session> {
     let agent = configured_agent(target, route.clone())?;
@@ -632,7 +639,13 @@ fn install_over_route(
     let mut command = Command::new("ssh");
     command
         .args(["-vvv", "-o", "FingerprintHash=sha256", "-E"])
-        .arg(&trace_path)
+        .arg(&trace_path);
+    if batch {
+        // SSH takes the first value of each option, so these come before
+        // the user's configuration.
+        command.args(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes"]);
+    }
+    command
         .args(enrollment::enrollment_ssh_args_raw(
             target,
             route.clone(),

@@ -67,6 +67,7 @@ fn unregister_signal_cleanup(path: &Path) {
 
 /// An owner-only temporary directory that is removed when it is dropped,
 /// and also when a termination signal ends the process first.
+#[derive(Debug)]
 pub(crate) struct SignalCleanedDir(tempfile::TempDir);
 
 impl SignalCleanedDir {

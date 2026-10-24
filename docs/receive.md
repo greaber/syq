@@ -261,9 +261,12 @@ You do not need to run `persist connect` first or forward your agent.
 
 With `auto`, eligible copies can instead ask for restricted per-copy approval
 after native SSH fails. That approval names permitted paths and applies transfer
-limits. Restricted uploads use direct TCP or SSH; both explicit `--no-tcp` and
-automatic TCP-to-SSH fallback temporarily add a copy-restricted key to hostB's
-`authorized_keys`. Restricted source-read downloads require direct TCP and do
+limits. A restricted upload uses hostB's
+[enrollment](remote-reference.md#enrollment), as copies between servers started
+from your laptop do: the first one sets it up, over your laptop's SSH login.
+Your laptop signs each approved copy, and hostA then connects to hostB's
+receiver itself, over direct TCP or SSH, and finishes the copy even if your
+laptop disconnects. Restricted source-read downloads require direct TCP and do
 not write SSH authorization on the source. Account-approved downloads can use
 SSH in either direction. See [authorization selection](remote-reference.md#authorization-selection)
 for routing details.

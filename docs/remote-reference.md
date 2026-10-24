@@ -275,15 +275,20 @@ login on the destination, `--detach`, custom
 `--rsh` or `--syq-path`, `--no-bootstrap`, alternative `--peer-auth`
 or `--coordinate-at`, or `--no-tcp-encryption`. The authorizing
 machine's copy limits apply, including its `--max-delete` and `--max-entries`
-for pruning. Uploads send file data directly from
-source to destination over encrypted TCP, falling back to SSH between those same
-servers. `--no-tcp` selects SSH data directly. SSH workers require an exact host
-key already trusted by the authorizing machine and writable
-`~/.ssh/authorized_keys` on the destination. Syq temporarily adds a key that can
-join only this approved copy, then removes it when the copy closes. The source
-receives no laptop credentials or general SSH access. Remote path completion
-can reuse existing account approval from the selected authorizer, but never
-requests approval itself. `auto` and `ssh` completion use native SSH.
+for pruning. A per-copy upload uses the destination account's
+[enrollment](#enrollment): the authorizing machine sets it up on the first
+approved copy over its own SSH login, without prompts, so its login key must
+be able to sign without a terminal (in its agent, or an unencrypted key file)
+and the destination's host key must already be trusted there. The authorizing
+machine then signs the approved copy and gives the source the enrollment's
+entry key and the destination host keys it trusts. The source connects to the
+destination's receiver at the address its own SSH configuration gives, sends
+file data directly over encrypted TCP, falling back to SSH between those same
+servers, and needs nothing more from the authorizing machine. `--no-tcp`
+selects SSH data directly. The source receives no laptop credentials or
+general SSH access. Remote path completion can reuse existing account
+approval from the selected authorizer, but never requests approval itself.
+`auto` and `ssh` completion use native SSH.
 
 For restricted per-copy downloads (`--from HOST` to this machine), approval grants read access
 to the displayed source files and directory trees. `--src-non-dir` grants only
@@ -296,9 +301,8 @@ encrypted direct TCP, with no SSH fallback or relay through the laptop.
 Account approval supports SSH-only downloads without this TCP requirement.
 
 For per-copy uploads, quoted `~` and `~/archive` select the destination account's home
-directory. Use `./~/archive` for a literal directory called `~`. Avoid
-`~//archive`: explicit receiving authorization keeps it under the home directory,
-but automatic selection uses ordinary SSH, where it resolves to `/archive`.
+directory, and `~//archive` is `/archive`, as with ordinary SSH. Use
+`./~/archive` for a literal directory called `~`.
 
 ## Approved account copies
 

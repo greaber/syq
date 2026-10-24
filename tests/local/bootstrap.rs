@@ -72,7 +72,7 @@ fn background_bootstrap_installs_the_command_quietly() {
             // is unrelated to whether setup publishes an interactive command.
             let script = fs::read_to_string(&ssh).unwrap().replace(
                 "exec /bin/sh -c",
-                "case \"$1\" in *--return-receiver*) exit 0 ;; esac\nexec /bin/sh -c",
+                "case \"$1\" in *--return-source*) exit 0 ;; esac\nexec /bin/sh -c",
             );
             executable(&ssh, script.as_bytes());
             let path = t.s("remote-home/data/n");
@@ -95,7 +95,8 @@ fn background_bootstrap_installs_the_command_quietly() {
                 let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
                 command
                     .arg("--return-connect-install")
-                    .arg(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("fake.example"));
+                    .arg(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("fake.example"))
+                    .arg("--return-source");
                 command
             };
             let output = command

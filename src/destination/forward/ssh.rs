@@ -381,32 +381,6 @@ impl Peer {
         }
         Ok(())
     }
-
-    fn resolve(target: &str, deadline: Instant, cancelled: &dyn Fn() -> bool) -> Result<Self> {
-        let endpoint = target_endpoint(target)?;
-        let policy = crate::agent_broker::resolve_host_policy_at_bounded(
-            "ssh",
-            endpoint.user.as_deref(),
-            &endpoint.host,
-            endpoint.port,
-            deadline,
-            cancelled,
-        )?;
-        Ok(Self {
-            host: policy.connection_host().into(),
-            user: policy.login_user.clone(),
-            port: policy.port(),
-            known_hosts: policy.known_hosts("syq-copy-peer")?,
-            algorithms: policy.host_key_algorithms(),
-        })
-    }
-}
-
-pub(crate) struct Session {
-    target: String,
-    ticket: String,
-    generation: u64,
-    setup: Mutex<SetupMemo>,
 }
 
 /// An explicit remote refusal cannot improve during this copy. Transport
@@ -442,113 +416,6 @@ impl SetupMemo {
     }
 }
 
-pub(super) struct SessionGuard<'a> {
-    receiver: &'a Receiver,
-    token: String,
-}
-impl<'a> SessionGuard<'a> {
-    pub(super) fn insert(
-        receiver: &'a Receiver,
-        target: String,
-        ticket: String,
-        generation: u64,
-    ) -> Result<Self> {
-        let token = random_token()?;
-        receiver.forward_sessions.lock().unwrap().insert(
-            token.clone(),
-            Arc::new(Session {
-                target,
-                ticket,
-                generation,
-                setup: Mutex::new(SetupMemo::default()),
-            }),
-        );
-        Ok(Self { receiver, token })
-    }
-    pub(super) fn token(&self) -> String {
-        self.token.clone()
-    }
-}
-impl Drop for SessionGuard<'_> {
-    fn drop(&mut self) {
-        self.receiver
-            .forward_sessions
-            .lock()
-            .unwrap()
-            .remove(&self.token);
-    }
-}
-impl Receiver {
-    pub(in crate::destination) fn forward_ssh(
-        &self,
-        token: String,
-        public_key: String,
-        mut stream: TrackedStream,
-    ) -> Result<()> {
-        let public_key = canonical_key(&public_key)?;
-        let session = self
-            .forward_sessions
-            .lock()
-            .unwrap()
-            .get(&token)
-            .cloned()
-            .context("copy SSH authorization has closed or is unknown")?;
-        let mut setup = session.setup.try_lock().map_err(|_| {
-            super::super::ssh_auth::RetryableSetupError("copy SSH setup is already running".into())
-        })?;
-        let _channel = self.active_streams.track(stream.try_clone()?)?;
-        let socket = stream.try_clone()?;
-        let cancelled = || {
-            self.stop.load(Ordering::Acquire)
-                || self.generation.load(Ordering::Acquire) != session.generation
-                || requester_closed(&socket)
-                || !self.forward_sessions.lock().unwrap().contains_key(&token)
-        };
-        anyhow::ensure!(!cancelled(), "copy SSH authorization has closed");
-        let deadline = Instant::now() + SETUP_TIMEOUT;
-        let peer = setup.resolve(&public_key, || {
-            let peer = Peer::resolve(&session.target, deadline, &cancelled)?;
-            let encoded =
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(session.target.as_bytes());
-            let mut command = crate::process::self_command()?;
-            command.args(["--return-ssh-connect", &encoded]);
-            let mut child = ForwardChild::spawn_command(command)?;
-            let result = (|| {
-                write_message(
-                    &mut DeadlineIo {
-                        inner: child.child.stdin.as_mut().unwrap(),
-                        deadline,
-                        cancelled: Some(&cancelled),
-                    },
-                    &SetupRequest {
-                        identity: crate::identity::build().into(),
-                        ticket: session.ticket.clone(),
-                        public_key: public_key.clone(),
-                    },
-                )?;
-                let reply: Reply = read_message(&mut DeadlineIo {
-                    inner: child.child.stdout.as_mut().unwrap(),
-                    deadline,
-                    cancelled: Some(&cancelled),
-                })?;
-                match reply {
-                    Reply::Ready => Ok(Ok(peer)),
-                    Reply::Error(error) => Ok(Err(format!(
-                        "destination refused SSH data transport: {error}"
-                    ))),
-                    Reply::RetryableError(error) => {
-                        Err(super::super::ssh_auth::RetryableSetupError(error).into())
-                    }
-                    _ => bail!("invalid copy SSH setup response"),
-                }
-            })();
-            result.with_context(|| format!("copy SSH setup failed: {}", child.errors()))
-        })?;
-        anyhow::ensure!(!cancelled(), "copy SSH authorization has closed");
-        write_message(&mut stream, &Reply::ForwardSsh(peer))
-    }
-}
-
 /// Requester state. Debug deliberately excludes registration credentials,
 /// private-key paths, and all contents of the key.
 pub(crate) struct Client {
@@ -556,10 +423,6 @@ pub(crate) struct Client {
     state: Mutex<Option<Ready>>,
 }
 enum Setup {
-    Return {
-        registration: Registration,
-        token: String,
-    },
     PeerBridge(super::super::peer_bridge::Ticket),
 }
 struct Ready {
@@ -573,15 +436,6 @@ impl std::fmt::Debug for Client {
     }
 }
 impl Client {
-    pub(in crate::destination) fn new(registration: Registration, token: String) -> Self {
-        Self {
-            setup: Setup::Return {
-                registration,
-                token,
-            },
-            state: Mutex::new(None),
-        }
-    }
     pub(in crate::destination) fn peer_bridge(ticket: super::super::peer_bridge::Ticket) -> Self {
         Self {
             setup: Setup::PeerBridge(ticket),
@@ -590,38 +444,15 @@ impl Client {
     }
     pub(crate) fn command(&self) -> Result<Command> {
         self.command_with(|public_key| {
-            let Setup::Return {
-                registration,
-                token,
-            } = &self.setup
-            else {
-                let Setup::PeerBridge(ticket) = &self.setup else {
-                    unreachable!()
-                };
-                return ticket.ssh(public_key);
-            };
-            let (_, reply) = exchange(
-                registration,
-                Message::ForwardSsh {
-                    token: token.clone(),
-                    public_key: public_key.to_owned(),
-                },
-                SETUP_TIMEOUT + Duration::from_secs(10),
-                None,
-            )?;
-            let Reply::ForwardSsh(peer) = reply else {
-                bail!("unexpected copy SSH authorization response");
-            };
-            Ok(peer)
+            let Setup::PeerBridge(ticket) = &self.setup;
+            ticket.ssh(public_key)
         })
     }
     fn command_with(&self, setup: impl FnOnce(&str) -> Result<Peer>) -> Result<Command> {
         let mut state = self.state.lock().unwrap();
         if state.is_none() {
-            let directory = match &self.setup {
-                Setup::Return { .. } => crate::private_broker::private_temp_dir("syq-copy-key-")?,
-                Setup::PeerBridge(ticket) => ticket.key_directory()?,
-            };
+            let Setup::PeerBridge(ticket) = &self.setup;
+            let directory = ticket.key_directory()?;
             let mut seed = [0u8; 32];
             getrandom::fill(&mut seed)?;
             let pair = ssh_key::private::Ed25519Keypair::from_seed(&seed);
@@ -846,39 +677,6 @@ mod tests {
     }
 
     #[test]
-    fn requester_keeps_same_copy_key_after_a_lost_setup_reply() {
-        let root = crate::test_support::tempdir().unwrap();
-        let (_broker, _receiver, registration, _) =
-            crate::destination::tests::broker(root.path(), Approval::Always);
-        let client = Client::new(registration, "copy".into());
-        let mut first = String::new();
-        assert!(client
-            .command_with(|key| {
-                first = key.into();
-                bail!("reply lost after installing key")
-            })
-            .is_err());
-        client
-            .command_with(|key| {
-                assert_eq!(key, first);
-                Ok(Peer {
-                    host: "backup".into(),
-                    user: "copy".into(),
-                    port: 22,
-                    known_hosts: "pinned host key".into(),
-                    algorithms: "ssh-ed25519".into(),
-                })
-            })
-            .unwrap();
-        let command = client
-            .command_with(|_| panic!("ready copy must reuse setup"))
-            .unwrap();
-        assert!(!command
-            .get_args()
-            .any(|arg| arg.to_string_lossy().starts_with("RequiredRSASize=")));
-    }
-
-    #[test]
     fn setup_memo_caches_refusal_but_retries_lost_replies() {
         let mut memo = SetupMemo::default();
         assert!(memo.resolve("key", || bail!("reply lost")).is_err());
@@ -976,92 +774,5 @@ mod tests {
             *seen.lock().unwrap(),
             vec![canonical_key(&public_key(1)).unwrap(); 4]
         );
-    }
-
-    #[test]
-    fn return_setup_preserves_busy_retry_and_memoized_refusal_across_rpc() {
-        let root = crate::test_support::tempdir().unwrap();
-        let (_broker, receiver, registration, _) =
-            crate::destination::tests::broker(root.path(), Approval::Always);
-        let guard = SessionGuard::insert(&receiver, "backup".into(), "unused".into(), 0).unwrap();
-        let session = receiver.forward_sessions.lock().unwrap()[&guard.token()].clone();
-        let mut setup = session.setup.lock().unwrap();
-        let attempt = || {
-            exchange(
-                &registration,
-                Message::ForwardSsh {
-                    token: guard.token(),
-                    public_key: public_key(1),
-                },
-                TIMEOUT,
-                Some(TIMEOUT),
-            )
-            .err()
-            .unwrap()
-        };
-        let busy = attempt();
-        assert!(
-            busy.is::<super::super::ssh_auth::RetryableSetupError>(),
-            "{busy:#}"
-        );
-        assert!(!super::super::peer_bridge::is_setup_refusal(&busy));
-        setup.completed = Some((
-            canonical_key(&public_key(1)).unwrap(),
-            Err("destination home is unwritable".into()),
-        ));
-        drop(setup);
-        for _ in 0..2 {
-            let refused = attempt();
-            assert!(
-                super::super::peer_bridge::is_setup_refusal(&refused),
-                "{refused:#}"
-            );
-            assert!(refused.to_string().contains("unwritable"));
-        }
-    }
-
-    #[test]
-    fn return_setup_rejects_invalid_input_without_retrying_it() {
-        let root = crate::test_support::tempdir().unwrap();
-        let (_broker, _receiver, registration, _) =
-            crate::destination::tests::broker(root.path(), Approval::Always);
-        let error = exchange(
-            &registration,
-            Message::ForwardSsh {
-                token: "unknown".into(),
-                public_key: "not a key".into(),
-            },
-            TIMEOUT,
-            Some(TIMEOUT),
-        )
-        .err()
-        .unwrap();
-        assert!(
-            super::super::peer_bridge::is_setup_refusal(&error),
-            "{error:#}"
-        );
-        assert!(!super::super::ssh_auth::retryable_setup_error(&error));
-    }
-
-    #[test]
-    fn closed_return_copy_cannot_start_ssh_setup() {
-        let root = crate::test_support::tempdir().unwrap();
-        let (_broker, receiver, registration, _) =
-            crate::destination::tests::broker(root.path(), Approval::Always);
-        let guard = SessionGuard::insert(&receiver, "backup".into(), "unused".into(), 0).unwrap();
-        let token = guard.token();
-        drop(guard);
-        let error = exchange(
-            &registration,
-            Message::ForwardSsh {
-                token,
-                public_key: public_key(1),
-            },
-            TIMEOUT,
-            Some(TIMEOUT),
-        )
-        .err()
-        .unwrap();
-        assert!(format!("{error:#}").contains("closed or is unknown"));
     }
 }

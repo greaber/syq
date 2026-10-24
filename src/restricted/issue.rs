@@ -17,37 +17,50 @@ pub(super) fn checked_destination(
     Ok(grant.copy.destination)
 }
 
-/// Sign a directive for a copy to `destination` with the user's login key,
-/// setting up the destination account's enrollment, refreshing it for this
-/// build, or finding the login key again first when needed. `command` is
-/// this machine's command as it was run. A dry run (`allow_enrollment`
-/// false) changes nothing on the server.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_transfer(
-    args: &Args,
-    command: Vec<Vec<u8>>,
-    sources: &[Location],
-    destination: &Location,
-    source_login: &str,
-    destination_login: &str,
-    destination_agent: Option<&Path>,
-    allow_enrollment: bool,
-) -> Result<PreparedTransfer> {
-    directive::validate_restricted_args(args)?;
-    let host = destination
-        .host
-        .as_deref()
-        .context("destination host missing")?;
-    let account = endpoint(destination_login, host, destination.port)?.label();
-    let jump = endpoint(
-        source_login,
-        sources[0].host.as_deref().context("source host missing")?,
-        sources[0].port,
-    )?;
-    let inputs = Inputs {
-        ignore: args.ignore_lines.clone(),
-        mapping: directive::mapping_authorization(args)?,
-    };
+/// A copy to approve with a directive: its command and what the command
+/// read from files, the destination account, and how to reach it.
+pub(crate) struct Issue<'a> {
+    /// The command as its initiator ran it, after the program name.
+    pub command: Vec<Vec<u8>>,
+    pub cwd: String,
+    pub inputs: Inputs,
+    /// This machine's limits, when it approves a server's command.
+    pub caps: Option<directive::Caps>,
+    pub host: &'a str,
+    pub port: Option<u16>,
+    pub login: &'a str,
+    /// A server to enroll through when the account cannot be reached
+    /// directly.
+    pub jump: Option<SshEndpoint>,
+    /// The SSH agent the configuration selects for the account.
+    pub agent: Option<&'a Path>,
+    /// Whether this may set up or refresh the enrollment: never for a dry
+    /// run.
+    pub allow_enrollment: bool,
+    /// Enroll without prompting and without accepting a host key the user
+    /// has not trusted: for the receiving service, which has no terminal.
+    pub batch: bool,
+}
+
+/// Sign a directive for a copy to an account with the user's login key,
+/// setting up the account's enrollment, refreshing it for this build, or
+/// finding the login key again first when needed. A dry run
+/// (`allow_enrollment` false) changes nothing on the server.
+pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
+    let Issue {
+        command,
+        cwd,
+        inputs,
+        caps,
+        host,
+        port,
+        login: destination_login,
+        jump,
+        agent: destination_agent,
+        allow_enrollment,
+        batch,
+    } = issue;
+    let account = endpoint(destination_login, host, port)?.label();
     let (recipient_secret, recipient_public_key) =
         crate::destination_results::generate_recipient()?;
     let directive_for = |enrollment: EnrollmentId, generation: u64| {
@@ -59,8 +72,8 @@ pub(crate) fn prepare_transfer(
                 role: Role::Destination,
             },
             command.clone(),
-            crate::approval_command::current_directory(),
-            inputs.clone(),
+            cwd.clone(),
+            (inputs.clone(), caps),
             recipient_public_key,
         )
     };
@@ -76,17 +89,15 @@ pub(crate) fn prepare_transfer(
     let enroll_now = |refresh: bool| {
         enroll(
             host,
-            destination.port,
+            port,
             destination_login,
-            Some(&jump),
+            (jump.as_ref(), batch),
             refresh,
             Some(&check),
         )
     };
     let found = load_local_enrollments()?.into_iter().find(|(metadata, _)| {
-        metadata.host == host
-            && metadata.port == destination.port
-            && metadata.target_login == destination_login
+        metadata.host == host && metadata.port == port && metadata.target_login == destination_login
     });
     if let Some((metadata, _)) = &found {
         check(Path::new(&metadata.remote_home), &metadata.receiving_state)?;
@@ -158,6 +169,13 @@ pub(crate) fn prepare_transfer(
     })
 }
 
+/// Whether this machine has an enrollment for `login@host:port`.
+pub(crate) fn enrollment_exists(host: &str, port: Option<u16>, login: &str) -> Result<bool> {
+    Ok(load_local_enrollments()?.into_iter().any(|(metadata, _)| {
+        metadata.host == host && metadata.port == port && metadata.target_login == login
+    }))
+}
+
 /// Whether `grant` is a signed directive for an enrolled receiver, whose
 /// sender paces network bytes as for an ordinary copy, rather than the
 /// marker of a route through a receiving machine. Connections that a
@@ -166,7 +184,6 @@ pub(crate) fn prepare_transfer(
 /// data.
 pub(crate) fn enrolled_grant(grant: &str) -> bool {
     !(crate::destination::is_named(&Some(grant.to_owned()))
-        || grant == crate::destination::RETURN_GRANT
         || grant == crate::destination::peer_bridge::GRANT)
 }
 

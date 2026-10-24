@@ -201,6 +201,7 @@ fn fixture_directive(request_byte: u8) -> Directive {
         .to_vec(),
         cwd: "~/work".to_owned(),
         inputs: Inputs::default(),
+        caps: None,
         results_key: [4; 32],
     }
 }

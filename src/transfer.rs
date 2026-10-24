@@ -552,14 +552,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
     Ok(match &loc.host {
         None => Endpoint::local(),
         Some(h) => {
-            let forwarded = args.return_source.clone().or_else(|| {
-                args.return_destination.clone().filter(|_| {
-                    matches!(
-                        args.auth_from,
-                        crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(_))
-                    )
-                })
-            });
+            let forwarded = args.return_source.clone();
             let rsh = parse_rsh(&args.rsh)?;
             if loc.port.is_some() && args.rsh.is_some() && !rsh[0].ends_with("ssh") {
                 bail!(
@@ -1581,7 +1574,7 @@ fn attempt_small_copy(
 
     // Every change is settled: end the destination's results, which also
     // ends its grant.
-    if crate::destination::reports_results(&args.restricted_grant) {
+    if crate::destination::reports_results(args) {
         let finished = dst_ctl
             .call(Request::FinishDestinationResults)
             .and_then(|response| ok(response, "end the destination's results"));
@@ -2701,7 +2694,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     };
     // A restricted destination between two servers reports its own results
     // to the syq that started this coordinator, from before any change.
-    let destination_results = crate::destination::reports_results(&args.restricted_grant);
+    let destination_results = crate::destination::reports_results(&args);
     if destination_results {
         anyhow::ensure!(
             args.results_token.is_some(),

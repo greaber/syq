@@ -1,4 +1,5 @@
-"""Source-shell copies authorized by the runner; all paths are disposable."""
+"""Source-shell copies the runner approves for the destination's enrolled
+receiver; all paths are disposable."""
 import json
 import os
 from pathlib import Path
@@ -19,7 +20,7 @@ def remote(command, *, success=True):
     return run("ssh", "destination", command, success=success)
 
 
-def copy(path, *, allow=True, success=True, extra=(), cancel=False,
+def copy(path, *, allow=True, success=True, extra=(), drop_laptop=False, interrupt=False,
          source="/tmp/syq-real-ssh/return-source/subdir/chunks.bin", prefix=None, after_approval=None, auth=(), binary="syq", stdin=None, ssh_trace=None):
 
     argv = [binary, "cp", "-vv", source, "--to", "destination",
@@ -38,12 +39,12 @@ def copy(path, *, allow=True, success=True, extra=(), cancel=False,
             assert len(pending) == 1, pending
             request = pending[0]
             assert ' on "destination" using your SSH access' in request["destination"], request
-            assert "SSH access" in request["permission"], request
+            assert "syq's receiver" in request["permission"], request
             run("syq", "persist", "receive", "approve" if allow else "deny", request["id"])
             run("syq", "persist", "receive", "approve", request["id"], success=False)
             if after_approval is not None:
                 after_approval()
-            if cancel:
+            if drop_laptop or interrupt:
                 deadline = time.monotonic() + 25
                 progress = time.monotonic() + 5
                 state = ""
@@ -60,7 +61,14 @@ def copy(path, *, allow=True, success=True, extra=(), cancel=False,
                         progress += 5
                     time.sleep(.1)
                 assert state == prefix, ("no complete resumable prefix before deadline", state)
-                run("syq", "persist", "receive", "off", "--name", "laptop")
+                if drop_laptop:
+                    # The copy no longer needs this machine.
+                    run("syq", "persist", "receive", "off", "--name", "laptop")
+                else:
+                    # Interrupting the command on the source stops its copy.
+                    # Only this copy runs on the source; the pattern cannot
+                    # match the shell that runs pkill.
+                    run("ssh", "source", "pkill -TERM -f '^timeout 75 syq cp '")
             deadline = time.monotonic() + 65
             last_output = 0
             while True:
@@ -153,36 +161,44 @@ def trace_events(text):
             for line in text.splitlines()]
 
 
-def forwarding_connections():
-    # Pool warming also connects to destination in the background. Only the
-    # approved copy launches --return-receiver in this container.
+def relayed_connections():
+    # Pool warming also connects to destination in the background. A copy
+    # relayed through this machine would start --return-receiver there.
     return [event for event in trace_events(trace.read_text())
             if event["phase"] == "start" and event["host"] == "destination"
             and event["return_receiver"] == "yes"]
 
 
-before = len(forwarding_connections())
+before = len(relayed_connections())
 # The source has its own trace filesystem. Give this copy a separate file so
 # an older source session's background activity cannot enter the assertion.
 source_trace = run("ssh", "source", "mktemp /tmp/syq-real-ssh/forward-ssh.XXXXXX").strip()
 try:
+    # The first approved copy sets up restricted copying on the destination.
     copy("/tmp/syq-real-ssh/forward/approved", extra=("--stats",), ssh_trace=source_trace)
-    approved = forwarding_connections()[before:]
-    assert len(approved) == 1, ("expected one approved SSH connection on the runner", approved)
+    assert relayed_connections()[before:] == [], "the copy was relayed through the runner"
     events = trace_events(run("ssh", "source", "cat " + shlex.quote(source_trace)))
     # RemoteSpec sets ControlMaster on every transport connection. The same
     # process also runs ssh -G to read config; that query never connects.
     attempts = [event for event in events
                 if event["phase"] == "start" and event["host"] == "destination"
-                and event["control_master"] != "unset"]
+                and event["control_master"] != "unset" and event["entry_key"] == "no"]
     assert len(attempts) == 1, ("expected one source SSH attempt", events)
     exits = [event for event in events
              if event["phase"] == "end" and event["pid"] == attempts[0]["pid"]]
     assert len(exits) == 1 and exits[0]["status"] == "255", events
+    # The source then connects to the destination's receiver itself, with
+    # the entry key the runner handed it.
+    receiver = [event for event in events
+                if event["phase"] == "end" and event["entry_key"] == "yes"]
+    assert receiver and all(event["status"] == "0" for event in receiver), events
 finally:
     run("ssh", "source", "rm -f " + shlex.quote(source_trace))
 expected = run("ssh", "source", "sha256sum /tmp/syq-real-ssh/return-source/subdir/chunks.bin").split()[0]
 assert remote("sha256sum /tmp/syq-real-ssh/forward/approved").split()[0] == expected
+
+assert "syq-enrollment:" in remote("cat ~/.ssh/authorized_keys")
+assert "syq-copy-worker" not in remote("cat ~/.ssh/authorized_keys")
 
 print("case: explicit automatic selection uses restricted fallback", flush=True)
 for option, name in [("--auth-from", "selected")]:
@@ -204,27 +220,6 @@ for auth in [(), ("--auth-from", "auto")]:
     assert remote("cat " + path + "/message.txt") == "return\n"
     remote("test ! -e " + path + "/subdir/chunks.bin")
 
-print("case: a missing helper is installed once after its launcher reports the cache miss", flush=True)
-helpers = remote('find "$HOME/.local/lib/syq" -type f -name syq').splitlines()
-assert len(helpers) == 1, helpers
-helper = shlex.quote(helpers[0])
-remote("rm " + helper)
-copy("/tmp/syq-real-ssh/forward/installed")
-assert remote("sha256sum /tmp/syq-real-ssh/forward/installed").split()[0] == expected
-
-print("case: an unexecutable cached helper gets one bootstrap retry", flush=True)
-# A malformed ELF passes the launcher's executable-bit check but exec fails
-# with 126. This is an actual exec failure, not a helper returning that code.
-remote("python3 -c " + shlex.quote(
-    "from pathlib import Path; p = Path(" + repr(helpers[0] + ".fixture") + "); "
-    "p.write_bytes(b'\\x7fELF' + b'\\x00' * 64); p.chmod(0o700); p.replace(" + repr(helpers[0]) + ")"))
-remote("sh -c " + shlex.quote("exec " + helper) + " 2>/dev/null; test \"$?\" -eq 126")
-try:
-    copy("/tmp/syq-real-ssh/forward/reinstalled")
-    assert remote("sha256sum /tmp/syq-real-ssh/forward/reinstalled").split()[0] == expected
-finally:
-    remote("cp /usr/local/bin/syq " + helper + ".fixture && mv " + helper + ".fixture " + helper)
-
 print("case: tilde paths use the destination home and ./~ stays literal", flush=True)
 remote("mkdir -p ~/syq-real-ssh-forward-home './~/syq-real-ssh-forward-home'")
 copy("~/syq-real-ssh-forward-home/expanded")
@@ -233,47 +228,6 @@ remote("test ! -e './~/syq-real-ssh-forward-home/expanded'")
 copy("./~/syq-real-ssh-forward-home/literal")
 assert remote("sha256sum './~/syq-real-ssh-forward-home/literal'").split()[0] == expected
 remote("test ! -e ~/syq-real-ssh-forward-home/literal")
-
-print("case: a delayed approval relay leaves time for the source to begin Hello", flush=True)
-# Start the real helper, then hold its Approved reply for longer than the old
-# 10-second deadline. Stream every subsequent control chunk without buffering.
-delayed_helper = r'''#!/usr/bin/python3
-import json
-import os
-import subprocess
-import sys
-import time
-
-# The helper reads the SSH stream directly; this wrapper only delays its reply.
-child = subprocess.Popen(['/usr/local/bin/syq', *sys.argv[1:]], stdout=subprocess.PIPE)
-def pump(reader, writer):
-    while True:
-        # Preserve any preamble bytes buffered while reading Approved, while
-        # returning available control bytes without waiting for a full chunk.
-        data = reader.read1(16384)
-        if not data:
-            break
-        while data:
-            count = os.write(writer, data)
-            data = data[count:]
-header = child.stdout.read(4)
-assert len(header) == 4
-length = int.from_bytes(header, 'big')
-assert 0 < length <= 256 * 1024
-reply = child.stdout.read(length)
-assert 'Approved' in json.loads(reply)
-time.sleep(12)
-sys.stdout.buffer.write(header + reply)
-sys.stdout.buffer.flush()
-pump(child.stdout, 1)
-sys.exit(child.wait())
-'''
-remote("printf %s " + shlex.quote(delayed_helper) + " > " + helper + ".fixture && chmod 700 " + helper + ".fixture && mv " + helper + ".fixture " + helper)
-try:
-    copy("/tmp/syq-real-ssh/forward/delayed-hello")
-    assert remote("sha256sum /tmp/syq-real-ssh/forward/delayed-hello").split()[0] == expected
-finally:
-    remote("cp /usr/local/bin/syq " + helper + ".fixture && mv " + helper + ".fixture " + helper)
 
 print("case: an approved copy's slow SSH setup does not block the next approval", flush=True)
 def deny_during_setup():
@@ -289,15 +243,16 @@ def deny_during_setup():
             os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=3)
 
-# The approval happens before the destination helper starts; keep that window
-# open long enough to exercise another request on the same return connection.
-remote("printf '%s\\n' '#!/bin/sh' 'sleep 10' 'exec /usr/local/bin/syq \"$@\"' > " + helper + ".fixture && chmod 700 " + helper + ".fixture && mv " + helper + ".fixture " + helper)
+# Reading the destination's SSH configuration after approval is slow here;
+# keep that window open long enough to exercise another request on the same
+# return connection.
+Path("/tmp/syq-real-ssh-slow-config").touch()
 try:
     run("syq", "persist", "receive", "on", "--no-auto-approve-root", "--notify", "off")
     run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
     copy("/tmp/syq-real-ssh/forward/slow-setup", after_approval=deny_during_setup)
 finally:
-    remote("cp /usr/local/bin/syq " + helper + ".fixture && mv " + helper + ".fixture " + helper)
+    Path("/tmp/syq-real-ssh-slow-config").unlink()
 
 print("case: previews and protected paths remain restricted", flush=True)
 copy("/tmp/syq-real-ssh/forward/preview", extra=("--dry-run",))
@@ -305,7 +260,6 @@ remote("test ! -e /tmp/syq-real-ssh/forward/preview")
 copy("/tmp/syq-real-ssh/forward/approved", extra=("--dry-run", "--hash",))
 source_hash = run("ssh", "source", "sha256sum /tmp/syq-real-ssh/return-source/subdir/chunks.bin").split()[0]
 assert remote("sha256sum /tmp/syq-real-ssh/forward/approved").split()[0] == source_hash
-remote("printf '%s\\n' '# protected syq test fixture' > ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys")
 authorized = remote("sha256sum ~/.ssh/authorized_keys")
 copy(".ssh/authorized_keys", success=False)
 assert remote("sha256sum ~/.ssh/authorized_keys") == authorized
@@ -363,37 +317,29 @@ started = time.monotonic()
 copy("/tmp/syq-real-ssh/forward/blocked", extra=("--tcp-ports", f"{port}-{port}"))
 print("cold approved SSH fallback including approval polling:", round(time.monotonic() - started, 3), "seconds", flush=True)
 assert remote("sha256sum /tmp/syq-real-ssh/forward/blocked").split()[0] == source_hash
-def wait_key_cleanup():
-    deadline = time.monotonic() + 10
-    report = time.monotonic() + 2
-    while True:
-        state = remote("sha256sum ~/.ssh/authorized_keys")
-        if state == authorized:
-            return
-        assert time.monotonic() < deadline, ("temporary copy SSH key was not removed", state)
-        if time.monotonic() >= report:
-            print("Waiting for temporary copy SSH key cleanup", flush=True)
-            report += 2
-        time.sleep(.05)
+assert remote("sha256sum ~/.ssh/authorized_keys") == authorized
 
-wait_key_cleanup()
-
-print("case: explicit SSH uses a temporary forced key without source credentials", flush=True)
+print("case: explicit SSH uses the entry key without source credentials", flush=True)
 copy("/tmp/syq-real-ssh/forward/ssh", extra=("--no-tcp",), auth=("--auth-from", "auto"))
 assert remote("sha256sum /tmp/syq-real-ssh/forward/ssh").split()[0] == source_hash
-wait_key_cleanup()
+assert remote("sha256sum ~/.ssh/authorized_keys") == authorized
 
-print("case: stopping receiving revokes an active remote copy; a new approval can resume", flush=True)
+print("case: an approved copy finishes after receiving stops on the runner", flush=True)
 source = "/tmp/syq-real-ssh/return-source/forward-resume.bin"
 run("ssh", "source", f"dd if=/dev/urandom of={source} bs=1M count=16 status=none")
 prefix = run("ssh", "source", f"dd if={source} bs=1M count=4 status=none | sha256sum")
 expected = run("ssh", "source", f"sha256sum {source}").split()[0]
-# Wait for a complete hash block, so the retry must actually reuse copied data.
-copy("/tmp/syq-real-ssh/forward/cancelled", source=source, prefix=prefix,
-     extra=("--resource-limits", "bandwidth=512"), cancel=True, success=False)
-remote("test ! -e /tmp/syq-real-ssh/forward/cancelled")
+copy("/tmp/syq-real-ssh/forward/survived", source=source, prefix=prefix,
+     extra=("--resource-limits", "bandwidth=2048"), drop_laptop=True)
+assert remote("sha256sum /tmp/syq-real-ssh/forward/survived").split()[0] == expected
 run("syq", "persist", "receive", "on", "--name", "laptop", "--notify", "off")
 run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
+
+print("case: interrupting the source's command stops its copy; a new approval resumes it", flush=True)
+# Wait for a complete hash block, so the retry must actually reuse copied data.
+copy("/tmp/syq-real-ssh/forward/cancelled", source=source, prefix=prefix,
+     extra=("--resource-limits", "bandwidth=512"), interrupt=True, success=False)
+remote("test ! -e /tmp/syq-real-ssh/forward/cancelled")
 results = "/tmp/syq-real-ssh/forward-resume.ndjson"
 copy("/tmp/syq-real-ssh/forward/cancelled", source=source, extra=("--results", results))
 records = [json.loads(line) for line in run("ssh", "source", f"cat {results}").splitlines()]

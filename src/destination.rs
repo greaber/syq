@@ -52,9 +52,6 @@ const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a registering server waits for the receiving laptop's handshake.
 const REGISTRATION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PREFIX: &str = "named-v2:";
-/// The restricted grant marker of a copy through a receiving machine's
-/// access to another server.
-pub(crate) const RETURN_GRANT: &str = "return-control-v1";
 const REQUEST_ROOT: &[u8] = b"/SYQ-RECEIVE";
 const RECONNECT_PENDING: i32 = 75;
 
@@ -127,14 +124,6 @@ pub(crate) struct ReturnConnection {
 }
 
 impl ReturnConnection {
-    pub(super) fn new(stream: UnixStream, ssh: Option<forward::ssh::Client>) -> Arc<Self> {
-        Arc::new(Self {
-            ssh,
-            data_hostname: None,
-            control: Mutex::new(Some(stream)),
-        })
-    }
-
     pub(super) fn source(stream: UnixStream, data_hostname: String) -> Result<Arc<Self>> {
         validate_data_hostname(&data_hostname)?;
         Ok(Arc::new(Self {
@@ -246,16 +235,14 @@ enum Message {
         cwd: String,
         request: Box<pull::PullRequest>,
     },
-    ForwardSsh {
-        token: String,
-        public_key: String,
-    },
+    /// A copy from the requesting server to another server, which this
+    /// machine approves with a directive for that server's enrolled
+    /// receiver. The server sends what its command read from files.
     Forward {
         target: String,
         command: Vec<Vec<u8>>,
-        #[serde(default)]
         cwd: String,
-        request: Box<CopyRequest>,
+        inputs: crate::directive::Inputs,
     },
     Open {
         token: String,
@@ -266,7 +253,7 @@ enum Message {
 enum Reply {
     RetryableError(String),
     SourceApproved { data_hostname: Option<String> },
-    ForwardSsh(forward::ssh::Peer),
+    Directive(Box<forward::Issued>),
     TcpProbed(Vec<crate::conn::TcpCandidate>),
     TcpCongestionRejected(String),
     Ready,
@@ -654,7 +641,6 @@ fn exchange(
             "named destination requires its matching helper; reconnect from the receiving machine"
         );
     }
-    let ssh_setup = matches!(message, Message::ForwardSsh { .. });
     let deadline = Instant::now() + timeout;
     let mut stream = connect_socket(&registration.socket, deadline, stream_timeout).map_err(|error| {
         let message = if error.kind() == std::io::ErrorKind::WouldBlock {
@@ -686,17 +672,8 @@ fn exchange(
         },
     )?;
     let reply = read_message(&mut io)?;
-    match &reply {
-        Reply::Error(error) if ssh_setup => {
-            return Err(forward::ssh::SetupRefusal(format!("receiving machine: {error}")).into());
-        }
-        Reply::RetryableError(error) if ssh_setup => {
-            return Err(
-                ssh_auth::RetryableSetupError(format!("receiving machine: {error}")).into(),
-            );
-        }
-        Reply::Error(error) => bail!("receiving machine: {error}"),
-        _ => {}
+    if let Reply::Error(error) = &reply {
+        bail!("receiving machine: {error}");
     }
     Ok((stream, reply))
 }
@@ -831,16 +808,12 @@ fn constrain(
     }
     // Ownership, special files and `--in-place=new` act as for any copy by
     // an ordinary account: the receiver never runs as root.
-    request.copy.limits.max_total_bytes = request.copy.limits.max_total_bytes.min(max_bytes);
-    request.copy.limits.max_file_bytes = request.copy.limits.max_file_bytes.min(max_bytes);
-    request.copy.limits.max_entries = request.copy.limits.max_entries.min(max_entries);
-    let ceiling = deletion_ceiling(&request, max_delete);
-    request.copy.limits.max_deletions = request.copy.limits.max_deletions.min(ceiling);
-    let prunes = dry_run_prunes
-        || request.copy.policy.deletion == crate::delegation::DeletionPolicy::DeleteDestinationOnly;
-    if prunes && ceiling == 0 {
-        bail!("pruning needs a positive --max-delete on the approving machine: `syq persist receive on --max-delete N`");
+    crate::directive::Caps {
+        max_bytes,
+        max_entries,
+        max_delete,
     }
+    .apply(&mut request.copy, dry_run_prunes)?;
     request.copy.limits.max_connections = request
         .copy
         .limits
@@ -856,7 +829,12 @@ fn constrain(
 /// plans more. A dry run's read-only grant deletes nothing, but its reply
 /// carries this too, so the dry run plans against what a real run would get.
 fn deletion_ceiling(request: &CopyRequest, max_delete: u64) -> u64 {
-    max_delete.min(request.copy.limits.max_entries)
+    crate::directive::Caps {
+        max_bytes: u64::MAX,
+        max_entries: u64::MAX,
+        max_delete,
+    }
+    .deletion_ceiling(&request.copy)
 }
 
 /// The SSH destination a copy through the receiving machine's access would use.
@@ -867,8 +845,8 @@ pub(crate) fn forward_target(args: &crate::cli::Args) -> Result<String> {
 /// Plan deletions against the approving machine's own --max-delete, or the
 /// command's if lower, so that pruning stays all or nothing, and note when
 /// the machine's limit is the one in effect.
-fn apply_deletion_limit(args: &mut crate::cli::Args, approved: &Approved) {
-    let Some(limit) = approved.max_delete.filter(|_| args.delete) else {
+fn apply_deletion_limit(args: &mut crate::cli::Args, max_delete: Option<u64>) {
+    let Some(limit) = max_delete.filter(|_| args.delete) else {
         return;
     };
     if args.max_delete.is_none_or(|stated| limit < stated) {
@@ -881,12 +859,13 @@ pub(crate) fn is_named(grant: &Option<String>) -> bool {
     grant.as_deref().is_some_and(|s| s.starts_with(PREFIX))
 }
 
-/// Whether a coordinator holding this grant relays the destination's own
-/// results to the syq that started it: on copies between two servers, whose
-/// invoking machine does not see the destination's replies. A copy to a
-/// receiving machine, or one it forwards, is coordinated by the requester.
-pub(crate) fn reports_results(grant: &Option<String>) -> bool {
-    grant.as_deref().is_some_and(|grant| grant != RETURN_GRANT) && !is_named(grant)
+/// Whether this coordinator relays the destination's own results to the
+/// syq that started it: one another syq started for a copy between two
+/// servers, which that syq does not see the destination's replies to. A copy
+/// to a receiving machine, or one a server started itself, is coordinated by
+/// the syq that reads every reply.
+pub(crate) fn reports_results(args: &crate::cli::Args) -> bool {
+    args.delegated && args.restricted_grant.is_some() && !is_named(&args.restricted_grant)
 }
 
 fn select_copy(
@@ -1058,7 +1037,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     let Reply::Approved(approved) = reply else {
         bail!("unexpected named destination response");
     };
-    apply_deletion_limit(args, &approved);
+    apply_deletion_limit(args, approved.max_delete);
     args.locations.last_mut().unwrap().path = approved.destination.clone();
     args.locations.last_mut().unwrap().host = Some(format!("@{name}"));
     args.restricted_grant = Some(format!(
@@ -1138,7 +1117,6 @@ struct Receiver {
     account_source: Mutex<std::result::Result<crate::receive_approval::AccountIdentity, String>>,
     account_sessions: Mutex<HashMap<String, u64>>,
     forward_count: std::sync::atomic::AtomicUsize,
-    forward_sessions: Mutex<HashMap<String, Arc<forward::ssh::Session>>>,
     request_lock: Mutex<()>,
     stop: Arc<AtomicBool>,
 }
@@ -1238,24 +1216,12 @@ impl Receiver {
                 cwd,
                 request,
             } => self.pull(target, command, cwd, *request, stream),
-            Message::ForwardSsh { token, public_key } => {
-                self.forward_ssh(token, public_key, stream)
-                    .map_err(|error| {
-                        if ssh_auth::retryable_setup_error(&error) {
-                            // A lost setup reply may follow a successful key install.
-                            // Keep that uncertainty retryable across the return RPC.
-                            ssh_auth::RetryableSetupError(format!("{error:#}")).into()
-                        } else {
-                            error
-                        }
-                    })
-            }
             Message::Forward {
                 target,
                 command,
                 cwd,
-                request,
-            } => self.forward(target, command, cwd, *request, stream),
+                inputs,
+            } => self.forward(target, command, cwd, inputs, stream),
             Message::Request {
                 command,
                 cwd,
@@ -1267,7 +1233,7 @@ impl Receiver {
                         "another transfer is awaiting approval; retry after it is decided"
                     )
                 })?;
-                crate::approval_command::check_copy(&command, &request, Some(&self.name), None)?;
+                crate::approval_command::check_copy(&command, &request, &self.name)?;
                 let (destination, mut container) =
                     resolve_destination(&self.cwd, self.root.as_deref(), &request.destination)?;
                 if self.root.as_ref() == Some(&destination)
@@ -1570,7 +1536,6 @@ pub(crate) fn serve_background(
         account_source: Mutex::new(Err("receiving SSH connection is not ready".into())),
         account_sessions: Mutex::new(HashMap::new()),
         forward_count: std::sync::atomic::AtomicUsize::new(0),
-        forward_sessions: Mutex::new(HashMap::new()),
         request_lock: Mutex::new(()),
         stop: stop.clone(),
     });

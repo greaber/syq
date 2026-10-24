@@ -340,7 +340,8 @@ fn automatic_workers_still_respect_restricted_receiver_authority() {
 fn automatic_workers_respect_source_scope_but_not_full_account_ssh() {
     let mut args = native_engine_defaults();
     let (control, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
-    args.return_source = Some(crate::destination::ReturnConnection::new(control, None));
+    args.return_source =
+        Some(crate::destination::ReturnConnection::source(control, "source".into()).unwrap());
     assert_eq!(args.automatic_worker_limit(), 128);
     args.resource_limits = Some(crate::advanced::ResourceLimits {
         workers: Some(3),

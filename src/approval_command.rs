@@ -49,12 +49,11 @@ fn ensure_same<T: serde::Serialize>(requested: &T, derived: &T) -> Result<()> {
     Ok(())
 }
 
-/// Copies to this machine, or through its SSH access to `target`.
+/// Copies to this machine, the receiving machine `receiver`.
 pub(crate) fn check_copy(
     command: &[Vec<u8>],
     request: &crate::destination::CopyRequest,
-    receiver: Option<&str>,
-    target: Option<&str>,
+    receiver: &str,
 ) -> Result<()> {
     let args = parse(command)?;
     anyhow::ensure!(
@@ -62,18 +61,10 @@ pub(crate) fn check_copy(
         "copy requests must come from syq cp"
     );
     let destination = args.locations.last().context("copy destination missing")?;
-    if let Some(name) = receiver {
-        anyhow::ensure!(
-            destination.host.as_deref() == Some(&format!("@{name}")),
-            "the requesting command copies to a different destination"
-        );
-    }
-    if let Some(target) = target {
-        anyhow::ensure!(
-            crate::destination::forward_target(&args)? == target,
-            "the requesting command copies to a different server"
-        );
-    }
+    anyhow::ensure!(
+        destination.host.as_deref() == Some(&format!("@{receiver}")),
+        "the requesting command copies to a different destination"
+    );
     let mut derived =
         crate::restricted::named_request(&args, request.constraints.receipt_policy.clone())?;
     // The server supplies ignore rules and mapping file contents; this machine

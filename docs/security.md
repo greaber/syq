@@ -441,17 +441,18 @@ private key stays on your machine and grants no SSH login access.
 ### Copying between servers
 
 A connected server can ask your laptop to authorize a copy to another server.
-Such a copy does not use an enrollment: syq uses your laptop's SSH access to
-the destination to start a receiver there for that copy alone. That receiver confines the copy to the approved destination, refuses
-the protected paths, and reports its changes, as described in
-[Copies between servers](#copies-between-servers). File data goes
-directly between the servers over encrypted TCP or SSH. When SSH data is needed,
-syq gives the source a temporary key whose destination authorization forces it
-into this copy's live worker connection, with terminal access, forwarding and
-`~/.ssh/rc` disabled (the account's shell may still read its startup files). The destination still enforces the approved
-copy scope. Closing the copy invalidates its worker connections and removes
-the key entry; an entry left by an interrupted cleanup cannot join another
-copy. Your laptop's credentials and signing agent remain on the laptop.
+Such a copy uses the destination account's enrollment, as described in
+[Copies between servers](#copies-between-servers), with the server that asked
+in hostA's place: your laptop shows the command, sets up the enrollment on the
+first approved copy, signs the approved copy with your login key, and gives the
+server the entry key and the destination host keys your laptop trusts. The
+server connects to the destination's receiver itself, which confines the copy
+to the approved destination, refuses the protected paths, and enforces your
+laptop's own limits as well as the command's. File data goes directly between
+the servers over encrypted TCP or SSH, and the copy continues if your laptop
+disconnects. The server chooses the contents written within the approval, and
+like any server that coordinated a copy, it keeps the entry key afterwards.
+Your laptop's credentials and signing agent remain on the laptop.
 
 A server can also request source-read approval to download files from another
 server. The source helper confines reads to the approved files and directory

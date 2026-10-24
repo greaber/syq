@@ -68,6 +68,9 @@ pub(crate) struct Directive {
     /// The initiator's working directory, for display only.
     pub cwd: String,
     pub inputs: Inputs,
+    /// The approving machine's own limits, when it approved a server's
+    /// command; a command run on the signing machine has none.
+    pub caps: Option<Caps>,
     /// The initiator's key for this copy's results from the destination.
     pub results_key: [u8; 32],
 }
@@ -98,6 +101,41 @@ pub(crate) struct Inputs {
     pub ignore: Vec<String>,
     /// The size and digest of the `--mapping` manifest.
     pub mapping: Option<crate::mapping::Authorization>,
+}
+
+/// An approving machine's limits on a copy it approved for a server: they
+/// lower what the command asks for, never raise it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Caps {
+    pub max_bytes: u64,
+    pub max_entries: u64,
+    /// The approving machine's `--max-delete`.
+    pub max_delete: u64,
+}
+
+impl Caps {
+    /// The most deletions `copy` may make under these limits: the
+    /// approving machine's `--max-delete`, within the copy's entry limit.
+    pub(crate) fn deletion_ceiling(&self, copy: &CopyOperation) -> u64 {
+        self.max_delete.min(copy.limits.max_entries)
+    }
+
+    /// Fit `copy` within these limits, or refuse it. `dry_run_prunes` marks a
+    /// dry run of a pruning copy, refused where pruning is off as the copy
+    /// itself would be.
+    pub(crate) fn apply(&self, copy: &mut CopyOperation, dry_run_prunes: bool) -> Result<()> {
+        copy.limits.max_total_bytes = copy.limits.max_total_bytes.min(self.max_bytes);
+        copy.limits.max_file_bytes = copy.limits.max_file_bytes.min(self.max_bytes);
+        copy.limits.max_entries = copy.limits.max_entries.min(self.max_entries);
+        let ceiling = self.deletion_ceiling(copy);
+        copy.limits.max_deletions = copy.limits.max_deletions.min(ceiling);
+        let prunes =
+            dry_run_prunes || copy.policy.deletion == DeletionPolicy::DeleteDestinationOnly;
+        if prunes && ceiling == 0 {
+            bail!("pruning needs a positive --max-delete on the approving machine: `syq persist receive on --max-delete N`");
+        }
+        Ok(())
+    }
 }
 
 impl Directive {
@@ -245,7 +283,7 @@ pub(crate) fn issue(
     binding: Binding,
     command: Vec<Vec<u8>>,
     cwd: String,
-    inputs: Inputs,
+    (inputs, caps): (Inputs, Option<Caps>),
     results_key: [u8; 32],
 ) -> Result<Directive> {
     let issued_at = now()?;
@@ -264,6 +302,7 @@ pub(crate) fn issue(
         command,
         cwd,
         inputs,
+        caps,
         results_key,
     })
 }
@@ -298,7 +337,10 @@ pub(crate) fn destination_rules(
     let destination_path = normalize_absolute(OsStr::from_bytes(&destination.path), home)?
         .into_os_string()
         .into_vec();
-    let copy = copy_operation(&args, &sources, &destination_path)?;
+    let mut copy = copy_operation(&args, &sources, &destination_path)?;
+    if let Some(caps) = &directive.caps {
+        caps.apply(&mut copy, args.dry_run && requests_pruning(&args))?;
+    }
     let mut constraints = GrantConstraints {
         tcp_congestion: args.tcp_congestion.clone(),
         mapping: directive.inputs.mapping.clone(),
