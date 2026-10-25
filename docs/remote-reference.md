@@ -19,66 +19,120 @@ host keys. HostA's SSH configuration does not override those choices.
 
 ## Enrollment
 
-Enrollment needs normal command authority on the destination during setup.
-The receiver does not run as root or with root's capabilities, so enroll an
-ordinary account.
-Use a real directory, not a symlink, unless the copy that sets up the receiver
-follows it with `--follow-dst`. Transfers cannot overwrite the receiver's
-SSH configuration, programs, or enrollment state. Manage that state with
-`syq receiver` commands; it is not a disposable cache.
+Restricted copying is set up once for each server account you copy to from
+each of your machines. Setup needs an ordinary SSH login to the account with
+an SSH key. The receiver does not run as root or with root's capabilities, so
+enroll an ordinary account. The server needs OpenSSH 7.2 or newer and a
+writable `~/.ssh/authorized_keys`; syq checks both before installing anything.
 
-Each enrollment has a grant-signing key and a separate SSH key that can
-only enter the receiver. The grant-signing key matches the login key that
-authenticated setup. Ed25519 stays Ed25519; RSA uses at least 3,072 bits and at least the login key's size.
-Unencrypted ECDSA keeps its curve. FIDO (`*-sk`) logins create a separate
-hardware-backed key with the same effective touch and PIN requirements;
-creating and checking that key can require touching the device. Syq checks
-that the destination's selected SSH agent can sign before installing the key.
-PIN-protected keys need a working `SSH_ASKPASS` program in that agent's
-environment; the agent cannot use syq's terminal for its PIN prompt. Enrollment
-stops before installation if the signing check fails.
+Setup installs three things on the server:
 
-For a passphrase-protected Ed25519 or RSA login, the grant-signing key is encrypted
-using a secret derived through the login key's SSH agent. There is no new
-passphrase. If the login key is not loaded, `ssh-add` asks for its usual
-passphrase. Syq uses the agent selected by the destination's `IdentityAgent`
-setting, or `SSH_AUTH_SOCK` when that setting is absent. Losing that login key requires revoking and enrolling again through
-another login. Revocation itself does not need the grant-signing key unlocked.
+- One line in `~/.ssh/authorized_keys`. Its key, the entry key, can only start
+  syq's receiver. The line's comment names the login key the receiver trusts:
+  `syq-enrollment:ID signer TYPE KEY`.
+- The receiver: this build of syq in the server's binary store, at
+  `~/.local/lib/syq/RELEASE/PLATFORM/syq`, where syq's SSH helper for the same
+  build lives too. When the store already has exactly this build, the same
+  SHA-256, setup uses it instead of uploading one; see
+  [stored releases and helpers](environment.md#stored-releases-and-helpers)
+  for the rules it follows.
+- Private state in `~/.local/share/syq/enrollments/ID`: the login key the
+  receiver trusts, the record of authorizations already used, and the
+  server's key for signing its reports.
 
-The SSH admission key is a separate, unencrypted software key: it keeps the
-signer's RSA size or ECDSA curve, or uses Ed25519 for an Ed25519 signer.
-A FIDO signer uses the corresponding software key type for SSH admission,
-so the destination must accept that software type as well. Grant signing still
-requires the hardware device.
+Your machine keeps the entry key and its own record in
+`~/.local/state/syq/enrollments/ID`. Manage that state with `syq receiver`
+commands; it is not a disposable cache.
 
-Automatic matching needs the login's local OpenSSH private-key file or FIDO
-handle, readable only by its owner (mode 0400 or 0600). Passphrase-protected ECDSA, encrypted FIDO handles, SSH certificates,
-password or multi-factor logins, and agent-only identities (including
-PIV/OpenPGP keys) are unsupported. For FIDO, the login key must have one matching
-entry in `~/.ssh/authorized_keys` so syq can read its server policy. Syq reports
-an error when it cannot preserve the key's protection.
+Copies cannot write the receiver's protected paths: the account's
+`~/.ssh`, syq's stored programs, enrollment state on either side, and syq's
+receiving state, such as `~/.config/syq` and its runtime directory
+`$XDG_RUNTIME_DIR/syq-persist-UID`. Without `XDG_RUNTIME_DIR`, the runtime
+directory is `/tmp/syq-persist-UID` on macOS and `$TMPDIR/syq-persist-UID`
+elsewhere, which is also in `/tmp` when `TMPDIR` is unset. A copy into one of
+them is refused, and so is one that copies a directory's contents into, or
+deletes in, a directory that holds one, such as your home directory, or
+`/tmp` when it holds the runtime directory, because it could change syq's own
+files there. Copy into a subdirectory instead. Copying named files or
+directories into such a directory is fine.
 
-Repeating `enroll` updates the receiver to match your local build. A pending
-enrollment can be retried or revoked. Existing keys keep their protection;
-revoke and enroll again to adopt matching protection or rotate either key. Revocation stops active receivers before removing their state;
-see [access management](remote-to-remote.md#first-copy-and-access-management)
-for interruption and retry behavior.
+### Which key signs
 
-Stop active copies before upgrading: replacing the executable does not update
-running receivers. Repeat `syq receiver enroll hostB:/destination` afterward
-to refresh the installed receiver. Compatible grant-signing keys and replay records
-are preserved. An older enrollment that used one key for both purposes gains a
-separate SSH key on its next copy or explicit enrollment; the original key
-continues signing grants. A dry run requires this upgrade to be completed first
-with `receiver enroll`. The upgrade also preserves its signing key and identity.
-Older clients cannot use the upgraded enrollment; use the newer build to manage
-or revoke it. Different client builds cannot share one installed receiver
-concurrently; each needs a matching receiver.
+The key you log in with during setup signs each copy's authorization, on your
+machine. Syq signs through your SSH agent (the one your SSH configuration's
+`IdentityAgent` selects for the server, else `SSH_AUTH_SOCK`), or reads the
+key's file when it is not passphrase-protected. Syq never asks for a
+passphrase: load passphrase-protected keys, FIDO keys, and PKCS#11 or PIV keys
+into your agent. Before installing anything, setup checks that the key can
+sign. A key added with `ssh-add -h`, which signs only logins, is refused, and
+so is an RSA key with fewer than 2048 or more than 16384 bits.
 
-An incompatible enrollment requires fresh setup, which needs ordinary SSH
-access. Eligible copies install it automatically, or you can use `enroll`.
-Incompatible old enrollments are not listed or removed by the new build;
-they require manual cleanup on both machines.
+- **FIDO keys** need one touch for each copy. A copy that sets up or refreshes
+  restricted copying needs about three: for the login, for the check that the
+  key can sign, and for the copy itself. The receiver requires what your login
+  requires: a touch unless the server's `authorized_keys` line for your key
+  says `no-touch-required`, and a PIN when that line says `verify-required` or
+  the key itself always asks for one. For a certificate login, the
+  certificate's options count as sshd counts them: the touch is skipped only
+  when both the certificate and its authority's `cert-authority` line allow
+  it, and a PIN is needed when either asks for one. A certificate whose
+  authority the server trusts some other way, such as `TrustedUserCAKeys`,
+  always needs a touch, so a key that cannot be touched cannot set up
+  restricted copying that way. A PIN needs an `SSH_ASKPASS` program the
+  agent can run; the agent cannot use syq's terminal.
+- **Certificates:** the certificate's key signs, and the receiver stops
+  accepting copies when the certificate expires. The next copy after that
+  logs in again and records the new certificate's expiry. SSH does not report
+  which of several certificates for one key it logged in with, so syq looks at
+  every certificate for that key in your agent and beside its key file that is
+  valid now, and records what they allow together: the earliest expiry, and
+  a touch or PIN when any of them needs one.
+- **Other logins** cannot set up restricted copying: passwords,
+  keyboard-interactive, Kerberos, host-based, and logins that need a second
+  factor. A key alone would drop the second factor. Use
+  [account access](persistence-reference.md#approved-account-connections) with `--auth-from @NAME`
+  instead.
+
+### Changing keys and updating syq
+
+When the key syq recorded can no longer sign, for example because you now log
+in with a new key, the next copy logs in again and trusts your current key
+instead. Only the trusted key changes; the entry key stays, so copies already
+running continue. The enrollment outlives removing or revoking your login key
+on the server. To end it, run `syq receiver revoke ID`, or remove every
+`authorized_keys` line that contains the key; syq's line names it in its
+comment. `syq receiver list` shows the fingerprint of the key each enrollment
+trusts.
+
+Whether the receiver accepts a grant depends only on the login key's
+signature, its touch and PIN policy, and a certificate's expiry. Options such
+as `from=` or `expiry-time=` on your key's `authorized_keys` line, a
+certificate's other critical options, such as `source-address` or
+`force-command`, and revoking a certificate or its authority on the server do
+not stop a grant your key signs. Revoke the enrollment to stop them.
+
+After you change syq builds, the next copy logs in once to install the
+matching receiver and rewrite syq's line. An SSH connection opened before that
+refresh cannot start a new copy; copies already running finish. Releases stay
+in `~/.local/lib/syq` until you delete them. Delete a release's directory only
+when no syq line in `authorized_keys` names it.
+
+If the server loses an enrollment's state, its receiver refuses every copy.
+`syq receiver enroll` then sets up a new enrollment in its place and removes
+the old line. If only the record of authorizations already used is lost, or
+unusable, for example with another owner or mode after a restore from a
+backup, `syq receiver enroll` recreates it and rewrites syq's line, and
+authorizations signed before then are refused.
+
+### Enrollments from older versions
+
+Syq 0.4.0 to 0.7.1 made one enrollment per destination directory. This
+version does not use, list, or remove them, and an older syq can keep copying
+through them until you remove them. Revoke them with the older version before
+upgrading, or remove them by hand: on the server, delete the
+`authorized_keys` lines whose command runs `~/.local/libexec/syq-receiver`,
+then `~/.local/share/syq/restricted` and `~/.local/libexec/syq-receiver`; on
+your machine, delete `~/.local/state/syq/restricted`.
 
 Enrollment detects the destination platform and installs a matching executable.
 Source builds require compatible platforms; `--syq-path` does not select the
@@ -107,8 +161,8 @@ Existing authorizations keep their original limits.
 | `--no-tcp-encryption` | Unsupported; data connections must be encrypted |
 | `--mapping` | Listed destinations and necessary parent creation are authorized |
 | Fixed `workers` above 128 | Unsupported |
-| `--follow-dst` with `--into` | The receiver follows a destination symlink to the directory it leads to inside the directory it was set up for; not with `--widen-dirs all`, and not for [named destinations](persistence-reference.md#copy-limits) |
-| `--widen-dirs` | Approved as part of the copy; `all` widens the directory the copy goes into and those on the way to it, but nothing above the directory the receiver was set up for |
+| `--follow-dst` with `--into` | The receiver follows a destination symlink to the directory it leads to inside the directory the destination is in; not with `--widen-dirs all`, and not for [named destinations](persistence-reference.md#copy-limits) |
+| `--widen-dirs` | Approved as part of the copy; `all` widens the directory the copy goes into and those on the way to it, but nothing above the directory the destination is in |
 | `--detach` | Unsupported; the local authorization process must remain attached |
 | Native `rm` | Unsupported; use a normal SSH login |
 
@@ -158,7 +212,7 @@ server or change the file-data route.
 
 The authentication broker allows 129 simultaneous clients by default. An
 explicit worker count or ceiling changes this to that count plus one control
-connection; restricted copies remain capped at 129 clients.
+connection.
 
 To make hostB pull from hostA using credentials already on hostB:
 

@@ -1,9 +1,9 @@
 //! A patch whose new data is too large to hold for a batch is streamed:
 //! `PatchBegin` opens its stage, each `PatchData` piece is written into it as
 //! it arrives, and `PatchEnd` publishes it or abandons it. The stage is
-//! seeded from the file it replaces under the same fingerprint check as a
-//! batch patch's, or takes that file's reused blocks as the pieces around
-//! them arrive. Either way it holds that file's bytes for as long as the
+//! seeded from the file it replaces under the same checks as a batch
+//! patch's (`seed_patch_stage`), or takes that file's reused blocks as the
+//! pieces around them arrive. Either way it holds that file's bytes for as long as the
 //! stream lasts, so it is always a new file, created exclusively, and stays
 //! private until publication. A stage that will not be published, whether
 //! the patch failed, was abandoned or its connection closed, is removed at
@@ -189,6 +189,7 @@ impl FsOps {
         }
         let patch = &stream.patch;
         check_stream_layout(patch, stream.data_len)?;
+        let guard = self.compared_files.take(&patch.path);
         let target = self.destination_mutation_target(&patch.path)?;
         if patch.reuse.iter().any(Option::is_some) {
             let old = target
@@ -206,26 +207,22 @@ impl FsOps {
             (Some(old), Some(basis))
                 if reused >= CLONE_MIN_REUSED
                     && reused * 2 >= patch.len
-                    && reuses_within(patch, basis.len)
-                    && fingerprint(&old.metadata()?) == basis =>
+                    && reuses_within(patch, basis.len) =>
             {
-                Some(PatchSource {
-                    old: old.try_clone()?,
+                seed_from(old, basis, guard)?.map(|(seed, guard)| PatchSource {
+                    old: seed,
                     basis,
                     patch,
+                    guard,
                 })
             }
             _ => None,
         };
         let stage = self.create_stream_stage(&stream.put, source.as_ref(), target)?;
         let stage = &*stream.stage.insert(stage);
-        // Like a clone, a copy is trusted only if the file it came from
-        // still has the fingerprint it had when its blocks were hashed.
+        // As a batch patch's stage is seeded, and trusted or checked.
         let seeded = match &source {
-            Some(source) => {
-                (stage.cloned || self.copy_basis(source, stage))
-                    && fingerprint(&source.old.metadata()?) == source.basis
-            }
+            Some(source) => self.seed_patch_stage(source, stage)?,
             None => false,
         };
         if !seeded {

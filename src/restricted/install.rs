@@ -1,64 +1,66 @@
+//! The server side of enrollment: installing or refreshing an enrollment's
+//! receiver, state and `authorized_keys` line over the user's own login, and
+//! revoking them.
 use super::*;
 
 #[cfg(test)]
-pub(super) fn generate_enrollment_key(id: EnrollmentId) -> Result<PrivateKey> {
+pub(super) fn generate_test_key(comment: &str) -> Result<PrivateKey> {
     let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed).context("generate enrollment key")?;
+    getrandom::fill(&mut seed).context("generate test key")?;
     let keypair = Ed25519Keypair::from_seed(&seed);
     seed.fill(0);
-    PrivateKey::new(keypair.into(), format!("syq-enrollment:{id}"))
-        .context("construct enrollment key")
+    PrivateKey::new(keypair.into(), comment).context("construct test key")
 }
 
 /// The receiver's own signing key, which signs the header of its results
-/// for the invoking machine. It lives only on hostB, in the enrollment's
-/// state directory, and is generated once per enrollment. Its file and
-/// comment keep the names it had when it signed receipts.
-pub(super) fn generate_receipt_key(id: EnrollmentId) -> Result<PrivateKey> {
+/// for the invoking machine. It lives only on the server, in the
+/// enrollment's state directory, and is generated once per enrollment.
+pub(super) fn generate_results_key(id: EnrollmentId) -> Result<PrivateKey> {
     let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed).context("generate receipt signing key")?;
+    getrandom::fill(&mut seed).context("generate results signing key")?;
     let keypair = Ed25519Keypair::from_seed(&seed);
     seed.fill(0);
-    PrivateKey::new(keypair.into(), format!("syq-receipt:{id}"))
-        .context("construct receipt signing key")
+    PrivateKey::new(keypair.into(), format!("syq-results:{id}"))
+        .context("construct results signing key")
 }
 
-pub(super) const RECEIPT_KEY_FILE: &str = "receipt-key";
+pub(super) const RESULTS_KEY_FILE: &str = "results-key";
 
 /// The enrollment's results key: generated on first install and kept by
-/// every later install, so a refresh after a syq upgrade, or a retry after
-/// a lost reply, always reports the key the local side already holds.
-/// Rotation is explicit: revoke, then enroll again.
-pub(super) fn ensure_receipt_key(state: &Path, id: EnrollmentId) -> Result<PrivateKey> {
-    let path = state.join(RECEIPT_KEY_FILE);
+/// every later install, so a refresh, or a retry after a lost reply, always
+/// reports the key the enrolling machine already holds. Rotation is
+/// explicit: revoke, then enroll again.
+pub(super) fn ensure_results_key(state: &Path, id: EnrollmentId) -> Result<PrivateKey> {
+    let path = state.join(RESULTS_KEY_FILE);
     match fs::symlink_metadata(&path) {
-        Ok(_) => return load_receipt_key(state),
+        Ok(_) => return load_results_key(state),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(error).with_context(|| format!("inspect {}", path.display()));
         }
     }
-    let key = generate_receipt_key(id)?;
+    let key = generate_results_key(id)?;
     atomic_write(
         state,
-        RECEIPT_KEY_FILE,
+        RESULTS_KEY_FILE,
         key.to_openssh(LineEnding::LF)
-            .context("encode receipt signing key")?
+            .context("encode results signing key")?
             .as_bytes(),
         0o600,
     )?;
     Ok(key)
 }
 
-/// The receipt signing key installed for this enrollment.
-pub(super) fn load_receipt_key(state: &Path) -> Result<PrivateKey> {
-    let path = state.join(RECEIPT_KEY_FILE);
-    let encoded = delegation::read_private_regular(&path, "receipt signing key", 128 * 1024)?;
-    PrivateKey::from_openssh(&encoded).context("parse receipt signing key")
+pub(super) fn load_results_key(state: &Path) -> Result<PrivateKey> {
+    let path = state.join(RESULTS_KEY_FILE);
+    let encoded = delegation::read_private_regular(&path, "results signing key", 128 * 1024)?;
+    PrivateKey::from_openssh(&encoded).context("parse results signing key")
 }
 
-pub(super) fn signer_name(id: EnrollmentId) -> String {
-    format!("syq-enrollment-{id}")
+/// The signer a grant names: the enrollment at one generation, so a grant
+/// issued before a refresh is refused after it.
+pub(super) fn signer_name(id: EnrollmentId, generation: u64) -> String {
+    format!("syq-enrollment-{id}-generation-{generation}")
 }
 
 pub(super) fn normalize_absolute(path: &std::ffi::OsStr, home: &Path) -> Result<PathBuf> {
@@ -92,310 +94,505 @@ pub(super) fn requested_parent(destination: &Path) -> &Path {
     destination.parent().unwrap_or_else(|| Path::new("/"))
 }
 
-pub(super) fn install_state_paths(
-    home: &Path,
-    id: EnrollmentId,
-) -> Result<(PathBuf, PathBuf, PathBuf)> {
-    let base = ensure_private_chain(home, &[".local", "share", "syq", "restricted"])?;
-    let enrollment = base.join(id.to_string());
-    ensure_directory(&enrollment, 0o700)?;
-    let replay = enrollment.join("replay");
-    ensure_directory(&replay, 0o700)?;
-    Ok((
-        enrollment.clone(),
-        enrollment.join("allowed-signers"),
-        replay,
-    ))
+fn path_in(home: &Path, components: &[&str]) -> PathBuf {
+    components
+        .iter()
+        .fold(home.to_path_buf(), |path, component| path.join(component))
 }
 
-pub(super) fn receiver_install_path(home: &Path) -> PathBuf {
-    home.join(".local/libexec/syq-receiver")
+/// An enrollment's state directory on the server.
+pub(super) fn enrollment_state(home: &Path, id: EnrollmentId) -> PathBuf {
+    path_in(home, &SERVER_STATE).join(id.to_string())
 }
 
-pub(super) fn receiver_control_paths(
-    home: &Path,
-    receiver: &Path,
-    ssh_keygen: Option<&Path>,
-) -> Result<Vec<ReceiverControlPath>> {
-    let receiver_directory = receiver
+/// This build's executable in the store of `home`, for the platform it runs
+/// on.
+pub(super) fn store_receiver_path(home: &Path) -> PathBuf {
+    let target = crate::remote_helper::Target::key_for_platform(&crate::identity::platform())
+        .unwrap_or("self");
+    home.join(crate::user_dirs::BINARY_STORE_IN_HOME)
+        .join(crate::identity::build())
+        .join(target)
+        .join(crate::update::STORED_EXECUTABLE)
+}
+
+/// Put this executable in the store as its build's receiver, unless the
+/// store has a copy of it already. As for the store's other users, a stored
+/// build whose directories or file someone else could change is refused,
+/// and nothing is created under a home directory that belongs to another
+/// user. A private stored build whose bytes differ from this executable,
+/// such as a damaged copy or a compile of the same source on another
+/// machine, is replaced by this one: the build identity is what syq relies
+/// on to be compatible, and the bytes the line runs are the last ones
+/// installed. Where the filesystem fixes owners and modes when it is
+/// mounted, they cannot show who may change a stored build, so it is
+/// written again in any case.
+fn install_receiver(home: &Path) -> Result<PathBuf> {
+    let store = home.join(crate::user_dirs::BINARY_STORE_IN_HOME);
+    let receiver = store_receiver_path(home);
+    let directory = receiver
         .parent()
-        .context("restricted receiver path has no parent directory")?;
-    let mut protected = vec![
-        ReceiverControlPath {
-            path: home.join(".ssh").as_os_str().as_bytes().to_vec(),
-            label: "SSH configuration directory",
-        },
-        ReceiverControlPath {
-            path: receiver_directory.as_os_str().as_bytes().to_vec(),
-            label: "receiver executable directory",
-        },
-        ReceiverControlPath {
-            path: home
-                .join(".local/share/syq/restricted")
-                .as_os_str()
-                .as_bytes()
-                .to_vec(),
-            label: "enrollment state directory",
-        },
-    ];
-    if let Some(ssh_keygen) = ssh_keygen {
-        protected.push(ReceiverControlPath {
-            path: ssh_keygen.as_os_str().as_bytes().to_vec(),
-            label: "signature verifier executable",
-        });
+        .expect("the receiver is in a build directory")
+        .to_path_buf();
+    let running = std::env::current_exe().context("resolve the running syq")?;
+    if !crate::fsops::fixed_owners_and_modes(&store) {
+        let stored =
+            crate::update::stored_release(&store, &directory, &[crate::update::STORED_EXECUTABLE])
+                .context("cannot use the receiver in the binary store")?;
+        if stored == crate::update::StoredRelease::Complete
+            && delegation::validate_regular_executable(&receiver, "stored receiver").is_ok()
+            && same_executable(&running, &receiver)?
+        {
+            return Ok(receiver);
+        }
     }
-    Ok(protected)
-}
-
-pub(super) fn materialize_receiver(home: &Path, contents: &[u8]) -> Result<PathBuf> {
-    let directory_path = ensure_directory_chain(home, &[".local", "libexec"])?;
-    let directory = open_directory(&directory_path)?;
-    atomic_replace_executable_locked(&directory, "syq-receiver", contents)?;
-    let receiver = receiver_install_path(home);
-    delegation::validate_regular_executable(&receiver, "restricted receiver")?;
+    crate::update::create_store_directory(&store, &directory)?;
+    let contents = fs::read(&running)
+        .with_context(|| format!("read the running syq {}", running.display()))?;
+    let opened = open_directory(&directory)?;
+    lock_directory(&opened)?;
+    atomic_replace_executable_locked(&opened, crate::update::STORED_EXECUTABLE, &contents)?;
+    delegation::validate_regular_executable(&receiver, "stored receiver")?;
     Ok(receiver)
 }
 
-pub(super) fn directory_is_empty(path: &Path) -> Result<bool> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => delegation::validate_private_directory_path(path)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+/// Whether `stored` holds the running executable: the same file, as when
+/// the stored build is the one running, or the same bytes, compared a
+/// block at a time so neither is held in memory whole.
+pub(super) fn same_executable(running: &Path, stored: &Path) -> Result<bool> {
+    let mut left = File::open(running)
+        .with_context(|| format!("open the running syq {}", running.display()))?;
+    let Ok(mut right) = File::open(stored) else {
+        return Ok(false);
+    };
+    let (left_metadata, right_metadata) = (left.metadata()?, right.metadata()?);
+    if (left_metadata.dev(), left_metadata.ino()) == (right_metadata.dev(), right_metadata.ino()) {
+        return Ok(true);
     }
-    Ok(fs::read_dir(path)
-        .with_context(|| format!("list {}", path.display()))?
-        .next()
-        .transpose()?
-        .is_none())
-}
-
-pub(super) fn remove_empty_directory(path: &Path) -> Result<()> {
-    match fs::remove_dir(path) {
-        Ok(()) => Ok(()),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-            ) =>
-        {
-            Ok(())
+    if left_metadata.len() != right_metadata.len() {
+        return Ok(false);
+    }
+    let fill = |file: &mut File, buffer: &mut [u8]| -> std::io::Result<usize> {
+        let mut filled = 0;
+        while filled < buffer.len() {
+            match file.read(&mut buffer[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
         }
-        Err(error) => Err(error).with_context(|| format!("remove empty {}", path.display())),
+        Ok(filled)
+    };
+    let (mut ours, mut theirs) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
+    loop {
+        let read = fill(&mut left, &mut ours)?;
+        if fill(&mut right, &mut theirs)? != read || ours[..read] != theirs[..read] {
+            return Ok(false);
+        }
+        if read == 0 {
+            return Ok(true);
+        }
     }
 }
 
-pub(super) fn remove_final_enrollment_state_directories(home: &Path) -> Result<()> {
-    remove_empty_directory(&home.join(".local/share/syq/restricted"))?;
-    remove_empty_directory(&home.join(".local/share/syq"))
+/// Which machine's paths `receiver_control_paths` lists.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ControlPaths<'a> {
+    /// This machine's, including receiving state its environment locates.
+    Here,
+    /// Another machine's, known by its home directory and where it keeps
+    /// its receiving state.
+    Elsewhere(&'a [PathBuf]),
 }
 
-pub(super) fn contains_managed_enrollment(contents: &[u8]) -> bool {
-    const MARKER: &[u8] = b"syq-enrollment:";
-    contents.split(|byte| *byte == b'\n').any(|line| {
-        let trimmed = line
-            .iter()
-            .copied()
-            .skip_while(u8::is_ascii_whitespace)
-            .collect::<Vec<_>>();
-        !trimmed.starts_with(b"#")
-            && line
-                .rsplit(|byte| byte.is_ascii_whitespace())
-                .find(|word| !word.is_empty())
-                .is_some_and(|word| word.starts_with(MARKER))
+/// What each entry of `server_receiving_state` holds.
+const RECEIVING_STATE_LABELS: [&str; 3] = [
+    "receiver identity directory",
+    "receiving configuration directory",
+    "persistence runtime directory",
+];
+
+/// Where a server keeps its receiving state, computed as its syq does from
+/// what its login environment reports: the receiver identity, the receive
+/// configuration's directory, and the persistence runtime directory.
+pub(super) fn server_receiving_state(
+    home: &Path,
+    uid: &str,
+    os: &str,
+    (config_home, runtime_dir, tmpdir): (&str, &str, &str),
+) -> Vec<PathBuf> {
+    let absolute = |value: &str| value.starts_with('/').then(|| PathBuf::from(value));
+    let config = absolute(config_home)
+        .unwrap_or_else(|| home.join(".config"))
+        .join("syq");
+    let runtime = absolute(runtime_dir)
+        .unwrap_or_else(|| {
+            if os == "Darwin" || tmpdir.is_empty() {
+                PathBuf::from("/tmp")
+            } else {
+                PathBuf::from(tmpdir)
+            }
+        })
+        .join(format!("syq-persist-{uid}"));
+    vec![home.join(".syq-receiver-identity"), config, runtime]
+}
+
+/// The paths every receiver refuses to write, by name and by the identity
+/// each has in the session: the account's SSH configuration, syq's stored
+/// executables, enrollment state on both sides (including the directories
+/// released versions used), the receiving machine's approval state, and the
+/// directory of the running executable.
+pub(super) fn receiver_control_paths(
+    home: &Path,
+    executable: Option<&Path>,
+    machine: ControlPaths<'_>,
+) -> Result<Vec<ReceiverControlPath>> {
+    let mut protected = vec![
+        (home.join(".ssh"), "SSH configuration directory"),
+        (
+            home.join(crate::user_dirs::BINARY_STORE_IN_HOME),
+            "store of syq executables",
+        ),
+        (path_in(home, &SERVER_STATE), "enrollment state directory"),
+        (path_in(home, &LOCAL_STATE), "enrollment state directory"),
+        (
+            home.join(".local/share/syq/restricted"),
+            "released enrollment state directory",
+        ),
+        (
+            home.join(".local/state/syq/restricted"),
+            "released enrollment state directory",
+        ),
+        (
+            home.join(".local/libexec"),
+            "released receiver executable directory",
+        ),
+    ];
+    if let Some(executable) = executable {
+        protected.push((
+            executable
+                .parent()
+                .context("the running syq has no parent directory")?
+                .to_path_buf(),
+            "receiver executable directory",
+        ));
+    }
+    for directory in [
+        ".syq-receive-v1",
+        ".syq-destinations-v1",
+        ".syq-destinations-v2",
+        ".syq-destinations-v3",
+    ] {
+        protected.push((home.join(directory), "named destination authority state"));
+    }
+    // In the order `server_receiving_state` lists them.
+    let receiving: Vec<_> = match machine {
+        ControlPaths::Here => vec![
+            crate::destination::receiver_identity_directory().ok(),
+            crate::receive_service::config_path(&crate::persistence::Domain::default())
+                .ok()
+                .and_then(|path| path.parent().map(Path::to_path_buf)),
+            Some(crate::persistence::runtime_parent_path()),
+        ],
+        ControlPaths::Elsewhere(receiving) => receiving.iter().cloned().map(Some).collect(),
+    };
+    for (index, path) in receiving.into_iter().enumerate() {
+        if let Some(path) = path {
+            protected.push((
+                path,
+                RECEIVING_STATE_LABELS
+                    .get(index)
+                    .copied()
+                    .unwrap_or("background receiving control state"),
+            ));
+        }
+    }
+    Ok(protected
+        .into_iter()
+        .map(|(path, label)| ReceiverControlPath {
+            path: path.as_os_str().as_bytes().to_vec(),
+            label,
+        })
+        .collect())
+}
+
+/// Remove `name` from the private directory `state` when it is there,
+/// so a new one can be made: deleted when this account can, else renamed
+/// aside, as one another owner left there can be.
+fn set_aside_unusable(state: &Path, name: &str) -> Result<()> {
+    let path = state.join(name);
+    let metadata = match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+        Ok(metadata) => metadata,
+    };
+    let removed = if metadata.is_dir() {
+        fs::remove_dir_all(&path)
+    } else {
+        fs::remove_file(&path)
+    };
+    if removed.is_ok() {
+        return Ok(());
+    }
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce).context("name the unusable record")?;
+    let aside = state.join(format!(
+        "{name}.unusable-{:016x}",
+        u64::from_le_bytes(nonce)
+    ));
+    fs::rename(&path, &aside).with_context(|| {
+        format!(
+            "{} cannot be used or removed; remove it, then run `syq receiver enroll` again",
+            path.display()
+        )
     })
 }
 
-pub(super) fn resolve_ssh_keygen() -> Result<PathBuf> {
-    let candidates = std::iter::once(PathBuf::from("/usr/bin/ssh-keygen")).chain(
-        std::env::var_os("PATH")
-            .into_iter()
-            .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-            .map(|directory| directory.join("ssh-keygen")),
-    );
-    for candidate in candidates {
-        if candidate.is_absolute()
-            && candidate
-                .metadata()
-                .is_ok_and(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0)
-        {
-            return fs::canonicalize(&candidate)
-                .with_context(|| format!("canonicalize {}", candidate.display()));
-        }
-    }
-    bail!("restricted receiver requires ssh-keygen for SSHSIG verification")
-}
-
-pub(crate) fn remote_install() -> Result<()> {
+/// Read a request of at most the state-file size from standard input.
+fn read_request<T: serde::de::DeserializeOwned>(label: &str) -> Result<T> {
     let mut encoded = Vec::new();
     std::io::stdin()
         .take(MAX_STATE_FILE as u64 + 1)
         .read_to_end(&mut encoded)?;
     if encoded.len() > MAX_STATE_FILE {
-        bail!("restricted enrollment request is too large");
+        bail!("{label} is too large");
     }
-    let request: InstallRequest =
-        serde_json::from_slice(&encoded).context("decode restricted enrollment request")?;
-    if !supported_config_version(request.version) {
-        bail!("unsupported restricted enrollment request version");
+    serde_json::from_slice(&encoded).with_context(|| format!("decode {label}"))
+}
+
+/// The enrollment's state, when its directory holds any.
+pub(super) fn read_receiver_config(state: &Path) -> Result<Option<ReceiverEnrollment>> {
+    match fs::symlink_metadata(state.join("config.json")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect the enrollment's state"),
+        Ok(_) => {}
+    }
+    let encoded = delegation::read_private_regular(
+        &state.join("config.json"),
+        "enrollment state",
+        MAX_STATE_FILE,
+    )?;
+    let config: ReceiverEnrollment =
+        serde_json::from_slice(&encoded).context("decode the enrollment's state")?;
+    if config.version != CONFIG_VERSION {
+        bail!("the enrollment's state is from another syq version");
+    }
+    Ok(Some(config))
+}
+
+/// `authorized_keys` must be writable before anything is installed: the
+/// line is written last, and a server that cannot take it should be
+/// refused before any state exists.
+fn require_writable_authorized_keys(ssh: &Path) -> Result<()> {
+    let writable = |path: &Path| {
+        let path = CString::new(path.as_os_str().as_bytes()).expect("path without NUL");
+        unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
+    };
+    let file = ssh.join("authorized_keys");
+    if !writable(ssh) || (file.exists() && !writable(&file)) {
+        bail!(
+            "restricted copying needs a writable {}; this account's is not",
+            file.display()
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn remote_install() -> Result<()> {
+    let request: InstallRequest = read_request("enrollment request")?;
+    if request.version != CONFIG_VERSION {
+        bail!("this syq cannot handle that enrollment request version");
     }
     request.id.validate()?;
     refuse_privileged_receiver(None)?;
     let (account, home) = current_account()?;
-    if account != request.target_login {
-        bail!("enrollment target login does not match the remote account");
-    }
-    let destination =
-        normalize_absolute(std::ffi::OsStr::new(&request.requested_destination), &home)?;
-    let parent = requested_parent(&destination);
-    let canonical_root = fs::canonicalize(parent)
-        .with_context(|| format!("resolve restricted destination parent {}", parent.display()))?;
-    if !fs::metadata(&canonical_root)?.is_dir() {
-        bail!("restricted destination parent is not a directory");
-    }
-    let leaf = destination
-        .file_name()
-        .context("restricted destination / is not supported")?;
-    let canonical_destination = canonical_root.join(leaf);
-    if !request.follows_destination
-        && fs::symlink_metadata(&canonical_destination).is_ok_and(|metadata| metadata.is_symlink())
-    {
-        bail!(
-            "command-restricted enrollment does not follow a destination-root symlink; enroll its explicit referent instead"
-        );
-    }
-    let canonical_home = fs::canonicalize(&home)
-        .with_context(|| format!("resolve receiver home {}", home.display()))?;
-    let ssh_keygen = resolve_ssh_keygen()?;
-    let bootstrap_receiver = receiver_install_path(&canonical_home);
-    let protected =
-        receiver_control_paths(&canonical_home, &bootstrap_receiver, Some(&ssh_keygen))?;
-    reject_control_plane_path(canonical_destination.as_os_str().as_bytes(), &protected)?;
-    let root = crate::rooted::Root::open(&canonical_root)?;
-    let root_identity = root.identity();
-    let enrollment_key = EnrollmentPublicKey::parse(&request.public_key)?;
-    let ssh_key = EnrollmentPublicKey::parse(&request.ssh_public_key)?;
-    validate_ssh_public_key(&ssh_key::PublicKey::from_openssh(&request.ssh_public_key)?)?;
-    anyhow::ensure!(
-        ssh_key != enrollment_key,
-        "receiver SSH key must differ from its grant-signing key"
-    );
-    let signer = signer_name(request.id);
-    let public_words: Vec<&str> = request.public_key.split_ascii_whitespace().collect();
-    if public_words.len() < 2 {
-        bail!("enrollment public key is malformed");
-    }
-    let running_receiver = std::env::current_exe().context("resolve restricted receiver path")?;
-    delegation::validate_regular_executable(&running_receiver, "restricted receiver")?;
-    let receiver_contents = fs::read(&running_receiver)
-        .with_context(|| format!("read restricted receiver {}", running_receiver.display()))?;
-    let ssh = ensure_directory_chain(&home, &[".ssh"])?;
-    let directory = open_directory(&ssh)?;
-    lock_directory(&directory)?;
-    // The authorized-keys directory lock is the receiver lifecycle lock too.
-    // A concurrent final revoke may unlink the shared executable, but an
-    // installer that already started has its bytes and recreates it before
-    // publishing the new forced authorization.
-    let receiver_path = materialize_receiver(&home, &receiver_contents)?;
-    let entry = AuthorizedKeyEntry::new(request.id, &receiver_path, &ssh_key)?;
-    let original =
-        read_leaf(&directory, "authorized_keys", MAX_AUTHORIZED_KEYS, false)?.unwrap_or_default();
-    let normalized = normalize_managed_authorized_keys(&original, &entry.marker());
-    let normalized = replace_legacy_ssh_authorization(
-        &normalized,
-        &entry,
-        &AuthorizedKeyEntry::with_security_key_flags(
-            request.id,
-            &receiver_path,
-            &enrollment_key,
-            request.security_key_flags,
-        )?,
-    )?;
-    let (updated, change) = enrollment::install_authorized_key(&normalized, &entry)?;
-
-    // Publish the forced authorization last. A failed preflight therefore
-    // cannot leave a usable key, and a later state-write failure leaves only
-    // inert private state that an idempotent retry can complete.
-    let (state, _allowed_signers, _replay) = install_state_paths(&home, request.id)?;
-    active::require_not_revoked(&state)?;
-    atomic_write(
-        &state,
-        "allowed-signers",
-        format!("{signer} {} {}\n", public_words[0], public_words[1]).as_bytes(),
-        0o600,
-    )?;
-    let config = ReceiverEnrollment {
-        security_key_flags: request.security_key_flags,
-        version: CONFIG_VERSION,
-        id: request.id,
-        target_login: request.target_login.clone(),
-        signer,
-        root: canonical_root
-            .to_str()
-            .context("canonical restricted root is not UTF-8")?
-            .to_owned(),
-        root_dev: root_identity.dev,
-        root_ino: root_identity.ino,
-        ssh_keygen: ssh_keygen
-            .to_str()
-            .context("ssh-keygen path is not UTF-8")?
-            .to_owned(),
-        receiver_path: receiver_path
-            .to_str()
-            .context("restricted receiver path is not UTF-8")?
-            .to_owned(),
-    };
-    let receipt_key = ensure_receipt_key(&state, request.id)?;
-    let receipt_public_key = receipt_key
-        .public_key()
-        .to_openssh()
-        .context("encode receipt public key")?;
-    atomic_write(&state, "config.json", &serde_json::to_vec(&config)?, 0o600)?;
-    atomic_write_locked(&directory, "authorized_keys", &updated, 0o600, false)?;
-
-    let response = InstallResponse {
-        version: CONFIG_VERSION,
-        id: request.id,
-        target_login: request.target_login,
-        remote_home: home
-            .to_str()
-            .context("remote account home is not UTF-8")?
-            .to_owned(),
-        requested_parent: parent
-            .to_str()
-            .context("requested destination parent is not UTF-8")?
-            .to_owned(),
-        canonical_root: config.root,
-        canonical_destination: canonical_destination
-            .to_str()
-            .context("canonical destination is not UTF-8")?
-            .to_owned(),
-        receiver_path: receiver_path
-            .to_str()
-            .context("restricted receiver path is not UTF-8")?
-            .to_owned(),
-        receipt_public_key,
-        change: match change {
-            AuthorizedKeysChange::Installed => "installed",
-            AuthorizedKeysChange::Unchanged => "unchanged",
-            AuthorizedKeysChange::Revoked => unreachable!("install cannot revoke"),
-        }
-        .to_owned(),
-    };
+    let response = install_for_account(&request, &account, &home)?;
     serde_json::to_writer(std::io::stdout().lock(), &response)?;
     Ok(())
 }
 
-pub(crate) fn remote_revoke() -> Result<()> {
-    let mut encoded = Vec::new();
-    std::io::stdin()
-        .take(MAX_STATE_FILE as u64 + 1)
-        .read_to_end(&mut encoded)?;
-    if encoded.len() > MAX_STATE_FILE {
-        bail!("restricted revocation request is too large");
+pub(super) fn install_for_account(
+    request: &InstallRequest,
+    account: &str,
+    home: &Path,
+) -> Result<InstallResponse> {
+    if account != request.target_login {
+        bail!("enrollment target login does not match the remote account");
     }
-    let request: RevokeRequest = serde_json::from_slice(&encoded)?;
-    if !supported_config_version(request.version) {
-        bail!("unsupported restricted revocation request version");
+    request.signer.validate()?;
+    let entry_key = EnrollmentPublicKey::parse(&request.entry_public_key)?;
+    validate_entry_public_key(&ssh_key::PublicKey::from_openssh(
+        &request.entry_public_key,
+    )?)?;
+    let signer = EnrollmentPublicKey::login(&request.signer.public_key)?;
+    anyhow::ensure!(
+        entry_key != signer,
+        "the entry key must differ from the login key"
+    );
+    let ssh = ensure_directory_chain(home, &[".ssh"])?;
+    let directory = open_directory(&ssh)?;
+    // The authorized-keys directory lock is the receiver lifecycle lock too:
+    // receivers take it when they start, and revocation holds it.
+    lock_directory(&directory)?;
+    require_writable_authorized_keys(&ssh)?;
+    let state_base = ensure_private_chain(home, &SERVER_STATE)?;
+    let state = state_base.join(request.id.to_string());
+    let existing = match fs::symlink_metadata(&state) {
+        Ok(_) => {
+            delegation::validate_private_directory_path(&state)?;
+            active::require_not_revoked(&state)?;
+            read_receiver_config(&state)?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("inspect the enrollment's state"),
+    };
+    if request.refresh && existing.is_none() {
+        // Re-creating the state would start an empty record of used grants,
+        // so a grant from the last day could be replayed. Enroll anew.
+        return Ok(InstallResponse::StateMissing {
+            version: CONFIG_VERSION,
+            id: request.id,
+        });
+    }
+    if let Some(existing) = &existing {
+        if existing.id != request.id || existing.target_login != request.target_login {
+            bail!("the enrollment's state does not match the request");
+        }
+        if existing.entry_public_key != request.entry_public_key {
+            bail!(
+                "enrollment {} has a different entry key; revoke it and enroll again",
+                request.id
+            );
+        }
+    }
+    let receiver_path = install_receiver(home)?;
+    let release = crate::identity::build().to_owned();
+    let receiver = receiver_path
+        .to_str()
+        .context("the stored receiver's path is not UTF-8")?
+        .to_owned();
+    let mut original =
+        read_leaf(&directory, "authorized_keys", MAX_AUTHORIZED_KEYS, false)?.unwrap_or_default();
+    if let Some(replaced) = &request.replaces {
+        replaced.id.validate()?;
+        // Only an enrollment whose state is gone is replaced; its receiver
+        // refuses everything already.
+        let replaced_state = state_base.join(replaced.id.to_string());
+        let lost = match fs::symlink_metadata(&replaced_state) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => return Err(error).context("inspect the replaced enrollment's state"),
+            Ok(_) => read_receiver_config(&replaced_state)?.is_none(),
+        };
+        if replaced.id != request.id && lost {
+            let key = EnrollmentPublicKey::parse(&replaced.entry_public_key)?;
+            original = enrollment::remove_enrollment_line(&original, replaced.id, &key)?.0;
+        }
+    }
+    let results_key = |state: &Path| -> Result<String> {
+        ensure_results_key(state, request.id)?
+            .public_key()
+            .to_openssh()
+            .context("encode the results key")
+    };
+    let respond =
+        |generation: u64, results_public_key: String, changed: bool| InstallResponse::Installed {
+            version: CONFIG_VERSION,
+            id: request.id,
+            target_login: request.target_login.clone(),
+            remote_home: home.to_string_lossy().into_owned(),
+            generation,
+            release: release.clone(),
+            receiver_path: receiver.clone(),
+            results_public_key,
+            changed,
+        };
+    let entry_at = |generation: u64| {
+        AuthorizedKeyEntry::enrollment(request.id, &receiver_path, generation, &entry_key, &signer)
+    };
+    // A record of used grants the receiver cannot use, because it was
+    // deleted, or has another owner or mode, as after a restore from a
+    // backup, is recreated below under a new generation, so no grant signed
+    // before can be redeemed against the new record.
+    let replay = state.join("replay");
+    let replay_usable = delegation::validate_private_directory_path(&replay).is_ok();
+    if let Some(existing) = &existing {
+        if existing.release == release
+            && existing.receiver_path == receiver
+            && request.replaces.is_none()
+            && replay_usable
+        {
+            let (_, change) =
+                enrollment::set_enrollment_line(&original, &entry_at(existing.generation)?)?;
+            if change == AuthorizedKeysChange::Unchanged {
+                // The line already names this login key, so connections it
+                // opened stay valid. Only the key's policy or certificate
+                // expiry can differ, and receivers read them for each copy.
+                let changed = existing.signer != request.signer;
+                if changed {
+                    let config = ReceiverEnrollment {
+                        signer: request.signer.clone(),
+                        ..existing.clone()
+                    };
+                    atomic_write(&state, "config.json", &serde_json::to_vec(&config)?, 0o600)?;
+                }
+                return Ok(respond(existing.generation, results_key(&state)?, changed));
+            }
+        }
+    }
+    let generation = existing.as_ref().map_or(Ok(1), |existing| {
+        existing
+            .generation
+            .checked_add(1)
+            .context("enrollment generation overflow")
+    })?;
+    let (updated, _) = enrollment::set_enrollment_line(&original, &entry_at(generation)?)?;
+
+    // Write the state first and the line last. A failed preflight cannot
+    // leave a usable key, and a later failure leaves only inert private
+    // state, or a line for an older generation that refuses new copies,
+    // which a retry completes.
+    ensure_directory(&state, 0o700)?;
+    let results_public_key = results_key(&state)?;
+    let config = ReceiverEnrollment {
+        version: CONFIG_VERSION,
+        id: request.id,
+        target_login: request.target_login.clone(),
+        generation,
+        release: release.clone(),
+        receiver_path: receiver.clone(),
+        entry_public_key: request.entry_public_key.clone(),
+        signer: request.signer.clone(),
+    };
+    // The new generation is durable before a record of used grants is
+    // recreated: receivers admit grants only for the current generation, so
+    // an interruption after this leaves no generation whose grants could be
+    // redeemed again against an empty record.
+    atomic_write(&state, "config.json", &serde_json::to_vec(&config)?, 0o600)?;
+    if !replay_usable {
+        set_aside_unusable(&state, "replay")?;
+    }
+    ensure_directory(&replay, 0o700)?;
+    #[cfg(test)]
+    if INTERRUPT_AFTER_RECORD.with(std::cell::Cell::get) {
+        bail!("interrupted after recreating the record of used grants");
+    }
+    atomic_write_locked(&directory, "authorized_keys", &updated, 0o600, false)?;
+    Ok(respond(generation, results_public_key, true))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Stop an install right after it creates the record of used grants,
+    /// as an interruption would.
+    pub(super) static INTERRUPT_AFTER_RECORD: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn remote_revoke() -> Result<()> {
+    let request: RevokeRequest = read_request("revocation request")?;
+    if request.version != CONFIG_VERSION {
+        bail!("this syq cannot handle that revocation request version");
     }
     request.id.validate()?;
     let (account, home) = current_account()?;
@@ -410,187 +607,45 @@ pub(super) fn revoke_for_account(
     if account != request.target_login {
         bail!("revocation target login does not match the remote account");
     }
-    // Serialize revocation with both enrollment updates and receiver admission.
+    let entry_key = EnrollmentPublicKey::parse(&request.entry_public_key)?;
+    // Serialize revocation with enrollment updates and receiver admission.
     let ssh = ensure_directory_chain(home, &[".ssh"])?;
     let directory = open_directory(&ssh)?;
     lock_directory(&directory)?;
-    let state_base = home.join(".local/share/syq/restricted");
-    let state = state_base.join(request.id.to_string());
-    let (receiver_path, remove_state) = match fs::symlink_metadata(&state) {
+    let state = enrollment_state(home, request.id);
+    // Check the state before the line changes, so a failure leaves both.
+    let base = state.parent().context("enrollment state has no parent")?;
+    if fs::symlink_metadata(base).is_ok() {
+        delegation::validate_private_directory_path(base)?;
+    }
+    let present = match fs::symlink_metadata(&state) {
         Ok(_) => {
             delegation::validate_private_directory_path(&state)?;
-            let (config, allowed_signers, _) = receiver_config(request.id)?;
-            if config.target_login != request.target_login {
-                bail!("revocation target login does not match receiver state");
+            if let Some(config) = read_receiver_config(&state)? {
+                if config.target_login != request.target_login
+                    || config.entry_public_key != request.entry_public_key
+                {
+                    bail!("the enrollment's state does not match the revocation request");
+                }
             }
-            let state = allowed_signers
-                .parent()
-                .context("restricted receiver state has no enrollment directory")?;
-            (
-                PathBuf::from(config.receiver_path),
-                Some(state.to_path_buf()),
-            )
+            true
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            (receiver_install_path(home), None)
-        }
-        Err(error) => return Err(error).context("inspect restricted receiver state"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).context("inspect the enrollment's state"),
     };
-    let enrollment_key = EnrollmentPublicKey::parse(&request.public_key)?;
-    let entry = AuthorizedKeyEntry::with_security_key_flags(
-        request.id,
-        &receiver_path,
-        &enrollment_key,
-        request.security_key_flags,
-    )?;
-    // Validate the shared state chain before removing the credential. The
-    // second check below determines whether the now-updated state is empty.
-    let _ = directory_is_empty(&state_base)?;
-    let leases = remove_state
-        .as_deref()
-        .map(active::open_leases)
-        .transpose()?;
+    let leases = present.then(|| active::open_leases(&state)).transpose()?;
     let original =
         read_leaf(&directory, "authorized_keys", MAX_AUTHORIZED_KEYS, false)?.unwrap_or_default();
-    let normalized = normalize_managed_authorized_keys(&original, &entry.marker());
-    let entry = if let Some(public) = &request.ssh_public_key {
-        let ssh_key = EnrollmentPublicKey::parse(public)?;
-        let ssh_entry = AuthorizedKeyEntry::new(request.id, &receiver_path, &ssh_key)?;
-        if normalized
-            .split(|byte| *byte == b'\n')
-            .any(|line| line == ssh_entry.line().as_bytes())
-        {
-            ssh_entry
-        } else {
-            entry
-        }
-    } else {
-        entry
-    };
-    let (updated, _) = enrollment::revoke_authorized_key(&normalized, &entry)?;
-    atomic_write_locked(&directory, "authorized_keys", &updated, 0o600, false)?;
-    if let Some(state) = remove_state {
-        active::revoke(&state, leases.as_ref().expect("enrollment lease file"))?;
+    let (updated, change) = enrollment::remove_enrollment_line(&original, request.id, &entry_key)?;
+    if change == AuthorizedKeysChange::Revoked {
+        atomic_write_locked(&directory, "authorized_keys", &updated, 0o600, false)?;
+    }
+    if let Some(leases) = &leases {
+        active::revoke(&state, leases)?;
         fs::remove_dir_all(&state)
             .with_context(|| format!("remove revoked receiver state {}", state.display()))?;
-    }
-    let last_enrollment =
-        !contains_managed_enrollment(&updated) && directory_is_empty(&state_base)?;
-    if last_enrollment {
-        let installed_receiver = receiver_install_path(home);
-        if receiver_path != installed_receiver {
-            bail!(
-                "refusing to remove unexpected restricted receiver path {}",
-                receiver_path.display()
-            );
-        }
-        remove_final_enrollment_state_directories(home)?;
-        match fs::symlink_metadata(&installed_receiver) {
-            Ok(_) => {
-                delegation::validate_regular_executable(
-                    &installed_receiver,
-                    "restricted receiver",
-                )?;
-                fs::remove_file(&installed_receiver).with_context(|| {
-                    format!(
-                        "remove final restricted receiver {}",
-                        installed_receiver.display()
-                    )
-                })?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("inspect {}", installed_receiver.display()))
-            }
-        }
-        // `.local`, `share`, and `libexec` are general account directories.
-        // Without a durable record proving syq created them, preserve them
-        // even when the final enrollment leaves them empty.
     }
     drop(directory);
     println!("revoked {}", request.id);
     Ok(())
-}
-
-pub(super) fn normalize_managed_authorized_keys(original: &[u8], marker: &str) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(original.len());
-    for raw in original.split_inclusive(|byte| *byte == b'\n') {
-        let line = raw.strip_suffix(b"\n").unwrap_or(raw);
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let trimmed = line
-            .iter()
-            .copied()
-            .skip_while(u8::is_ascii_whitespace)
-            .collect::<Vec<_>>();
-        let commented_managed = trimmed.starts_with(b"#")
-            && line
-                .rsplit(|byte| byte.is_ascii_whitespace())
-                .find(|word| !word.is_empty())
-                == Some(marker.as_bytes());
-        if !commented_managed {
-            normalized.extend_from_slice(line);
-            normalized.push(b'\n');
-        }
-    }
-    normalized
-}
-
-/// Replace only the exact old forced authorization. A conflicting entry or
-/// duplicate remains an error; retries with the new entry are unchanged.
-fn replace_legacy_ssh_authorization(
-    original: &[u8],
-    new: &AuthorizedKeyEntry,
-    old: &AuthorizedKeyEntry,
-) -> Result<Vec<u8>> {
-    if original
-        .split(|byte| *byte == b'\n')
-        .any(|line| line == new.line().as_bytes())
-    {
-        return Ok(original.to_vec());
-    }
-    let (without_old, _) = enrollment::revoke_authorized_key(original, old)?;
-    Ok(without_old)
-}
-
-#[cfg(test)]
-mod separate_key_tests {
-    use super::*;
-
-    #[test]
-    fn upgrade_replaces_only_exact_legacy_authorization_and_is_retryable() {
-        let id = EnrollmentId::random();
-        let grant = generate_enrollment_key(id).unwrap();
-        let login = generate_enrollment_key(id).unwrap();
-        let entry = |key: &PrivateKey| {
-            AuthorizedKeyEntry::new(
-                id,
-                Path::new("/usr/bin/syq"),
-                &EnrollmentPublicKey::parse(&key.public_key().to_openssh().unwrap()).unwrap(),
-            )
-            .unwrap()
-        };
-        let old = entry(&grant);
-        let new = entry(&login);
-        let original = format!("# unrelated\n{}\n", old.line()).into_bytes();
-        let without = replace_legacy_ssh_authorization(&original, &new, &old).unwrap();
-        let (installed, _) = enrollment::install_authorized_key(&without, &new).unwrap();
-        assert_eq!(
-            installed,
-            format!("# unrelated\n{}\n", new.line()).as_bytes()
-        );
-        assert_eq!(
-            replace_legacy_ssh_authorization(&installed, &new, &old).unwrap(),
-            installed
-        );
-        let changed = original
-            .windows(b"restrict".len())
-            .position(|b| b == b"restrict")
-            .unwrap();
-        let mut conflicting = original.clone();
-        conflicting[changed] = b'X';
-        assert!(replace_legacy_ssh_authorization(&conflicting, &new, &old).is_err());
-        let duplicate = [original.as_slice(), original.as_slice()].concat();
-        assert!(replace_legacy_ssh_authorization(&duplicate, &new, &old).is_err());
-    }
 }

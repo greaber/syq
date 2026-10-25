@@ -544,6 +544,11 @@ pub struct Args {
     /// Laptop-trusted destination keys for the restricted coordinator's SSH connections
     #[arg(skip)]
     pub(crate) receiver_known_hosts: Option<String>,
+    /// A native remote coordinator's standard input starts with this many
+    /// bytes of the enrollment's entry key, for its SSH connections to the
+    /// restricted receiver.
+    #[arg(skip)]
+    pub(crate) entry_key_stdin: Option<usize>,
     /// Terminal width for a native remote coordinator's progress display
     #[arg(skip)]
     pub width: Option<usize>,
@@ -3232,6 +3237,13 @@ fn apply_internal_native_direct(args: &mut Args) -> Result<()> {
         );
     }
     args.receiver_known_hosts = utf8(crate::remote_to_remote::RECEIVER_KNOWN_HOSTS)?;
+    args.entry_key_stdin = utf8(crate::remote_to_remote::ENTRY_KEY_STDIN)?
+        .map(|bytes| {
+            bytes
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid internal entry key length"))
+        })
+        .transpose()?;
     args.plan_source_host = utf8("SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST")?;
     args.requester_stdin = utf8(crate::remote_to_remote::REQUESTER_STDIN)?
         .map(|bytes| {

@@ -10,6 +10,11 @@ use super::*;
 /// on this machine copying whole files, comparing blocks (`blocks`), or to
 /// a remote helper over SSH or TCP. `env` is set for syq and its helper.
 fn rsync_inplace(t: &Tmp, route: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
+    rsync_inplace_command(t, route, args, env).run().unwrap()
+}
+
+/// The command `rsync_inplace` runs.
+fn rsync_inplace_command(t: &Tmp, route: &str, args: &[&str], env: &[(&str, &str)]) -> Command {
     let mut command = compat_command();
     command.args(["-a", "--inplace", "--block-size=64K", "--no-progress"]);
     if matches!(route, "ssh" | "tcp") {
@@ -42,7 +47,8 @@ fn rsync_inplace(t: &Tmp, route: &str, args: &[&str], env: &[(&str, &str)]) -> O
         }
         command.args(args).arg(t.s("src/")).arg(t.s("dst/"));
     }
-    command.envs(env.iter().copied()).run().unwrap()
+    command.envs(env.iter().copied());
+    command
 }
 
 /// `syq cp --in-place=update` of the contents of `src` into `dst`, with
@@ -1179,6 +1185,210 @@ fn a_refused_file_changed_unseen_after_its_group_was_compared_gets_the_sources_b
         serde_json::json!({"other_names": 1})
     );
     assert!(partial_files(&t.0).is_empty());
+}
+
+/// The events `SYQ_TEST_REUSE_GUARDS` recorded in `log`, or None, with a
+/// note, where the receiver does not trust the test filesystem's leases.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn trusted_reuse_guards(log: &Path, case: &str) -> Option<Vec<String>> {
+    let events: Vec<String> = fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    if events.iter().any(|event| event.starts_with("untrusted ")) {
+        eprintln!("note: {case}: the test filesystem's leases are not trusted");
+        return None;
+    }
+    Some(events)
+}
+
+/// A file updated in place is leased when it is compared, too. One whose
+/// writer changes a block the patch reuses after the comparison, keeping its
+/// length and, with coarse change times, its fingerprint, breaks the lease:
+/// the receiver hashes those blocks again before it writes into the file,
+/// finds the change, and the file is copied again, with the source's bytes.
+/// One that no one wrote is updated in place after its fingerprint check.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn a_file_written_after_its_group_was_compared_is_hashed_again_before_its_update() {
+    use std::os::unix::fs::FileExt as _;
+    for route in ["blocks", "ssh"] {
+        let t = Tmp::new();
+        let mut sources = Vec::new();
+        for (seed, name) in [(800, "written"), (801, "untouched")] {
+            let new = prng(2 << 20, seed);
+            let mut old = new.clone();
+            old[(5 << 16) + 9] ^= 1;
+            write(&t.path(&format!("src/{name}")), &new);
+            write(&t.path(&format!("dst/{name}")), &old);
+            for side in ["src", "dst"] {
+                fs::set_permissions(
+                    t.path(&format!("{side}/{name}")),
+                    fs::Permissions::from_mode(0o644),
+                )
+                .unwrap();
+            }
+            set_mtime(&t.path(&format!("src/{name}")), 1_700_000_000);
+            set_mtime(&t.path(&format!("dst/{name}")), 1_600_000_000);
+            sources.push(new);
+        }
+        let untouched = inode(&t.path("dst/untouched"));
+        let (ready, continuation, guards) = (t.path("ready"), t.path("continue"), t.path("guards"));
+        let mut child = rsync_inplace_command(
+            &t,
+            route,
+            &[],
+            &[
+                ("SYQ_TEST_SMALL_HASHED_READY_FILE", &ready.to_string_lossy()),
+                (
+                    "SYQ_TEST_SMALL_HASHED_CONTINUE_FILE",
+                    &continuation.to_string_lossy(),
+                ),
+                ("SYQ_TEST_REUSE_GUARDS", &guards.to_string_lossy()),
+                ("SYQ_TEST_COARSE_CHANGE_TIMES", "1"),
+            ],
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+        wait_for_confinement_marker(&mut child, &ready, "the group's comparison");
+        OpenOptions::new()
+            .write(true)
+            .open(t.path("dst/written"))
+            .unwrap()
+            .write_all_at(b"planted", (20 << 16) + 3)
+            .unwrap();
+        release_confinement_barrier(&continuation);
+        let out = child.wait_with_output().unwrap();
+        assert_output_ok(&out);
+        let Some(events) = trusted_reuse_guards(&guards, route) else {
+            continue;
+        };
+        assert!(
+            read(&t.path("dst/written")) == sources[0],
+            "{route}: the planted bytes were kept"
+        );
+        for name in ["written", "untouched"] {
+            assert!(
+                events.contains(&format!("leased {name}")),
+                "{route}: {events:?}"
+            );
+        }
+        assert!(read(&t.path("dst/untouched")) == sources[1], "{route}");
+        assert_eq!(inode(&t.path("dst/untouched")), untouched, "{route}");
+        assert!(partial_files(&t.0).is_empty(), "{route}");
+    }
+}
+
+/// A comparison's intact lease must be released before opening its file
+/// for an in-place update. A truncate in that gap changes the fingerprint,
+/// so the receiver checks the reused blocks and retries instead of keeping
+/// holes that would become zeros in a successful copy.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn a_file_truncated_after_its_lease_is_released_gets_the_sources_bytes() {
+    for route in ["blocks", "ssh"] {
+        let t = Tmp::new();
+        let new = prng(2 << 20, 803);
+        let mut old = new.clone();
+        old[(5 << 16) + 9] ^= 1;
+        write(&t.path("src/file"), &new);
+        write(&t.path("dst/file"), &old);
+        for side in ["src", "dst"] {
+            fs::set_permissions(
+                t.path(&format!("{side}/file")),
+                fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
+        set_mtime(&t.path("src/file"), 1_700_000_000);
+        set_mtime(&t.path("dst/file"), 1_600_000_000);
+        let (ready, continuation, guards) = (t.path("ready"), t.path("continue"), t.path("guards"));
+        let mut child = rsync_inplace_command(
+            &t,
+            route,
+            &[],
+            &[
+                ("SYQ_TEST_SMALL_UPDATE_READY_FILE", &ready.to_string_lossy()),
+                (
+                    "SYQ_TEST_SMALL_UPDATE_CONTINUE_FILE",
+                    &continuation.to_string_lossy(),
+                ),
+                ("SYQ_TEST_REUSE_GUARDS", &guards.to_string_lossy()),
+                ("SYQ_TEST_COARSE_CHANGE_TIMES", "1"),
+            ],
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+        wait_for_confinement_marker(&mut child, &ready, "the write after releasing the lease");
+        // O_NONBLOCK would fail with EAGAIN if the read lease were still held.
+        OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(t.path("dst/file"))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        release_confinement_barrier(&continuation);
+        let out = child.wait_with_output().unwrap();
+        assert_output_ok(&out);
+        let Some(events) = trusted_reuse_guards(&guards, route) else {
+            continue;
+        };
+        assert!(
+            events.contains(&"leased file".to_owned()),
+            "{route}: {events:?}"
+        );
+        assert!(
+            read(&t.path("dst/file")) == new,
+            "{route}: the truncate left zeros in a successful copy"
+        );
+        assert!(partial_files(&t.0).is_empty(), "{route}");
+    }
+}
+
+/// A file compared in a group only to see whether it is unchanged
+/// (`--checksum` copying whole files) is leased like any other. When it
+/// differs it is copied on its own, which opens it to update it in place
+/// while its comparison may still hold the lease: the receiver lets that
+/// lease go, and the update goes ahead.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn a_file_compared_in_a_group_and_then_copied_alone_is_updated_in_place() {
+    for route in ["ssh", "tcp"] {
+        let t = Tmp::new();
+        let new = prng(2 << 20, 802);
+        let mut old = new.clone();
+        old[(5 << 16) + 9] ^= 1;
+        write(&t.path("src/file"), &new);
+        write(&t.path("dst/file"), &old);
+        for side in ["src", "dst"] {
+            fs::set_permissions(
+                t.path(&format!("{side}/file")),
+                fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+            set_mtime(&t.path(&format!("{side}/file")), 1_700_000_000);
+        }
+        let before = inode(&t.path("dst/file"));
+        let guards = t.path("guards");
+        let out = rsync_inplace(
+            &t,
+            route,
+            &["--checksum", "--whole-file"],
+            &[("SYQ_TEST_REUSE_GUARDS", &guards.to_string_lossy())],
+        );
+        assert_output_ok(&out);
+        assert!(read(&t.path("dst/file")) == new, "{route}");
+        assert_eq!(inode(&t.path("dst/file")), before, "{route}");
+        if let Some(events) = trusted_reuse_guards(&guards, route) {
+            assert_eq!(events, ["leased file"], "{route}");
+        }
+    }
 }
 
 /// Under `--existing` small existing files are updated in place in groups

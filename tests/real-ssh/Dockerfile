@@ -139,4 +139,4 @@ COPY tests/real-ssh/test-receiver-keys.py /usr/local/libexec/syq-test-receiver-k
 COPY tests/real-ssh/timeout-diagnostics.py /usr/lib/python3/dist-packages/syq_real_ssh_timeouts.py
 RUN printf 'import syq_real_ssh_timeouts\n' > /usr/lib/python3/dist-packages/syq-real-ssh-timeouts.pth
 
-COPY tests/real-ssh/test-receiver-separate-keys.py /usr/local/libexec/syq-test-receiver-separate-keys.py
+COPY tests/real-ssh/test-receiver-old-openssh.py /usr/local/libexec/syq-test-receiver-old-openssh.py

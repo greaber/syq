@@ -288,6 +288,32 @@ impl FsOps {
     pub(crate) fn set_planning_lookups(&mut self, lookups: Option<Arc<PlanningLookups>>) {
         self.planning_lookups = lookups;
     }
+
+    /// The destination directories this executor has listed before its
+    /// lookups, or found it need not list. Another executor for the same
+    /// destination given them with `settle_listings` does not list them
+    /// again.
+    pub(crate) fn settled_listings(&self) -> Vec<PathBytes> {
+        #[cfg(target_os = "linux")]
+        return self
+            .listing_requests
+            .iter()
+            .filter(|(_, asked)| asked.is_none())
+            .map(|(directory, _)| directory.clone())
+            .collect();
+        #[cfg(not(target_os = "linux"))]
+        Vec::new()
+    }
+
+    /// Treat `directories` of the destination as listed already.
+    pub(crate) fn settle_listings(&mut self, directories: &[PathBytes]) {
+        #[cfg(target_os = "linux")]
+        for directory in directories {
+            self.listing_requests.insert(directory.clone(), None);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = directories;
+    }
 }
 
 #[cfg(test)]

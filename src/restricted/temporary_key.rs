@@ -87,7 +87,7 @@ mod tests {
                 drop(UnixListener::bind(&socket).unwrap());
             }
             let public = || {
-                generate_enrollment_key(EnrollmentId::random())
+                generate_test_key("syq-test")
                     .unwrap()
                     .public_key()
                     .to_openssh()
@@ -126,7 +126,7 @@ mod tests {
         fs::create_dir(&ssh).unwrap();
         let path = ssh.join("authorized_keys");
         fs::write(&path, b"# original without final newline").unwrap();
-        let key = generate_enrollment_key(EnrollmentId::random()).unwrap();
+        let key = generate_test_key("syq-test").unwrap();
         let public = key.public_key().to_openssh().unwrap();
         let guard =
             TemporaryKey::install_at(root.path(), Path::new("/usr/bin/syq"), &public, "ticket")
@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn unsafe_key_and_worker_command_are_rejected_before_writes() {
         let root = crate::test_support::tempdir().unwrap();
-        let key = generate_enrollment_key(EnrollmentId::random()).unwrap();
+        let key = generate_test_key("syq-test").unwrap();
         let public = key.public_key().to_openssh().unwrap();
         for (key, ticket) in [("bad", "ticket"), (public.as_str(), "ticket;id")] {
             assert!(

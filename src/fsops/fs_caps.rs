@@ -430,6 +430,44 @@ pub(crate) fn fixed_owners_and_modes(path: &std::path::Path) -> bool {
     }
 }
 
+/// Whether a read lease on `file` shows every write to it (`leases`): the
+/// filesystem grants leases, and its files change only through opens in
+/// this kernel, which break them. Tested on ext4, XFS, Btrfs, tmpfs and
+/// OpenZFS 2.4 (whose `zpl_file.c` uses `generic_setlease`): an open for
+/// writing or a truncate breaks a lease, and a file open for writing, or
+/// mapped writable and shared, is refused one. Network filesystems, FUSE and
+/// overlayfs are not trusted: another client, a FUSE server or a write to an
+/// overlay's layers changes a file without opening it here, and FUSE grants
+/// leases that such writes leave intact. Debug builds given
+/// `SYQ_TEST_LEASES=unsupported` trust no filesystem.
+#[cfg(target_os = "linux")]
+pub(crate) fn leases_show_writers(file: &File) -> bool {
+    use std::os::fd::AsRawFd;
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SYQ_TEST_LEASES").is_some_and(|value| value == "unsupported") {
+        return false;
+    }
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: fstatfs writes only into the local structure.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let stats = unsafe { stats.assume_init() };
+    linux_leases_show_writers(stats.f_type as u32)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_leases_show_writers(file_system_type: u32) -> bool {
+    matches!(
+        file_system_type,
+        0xef53 // ext2, ext3, ext4
+            | 0x5846_5342 // XFS
+            | 0x9123_683e // btrfs
+            | 0x0102_1994 // tmpfs
+            | ZFS_SUPER_MAGIC
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn linux_fixed_owners_and_modes(file_system_type: u32) -> bool {
     matches!(
@@ -864,6 +902,34 @@ mod tests {
             libc::FUSE_SUPER_MAGIC as u32,
         ] {
             assert!(!linux_fixed_owners_and_modes(kind), "{kind:#x}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn leases_are_trusted_only_on_local_filesystems_that_break_them() {
+        for kind in [
+            0xef53,
+            0x5846_5342,
+            0x9123_683e,
+            0x0102_1994,
+            ZFS_SUPER_MAGIC,
+        ] {
+            assert!(linux_leases_show_writers(kind), "{kind:#x}");
+        }
+        for kind in [
+            libc::NFS_SUPER_MAGIC as u32,
+            libc::FUSE_SUPER_MAGIC as u32,
+            0x794c_7630, // overlayfs
+            CIFS_SUPER_MAGIC,
+            SMB2_SUPER_MAGIC,
+            CEPH_SUPER_MAGIC,
+            GFS2_SUPER_MAGIC,
+            V9FS_MAGIC,
+            F2FS_SUPER_MAGIC,
+            0x4d44,
+        ] {
+            assert!(!linux_leases_show_writers(kind), "{kind:#x}");
         }
     }
 

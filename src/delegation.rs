@@ -2,19 +2,21 @@
 //!
 //! The forced receiver verifies and redeems a grant here, then converts the
 //! resulting `VerifiedGrant` into `restricted::RestrictedAuthority`. That
-//! separate type binds every protocol request to the enrolled filesystem root;
-//! verification by itself remains deliberately incapable of filesystem access.
+//! separate type binds every protocol request to the destination it resolves
+//! in the session; verification by itself remains deliberately incapable of
+//! filesystem access.
 //!
 //! The wire representation deliberately signs a typed, canonical binary grant
 //! rather than a command line. The signature is an OpenSSH SSHSIG in the fixed
-//! [`SSHSIG_NAMESPACE`], verified by OpenSSH against an explicit allowed-signers
-//! policy. A fresh random [`RequestId`] is a replay nonce; durable redeeming gives
-//! at-most-once redemption, not exactly-once execution across a receiver crash.
+//! [`SSHSIG_NAMESPACE`], made by the user's login key and verified here in
+//! Rust against the [`TrustedSigner`] the enrollment recorded, including a FIDO
+//! key's touch and PIN flags and a certificate's expiry. A fresh random
+//! [`RequestId`] is a replay nonce; durable redeeming gives at-most-once
+//! redemption, not exactly-once execution across a receiver crash.
 //! The ID is a separate type and size from the stable copy IDs in
 //! `proto`.
-//! Redeemed IDs are rejected from the pinned redeem store before invoking the
-//! verifier. Each verifier runs in an isolated process group with a 30-second
-//! deadline; a timeout kills the group before request handling returns.
+//! Redeemed IDs are rejected from the pinned redeem store before the signature
+//! is checked.
 //!
 //! "Durable" here means that redeem contents and directory-entry changes are
 //! flushed with ordinary `fsync` through [`File::sync_all`] on a local filesystem
@@ -30,10 +32,9 @@
 //! mode, and ACL walks over ancestor directories are deliberately not part of
 //! sender confinement: the receiver account and its local filesystem are in
 //! the trusted boundary. The restricted receiver instead prevents signed copy
-//! scopes from overlapping its executable, SSH configuration, verifier, or
-//! enrollment state.
+//! scopes from overlapping its executables, SSH configuration, or enrollment
+//! state.
 
-use crate::process::CommandExt as _;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -45,9 +46,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -58,10 +57,6 @@ const WIRE_HEADER_LEN: usize = WIRE_MAGIC.len() + 4 + 4;
 const MAX_GRANT_BYTES: usize = 32 * 1024;
 const MAX_SIGNATURE_BYTES: usize = 16 * 1024;
 const MAX_ENVELOPE_BYTES: usize = WIRE_HEADER_LEN + MAX_GRANT_BYTES + MAX_SIGNATURE_BYTES;
-const MAX_POLICY_BYTES: usize = 1024 * 1024;
-const MAX_REVOCATION_BYTES: usize = 4 * 1024 * 1024;
-const MAX_VERIFIER_OUTPUT_BYTES: usize = 4096;
-const VERIFIER_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const MAX_PATH_BYTES: usize = 4096;
 const MAX_LOGIN_BYTES: usize = 256;
 const MAX_SIGNER_BYTES: usize = 512;
@@ -124,7 +119,7 @@ pub(crate) enum GrantOperation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CopyOperation {
     /// Canonically spelled absolute target path. This is only a signed name;
-    /// receiver authorization resolves it beneath the enrolled root handle.
+    /// receiver authorization resolves it beneath the confinement root handle.
     pub destination: Vec<u8>,
     /// Exact receiver-side mutation roots derived locally from the source
     /// spellings. A scope may authorize the named object alone or its subtree.
@@ -421,7 +416,7 @@ impl FilterPolicy {
 }
 
 /// Signed precondition on the placement root itself. The receiver checks it
-/// once against the enrolled root when the grant is redeemed, and `New`
+/// once against the confinement root when the grant is redeemed, and `New`
 /// additionally forces no-replace creation of that root, so a remote source
 /// coordinator cannot turn `--into-new` into an update of an existing tree.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -455,14 +450,14 @@ pub(crate) struct ExtraCopyOptions {
     /// existing directories still take the copy's metadata.
     pub keep_files: bool,
     /// `--follow-dst` with `--into`: when the destination is a symlink, the
-    /// copy goes into the directory it resolves to inside the enrolled root.
+    /// copy goes into the directory it resolves to inside the confinement root.
     pub follow_dst: bool,
 }
 
 /// Which existing destination directories the receiver may briefly give the
 /// owner permission the copy needs, as `--widen-dirs` names them: none, the
 /// ones the copy includes, or also the directory the copy goes into. Never
-/// one above the enrolled root.
+/// one above the confinement root.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum DirectoryWidening {
     #[default]
@@ -1079,247 +1074,249 @@ impl ReceiverContext<'_> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct SshsigPolicy {
-    pub ssh_keygen: PathBuf,
-    pub allowed_signers: PathBuf,
-    pub revocation_file: Option<PathBuf>,
+/// The login key a receiver trusts to sign its grants, with what each
+/// signature must also show: a FIDO key's touch (user presence) and PIN (user
+/// verification) flags, and a certificate login's expiry. Verification is
+/// done here in Rust; no other program takes part.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TrustedSigner {
+    /// The login key, as an OpenSSH public key without a comment. For a
+    /// certificate login it is the certificate's own key.
+    pub public_key: String,
+    /// For a FIDO key, the flags every signature must carry: 1 for touch and
+    /// 4 for PIN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_key_flags: Option<u8>,
+    /// For a certificate login, when the certificate stops being valid, in
+    /// seconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_before: Option<u64>,
 }
 
-impl SshsigPolicy {
-    fn verify(
-        &self,
-        store: &ReplayStore,
-        signer: &str,
-        signature: &[u8],
-        payload: &[u8],
-    ) -> Result<()> {
-        validate_regular_executable(&self.ssh_keygen, "SSHSIG verifier")?;
-        let allowed = read_private_regular(
-            &self.allowed_signers,
-            "allowed-signers policy",
-            MAX_POLICY_BYTES,
-        )?;
-        let revocation = self
-            .revocation_file
-            .as_ref()
-            .map(|path| {
-                read_private_regular(path, "SSHSIG revocation policy", MAX_REVOCATION_BYTES)
-            })
-            .transpose()?;
-        let signature_file = store.temporary_file("signature", signature)?;
-        let allowed_file = store.temporary_file("allowed-signers", &allowed)?;
-        let revocation_file = revocation
-            .as_deref()
-            .map(|contents| store.temporary_file("revocations", contents))
-            .transpose()?;
+/// FIDO signature flags: user presence (touch) and user verification (PIN).
+pub(crate) const SK_USER_PRESENCE: u8 = 0x01;
+pub(crate) const SK_USER_VERIFICATION: u8 = 0x04;
 
-        // Reserve CLOEXEC descriptor numbers in the parent, then map the
-        // read-only snapshots onto those numbers in the forked child only.
-        // This avoids a process-wide inheritance window while still making
-        // ssh-keygen consume the exact pinned inodes through /dev/fd.
-        let signature_child = VerifierSnapshotFd::reserve(&signature_file, 64)
-            .context("reserve signature descriptor for verifier")?;
-        let allowed_child = VerifierSnapshotFd::reserve(&allowed_file, 64)
-            .context("reserve allowed-signers descriptor for verifier")?;
-        let revocation_child = revocation_file
-            .as_ref()
-            .map(|file| VerifierSnapshotFd::reserve(file, 64))
-            .transpose()
-            .context("reserve revocation descriptor for verifier")?;
-
-        let mut command = Command::new(&self.ssh_keygen);
-        command
-            .env_clear()
-            .args(["-Y", "verify", "-f"])
-            .arg(allowed_child.path())
-            .args(["-I", signer, "-n", SSHSIG_NAMESPACE, "-s"])
-            .arg(signature_child.path());
-        if let Some(revocation) = &revocation_child {
-            // ssh-keygen opens a plain-text revocation list twice: once to
-            // probe for KRL magic and again to scan keys. On Darwin an open of
-            // /dev/fd/N duplicates the descriptor and shares its offset, so the
-            // second pass would start at EOF and a revoked key would verify.
-            // macOS therefore names the snapshot relative to the store's
-            // retained directory descriptor, which the child enters with
-            // fchdir below, so a replaced path cannot substitute the list.
-            let argument = if cfg!(target_os = "macos") {
-                PathBuf::from(
-                    &revocation_file
-                        .as_ref()
-                        .expect("revocation snapshot exists when its descriptor does")
-                        .name,
-                )
-            } else {
-                revocation.path()
-            };
-            command.arg("-r").arg(argument);
-        }
-        let mut mappings = vec![signature_child.mapping(), allowed_child.mapping()];
-        if let Some(revocation) = &revocation_child {
-            mappings.push(revocation.mapping());
-        }
-        let store_directory = if cfg!(target_os = "macos") && revocation_child.is_some() {
-            Some(store.directory.as_raw_fd())
-        } else {
-            None
+impl TrustedSigner {
+    pub(crate) fn new(
+        key: &ssh_key::PublicKey,
+        security_key_flags: Option<u8>,
+        valid_before: Option<u64>,
+    ) -> Result<Self> {
+        let mut plain = ssh_key::PublicKey::new(key.key_data().clone(), "");
+        plain.set_comment("");
+        let signer = Self {
+            public_key: plain.to_openssh().context("encode the trusted login key")?,
+            security_key_flags,
+            valid_before,
         };
-        unsafe {
-            command.pre_exec(move || {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                if let Some(directory) = store_directory {
-                    if libc::fchdir(directory) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
-                for (source, target) in &mappings {
-                    dup2_retry(*source, *target)?;
-                }
-                Ok(())
-            });
+        signer.validate()?;
+        Ok(signer)
+    }
+
+    pub(crate) fn key(&self) -> Result<ssh_key::PublicKey> {
+        ssh_key::PublicKey::from_openssh(&self.public_key).context("parse the trusted login key")
+    }
+
+    /// Whether the key is one whose signatures can be checked and carry
+    /// FIDO flags exactly when it is a FIDO key.
+    pub(crate) fn validate(&self) -> Result<()> {
+        use ssh_key::Algorithm;
+        let key = self.key()?;
+        let security_key = matches!(
+            key.algorithm(),
+            Algorithm::SkEd25519 | Algorithm::SkEcdsaSha2NistP256
+        );
+        match key.algorithm() {
+            Algorithm::Ed25519
+            | Algorithm::Ecdsa { .. }
+            | Algorithm::Rsa { .. }
+            | Algorithm::SkEd25519
+            | Algorithm::SkEcdsaSha2NistP256 => {}
+            algorithm => bail!("syq cannot check signatures made with a {algorithm} login key"),
         }
-        let child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn_guarded()
-            .context("start trusted ssh-keygen SSHSIG verifier")?;
-        let output = wait_for_verifier(child, payload, VERIFIER_TIMEOUT)?;
-        if !output.status.success() {
-            let diagnostic = String::from_utf8_lossy(&output.stderr);
-            let diagnostic: String = diagnostic
-                .trim()
-                .chars()
-                .take(MAX_VERIFIER_OUTPUT_BYTES)
-                .collect();
-            if diagnostic.is_empty() {
-                bail!("SSHSIG verification failed");
+        match (security_key, self.security_key_flags) {
+            (true, Some(flags)) if flags & !(SK_USER_PRESENCE | SK_USER_VERIFICATION) == 0 => {}
+            (true, Some(_)) => bail!("unsupported FIDO touch and PIN policy"),
+            (true, None) => bail!("a FIDO login key needs a touch and PIN policy"),
+            (false, Some(_)) => bail!("a touch and PIN policy applies only to a FIDO login key"),
+            (false, None) => {}
+        }
+        if let Some(bits) = rsa_bits(key.key_data()) {
+            if bits < MIN_RSA_BITS {
+                bail!("RSA login keys need at least {MIN_RSA_BITS} bits; this one has {bits}");
             }
-            bail!("SSHSIG verification failed: {diagnostic}");
+            if bits > MAX_RSA_BITS {
+                bail!(
+                    "syq checks RSA login keys of up to {MAX_RSA_BITS} bits; this one has {bits}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The SHA-256 fingerprint of the trusted key, as `ssh-keygen -l` shows it.
+    pub(crate) fn fingerprint(&self) -> Result<String> {
+        Ok(self.key()?.fingerprint(HashAlg::Sha256).to_string())
+    }
+
+    /// Check one armored SSHSIG over `payload` in `namespace`: made by this
+    /// key, with the flags a FIDO key must show, while a certificate is
+    /// still valid at `now`.
+    pub(crate) fn verify(
+        &self,
+        namespace: &str,
+        payload: &[u8],
+        armored: &[u8],
+        now: i64,
+    ) -> Result<()> {
+        self.validate()?;
+        if let Some(valid_before) = self.valid_before {
+            if u64::try_from(now).map_or(true, |now| now >= valid_before) {
+                bail!("the login certificate this receiver trusts has expired; the next copy from your machine renews it");
+            }
+        }
+        let key = self.key()?;
+        let signature = ssh_key::SshSig::from_pem(armored).context("parse the SSH signature")?;
+        if signature.namespace() != namespace {
+            bail!("the signature was made for another purpose");
+        }
+        if !signature.reserved().is_empty() {
+            bail!("the signature carries reserved data");
+        }
+        if signature.public_key() != key.key_data() {
+            bail!("the signature was made by a key this receiver does not trust");
+        }
+        let signed = ssh_key::SshSig::signed_data(namespace, signature.hash_alg(), payload)?;
+        verify_signature(key.key_data(), &signed, signature.signature())
+            .map_err(|_| anyhow!("the signature does not verify with the trusted login key"))?;
+        if let Some(required) = self.security_key_flags {
+            let flags = security_key_flags(&signature)?;
+            if flags & required != required {
+                bail!(
+                    "the signature lacks the FIDO {} this receiver requires",
+                    match (
+                        required & !flags & SK_USER_PRESENCE != 0,
+                        required & !flags & SK_USER_VERIFICATION != 0,
+                    ) {
+                        (true, true) => "touch and PIN",
+                        (true, false) => "touch",
+                        _ => "PIN",
+                    }
+                );
+            }
         }
         Ok(())
     }
 }
 
-#[derive(Debug)]
-struct VerifierOutput {
-    status: ExitStatus,
-    stderr: Vec<u8>,
+/// The largest RSA login key syq checks signatures from.
+pub(crate) const MAX_RSA_BITS: usize = 16384;
+/// The smallest RSA login key a receiver trusts.
+pub(crate) const MIN_RSA_BITS: usize = 2048;
+
+/// The size of an RSA key's modulus in bits.
+pub(crate) fn rsa_bits(key: &ssh_key::public::KeyData) -> Option<usize> {
+    let modulus = key.rsa()?.n.as_positive_bytes()?;
+    Some(modulus.first().map_or(0, |first| {
+        modulus.len() * 8 - first.leading_zeros() as usize
+    }))
 }
 
-fn wait_for_verifier(
-    mut child: Child,
-    payload: &[u8],
-    timeout: Duration,
-) -> Result<VerifierOutput> {
-    let process_group =
-        libc::pid_t::try_from(child.id()).context("SSHSIG verifier process ID is out of range")?;
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| anyhow!("SSHSIG verifier timeout overflow"))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("SSHSIG verifier stdin unavailable"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("SSHSIG verifier stdout unavailable"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("SSHSIG verifier stderr unavailable"))?;
-    let payload = payload.to_vec();
-    let writer = match thread::Builder::new()
-        .name("syq-sshsig-input".into())
-        .spawn(move || stdin.write_all(&payload))
-    {
-        Ok(worker) => worker,
-        Err(error) => {
-            terminate_verifier(&mut child, process_group);
-            return Err(error).context("start SSHSIG verifier input worker");
-        }
+/// Check `signature` over `data` with `key`. RSA goes through the rsa crate
+/// directly: ssh-key 0.6.7 builds RSA public keys with
+/// `rsa::RsaPublicKey::new`, which refuses moduli over 4,096 bits, so
+/// signatures from larger login keys would never verify.
+pub(crate) fn verify_signature(
+    key: &ssh_key::public::KeyData,
+    data: &[u8],
+    signature: &ssh_key::Signature,
+) -> Result<()> {
+    use signature::Verifier as _;
+    let Some(rsa_key) = key.rsa() else {
+        return key
+            .verify(data, signature)
+            .map_err(|_| anyhow!("the signature does not verify"));
     };
-    let stdout_reader = match thread::Builder::new()
-        .name("syq-sshsig-output".into())
-        .spawn(move || read_verifier_output(stdout))
-    {
-        Ok(worker) => worker,
-        Err(error) => {
-            terminate_verifier(&mut child, process_group);
-            let _ = writer.join();
-            return Err(error).context("start SSHSIG verifier output worker");
-        }
+    let public = rsa::RsaPublicKey::new_with_max_size(
+        rsa::BigUint::from_bytes_be(rsa_key.n.as_positive_bytes().context("RSA modulus")?),
+        rsa::BigUint::from_bytes_be(rsa_key.e.as_positive_bytes().context("RSA exponent")?),
+        MAX_RSA_BITS,
+    )
+    .context("unsupported RSA key")?;
+    let rsa_signature = rsa::pkcs1v15::Signature::try_from(signature.as_bytes())
+        .map_err(|_| anyhow!("malformed RSA signature"))?;
+    let verified = match signature.algorithm() {
+        ssh_key::Algorithm::Rsa {
+            hash: Some(HashAlg::Sha256),
+        } => rsa::pkcs1v15::VerifyingKey::<sha2_compat::Sha256>::new(public)
+            .verify(data, &rsa_signature),
+        ssh_key::Algorithm::Rsa {
+            hash: Some(HashAlg::Sha512),
+        } => rsa::pkcs1v15::VerifyingKey::<sha2_compat::Sha512>::new(public)
+            .verify(data, &rsa_signature),
+        algorithm => bail!("an RSA key cannot have made a {algorithm} signature"),
     };
-    let stderr_reader = match thread::Builder::new()
-        .name("syq-sshsig-diagnostic".into())
-        .spawn(move || read_verifier_output(stderr))
-    {
-        Ok(worker) => worker,
-        Err(error) => {
-            terminate_verifier(&mut child, process_group);
-            let _ = writer.join();
-            let _ = stdout_reader.join();
-            return Err(error).context("start SSHSIG verifier diagnostic worker");
-        }
-    };
-
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(error) => {
-                terminate_verifier(&mut child, process_group);
-                let _ = writer.join();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(error).context("poll SSHSIG verifier");
-            }
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            // pre_exec creates a dedicated process group, so descendants cannot
-            // keep the verifier pipes or receiver resources alive after timeout.
-            terminate_verifier(&mut child, process_group);
-            let _ = writer.join();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            bail!("SSHSIG verifier exceeded its configured timeout");
-        }
-        thread::sleep((deadline - now).min(Duration::from_millis(10)));
-    };
-
-    writer
-        .join()
-        .map_err(|_| anyhow!("SSHSIG verifier input worker panicked"))?
-        .context("write SSHSIG verification payload")?;
-    stdout_reader
-        .join()
-        .map_err(|_| anyhow!("SSHSIG verifier output worker panicked"))??;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| anyhow!("SSHSIG verifier diagnostic worker panicked"))??;
-    Ok(VerifierOutput { status, stderr })
+    verified.map_err(|_| anyhow!("the signature does not verify"))
 }
 
-fn terminate_verifier(child: &mut Child, process_group: libc::pid_t) {
-    let _ = unsafe { libc::kill(-process_group, libc::SIGKILL) };
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn read_verifier_output(mut output: impl Read) -> io::Result<Vec<u8>> {
-    let mut contents = Vec::new();
-    output
-        .by_ref()
-        .take(MAX_VERIFIER_OUTPUT_BYTES as u64 + 1)
-        .read_to_end(&mut contents)?;
-    if contents.len() > MAX_VERIFIER_OUTPUT_BYTES {
-        contents.truncate(MAX_VERIFIER_OUTPUT_BYTES);
+/// The armored SSHSIG of `signature`, made by `key` over a message hashed
+/// with `hash` in `namespace`.
+///
+/// Syq writes the blob itself instead of using `ssh_key::SshSig::to_pem`.
+/// In ssh-key 0.6.7, `Signature`'s `Encode` splits off the flags byte and
+/// counter of a FIDO signature only for `sk-ssh-ed25519@openssh.com`; for
+/// `sk-ecdsa-sha2-nistp256@openssh.com` it writes them inside the signature
+/// string. `SshSig::from_pem` then fails on the result with "length
+/// invalid", and OpenSSH cannot read it either, so every grant signed with
+/// a FIDO ECDSA login key would be refused. Decoding is correct.
+pub(crate) fn armored_sshsig(
+    key: &ssh_key::public::KeyData,
+    namespace: &str,
+    hash: HashAlg,
+    signature: &ssh_key::Signature,
+) -> Result<Vec<u8>> {
+    use ssh_agent_lib::ssh_encoding::Encode as _;
+    let mut encoded = Vec::new();
+    signature.algorithm().as_str().encode(&mut encoded)?;
+    let bytes = signature.as_bytes();
+    match signature.algorithm() {
+        ssh_key::Algorithm::SkEd25519 | ssh_key::Algorithm::SkEcdsaSha2NistP256 => {
+            // The flags byte and the 4-byte counter follow the signature.
+            let split = bytes
+                .len()
+                .checked_sub(5)
+                .context("truncated FIDO signature")?;
+            bytes[..split].encode(&mut encoded)?;
+            encoded.extend_from_slice(&bytes[split..]);
+        }
+        _ => bytes.encode(&mut encoded)?,
     }
-    Ok(contents)
+    let mut blob = b"SSHSIG".to_vec();
+    1u32.encode(&mut blob)?;
+    key.encode_prefixed(&mut blob)?;
+    namespace.encode(&mut blob)?;
+    b"".as_slice().encode(&mut blob)?;
+    hash.as_str().encode(&mut blob)?;
+    encoded.encode(&mut blob)?;
+    Ok(canonical_sshsig_armor(&blob))
+}
+
+/// The flags of a FIDO signature: user presence and user verification.
+pub(crate) fn security_key_flags(signature: &ssh_key::SshSig) -> Result<u8> {
+    if !matches!(
+        signature.algorithm(),
+        ssh_key::Algorithm::SkEd25519 | ssh_key::Algorithm::SkEcdsaSha2NistP256
+    ) {
+        bail!("the signature was not made by a FIDO key");
+    }
+    // A FIDO signature ends with its flags byte and a 4-byte counter.
+    let bytes = signature.signature_bytes();
+    let index = bytes
+        .len()
+        .checked_sub(5)
+        .context("truncated FIDO signature")?;
+    Ok(bytes[index])
 }
 
 /// Evidence that the signature, target binding, time bounds, and one-time
@@ -1401,20 +1398,24 @@ impl VerifiedGrant {
 pub(crate) fn verify_and_redeem(
     encoded: &[u8],
     context: &ReceiverContext<'_>,
-    policy: &SshsigPolicy,
+    signer: &TrustedSigner,
     replay: &ReplayStore,
 ) -> Result<VerifiedGrant> {
     let envelope = SignedGrantEnvelope::decode(encoded)?;
-    context.validate_at(&envelope.grant, Instant::now())?;
+    let observed_at = Instant::now();
+    context.validate_at(&envelope.grant, observed_at)?;
     let payload = envelope.signing_payload()?;
     let replay_digest: [u8; 32] = Sha256::digest(&payload).into();
     let grant_digest = grant_transcript_digest(&payload);
     replay.reject_if_redeemed(envelope.grant.request_id, replay_digest)?;
-    policy.verify(
-        replay,
-        context.expected_signer,
-        &envelope.signature,
+    // A certificate's expiry is judged with the clock skew in the signer's
+    // favour, like the grant's own start-by time.
+    let (_, latest_now) = context.wall_time_bounds_at(observed_at)?;
+    signer.verify(
+        SSHSIG_NAMESPACE,
         &payload,
+        &envelope.signature,
+        latest_now.saturating_sub(context.clock_skew_seconds),
     )?;
     replay.redeem_after_lock(envelope.grant.request_id, replay_digest, || {
         context.validate_at(&envelope.grant, Instant::now())
@@ -1606,117 +1607,6 @@ impl ReplayStore {
         }
         Ok(())
     }
-
-    fn temporary_file(&self, label: &str, contents: &[u8]) -> Result<TemporaryStateFile> {
-        let name = format!(".{label}-{}.tmp", hex(&random_array::<16>()?));
-        let cleanup_name = name.clone();
-        let mut writable = openat_file(
-            self.directory.as_raw_fd(),
-            &name,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            0o600,
-        )
-        .with_context(|| format!("create private {label} file"))?;
-        let result = (|| -> Result<TemporaryStateFile> {
-            validate_private_file(&writable, label)?;
-            writable
-                .write_all(contents)
-                .with_context(|| format!("write private {label} file"))?;
-            writable
-                .flush()
-                .with_context(|| format!("flush private {label} file"))?;
-            let file = openat_file(
-                self.directory.as_raw_fd(),
-                &name,
-                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                0,
-            )
-            .with_context(|| format!("reopen private {label} file read-only"))?;
-            validate_private_file(&file, label)?;
-            let written_metadata = writable.metadata()?;
-            let read_metadata = file.metadata()?;
-            if written_metadata.dev() != read_metadata.dev()
-                || written_metadata.ino() != read_metadata.ino()
-            {
-                bail!("private {label} file changed while making a verifier snapshot");
-            }
-            drop(writable);
-            Ok(TemporaryStateFile {
-                directory: Arc::clone(&self.directory),
-                name,
-                file,
-            })
-        })();
-        if result.is_err() {
-            let _ = unlinkat(self.directory.as_raw_fd(), &cleanup_name);
-        }
-        result
-    }
-}
-
-struct TemporaryStateFile {
-    directory: Arc<File>,
-    name: String,
-    file: File,
-}
-
-impl TemporaryStateFile {
-    fn is_read_only(&self) -> io::Result<bool> {
-        descriptor_is_read_only(self.file.as_raw_fd())
-    }
-
-    fn is_close_on_exec(&self) -> io::Result<bool> {
-        descriptor_is_close_on_exec(self.file.as_raw_fd())
-    }
-}
-
-struct VerifierSnapshotFd {
-    source: RawFd,
-    child: File,
-}
-
-impl VerifierSnapshotFd {
-    fn reserve(snapshot: &TemporaryStateFile, minimum: libc::c_int) -> io::Result<Self> {
-        if !snapshot.is_read_only()? || !snapshot.is_close_on_exec()? {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "verifier snapshot must be read-only and close-on-exec",
-            ));
-        }
-        let fd = unsafe { libc::fcntl(snapshot.file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, minimum) };
-        if fd == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        let reserved = Self {
-            source: snapshot.file.as_raw_fd(),
-            child: unsafe { File::from_raw_fd(fd) },
-        };
-        if !reserved.is_close_on_exec()? || !descriptor_is_read_only(reserved.child.as_raw_fd())? {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "reserved verifier descriptor must be read-only and close-on-exec",
-            ));
-        }
-        Ok(reserved)
-    }
-
-    fn path(&self) -> PathBuf {
-        PathBuf::from(format!("/dev/fd/{}", self.child.as_raw_fd()))
-    }
-
-    fn mapping(&self) -> (RawFd, RawFd) {
-        (self.source, self.child.as_raw_fd())
-    }
-
-    fn is_close_on_exec(&self) -> io::Result<bool> {
-        descriptor_is_close_on_exec(self.child.as_raw_fd())
-    }
-}
-
-impl Drop for TemporaryStateFile {
-    fn drop(&mut self) {
-        let _ = unlinkat(self.directory.as_raw_fd(), &self.name);
-    }
 }
 
 pub(crate) fn validate_private_directory(directory: &File, path: &Path) -> Result<()> {
@@ -1846,36 +1736,6 @@ fn openat_os_file(
         let fd = unsafe { libc::openat(directory, name.as_ptr(), flags, mode) };
         if fd >= 0 {
             return Ok(unsafe { File::from_raw_fd(fd) });
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-}
-
-fn descriptor_is_read_only(fd: RawFd) -> io::Result<bool> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(flags & libc::O_ACCMODE == libc::O_RDONLY)
-}
-
-fn descriptor_is_close_on_exec(fd: RawFd) -> io::Result<bool> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(flags & libc::FD_CLOEXEC != 0)
-}
-
-// Called from CommandExt::pre_exec. Keep this to async-signal-safe dup2(2),
-// errno inspection, and bounded stack-only control flow.
-fn dup2_retry(source: RawFd, target: RawFd) -> io::Result<()> {
-    loop {
-        if unsafe { libc::dup2(source, target) } >= 0 {
-            return Ok(());
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
