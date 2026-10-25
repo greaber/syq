@@ -205,9 +205,9 @@ try:
     assert untrusted.returncode not in (0, 124), stderr
     assert "no exact trusted host key for destination" in stderr, stderr
     assert destination_enrollments() == []
-    assert "syq-enrollment:" not in remote("cat ~/.ssh/authorized_keys 2>/dev/null || true")
 finally:
     known_hosts.write_bytes(trusted)
+assert "syq-enrollment:" not in remote("cat ~/.ssh/authorized_keys 2>/dev/null || true")
 remote("test ! -e /tmp/syq-real-ssh/forward/first-use")
 
 before = len(relayed_connections())
