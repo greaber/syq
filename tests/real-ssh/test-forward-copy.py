@@ -169,6 +169,47 @@ def relayed_connections():
             and event["return_receiver"] == "yes"]
 
 
+def destination_enrollments():
+    return [line.split("\t")[0] for line in run("syq", "receiver", "list").splitlines()
+            if "\tsyq@destination" in line]
+
+
+def source_copy(*extra):
+    argv = ["syq", "cp", "/tmp/syq-real-ssh/return-source/subdir/chunks.bin", "--to", "destination",
+            "--as", "/tmp/syq-real-ssh/forward/first-use", "--no-progress", *extra]
+    command = "test -z \"${SSH_AUTH_SOCK:-}\" && test ! -e ~/.ssh/id_ed25519 && exec timeout 75 " + shlex.join(argv)
+    return subprocess.Popen(["ssh", "source", command], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, start_new_session=True)
+
+
+print("case: a dry run is refused before approval while the destination is not enrolled", flush=True)
+for enrollment in destination_enrollments():
+    run("syq", "receiver", "revoke", enrollment)
+preview = source_copy("--dry-run")
+_, stderr = preview.communicate(timeout=90)
+assert preview.returncode not in (0, 124), stderr
+assert "a dry run does not set up restricted copying on syq@destination" in stderr, stderr
+assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
+assert destination_enrollments() == []
+
+print("case: a first copy to a destination this machine does not trust is refused without enrolling", flush=True)
+known_hosts = Path.home() / ".ssh/known_hosts"
+trusted = known_hosts.read_bytes()
+run("ssh-keygen", "-R", "destination", "-f", str(known_hosts))
+try:
+    untrusted = source_copy()
+    pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
+    assert len(pending) == 1 and "Also sets up restricted copying" in pending[0]["permission"], pending
+    run("syq", "persist", "receive", "approve", pending[0]["id"])
+    _, stderr = untrusted.communicate(timeout=90)
+    assert untrusted.returncode not in (0, 124), stderr
+    assert "no exact trusted host key for destination" in stderr, stderr
+    assert destination_enrollments() == []
+    assert "syq-enrollment:" not in remote("cat ~/.ssh/authorized_keys 2>/dev/null || true")
+finally:
+    known_hosts.write_bytes(trusted)
+remote("test ! -e /tmp/syq-real-ssh/forward/first-use")
+
 before = len(relayed_connections())
 # The source has its own trace filesystem. Give this copy a separate file so
 # an older source session's background activity cannot enter the assertion.

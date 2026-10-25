@@ -382,3 +382,50 @@ fn derivation_does_not_depend_on_the_environment() {
         .unwrap_or_else(|| panic!("no rules in {stdout}"));
     assert_eq!(child, rules());
 }
+
+/// A machine that approves a server's command signs its own limits beside
+/// it, and the receiver holds the copy to the lower of the two.
+#[test]
+fn the_approving_machines_limits_lower_the_commands() {
+    let home = Path::new(HOME);
+    let mut args = ROUTE_5.to_vec();
+    args.extend(["--prune", "--receiver-max-entries", "50"]);
+    let capped = |caps: Caps| {
+        let mut directive = directive(&args);
+        directive.caps = Some(caps);
+        destination_rules(&directive, home)
+    };
+    let (grant, _) = capped(Caps {
+        max_bytes: 1 << 20,
+        max_entries: 10,
+        max_delete: 3,
+    })
+    .unwrap();
+    assert_eq!(grant.copy.limits.max_total_bytes, 1 << 20);
+    assert_eq!(grant.copy.limits.max_file_bytes, 1 << 20);
+    assert_eq!(grant.copy.limits.max_entries, 10);
+    assert_eq!(grant.copy.limits.max_deletions, 3);
+    // Limits above the command's leave it as it is.
+    let (grant, _) = capped(Caps {
+        max_bytes: u64::MAX,
+        max_entries: u64::MAX,
+        max_delete: u64::MAX,
+    })
+    .unwrap();
+    assert_eq!(grant.copy.limits.max_entries, 50);
+    assert_eq!(grant.copy.limits.max_deletions, 50);
+    // Pruning, or a dry run of it, needs the machine to allow deletions.
+    for dry_run in [false, true] {
+        let mut directive = directive(&args);
+        if dry_run {
+            directive.command.push(b"--dry-run".to_vec());
+        }
+        directive.caps = Some(Caps {
+            max_bytes: u64::MAX,
+            max_entries: u64::MAX,
+            max_delete: 0,
+        });
+        let error = destination_rules(&directive, home).unwrap_err().to_string();
+        assert!(error.contains("positive --max-delete"), "{error}");
+    }
+}
