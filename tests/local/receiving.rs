@@ -1647,18 +1647,10 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     }
 
     // Explicit SSH never asks a receiving machine.
-    for extra in [vec!["--auth-from", "ssh"]] {
-        let mut args = vec!["cp", "source", "--to", "backup"];
-        args.extend(extra);
-        let output = run(&args);
-        assert!(!output.status.success());
-        assert!(
-            t.path("ssh-used").exists(),
-            "{args:?}: {}",
-            stderr_of(&output)
-        );
-        fs::remove_file(t.path("ssh-used")).unwrap();
-    }
+    let output = run(&["cp", "source", "--to", "backup", "--auth-from", "ssh"]);
+    assert!(!output.status.success());
+    assert!(t.path("ssh-used").exists(), "{}", stderr_of(&output));
+    fs::remove_file(t.path("ssh-used")).unwrap();
     let selected = run(&["cp", "source", "--to", "backup", "--auth-from", "@z-other"]);
     assert!(!selected.status.success());
     assert!(
