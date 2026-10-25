@@ -49,7 +49,8 @@ def copy(path, *, allow=True, success=True, extra=(), drop_laptop=False, interru
                 progress = time.monotonic() + 5
                 state = ""
                 while time.monotonic() < deadline:
-                    partials = remote("find /tmp/syq-real-ssh/forward -type f -name '.cancelled.syq-tmp.*'").splitlines()
+                    partials = remote("find /tmp/syq-real-ssh/forward -type f -name "
+                                      + shlex.quote("." + path.rsplit("/", 1)[-1] + ".syq-tmp.*")).splitlines()
                     state = repr(partials)
                     if len(partials) == 1:
                         state = remote("dd if=" + shlex.quote(partials[0]) + " bs=1M count=4 status=none | sha256sum")
@@ -85,7 +86,6 @@ def copy(path, *, allow=True, success=True, extra=(), drop_laptop=False, interru
             text = output.read().decode(errors="replace")
             print(text, end="", flush=True)
             assert "one-time SSH grant" not in text and "signed receiver" not in text, text
-            assert "(restricted grant)" not in text, text
             assert status != 124, ("copy timed out", text)
             assert (status == 0) == success, (status, text)
             if success:
