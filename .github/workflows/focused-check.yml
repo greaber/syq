@@ -1,5 +1,5 @@
 name: Focused check
-run-name: Focused check (${{ inputs.runner }}, ${{ inputs.provider }}) at ${{ inputs.revision || github.sha }}
+run-name: Focused check (${{ inputs.runner }}) at ${{ inputs.revision || github.sha }}
 
 # Deliberate, maintainer-dispatched shell code. No automatic triggers or release
 # certification: success means only that the submitted script exited zero.
@@ -11,11 +11,6 @@ on:
         type: choice
         default: linux
         options: [linux, macos, macos-intel]
-      provider:
-        description: Runner provider
-        type: choice
-        default: namespace
-        options: [namespace, github]
       script:
         description: Bash script to run (public; do not include secrets)
         type: string
@@ -24,7 +19,7 @@ on:
         description: Exact commit to check out (defaults to workflow commit)
         type: string
       cargo_cache:
-        description: Attach Cargo cache for Rust checks
+        description: Restore the matching CI job's Cargo cache for Rust checks
         type: boolean
         default: false
       timeout:
@@ -38,16 +33,20 @@ on:
 permissions:
   contents: read
 
+# CI builds start from a clean checkout, so incremental compilation data only
+# costs build time and cache space.
+env:
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   check:
-    # scripts/branch-status.py identifies a check by its job name.
-    name: check (${{ inputs.runner }}, ${{ inputs.provider }}${{ inputs.label && format(', {0}', inputs.label) || '' }})
-    runs-on: ${{ inputs.provider == 'namespace' && (inputs.runner == 'macos' && 'namespace-profile-syq-macos' || format('namespace-profile-syq-linux;github.run-id={0}', github.run_id)) || (inputs.runner == 'macos-intel' && 'macos-26-intel' || inputs.runner == 'macos' && 'macos-26' || 'ubuntu-24.04') }}
+    # scripts/branch-status.py identifies a check by its job name. It keeps
+    # `github` from when the provider was a choice, so reruns of earlier
+    # checks still match them.
+    name: check (${{ inputs.runner }}, github${{ inputs.label && format(', {0}', inputs.label) || '' }})
+    runs-on: ${{ inputs.runner == 'macos-intel' && 'macos-26-intel' || inputs.runner == 'macos' && 'macos-26' || 'ubuntu-24.04' }}
     timeout-minutes: ${{ fromJSON(inputs.timeout) }}
     steps:
-      - name: Validate runner selection
-        if: inputs.runner == 'macos-intel' && inputs.provider != 'github'
-        run: echo 'Intel macOS requires the GitHub provider.' >&2; exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.revision || github.sha }}
@@ -57,26 +56,23 @@ jobs:
         run: |
           printf '%s\n' CARGO_PROFILE_DEV_OPT_LEVEL=0 CARGO_PROFILE_TEST_OPT_LEVEL=0 \
             >> "$GITHUB_ENV"
-      - name: Attach Namespace Cargo cache
-        if: inputs.cargo_cache && inputs.provider == 'namespace'
-        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-      - name: Restore GitHub Cargo cache
-        id: cargo-cache
-        if: inputs.cargo_cache && inputs.provider == 'github'
+      # C dependencies rebuild when this differs from the cached macOS build.
+      - name: Match the macOS suite's deployment target
+        if: inputs.runner == 'macos'
+        run: echo MACOSX_DEPLOYMENT_TARGET=11.0 >> "$GITHUB_ENV"
+      # Restore only: master runs of the matching CI job save these entries.
+      - name: Restore the matching CI job's Cargo cache
+        if: inputs.cargo_cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
             target
-          key: ${{ inputs.runner == 'macos-intel' && format('cargo-ci-macos_intel-fast-v1-{0}-{1}-{2}-{3}-{4}', runner.os, runner.arch, hashFiles('rust-toolchain.toml'), hashFiles('Cargo.lock'), inputs.revision || github.sha) || format('focused-{0}-{1}-{2}', runner.os, runner.arch, hashFiles('rust-toolchain.toml', 'Cargo.lock')) }}
+          key: cargo-${{ inputs.runner == 'macos-intel' && 'ci-macos_intel-fast-v1' || inputs.runner == 'macos' && 'macos-suite' || 'ci-rust' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-${{ inputs.runner == 'macos-intel' && 'ci-macos_intel-fast-v1' || inputs.runner == 'macos' && 'macos-suite' || 'ci-rust' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
+            cargo-${{ inputs.runner == 'macos-intel' && 'ci-macos_intel-fast-v1' || inputs.runner == 'macos' && 'macos-suite' || 'ci-rust' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Install the pinned Rust test runner
         if: inputs.cargo_cache
         env:
@@ -91,12 +87,3 @@ jobs:
           test -n "$CHECK_SCRIPT"
           printf '%s\n' "$CHECK_SCRIPT" > "$RUNNER_TEMP/syq-focused-check.sh"
           bash --noprofile --norc -euo pipefail "$RUNNER_TEMP/syq-focused-check.sh"
-      - name: Save the Intel CI Cargo cache
-        if: inputs.cargo_cache && inputs.runner == 'macos-intel' && steps.cargo-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
