@@ -2327,19 +2327,38 @@ fn a_failed_login_reports_what_ssh_said_in_its_trace() {
                  debug3: resolve_host: lookup backup:22\n\
                  ssh: Could not resolve hostname backup: Name or service not known\n";
     assert_eq!(
-        ssh_reason(trace).unwrap(),
+        ssh_reason(trace, true).unwrap(),
         "ssh: Could not resolve hostname backup: Name or service not known"
     );
     let refused = "debug1: Authentications that can continue: publickey\n\
                    debug1: No more authentication methods to try.\n\
                    syq@backup: Permission denied (publickey).\n";
     assert_eq!(
-        ssh_reason(refused).unwrap(),
+        ssh_reason(refused, true).unwrap(),
         "syq@backup: Permission denied (publickey)."
     );
-    assert!(ssh_reason("debug1: only debug output\n").is_none());
+    assert!(ssh_reason("debug1: only debug output\n", true).is_none());
     let long = format!("{}\n", "x".repeat(1000));
-    assert_eq!(ssh_reason(&long).unwrap().len(), 300);
+    assert_eq!(ssh_reason(&long, true).unwrap().len(), 300);
+
+    // After the login, the lines SSH writes without a prefix are progress.
+    // When the remote command failed, SSH said nothing about it...
+    let worked = "debug1: Server accepts key: /home/syq/.ssh/id_ed25519 ED25519 SHA256:x\n\
+                  Authenticated to backup ([192.0.2.7]:22) using \"publickey\".\n\
+                  debug1: Exit status 1\n\
+                  Transferred: sent 41500000, received 2000 bytes, in 3.1 seconds\n\
+                  Bytes per second: sent 13387096.8, received 645.2\n";
+    assert!(ssh_reason(worked, false).is_none());
+    // ...and when the connection broke after it, the reason is not the
+    // progress around it.
+    let dropped = "Authenticated to backup ([192.0.2.7]:22) using \"publickey\".\n\
+                   Connection to backup closed by remote host.\n\
+                   Transferred: sent 4100, received 2000 bytes, in 3.1 seconds\n\
+                   Bytes per second: sent 1322.6, received 645.2\n";
+    assert_eq!(
+        ssh_reason(dropped, true).unwrap(),
+        "Connection to backup closed by remote host."
+    );
 }
 
 #[test]

@@ -133,15 +133,27 @@ pub(super) fn enrollment_ssh_error(
     })
 }
 
-/// What SSH itself said about a login that failed: the last lines of its
-/// trace that are not debug output, such as "Permission denied (publickey)."
-/// or a host name it could not resolve. Logging to a file, SSH writes these
-/// only there.
-pub(super) fn ssh_reason(trace: &str) -> Option<String> {
+/// What SSH itself said when it failed (`ssh_failed`: exit status 255, or
+/// no output from the remote command): the last lines of its trace that are
+/// not debug output, such as "Permission denied (publickey)." or a host name
+/// it could not resolve. Logging to a file, SSH writes these only there.
+/// When SSH worked and the remote command failed, those lines are only its
+/// progress, so there is none.
+pub(super) fn ssh_reason(trace: &str, ssh_failed: bool) -> Option<String> {
+    if !ssh_failed {
+        return None;
+    }
     let lines: Vec<&str> = trace
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with("debug"))
+        .filter(|line| {
+            !line.is_empty()
+                && !line.starts_with("debug")
+                // The progress SSH reports at this log level.
+                && !line.starts_with("Authenticated to ")
+                && !line.starts_with("Transferred: ")
+                && !line.starts_with("Bytes per second: ")
+        })
         .collect();
     let reason = lines[lines.len().saturating_sub(3)..]
         .iter()
@@ -749,10 +761,10 @@ fn install_over_route(
             } else {
                 group.wait()?
             };
+            let ssh_failed = !greeted || status.code() == Some(255);
             let reason = fs::read_to_string(&trace_path)
                 .ok()
-                .as_deref()
-                .and_then(ssh_reason);
+                .and_then(|trace| ssh_reason(&trace, ssh_failed));
             return Err(enrollment_ssh_error(
                 target,
                 status.code() == Some(255),
@@ -870,8 +882,7 @@ fn install_over_route(
     if !status.success() {
         let reason = fs::read_to_string(&trace_path)
             .ok()
-            .as_deref()
-            .and_then(ssh_reason)
+            .and_then(|trace| ssh_reason(&trace, status.code() == Some(255)))
             .map(|reason| format!(": {reason}"))
             .unwrap_or_default();
         bail!(
