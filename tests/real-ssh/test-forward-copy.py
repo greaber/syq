@@ -283,10 +283,12 @@ try:
     copy("/tmp/syq-real-ssh/forward/approved", extra=("--stats",), ssh_trace=source_trace)
     events = trace_events(run("ssh", "source", "cat " + shlex.quote(source_trace)))
     # RemoteSpec sets ControlMaster on every transport connection. The same
-    # process also runs ssh -G to read config; that query never connects.
+    # process also runs ssh -G to read config, for the receiver too; those
+    # queries never connect.
     attempts = [event for event in events
                 if event["phase"] == "start" and event["host"] == "destination"
-                and event["control_master"] != "unset" and event["entry_key"] == "no"]
+                and event["control_master"] != "unset" and event["entry_key"] == "no"
+                and event.get("query") != "yes"]
     assert len(attempts) == 1, ("expected one source SSH attempt", events)
     exits = [event for event in events
              if event["phase"] == "end" and event["pid"] == attempts[0]["pid"]]
