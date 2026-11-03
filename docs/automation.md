@@ -51,8 +51,9 @@ writing it. Filesystem work can continue, leaving an incomplete stream.
 
 Argument errors exit 2 without a stream. Failure to open the results sink
 exits 1 without a stream. Once opened, completed runs and fatal setup failures
-emit a terminal record if the sink remains writable. Crashes and interruptions
-can leave it missing.
+emit a terminal record if the sink remains writable; a fatal failure first
+emits an `error` record with its message, counted in `errors`. Crashes and
+interruptions can leave the terminal record missing.
 
 ## Consumer rules
 

@@ -1962,10 +1962,20 @@ pub fn run(mut args: Args) -> Result<i32> {
         // including failures in deferred metadata and deletion finalization.
         progress.stop();
         progress.finish(false);
-        // The error text reaches stderr via main; the stream still gets its
-        // terminal record so a consumer never mistakes a handled fatal for a
-        // crash (only a real crash leaves the terminal record missing).
+        // The error text reaches stderr via main; the stream gets it as a
+        // counted error record, then its terminal record, so a consumer
+        // never mistakes a handled fatal for a crash (only a real crash
+        // leaves the terminal record missing) and can say why it failed.
         if let Some(results) = progress.results_writer() {
+            if let Err(error) = &outcome {
+                let os_kind = os_kind_of(error);
+                progress.errors.fetch_add(1, Relaxed);
+                results.emit_error_classified(
+                    &format!("syq: {error:#}"),
+                    os_kind.map(|_| "io"),
+                    os_kind,
+                );
+            }
             results.emit_result(&crate::results::ResultRecord {
                 status: "failed",
                 exit_code: 1,
