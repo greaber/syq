@@ -1718,7 +1718,7 @@ pub(crate) fn serve_background(
             // the return socket; each attempt would only log in once more.
             if !online && refuses_remote_forwarding(&error) {
                 bail!(
-                    "{} refuses remote forwarding, which receiving needs ({error}); allow remote Unix socket forwarding in its SSH server (OpenSSH 9.2 and later also need remote TCP forwarding allowed), then run syq persist connect {} on the receiving machine",
+                    "{} refuses remote forwarding, which receiving needs ({error}); allow remote Unix socket forwarding in its SSH server (OpenSSH 7.8 and later also need remote TCP forwarding allowed), then run syq persist connect {} on the receiving machine",
                     spec.endpoint.label(),
                     shell_words::quote(&spec.endpoint.label())
                 );
