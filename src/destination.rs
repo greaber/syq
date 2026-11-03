@@ -58,6 +58,38 @@ pub(crate) const RETURN_GRANT: &str = "return-control-v1";
 const REQUEST_ROOT: &[u8] = b"/SYQ-RECEIVE";
 const RECONNECT_PENDING: i32 = 75;
 
+/// The first wait before a receiving connection whose login was rejected
+/// tries again, and the longest, which later waits double up to.
+const LOGIN_RETRY_FIRST: Duration = Duration::from_secs(30);
+const LOGIN_RETRY_MAX: Duration = Duration::from_secs(600);
+
+fn login_retry_first() -> Duration {
+    // Tests shorten the first wait to see a retry happen by itself.
+    #[cfg(debug_assertions)]
+    if let Some(millis) = std::env::var("SYQ_TEST_LOGIN_RETRY_MS")
+        .ok()
+        .and_then(|millis| millis.parse().ok())
+    {
+        return Duration::from_millis(millis);
+    }
+    LOGIN_RETRY_FIRST
+}
+
+fn next_login_retry(wait: Duration) -> Duration {
+    (wait * 2).min(LOGIN_RETRY_MAX)
+}
+
+/// A retry wait as the status shows it: whole seconds below a minute,
+/// otherwise whole minutes.
+fn retry_wait(wait: Duration) -> String {
+    let seconds = wait.as_secs();
+    if seconds < 60 {
+        format!("{seconds} s")
+    } else {
+        format!("{} min", seconds / 60)
+    }
+}
+
 /// Whether ssh's error output says the server refused a remote forwarding,
 /// as OpenSSH reports it under `ExitOnForwardFailure`.
 fn refuses_remote_forwarding(ssh_error: &str) -> bool {
@@ -1604,6 +1636,7 @@ pub(crate) fn serve_background(
     )?;
     let result = (|| {
         let mut delay = Duration::from_secs(1);
+        let mut login_delay = login_retry_first();
         while !stop.load(Ordering::Acquire) {
             let socket = format!("/tmp/syq-return-{}.sock", random_token()?);
             let args = [
@@ -1715,7 +1748,8 @@ pub(crate) fn serve_background(
                 bail!("server rejected return connection: {error}; run syq persist connect {} on the receiving machine to retry", shell_words::quote(&spec.endpoint.label()));
             }
             // Dialing again cannot help a server whose configuration refuses
-            // the return socket; each attempt would only log in once more.
+            // the return socket; each attempt would only log in once more. A
+            // later command connecting to the server retries.
             if !online && refuses_remote_forwarding(&error) {
                 bail!(
                     "{} refuses remote forwarding, which receiving needs ({error}); allow remote Unix socket forwarding in its SSH server (OpenSSH 7.8 and later also need remote TCP forwarding allowed), then run syq persist connect {} on the receiving machine",
@@ -1723,19 +1757,52 @@ pub(crate) fn serve_background(
                     shell_words::quote(&spec.endpoint.label())
                 );
             }
-            *state.lock().unwrap() = crate::receive_service::ConnectionState {
-                phase: "reconnecting".into(),
-                error: Some(error),
-                ssh_pid: None,
-            };
-            if online && connected.elapsed() >= Duration::from_secs(60) {
-                delay = Duration::from_secs(1);
+            if online {
+                login_delay = login_retry_first();
             }
-            let until = Instant::now() + delay;
+            // A rejected login, as after a key was removed, or a host key
+            // that does not match is tried again less and less often: it may
+            // only be an agent still locked after sleep. The status says why
+            // meanwhile, and a command that connects to the server restarts
+            // this connection, trying again at once.
+            let login = (!online)
+                .then(|| crate::conn::login_rejection(&error))
+                .flatten();
+            let wait = match login {
+                Some(advice) => {
+                    let wait = login_delay;
+                    login_delay = next_login_retry(login_delay);
+                    *state.lock().unwrap() = crate::receive_service::ConnectionState {
+                        phase: "failed".into(),
+                        error: Some(format!(
+                            "cannot log in to {} ({error}): {advice}; trying again in {}, or as soon as a command connects to {}",
+                            spec.endpoint.label(),
+                            retry_wait(wait),
+                            spec.endpoint.label()
+                        )),
+                        ssh_pid: None,
+                    };
+                    wait
+                }
+                None => {
+                    *state.lock().unwrap() = crate::receive_service::ConnectionState {
+                        phase: "reconnecting".into(),
+                        error: Some(error),
+                        ssh_pid: None,
+                    };
+                    if online && connected.elapsed() >= Duration::from_secs(60) {
+                        delay = Duration::from_secs(1);
+                    }
+                    delay
+                }
+            };
+            let until = Instant::now() + wait;
             while !stop.load(Ordering::Acquire) && Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(100));
             }
-            delay = (delay * 2).min(Duration::from_secs(30));
+            if login.is_none() {
+                delay = (delay * 2).min(Duration::from_secs(30));
+            }
         }
         Ok(())
     })();

@@ -1780,3 +1780,17 @@ fn named_requests_never_sign_following_the_destination() {
         assert!(!request.constraints.extra_options.follow_dst, "{follow}");
     }
 }
+
+#[test]
+fn a_rejected_login_waits_longer_each_time_up_to_ten_minutes() {
+    let mut wait = super::LOGIN_RETRY_FIRST;
+    let mut shown = Vec::new();
+    for _ in 0..7 {
+        shown.push(super::retry_wait(wait));
+        wait = super::next_login_retry(wait);
+    }
+    assert_eq!(
+        shown,
+        ["30 s", "1 min", "2 min", "4 min", "8 min", "10 min", "10 min"]
+    );
+}

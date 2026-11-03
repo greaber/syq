@@ -52,6 +52,22 @@ pub(super) fn capture(mut stderr: ChildStderr) -> std::io::Result<Receiver<Optio
     Ok(receive)
 }
 
+/// Advice for a login that ssh's error output shows the server will keep
+/// refusing until someone changes a key: this machine's credentials were
+/// rejected, or the server's host key could not be verified. None for
+/// failures a later attempt can get past, such as an unreachable network.
+pub(crate) fn login_rejection(stderr: &str) -> Option<&'static str> {
+    match classify(stderr.as_bytes())? {
+        Failure::Credentials => Some(
+            "the server rejected this machine's SSH credentials; make sure this machine's key is authorized there and available to its SSH agent",
+        ),
+        Failure::HostKey => Some(
+            "the server's SSH host key could not be verified; check its entry in this machine's known_hosts",
+        ),
+        Failure::Hostname | Failure::ConnectionRefused => None,
+    }
+}
+
 fn classify(stderr: &[u8]) -> Option<Failure> {
     // Exit 255 also covers timeouts and configuration errors. Only recognized
     // failures that another machine may resolve permit fallback. OpenSSH
