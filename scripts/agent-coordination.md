@@ -3,8 +3,8 @@
 `python3 scripts/agent-coordination.py` coordinates sessions on one machine
 through shared files. It needs Python 3.9 or later on Linux or macOS. Reviews
 also need Git, `gh`, tmux, and the selected `claude` or `codex` executable.
-It does not install tools or inject terminal input. By default it starts
-reviewers with permission prompts turned off, at `xhigh` effort; see
+It does not install tools or inject terminal input. It starts reviewers with
+permission prompts turned off, at `xhigh` effort by default; see
 [Reviewer settings](#reviewer-settings). Reviewers receive access to the
 selected state directory with `--add-dir`.
 Run it from your task worktree. If that branch predates the tool, invoke the
@@ -187,7 +187,8 @@ implementation cannot consume these updates; start a new request explicitly.
 Use the same tool version for all participants in a review request.
 
 To request an independent second reviewer, run another `review start` with
-`--additional-reviewer`, choosing Claude or Codex explicitly. It gets its own
+`--additional-reviewer`, choosing Claude (the default) or Codex with
+`--reviewer`. It gets its own
 conversation, window, worktree, reports, round limit, and reviewer options, all
 reused across its own rounds. Each request is triaged separately; there is no
 automatic agreement rule between reviewers. Use collect or triage mode when you
