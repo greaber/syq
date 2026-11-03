@@ -429,10 +429,9 @@ pub(super) fn endpoint(login: &str, host: &str, port: Option<u16>) -> Result<Ssh
     SshEndpoint::from_parts(login, host, port)
 }
 
-/// The SSH agent the user's configuration selects for `target`: its
-/// `IdentityAgent`, else `SSH_AUTH_SOCK`.
-/// The SSH agent the configuration selects for the enrollment's login, and
-/// whether it would ask about a host key nobody knows.
+/// The SSH agent the user's configuration selects for the enrollment's
+/// login (its `IdentityAgent`, else `SSH_AUTH_SOCK`), and whether it would
+/// ask about a host key nobody knows.
 pub(super) fn configured_agent(
     target: &SshEndpoint,
     route: EnrollmentRoute<'_>,

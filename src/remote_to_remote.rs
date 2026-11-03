@@ -727,73 +727,66 @@ enum DestinationAuthentication<'a> {
     Receiver,
 }
 
-/// The SSH command for an enrolled receiver at `port`: the entry key alone.
-/// `prepare_receiver_ssh_with` fills the key in, and adds the coordinator's
-/// own host-key checking.
-pub(crate) fn receiver_rsh(port: u16) -> String {
+/// The SSH command for an enrolled receiver, at `port` when one is given:
+/// this machine's own SSH configuration, under the entry-key hardening.
+/// `prepare_receiver_ssh_with` fills the key in and adds what the
+/// configuration needs on top.
+pub(crate) fn receiver_rsh(port: Option<u16>) -> String {
     constrained_destination_rsh(port, DestinationAuthentication::Receiver)
 }
 
 /// The SSH command a coordinator uses to reach the destination. With the
-/// broker it authenticates through the forwarded, filtered agent. With an
-/// enrollment it uses the entry key alone, whose file replaces the
-/// `IdentityFile=none` placeholder on the coordinator, with no agent, no
-/// control socket, no forwarding and no proxy.
-fn constrained_destination_rsh(port: u16, authentication: DestinationAuthentication<'_>) -> String {
+/// broker it authenticates through the forwarded, filtered agent, with no
+/// SSH configuration at all. With an enrollment it uses this machine's own
+/// SSH configuration, which decides how the destination's host key is
+/// checked, and overrides on the command line, where the first value wins,
+/// everything the entry key's session must not do: the entry key, whose
+/// file replaces the `IdentityFile=none` placeholder on the coordinator, is
+/// the first identity, with no agent, PKCS#11 provider, control socket,
+/// forwarding, proxy, local command or prompt.
+fn constrained_destination_rsh(
+    port: Option<u16>,
+    authentication: DestinationAuthentication<'_>,
+) -> String {
     let (publickey, agent, only) = match authentication {
         DestinationAuthentication::Broker { .. } => ("host-bound", "SSH_AUTH_SOCK", "no"),
         DestinationAuthentication::Receiver => ("yes", "none", "yes"),
     };
-    let mut command = vec![
-        "ssh".to_owned(),
-        "-F".to_owned(),
-        "/dev/null".to_owned(),
-        "-a".to_owned(),
-        "-x".to_owned(),
-        "-k".to_owned(),
-        "-T".to_owned(),
-        "-o".to_owned(),
+    let mut command = vec!["ssh".to_owned()];
+    if let DestinationAuthentication::Broker { .. } = authentication {
+        command.extend(["-F".to_owned(), "/dev/null".to_owned()]);
+    }
+    command.extend(["-a", "-x", "-k", "-T"].map(str::to_owned));
+    for option in [
         format!("IdentityAgent={agent}"),
-        "-o".to_owned(),
         format!("IdentitiesOnly={only}"),
-        "-o".to_owned(),
         ENTRY_KEY_PLACEHOLDER.to_owned(),
-        "-o".to_owned(),
         "CertificateFile=none".to_owned(),
-        "-o".to_owned(),
         "PKCS11Provider=none".to_owned(),
-        "-o".to_owned(),
         format!("PubkeyAuthentication={publickey}"),
-        "-o".to_owned(),
         "PreferredAuthentications=publickey".to_owned(),
-        "-o".to_owned(),
         "BatchMode=yes".to_owned(),
-        "-o".to_owned(),
         "ControlMaster=no".to_owned(),
-        "-o".to_owned(),
         "ControlPath=none".to_owned(),
-        "-o".to_owned(),
         "ClearAllForwardings=yes".to_owned(),
-        "-o".to_owned(),
+        "ForwardAgent=no".to_owned(),
+        "ForwardX11=no".to_owned(),
         "PermitLocalCommand=no".to_owned(),
-        "-o".to_owned(),
         "ProxyJump=none".to_owned(),
-        "-o".to_owned(),
         "ProxyCommand=none".to_owned(),
-        "-o".to_owned(),
         "LogLevel=ERROR".to_owned(),
-        // Like the other server-to-server SSH paths, fail a stalled connect or
-        // handshake in bounded time instead of waiting for the TCP timeout.
-        "-o".to_owned(),
+        // Like the other server-to-server SSH paths, fail a stalled connect
+        // or handshake in bounded time instead of waiting for the TCP
+        // timeout, and notice a destination that stops answering.
         "ConnectTimeout=10".to_owned(),
-        // And notice a destination that stops answering during the copy.
-        "-o".to_owned(),
         "ServerAliveInterval=15".to_owned(),
-        "-o".to_owned(),
         "ServerAliveCountMax=3".to_owned(),
-        "-p".to_owned(),
-        port.to_string(),
-    ];
+    ] {
+        command.extend(["-o".to_owned(), option]);
+    }
+    if let Some(port) = port {
+        command.extend(["-p".to_owned(), port.to_string()]);
+    }
     if let DestinationAuthentication::Broker {
         host_key_algorithms,
     } = authentication
@@ -813,41 +806,47 @@ fn constrained_destination_rsh(port: u16, authentication: DestinationAuthenticat
     shell_words::join(command)
 }
 
-/// How a coordinator checks an enrolled receiver's host key: as its own
-/// `ssh` would check that destination, from what `ssh -G` resolves for it
-/// (its known_hosts files, host certificate authorities, KnownHostsCommand
-/// and StrictHostKeyChecking), also accepting what the approving machine
-/// knows about the destination. Where its `ssh` would ask about a host
-/// neither knows, nobody can answer, so the key is accepted the first time
-/// and recorded, as `accept-new` does. A key that contradicts a known one is
-/// refused, as `ssh` refuses it.
-pub(crate) struct DialerHostKeys {
-    /// The configured HostKeyAlias, the name the destination is listed
-    /// under in known_hosts files in place of its address.
-    alias: Option<String>,
-    /// `Option=value` settings for the connection.
-    options: Vec<String>,
+/// What this machine's own SSH configuration makes of an enrolled
+/// receiver's connection, from `ssh -G` run with the connection's own
+/// command: the name the destination's host key is looked up under, and
+/// what syq adds to the command for it. The configuration itself checks the
+/// host key, as `ssh` would: its known_hosts files, host certificate
+/// authorities, KnownHostsCommand and StrictHostKeyChecking. Syq adds the
+/// approving machine's knowledge as one more global file, accepts a host
+/// nobody knows the first time where the configuration would ask, which
+/// nobody can answer, and overrides the session options a configuration
+/// can set that the entry key's session must not use.
+pub(crate) struct ReceiverConnection {
+    /// The name the destination is listed under in known_hosts files.
+    lookup: String,
+    /// `Option=value` settings syq adds.
+    additions: Vec<String>,
     /// The configured GlobalKnownHostsFile value.
     global: String,
 }
 
-impl DialerHostKeys {
-    /// What this machine's SSH configuration says about checking the key of
-    /// `host`, as `ssh [-l user] [-p port] host` would use it.
-    pub(crate) fn resolve(user: Option<&str>, host: &str, port: Option<u16>) -> Result<Self> {
-        let mut command = std::process::Command::new("ssh");
-        command.arg("-G");
+impl ReceiverConnection {
+    /// Inspect the connection `command` makes to `host`.
+    fn inspect(
+        command: &[String],
+        user: Option<&str>,
+        port: Option<u16>,
+        host: &str,
+    ) -> Result<Self> {
+        let (program, options) = command
+            .split_first()
+            .context("receiver SSH command is empty")?;
+        let mut query = std::process::Command::new(program);
+        query.args(options).arg("-G");
         if let Some(user) = user {
-            command.args(["-l", user]);
+            query.args(["-l", user]);
         }
         if let Some(port) = port {
-            command.args(["-p", &port.to_string()]);
+            query.args(["-p", &port.to_string()]);
         }
-        command
-            .args(["--", host])
-            .stdin(std::process::Stdio::null());
+        query.args(["--", host]).stdin(std::process::Stdio::null());
         let output = crate::process::capture_output_bounded(
-            &mut command,
+            &mut query,
             std::time::Instant::now() + std::time::Duration::from_secs(30),
             &|| false,
             1 << 20,
@@ -868,76 +867,67 @@ impl DialerHostKeys {
                 .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
                 .map(str::trim)
         };
-        anyhow::ensure!(value("hostname").is_some(), "`ssh -G` reported no hostname");
-        let alias = value("hostkeyalias")
-            .filter(|alias| *alias != "none")
-            .map(str::to_owned);
-        anyhow::ensure!(
-            alias
-                .as_deref()
-                .is_none_or(|alias| !alias.is_empty() && !alias.contains(char::is_whitespace)),
-            "the destination's HostKeyAlias {alias:?} is not one word"
-        );
-        let checking = match value("stricthostkeychecking") {
-            Some("true" | "yes") => "yes",
-            Some("false" | "no" | "off") => "no",
-            // `ask`, the default, needs someone to answer. Nobody watches
-            // this connection, so a host nobody knows is accepted the first
-            // time and recorded.
-            Some("ask" | "accept-new") | None => "accept-new",
-            Some(other) => bail!("unexpected StrictHostKeyChecking {other:?} from `ssh -G`"),
+        let hostname = value("hostname").context("`ssh -G` reported no hostname")?;
+        let port: u16 = value("port")
+            .context("`ssh -G` reported no port")?
+            .parse()
+            .context("`ssh -G` reported an invalid port")?;
+        let lookup = match value("hostkeyalias").filter(|alias| *alias != "none") {
+            Some(alias) => alias.to_owned(),
+            None if port == 22 => hostname.to_owned(),
+            None => format!("[{hostname}]:{port}"),
         };
-        // The connection dials the destination's address and port itself,
-        // which SSH looks the destination up under unless there is an alias.
-        // A host certificate's names are checked against that name too.
-        let mut options: Vec<String> = alias
-            .iter()
-            .map(|alias| format!("HostKeyAlias={alias}"))
-            .collect();
-        options.extend([
-            format!("StrictHostKeyChecking={checking}"),
-            "UpdateHostKeys=no".to_owned(),
-        ]);
-        for (name, option) in [
-            ("userknownhostsfile", "UserKnownHostsFile"),
-            ("checkhostip", "CheckHostIP"),
-            ("verifyhostkeydns", "VerifyHostKeyDNS"),
-            ("hashknownhosts", "HashKnownHosts"),
-            ("hostkeyalgorithms", "HostKeyAlgorithms"),
-            ("requiredrsasize", "RequiredRSASize"),
-            ("knownhostscommand", "KnownHostsCommand"),
-            ("revokedhostkeys", "RevokedHostKeys"),
+        anyhow::ensure!(
+            !lookup.is_empty() && !lookup.contains(char::is_whitespace),
+            "the destination's known_hosts name {lookup:?} is not one word"
+        );
+        let mut additions = Vec::new();
+        // `ask`, the default, needs someone to answer. Nobody watches this
+        // connection, so a host nobody knows is accepted the first time and
+        // recorded, as `accept-new` does. Other settings stand as configured.
+        if value("stricthostkeychecking") == Some("ask") {
+            additions.push("StrictHostKeyChecking=accept-new".to_owned());
+        }
+        // Session options a configuration can set that the entry key's
+        // session must not use. Only the ones the configuration changes are
+        // overridden, so an older ssh never sees an option it lacks.
+        for (name, allowed, option) in [
+            ("remotecommand", &["none"][..], "RemoteCommand=none"),
+            ("sessiontype", &["default"], "SessionType=default"),
+            ("stdinnull", &["no", "false"], "StdinNull=no"),
+            (
+                "forkafterauthentication",
+                &["no", "false"],
+                "ForkAfterAuthentication=no",
+            ),
+            (
+                "securitykeyprovider",
+                &["internal"],
+                "SecurityKeyProvider=internal",
+            ),
+            ("tunnel", &["no", "false"], "Tunnel=no"),
+            ("proxyusefdpass", &["no", "false"], "ProxyUseFdpass=no"),
         ] {
-            if let Some(value) = value(name).filter(|value| !value.is_empty() && *value != "none") {
-                options.push(format!("{option}={value}"));
+            if value(name).is_some_and(|value| !allowed.contains(&value)) {
+                additions.push(option.to_owned());
             }
         }
         Ok(Self {
-            alias,
-            options,
+            lookup,
+            additions,
             global: value("globalknownhostsfile").unwrap_or("none").to_owned(),
         })
     }
 
-    /// The name SSH looks the destination up under when it dials `host` at
-    /// `port`.
-    fn lookup(&self, host: &str, port: u16) -> String {
-        match &self.alias {
-            Some(alias) => alias.clone(),
-            None if port == 22 => host.to_owned(),
-            None => format!("[{host}]:{port}"),
-        }
-    }
-
-    /// The `-o` arguments for the connection, with `approving`, the
-    /// approving machine's known_hosts lines, as one more global file:
-    /// OpenSSH records a newly accepted key only in the first user file.
+    /// The `-o` arguments syq adds, with `approving`, the approving
+    /// machine's known_hosts lines, as one more global file: OpenSSH records
+    /// a newly accepted key only in the first user file.
     fn arguments(&self, approving: &std::path::Path) -> Vec<String> {
         let global = match self.global.as_str() {
             "none" => approving.display().to_string(),
             files => format!("{files} {}", approving.display()),
         };
-        self.options
+        self.additions
             .iter()
             .cloned()
             .chain([format!("GlobalKnownHostsFile={global}")])
@@ -1029,18 +1019,7 @@ pub(crate) fn prepare_receiver_ssh(
     };
     let entry_key =
         entry_key.context("a restricted receiver's SSH connections need its entry key")?;
-    // This machine checks the receiver's host key as its own `ssh` would for
-    // the destination it dials.
-    let destination = args.locations.last().context("copy destination missing")?;
-    let dialer = DialerHostKeys::resolve(
-        destination.user.as_deref(),
-        destination
-            .host
-            .as_deref()
-            .context("the receiver's host is missing")?,
-        Some(receiver_port(&parse_rsh(&args.rsh)?)?),
-    )?;
-    prepare_receiver_ssh_with(args, &known_hosts, &entry_key, &dialer).map(Some)
+    prepare_receiver_ssh_with(args, &known_hosts, &entry_key).map(Some)
 }
 
 /// Read `length` bytes of what the requesting syq sends first on this
@@ -1064,16 +1043,6 @@ fn read_input(label: &str, length: usize, maximum: usize) -> Result<zeroize::Zer
     Ok(bytes)
 }
 
-/// The port a receiver's SSH command dials.
-fn receiver_port(command: &[String]) -> Result<u16> {
-    command
-        .windows(2)
-        .find(|pair| pair[0] == "-p")
-        .context("receiver SSH command is missing its port")?[1]
-        .parse()
-        .context("receiver SSH command has an invalid port")
-}
-
 /// The file of what the approving machine knows about the destination's
 /// key; its name says where an offending key OpenSSH reports came from.
 const APPROVING_KNOWN_HOSTS: &str = "known-to-the-machine-that-approved-this-copy";
@@ -1082,7 +1051,6 @@ pub(crate) fn prepare_receiver_ssh_with(
     args: &mut Args,
     known_hosts: &str,
     entry_key: &[u8],
-    dialer: &DialerHostKeys,
 ) -> Result<crate::private_broker::SignalCleanedDir> {
     anyhow::ensure!(
         args.restricted_grant
@@ -1095,19 +1063,49 @@ pub(crate) fn prepare_receiver_ssh_with(
         "invalid receiver known-hosts length"
     );
     let mut command = parse_rsh(&args.rsh)?;
-    // What the approving machine knows, under the name this machine's own
-    // known_hosts files use for the destination it dials.
-    let lookup = dialer.lookup(
-        args.locations
-            .last()
-            .and_then(|destination| destination.host.as_deref())
+    for required in [
+        "IdentityAgent=none",
+        "IdentitiesOnly=yes",
+        "ControlPath=none",
+    ] {
+        anyhow::ensure!(
+            command.iter().any(|argument| argument == required),
+            "receiver SSH command is missing {required}"
+        );
+    }
+    // SSH takes the first value of each option: the configuration and what
+    // syq adds for it decide host-key checking, and nothing before them.
+    for checking in [
+        "StrictHostKeyChecking=",
+        "UserKnownHostsFile=",
+        "GlobalKnownHostsFile=",
+        "HostKeyAlias=",
+        "KnownHostsCommand=",
+        "HostKeyAlgorithms=",
+    ] {
+        anyhow::ensure!(
+            !command
+                .iter()
+                .any(|argument| argument.starts_with(checking)),
+            "receiver SSH command already sets {checking}"
+        );
+    }
+    // This machine checks the receiver's host key as its own `ssh` would:
+    // with its configuration for the destination, as this connection names
+    // it and logs in.
+    let destination = args.locations.last().context("copy destination missing")?;
+    let connection = ReceiverConnection::inspect(
+        &command,
+        destination.user.as_deref(),
+        destination.port,
+        destination
+            .host
+            .as_deref()
             .context("the receiver's host is missing")?,
-        receiver_port(&command)?,
-    );
-    anyhow::ensure!(
-        !lookup.is_empty() && !lookup.contains(char::is_whitespace),
-        "the destination's known_hosts name {lookup:?} is not one word"
-    );
+    )?;
+    // What the approving machine knows, under the name this machine's own
+    // known_hosts files use for the destination.
+    let lookup = &connection.lookup;
     let mut approving = String::new();
     for line in known_hosts.lines() {
         let (marker, rest) = match line.split_once(' ') {
@@ -1123,32 +1121,6 @@ pub(crate) fn prepare_receiver_ssh_with(
             approving.push(' ');
         }
         approving.push_str(&format!("{lookup} {}\n", key.to_openssh()?));
-    }
-    for required in [
-        "IdentityAgent=none",
-        "IdentitiesOnly=yes",
-        "ControlPath=none",
-    ] {
-        anyhow::ensure!(
-            command.iter().any(|argument| argument == required),
-            "receiver SSH command is missing {required}"
-        );
-    }
-    // SSH takes the first value of each option: this machine's own
-    // host-key checking must be the only one.
-    for checking in [
-        "StrictHostKeyChecking=",
-        "UserKnownHostsFile=",
-        "GlobalKnownHostsFile=",
-        "HostKeyAlias=",
-        "KnownHostsCommand=",
-    ] {
-        anyhow::ensure!(
-            !command
-                .iter()
-                .any(|argument| argument.starts_with(checking)),
-            "receiver SSH command already sets {checking}"
-        );
     }
     // An interrupted copy removes the entry key too; only SIGKILL leaves it.
     let directory = crate::private_broker::SignalCleanedDir::new("syq-receiver-hosts-")?;
@@ -1167,7 +1139,7 @@ pub(crate) fn prepare_receiver_ssh_with(
         file.write_all(entry_key)?;
     }
     crate::agent_broker::validate_openssh_option_path(&key, "entry key file")?;
-    command.extend(dialer.arguments(&path));
+    command.extend(connection.arguments(&path));
     let identity = command
         .iter_mut()
         .find(|argument| *argument == ENTRY_KEY_PLACEHOLDER)
@@ -1427,7 +1399,7 @@ fn run_remote(
             // for every SSH connection to the receiver, so the copy needs
             // nothing more from this machine: no agent is forwarded.
             receiver_known_hosts = Some(peer_policy.known_hosts_for_others(RECEIVER_HOST_ALIAS)?);
-            constrained_rsh = Some(receiver_rsh(peer_policy.port()));
+            constrained_rsh = Some(receiver_rsh(Some(peer_policy.port())));
             restricted_destination_path = Some(prepared.destination);
             restricted_grant = Some(prepared.directive);
             destination_results = Some(crate::destination_results::Expectation {
@@ -1458,7 +1430,7 @@ fn run_remote(
             coordinator_policy.require_exact_host_keys()?;
             peer_policy.require_exact_host_keys()?;
             constrained_rsh = Some(constrained_destination_rsh(
-                peer_policy.port(),
+                Some(peer_policy.port()),
                 DestinationAuthentication::Broker {
                     host_key_algorithms: &peer_policy.host_key_algorithms(),
                 },

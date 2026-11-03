@@ -13,6 +13,9 @@ endpoint() {
     install -m 0600 -o longhome -g syq /run/lab/authorized_keys "$long_home/.ssh/authorized_keys"
     install -d -m 0755 /run/sshd
     ssh-keygen -q -t ed25519 -N '' -f /run/sshd/ssh_host_ed25519_key
+    # A second host key type: a client that knows only this one must still
+    # be offered it.
+    ssh-keygen -q -t ecdsa -b 256 -N '' -f /run/sshd/ssh_host_ecdsa_key
     if [ -n "${SYQ_REAL_SSH_BLOCKED_TCP_PORT:-}" ]; then
         iptables -w -A INPUT -p tcp \
             --dport "$SYQ_REAL_SSH_BLOCKED_TCP_PORT" \
@@ -56,6 +59,7 @@ runner() {
         ssh-keygen -y -f /home/syq/.ssh/id_ed25519 > /etc/ssh/lab_authorized_keys
         chmod 0644 /etc/ssh/lab_authorized_keys
         ssh-keygen -q -t ed25519 -N '' -f /run/sshd/ssh_host_ed25519_key
+        ssh-keygen -q -t ecdsa -b 256 -N '' -f /run/sshd/ssh_host_ecdsa_key
         sed 's/ListenAddress 0.0.0.0/ListenAddress 127.0.0.1/' \
             /etc/ssh/sshd_config > /run/sshd/requester_config
         printf 'AllowTcpForwarding remote\nAllowStreamLocalForwarding remote\n' \

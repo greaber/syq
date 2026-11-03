@@ -237,68 +237,41 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
             "syq: remote copy approved; connecting to the destination's restricted receiver"
         );
     }
-    // This machine reaches the receiver at the address its own SSH
-    // configuration gives the target, as the account the approving machine
+    // This machine reaches the receiver as its own SSH configuration reaches
+    // the target its command named, as the account the approving machine
     // enrolled, and checks its host key as its own `ssh` would, also
     // accepting what the approving machine knows.
-    let address = ssh_target(&target, Instant::now() + SETUP_TIMEOUT, &|| false)?;
     let endpoint = target_endpoint(&target)?;
-    let dialer = crate::remote_to_remote::DialerHostKeys::resolve(
-        endpoint.user.as_deref(),
-        &endpoint.host,
-        endpoint.port,
-    )?;
-    let port = address.port;
     super::apply_deletion_limit(args, Some(issued.max_delete));
     let destination = args.locations.last_mut().unwrap();
     destination.path = issued.destination;
-    destination.host = Some(address.hostname);
+    destination.host = Some(endpoint.host);
     destination.user = Some(issued.login);
-    destination.port = Some(port);
+    destination.port = endpoint.port;
     args.auth_from = crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name));
     args.restricted_grant = Some(issued.directive);
-    args.rsh = Some(crate::remote_to_remote::receiver_rsh(port));
+    args.rsh = Some(crate::remote_to_remote::receiver_rsh(endpoint.port));
     let keys = crate::remote_to_remote::prepare_receiver_ssh_with(
         args,
         &issued.known_hosts,
         issued.entry_key.0.as_bytes(),
-        &dialer,
     )?;
     args.receiver_keys = Some(Arc::new(keys));
     Ok(())
 }
 
-/// What this machine's SSH configuration gives `target`.
-struct SshTarget {
-    user: String,
-    hostname: String,
-    port: u16,
-}
-
-fn ssh_target(target: &str, deadline: Instant, cancelled: &dyn Fn() -> bool) -> Result<SshTarget> {
+/// The login this machine's SSH configuration gives `target`.
+fn ssh_login(target: &str, deadline: Instant, cancelled: &dyn Fn() -> bool) -> Result<String> {
     let output = read_ssh_configuration(
         target_spec(target)?.ssh_hostname_command(),
         deadline,
         cancelled,
     )?;
-    let value = |name: &str| {
-        output
-            .lines()
-            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
-            .map(|value| value.trim().to_owned())
-            .with_context(|| {
-                format!("the SSH configuration for {target:?} did not report its {name}")
-            })
-    };
-    let hostname = value("hostname")?;
-    validate_data_hostname(&hostname)?;
-    Ok(SshTarget {
-        user: value("user")?,
-        port: value("port")?.parse().with_context(|| {
-            format!("the SSH configuration for {target:?} reported an invalid port")
-        })?,
-        hostname,
-    })
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("user ")?.trim().to_owned().into())
+        .filter(|user: &String| !user.is_empty())
+        .with_context(|| format!("the SSH configuration for {target:?} did not report its user"))
 }
 
 pub(super) struct Slot<'a>(pub(super) &'a AtomicUsize);
@@ -391,7 +364,7 @@ impl Receiver {
                 || requester_closed(&socket)
         };
         // Reading this machine's SSH configuration contacts no server.
-        let login = ssh_target(&target, Instant::now() + SETUP_TIMEOUT, &cancelled)?.user;
+        let login = ssh_login(&target, Instant::now() + SETUP_TIMEOUT, &cancelled)?;
         let enrollment =
             crate::restricted::local_enrollment_state(&endpoint.host, endpoint.port, &login)?;
         let account = format!("{login}@{}", endpoint.host);

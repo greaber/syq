@@ -863,4 +863,23 @@ finally:
     known_hosts.write_bytes(saved_runner)
     remote(f"kill $(cat {shlex.quote(root)}/sshd.pid) 2>/dev/null; rm -rf {shlex.quote(root)}")
 assert remote("sha256sum /tmp/syq-real-ssh/forward/hostkey-certificate").split()[0] == source_hash
+print("case: a destination whose only known key is ECDSA is checked against that key", flush=True)
+# The destination also offers ed25519, which OpenSSH prefers unless it
+# already knows another type for the host: both machines know only ECDSA.
+saved_source = source_known_hosts()
+saved_runner = known_hosts.read_bytes()
+ecdsa = run("ssh-keyscan", "-T", "5", "-t", "ecdsa", "destination")
+assert ecdsa.split()[1].startswith("ecdsa-sha2-"), ecdsa
+try:
+    run("ssh-keygen", "-R", "destination", "-f", str(known_hosts))
+    with known_hosts.open("a") as hosts:
+        hosts.write(ecdsa)
+    run("ssh", "source", "ssh-keygen -R destination >/dev/null 2>&1; umask 077; cat >> ~/.ssh/known_hosts",
+        stdin=ecdsa)
+    with_source_config("Host destination\n  StrictHostKeyChecking yes\n",
+                       lambda: copy("/tmp/syq-real-ssh/forward/hostkey-ecdsa"))
+finally:
+    restore_source_known_hosts(saved_source)
+    known_hosts.write_bytes(saved_runner)
+assert remote("sha256sum /tmp/syq-real-ssh/forward/hostkey-ecdsa").split()[0] == source_hash
 print("source-shell remote copy checks passed", flush=True)

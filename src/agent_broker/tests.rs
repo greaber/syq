@@ -19,7 +19,8 @@ fn host_policy(user: &str, name: &str, key: KeyData) -> HostPolicy {
         login_user: user.into(),
         connection_host: name.into(),
         port: 22,
-        host_keys: vec![key],
+        host_keys: vec![key.clone()],
+        listed_keys: vec![key],
         authorities: Vec::new(),
         revoked: Vec::new(),
         unsupported: None,
@@ -197,12 +198,40 @@ fn ambiguous_or_relative_known_hosts_filenames_fail_closed() {
         let output = format!(
                 "user backup\nhostname vault.internal\nport 22\nuserknownhostsfile {value}\nglobalknownhostsfile none\nhostkeyalgorithms ssh-ed25519\n"
             );
-        let error = parse_ssh_config(output.as_bytes()).unwrap_err();
+        // Exact-key uses refuse it; reading what the files hold does not.
+        let config = parse_ssh_config(output.as_bytes()).unwrap();
+        let reason = config.unsupported.unwrap();
         assert!(
-            error.to_string().contains("known_hosts"),
-            "unexpected error for {value:?}: {error:#}"
+            reason.contains("known_hosts"),
+            "unexpected reason for {value:?}: {reason}"
         );
     }
+}
+
+/// What the laptop tells a server about a host: the files a list names,
+/// whitespace separating them as OpenSSH reads an unquoted list, and no
+/// relative path.
+#[test]
+fn known_hosts_lists_are_read_as_far_as_they_can_be() {
+    let mut files = Vec::new();
+    let mut unsupported = None;
+    append_known_hosts_files(
+        &mut files,
+        "/tmp/one /tmp/two relative-hosts ~/.ssh/known_hosts",
+        None,
+        true,
+        &mut unsupported,
+    );
+    assert_eq!(
+        files,
+        [PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")]
+    );
+    assert!(unsupported.is_some());
+    let mut files = Vec::new();
+    let mut unsupported = None;
+    append_known_hosts_files(&mut files, "/tmp/only", None, true, &mut unsupported);
+    assert_eq!(files, [PathBuf::from("/tmp/only")]);
+    assert!(unsupported.is_none());
 }
 
 #[test]
@@ -224,7 +253,7 @@ fn configured_value_identical_to_flattened_defaults_fails_closed() {
             files: Vec::new(),
         },
     };
-    let error = parse_ssh_config_with_defaults(
+    let config = parse_ssh_config_with_defaults(
         output.as_bytes(),
         Some(&defaults),
         &KnownHostsConfigured {
@@ -232,8 +261,11 @@ fn configured_value_identical_to_flattened_defaults_fails_closed() {
             global: false,
         },
     )
-    .unwrap_err();
-    assert!(error.to_string().contains("ambiguous known_hosts"));
+    .unwrap();
+    assert!(config
+        .unsupported
+        .unwrap()
+        .contains("ambiguous known_hosts"));
 }
 
 #[test]
@@ -304,9 +336,12 @@ fn openssh_quoted_default_collision_is_rejected_end_to_end() {
     let paths = ssh_configuration_paths(&output.stderr).unwrap();
     let configured = configured_known_hosts_directives(&paths).unwrap();
     assert!(configured.user);
-    let error =
-        parse_ssh_config_with_defaults(&output.stdout, Some(&defaults), &configured).unwrap_err();
-    assert!(error.to_string().contains("ambiguous known_hosts"));
+    let config =
+        parse_ssh_config_with_defaults(&output.stdout, Some(&defaults), &configured).unwrap();
+    assert!(config
+        .unsupported
+        .unwrap()
+        .contains("ambiguous known_hosts"));
 }
 
 #[test]

@@ -315,29 +315,46 @@ would. See [Other authentication modes](remote-reference.md#other-authentication
 
 ### How hostA checks hostB's key
 
-HostA checks hostB's host key the way its own `ssh hostB` would: with its
-known_hosts files, host certificate authorities, `KnownHostsCommand`, and
-`StrictHostKeyChecking` setting. It also accepts the keys and host
-certificate authorities that your laptop's known_hosts lists for hostB. A key
-that contradicts one either machine knows is refused, as `ssh` refuses it,
-and the message names the file that holds the other key; the file named
-`known-to-the-machine-that-approved-this-copy` holds your laptop's. When
-neither machine knows hostB, hostA follows its own setting, except that
-nobody can answer the question `ask`, the default, would ask. So `ask` works
-like `accept-new`: hostA accepts the key it is shown the first time and
-records it in its own known_hosts, and later connections are checked
-against it. Your laptop's own login to hostB, which sets up restricted
-copying, checks hostB's key with your laptop's SSH configuration in the same
-way, and asks you only when it runs in a terminal.
+HostA connects to hostB with its own SSH configuration, which checks hostB's
+host key as its own `ssh` would: its known_hosts files, host certificate
+authorities, `KnownHostsCommand`, `StrictHostKeyChecking`, and the rest of its
+host-key settings. Syq overrides on the command line what this connection
+must not do: it uses the entry key first, no agent, no PKCS#11 or other
+security key provider, no control socket, forwarding, proxy, tunnel, local
+or remote command, or terminal, and it never prompts. Identity files
+hostA's configuration names are still offered after the entry key if hostB
+refuses it, and environment variables it sends go as far as hostB's sshd
+accepts them.
+
+HostA also accepts the keys and host certificate authorities that your
+laptop's known_hosts lists for hostB, from a file named
+`known-to-the-machine-that-approved-this-copy`. A key that matches an entry
+on either machine is accepted, so a key your laptop knows works even where
+hostA has an old one. A key that matches nothing while either machine lists
+some key for hostB is refused, as `ssh` refuses it, and the message names
+the file with the other key; with `StrictHostKeyChecking no`, hostA accepts
+it, as its `ssh` would. When neither machine knows hostB, hostA follows its
+own setting, except that nobody can answer the question `ask`, the default,
+would ask. So `ask` works like `accept-new`: hostA accepts the key it is
+shown the first time and records it in its own known_hosts, and later
+connections are checked against it. Your laptop's own login to hostB, which
+sets up restricted copying, checks hostB's key with your laptop's SSH
+configuration in the same way, records a newly accepted key in your
+laptop's known_hosts, and asks you only when it runs in a terminal.
 
 Accepting a new key means that someone who can intercept that first
 connection could present their own key. They could not use the entry key or
 the signed copy against the real hostB, because an SSH key login cannot be
 relayed to another connection, but they would receive the copy's data and
 could report that it completed. For a copy started on your laptop, your
-laptop checks hostB's reports (step 4) and would detect that. Set
-`StrictHostKeyChecking yes` for hostB on hostA, and trust hostB's key there
-or on your laptop, to refuse a host neither machine has seen.
+laptop checks hostB's reports (step 4) and would detect that.
+
+To refuse a host neither machine has seen, set `StrictHostKeyChecking yes`
+on hostA for the name hostA connects with, and trust hostB's key there or
+on your laptop. For a copy a server started, that is the name in the
+server's command. For a copy started on your laptop, it is the address your
+laptop's SSH configuration gives hostB, not the name you typed: a `Host`
+block on hostA for that name does not apply.
 
 ### A compromised source server
 
