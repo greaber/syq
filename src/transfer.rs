@@ -5177,7 +5177,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             .earlier_partials
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len();
+            .values()
+            .filter(|found| **found)
+            .count();
         if earlier > 0 {
             progress.eprintln(&earlier_partials_notice(
                 earlier,

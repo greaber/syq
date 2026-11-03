@@ -61,10 +61,11 @@ pub struct Progress {
     /// Under `--in-place=update`, existing files replaced rather than
     /// updated in place, by reason; planned ones in a dry run.
     pub in_place_refusals: InPlaceRefusals,
-    /// The files whose destination held partial files from an earlier copy
-    /// when this copy first prepared them. This copy reads those partials
-    /// but leaves them, since another copy may still be writing one.
-    pub(crate) earlier_partials: Mutex<std::collections::HashSet<usize>>,
+    /// For each file this copy prepared, whether its destination held
+    /// partial files from an earlier copy when it was first prepared. This
+    /// copy reads those partials but leaves them, since another copy may
+    /// still be writing one.
+    pub(crate) earlier_partials: Mutex<std::collections::HashMap<usize, bool>>,
     /// Settled creations, mirrored here (like the deletion counters) so a
     /// fatal-error terminal record reports what the run actually did.
     pub directories_created: AtomicU64,

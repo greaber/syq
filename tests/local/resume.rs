@@ -169,6 +169,42 @@ fn retry_names_the_earlier_partials_it_leaves() {
 
 #[cfg(debug_assertions)]
 #[test]
+fn a_file_prepared_again_after_a_dropped_connection_finds_no_earlier_partial() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    t.expose_remote_syq();
+    let data = prng(2 * 1024 * 1024 + 7, 11);
+    write(&t.path("src"), &data);
+    let remote = format!("fake:{}", t.s("dst"));
+    let marker = t.path("drop-prepare-once");
+    // The receiver creates this copy's partial, then the connection drops
+    // before its reply. Prepared again over a new connection, the file finds
+    // that partial, which is this copy's own.
+    let out = remote_syq_command(
+        &t,
+        &rsh,
+        &[
+            "-a",
+            "--syq-no-bootstrap",
+            "--block-size=64K",
+            &t.s("src"),
+            &remote,
+        ],
+    )
+    .env("SYQ_TEST_DROP_AFTER_REQUEST", "prepare")
+    .env("SYQ_TEST_DROP_MARKER", &marker)
+    .run()
+    .unwrap();
+    assert_output_ok(&out);
+    assert!(marker.exists());
+    assert_eq!(read(&t.path("dst")), data);
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("connection dropped; reopening"), "{stderr}");
+    assert!(!stderr.contains("from an earlier copy"), "{stderr}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
 fn checksum_toggle_accepts_prior_partial_candidates() {
     let t = Tmp::new();
     let data = prng(6 * 1024 * 1024, 43);
