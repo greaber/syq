@@ -3104,6 +3104,115 @@ fn source_read_ahead_runs_for_tcp_and_ssh_ranges_and_streams() {
     }
 }
 
+/// A closed output stream, as with `2>&1 | head`, must not stop a copy. A
+/// transfer worker reports that source read-ahead started: on the
+/// coordinator for a push, on the helper for a pull. Without a failed write
+/// to drop, the worker would stop and leave the file unpublished.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn closed_output_streams_do_not_stop_debug_copies() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    let broken = || {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        OwnedFd::from(writer)
+    };
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    // Several read-ahead blocks, so a worker starts preparation mid-file.
+    let data = prng(9 << 20, 211);
+    write(&t.path("source"), &data);
+    for pull in [false, true] {
+        for tcp in [false, true] {
+            for closed in ["stdout", "stderr", "both"] {
+                let case = format!("pull={pull} tcp={tcp} closed={closed}");
+                let destination = t.path(&format!("dst-{pull}-{tcp}-{closed}"));
+                let log = t.path(&format!("output-{pull}-{tcp}-{closed}.log"));
+                let open = || Stdio::from(File::create(&log).unwrap());
+                let (stdout, stderr): (Stdio, Stdio) = match closed {
+                    "stdout" => (broken().into(), open()),
+                    "stderr" => (open(), broken().into()),
+                    _ => {
+                        // One closed pipe for both, as with `2>&1 | head`.
+                        let both = broken();
+                        (both.try_clone().unwrap().into(), both.into())
+                    }
+                };
+                let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                command
+                    .args(["cp", "--rsh"])
+                    .arg(&rsh)
+                    .args(["--syq-path", env!("CARGO_BIN_EXE_syq"), "-vv"])
+                    .args(["--no-progress", "--tcp-ports", EPHEMERAL_TCP_PORTS]);
+                if tcp {
+                    command.env("SYQ_TEST_REQUIRE_TCP", "1");
+                } else {
+                    command.arg("--no-tcp");
+                }
+                if pull {
+                    command.args(["--from", "host"]);
+                }
+                command.arg(t.path("source"));
+                if !pull {
+                    command.args(["--to", "host"]);
+                }
+                command
+                    .arg("--into")
+                    .arg(&destination)
+                    .env("SYQ_DEBUG", "1")
+                    .env("SYQ_TEST_LOCAL_READ_AHEAD", "1")
+                    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                    .env("FAKE_SSH_CONNECTION", "127.0.0.1 40000 127.0.0.1 22")
+                    .env("XDG_CONFIG_HOME", t.path("config"))
+                    .env("XDG_CACHE_HOME", t.path("cache"))
+                    .stdin(Stdio::null())
+                    .stdout(stdout)
+                    .stderr(stderr);
+                // The copy's helper shares this group; closing it on any exit
+                // or failure leaves no process behind.
+                let mut copy = process_group::ProcessGroup::spawn(&mut command).unwrap();
+                drop(command);
+                let started = Instant::now();
+                let mut next_progress = started + Duration::from_secs(5);
+                let status = loop {
+                    if let Some(status) = copy.poll().unwrap() {
+                        break status;
+                    }
+                    if started.elapsed() >= Duration::from_secs(30) {
+                        let partials = partial_files(&destination);
+                        copy.close().unwrap();
+                        panic!(
+                            "{case}: syq still running after 30s; partials {partials:?}; output:\n{}",
+                            fs::read_to_string(&log).unwrap_or_default()
+                        );
+                    }
+                    if Instant::now() >= next_progress {
+                        eprintln!("{case}: waiting for syq to exit");
+                        next_progress += Duration::from_secs(5);
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                };
+                let output = fs::read_to_string(&log).unwrap_or_default();
+                assert!(status.success(), "{case}: {status:?}\n{output}");
+                assert!(read(&destination.join("source")) == data, "{case}");
+                assert_eq!(partial_files(&destination), Vec::<PathBuf>::new(), "{case}");
+                if closed == "stdout" {
+                    // The diagnostic the other cases must drop was emitted.
+                    assert!(
+                        output.contains("syq: source read-ahead started"),
+                        "{case}: {output}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn rejected_telemetry_subscription_does_not_fail_remote_copy() {

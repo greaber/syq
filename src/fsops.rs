@@ -260,7 +260,7 @@ pub(crate) fn test_race_barrier(ready_env: &str, continue_env: &str, label: &str
                 );
             }
             if std::time::Instant::now() >= next_progress {
-                eprintln!(
+                crate::output::diagnostic!(
                     "syq: waiting for {label} continuation {}",
                     Path::new(&continuation).display()
                 );

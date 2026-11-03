@@ -888,10 +888,10 @@ impl RemoteConn {
         );
         let (rx, reader, batch_receipts) =
             spawn_observed_reader(Box::new(session.stdout), replies, None, observation.clone())?;
-        let mut stderr = session.stderr;
+        let stderr = session.stderr;
         std::thread::Builder::new()
             .spawn(move || {
-                let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
+                let _ = crate::output::pass_through(stderr, &mut std::io::stderr());
             })
             .map_err(crate::resources::allocation_error)
             .context("start pooled stderr reader")?;
