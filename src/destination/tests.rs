@@ -1020,7 +1020,7 @@ fn a_large_message_may_arrive_after_the_ordinary_deadline() {
     write_message(&mut bytes, &"x".repeat(MAX_MESSAGE)).unwrap();
     let (mut client, mut server) = UnixStream::pair().unwrap();
     let reader = std::thread::spawn(move || {
-        read_socket_message::<String>(&mut server, Duration::from_millis(100))
+        read_socket_request::<String>(&mut server, Duration::from_millis(100))
             .map(|text| text.len())
     });
     client.write_all(&bytes[..4]).unwrap();

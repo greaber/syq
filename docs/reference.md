@@ -806,8 +806,9 @@ expands to. Some copies take fewer:
   characters.
 - A [copy between two servers](remote-to-remote.md), including a
   [restricted copy](remote-reference.md#enrollment), passes its named sources
-  to the server that runs it on a command line, which holds 128 KiB, and each
-  path takes about a third more room there than its length. So 1,024 sources
+  to the server that runs it on a command line, unless it runs with
+  `--coordinate-at local`. The command line holds 128 KiB, and each path takes
+  about a third more room there than its length. So 1,024 sources
   fit when their paths average up to about 90 characters, and 500 when they
   average up to about 190.
 - With `--prune`, a copy checks every named source against every other in

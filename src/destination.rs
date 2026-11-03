@@ -509,6 +509,31 @@ pub(crate) fn read_socket_message<T: DeserializeOwned>(
     socket: &mut UnixStream,
     timeout: Duration,
 ) -> Result<T> {
+    read_socket_framed(socket, timeout, MAX_MESSAGE, "named destination message")
+}
+/// As `read_socket_message`, for a message of at most `limit` bytes.
+pub(crate) fn read_socket_framed<T: DeserializeOwned>(
+    socket: &mut UnixStream,
+    timeout: Duration,
+    limit: usize,
+    what: &str,
+) -> Result<T> {
+    read_framed(
+        &mut DeadlineSocket {
+            socket,
+            deadline: Instant::now() + timeout,
+        },
+        limit,
+        what,
+    )
+}
+/// As `read_socket_message`, for a request that may be as large as a
+/// message can be: one larger than an ordinary message takes one of the
+/// `LARGE_MESSAGE_READS`, and has until `LARGE_MESSAGE_TIMEOUT` to arrive.
+pub(crate) fn read_socket_request<T: DeserializeOwned>(
+    socket: &mut UnixStream,
+    timeout: Duration,
+) -> Result<T> {
     let started = Instant::now();
     read_message_extending(
         &mut DeadlineSocket {
@@ -1266,7 +1291,7 @@ impl Receiver {
 
     fn handle(&self, mut stream: TrackedStream) -> Result<()> {
         let envelope: Envelope =
-            read_socket_message(&mut stream.try_clone()?, Duration::from_secs(10))?;
+            read_socket_request(&mut stream.try_clone()?, Duration::from_secs(10))?;
         let version = if matches!(envelope.message, Message::Ping | Message::Identify { .. }) {
             DISCOVERY_VERSION
         } else {
