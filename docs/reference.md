@@ -798,10 +798,13 @@ directory. Sources must then be relative: `../private` is refused, and even
 with `--follow-src`, symlinks cannot lead outside the root. `-C` permits both.
 
 One copy accepts up to 1,024 named sources, such as the names a shell glob
-expands to. For more, select their parent directory with `--srcs-in` and leave
-out what you don't want with `--ignore` or `--where`, or split the copy. Each
-named source adds to the copy's setup time, and with `--prune` that time grows
-with the square of their number.
+expands to. A [copy between two servers](remote-to-remote.md) that uses
+restricted copying on the destination takes fewer, because its signed approval
+lists each one: about 900 short names, fewer when the destination paths are
+long. For more, select their parent directory with `--srcs-in` and
+leave out what you don't want with `--ignore` or `--where`, or split the copy.
+Each named source adds to the copy's setup time, and with `--prune` that time
+grows with the square of their number.
 
 ## Shell pipelines and file descriptors
 
