@@ -3883,24 +3883,31 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 .unwrap_or_default()
                 .to_vec()
         };
-        let prune_suffixes: Vec<_> = if may_prune {
-            srcs.iter()
+        // Recursion checks include the destination container, but prune
+        // overlap checks apply only to copied directory roots. The receiver
+        // compares every selected source with every such root, so one
+        // source's prune cannot remove another selected source.
+        let mut prune_suffixes = Vec::new();
+        if may_prune {
+            let mut distinct = std::collections::HashSet::new();
+            for (candidate, _) in srcs
+                .iter()
                 .zip(roots)
                 .filter(|(_, root)| root.selection.relative().is_empty())
-                .map(|(candidate, _)| {
-                    if candidate.copies_contents()
-                        || args.files_from.is_some()
-                        || args.placement == Placement::As
-                    {
-                        primary_suffix.clone()
-                    } else {
-                        join(&primary_suffix, &candidate.basename())
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+            {
+                let suffix = if candidate.copies_contents()
+                    || args.files_from.is_some()
+                    || args.placement == Placement::As
+                {
+                    primary_suffix.clone()
+                } else {
+                    join(&primary_suffix, &candidate.basename())
+                };
+                if distinct.insert(suffix.clone()) {
+                    prune_suffixes.push(suffix);
+                }
+            }
+        }
         for (source_index, (source, root)) in srcs.iter().zip(roots).enumerate() {
             // Registration represents every selected directory as an empty
             // path beneath that directory descriptor. Exact files and
@@ -3917,20 +3924,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     suffixes.push(basename);
                 }
             }
-            // Recursion checks include the destination container, but prune
-            // overlap checks apply only to copied directory roots. Compare
-            // every selected source with every such root: one source's prune
-            // must not remove another selected source.
-            for suffix in &prune_suffixes {
-                if !suffixes.contains(suffix) {
-                    suffixes.push(suffix.clone());
-                }
-            }
-            let checked_for_prune = suffixes
-                .iter()
-                .map(|suffix| prune_suffixes.contains(suffix))
-                .collect::<Vec<_>>();
-            source_checks.push((source_index, checked_for_prune));
+            source_checks.push((source_index, suffixes.len()));
             ancestry_checks.push(DirectoryAncestryCheck {
                 source_root: root.ticket.clone(),
                 source_is_directory,
@@ -3950,6 +3944,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             match check_operator_directory_ancestry(
                 &mut *dst_ctl,
                 ancestry_checks,
+                prune_suffixes,
                 opts.may_widen_directory_permissions()
                     .then_some(selection_in_copy),
             ) {
@@ -3964,7 +3959,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     prune_overlap_unsearchable = true;
                     source_checks
                         .iter()
-                        .map(|(_, checked)| vec![DirectoryRelation::Separate; checked.len()])
+                        .map(|&(_, suffixes)| SourceDirectoryRelations {
+                            relations: vec![DirectoryRelation::Separate; suffixes],
+                            shared: DirectoryRelation::Separate,
+                        })
                         .collect()
                 }
                 result => result?,
@@ -3977,18 +3975,24 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 source_checks.len()
             );
         }
-        for ((source_index, checked_for_prune), relations) in
-            source_checks.into_iter().zip(relations)
-        {
-            if relations.len() != checked_for_prune.len() {
+        for ((source_index, suffixes), relations) in source_checks.into_iter().zip(relations) {
+            if relations.relations.len() != suffixes {
                 bail!(
                     "destination returned {} ancestry results for {} effective paths",
-                    relations.len(),
-                    checked_for_prune.len()
+                    relations.relations.len(),
+                    suffixes
                 );
             }
             let source = &srcs[source_index];
-            for (relation, checks_prune) in relations.into_iter().zip(checked_for_prune) {
+            // The source's own effective paths check recursion; its relation
+            // to the copied directory roots together decides whether pruning
+            // could remove it.
+            let relations = relations
+                .relations
+                .into_iter()
+                .map(|relation| (relation, false))
+                .chain([(relations.shared, true)]);
+            for (relation, checks_prune) in relations {
                 match relation {
                     DirectoryRelation::Separate => {}
                     DirectoryRelation::SourceUnsearchable => {
@@ -5514,14 +5518,19 @@ fn check_operator_directory(
 fn check_operator_directory_ancestry(
     conn: &mut dyn Conn,
     checks: Vec<DirectoryAncestryCheck>,
+    shared_suffixes: Vec<PathBytes>,
     access: Option<bool>,
-) -> Result<Vec<Vec<DirectoryRelation>>> {
+) -> Result<Vec<SourceDirectoryRelations>> {
     let request = match access {
         Some(selection_in_copy) => Request::CheckOperatorDirectoryAncestryWithAccess {
             checks,
+            shared_suffixes,
             selection_in_copy,
         },
-        None => Request::CheckOperatorDirectoryAncestry { checks },
+        None => Request::CheckOperatorDirectoryAncestry {
+            checks,
+            shared_suffixes,
+        },
     };
     match ok(conn.call(request)?, "destination ancestry")? {
         Response::DirectoryRelations(relations) => Ok(relations),

@@ -1242,10 +1242,17 @@ fn ancestry_requires_an_available_source_directory() {
                 source_is_directory: true,
                 suffixes: vec![Vec::new()],
             }],
+            &[],
             None,
         )
     };
-    assert_eq!(check().unwrap(), vec![vec![DirectoryRelation::Same]]);
+    assert_eq!(
+        check().unwrap(),
+        vec![SourceDirectoryRelations {
+            relations: vec![DirectoryRelation::Same],
+            shared: DirectoryRelation::Separate,
+        }]
+    );
 
     if unsafe { libc::geteuid() } != 0 {
         let socket = ticket.broker_path();
@@ -1328,6 +1335,136 @@ fn retained_operator_directory_reports_source_ancestry_without_following_suffix_
     );
 
     fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A source's relation to the shared directories together is the first
+/// relation that refuses pruning, or that cannot be checked, found by
+/// comparing each pair, with each directory and ancestry walked only once.
+#[test]
+fn shared_ancestry_matches_comparing_each_pair() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path();
+    for directory in ["dst/kept/inner", "dst/other", "external/sub", "parent"] {
+        fs::create_dir_all(root.join(directory)).unwrap();
+    }
+    fs::write(root.join("dst/kept/file"), b"file").unwrap();
+    fs::write(root.join("dst/file"), b"file").unwrap();
+    symlink(root.join("external"), root.join("dst/link")).unwrap();
+    let session = DescriptorSessionSlot::default();
+    let source = |path: &str, source_is_directory| DirectoryAncestryCheck {
+        source_root: session
+            .register(File::open(root.join(path)).unwrap())
+            .unwrap(),
+        source_is_directory,
+        suffixes: Vec::new(),
+    };
+    let checks = vec![
+        source("dst/kept", true),
+        source("dst/kept/inner", true),
+        source("dst", true),
+        source(".", true),
+        source("external", true),
+        source("external/sub", true),
+        // Exact files in dst/kept and in dst.
+        source("dst/kept", false),
+        source("dst", false),
+    ];
+    let shared: Vec<PathBytes> = ["missing", "other", "kept", "link", "file", "kept/inner"]
+        .into_iter()
+        .map(|suffix| suffix.as_bytes().to_vec())
+        .collect();
+    let mut ops = FsOps::new();
+    ops.check_operator_directory(
+        root.join("dst").as_os_str().as_bytes(),
+        false,
+        OperatorSymlinkPolicy::Refuse,
+    )
+    .unwrap();
+    let combined = |shared: &[PathBytes]| {
+        ops.check_operator_directory_ancestry(&checks, shared, None)
+            .unwrap()
+            .into_iter()
+            .map(|relations| relations.shared)
+            .collect::<Vec<_>>()
+    };
+    let pairs = |shared: &[PathBytes]| {
+        let checks: Vec<_> = checks
+            .iter()
+            .cloned()
+            .map(|check| DirectoryAncestryCheck {
+                suffixes: shared.to_vec(),
+                ..check
+            })
+            .collect();
+        ops.check_operator_directory_ancestry(&checks, &[], None)
+            .unwrap()
+            .into_iter()
+            .map(|relations| {
+                let refusing = relations.relations.iter().find(|relation| {
+                    matches!(
+                        relation,
+                        DirectoryRelation::Same
+                            | DirectoryRelation::Descendant
+                            | DirectoryRelation::Ancestor
+                    )
+                });
+                match refusing {
+                    Some(relation) => *relation,
+                    None if relations
+                        .relations
+                        .contains(&DirectoryRelation::SourceUnsearchable) =>
+                    {
+                        DirectoryRelation::SourceUnsearchable
+                    }
+                    None => DirectoryRelation::Separate,
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    use DirectoryRelation::*;
+    assert_eq!(
+        combined(&shared),
+        [Same, Ancestor, Descendant, Descendant, Separate, Separate, Ancestor, Separate]
+    );
+    // Each order of the shared directories reports its own first relation.
+    let mut reversed = shared.clone();
+    reversed.reverse();
+    assert_eq!(combined(&reversed)[1], Same);
+    for shared in [&shared, &reversed, &shared[..2].to_vec(), &Vec::new()] {
+        assert_eq!(combined(shared), pairs(shared), "{shared:?}");
+    }
+
+    if is_superuser() {
+        return;
+    }
+    // A source whose ancestry stops below the root cannot be cleared of lying
+    // beneath an existing shared directory.
+    let blocked = root.join("parent/blocked");
+    fs::create_dir(&blocked).unwrap();
+    let unsearchable = source("parent/blocked", true);
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o600)).unwrap();
+    let relations =
+        ops.check_operator_directory_ancestry(std::slice::from_ref(&unsearchable), &shared, None);
+    let missing = ops.check_operator_directory_ancestry(
+        std::slice::from_ref(&unsearchable),
+        &shared[..1],
+        None,
+    );
+    // A shared directory whose ancestry stops below the root fails the check,
+    // unless it is itself the source.
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(relations.unwrap()[0].shared, SourceUnsearchable);
+    assert_eq!(missing.unwrap()[0].shared, Separate);
+    let kept = root.join("dst/kept");
+    fs::set_permissions(&kept, fs::Permissions::from_mode(0o600)).unwrap();
+    let same = ops.check_operator_directory_ancestry(&checks[..1], &shared[..3], None);
+    let other = ops.check_operator_directory_ancestry(&checks[4..5], &shared[..3], None);
+    fs::set_permissions(&kept, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(same.unwrap()[0].shared, Same);
+    assert!(error_is_kind(
+        &other.unwrap_err(),
+        io::ErrorKind::PermissionDenied
+    ));
 }
 
 #[test]
@@ -8254,6 +8391,7 @@ fn ancestry_access_restores_after_request_error() {
             source_is_directory: true,
             suffixes: vec![Vec::new(), b"invalid\0suffix".to_vec()],
         }],
+        &[],
         Some(true),
     );
     assert!(result.unwrap_err().to_string().contains("NUL"));
@@ -8290,6 +8428,7 @@ fn ancestry_access_widens_only_directories_inside_the_copy() {
                 source_is_directory: true,
                 suffixes: vec![suffix.to_vec()],
             }],
+            &[],
             Some(selection_in_copy),
         )
     };
@@ -8327,7 +8466,13 @@ fn ancestry_access_widens_only_directories_inside_the_copy() {
     let result = check(&parent, b"copied", false);
     let after = fs::metadata(&copied).unwrap();
     fs::set_permissions(&copied, fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(result.unwrap(), vec![vec![DirectoryRelation::Separate]]);
+    assert_eq!(
+        result.unwrap(),
+        vec![SourceDirectoryRelations {
+            relations: vec![DirectoryRelation::Separate],
+            shared: DirectoryRelation::Separate,
+        }]
+    );
     assert_eq!(after.mode() & 0o777, 0o600);
 }
 

@@ -1288,12 +1288,19 @@ impl FsOps {
     fn check_operator_directory_ancestry(
         &self,
         checks: &[DirectoryAncestryCheck],
+        shared_suffixes: &[PathBytes],
         access: Option<bool>,
-    ) -> Result<Vec<Vec<DirectoryRelation>>> {
+    ) -> Result<Vec<SourceDirectoryRelations>> {
         if checks.len() > DEFAULT_MAX_ROOTS {
             bail!(
                 "destination ancestry source count ({}) exceeds the endpoint-session limit ({DEFAULT_MAX_ROOTS})",
                 checks.len()
+            );
+        }
+        if shared_suffixes.len() > DEFAULT_MAX_ROOTS {
+            bail!(
+                "destination ancestry shared directory count ({}) exceeds the endpoint-session limit ({DEFAULT_MAX_ROOTS})",
+                shared_suffixes.len()
             );
         }
         let registered_selection;
@@ -1321,36 +1328,37 @@ impl FsOps {
             ),
             None => TemporaryDirectorySearchAccess::default(),
         };
-        let relations = checks
-            .iter()
-            .map(|check| {
-                if !check.source_root.is_directory() {
-                    bail!("destination ancestry requires a source directory ticket");
-                }
-                let source = acquire_descriptor(&check.source_root)
-                    .context("claim exact source directory for destination ancestry")?;
-                check
-                    .suffixes
-                    .iter()
-                    .map(|suffix| {
-                        let relation = selection.relation_to_source_with_access(
-                            &source,
-                            suffix,
-                            &mut temporary,
-                        )?;
-                        Ok(if check.source_is_directory {
-                            relation
-                        } else {
-                            match relation {
-                                DirectoryRelation::Same => DirectoryRelation::Ancestor,
-                                DirectoryRelation::Descendant => DirectoryRelation::Separate,
-                                other => other,
-                            }
-                        })
-                    })
-                    .collect()
-            })
-            .collect();
+        #[cfg(debug_assertions)]
+        let lookups = crate::rooted::operator_directory_lookups_for_test();
+        let relations = {
+            let mut ancestry = DirectoryAncestry::new(selection, &mut temporary);
+            checks
+                .iter()
+                .map(|check| {
+                    if !check.source_root.is_directory() {
+                        bail!("destination ancestry requires a source directory ticket");
+                    }
+                    let source = acquire_descriptor(&check.source_root)
+                        .context("claim exact source directory for destination ancestry")?;
+                    ancestry.check(
+                        source,
+                        check.source_is_directory,
+                        &check.suffixes,
+                        shared_suffixes,
+                    )
+                })
+                .collect()
+        };
+        // Debug builds log how many directories each check opened, a line
+        // each, in the file `SYQ_TEST_ANCESTRY_LOOKUPS_LOG` names.
+        #[cfg(debug_assertions)]
+        let _ = record_test_event(
+            "SYQ_TEST_ANCESTRY_LOOKUPS_LOG",
+            format_args!(
+                "{}",
+                crate::rooted::operator_directory_lookups_for_test() - lookups
+            ),
+        );
         match (relations, temporary.restore()) {
             (Err(error), Err(restore)) => Err(error.context(format!("{restore:#}"))),
             (Ok(_), Err(restore)) => Err(restore),
