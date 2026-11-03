@@ -3,8 +3,10 @@
 `python3 scripts/agent-coordination.py` coordinates sessions on one machine
 through shared files. It needs Python 3.9 or later on Linux or macOS. Reviews
 also need Git, `gh`, tmux, and the selected `claude` or `codex` executable.
-It does not install tools, change their permission settings, or inject terminal
-input. Reviewers receive access to the selected state directory with `--add-dir`.
+It does not install tools or inject terminal input. By default it starts
+reviewers with permission prompts turned off, at `xhigh` effort; see
+[Reviewer settings](#reviewer-settings). Reviewers receive access to the
+selected state directory with `--add-dir`.
 Run it from your task worktree. If that branch predates the tool, invoke the
 script by absolute path from a checkout that contains it. Keep that checkout
 available while its reviewer requests are active; their prompts record its path.
@@ -142,13 +144,15 @@ The PR description by itself is not evidence of what the user requested.
 
 ```sh
 python3 scripts/agent-coordination.py review start --pr 123 --agent implementation \
-  --reviewer claude --mode triage --brief target/task-brief.md
+  --mode triage --brief target/task-brief.md
 ```
 
-Choose `--reviewer codex` for a Codex reviewer. The tool resolves the GitHub PR
-head and repository identity, checks that your clean task branch matches it,
-fetches the head/base commits using matching configured repository URLs, and
-creates one worktree, tmux window, and interactive reviewer session per request.
+Claude is the default reviewer; choose `--reviewer codex` for a Codex reviewer.
+[Reviewer settings](#reviewer-settings) lists the model, effort, and permission
+flags each one uses. The tool resolves the GitHub PR head and repository
+identity, checks that your clean task branch matches it, fetches the head/base
+commits using matching configured repository URLs, and creates one worktree,
+tmux window, and interactive reviewer session per request.
 Later rounds publish to that reviewer’s inbox topic; the same session receives
 the next prompt through `topic wait`. They reuse the window and advance the
 existing worktree without clearing `target/`, so builds can reuse artifacts. The
@@ -184,10 +188,10 @@ Use the same tool version for all participants in a review request.
 
 To request an independent second reviewer, run another `review start` with
 `--additional-reviewer`, choosing Claude or Codex explicitly. It gets its own
-conversation, window, worktree, reports, and round limit, all reused across its
-own rounds. Each request is triaged separately; there is no automatic agreement
-rule between reviewers. Use collect or triage mode when you want to compare
-their reports before deciding on fixes.
+conversation, window, worktree, reports, round limit, and reviewer options, all
+reused across its own rounds. Each request is triaged separately; there is no
+automatic agreement rule between reviewers. Use collect or triage mode when you
+want to compare their reports before deciding on fixes.
 
 The requesting agent stays in the original conversation:
 
@@ -244,6 +248,33 @@ an interactive reviewer or its jobs. An outstanding reviewer may still submit
 its report, but that submission does not restart the loop. The request’s worktree and reviewer
 window are retained for discussion; inspect cleanliness and running processes
 before removing them with normal Git/tmux commands.
+
+### Reviewer settings
+
+Both reviewers start at `xhigh` effort with permission prompts turned off:
+
+| Reviewer | Default command, before the tool's own arguments and prompt |
+| --- | --- |
+| `claude` | `claude --model claude-opus-5-5 --effort xhigh --dangerously-skip-permissions` |
+| `codex` | `codex --model gpt-6-astra -c 'model_reasoning_effort="xhigh"' --dangerously-bypass-approvals-and-sandbox` |
+
+The reviewer therefore runs any command it chooses as your user, without asking
+and, for Codex, without a sandbox. Start reviews only where you would run that
+tool the same way yourself.
+
+`--model MODEL` and `--effort LEVEL` override the defaults; lower effort suits
+small or test-only changes. For Codex, `--model gpt-6.1-sol` selects GPT-6.1
+Sol instead of GPT-6 Astra. To add any other argument, repeat
+`--reviewer-option` once per argument. Each value is one argument, with no shell
+interpretation; write a value that starts with `-` as `--reviewer-option=VALUE`.
+The request records these settings and uses them on the first launch and on
+`review resume`; later rounds continue in the same session. For example:
+
+```sh
+python3 scripts/agent-coordination.py review start --pr 123 --agent implementation \
+  --reviewer codex --model gpt-6.1-sol --effort high --reviewer-option=--search \
+  --additional-reviewer --brief target/task-brief.md
+```
 
 ## Checks
 

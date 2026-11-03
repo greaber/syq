@@ -11,6 +11,10 @@ import uuid
 from .store import Error, identifier, name, notify, publish, run
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'agent-coordination.py'
+# Reviewers run as the user runs their own review sessions: a strong model at
+# extra-high effort without approval prompts. A request can override these.
+DEFAULT_MODELS = {'claude': 'claude-opus-5-5', 'codex': 'gpt-6-astra'}
+DEFAULT_EFFORT = 'xhigh'
 
 
 def snapshot(repo, pr, repository=None):
@@ -123,7 +127,10 @@ def start(store, args):
     if not brief.strip():
         raise Error('Task brief must not be empty')
     review = {'id': identifier('review'), 'agent': name(args.agent), 'repo': repo,
-              'reviewer': args.reviewer, 'mode': args.mode, 'max_rounds': args.max_rounds,
+              'reviewer': args.reviewer, 'model': args.model or DEFAULT_MODELS[args.reviewer],
+              'effort': args.effort or DEFAULT_EFFORT,
+              'reviewer_options': list(args.reviewer_option or []),
+              'mode': args.mode, 'max_rounds': args.max_rounds,
               'repository': snap['repository'], 'pr': snap['pr'], 'rounds': [],
               'status': 'starting', 'notify': args.notify, 'created': time.time()}
     review['inbox'] = review['id'] + '.inbox'
@@ -282,16 +289,17 @@ def worker(store, review_id, number, resume_session=False):
         review['worker_started'] = True
         if os.environ.get('TMUX_PANE'):
             review['pane'] = os.environ['TMUX_PANE']
+        settings = reviewer_arguments(review)
     code = 'launch or interruption failure'
     try:
         if os.environ.get('TMUX_PANE'):
             run('tmux', 'set-option', '-p', '-t', os.environ['TMUX_PANE'], 'remain-on-exit', 'on')
         prompt = Path(current['prompt']).read_text()
         if reviewer == 'claude':
-            cmd = ['claude', '--add-dir', str(store.root),
+            cmd = ['claude', *settings, '--add-dir', str(store.root),
                    '--resume' if resume_session else '--session-id', session_id, '--name', review_id, prompt]
         else:
-            cmd = ['codex', *(['resume', session_id] if resume_session else []),
+            cmd = ['codex', *(['resume', session_id] if resume_session else []), *settings,
                    '--add-dir', str(store.root), prompt]
         env = dict(os.environ, SYQ_REVIEW_ID=review_id)
         env.pop('CODEX_THREAD_ID', None)
@@ -304,6 +312,21 @@ def worker(store, review_id, number, resume_session=False):
                 review['status'] = 'failed'
                 review['reason'] = f'Reviewer exited ({code}) without publishing a report'
     return {'exit_code': code, 'review': review_id}
+
+
+def reviewer_arguments(review):
+    """Arguments placed before the tool's own, so an option that takes several
+    values (such as Claude's --add-dir) cannot absorb the prompt."""
+    reviewer = review['reviewer']
+    # Requests recorded before these settings existed use the current defaults.
+    model = review.get('model') or DEFAULT_MODELS[reviewer]
+    effort = review.get('effort') or DEFAULT_EFFORT
+    if reviewer == 'claude':
+        settings = ['--model', model, '--effort', effort, '--dangerously-skip-permissions']
+    else:
+        settings = ['--model', model, '-c', f'model_reasoning_effort="{effort}"',
+                    '--dangerously-bypass-approvals-and-sandbox']
+    return [*settings, *review.get('reviewer_options', [])]
 
 
 def bind_session(store, review_id):

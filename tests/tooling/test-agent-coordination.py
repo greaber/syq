@@ -179,10 +179,11 @@ class CoordinationTests(unittest.TestCase):
             'state': 'OPEN', 'headRefName': 'task', 'headRefOid': self.sha, 'baseRefOid': self.base,
             'headRepositoryOwner': {'login': 'example'}, 'headRepository': {'name': 'project'}}))
 
-    def review(self, mode='auto', reviewer='claude', limit=3, additional=False, code=0):
-        return self.cmd('review', 'start', '--pr', '17', '--agent', 'implementer', '--reviewer', reviewer,
+    def review(self, mode='auto', reviewer='claude', limit=3, additional=False, extra=(), code=0):
+        return self.cmd('review', 'start', '--pr', '17', '--agent', 'implementer',
+                        *(['--reviewer', reviewer] if reviewer else []),
                         '--mode', mode, '--max-rounds', str(limit), '--brief', str(self.brief),
-                        *(['--additional-reviewer'] if additional else []), code=code)
+                        *(['--additional-reviewer'] if additional else []), *extra, code=code)
 
     def submit(self, review, verdict='findings'):
         current = review['rounds'][-1]
@@ -623,15 +624,7 @@ subprocess.run(args,check=True)
             review = self.review(reviewer=runtime)
             failed = self.cmd('review', 'wait', review['id'], '--timeout', '10')
             self.assertEqual(failed['status'], 'failed', failed)
-            deadline = time.monotonic() + 5
-            last = None
-            print('Waiting for exited fixture reviewer pane', flush=True)
-            while time.monotonic() < deadline:
-                last = subprocess.check_output([tmux, '-S', socket, 'display-message', '-p',
-                    '-t', failed['pane'], '#{pane_dead}'], text=True).strip()
-                if last == '1': break
-                time.sleep(0.05)
-            self.assertEqual(last, '1', 'Reviewer pane did not exit before deadline')
+            self.wait_pane_dead(tmux, socket, failed['pane'])
             self.cmd('review', 'resume', review['id'], '--agent', 'implementer', '--session', 'wrong-session', code=2)
             self.assertEqual(self.cmd('review', 'status', review['id'])['session_id'], failed['session_id'])
             self.cmd('review', 'resume', review['id'], '--agent', 'implementer')
@@ -647,6 +640,83 @@ subprocess.run(args,check=True)
             self.triage(ready, 'complete')
         windows = subprocess.check_output([tmux, '-S', socket, 'list-windows', '-F', '#{window_id}'], text=True)
         self.assertEqual(len(windows.splitlines()), 3)
+
+    def wait_pane_dead(self, tmux, socket, pane):
+        deadline = time.monotonic() + 5
+        last = None
+        print('Waiting for exited fixture reviewer pane', flush=True)
+        while time.monotonic() < deadline:
+            last = subprocess.check_output([tmux, '-S', socket, 'display-message', '-p',
+                '-t', pane, '#{pane_dead}'], text=True).strip()
+            if last == '1': return
+            time.sleep(0.05)
+        self.fail(f'Reviewer pane did not exit before deadline; pane_dead={last}')
+
+    def test_real_tmux_reviewer_settings_reach_launch_and_resume(self):
+        self.review_setup()
+        tmux, socket = self.real_tmux()
+        # Record the exact argv, then exit without a report so the request can be resumed.
+        agent_body = """import json,os,shlex,subprocess,sys
+from pathlib import Path
+with (Path(os.environ['TEST_ROOT'])/'launches').open('a') as out:
+ out.write(json.dumps([os.environ['SYQ_REVIEW_ID'],*sys.argv])+'\\n')
+if Path(sys.argv[0]).name=='codex':
+ args=shlex.split(next(line for line in sys.argv[-1].splitlines() if ' review submit ' in line))
+ index=args.index('review')
+ subprocess.run([*args[:index],'review','bind-session',args[index+2]],check=True,
+                env=dict(os.environ,CODEX_THREAD_ID='fixture-codex-session'))
+sys.exit(1)
+"""
+        for runtime in ('claude', 'codex'):
+            self.stub(runtime, agent_body)
+        tricky = 'two words; "quoted" $(touch injected) | cat'
+        claude_skip, codex_skip = '--dangerously-skip-permissions', '--dangerously-bypass-approvals-and-sandbox'
+        # (reviewer flag, review start arguments, expected settings before the tool's own arguments)
+        requests = [
+            (None, [], ['--model', 'claude-opus-5-5', '--effort', 'xhigh', claude_skip]),
+            ('codex', [], ['--model', 'gpt-6-astra', '-c', 'model_reasoning_effort="xhigh"', codex_skip]),
+            ('claude', ['--model', 'claude-fixture', '--effort', 'high', '--reviewer-option=--append-system-prompt',
+                        f'--reviewer-option={tricky}'],
+             ['--model', 'claude-fixture', '--effort', 'high', claude_skip, '--append-system-prompt', tricky]),
+            ('codex', ['--model', 'gpt-6.1-sol', '--effort', 'medium', '--reviewer-option=--search'],
+             ['--model', 'gpt-6.1-sol', '-c', 'model_reasoning_effort="medium"', codex_skip, '--search'])]
+        started = [self.review(reviewer=reviewer, extra=extra, additional=bool(index))
+                   for index, (reviewer, extra, _settings) in enumerate(requests)]
+        self.assertEqual([r['reviewer'] for r in started], ['claude', 'codex', 'claude', 'codex'])
+        self.assertEqual([(r['model'], r['effort'], r['reviewer_options']) for r in started],
+                         [('claude-opus-5-5', 'xhigh', []), ('gpt-6-astra', 'xhigh', []),
+                          ('claude-fixture', 'high', ['--append-system-prompt', tricky]),
+                          ('gpt-6.1-sol', 'medium', ['--search'])])
+        for review in started:
+            failed = self.cmd('review', 'wait', review['id'], '--timeout', '10')
+            self.assertEqual(failed['status'], 'failed', failed)
+            self.wait_pane_dead(tmux, socket, failed['pane'])
+            self.cmd('review', 'resume', review['id'], '--agent', 'implementer')
+            self.assertEqual(self.cmd('review', 'wait', review['id'], '--timeout', '10')['status'], 'failed')
+        launches = {}
+        for line in (self.root / 'launches').read_text().splitlines():
+            review_id, executable, *argv = json.loads(line)
+            launches.setdefault(review_id, []).append((Path(executable).name, argv[:-1]))
+        state = str(self.state)
+        for review, (_reviewer, _extra, settings) in zip(started, requests):
+            runtime, rid = review['reviewer'], review['id']
+            session = self.cmd('review', 'status', rid)['session_id']
+            if runtime == 'claude':
+                expected = [[*settings, '--add-dir', state, flag, session, '--name', rid]
+                            for flag in ('--session-id', '--resume')]
+            else:
+                expected = [[*settings, '--add-dir', state],
+                            ['resume', session, *settings, '--add-dir', state]]
+            self.assertEqual(launches[rid], [(runtime, argv) for argv in expected])
+        self.assertFalse(any(self.root.rglob('injected')))
+
+    def test_effort_must_be_a_level_name(self):
+        # Codex receives the level inside a TOML string.
+        result = subprocess.run([sys.executable, str(SCRIPT), '--state-dir', str(self.state), 'review', 'start',
+                                 '--pr', '17', '--agent', 'a', '--brief', 'brief.md', '--effort', 'high"'],
+                                cwd=self.cwd, env=self.env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('level name', result.stderr)
 
 
     def test_legacy_review_is_readable_but_cannot_advance_without_inbox(self):

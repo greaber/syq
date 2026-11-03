@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -16,6 +17,13 @@ def positive(value):
     if number <= 0:
         raise argparse.ArgumentTypeError('Must be positive')
     return number
+
+
+def effort(value):
+    # Codex receives the level inside a TOML string, so keep it to a plain word.
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', value):
+        raise argparse.ArgumentTypeError('Use a level name such as high or xhigh')
+    return value
 
 
 def parser():
@@ -66,7 +74,12 @@ def parser():
     p.add_argument('--pr', type=positive, required=True)
     p.add_argument('--agent', required=True)
     p.add_argument('--brief', required=True, help='Markdown task context, including actual requirements and open questions')
-    p.add_argument('--reviewer', choices=['claude', 'codex'], required=True)
+    p.add_argument('--reviewer', choices=['claude', 'codex'], default='claude')
+    p.add_argument('--model', help='Reviewer model; default claude-opus-5-5 for Claude, gpt-6-astra for Codex')
+    p.add_argument('--effort', type=effort, help='Reviewer effort level; default xhigh')
+    p.add_argument('--reviewer-option', action='append', metavar='ARG',
+                   help='One extra reviewer command argument, used on launch and resume; repeat for each. '
+                        'Write values starting with - as --reviewer-option=ARG')
     p.add_argument('--additional-reviewer', action='store_true',
                    help='Explicitly start another independent reviewer for this task')
     p.add_argument('--mode', choices=['collect', 'triage', 'auto'], default='triage')
