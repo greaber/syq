@@ -180,8 +180,7 @@ fn run() {
             if let Some(error) = error.downcast_ref::<clap::Error>() {
                 crate::output::exit_with(error);
             }
-            crate::output::diagnostic!("syq: {error:#}");
-            crate::output::exit(1);
+            crate::output::exit_on_error(&error, 1, "syq");
         }
     };
     let environment_options = cli::EnvironmentOptions::take_from_environment();
@@ -191,14 +190,12 @@ fn run() {
     let mut argv = match destination::handoff::enter(argv) {
         Ok(argv) => argv,
         Err(error) => {
-            crate::output::diagnostic!("syq: {error:#}");
-            crate::output::exit(1);
+            crate::output::exit_on_error(&error, 1, "syq");
         }
     };
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("help") {
         if let Err(error) = help::show_topic(&argv[2..]) {
-            crate::output::diagnostic!("syq: {error:#}");
-            crate::output::exit(2);
+            crate::output::exit_on_error(&error, 2, "syq");
         }
         return;
     }
@@ -220,8 +217,7 @@ fn run() {
         }
         fsops::reserve_startup_descriptors();
         if let Err(e) = update::write_manifest_signing_payload(std::path::Path::new(&argv[2])) {
-            crate::output::diagnostic!("syq: {e:#}");
-            crate::output::exit(1);
+            crate::output::exit_on_error(&e, 1, "syq");
         }
         return;
     }
@@ -232,8 +228,7 @@ fn run() {
         }
         fsops::reserve_startup_descriptors();
         if let Err(error) = restricted::remote_install() {
-            crate::output::diagnostic!("syq restricted installer: {error:#}");
-            crate::output::exit(1);
+            crate::output::exit_on_error(&error, 1, "syq restricted installer");
         }
         return;
     }
@@ -244,8 +239,7 @@ fn run() {
         }
         fsops::reserve_startup_descriptors();
         if let Err(error) = restricted::remote_revoke() {
-            crate::output::diagnostic!("syq restricted revoker: {error:#}");
-            crate::output::exit(1);
+            crate::output::exit_on_error(&error, 1, "syq restricted revoker");
         }
         return;
     }
@@ -270,16 +264,14 @@ fn run() {
         }
         fsops::reserve_startup_descriptors();
         if let Err(error) = server::run_checker(enrollment, generation) {
-            crate::output::diagnostic!("syq restricted receiver: {error:#}");
-            crate::output::exit(1);
+            crate::output::exit_on_error(&error, 1, "syq restricted receiver");
         }
         return;
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("--session-pool") {
         fsops::reserve_startup_descriptors();
         if let Err(error) = session_pool::run(&argv[2..]) {
-            crate::output::diagnostic!("syq session pool: {error:#}");
-            crate::output::exit(1);
+            crate::output::exit_on_error(&error, 1, "syq session pool");
         }
         return;
     }
@@ -293,8 +285,7 @@ fn run() {
         let local_receiver = argv.get(1).and_then(|arg| arg.to_str()) == Some("--server")
             && argv.get(2).and_then(|arg| arg.to_str()) == Some("--local-receiver");
         if let Err(e) = server::run(local_receiver) {
-            crate::output::diagnostic!("syq server: {e:#}");
-            crate::output::exit(1);
+            crate::output::exit_on_error(&e, 1, "syq server");
         }
         return;
     }
@@ -302,8 +293,7 @@ fn run() {
     // here, before `exec` and the copy commands, and record the result for
     // the return-helper handoff, which both of those may perform.
     if let Err(error) = environment_options.insert(&mut argv) {
-        crate::output::diagnostic!("syq: {error:#}");
-        crate::output::exit(2);
+        crate::output::exit_on_error(&error, 2, "syq");
     }
     destination::handoff::record_command_line(&argv);
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("ssh") {
@@ -313,8 +303,7 @@ fn run() {
                 if let Some(error) = error.downcast_ref::<clap::Error>() {
                     crate::output::exit_with(error);
                 }
-                crate::output::diagnostic!("syq ssh: {error:#}");
-                crate::output::exit(255);
+                crate::output::exit_on_error(&error, 255, "syq ssh");
             }
         }
     }
@@ -325,8 +314,7 @@ fn run() {
                 if let Some(error) = error.downcast_ref::<clap::Error>() {
                     crate::output::exit_with(error);
                 }
-                crate::output::diagnostic!("syq exec: {error:#}");
-                crate::output::exit(1);
+                crate::output::exit_on_error(&error, 1, "syq exec");
             }
         }
     }
@@ -335,8 +323,7 @@ fn run() {
         match janky_cat::run(&argv[2..]) {
             Ok(code) => crate::output::exit(code),
             Err(error) => {
-                crate::output::diagnostic!("syq cat: {error:#}");
-                crate::output::exit(1);
+                crate::output::exit_on_error(&error, 1, "syq cat");
             }
         }
     }
@@ -344,8 +331,7 @@ fn run() {
         match persistence::run(&argv[2..]) {
             Ok(code) => crate::output::exit(code),
             Err(error) => {
-                crate::output::diagnostic!("syq persist: {error:#}");
-                crate::output::exit(1);
+                crate::output::exit_on_error(&error, 1, "syq persist");
             }
         }
     }
@@ -353,8 +339,7 @@ fn run() {
         match s3::listing::run(&argv[2..]) {
             Ok(code) => crate::output::exit(code),
             Err(error) => {
-                crate::output::diagnostic!("syq _ls: {error:#}");
-                crate::output::exit(1);
+                crate::output::exit_on_error(&error, 1, "syq _ls");
             }
         }
     }
@@ -362,8 +347,7 @@ fn run() {
         match tune::history::run(&argv[2..]) {
             Ok(code) => crate::output::exit(code),
             Err(error) => {
-                crate::output::diagnostic!("syq tuning-cache: {error:#}");
-                crate::output::exit(1);
+                crate::output::exit_on_error(&error, 1, "syq tuning-cache");
             }
         }
     }
@@ -371,8 +355,7 @@ fn run() {
         match completion::run(&argv[2..]) {
             Ok(code) => crate::output::exit(code),
             Err(error) => {
-                crate::output::diagnostic!("syq completion: {error:#}");
-                crate::output::exit(1);
+                crate::output::exit_on_error(&error, 1, "syq completion");
             }
         }
     }
@@ -380,8 +363,7 @@ fn run() {
         match result {
             Ok(code) => crate::output::exit(code),
             Err(error) => {
-                crate::output::diagnostic!("syq: {error:#}");
-                crate::output::exit(1);
+                crate::output::exit_on_error(&error, 1, "syq");
             }
         }
     }
@@ -390,8 +372,7 @@ fn run() {
         match result {
             Ok(code) => crate::output::exit(code),
             Err(error) => {
-                crate::output::diagnostic!("syq: {error:#}");
-                crate::output::exit(1);
+                crate::output::exit_on_error(&error, 1, "syq");
             }
         }
     }
@@ -401,8 +382,7 @@ fn run() {
             if let Some(error) = e.downcast_ref::<clap::Error>() {
                 crate::output::exit_with(error);
             }
-            crate::output::diagnostic!("syq: {e:#}");
-            crate::output::exit(2);
+            crate::output::exit_on_error(&e, 2, "syq");
         }
     };
     fsops::reserve_startup_descriptors();
@@ -410,30 +390,25 @@ fn run() {
     args.normalize();
     if args.self_update {
         if let Err(e) = update::self_update() {
-            crate::output::diagnostic!("syq: {e:#}");
-            crate::output::exit(1);
+            crate::output::exit_on_error(&e, 1, "syq");
         }
         return;
     }
     if args.register_standalone_install {
         if let Err(e) = update::register_standalone_install() {
-            crate::output::diagnostic!("syq: {e:#}");
-            crate::output::exit(1);
+            crate::output::exit_on_error(&e, 1, "syq");
         }
         return;
     }
     if let Err(error) = persistence::mark_explicit_scope(&mut args) {
-        crate::output::diagnostic!("syq: {error:#}");
-        crate::output::exit(2);
+        crate::output::exit_on_error(&error, 2, "syq");
     }
     if let Err(error) = destination::account_copy::prepare_handoff(&args) {
-        crate::output::diagnostic!("syq: {error:#}");
-        crate::output::exit(2);
+        crate::output::exit_on_error(&error, 2, "syq");
     }
     if args.interface != cli::Interface::NativeCp && args.s3.is_none() {
         if let Err(error) = destination::prepare(&mut args) {
-            crate::output::diagnostic!("syq: {error:#}");
-            crate::output::exit(2);
+            crate::output::exit_on_error(&error, 2, "syq");
         }
     }
     let quiet = args.quiet;
@@ -458,8 +433,7 @@ fn run() {
             crate::output::exit(code)
         }
         Err(e) => {
-            crate::output::diagnostic!("syq: {e:#}");
-            crate::output::exit(1);
+            crate::output::exit_on_error(&e, 1, "syq");
         }
     }
 }

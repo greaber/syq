@@ -458,9 +458,10 @@ pub(crate) fn show_topic(topics: &[std::ffi::OsString]) -> anyhow::Result<()> {
     } else {
         command.print_help()
     };
-    match printed {
-        // A reader that stopped early, as `head` does, has what it wanted.
-        Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => Err(error.into()),
-        _ => Ok(()),
+    // As other command output: quiet for a closed stdout, and otherwise
+    // reported once, failing the command when it exits.
+    if let Err(error) = printed {
+        crate::output::command_stdout_failed(&error);
     }
+    Ok(())
 }

@@ -1206,14 +1206,11 @@ fn print_root_help(full: bool) {
     } else {
         command.print_help()
     };
-    result.unwrap_or_else(|error| {
-        // A reader that stopped early, as `head` does, has what it wanted.
-        if error.kind() == std::io::ErrorKind::BrokenPipe {
-            crate::output::exit(0);
-        }
-        crate::output::diagnostic!("syq: {error}");
-        crate::output::exit(1);
-    });
+    // As other command output: quiet for a closed stdout, and otherwise
+    // reported once, failing the command when it exits.
+    if let Err(error) = result {
+        crate::output::command_stdout_failed(&error);
+    }
 }
 
 /// Clap metadata for the public filesystem command surfaces. The dynamic

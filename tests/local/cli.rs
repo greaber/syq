@@ -1981,10 +1981,7 @@ fn a_full_stdout_fails_printing_commands() {
             .wait_with_output()
             .unwrap();
         let stderr = stderr_of(&output);
-        assert!(
-            !output.status.success() && output.status.code().is_some(),
-            "{args:?}: {output:?}"
-        );
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
         assert_eq!(
             stderr.matches("No space left on device").count(),
             1,
@@ -1992,4 +1989,30 @@ fn a_full_stdout_fails_printing_commands() {
         );
         assert!(!stderr.contains("panicked"), "{args:?}: {stderr}");
     }
+}
+
+/// A streaming command stops at a closed stdout instead of finishing work
+/// nobody reads: this map would fail on its second source, which it reaches
+/// only after writing every entry of the first.
+#[test]
+fn a_closed_stdout_stops_a_streaming_command() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("src/big")).unwrap();
+    // Far more than a pipe holds.
+    for index in 0..3000 {
+        fs::write(t.path(&format!("src/big/file-{index:05}")), b"").unwrap();
+    }
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["map", "--cwd", &t.s("src"), "big", "absent"])
+        .stdin(Stdio::null())
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{}", stderr_of(&output));
 }
