@@ -653,6 +653,16 @@ impl Sched {
         &self.worker_setups
     }
 
+    /// Let the worker setups ask this scheduler whether the copy has ended.
+    pub fn watch_worker_setups(self: &Arc<Self>) {
+        let sched = Arc::downgrade(self);
+        self.worker_setups.set_ended(move || {
+            sched
+                .upgrade()
+                .is_none_or(|sched| sched.is_aborted() || sched.finished())
+        });
+    }
+
     /// Once the copy has finished or failed, a worker connection still being
     /// set up can never be used. End those setups rather than wait for them.
     pub fn end_unneeded_worker_setups(&self) {
@@ -784,6 +794,17 @@ impl Sched {
             .files
             .push((size, Reverse(FileOrder::new(idx))));
         self.cv.notify_one();
+    }
+
+    /// End the probe of file `idx` and queue it again, in one step: between
+    /// the two the copy would look finished, and workers that woke then
+    /// would leave and end the setups of connections it still needs.
+    pub fn requeue_probed(&self, idx: usize) {
+        let size = self.jobs.lock().unwrap()[idx].entry.size;
+        let mut g = self.inner.lock().unwrap();
+        g.probing -= 1;
+        g.files.push((size, Reverse(FileOrder::new(idx))));
+        self.cv.notify_all();
     }
 
     /// Release validated jobs while the planner finishes preparing later

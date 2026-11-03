@@ -1539,16 +1539,19 @@ impl std::error::Error for SetupCancelled {}
 /// The data connections one copy is still setting up. Once the copy has
 /// finished or failed, none of them can be used, so `cancel` ends them: it
 /// terminates their login processes and stops their retries and waits for a
-/// connection slot. Connections already set up are not affected.
+/// connection slot. Connections already set up are not affected. Whether
+/// the copy has ended is asked of the copy each time (`ended`), never
+/// remembered: work queued again after a moment that looked like the end
+/// gets its connections.
 #[derive(Default)]
 pub(crate) struct WorkerSetups {
     state: std::sync::Mutex<SetupState>,
     wake: std::sync::Condvar,
+    ended: std::sync::OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 
 #[derive(Default)]
 struct SetupState {
-    cancelled: bool,
     next: u64,
     /// Unreaped login processes and whether each leads its own process group.
     logins: std::collections::HashMap<u64, (libc::pid_t, bool)>,
@@ -1564,11 +1567,19 @@ fn end_login(pid: libc::pid_t, group: bool) {
 }
 
 impl WorkerSetups {
+    /// Ask `ended` whether the copy has finished or failed. It must not wait
+    /// for anything that calls `cancel`.
+    pub(crate) fn set_ended(&self, ended: impl Fn() -> bool + Send + Sync + 'static) {
+        assert!(
+            self.ended.set(Box::new(ended)).is_ok(),
+            "worker setups already watch a copy"
+        );
+    }
+
+    /// The copy has ended, so the setups under way cannot be used: end
+    /// their logins and wake their waits.
     pub(crate) fn cancel(&self) {
-        let mut state = self.state.lock().unwrap();
-        if std::mem::replace(&mut state.cancelled, true) {
-            return;
-        }
+        let state = self.state.lock().unwrap();
         for &(pid, group) in state.logins.values() {
             end_login(pid, group);
         }
@@ -1579,18 +1590,19 @@ impl WorkerSetups {
         CONNECTS_CV.notify_all();
     }
 
+    /// Whether the copy has ended, as it says now.
     pub(crate) fn cancelled(&self) -> bool {
-        self.state.lock().unwrap().cancelled
+        self.ended.get().is_some_and(|ended| ended())
     }
 
     /// Wait before a retry, unless the copy ends first.
     pub(crate) fn sleep(&self, delay: std::time::Duration) -> Result<()> {
         let state = self.state.lock().unwrap();
-        let (state, _) = self
+        let _ = self
             .wake
-            .wait_timeout_while(state, delay, |state| !state.cancelled)
+            .wait_timeout_while(state, delay, |_| !self.cancelled())
             .unwrap();
-        if state.cancelled {
+        if self.cancelled() {
             return Err(SetupCancelled.into());
         }
         Ok(())
@@ -1601,7 +1613,7 @@ impl WorkerSetups {
     fn watch(self: &std::sync::Arc<Self>, pid: u32, group: bool) -> SetupWatch {
         let pid = pid as libc::pid_t;
         let mut state = self.state.lock().unwrap();
-        if state.cancelled {
+        if self.cancelled() {
             end_login(pid, group);
         }
         let id = state.next;
@@ -1625,9 +1637,8 @@ impl SetupWatch {
     /// The connection is ready: from now on the copy keeps it, unless the
     /// copy ended first.
     fn finish(self) -> Result<()> {
-        let mut state = self.setups.state.lock().unwrap();
-        state.logins.remove(&self.id);
-        if state.cancelled {
+        self.setups.state.lock().unwrap().logins.remove(&self.id);
+        if self.setups.cancelled() {
             return Err(SetupCancelled.into());
         }
         Ok(())

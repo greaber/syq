@@ -2794,6 +2794,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     };
     let opts = Arc::new(opts);
     let sched = Arc::new(Sched::new(block, opts.tuning.split_min_size(block)));
+    sched.watch_worker_setups();
 
     // Workers connect on their own threads once the control connections are
     // up: everything waits on those, so they must never compete with worker

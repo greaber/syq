@@ -2957,13 +2957,19 @@ fn ending_worker_setups_ends_a_login_in_progress_and_later_retry_waits() {
     spec.local_process = false;
     spec.rsh = vec![script.to_string_lossy().into_owned()];
     let setups = std::sync::Arc::new(WorkerSetups::default());
+    let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    setups.set_ended({
+        let ended = ended.clone();
+        move || ended.load(std::sync::atomic::Ordering::SeqCst)
+    });
     let canceller = {
-        let (setups, started_file) = (setups.clone(), started_file.clone());
+        let (setups, started_file, ended) = (setups.clone(), started_file.clone(), ended.clone());
         std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
             while !started_file.exists() && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
+            ended.store(true, std::sync::atomic::Ordering::SeqCst);
             setups.cancel();
         })
     };
@@ -3015,4 +3021,37 @@ fn ending_worker_setups_ends_a_login_in_progress_and_later_retry_waits() {
     );
     assert!(result.is_err_and(|error| error.is::<SetupCancelled>()));
     assert!(!started_file.exists(), "a cancelled setup started a login");
+
+    // Work queued again after a moment that looked like the end needs its
+    // connections: once the copy no longer says it has ended, waits and
+    // logins go ahead again, and ending the copy ends them once more.
+    ended.store(false, std::sync::atomic::Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    assert!(setups.sleep(std::time::Duration::from_millis(200)).is_ok());
+    assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+    let canceller = {
+        let (setups, started_file, ended) = (setups.clone(), started_file.clone(), ended.clone());
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !started_file.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            ended.store(true, std::sync::atomic::Ordering::SeqCst);
+            setups.cancel();
+        })
+    };
+    let result = spec.connect_retried(
+        false,
+        true,
+        ConnectionRole::SourceWorker {
+            roots: Vec::new(),
+            send_budget: None,
+        },
+        false,
+        false,
+        Some(&setups),
+    );
+    canceller.join().unwrap();
+    assert!(started_file.exists(), "the login did not start again");
+    assert!(result.is_err_and(|error| error.is::<SetupCancelled>()));
 }

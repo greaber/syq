@@ -179,14 +179,20 @@ impl Worker {
                         batch.into_iter().partition(|&i| self.fast_eligible(i));
                     self.sched.mark_fast(fast.len() - 1);
                     let fast_result = self.fast_batch(&mut fast);
+                    // A dead transport's files go back in the queue before
+                    // their probes end, so the copy never looks finished
+                    // while they wait for another connection.
+                    let requeue = fast_result.is_err() && self.transport_dead();
+                    if requeue {
+                        for &i in &fast {
+                            self.sched.requeue(i);
+                        }
+                    }
                     self.sched.complete_fast_batch(fast.len());
                     if let Err(e) = fast_result {
-                        if self.transport_dead() {
+                        if requeue {
                             for &i in &slow {
-                                self.sched.ranges_ready(i, vec![]);
-                            }
-                            for &i in fast.iter().chain(&slow) {
-                                self.sched.requeue(i);
+                                self.sched.requeue_probed(i);
                             }
                             return Err(e);
                         }
@@ -209,8 +215,7 @@ impl Worker {
                         if let Err(e) = self.handle_file(i) {
                             if self.transport_dead() {
                                 for &pending in &slow[position + 1..] {
-                                    self.sched.ranges_ready(pending, vec![]);
-                                    self.sched.requeue(pending);
+                                    self.sched.requeue_probed(pending);
                                 }
                             }
                             self.file_error(i, e)?;
@@ -1178,12 +1183,8 @@ impl Worker {
             }
             Ok(false) => {}
             Err(error) => {
-                self.sched.ranges_ready(idx, vec![]);
-                if self.replace_instead(idx, &error) {
+                if self.end_failed_probe(idx, &error) {
                     return Ok(());
-                }
-                if self.transport_dead() {
-                    self.sched.requeue(idx);
                 }
                 return Err(error);
             }
@@ -1213,24 +1214,16 @@ impl Worker {
                     && match self.matches_final_windows(&job) {
                         Ok(matched) => matched,
                         Err(error) => {
-                            self.sched.ranges_ready(idx, vec![]);
-                            if self.replace_instead(idx, &error) {
+                            if self.end_failed_probe(idx, &error) {
                                 return Ok(());
-                            }
-                            if self.transport_dead() {
-                                self.sched.requeue(idx);
                             }
                             return Err(error);
                         }
                     };
                 if matched {
                     if let Err(error) = self.finish_matched_basis(idx, &job) {
-                        self.sched.ranges_ready(idx, vec![]);
-                        if self.replace_instead(idx, &error) {
+                        if self.end_failed_probe(idx, &error) {
                             return Ok(());
-                        }
-                        if self.transport_dead() {
-                            self.sched.requeue(idx);
                         }
                         return Err(error);
                     }
@@ -1276,19 +1269,21 @@ impl Worker {
                     self.sched.request_direct_fallback();
                 }
                 Err(e) => {
-                    self.sched.ranges_ready(idx, vec![]);
                     // `--in-place=update` found a file it will not write in
-                    // place, before copying anything.
-                    if self.replace_instead(idx, &e) {
-                        return Ok(());
+                    // place, before copying anything. Otherwise
+                    // try_copy_local queues publication recovery after it
+                    // has credited the completed kernel copy; earlier
+                    // connection failures still need the whole probe.
+                    let replaced = self.replacing(idx, &e);
+                    if replaced
+                        || (self.transport_dead() && job.done.load(Relaxed) < job.entry.size)
+                    {
+                        self.sched.requeue_probed(idx);
+                    } else {
+                        self.sched.ranges_ready(idx, vec![]);
                     }
-                    if self.transport_dead() {
-                        // try_copy_local queues publication recovery after it
-                        // has credited the completed kernel copy. Earlier
-                        // connection failures still need the whole probe.
-                        if job.done.load(Relaxed) < job.entry.size {
-                            self.sched.requeue(idx);
-                        }
+                    if replaced {
+                        return Ok(());
                     }
                     return Err(e);
                 }
@@ -1471,12 +1466,8 @@ impl Worker {
         let (ranges, needs_finalize) = match planned {
             Ok(result) => result,
             Err(e) => {
-                self.sched.ranges_ready(idx, vec![]);
-                if self.replace_instead(idx, &e) {
+                if self.end_failed_probe(idx, &e) {
                     return Ok(());
-                }
-                if self.transport_dead() {
-                    self.sched.requeue(idx);
                 }
                 return Err(e);
             }
@@ -1534,6 +1525,16 @@ impl Worker {
     /// its metadata in place (`fsops::vouch`), copy it again as a file to
     /// replace, and say so. The job's scheduling has been settled.
     fn replace_instead(&self, idx: usize, error: &anyhow::Error) -> bool {
+        let replacing = self.replacing(idx, error);
+        if replacing {
+            self.sched.requeue(idx);
+        }
+        replacing
+    }
+
+    /// Whether `error` asks for the file at `idx` to be replaced rather than
+    /// written in place, which it then will be once queued again.
+    fn replacing(&self, idx: usize, error: &anyhow::Error) -> bool {
         let Some(reason) = crate::fsops::vouch::replace_reason(error) else {
             return false;
         };
@@ -1541,8 +1542,22 @@ impl Worker {
             return false;
         }
         self.refuse_in_place(idx, reason);
-        self.sched.requeue(idx);
         true
+    }
+
+    /// End the probe of file `idx` after `error`: queued again to be
+    /// replaced instead of written in place, or to be retried on another
+    /// connection when this one's transport died, or else let go. Queueing
+    /// it again ends the probe in the same step. True when it will be
+    /// replaced, which is not a failure.
+    fn end_failed_probe(&self, idx: usize, error: &anyhow::Error) -> bool {
+        let replacing = self.replacing(idx, error);
+        if replacing || self.transport_dead() {
+            self.sched.requeue_probed(idx);
+        } else {
+            self.sched.ranges_ready(idx, vec![]);
+        }
+        replacing
     }
 
     /// Have the file at `idx` replaced, as the receiver asked for `reason`:
@@ -3283,16 +3298,12 @@ impl Worker {
             }
             _ => Ok(false),
         };
-        self.sched.ranges_ready(idx, vec![]);
-        let contents_match = match result {
-            Ok(matched) => matched,
-            Err(error) => {
-                if self.transport_dead() {
-                    self.sched.requeue(idx);
-                }
-                return Err(error);
-            }
-        };
+        if result.is_err() && self.transport_dead() {
+            self.sched.requeue_probed(idx);
+        } else {
+            self.sched.ranges_ready(idx, vec![]);
+        }
+        let contents_match = result?;
         // A file the receiver would not keep is replaced even when its
         // contents match (`fsops::vouch`).
         let matched = contents_match && !job.replace;
