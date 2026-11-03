@@ -802,12 +802,9 @@ expands to. Some copies take fewer:
 
 - A copy that runs on an approval, such as a
   [restricted copy between servers](remote-reference.md#enrollment) or a copy
-  a [receiving machine](receive.md) approves, lists in that approval the
-  destination and each path a named source is copied to, at most 1,024 paths
-  in all. Copied into a directory, such a copy takes up to 1,023 named
-  sources. A receiving machine also limits the size of the request it
-  approves, so long names lower that: to about 890 names of 20 characters, or
-  460 of 50.
+  a [receiving machine](receive.md) approves, carries its whole command in
+  that approval, which holds 256 KiB of it. So 1,024 named sources fit when
+  the arguments naming them average up to about 250 characters.
 - A [copy between two servers](remote-to-remote.md) passes its named sources
   to the server that runs it on a command line, which holds 128 KiB, and each
   path takes about a third more room there than its length. So 1,024 sources

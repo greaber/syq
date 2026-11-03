@@ -20,7 +20,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     mpsc, Arc, Mutex,
 };
 use std::time::{Duration, Instant};
@@ -46,7 +46,20 @@ pub(crate) mod tcp;
 const DISCOVERY_VERSION: u16 = 2;
 const VERSION: u16 = 2;
 const REGISTRATION_VERSION: u16 = 3;
+/// The size of an ordinary message, and the most a few small values
+/// carried beside messages may take.
 const MAX_MESSAGE: usize = 256 * 1024;
+/// The largest message: a copy request whose command is as long as a
+/// receiving machine accepts (`approval_command::MAX_COMMAND_BYTES`), which
+/// JSON spells with up to four characters a byte, once in the command and
+/// twice in the request derived from it.
+const MAX_REQUEST_MESSAGE: usize = 4 * 1024 * 1024;
+/// How many messages larger than an ordinary one this process reads at
+/// once. A message is read before its sender is authenticated, so this keeps
+/// what unauthenticated senders can make it hold near what ordinary
+/// messages allow.
+const LARGE_MESSAGE_READS: usize = 4;
+static LARGE_READS: AtomicUsize = AtomicUsize::new(0);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a registering server waits for the receiving laptop's handshake.
@@ -291,10 +304,45 @@ struct Route {
 }
 
 pub(crate) fn write_message(writer: &mut impl Write, message: &impl Serialize) -> Result<()> {
-    write_framed(writer, message, MAX_MESSAGE, "named destination message")
+    write_framed(
+        writer,
+        message,
+        MAX_REQUEST_MESSAGE,
+        "named destination message",
+    )
 }
 pub(crate) fn read_message<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
-    read_framed(reader, MAX_MESSAGE, "named destination message")
+    let length = read_frame_length(reader, MAX_REQUEST_MESSAGE, "named destination message")?;
+    let _large = if length > MAX_MESSAGE {
+        let Some(read) = LargeRead::start() else {
+            // Read the rest without keeping it, so that the sender sees why.
+            std::io::copy(&mut reader.take(length as u64), &mut std::io::sink())?;
+            bail!(
+                "the receiving machine is busy reading {LARGE_MESSAGE_READS} other large requests; retry"
+            );
+        };
+        Some(read)
+    } else {
+        None
+    };
+    read_frame_body(reader, length)
+}
+/// One of the `LARGE_MESSAGE_READS` reads of a large message.
+struct LargeRead;
+impl LargeRead {
+    fn start() -> Option<Self> {
+        LARGE_READS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reads| {
+                (reads < LARGE_MESSAGE_READS).then_some(reads + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+impl Drop for LargeRead {
+    fn drop(&mut self) {
+        LARGE_READS.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 /// One JSON value behind a four-byte big-endian length. `what` names the
 /// message in size errors.
@@ -318,12 +366,19 @@ pub(crate) fn read_framed<T: DeserializeOwned>(
     limit: usize,
     what: &str,
 ) -> Result<T> {
+    let length = read_frame_length(reader, limit, what)?;
+    read_frame_body(reader, length)
+}
+fn read_frame_length(reader: &mut impl Read, limit: usize, what: &str) -> Result<usize> {
     let mut length = [0; 4];
     reader.read_exact(&mut length)?;
     let length = u32::from_be_bytes(length) as usize;
     if length == 0 || length > limit {
         bail!("invalid {what} size");
     }
+    Ok(length)
+}
+fn read_frame_body<T: DeserializeOwned>(reader: &mut impl Read, length: usize) -> Result<T> {
     let mut bytes = vec![0; length];
     reader.read_exact(&mut bytes)?;
     Ok(serde_json::from_slice(&bytes)?)
