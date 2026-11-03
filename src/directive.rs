@@ -287,7 +287,7 @@ pub(crate) fn issue(
     results_key: [u8; 32],
 ) -> Result<Directive> {
     let issued_at = now()?;
-    Ok(Directive {
+    let directive = Directive {
         build: crate::identity::build().to_owned(),
         request_id: RequestId::fresh(issued_at)?,
         issued_at,
@@ -304,7 +304,11 @@ pub(crate) fn issue(
         inputs,
         caps,
         results_key,
-    })
+    };
+    // Out of bounds is refused when a directive is made, before any prompt
+    // shows it, as well as when it is signed or read.
+    directive.validate()?;
+    Ok(directive)
 }
 
 /// The rules for the destination of `directive`, on an account whose home

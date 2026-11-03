@@ -1093,6 +1093,9 @@ struct Prompt {
 }
 struct Receiver {
     tcp_peer: crate::conn::RemoteSpec,
+    /// The login this machine's receiving connection uses on the server,
+    /// when it names one; else the SSH configuration chooses.
+    server_user: Option<String>,
     name: String,
     identity_key: ssh_key::PrivateKey,
     requester: crate::receive_approval::Requester,
@@ -1507,6 +1510,7 @@ pub(crate) fn serve_background(
     }
     let receiver = Arc::new(Receiver {
         tcp_peer,
+        server_user: spec.endpoint.user.clone(),
         name: config.name.clone(),
         identity_key: identity::load_key()?,
         requester: crate::receive_approval::Requester {

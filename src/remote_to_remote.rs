@@ -724,11 +724,6 @@ enum DestinationAuthentication {
     Receiver,
 }
 
-/// The SSH command a coordinator uses to reach the destination. With the
-/// broker it authenticates through the forwarded, filtered agent. With an
-/// enrollment it uses the entry key alone, whose file replaces the
-/// `IdentityFile=none` placeholder on the coordinator, with no agent, no
-/// control socket, no forwarding, no proxy, and only the pinned host keys.
 /// The SSH command for an enrolled receiver at `port`: the entry key alone,
 /// and only the pinned host keys, which `prepare_receiver_ssh_with` fills in.
 pub(crate) fn receiver_rsh(port: u16, host_key_algorithms: &str) -> String {
@@ -739,6 +734,11 @@ pub(crate) fn receiver_rsh(port: u16, host_key_algorithms: &str) -> String {
     )
 }
 
+/// The SSH command a coordinator uses to reach the destination. With the
+/// broker it authenticates through the forwarded, filtered agent. With an
+/// enrollment it uses the entry key alone, whose file replaces the
+/// `IdentityFile=none` placeholder on the coordinator, with no agent, no
+/// control socket, no forwarding, no proxy, and only the pinned host keys.
 fn constrained_destination_rsh(
     port: u16,
     host_key_algorithms: &str,
@@ -798,6 +798,11 @@ fn constrained_destination_rsh(
         // handshake in bounded time instead of waiting for the TCP timeout.
         "-o".to_owned(),
         "ConnectTimeout=10".to_owned(),
+        // And notice a destination that stops answering during the copy.
+        "-o".to_owned(),
+        "ServerAliveInterval=15".to_owned(),
+        "-o".to_owned(),
+        "ServerAliveCountMax=3".to_owned(),
         "-o".to_owned(),
         format!("HostKeyAlgorithms={host_key_algorithms}"),
         "-p".to_owned(),

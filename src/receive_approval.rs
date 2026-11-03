@@ -92,12 +92,12 @@ impl std::fmt::Display for Requester {
     }
 }
 
-/// The other server a copy approved here goes to, and whether approving it
-/// sets up restricted copying there.
+/// The other server a copy approved here goes to, and what approving it
+/// sets up there first.
 #[derive(Clone, Copy)]
 pub(crate) struct Remote<'a> {
     pub target: &'a str,
-    pub first_use: bool,
+    pub enrollment: crate::restricted::EnrollmentState,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -244,18 +244,21 @@ impl Summary {
             ),
             // Automatic approval of writes to this machine does not authorize
             // use of its SSH credentials on another host; say what that use is.
-            Some(Remote { target, first_use }) => (
+            Some(Remote { target, enrollment }) => (
                 format!(
                     "{:?} on {target:?} using your SSH access",
                     std::ffi::OsStr::from_bytes(&request.destination)
                 ),
-                if first_use {
-                    format!(
+                match enrollment {
+                    crate::restricted::EnrollmentState::Missing => format!(
                         "{permission}. Also sets up restricted copying on {target:?}: adds a key to its ~/.ssh/authorized_keys that can only start syq's receiver for copies you approve, and installs syq {} in ~/.local/lib/syq. Remove it with `syq receiver revoke`",
                         crate::identity::build()
-                    )
-                } else {
-                    format!("{permission}. Signs this copy with your SSH login key for {target:?}; the server keeps a key that can only start syq's receiver there")
+                    ),
+                    crate::restricted::EnrollmentState::Outdated => format!(
+                        "{permission}. Also updates restricted copying on {target:?}: installs syq {} in ~/.local/lib/syq and rewrites syq's line in its ~/.ssh/authorized_keys, whose key can only start syq's receiver for copies you approve",
+                        crate::identity::build()
+                    ),
+                    crate::restricted::EnrollmentState::Ready => format!("{permission}. Signs this copy with your SSH login key for {target:?}; the server keeps a key that can only start syq's receiver there"),
                 },
             ),
         };
@@ -1851,7 +1854,7 @@ mod tests {
             TIMEOUT,
             Some(Remote {
                 target: "backup",
-                first_use: false,
+                enrollment: crate::restricted::EnrollmentState::Ready,
             }),
         )
         .unwrap();
@@ -1874,7 +1877,7 @@ mod tests {
             TIMEOUT,
             Some(Remote {
                 target: "backup",
-                first_use: true,
+                enrollment: crate::restricted::EnrollmentState::Missing,
             }),
         )
         .unwrap()
@@ -1882,6 +1885,23 @@ mod tests {
         assert!(
             first.contains("Also sets up restricted copying on \"backup\": adds a key to its ~/.ssh/authorized_keys that can only start syq's receiver for copies you approve"),
             "{first}"
+        );
+        let outdated = Summary::new(
+            &requester(),
+            &command,
+            "~/rt-bench",
+            &forwarded,
+            TIMEOUT,
+            Some(Remote {
+                target: "backup",
+                enrollment: crate::restricted::EnrollmentState::Outdated,
+            }),
+        )
+        .unwrap()
+        .details_description(str::to_owned);
+        assert!(
+            outdated.contains(&format!("Also updates restricted copying on \"backup\": installs syq {} in ~/.local/lib/syq and rewrites syq's line in its ~/.ssh/authorized_keys", crate::identity::build())),
+            "{outdated}"
         );
 
         // The server's directory is remote text: no line breaks or markup of
@@ -2202,7 +2222,7 @@ mod tests {
             TIMEOUT,
             Some(Remote {
                 target: "backup",
-                first_use: false,
+                enrollment: crate::restricted::EnrollmentState::Ready,
             }),
         )
         .unwrap();

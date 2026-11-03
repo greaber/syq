@@ -2473,8 +2473,29 @@ fn local_records_track_pending_enrollments_and_unconfirmed_refreshes() {
     // lost: the server may already trust the new key, so the next copy
     // logs in to finish it even though the recorded key still signs.
     assert!(!needs_refresh(&metadata, &directory));
+    let state = || {
+        state_of(
+            load_local_enrollments_in(temporary.path()).unwrap(),
+            &metadata.host,
+            metadata.port,
+            &metadata.target_login,
+        )
+    };
+    assert_eq!(state(), EnrollmentState::Ready);
+    assert_eq!(
+        state_of(
+            load_local_enrollments_in(temporary.path()).unwrap(),
+            "elsewhere",
+            metadata.port,
+            &metadata.target_login,
+        ),
+        EnrollmentState::Missing
+    );
     atomic_write(&directory, REFRESH_FILE, b"", 0o600).unwrap();
     assert!(needs_refresh(&metadata, &directory));
+    // Approving the next copy updates syq there: the prompt says so, and a
+    // dry run is refused before it.
+    assert_eq!(state(), EnrollmentState::Outdated);
     complete_local_enrollment(&directory, &metadata).unwrap();
     assert!(!needs_refresh(&metadata, &directory));
     let mut other_build = metadata.clone();

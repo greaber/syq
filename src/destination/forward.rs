@@ -171,7 +171,7 @@ pub(super) struct Issued {
     /// The signed directive, base64url-encoded.
     directive: String,
     /// The enrollment's entry key, which only starts its receiver.
-    entry_key: String,
+    entry_key: EntryKeyText,
     /// The account the enrollment is for.
     login: String,
     /// The destination's host keys this machine trusts.
@@ -181,6 +181,17 @@ pub(super) struct Issued {
     destination: Vec<u8>,
     /// This machine's deletion limit for the copy.
     max_delete: u64,
+}
+
+/// An entry key in OpenSSH form, wiped when dropped.
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+struct EntryKeyText(String);
+
+impl Drop for EntryKeyText {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
 }
 
 impl std::fmt::Debug for Issued {
@@ -247,7 +258,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
     let keys = crate::remote_to_remote::prepare_receiver_ssh_with(
         args,
         &issued.known_hosts,
-        zeroize::Zeroizing::new(issued.entry_key).as_bytes(),
+        issued.entry_key.0.as_bytes(),
     )?;
     args.receiver_keys = Some(Arc::new(keys));
     Ok(())
@@ -355,7 +366,7 @@ impl Receiver {
         let count = self.forward_count.fetch_add(1, Ordering::AcqRel);
         let _slot = Slot(&self.forward_count);
         if count >= 8 {
-            bail!("too many active remote copies; wait for one to finish");
+            bail!("too many copies to other servers are waiting for approval or setup here; retry after one is decided");
         }
         let (generation, _channel) = {
             // Serialize registration with revocation, including reconnects.
@@ -373,12 +384,18 @@ impl Receiver {
         };
         // Reading this machine's SSH configuration contacts no server.
         let login = ssh_target(&target, Instant::now() + SETUP_TIMEOUT, &cancelled)?.user;
-        let enrolled = crate::restricted::enrollment_exists(&endpoint.host, endpoint.port, &login)?;
-        if args.dry_run && !enrolled {
-            let account = format!("{login}@{}", endpoint.host);
-            bail!(
+        let enrollment =
+            crate::restricted::local_enrollment_state(&endpoint.host, endpoint.port, &login)?;
+        let account = format!("{login}@{}", endpoint.host);
+        match enrollment {
+            _ if !args.dry_run => {}
+            crate::restricted::EnrollmentState::Ready => {}
+            crate::restricted::EnrollmentState::Missing => bail!(
                 "a dry run does not set up restricted copying on {account}; the first real copy does, or run `syq receiver enroll {account}` on the receiving machine"
-            );
+            ),
+            crate::restricted::EnrollmentState::Outdated => bail!(
+                "a dry run does not update syq on {account} for this machine's build; the next real copy does, or run `syq receiver enroll {account}` on the receiving machine"
+            ),
         }
         // Automatic approval of writes to this machine does not authorize
         // use of its SSH credentials on another host.
@@ -388,7 +405,7 @@ impl Receiver {
             &cwd,
             crate::receive_approval::Remote {
                 target: &target,
-                first_use: !enrolled,
+                enrollment,
             },
             &request,
             self.notifications,
@@ -411,27 +428,34 @@ impl Receiver {
             policy.login_user == login,
             "the SSH configuration for {target:?} changed during approval"
         );
-        let prepared = crate::restricted::prepare_transfer(crate::restricted::Issue {
-            command,
-            cwd,
-            inputs,
-            caps: Some(caps),
-            host: &endpoint.host,
-            port: endpoint.port,
-            login: &policy.login_user,
-            jump: None,
-            agent: policy.agent_socket(),
-            allow_enrollment: !args.dry_run,
-            batch: true,
-        })
+        let mut setup = crate::process::self_command()?;
+        setup.arg("--return-prepare");
+        let prepared = prepare_in_child(
+            setup,
+            &Prepare {
+                command,
+                cwd,
+                inputs,
+                caps,
+                host: endpoint.host.clone(),
+                port: endpoint.port,
+                login: policy.login_user.clone(),
+                via: (
+                    self.server_user.clone(),
+                    self.tcp_peer.host.clone(),
+                    self.tcp_peer.port,
+                ),
+                agent: policy.agent_socket().map(Path::to_path_buf),
+                allow_enrollment: !args.dry_run,
+            },
+            Instant::now() + SETUP_TIMEOUT,
+            &cancelled,
+        )
         .with_context(|| format!("approve the copy to {target:?}"))?;
         anyhow::ensure!(!cancelled(), "remote copy disconnected before setup");
         let issued = Issued {
             directive: prepared.directive,
-            entry_key: prepared
-                .entry_key
-                .to_openssh(ssh_key::LineEnding::LF)?
-                .to_string(),
+            entry_key: prepared.entry_key,
             login: policy.login_user.clone(),
             known_hosts: policy.known_hosts(crate::remote_to_remote::RECEIVER_HOST_ALIAS)?,
             host_key_algorithms: policy.host_key_algorithms(),
@@ -440,6 +464,134 @@ impl Receiver {
         };
         write_message(&mut stream, &Reply::Directive(Box::new(issued)))
     }
+}
+
+/// What the receiving service's setup child needs to set up or refresh the
+/// destination's enrollment and sign an approved upload's directive.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Prepare {
+    command: Vec<Vec<u8>>,
+    cwd: String,
+    inputs: crate::directive::Inputs,
+    caps: crate::directive::Caps,
+    host: String,
+    port: Option<u16>,
+    login: String,
+    /// The server that asked, as this machine's receiving connection logs
+    /// in to it: its user, if named, host and port.
+    via: (Option<String>, String, Option<u16>),
+    agent: Option<PathBuf>,
+    allow_enrollment: bool,
+}
+
+impl Prepare {
+    fn issue(&self) -> Result<crate::restricted::Issue<'_>> {
+        let (user, host, port) = &self.via;
+        Ok(crate::restricted::Issue {
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
+            inputs: self.inputs.clone(),
+            caps: Some(self.caps),
+            host: &self.host,
+            port: self.port,
+            login: &self.login,
+            // The copy needs the server that asked to reach the
+            // destination's SSH port, so enrolling can go through it when
+            // this machine cannot reach the destination directly, as a copy
+            // started on this machine goes through its source.
+            jump: Some(crate::enrollment::SshEndpoint::from_host(
+                user.as_deref(),
+                host,
+                *port,
+            )?),
+            agent: self.agent.as_deref(),
+            allow_enrollment: self.allow_enrollment,
+            // No terminal: never prompt, and never trust a new host key.
+            batch: true,
+        })
+    }
+}
+
+/// The setup child's answer.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+enum Prepared {
+    Signed(Signed),
+    Refused(String),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Signed {
+    directive: String,
+    entry_key: EntryKeyText,
+    destination: Vec<u8>,
+}
+
+/// Set up the enrollment and sign the directive in the setup child
+/// `command`, until `deadline` or until `cancelled`. Then the child ends
+/// with everything in its process group, its SSH login included, which
+/// releases the enrollment lock and any wait for the SSH agent with it.
+fn prepare_in_child(
+    command: Command,
+    request: &Prepare,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Signed> {
+    let mut child = ForwardChild::spawn_command(command)?;
+    let reply = (|| -> Result<Prepared> {
+        let mut input = child.child.stdin.take().context("setup input missing")?;
+        write_message(
+            &mut DeadlineIo {
+                inner: &mut input,
+                deadline,
+                cancelled: Some(cancelled),
+            },
+            request,
+        )?;
+        drop(input);
+        read_message(&mut DeadlineIo {
+            inner: child.child.stdout.as_mut().unwrap(),
+            deadline,
+            cancelled: Some(cancelled),
+        })
+    })();
+    let status = child.close();
+    match reply {
+        Ok(Prepared::Signed(signed)) => Ok(signed),
+        Ok(Prepared::Refused(error)) => Err(anyhow::anyhow!(error)),
+        Err(error) => Err(error)
+            .with_context(|| format!("the copy's setup stopped ({status:?}): {}", child.errors())),
+    }
+}
+
+/// The receiving service's setup child (`--return-prepare`): set up or
+/// refresh the destination's enrollment and sign the directive. Its parent
+/// ends it, with its process group, at the setup deadline or when the
+/// requester goes.
+fn prepare_setup() -> Result<i32> {
+    let request: Prepare = read_message(&mut std::io::stdin().lock())?;
+    let reply = match request
+        .issue()
+        .and_then(crate::restricted::prepare_transfer)
+    {
+        Ok(prepared) => Prepared::Signed(Signed {
+            directive: prepared.directive,
+            entry_key: EntryKeyText(
+                prepared
+                    .entry_key
+                    .to_openssh(ssh_key::LineEnding::LF)?
+                    .to_string(),
+            ),
+            destination: prepared.destination,
+        }),
+        Err(error) => Prepared::Refused(format!("{error:#}")),
+    };
+    let mut output = std::io::stdout().lock();
+    write_message(&mut output, &reply)?;
+    output.flush()?;
+    Ok(0)
 }
 
 /// Kill before reaping, including bootstrap/ProxyCommand descendants. Capture
@@ -1102,6 +1254,7 @@ pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
                 .and_then(ssh::worker),
         ),
         "--return-source-probe" if argv.len() == 2 => Some(Ok(0)),
+        "--return-prepare" if argv.len() == 2 => Some(prepare_setup()),
         "--return-source" if argv.len() == 2 => Some(super::pull::receive()),
         "--return-connect" | "--return-connect-install" if argv.len() == 4 => Some(
             argv[2]
@@ -1126,6 +1279,97 @@ pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
 mod tests {
     use super::*;
     use crate::destination::tests::{args, broker};
+
+    fn prepare_request() -> Prepare {
+        Prepare {
+            command: vec![b"cp".to_vec()],
+            cwd: "~".into(),
+            inputs: Default::default(),
+            caps: crate::directive::Caps {
+                max_bytes: 1,
+                max_entries: 1,
+                max_delete: 0,
+            },
+            host: "backup".into(),
+            port: None,
+            login: "alice".into(),
+            via: (None, "server".into(), None),
+            agent: None,
+            allow_enrollment: true,
+        }
+    }
+
+    /// Whether `pid` has ended: gone, or a zombie its new parent has not
+    /// reaped yet.
+    fn ended(pid: libc::pid_t) -> bool {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .is_ok_and(|output| output.stdout.trim_ascii().starts_with(b"Z"))
+    }
+
+    #[test]
+    fn the_setup_child_ends_with_its_group_at_the_deadline_or_when_the_requester_goes() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        for requester_goes in [false, true] {
+            // A child whose own login waits on a server that stopped
+            // answering, as enrollment's SSH does in the child's group.
+            let pid_file = temporary.path().join(format!("login-{requester_goes}"));
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                &format!(
+                    "sleep 60 & echo $! > {}; wait",
+                    shell_words::quote(pid_file.to_str().unwrap())
+                ),
+            ]);
+            let started = Instant::now();
+            let deadline = started
+                + if requester_goes {
+                    Duration::from_secs(60)
+                } else {
+                    Duration::from_millis(500)
+                };
+            let cancelled = || requester_goes && started.elapsed() >= Duration::from_millis(500);
+            let error = prepare_in_child(command, &prepare_request(), deadline, &cancelled)
+                .err()
+                .unwrap();
+            assert!(started.elapsed() < Duration::from_secs(10), "{error:#}");
+            let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let waited = Instant::now();
+            while !ended(pid) {
+                assert!(
+                    waited.elapsed() < Duration::from_secs(5),
+                    "the child's login outlived it"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    #[test]
+    fn the_setup_child_enrolls_without_prompts_and_through_the_server_that_asked() {
+        let request = prepare_request();
+        let issue = request.issue().unwrap();
+        assert!(issue.batch);
+        assert_eq!(issue.caps, Some(request.caps));
+        assert_eq!(issue.jump.unwrap().label(), "server");
+        let mut named = prepare_request();
+        named.via = (Some("alice".into()), "server".into(), Some(2222));
+        assert_eq!(
+            named.issue().unwrap().jump.unwrap().label(),
+            "alice@server:2222"
+        );
+        named.via = (None, "-oProxyCommand=evil".into(), None);
+        assert!(named.issue().is_err());
+    }
 
     #[test]
     fn source_hostname_lookup_obeys_setup_deadline_and_cancellation() {

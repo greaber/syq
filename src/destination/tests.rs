@@ -389,6 +389,7 @@ fn broker_with_max_delete(
     let (prompts, requests) = mpsc::sync_channel(1);
     let receiver = Arc::new(Receiver {
         tcp_peer: crate::conn::RemoteSpec::local_receiver(false),
+        server_user: None,
         name: "laptop".into(),
         identity_key: identity::generate_key().unwrap(),
         requester: crate::receive_approval::Requester {

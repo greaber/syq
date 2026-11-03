@@ -642,8 +642,20 @@ fn install_over_route(
         .arg(&trace_path);
     if batch {
         // SSH takes the first value of each option, so these come before
-        // the user's configuration.
-        command.args(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes"]);
+        // the user's configuration. Nobody is watching a batch login, so it
+        // also gives up on a server that stops answering.
+        command.args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=3",
+        ]);
     }
     command
         .args(enrollment::enrollment_ssh_args_raw(
@@ -654,8 +666,15 @@ fn install_over_route(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    let mut group = crate::process_group::ProcessGroup::spawn(&mut command)
-        .map_err(|error| enrollment_ssh_error(target, true, error))?;
+    // Without a terminal, the login stays in this process's group: the
+    // receiving service ends its setup child with that whole group, at its
+    // deadline or when the requester goes, and the login with it.
+    let mut group = if batch {
+        crate::process_group::ProcessGroup::spawn_in_this_group(&mut command)
+    } else {
+        crate::process_group::ProcessGroup::spawn(&mut command)
+    }
+    .map_err(|error| enrollment_ssh_error(target, true, error))?;
     let foreground = group
         .foreground()
         .context("give enrollment SSH access to the terminal")?;

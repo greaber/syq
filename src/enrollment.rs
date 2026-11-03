@@ -529,6 +529,27 @@ impl SshEndpoint {
         })
     }
 
+    /// An endpoint whose login the SSH configuration may choose.
+    pub(crate) fn from_host(user: Option<&str>, host: &str, port: Option<u16>) -> Result<Self> {
+        match user {
+            Some(user) => Self::from_parts(user, host, port),
+            None => {
+                if host.is_empty()
+                    || host.starts_with('-')
+                    || host
+                        .bytes()
+                        .any(|byte| byte == 0 || byte == b'@' || byte.is_ascii_whitespace())
+                {
+                    bail!("invalid native enrollment endpoint");
+                }
+                Ok(Self {
+                    target: host.to_owned(),
+                    port,
+                })
+            }
+        }
+    }
+
     pub fn as_str(&self) -> &str {
         &self.target
     }

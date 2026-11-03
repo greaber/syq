@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shlex
 import signal
+import socket
 import subprocess
 import tempfile
 import time
@@ -161,12 +162,52 @@ def trace_events(text):
             for line in text.splitlines()]
 
 
-def relayed_connections():
-    # Pool warming also connects to destination in the background. A copy
-    # relayed through this machine would start --return-receiver there.
-    return [event for event in trace_events(trace.read_text())
-            if event["phase"] == "start" and event["host"] == "destination"
-            and event["return_receiver"] == "yes"]
+def trace_length():
+    return len(trace.read_text().splitlines())
+
+
+def runner_sessions_to_destination(start):
+    # This machine's SSH connections to the destination since `start`,
+    # other than reading its SSH configuration with -G.
+    return [event for event in trace_events(trace.read_text())[start:]
+            if event["phase"] == "start" and event["host"].rsplit("@", 1)[-1] == "destination"
+            and event.get("query") != "yes"]
+
+
+def alive(pid):
+    # A process that ended but that nobody reaped yet counts as ended.
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return False
+    return state != "Z"
+
+
+def setup_processes():
+    found = []
+    for entry in Path("/proc").iterdir():
+        try:
+            if entry.name.isdigit() and b"--return-prepare" in (entry / "cmdline").read_bytes():
+                if alive(int(entry.name)):
+                    found.append(int(entry.name))
+        except OSError:
+            pass
+    return found
+
+
+def wait_until(label, probe, seconds=20):
+    deadline = time.monotonic() + seconds
+    progress = time.monotonic() + 5
+    last = None
+    while time.monotonic() < deadline:
+        done, last = probe()
+        if done:
+            return
+        if time.monotonic() >= progress:
+            print(f"Waiting for {label}: {last}", flush=True)
+            progress += 5
+        time.sleep(.1)
+    raise AssertionError(f"{label} timed out; last state: {last}")
 
 
 def destination_enrollments():
@@ -210,14 +251,12 @@ finally:
 assert "syq-enrollment:" not in remote("cat ~/.ssh/authorized_keys 2>/dev/null || true")
 remote("test ! -e /tmp/syq-real-ssh/forward/first-use")
 
-before = len(relayed_connections())
 # The source has its own trace filesystem. Give this copy a separate file so
 # an older source session's background activity cannot enter the assertion.
 source_trace = run("ssh", "source", "mktemp /tmp/syq-real-ssh/forward-ssh.XXXXXX").strip()
 try:
     # The first approved copy sets up restricted copying on the destination.
     copy("/tmp/syq-real-ssh/forward/approved", extra=("--stats",), ssh_trace=source_trace)
-    assert relayed_connections()[before:] == [], "the copy was relayed through the runner"
     events = trace_events(run("ssh", "source", "cat " + shlex.quote(source_trace)))
     # RemoteSpec sets ControlMaster on every transport connection. The same
     # process also runs ssh -G to read config; that query never connects.
@@ -243,7 +282,11 @@ assert "syq-copy-worker" not in remote("cat ~/.ssh/authorized_keys")
 
 print("case: explicit automatic selection uses restricted fallback", flush=True)
 for option, name in [("--auth-from", "selected")]:
+    start = trace_length()
     copy("/tmp/syq-real-ssh/forward/" + name, auth=(option, "auto"))
+    # With the destination enrolled, the runner only signs: the server
+    # connects to the destination itself, and nothing goes through here.
+    assert runner_sessions_to_destination(start) == [], "the runner logged in to the destination"
     assert remote("sha256sum /tmp/syq-real-ssh/forward/" + name).split()[0] == expected
 
 print("case: another source build hands off automatic and explicit authorization", flush=True)
@@ -391,4 +434,122 @@ assert len(remote("find /tmp/syq-real-ssh/forward -type f -name '.cancelled.syq-
 run("syq", "clean-partials", "--on", "destination", "/tmp/syq-real-ssh/forward")
 assert not remote("find /tmp/syq-real-ssh/forward -type f -name '.cancelled.syq-tmp.*'")
 assert remote("sha256sum /tmp/syq-real-ssh/forward/cancelled").split()[0] == expected
+print("case: a requester that goes while its approval enrolls ends the setup and frees it", flush=True)
+for enrollment in destination_enrollments():
+    run("syq", "receiver", "revoke", enrollment)
+hold = Path("/tmp/syq-real-ssh-hold-enrollment")
+waiting = Path("/tmp/syq-real-ssh-hold-enrollment.waiting")
+waiting.unlink(missing_ok=True)
+hold.touch()
+try:
+    held = source_copy()
+    try:
+        pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
+        assert len(pending) == 1, pending
+        run("syq", "persist", "receive", "approve", pending[0]["id"])
+        wait_until("the enrolling login", lambda: (waiting.exists(), setup_processes()))
+        login = int(waiting.read_text())
+        assert alive(login) and setup_processes()
+        # The requesting command goes away on the source.
+        run("ssh", "source", "pkill -TERM -f '^timeout 75 syq cp '")
+        _, stderr = held.communicate(timeout=30)
+        assert held.returncode not in (0, 124), stderr
+    finally:
+        if held.poll() is None:
+            os.killpg(held.pid, signal.SIGKILL)
+            held.wait(timeout=3)
+    # The setup child and the login it held end with it, well before the
+    # setup deadline.
+    wait_until("the setup to end", lambda: (not alive(login) and not setup_processes(),
+                                             (alive(login), setup_processes())), seconds=10)
+    assert destination_enrollments() == []
+finally:
+    hold.unlink(missing_ok=True)
+    waiting.unlink(missing_ok=True)
+# The enrollment lock and the request's slot are free again: the next
+# approval sets restricted copying up.
+copy("/tmp/syq-real-ssh/forward/after-held-setup")
+assert remote("sha256sum /tmp/syq-real-ssh/forward/after-held-setup").split()[0] == source_hash
+assert len(destination_enrollments()) == 1
+
+print("case: enrolling goes through the server that asked when the runner cannot reach the destination", flush=True)
+for enrollment in destination_enrollments():
+    run("syq", "receiver", "revoke", enrollment)
+# Lab servers refuse forwarding, so the server that asked runs a listener
+# that permits it, and the jump goes there.
+listener = json.loads(run("ssh", "source", "python3 -", stdin="""
+import json, pathlib, socket, subprocess, tempfile
+root = pathlib.Path(tempfile.mkdtemp(prefix="syq-real-ssh-jump-"))
+key = root / "host_key"
+subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
+with socket.socket() as probe:
+    probe.bind(("0.0.0.0", 0))
+    port = probe.getsockname()[1]
+config = root / "sshd_config"
+config.write_text("\\n".join([
+    "Port " + str(port), "ListenAddress 0.0.0.0", "AddressFamily inet", "HostKey " + str(key),
+    "PidFile " + str(root / "sshd.pid"), "AuthorizedKeysFile /etc/ssh/lab_authorized_keys",
+    "StrictModes yes", "AllowUsers syq", "AuthenticationMethods publickey", "PubkeyAuthentication yes",
+    "PasswordAuthentication no", "KbdInteractiveAuthentication no", "UsePAM no", "UseDNS no",
+    "AllowAgentForwarding no", "AllowTcpForwarding local", "X11Forwarding no", "PermitTTY no",
+    "LogLevel VERBOSE", "",
+]))
+subprocess.run(["/usr/sbin/sshd", "-f", str(config), "-E", str(root / "sshd.log")], check=True)
+print(json.dumps({"root": str(root), "port": port,
+                  "key": " ".join(key.with_suffix(".pub").read_text().split()[:2])}))
+"""))
+known_hosts = Path.home() / ".ssh/known_hosts"
+trusted = known_hosts.read_bytes()
+jump_port = Path("/tmp/syq-real-ssh-jump-port")
+unreachable = Path("/tmp/syq-real-ssh-unreachable-direct")
+try:
+    def listening():
+        try:
+            with socket.create_connection(("source", listener["port"]), timeout=.5):
+                return True, "listening"
+        except OSError as error:
+            return False, str(error)
+    wait_until("the jump listener", listening)
+    with known_hosts.open("a") as hosts:
+        hosts.write(f"[source]:{listener['port']} {listener['key']}\n")
+    jump_port.write_text(str(listener["port"]))
+    unreachable.touch()
+    start = trace_length()
+    copy("/tmp/syq-real-ssh/forward/through-server")
+    events = trace_events(trace.read_text())[start:]
+finally:
+    unreachable.unlink(missing_ok=True)
+    jump_port.unlink(missing_ok=True)
+    known_hosts.write_bytes(trusted)
+    run("ssh", "source", "kill $(cat " + shlex.quote(listener["root"] + "/sshd.pid") + "); rm -rf "
+        + shlex.quote(listener["root"]))
+ends = {event["pid"]: event for event in events if event["phase"] == "end"}
+direct = [event for event in events if event["phase"] == "start" and event.get("enrollment") == "yes"
+          and event.get("direct") == "yes" and event.get("query") != "yes"]
+assert direct and all(ends[event["pid"]]["status"] == "255" for event in direct), events
+jumps = [event for event in events if event["phase"] == "start" and event.get("jump") == "yes"
+         and event["host"].rsplit("@", 1)[-1] == "source"]
+assert jumps, events
+assert remote("sha256sum /tmp/syq-real-ssh/forward/through-server").split()[0] == source_hash
+assert len(destination_enrollments()) == 1
+
+print("case: an outdated enrollment refuses a dry run before approval, and approving updates it", flush=True)
+records = [(path.parent, json.loads(path.read_bytes()))
+           for path in (Path.home() / ".local/state/syq/enrollments").glob("*/enrollment.json")]
+directories = [directory for directory, record in records if record["host"] == "destination"]
+assert len(directories) == 1, records
+refreshing = directories[0] / "refreshing"
+refreshing.touch(mode=0o600)
+preview = source_copy("--dry-run")
+_, stderr = preview.communicate(timeout=90)
+assert preview.returncode not in (0, 124), stderr
+assert "a dry run does not update syq on syq@destination" in stderr, stderr
+assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
+updating = source_copy()
+pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
+assert len(pending) == 1 and 'Also updates restricted copying on "destination"' in pending[0]["permission"], pending
+run("syq", "persist", "receive", "approve", pending[0]["id"])
+_, stderr = updating.communicate(timeout=90)
+assert updating.returncode == 0, stderr
+assert not refreshing.exists()
 print("source-shell remote copy checks passed", flush=True)

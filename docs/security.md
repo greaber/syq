@@ -447,16 +447,21 @@ private key stays on your machine and grants no SSH login access.
 A connected server can ask your laptop to authorize a copy to another server.
 Such a copy uses the destination account's enrollment, as described in
 [Copies between servers](#copies-between-servers), with the server that asked
-in hostA's place: your laptop shows the command, sets up the enrollment on the
-first approved copy, signs the approved copy with your login key, and gives the
-server the entry key and the destination host keys your laptop trusts. The
-server connects to the destination's receiver itself, which confines the copy
-to the approved destination, refuses the protected paths, and enforces your
-laptop's own limits as well as the command's. File data goes directly between
-the servers over encrypted TCP or SSH, and the copy continues if your laptop
-disconnects. The server chooses the contents written within the approval, and
-like any server that coordinated a copy, it keeps the entry key afterwards.
-Your laptop's credentials and signing agent remain on the laptop.
+in hostA's place: your laptop shows the command, sets up or updates the
+enrollment when it needs that, signs the approved copy with your login key,
+and gives the server the entry key and the destination host keys your laptop
+trusts. The server coordinates the copy itself: it connects to the
+destination's receiver, which confines the copy to the approved destination,
+refuses the protected paths, and enforces your laptop's own limits as well as
+the command's. Step 4 above does not apply: your laptop does not check what
+the destination reports it changed, and the server that asked reports the
+copy's outcome itself, as for any copy it runs.
+File data goes directly between the servers over encrypted TCP or SSH, and the
+copy continues if your laptop disconnects or stops receiving, until it
+finishes, someone interrupts it on the server, or you revoke the enrollment.
+The server chooses the contents written within the approval, and like any
+server that coordinated a copy, it keeps the entry key afterwards. Your
+laptop's credentials and signing agent remain on the laptop.
 
 A server can also request source-read approval to download files from another
 server. The source helper confines reads to the approved files and directory

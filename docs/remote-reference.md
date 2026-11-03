@@ -277,10 +277,14 @@ or `--coordinate-at`, or `--no-tcp-encryption`. The authorizing
 machine's copy limits apply, including its `--max-delete` and `--max-entries`
 for pruning. A per-copy upload uses the destination account's
 [enrollment](#enrollment): the authorizing machine sets it up on the first
-approved copy over its own SSH login, without prompts, so its login key must
-be able to sign without a terminal (in its agent, or an unencrypted key file)
-and the destination's host key must already be trusted there. The authorizing
-machine then signs the approved copy and gives the source the enrollment's
+approved copy, and updates it after you upgrade syq, over its own SSH login,
+without prompts. Its login key must be able to sign without a terminal (in
+its agent, or an unencrypted key file), and its `known_hosts` must already
+hold the destination's exact host key: trust through a host certificate alone
+is refused, after approval. That login goes to the destination directly, or,
+when the authorizing machine cannot reach it, through the source, whose SSH
+server must then allow TCP forwarding for the authorizing machine's login on
+it. The authorizing machine then signs the approved copy and gives the source the enrollment's
 entry key and the destination host keys it trusts. The source connects to the
 destination's receiver at the address its own SSH configuration gives, sends
 file data directly over encrypted TCP, falling back to SSH between those same

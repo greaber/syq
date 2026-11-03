@@ -169,11 +169,42 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
     })
 }
 
-/// Whether this machine has an enrollment for `login@host:port`.
-pub(crate) fn enrollment_exists(host: &str, port: Option<u16>, login: &str) -> Result<bool> {
-    Ok(load_local_enrollments()?.into_iter().any(|(metadata, _)| {
+/// What this machine's enrollment for an account needs before a copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EnrollmentState {
+    /// There is none: the first copy sets it up.
+    Missing,
+    /// It is for another build, or a refresh did not finish: the next copy
+    /// updates syq on the server and rewrites its `authorized_keys` line.
+    Outdated,
+    Ready,
+}
+
+/// This machine's enrollment state for `login@host:port`, from its own
+/// records alone.
+pub(crate) fn local_enrollment_state(
+    host: &str,
+    port: Option<u16>,
+    login: &str,
+) -> Result<EnrollmentState> {
+    Ok(state_of(load_local_enrollments()?, host, port, login))
+}
+
+pub(super) fn state_of(
+    enrollments: Vec<(LocalEnrollment, PathBuf)>,
+    host: &str,
+    port: Option<u16>,
+    login: &str,
+) -> EnrollmentState {
+    match enrollments.into_iter().find(|(metadata, _)| {
         metadata.host == host && metadata.port == port && metadata.target_login == login
-    }))
+    }) {
+        None => EnrollmentState::Missing,
+        Some((metadata, directory)) if needs_refresh(&metadata, &directory) => {
+            EnrollmentState::Outdated
+        }
+        Some(_) => EnrollmentState::Ready,
+    }
 }
 
 /// Whether `grant` is a signed directive for an enrolled receiver, whose
