@@ -1947,6 +1947,9 @@ pub fn run(mut args: Args) -> Result<i32> {
     let dry_run = args.dry_run;
     let prune = args.delete;
     let in_place_update = args.in_place_update;
+    // A caller that lends this copy its stream, as a stream mapping does for
+    // its pathname phase, records a fatal failure there itself.
+    let records_failure = args.results_override.is_none();
     let outcome = handoff.and_then(|()| run_transfer(args, Arc::clone(&progress)));
     if let Some(history) = progress.tuning_history.get() {
         history.complete(matches!(&outcome, Ok(0)), serde_json::json!({
@@ -1967,7 +1970,7 @@ pub fn run(mut args: Args) -> Result<i32> {
         // never mistakes a handled fatal for a crash (only a real crash
         // leaves the terminal record missing) and can say why it failed.
         if let Some(results) = progress.results_writer() {
-            if let Err(error) = &outcome {
+            if let (Err(error), true) = (&outcome, records_failure) {
                 let os_kind = os_kind_of(error);
                 progress.errors.fetch_add(1, Relaxed);
                 results.emit_error_classified(
