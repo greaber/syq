@@ -2328,8 +2328,12 @@ fn unverified_sessions_beyond_the_slots_are_refused_at_once() {
     fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
     let first = UnverifiedSlot::take(&state, 2).unwrap();
     let second = UnverifiedSlot::take(&state, 2).unwrap();
-    let error = UnverifiedSlot::take(&state, 2).err().unwrap().to_string();
-    assert!(error.contains("2 other connections"), "{error}");
+    let error = UnverifiedSlot::take(&state, 2).err().unwrap();
+    assert!(is_sessions_full(&error), "{error:#}");
+    assert!(
+        error.to_string().contains("2 other connections"),
+        "{error:#}"
+    );
     // A slot frees when its session is verified or ends.
     drop(first);
     let third = UnverifiedSlot::take(&state, 2).unwrap();

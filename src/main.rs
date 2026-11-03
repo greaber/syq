@@ -259,7 +259,11 @@ fn main() {
         fsops::reserve_startup_descriptors();
         if let Err(error) = server::run_checker(enrollment, generation) {
             crate::output::diagnostic!("syq restricted receiver: {error:#}");
-            std::process::exit(1);
+            std::process::exit(if crate::restricted::is_sessions_full(&error) {
+                crate::restricted::SESSIONS_FULL_EXIT
+            } else {
+                1
+            });
         }
         return;
     }

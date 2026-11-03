@@ -125,10 +125,33 @@ impl UnverifiedSlot {
                 }
             }
         }
-        bail!(
+        Err(SessionsFull(format!(
             "{slots} other connections are starting copies on this enrollment; try again shortly, or replace its entry key with `syq receiver revoke` and enroll again if this persists"
-        )
+        ))
+        .into())
     }
+}
+
+/// Every slot for unverified sessions was taken, so the session was refused.
+/// The receiver exits with [`SESSIONS_FULL_EXIT`], and a coordinator that
+/// sees it reports this error, which it retries soon: the slots free as
+/// soon as other connections finish starting.
+#[derive(Debug)]
+pub(crate) struct SessionsFull(pub(crate) String);
+
+impl fmt::Display for SessionsFull {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SessionsFull {}
+
+/// The exit status of a session refused for [`SessionsFull`].
+pub(crate) const SESSIONS_FULL_EXIT: i32 = 73;
+
+pub(crate) fn is_sessions_full(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<SessionsFull>())
 }
 
 /// What a session the forced command started may go on to do.

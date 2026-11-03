@@ -1996,6 +1996,47 @@ fn first_ssh_worker_retries_independently_after_mux_rejection() {
 }
 
 #[test]
+fn a_receiver_with_full_session_slots_is_retried_on_the_fast_path() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let script = temporary.path().join("ssh");
+    let log = temporary.path().join("attempts");
+    // The first two connections find the receiver's slots taken; the third
+    // reaches a host without syq, which is not retried.
+    crate::test_support::write_executable(
+        &script,
+        format!(
+            "#!/bin/sh\necho attempt >> {log}\n[ \"$(wc -l < {log})\" -le 2 ] && exit {full}\nexit 127\n",
+            log = shell_words::quote(log.to_str().unwrap()),
+            full = crate::restricted::SESSIONS_FULL_EXIT,
+        ),
+        0o700,
+    );
+    let mut spec = RemoteSpec::local_receiver(true);
+    spec.local_process = false;
+    spec.rsh = vec![script.to_string_lossy().into_owned()];
+    let worker = || ConnectionRole::SourceWorker {
+        roots: Vec::new(),
+        send_budget: None,
+    };
+    let refused = spec
+        .connect_once(false, SshConnection::Independent, worker(), false)
+        .err()
+        .unwrap();
+    assert!(crate::restricted::is_sessions_full(&refused), "{refused:#}");
+    assert!(!is_non_retryable_connect_error(&refused), "{refused:#}");
+    assert!(!helper_needs_install(&refused), "{refused:#}");
+    let error = spec
+        .connect_retried(false, true, worker(), false, false)
+        .err()
+        .unwrap();
+    assert!(!crate::restricted::is_sessions_full(&error), "{error:#}");
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "attempt\nattempt\nattempt\n"
+    );
+}
+
+#[test]
 fn a_pool_appearing_after_priming_is_not_queried_during_connect() {
     use std::os::unix::net::UnixListener;
     let directory = crate::test_support::short_tempdir().unwrap();

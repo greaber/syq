@@ -72,6 +72,20 @@ if [ "$entry_key" = yes ] && [ -f /tmp/syq-real-ssh-block-restricted-workers ]; 
         : >/tmp/syq-real-ssh-block-restricted-workers.control
     fi
 fi
+# The slot test holds a copy's workers the same way until it removes the
+# file, so that they start while other sessions hold the receiver's slots.
+if [ "$entry_key" = yes ] && [ -f /tmp/syq-real-ssh-hold-restricted-workers ]; then
+    if [ -e /tmp/syq-real-ssh-hold-restricted-workers.control ]; then
+        : >/tmp/syq-real-ssh-hold-restricted-workers.waiting
+        waited=0
+        while [ -f /tmp/syq-real-ssh-hold-restricted-workers ] && [ "$waited" -lt 600 ]; do
+            sleep 0.1
+            waited=$((waited + 1))
+        done
+    else
+        : >/tmp/syq-real-ssh-hold-restricted-workers.control
+    fi
+fi
 if [ "$blocked" = yes ]; then
     printf 'restricted SSH worker blocked by the route test\n' >&2
     status=255
