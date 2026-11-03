@@ -1782,9 +1782,10 @@ pub(crate) fn serve_background(
             // A rejected login, as after a key was removed, or a host key
             // that does not match is tried again less and less often: it may
             // only be an agent still locked after sleep. The status says why
-            // meanwhile, and a command that connects to the server restarts
-            // this connection, trying again at once once a while has passed
-            // since this attempt (`command_retry_interval`).
+            // meanwhile. `persist connect` starts the connection over, and
+            // another command connecting to the server wakes this wait once
+            // a while has passed since the last attempt
+            // (`command_retry_interval`), keeping the waits growing.
             let login = (!online)
                 .then(|| crate::conn::login_rejection(&error))
                 .flatten();
@@ -1802,8 +1803,8 @@ pub(crate) fn serve_background(
                     state.retry = Some((
                         Instant::now() + wait,
                         format!(
-                            ", or sooner when a command connects to {}",
-                            spec.endpoint.label()
+                            ", or run syq persist connect {} to try now",
+                            shell_words::quote(&spec.endpoint.label())
                         ),
                     ));
                     wait

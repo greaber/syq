@@ -589,6 +589,22 @@ struct LocalRequest {
     decision: Option<Decision>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     retry: bool,
+    /// Restart failed connections now, whenever they last tried, as
+    /// `persist connect` asks. Only a service of the same build receives it
+    /// (`ensure_inner`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    restart: bool,
+}
+
+/// What a request asks the service to do with its failed connections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Retry {
+    No,
+    /// A command connected to the server: try again if a while has passed
+    /// since the last attempt.
+    IfDue,
+    /// `persist connect`: start a failed connection over at once.
+    Now,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -607,13 +623,13 @@ fn status(control: &Path, stop: bool) -> Result<Status> {
     query(control, stop, None)
 }
 fn query(control: &Path, stop: bool, decision: Option<Decision>) -> Result<Status> {
-    query_retry(control, stop, decision, false)
+    query_retry(control, stop, decision, Retry::No)
 }
 fn query_retry(
     control: &Path,
     stop: bool,
     decision: Option<Decision>,
-    retry: bool,
+    retry: Retry,
 ) -> Result<Status> {
     let mut socket = UnixStream::connect(suffixed(control, SOCKET))?;
     socket.set_read_timeout(Some(Duration::from_secs(1)))?;
@@ -624,7 +640,8 @@ fn query_retry(
             version: VERSION,
             stop,
             decision,
-            retry,
+            retry: retry == Retry::IfDue,
+            restart: retry == Retry::Now,
         },
     )?;
     let result: Status = read_status(&mut socket)?;
@@ -654,7 +671,7 @@ fn unanswered(error: &anyhow::Error) -> bool {
 }
 /// Query the service holding this control's lock, waiting up to `timeout` for
 /// it to answer while it starts or stops. None once no service holds the lock.
-fn running_status(control: &Path, retry: bool, timeout: Duration) -> Result<Option<Status>> {
+fn running_status(control: &Path, retry: Retry, timeout: Duration) -> Result<Option<Status>> {
     let deadline = Instant::now() + timeout;
     while is_running(control) {
         match query_retry(control, false, None, retry) {
@@ -741,7 +758,7 @@ fn read_spec(control: &Path) -> Result<ServiceSpec> {
 /// Called after a successful ordinary persistent SSH control connection. A
 /// failed return setup is visible but does not invalidate that ordinary copy.
 pub(crate) fn ensure(domain: &Domain, control: &Path, remote: &crate::conn::RemoteSpec) {
-    if let Err(error) = ensure_inner(domain, control, remote) {
+    if let Err(error) = ensure_inner(domain, control, remote, Retry::IfDue) {
         crate::output::diagnostic!(
             "syq: background receiving through {}: {error:#}",
             remote.label()
@@ -755,7 +772,7 @@ pub(crate) fn ensure_ready(
     remote: &crate::conn::RemoteSpec,
     timeout: Duration,
 ) -> Result<Option<Vec<String>>> {
-    if !ensure_inner(domain, control, remote)? {
+    if !ensure_inner(domain, control, remote, Retry::Now)? {
         return Ok(None);
     }
     let deadline = Instant::now() + timeout;
@@ -831,7 +848,15 @@ pub(crate) fn profile_names(domain: &Domain) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn ensure_inner(domain: &Domain, control: &Path, remote: &crate::conn::RemoteSpec) -> Result<bool> {
+/// `retry` is what to do with a failed connection to this server: what a
+/// command connecting to it asks (`Retry::IfDue`), or `persist connect`
+/// (`Retry::Now`).
+fn ensure_inner(
+    domain: &Domain,
+    control: &Path,
+    remote: &crate::conn::RemoteSpec,
+    retry: Retry,
+) -> Result<bool> {
     let scope = control.parent().context("persistence scope missing")?;
     crate::persistence::validate_scope(scope)?;
     anyhow::ensure!(
@@ -851,10 +876,10 @@ fn ensure_inner(domain: &Domain, control: &Path, remote: &crate::conn::RemoteSpe
         .iter()
         .any(|p| p.allows_server(&remote.label()));
     if allowed {
-        if let Some(state) = running_status(control, false, ANSWER_TIMEOUT)? {
+        if let Some(state) = running_status(control, Retry::No, ANSWER_TIMEOUT)? {
             if state.identity != crate::identity::build() {
                 stop_inner(control, false)?;
-            } else if running_status(control, true, ANSWER_TIMEOUT)?.is_some() {
+            } else if running_status(control, retry, ANSWER_TIMEOUT)?.is_some() {
                 return Ok(true);
             }
         }
@@ -988,7 +1013,7 @@ struct ProfileWorker {
     config: Settings,
     state: Arc<Mutex<ConnectionState>>,
     approvals: Arc<crate::receive_approval::Queue>,
-    _worker: Worker,
+    worker: Worker,
 }
 impl ProfileWorker {
     fn new(domain: &Domain, config: Settings, spec: ServiceSpec) -> Self {
@@ -1032,7 +1057,7 @@ impl ProfileWorker {
             config,
             state,
             approvals,
-            _worker: Worker {
+            worker: Worker {
                 stop,
                 wake: Some(wake),
                 thread: Some(thread),
@@ -1052,7 +1077,7 @@ fn reconcile(
     workers: &mut Vec<ProfileWorker>,
     config: &Preferences,
     spec: &ServiceSpec,
-    retry: bool,
+    retry: Retry,
 ) {
     workers.retain_mut(|worker| {
         let Some(profile) = config.profiles.iter().find(|profile| {
@@ -1062,17 +1087,46 @@ fn reconcile(
         };
         worker.approvals.set_notifications(profile.notifications);
         worker.config = profile.clone();
-        // A command restarts a failed connection, trying again at once,
-        // but no sooner than a while after its last attempt: commands such
-        // as completion may come every few seconds, and each retry of a
-        // rejected login is another failed login on the server.
-        !(retry && {
-            let state = worker.state.lock().unwrap();
-            state.phase == "failed"
-                && state.attempted.is_none_or(|attempted| {
+        let mut state = worker.state.lock().unwrap();
+        if state.phase != "failed" {
+            return true;
+        }
+        match retry {
+            Retry::No => true,
+            // Start over, with the first short wait.
+            Retry::Now => false,
+            // A command connected: try again at once, but no sooner than a
+            // while after the last attempt, since commands such as
+            // completion may come every few seconds and each retry of a
+            // rejected login is another failed login on the server. A
+            // connection still waiting to retry is woken, keeping its
+            // growing waits; one that stopped is started over.
+            Retry::IfDue => {
+                let due = state.attempted.is_none_or(|attempted| {
                     attempted.elapsed() >= crate::destination::command_retry_interval()
-                })
-        })
+                });
+                if !due {
+                    return true;
+                }
+                let running = worker
+                    .worker
+                    .thread
+                    .as_ref()
+                    .is_some_and(|thread| !thread.is_finished());
+                if running
+                    && worker
+                        .worker
+                        .wake
+                        .as_ref()
+                        .is_some_and(|wake| wake.send(()).is_ok())
+                {
+                    // Under way: later commands wait for this attempt.
+                    state.attempted = Some(Instant::now());
+                    return true;
+                }
+                false
+            }
+        }
     });
     for profile in config
         .profiles
@@ -1123,7 +1177,7 @@ fn apply_preferences(domain: &Domain, config: &Preferences) -> Result<()> {
             stop_inner(&control, false)?;
             continue;
         }
-        if running_status(&control, false, ANSWER_TIMEOUT)?
+        if running_status(&control, Retry::No, ANSWER_TIMEOUT)?
             .is_some_and(|state| state.identity != crate::identity::build())
         {
             stop_inner(&control, false)?;
@@ -1244,7 +1298,7 @@ fn run(domain: &Domain, control: &Path) -> Result<()> {
             }
             if last_check.elapsed() >= Duration::from_millis(200) {
                 config = preferences(domain)?;
-                reconcile(domain, &mut workers, &config, &spec, false);
+                reconcile(domain, &mut workers, &config, &spec, Retry::No);
                 last_check = Instant::now();
             }
             match listener.accept() {
@@ -1256,8 +1310,15 @@ fn run(domain: &Domain, control: &Path) -> Result<()> {
                             if request.stop {
                                 shutdown.store(true, Ordering::Release);
                             }
-                            if request.retry {
-                                reconcile(domain, &mut workers, &config, &spec, true);
+                            let retry = if request.restart {
+                                Retry::Now
+                            } else if request.retry {
+                                Retry::IfDue
+                            } else {
+                                Retry::No
+                            };
+                            if retry != Retry::No {
+                                reconcile(domain, &mut workers, &config, &spec, retry);
                             }
                             let decision_error = request.decision.and_then(|decision| {
                                 workers
@@ -2001,7 +2062,7 @@ mod tests {
                 ..Default::default()
             })),
             approvals: approvals.clone(),
-            _worker: Worker {
+            worker: Worker {
                 stop: stop.clone(),
                 wake: None,
                 thread: None,
@@ -2024,7 +2085,7 @@ mod tests {
             version: PREFERENCES_VERSION,
             profiles: vec![settings],
         };
-        reconcile(&Domain::default(), &mut workers, &config, &spec, false);
+        reconcile(&Domain::default(), &mut workers, &config, &spec, Retry::No);
         assert_eq!(workers.len(), 1);
         assert!(Arc::ptr_eq(&workers[0].approvals, &approvals));
         assert!(!stop.load(Ordering::Acquire));
@@ -2040,7 +2101,7 @@ mod tests {
 
         // Access changes still remove the old worker, including its authority.
         config.profiles[0].servers = vec!["other".into()];
-        reconcile(&Domain::default(), &mut workers, &config, &spec, false);
+        reconcile(&Domain::default(), &mut workers, &config, &spec, Retry::No);
         assert!(workers.is_empty());
         assert!(stop.load(Ordering::Acquire));
     }
@@ -2334,6 +2395,7 @@ mod tests {
                 stop,
                 decision: None,
                 retry: false,
+                restart: false,
             };
             assert_eq!(serde_json::to_string(&request).unwrap(), old);
             let decoded: LocalRequest = serde_json::from_str(old).unwrap();
@@ -2372,7 +2434,7 @@ mod tests {
                 }
             };
             let request = read_control_request(&mut client).unwrap();
-            assert!(!request.stop && !request.retry);
+            assert!(!request.stop && !request.retry && !request.restart);
             let state = Status {
                 version: VERSION,
                 identity: crate::identity::build().into(),
@@ -2387,7 +2449,7 @@ mod tests {
             };
             write_status(&mut client, &state).unwrap();
         });
-        let state = running_status(&control, false, ANSWER_TIMEOUT).unwrap();
+        let state = running_status(&control, Retry::No, ANSWER_TIMEOUT).unwrap();
         service.join().unwrap();
         assert_eq!(state.unwrap().pid, 4242);
     }
@@ -2396,7 +2458,7 @@ mod tests {
     fn a_locked_service_that_never_answers_fails_with_its_socket() {
         let (_root, control, _lock) = locked_control();
         let started = Instant::now();
-        let error = running_status(&control, false, Duration::from_millis(200)).unwrap_err();
+        let error = running_status(&control, Retry::No, Duration::from_millis(200)).unwrap_err();
         let elapsed = started.elapsed();
         assert!(
             elapsed >= Duration::from_millis(200) && elapsed < Duration::from_secs(5),
@@ -2420,7 +2482,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             drop(lock);
         });
-        assert!(running_status(&control, false, Duration::from_secs(10))
+        assert!(running_status(&control, Retry::No, Duration::from_secs(10))
             .unwrap()
             .is_none());
         stopped.join().unwrap();

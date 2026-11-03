@@ -478,9 +478,10 @@ instead of reconnecting, and `syq persist status` shows it as failed with the
 reason. When a server rejects your login or presents a host key that does not
 match, receiving tries again after 30 seconds, then waits twice as long each
 time, up to 10 minutes; meanwhile `syq persist status` shows it as failed with
-the reason and when it tries next. In both cases a command that connects to
-that server tries again at once if at least 30 seconds have passed since the
-last attempt.
+the reason and when it tries next. In both cases run
+`syq persist connect server` to try again at once. Other commands that connect
+to that server try again too, but at most once every 30 seconds, and without
+shortening the waits that follow.
 
 The server command uses the matching helper installed by the receiving
 connection. If that helper is missing or does not recognize an option, update
