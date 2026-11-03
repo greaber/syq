@@ -819,7 +819,7 @@ fn constrain(
     max_delete: u64,
     dry_run_prunes: bool,
 ) -> Result<CopyRequest> {
-    if request.copy.mutation_scopes.len() > 1024 {
+    if request.copy.mutation_scopes.len() > crate::delegation::MAX_MUTATION_SCOPES {
         bail!("too many copy scopes");
     }
     request.copy.destination = rebase(&request.copy.destination, destination)?;

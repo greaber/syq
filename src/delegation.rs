@@ -62,6 +62,8 @@ pub(crate) const MAX_CONNECTIONS: u16 = 128;
 const MAX_FILTER_RULES: usize = 4096;
 const MAX_FILTER_RULE_BYTES: usize = 4096;
 const MAX_FILTER_ROOTS: usize = 1024;
+/// Most destination paths one copy's rules may change.
+pub(crate) const MAX_MUTATION_SCOPES: usize = 1024;
 const REDEMPTION_MAGIC: &[u8; 8] = b"SYQCLM\0\0";
 const REDEMPTION_RECORD_LEN: usize = REDEMPTION_MAGIC.len() + 8 + 32 + 32;
 
@@ -219,7 +221,7 @@ pub(crate) struct Grant {
 impl CopyOperation {
     fn validate(&self) -> Result<()> {
         validate_absolute_path(&self.destination)?;
-        if self.mutation_scopes.is_empty() || self.mutation_scopes.len() > 1024 {
+        if self.mutation_scopes.is_empty() || self.mutation_scopes.len() > MAX_MUTATION_SCOPES {
             bail!("copy mutation-scope count is outside the supported range");
         }
         for scope in &self.mutation_scopes {
