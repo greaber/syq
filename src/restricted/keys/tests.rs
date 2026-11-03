@@ -547,7 +547,10 @@ fn certify(ca: &Path, public_key: &Path, principal: &str, validity: &str, option
 }
 
 /// Certify `key` as `backup` for `hours`, like `certify` but built in Rust:
-/// `ssh-keygen` before OpenSSH 9.x cannot set `verify-required`.
+/// `ssh-keygen` before OpenSSH 9.x cannot set `verify-required`. OpenSSH's
+/// certificate format (PROTOCOL.certkeys) makes `verify-required` a critical
+/// option and the other options here, such as `no-touch-required`,
+/// extensions.
 fn certify_in_rust(ca: &Path, key: &PublicKey, certificate: &Path, hours: u64, options: &[&str]) {
     let ca = PrivateKey::read_openssh_file(ca).unwrap();
     let now = now() as u64;
@@ -731,7 +734,6 @@ fn fido_certificates_keep_their_touch_and_pin_requirements() {
     let ca = directory.path().join("ca");
     keygen(&ca, "ed25519", None, "");
     let ca_public = fs::read_to_string(ca.with_extension("pub")).unwrap();
-    let handle = directory.path().join("identity");
     let key = security_key(SK_USER_PRESENCE);
     atomic_write(
         directory.path(),
@@ -759,11 +761,6 @@ fn fido_certificates_keep_their_touch_and_pin_requirements() {
             1,
         ),
     ] {
-        fs::write(
-            handle.with_extension("pub"),
-            key.public_key().to_openssh().unwrap(),
-        )
-        .unwrap();
         certify_in_rust(&ca, key.public_key(), &certificate_path, 1, options);
         let certificate = read_certificate(&certificate_path).unwrap();
         let authorized = if line.is_empty() {
