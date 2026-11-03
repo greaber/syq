@@ -336,6 +336,12 @@ pub(crate) fn capture_output_bounded(
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let (mut out_done, mut err_done) = (false, false);
     let mut total = 0;
+    // The longest wait between checks of the deadline and cancellation.
+    const CHECK_INTERVAL: Duration = Duration::from_millis(20);
+    // How long to wait before looking again for the exit of a command that
+    // has closed its output: briefly at first, since it is usually exiting
+    // already, then up to the check interval for one that lingers.
+    let mut exit_wait = Duration::from_micros(100);
     loop {
         check(deadline, cancelled)?;
         if !out_done {
@@ -360,6 +366,9 @@ pub(crate) fn capture_output_bounded(
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error),
             }
+            std::thread::sleep(exit_wait.min(deadline.saturating_duration_since(Instant::now())));
+            exit_wait = (exit_wait * 2).min(CHECK_INTERVAL);
+            continue;
         }
         let mut descriptors = [
             libc::pollfd {
@@ -375,7 +384,7 @@ pub(crate) fn capture_output_bounded(
         ];
         let timeout = deadline
             .saturating_duration_since(Instant::now())
-            .min(Duration::from_millis(20))
+            .min(CHECK_INTERVAL)
             .as_millis() as i32;
         let result = unsafe {
             libc::poll(
@@ -530,6 +539,31 @@ mod bounded_tests {
         assert_eq!(output.status.code(), Some(17));
         assert_eq!(output.stdout, b"output");
         assert_eq!(output.stderr, b"error");
+    }
+
+    #[test]
+    fn returns_soon_after_the_command_exits() {
+        // A command that has closed its output is about to exit, as ssh is
+        // once it has printed its configuration. Waiting a whole polling
+        // interval for that would add the interval to every SSH
+        // configuration check. The fastest of a few attempts stays well
+        // under the old 20 ms interval even on a busy host.
+        let fastest = (0..5)
+            .map(|_| {
+                let started = Instant::now();
+                let output = capture(
+                    "printf done; exec >&- 2>&-; sleep 0.002",
+                    Duration::from_secs(5),
+                    &|| false,
+                    64,
+                )
+                .unwrap();
+                assert_eq!(output.stdout, b"done");
+                started.elapsed()
+            })
+            .min()
+            .unwrap();
+        assert!(fastest < Duration::from_millis(15), "{fastest:?}");
     }
 
     #[test]
