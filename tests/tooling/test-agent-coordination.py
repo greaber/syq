@@ -28,8 +28,13 @@ with (root/'launches').open('a') as out:
  out.write(json.dumps({'review':os.environ['SYQ_REVIEW_ID'],'runtime':runtime,'argv':sys.argv[1:],
   'head':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
   'env':sorted(k for k in os.environ if k.startswith(('CLAUDE','CODEX')))})+'\\n')
-if runtime=='codex': print(json.dumps({'type':'thread.started','thread_id':'fixture-codex-session'}),flush=True)
 behavior=os.environ.get('FIXTURE_REVIEWER','submit')
+if behavior=='fail-early': sys.exit(1)
+if runtime=='codex': event={'type':'thread.started','thread_id':'fixture-codex-session'}
+else:
+ flag=next(f for f in ('--session-id','--resume') if f in sys.argv)
+ event={'type':'system','subtype':'init','session_id':sys.argv[sys.argv.index(flag)+1]}
+print(json.dumps(event),flush=True)
 if behavior=='fail': sys.exit(1)
 if behavior=='hold':
  deadline=time.monotonic()+30
@@ -364,9 +369,11 @@ class CoordinationTests(unittest.TestCase):
         self.git('config', 'branch.task.remote', 'origin')
         self.sha = self.git('rev-parse', 'HEAD')
         self.metadata()
-        # The fixture reviewer records each launch, reports a Codex session as
-        # codex exec --json does, and then behaves as FIXTURE_REVIEWER says:
-        # submit a report (the default), fail, or hold until the test releases it.
+        # The fixture reviewer records each launch, reports its session as
+        # claude -p --output-format stream-json and codex exec --json do, and
+        # then behaves as FIXTURE_REVIEWER says: submit a report (the default),
+        # fail, or hold until the test releases it. fail-early exits before
+        # reporting a session, like a bad option or an authentication error.
         for runtime in ('claude', 'codex'):
             self.stub(runtime, FIXTURE_REVIEWER)
         self.stub('tmux', "import os\nfrom pathlib import Path\n(Path(os.environ['TEST_ROOT'])/'tmux-calls').touch()\n")
@@ -392,6 +399,14 @@ class CoordinationTests(unittest.TestCase):
     def launches(self):
         path = self.root / 'launches'
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def wait_launched(self, review):
+        # The worker starts the reviewer after review start returns.
+        deadline = time.monotonic() + 10
+        print('Waiting for the fixture reviewer to start', flush=True)
+        while not any(c['review'] == review['id'] for c in self.launches()):
+            self.assertLess(time.monotonic(), deadline, 'Fixture reviewer did not start before the deadline')
+            time.sleep(0.05)
 
     def test_review_freshness_worktree_report_and_collect_mode(self):
         self.review_setup()
@@ -458,14 +473,54 @@ class CoordinationTests(unittest.TestCase):
                 self.assertNotIn('topic wait', prompt)
                 self.assertNotIn('Acquire shared local-compute', prompt)
 
-    def test_killed_worker_is_reported_failed(self):
+    def test_sigterm_to_the_worker_ends_its_reviewer(self):
         self.review_setup()
         review = self.review(behavior='hold')
+        self.wait_launched(review)
         self.assertTrue(self.cmd('review', 'status', review['id'])['running'])
-        os.killpg(review['pid'], signal.SIGKILL)
+        os.kill(review['pid'], signal.SIGTERM)
         failed = self.wait(review, 'failed')
-        self.assertEqual(failed['reason'], 'Reviewer process ended without publishing a report')
         self.assertFalse(failed['running'])
+        self.assertIn('interrupted', failed['reason'])
+        self.assertEqual(self.running_processes({review['pid']}), {})
+
+    def test_reviewer_outliving_a_killed_worker_counts_as_running_until_stopped(self):
+        self.review_setup()
+        review = self.review(behavior='hold')
+        self.wait_launched(review)
+        os.kill(review['pid'], signal.SIGKILL)
+        current = self.cmd('review', 'status', review['id'])
+        self.assertEqual((current['status'], current['running']), ('waiting_review', True))
+        self.cmd('review', 'resume', review['id'], '--agent', 'implementer', code=2)
+        self.cmd('review', 'stop', review['id'], '--agent', 'other', code=2)
+        stopped = self.cmd('review', 'stop', review['id'], '--agent', 'implementer')
+        self.assertEqual((stopped['status'], stopped['running']), ('failed', False))
+        self.assertIn('review stop', stopped['reason'])
+        self.assertEqual(self.running_processes({review['pid']}), {})
+        self.cmd('review', 'resume', review['id'], '--agent', 'implementer')
+        self.wait(review)
+        self.assertFalse(self.cmd('review', 'stop', review['id'], '--agent', 'implementer')['running'])
+
+    def test_reviewer_that_fails_before_its_session_starts_gets_a_new_one(self):
+        self.review_setup()
+        for runtime in ('claude', 'codex'):
+            with self.subTest(runtime=runtime):
+                review = self.review(reviewer=runtime, additional=True, behavior='fail-early')
+                failed = self.wait(review, 'failed')
+                self.assertFalse(failed['session_started'])
+                self.cmd('review', 'resume', review['id'], '--agent', 'implementer')
+                ready = self.wait(review)
+                self.assertTrue(ready['session_started'])
+                calls = [c['argv'] for c in self.launches() if c['review'] == review['id']]
+                self.assertEqual(len(calls), 2)
+                for argv in calls:
+                    if runtime == 'claude':
+                        self.assertNotIn('--resume', argv)
+                        self.assertEqual(argv[argv.index('--session-id') + 1], review['session_id'])
+                    else:
+                        self.assertNotIn('resume', argv)
+                self.assertEqual(ready['session_id'], review['session_id'] if runtime == 'claude'
+                                 else 'fixture-codex-session')
 
     def test_two_reviewers_resume_their_own_sessions_across_rounds(self):
         self.review_setup()
@@ -630,13 +685,15 @@ class CoordinationTests(unittest.TestCase):
         record = state['reviews'][review['id']]
         record.update(status='waiting_review', worker_alive=True, worker_started=True, pane='%7',
                       window='@7', inbox=review['id'] + '.inbox')
-        record.pop('reason')
+        for key in ('reason', 'session_started'):
+            record.pop(key)
         for key in ('pid', 'log', 'exit_code'):
             record['rounds'][0].pop(key)
         record['rounds'][0].update(status='running', sequence=1, window='@7')
         path.write_text(json.dumps(state))
         self.assertTrue(self.cmd('review', 'status', review['id'])['running'])
         self.cmd('review', 'wait', review['id'], '--timeout', '1', code=2)
+        self.assertIn('tmux pane %7', self.cmd('review', 'stop', review['id'], '--agent', 'implementer', code=2)['error'])
         self.assertEqual(self.submit(review)['status'], 'review_ready')
         self.advance()
         blocked = self.triage(review, 'revise', code=2)

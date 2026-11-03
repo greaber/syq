@@ -163,11 +163,17 @@ Each round runs one non-interactive reviewer process in the background,
 detached from the command that started it. The first round starts the
 reviewer's session and later rounds resume it, so the reviewer keeps its
 context; nobody can answer its questions while it runs. Its output goes to
-`reviewer.log` next to the round's prompt in the state directory. `review status
-REVIEW_ID` shows the process ID (`pid`), whether it is still `running`, and the
-`log` path. The process starts from the command that launched it, so it runs in
-that command's sandbox, if any, but it does not inherit the requesting agent's
-own Claude Code or Codex session variables.
+`reviewer.log` next to the round's prompt in the state directory. Logs keep the
+reviewer's full transcript, and nothing removes them; delete a request's
+directory under `reviews/` when you no longer need it. `review status REVIEW_ID`
+shows the process ID (`pid`), whether it is still `running`, and the `log` path.
+The `pid` leads a process group that also holds the reviewer; `review stop
+REVIEW_ID --agent NAME` ends that group, first with SIGTERM and then SIGKILL,
+and leaves the round `failed`. The process starts from the command that
+launched it, so it runs in that command's sandbox, if any, but it does not
+inherit the requesting agent's own Claude Code or Codex session variables. If
+reviewers fail as soon as they start, read the log; when the requesting agent
+runs in a sandbox, run `review start` from outside it.
 
 Each review round has its own prompt, immutable report, and triage Markdown.
 The reviewer publishes by running the `review submit` command in its prompt,
@@ -181,13 +187,16 @@ up to a minute for it to exit.
 If the process exits or dies without submitting, the status becomes `failed`
 and `next_action` names the log. `review resume REVIEW_ID --agent NAME` reruns
 that round in the same session, and `review next` starts a new round at the
-current PR head; both refuse while a reviewer process is running. Codex reports
-its session ID when it starts, and the tool records it. If none was recorded, a
-rerun starts a new Codex session unless you supply the exact ID with `--session`.
-A request started by an earlier, interactive version of this tool can still
-submit its report and be triaged; exit that interactive reviewer in its tmux
-pane before starting another round. Use the same tool version for all
-participants in a review request.
+current PR head; both refuse while a reviewer process is running. Each reviewer
+reports its session when it starts, and the tool records it. A reviewer that
+failed before that point, for example on a bad option or an authentication
+error, starts a new session on its rerun unless you supply an exact ID with
+`--session`. A request started by an earlier, interactive version of this tool
+can still submit its report and be triaged; exit that interactive reviewer in
+its tmux pane before starting another round. If that reviewer's worker was
+killed without cleaning up, the request keeps reporting it as running; end it
+with `review stop-loop` and start a new request. Use the same tool version for
+all participants in a review request.
 
 To request an independent second reviewer, run another `review start` with
 `--additional-reviewer`, choosing Claude (the default) or Codex with
@@ -247,10 +256,10 @@ inspect the new code independently first. Review completion never grants merge
 permission. These are workflow instructions, not a sandbox around the agents.
 
 `review stop-loop REVIEW_ID --agent NAME` prevents continuation without stopping
-a running reviewer process. That reviewer may still submit its report, but the
-submission does not restart the loop. The request’s worktree is retained; check
-that its reviewer is no longer `running` and that the worktree is clean before
-removing it with `git worktree remove`.
+a running reviewer process; use `review stop` for that. A running reviewer may
+still submit its report, but the submission does not restart the loop. The
+request’s worktree is retained; check that its reviewer is no longer `running`
+and that the worktree is clean before removing it with `git worktree remove`.
 
 ### Reviewer settings
 

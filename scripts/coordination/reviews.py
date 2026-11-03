@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -23,6 +24,8 @@ SESSION_VARIABLES = {'CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'CLAUDE_JOB_DI
 SESSION_PREFIXES = ('CLAUDE_CODE_SESSION_', 'CLAUDE_CODE_MESSAGING_')
 # How long a new round waits for the previous reviewer process to finish its turn.
 SETTLE_SECONDS = 60
+# How long review stop waits after SIGTERM before it kills the process group.
+STOP_SECONDS = 15
 
 
 def snapshot(repo, pr, repository=None):
@@ -91,18 +94,28 @@ def get(state, review_id):
         raise Error('Unknown review request') from None
 
 
-def alive(pid):
+def alive(group):
+    """True while any process of a worker's group runs. The worker leads its own group, and the
+    reviewer it starts stays in that group, so a killed worker does not hide a live reviewer."""
     try:
-        os.kill(pid, 0)
+        os.killpg(group, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
-    try:
-        # Linux lists an exited process that nobody has reaped yet as a zombie.
-        return Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[0] != 'Z'
-    except (OSError, IndexError):
+    proc = Path('/proc')
+    if not proc.is_dir():
         return True
+    # Linux lists an exited process that nobody has reaped yet as a zombie;
+    # it does nothing more. Check the leader first, then the rest of the group.
+    for stat in (proc / str(group) / 'stat', *proc.glob('[0-9]*/stat')):
+        try:
+            state, _parent, process_group = stat.read_text().rsplit(')', 1)[1].split()[:3]
+        except (OSError, ValueError):
+            continue
+        if process_group == str(group) and state != 'Z':
+            return True
+    return False
 
 
 def running(review):
@@ -182,7 +195,8 @@ def start(store, args):
               'reviewer_options': list(args.reviewer_option or []),
               'mode': args.mode, 'max_rounds': args.max_rounds,
               'repository': snap['repository'], 'pr': snap['pr'], 'rounds': [],
-              'status': 'starting', 'notify': args.notify, 'created': time.time()}
+              'status': 'starting', 'notify': args.notify, 'created': time.time(),
+              'session_started': False}
     if args.reviewer == 'claude':
         review['session_id'] = str(uuid.uuid4())
     with store.locked() as state:
@@ -361,27 +375,29 @@ def worker(store, review_id, number):
         if (current['number'] != number or review['status'] != 'waiting_review'
                 or current.get('pid') != os.getpid()):
             raise Error('This reviewer round is not assigned to this process')
-        reviewer = review['reviewer']
-        # Claude sessions take the ID chosen at start; Codex reports its ID on startup.
-        resume_session = (review.get('worker_started') if reviewer == 'claude'
-                          else bool(review.get('session_id')))
-        review['worker_started'] = True
+        # Resume only a session the reviewer reported starting. Requests from the
+        # earlier tmux version record only that a reviewer had run.
+        resume_session = review.get('session_started',
+                                    bool(review.get('worker_started') and review.get('session_id')))
         cmd = reviewer_command(store, review, current, resume_session)
     print(f'{time.strftime("%Y-%m-%d %H:%M:%S")} round {number}: {shlex.join(cmd[:-1])} PROMPT', flush=True)
     env = dict(os.environ, SYQ_REVIEW_ID=review_id)
     process = None
     code = None
+    # The CLI turns SIGTERM and SIGHUP into KeyboardInterrupt, so a stopped
+    # worker still reaches the cleanup below and ends the reviewer with it.
     try:
         process = subprocess.Popen(cmd, cwd=current['worktree'], env=env, stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.PIPE if reviewer == 'codex' else None)
-        if reviewer == 'codex':
-            session_known = False
-            for line in process.stdout:
-                sys.stdout.buffer.write(line)
-                sys.stdout.buffer.flush()
-                session_known = session_known or record_codex_session(store, review_id, line)
+                                   stdout=subprocess.PIPE)
+        session_known = False
+        for line in process.stdout:
+            sys.stdout.buffer.write(line)
+            sys.stdout.buffer.flush()
+            session_known = session_known or record_session(store, review_id, line)
         code = process.wait()
     finally:
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(signum, signal.SIG_IGN)
         if process and process.poll() is None:
             process.terminate()
             try:
@@ -401,16 +417,26 @@ def worker(store, review_id, number):
     return {'exit_code': code, 'review': review_id}
 
 
-def record_codex_session(store, review_id, line):
-    """Record the session ID from codex exec --json's thread.started event; true once seen."""
+def record_session(store, review_id, line):
+    """Record the session the reviewer reports when it starts: Claude's stream-json system/init
+    event or the thread.started event of codex exec --json. True once seen."""
     try:
         event = json.loads(line)
     except ValueError:
         return False
-    if not (isinstance(event, dict) and event.get('type') == 'thread.started' and event.get('thread_id')):
+    if not isinstance(event, dict):
+        return False
+    if event.get('type') == 'system' and event.get('subtype') == 'init':
+        session_id = event.get('session_id')
+    elif event.get('type') == 'thread.started':
+        session_id = event.get('thread_id')
+    else:
+        return False
+    if not session_id:
         return False
     with store.locked() as state:
-        get(state, review_id).setdefault('session_id', event['thread_id'])
+        review = get(state, review_id)
+        review.update(session_id=session_id, session_started=True)
     return True
 
 
@@ -428,13 +454,62 @@ def resume(store, review_id, agent, session_id=None):
         if session_id and review.get('session_id') and session_id != review['session_id']:
             raise Error('Session ID does not match the recorded reviewer conversation')
         if session_id:
-            review['session_id'] = session_id
+            # An explicitly named session exists even if no start was observed.
+            review.update(session_id=session_id, session_started=True)
         if not Path(current['worktree']).is_dir():
             raise Error('The round’s review worktree is missing; use review next')
         review['status'] = 'waiting_review'
         review.pop('reason', None)
         current.update(status='running', log=current.get('log') or str(Path(current['prompt']).with_name('reviewer.log')))
         spawn(store, review_id, current)
+        return view(review)
+
+
+def worker_group(group, review_id):
+    """Whether a process group is still this request's: its live leader runs the worker. A group
+    whose leader has exited keeps its ID reserved while members remain, so it cannot be reused."""
+    result = subprocess.run(['ps', '-ww', '-o', 'stat=,command=', '-p', str(group)],
+                            capture_output=True, text=True, timeout=10)
+    if result.returncode or not result.stdout.strip():
+        return True
+    state, _, command = result.stdout.strip().partition(' ')
+    return state.startswith('Z') or f' review worker {review_id} ' in command + ' '
+
+
+def stop(store, review_id, agent):
+    """Stop the round's reviewer process group: SIGTERM, then SIGKILL after a deadline."""
+    with store.locked() as state:
+        review = get(state, review_id)
+        if review['agent'] != agent:
+            raise Error('Only the requester can stop its reviewer')
+        current = review['rounds'][-1] if review['rounds'] else {}
+        if 'pid' not in current and review.get('worker_alive'):
+            raise Error('This reviewer was started by an earlier, interactive version of this tool'
+                        + (f'; exit it in tmux pane {review["pane"]}' if review.get('pane') else ''))
+        group = current.get('pid') if running(review) else None
+    if group is not None and not worker_group(group, review_id):
+        raise Error(f'Process group {group} no longer belongs to this reviewer; not signalling it')
+    for signum in (signal.SIGTERM, signal.SIGKILL):
+        if group is None or not alive(group):
+            break
+        try:
+            os.killpg(group, signum)
+        except ProcessLookupError:
+            break
+        deadline = time.monotonic() + STOP_SECONDS
+        progress = 0
+        while alive(group) and time.monotonic() < deadline:
+            if time.monotonic() >= progress:
+                print(f'Waiting for reviewer process group {group} to exit', file=sys.stderr, flush=True)
+                progress = time.monotonic() + 5
+            time.sleep(0.1)
+    if group is not None and alive(group):
+        raise Error(f'Reviewer process group {group} is still running after SIGKILL')
+    with store.locked() as state:
+        review = get(state, review_id)
+        reconcile(review)
+        if group is not None and review['status'] == 'failed' and review['rounds'][-1].get('pid') == group:
+            review['reason'] = 'Reviewer stopped with review stop before publishing a report'
         return view(review)
 
 

@@ -85,12 +85,12 @@ def parser():
     p.add_argument('--mode', choices=['collect', 'triage', 'auto'], default='triage')
     p.add_argument('--max-rounds', type=positive, default=3)
     p.add_argument('--notify', action='store_true', help='Also queue a hint to the requesting agent’s registered Codex endpoint')
-    for action in ('status', 'wait', 'next', 'stop-loop', 'worker', 'resume'):
+    for action in ('status', 'wait', 'next', 'stop', 'stop-loop', 'worker', 'resume'):
         p = review.add_parser(action)
         p.add_argument('id')
         if action == 'wait':
             p.add_argument('--timeout', type=positive, default=60)
-        if action in ('next', 'stop-loop', 'resume'):
+        if action in ('next', 'stop', 'stop-loop', 'resume'):
             p.add_argument('--agent', required=True)
         if action == 'next':
             p.add_argument('--allow-unchanged', action='store_true', help='Explicitly request re-review of an already reviewed SHA')
@@ -195,6 +195,8 @@ def dispatch(store, args):
         return reviews.worker(store, args.id, args.round)
     if args.action == 'status':
         return reviews.status(store, args.id)
+    if args.action == 'stop':
+        return reviews.stop(store, args.id, args.agent)
     if args.action == 'wait':
         return reviews.wait(store, args.id, args.timeout)
     if args.action == 'resume':
