@@ -7,15 +7,20 @@ the option lists.
 
 ## SSH configurations
 
-Host-certificate-only trust, `KnownHostsCommand`, and `RevokedHostKeys` are
-unsupported by the default restricted path and the authentication broker.
-Custom known-hosts paths must be unambiguous:
-one absolute, whitespace-free filename per configured user/global directive.
-The default known-hosts file list works. Syq reports unsupported configurations
-instead of relaxing host verification.
+Your local SSH configuration selects hostB's login, address, and port. With an
+enrollment, hostA checks hostB's host key with its own SSH configuration, as
+`ssh` there would, and also accepts what your laptop's known_hosts lists for
+hostB; where its configuration would ask about a host neither machine knows,
+it accepts the key the first time and records it, as `accept-new` does. See
+[how hostA checks hostB's key](security.md#how-hosta-checks-hostbs-key).
+Known-hosts file paths that contain whitespace are not supported.
 
-Your local SSH configuration selects hostB's login, address, port, and trusted
-host keys. HostA's SSH configuration does not override those choices.
+The authentication broker (`--peer-auth broker`) needs your laptop to trust
+both servers through exact plain host keys in known_hosts:
+host-certificate-only trust, `KnownHostsCommand`, and `RevokedHostKeys` are
+unsupported there, and custom known-hosts paths must be one absolute filename
+per configured user/global directive. The default known-hosts file list works.
+Syq reports unsupported configurations instead of relaxing host verification.
 
 ## Enrollment
 
@@ -279,15 +284,17 @@ for pruning. A per-copy upload uses the destination account's
 [enrollment](#enrollment): the authorizing machine sets it up on the first
 approved copy, and updates it after you upgrade syq, over its own SSH login,
 without prompts. Its login key must be able to sign without a terminal (in
-its agent, or an unencrypted key file), and its `known_hosts` must already
-hold the destination's exact host key: trust through a host certificate alone
-is refused, after approval. That login follows the authorizing machine's SSH
-configuration, including its jump hosts and proxy commands, and checks the
-destination's host key itself; when that cannot connect, it tries again
-through the source, whose SSH server must then allow TCP forwarding for the
-authorizing machine's login there. The authorizing machine then signs the approved copy and gives the source the enrollment's
-entry key and the destination host keys it trusts. The source connects to the
-destination's receiver at the address its own SSH configuration gives, sends
+its agent, or an unencrypted key file). That login follows the authorizing
+machine's SSH configuration, including its jump hosts, proxy commands and
+host-key checking, except that a destination the configuration would ask
+about is accepted the first time, as with `accept-new`, because nobody can
+answer. When it cannot connect, it tries again through the source, whose SSH
+server must then allow TCP forwarding for the authorizing machine's login
+there. The authorizing machine then signs the approved copy and gives the
+source the enrollment's entry key and what its known_hosts lists for the
+destination. The source connects to the destination's receiver at the
+address its own SSH configuration gives, checking its host key as described
+above, sends
 file data directly over encrypted TCP, falling back to SSH between those same
 servers, and needs nothing more from the authorizing machine. `--no-tcp`
 selects SSH data directly. The source receives no laptop credentials or

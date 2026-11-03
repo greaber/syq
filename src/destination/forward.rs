@@ -174,9 +174,8 @@ pub(super) struct Issued {
     entry_key: EntryKeyText,
     /// The account the enrollment is for.
     login: String,
-    /// The destination's host keys this machine trusts.
+    /// What this machine's known_hosts files say about the destination.
     known_hosts: String,
-    host_key_algorithms: String,
     /// The destination as the directive's rules name it.
     destination: Vec<u8>,
     /// This machine's deletion limit for the copy.
@@ -240,8 +239,15 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
     }
     // This machine reaches the receiver at the address its own SSH
     // configuration gives the target, as the account the approving machine
-    // enrolled, trusting only the host keys that machine trusts.
+    // enrolled, and checks its host key as its own `ssh` would, also
+    // accepting what the approving machine knows.
     let address = ssh_target(&target, Instant::now() + SETUP_TIMEOUT, &|| false)?;
+    let endpoint = target_endpoint(&target)?;
+    let dialer = crate::remote_to_remote::DialerHostKeys::resolve(
+        endpoint.user.as_deref(),
+        &endpoint.host,
+        endpoint.port,
+    )?;
     let port = address.port;
     super::apply_deletion_limit(args, Some(issued.max_delete));
     let destination = args.locations.last_mut().unwrap();
@@ -251,14 +257,12 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
     destination.port = Some(port);
     args.auth_from = crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name));
     args.restricted_grant = Some(issued.directive);
-    args.rsh = Some(crate::remote_to_remote::receiver_rsh(
-        port,
-        &issued.host_key_algorithms,
-    ));
+    args.rsh = Some(crate::remote_to_remote::receiver_rsh(port));
     let keys = crate::remote_to_remote::prepare_receiver_ssh_with(
         args,
         &issued.known_hosts,
         issued.entry_key.0.as_bytes(),
+        &dialer,
     )?;
     args.receiver_keys = Some(Arc::new(keys));
     Ok(())
@@ -418,9 +422,9 @@ impl Receiver {
         anyhow::ensure!(!cancelled(), "remote copy disconnected before setup");
         // This lock only serializes decisions, not enrollment.
         drop(request_lock);
-        // The destination's host keys this machine trusts, which the server
-        // checks; the same lookup gives the login enrollment uses.
-        let policy = crate::agent_broker::resolve_host_policy_at_bounded(
+        // The login enrollment uses, and what this machine knows about the
+        // destination's key, which the server adds to what it knows.
+        let policy = crate::agent_broker::resolve_known_policy_at_bounded(
             "ssh",
             endpoint.user.as_deref(),
             &endpoint.host,
@@ -464,8 +468,8 @@ impl Receiver {
             directive: prepared.directive,
             entry_key: prepared.entry_key,
             login: policy.login_user.clone(),
-            known_hosts: policy.known_hosts(crate::remote_to_remote::RECEIVER_HOST_ALIAS)?,
-            host_key_algorithms: policy.host_key_algorithms(),
+            known_hosts: policy
+                .known_hosts_for_others(crate::remote_to_remote::RECEIVER_HOST_ALIAS)?,
             destination: prepared.destination,
             max_delete,
         };

@@ -246,7 +246,7 @@ The protection has several parts:
    trusts. The receiver refuses to run as root.
 2. **Give hostA only the entry key.** HostA receives the entry key with each
    copy you authorize and uses it for every connection to the receiver,
-   checking hostB's host key against the keys your laptop trusts. The entry
+   checking hostB's host key as described [below](#how-hosta-checks-hostbs-key). The entry
    key can start the receiver but authorizes nothing: anyone holding it,
    including a server that ran an earlier copy, still needs a copy you newly
    signed to copy files. A connection made with the entry key has 10 seconds
@@ -312,6 +312,32 @@ Alternative authentication modes grant more authority. `--peer-auth broker`
 limits authentication to the chosen host and user but allows that account's
 full authority. `--peer-auth full-agent` exposes your SSH agent as `ssh -A`
 would. See [Other authentication modes](remote-reference.md#other-authentication-modes).
+
+### How hostA checks hostB's key
+
+HostA checks hostB's host key the way its own `ssh hostB` would: with its
+known_hosts files, host certificate authorities, `KnownHostsCommand`, and
+`StrictHostKeyChecking` setting. It also accepts the keys and host
+certificate authorities that your laptop's known_hosts lists for hostB. A key
+that contradicts one either machine knows is refused, as `ssh` refuses it,
+and the message names the file that holds the other key; the file named
+`known-to-the-machine-that-approved-this-copy` holds your laptop's. When
+neither machine knows hostB, hostA follows its own setting, except that
+nobody can answer the question `ask`, the default, would ask. So `ask` works
+like `accept-new`: hostA accepts the key it is shown the first time and
+records it in its own known_hosts, and later connections are checked
+against it. Your laptop's own login to hostB, which sets up restricted
+copying, checks hostB's key with your laptop's SSH configuration in the same
+way, and asks you only when it runs in a terminal.
+
+Accepting a new key means that someone who can intercept that first
+connection could present their own key. They could not use the entry key or
+the signed copy against the real hostB, because an SSH key login cannot be
+relayed to another connection, but they would receive the copy's data and
+could report that it completed. For a copy started on your laptop, your
+laptop checks hostB's reports (step 4) and would detect that. Set
+`StrictHostKeyChecking yes` for hostB on hostA, and trust hostB's key there
+or on your laptop, to refuse a host neither machine has seen.
 
 ### A compromised source server
 
@@ -449,8 +475,9 @@ Such a copy uses the destination account's enrollment, as described in
 [Copies between servers](#copies-between-servers), with the server that asked
 in hostA's place: your laptop shows the command, sets up or updates the
 enrollment when it needs that, signs the approved copy with your login key,
-and gives the server the entry key and the destination host keys your laptop
-trusts. The server coordinates the copy itself: it connects to the
+and gives the server the entry key and what your laptop's known_hosts lists
+for the destination, which the server accepts as well as what it knows
+itself. The server coordinates the copy itself: it connects to the
 destination's receiver, which confines the copy to the approved destination,
 refuses the protected paths, and enforces your laptop's own limits as well as
 the command's. Step 4 above does not apply: your laptop does not check what

@@ -120,8 +120,12 @@ fn setup_and_destination_connections_apply_only_the_selected_agent_policy() {
         ambient: "/tmp/ambient-agent".into(),
         broker: "/tmp/syq-agent".into(),
     };
-    let hardened =
-        constrained_destination_rsh(2222, "ssh-ed25519", DestinationAuthentication::Broker);
+    let hardened = constrained_destination_rsh(
+        2222,
+        DestinationAuthentication::Broker {
+            host_key_algorithms: "ssh-ed25519",
+        },
+    );
     assert_eq!(
         destination_rsh(None, false, Some(&constrained), Some(&hardened)),
         Some(hardened.clone())
@@ -141,6 +145,8 @@ fn setup_and_destination_connections_apply_only_the_selected_agent_policy() {
         "LogLevel=ERROR",
         "ConnectTimeout=10",
         "HostKeyAlgorithms=ssh-ed25519",
+        "StrictHostKeyChecking=no",
+        "UserKnownHostsFile=/dev/null",
         "2222",
     ] {
         assert!(hardened_words.iter().any(|word| word == required));
@@ -912,31 +918,180 @@ fn requester_loss_counts_only_input_that_ends_after_the_marker() {
     }
 }
 
+/// `ssh -G` output for a destination this machine knows through its own
+/// configuration.
+const DIALER_CONFIG: &str = "user backup\n\
+    hostname backup.example.net\n\
+    port 2222\n\
+    stricthostkeychecking ask\n\
+    userknownhostsfile /home/u/.ssh/known_hosts /home/u/.ssh/known_hosts2\n\
+    globalknownhostsfile /etc/ssh/ssh_known_hosts\n\
+    checkhostip no\n\
+    hashknownhosts yes\n\
+    verifyhostkeydns false\n\
+    hostkeyalgorithms ssh-ed25519,rsa-sha2-512\n\
+    knownhostscommand /usr/local/bin/hosts %H %K\n\
+    revokedhostkeys none\n";
+
 #[test]
-fn receiver_ssh_uses_the_entry_key_alone_and_pinned_host_keys() {
+fn the_coordinator_checks_host_keys_as_its_own_ssh_with_the_approving_machines_too() {
+    let dialer = DialerHostKeys::parse(DIALER_CONFIG).unwrap();
+    // SSH looks up the address it dials, unless there is an alias.
+    assert_eq!(
+        dialer.lookup("backup.example.net", 2222),
+        "[backup.example.net]:2222"
+    );
+    assert_eq!(
+        dialer.lookup("backup.example.net", 22),
+        "backup.example.net"
+    );
+    let arguments = dialer.arguments(std::path::Path::new("/tmp/approving"));
+    let options: Vec<_> = arguments
+        .chunks(2)
+        .map(|pair| {
+            assert_eq!(pair[0], "-o");
+            pair[1].as_str()
+        })
+        .collect();
+    assert_eq!(
+        options,
+        [
+            // Nobody can answer `ask` here: accept a new host, as
+            // accept-new does.
+            "StrictHostKeyChecking=accept-new",
+            "UpdateHostKeys=no",
+            "UserKnownHostsFile=/home/u/.ssh/known_hosts /home/u/.ssh/known_hosts2",
+            "CheckHostIP=no",
+            "VerifyHostKeyDNS=false",
+            "HashKnownHosts=yes",
+            "HostKeyAlgorithms=ssh-ed25519,rsa-sha2-512",
+            "KnownHostsCommand=/usr/local/bin/hosts %H %K",
+            // The approving machine's keys come after this machine's own
+            // files, which alone record a newly accepted key.
+            "GlobalKnownHostsFile=/etc/ssh/ssh_known_hosts /tmp/approving",
+        ]
+    );
+    for (configured, used) in [
+        ("yes", "yes"),
+        ("true", "yes"),
+        ("false", "no"),
+        ("accept-new", "accept-new"),
+        ("ask", "accept-new"),
+    ] {
+        let dialer = DialerHostKeys::parse(&DIALER_CONFIG.replace(
+            "stricthostkeychecking ask",
+            &format!("stricthostkeychecking {configured}"),
+        ))
+        .unwrap();
+        assert!(dialer
+            .options
+            .contains(&format!("StrictHostKeyChecking={used}")));
+    }
+    // A configured alias is the name, as for `ssh`, and is passed on; no
+    // global files leaves only the approving machine's.
+    let aliased =
+        DialerHostKeys::parse(&format!("{DIALER_CONFIG}hostkeyalias backup-alias\n")).unwrap();
+    assert_eq!(aliased.lookup("backup.example.net", 2222), "backup-alias");
+    assert!(aliased
+        .arguments(std::path::Path::new("/tmp/approving"))
+        .contains(&"HostKeyAlias=backup-alias".to_owned()));
+    let no_global = DialerHostKeys::parse(&DIALER_CONFIG.replace(
+        "globalknownhostsfile /etc/ssh/ssh_known_hosts",
+        "globalknownhostsfile none",
+    ))
+    .unwrap();
+    assert!(no_global
+        .arguments(std::path::Path::new("/tmp/approving"))
+        .contains(&"GlobalKnownHostsFile=/tmp/approving".to_owned()));
+    assert!(DialerHostKeys::parse("port 22\n").is_err());
+}
+
+/// The options a coordinator passes resolve, with real OpenSSH and no
+/// configuration of its own, to what its own configuration said.
+#[test]
+fn the_coordinators_host_key_options_mean_what_its_configuration_said() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let config = temporary.path().join("config");
+    let known = temporary.path().join("known_hosts");
+    std::fs::write(
+        &config,
+        format!(
+            "Host backup\n  HostName backup.example.net\n  Port 2222\n  UserKnownHostsFile {}\n  StrictHostKeyChecking yes\n  HashKnownHosts yes\n",
+            known.display()
+        ),
+    )
+    .unwrap();
+    let resolved = |arguments: &[&str]| {
+        let output = Command::new("ssh")
+            .arg("-G")
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let configured = resolved(&["-F", config.to_str().unwrap(), "backup"]);
+    let dialer = DialerHostKeys::parse(&configured).unwrap();
+    let approving = temporary.path().join("approving");
+    let arguments = dialer.arguments(&approving);
+    let mut passed = vec!["-F", "/dev/null", "-p", "2222"];
+    passed.extend(arguments.iter().map(String::as_str));
+    passed.push("backup.example.net");
+    let effective = resolved(&passed);
+    let line = |output: &str, name: &str| {
+        output
+            .lines()
+            .find(|line| line.starts_with(&format!("{name} ")))
+            .map(str::to_owned)
+    };
+    for name in [
+        "stricthostkeychecking",
+        "userknownhostsfile",
+        "hashknownhosts",
+        "hostkeyalgorithms",
+        "checkhostip",
+    ] {
+        assert_eq!(line(&effective, name), line(&configured, name), "{name}");
+    }
+    assert_eq!(line(&effective, "hostkeyalias"), None);
+    assert!(line(&effective, "globalknownhostsfile")
+        .unwrap()
+        .ends_with(&approving.display().to_string()));
+}
+
+#[test]
+fn receiver_ssh_uses_the_entry_key_alone_and_checks_host_keys_as_this_machine_does() {
     use clap::Parser;
     use std::os::unix::fs::PermissionsExt as _;
     let mut args = Args::parse_from(["syq", "src", "dst"]);
     args.restricted_grant = Some("signed-grant".into());
-    let template =
-        constrained_destination_rsh(2222, "ssh-ed25519", DestinationAuthentication::Receiver);
+    args.locations = vec![Location::parse("backup.example.net:/archive").unwrap()];
+    let template = receiver_rsh(2222);
     args.rsh = Some(template.clone());
     let host =
         ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ed25519)
             .unwrap();
+    let authority =
+        ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ed25519)
+            .unwrap();
+    let host_key = host.public_key().to_openssh().unwrap();
+    let authority_key = authority.public_key().to_openssh().unwrap();
+    // What the approving machine knows: a key and a host certificate
+    // authority, under syq's placeholder name.
     let known_hosts = format!(
-        "{RECEIVER_HOST_ALIAS} {}\n",
-        host.public_key().to_openssh().unwrap()
+        "{RECEIVER_HOST_ALIAS} {host_key}\n@cert-authority {RECEIVER_HOST_ALIAS} {authority_key}\n"
     );
     let entry =
         ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ed25519)
             .unwrap();
     let entry_key = entry.to_openssh(ssh_key::LineEnding::LF).unwrap();
-    let guard = prepare_receiver_ssh_with(&mut args, &known_hosts, entry_key.as_bytes()).unwrap();
+    let dialer = DialerHostKeys::parse(DIALER_CONFIG).unwrap();
+    let guard =
+        prepare_receiver_ssh_with(&mut args, &known_hosts, entry_key.as_bytes(), &dialer).unwrap();
     let command = parse_rsh(&args.rsh).unwrap();
     // The whole hardening set: no user configuration, agent, control
-    // socket, forwarding, proxy or local command, the entry key as the only
-    // identity, and only the pinned host keys.
+    // socket, forwarding, proxy or local command, and the entry key as the
+    // only identity.
     assert_eq!(&command[..3], ["ssh", "-F", "/dev/null"]);
     for flag in ["-a", "-x", "-k", "-T"] {
         assert!(command.contains(&flag.to_owned()), "{flag}");
@@ -955,45 +1110,87 @@ fn receiver_ssh_uses_the_entry_key_alone_and_pinned_host_keys() {
         "PermitLocalCommand=no",
         "ProxyJump=none",
         "ProxyCommand=none",
-        "StrictHostKeyChecking=yes",
-        "GlobalKnownHostsFile=/dev/null",
         "UpdateHostKeys=no",
-        "HostKeyAlias=syq-enrolled-receiver",
+        // This machine's own host-key checking, and nothing else's.
+        "StrictHostKeyChecking=accept-new",
+        "UserKnownHostsFile=/home/u/.ssh/known_hosts /home/u/.ssh/known_hosts2",
+        "KnownHostsCommand=/usr/local/bin/hosts %H %K",
     ] {
         assert!(command.contains(&option.to_owned()), "{option}");
     }
+    assert_eq!(
+        command
+            .iter()
+            .filter(|argument| argument.starts_with("StrictHostKeyChecking="))
+            .count(),
+        1
+    );
+    assert!(!command
+        .iter()
+        .any(|argument| argument.starts_with("HostKeyAlias=")));
     assert!(!command.contains(&"PubkeyAuthentication=host-bound".into()));
     assert!(!command
         .iter()
         .any(|argument| argument == "IdentityFile=none"));
-    let known = guard.path().join("known_hosts");
+    let approving = guard.path().join(APPROVING_KNOWN_HOSTS);
     let key = guard.path().join("entry-key");
-    assert!(command.contains(&format!("UserKnownHostsFile={}", known.display())));
+    assert!(command.contains(&format!(
+        "GlobalKnownHostsFile=/etc/ssh/ssh_known_hosts {}",
+        approving.display()
+    )));
     assert!(command.contains(&format!("IdentityFile={}", key.display())));
-    assert_eq!(std::fs::read_to_string(&known).unwrap(), known_hosts);
+    // Written under the name this machine's own files use.
+    assert_eq!(
+        std::fs::read_to_string(&approving).unwrap(),
+        format!(
+            "[backup.example.net]:2222 {host_key}\n@cert-authority [backup.example.net]:2222 {authority_key}\n"
+        )
+    );
     assert_eq!(std::fs::read_to_string(&key).unwrap(), entry_key.as_str());
     assert_eq!(
         std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
         0o600
     );
     drop(guard);
-    assert!(!known.exists() && !key.exists());
+    assert!(!approving.exists() && !key.exists());
 
+    // An approving machine that knows nothing leaves this machine's own.
     args.rsh = Some(template.clone());
+    let guard = prepare_receiver_ssh_with(&mut args, "", entry_key.as_bytes(), &dialer).unwrap();
     assert!(
-        prepare_receiver_ssh_with(&mut args, "@cert-authority * bad", entry_key.as_bytes())
-            .is_err()
+        std::fs::read_to_string(guard.path().join(APPROVING_KNOWN_HOSTS))
+            .unwrap()
+            .is_empty()
+    );
+    drop(guard);
+    args.rsh = Some(template.clone());
+    assert!(prepare_receiver_ssh_with(
+        &mut args,
+        "@cert-authority * bad",
+        entry_key.as_bytes(),
+        &dialer
+    )
+    .is_err());
+    // A command that already checks host keys its own way is refused.
+    args.rsh = Some(format!("{template} -o StrictHostKeyChecking=no"));
+    assert!(
+        prepare_receiver_ssh_with(&mut args, &known_hosts, entry_key.as_bytes(), &dialer).is_err()
     );
     // A command that would also use an agent never gets the key.
     args.rsh = Some(template.replace("IdentityAgent=none", "IdentityAgent=SSH_AUTH_SOCK"));
-    assert!(prepare_receiver_ssh_with(&mut args, &known_hosts, entry_key.as_bytes()).is_err());
+    assert!(
+        prepare_receiver_ssh_with(&mut args, &known_hosts, entry_key.as_bytes(), &dialer).is_err()
+    );
     // The broker's command uses an agent, so it never gets the key.
     args.rsh = Some(constrained_destination_rsh(
         2222,
-        "ssh-ed25519",
-        DestinationAuthentication::Broker,
+        DestinationAuthentication::Broker {
+            host_key_algorithms: "ssh-ed25519",
+        },
     ));
-    assert!(prepare_receiver_ssh_with(&mut args, &known_hosts, entry_key.as_bytes()).is_err());
+    assert!(
+        prepare_receiver_ssh_with(&mut args, &known_hosts, entry_key.as_bytes(), &dialer).is_err()
+    );
 }
 
 #[test]
@@ -1019,11 +1216,8 @@ fn an_interrupted_coordinator_removes_its_entry_key() {
     if let Some(report) = std::env::var_os(CHILD) {
         let mut args = Args::parse_from(["syq", "src", "dst"]);
         args.restricted_grant = Some("signed-grant".into());
-        args.rsh = Some(constrained_destination_rsh(
-            2222,
-            "ssh-ed25519",
-            DestinationAuthentication::Receiver,
-        ));
+        args.locations = vec![Location::parse("backup:/archive").unwrap()];
+        args.rsh = Some(receiver_rsh(2222));
         let host = ssh_key::PrivateKey::random(
             &mut ssh_key::rand_core::OsRng,
             ssh_key::Algorithm::Ed25519,
@@ -1043,6 +1237,7 @@ fn an_interrupted_coordinator_removes_its_entry_key() {
                 host.public_key().to_openssh().unwrap()
             ),
             entry.as_bytes(),
+            &DialerHostKeys::parse(DIALER_CONFIG).unwrap(),
         )
         .unwrap();
         assert!(directory.path().join("entry-key").is_file());
@@ -1114,6 +1309,12 @@ fn the_coordinator_reads_the_entry_key_and_directive_from_its_input() {
             .to_openssh(ssh_key::LineEnding::LF)
             .unwrap();
     let directive = b"SYQDIR1\0 the copy's directive";
+    let stand_in = crate::test_support::tempdir().unwrap();
+    crate::test_support::write_executable(
+        &stand_in.path().join("ssh"),
+        format!("#!/bin/sh\nprintf '%s' '{DIALER_CONFIG}'\n"),
+        0o700,
+    );
     if std::env::var_os(CHILD).is_some() {
         let host = ssh_key::PrivateKey::random(
             &mut ssh_key::rand_core::OsRng,
@@ -1133,11 +1334,10 @@ fn the_coordinator_reads_the_entry_key_and_directive_from_its_input() {
             "{RECEIVER_HOST_ALIAS} {}\n",
             host.public_key().to_openssh().unwrap()
         ));
-        args.rsh = Some(constrained_destination_rsh(
-            2222,
-            "ssh-ed25519",
-            DestinationAuthentication::Receiver,
-        ));
+        args.rsh = Some(receiver_rsh(2222));
+        // The coordinator reads its own SSH configuration for the receiver,
+        // here from the stand-in `ssh` the parent put first on PATH.
+        args.locations = vec![Location::parse("backup:/archive").unwrap()];
         let _directory = prepare_receiver_ssh(&mut args).unwrap().unwrap();
         assert_eq!(
             args.restricted_grant.as_deref(),
@@ -1160,6 +1360,14 @@ fn the_coordinator_reads_the_entry_key_and_directive_from_its_input() {
         ])
         .env(CHILD, "1")
         .env("SYQ_TEST_ENTRY_KEY_LENGTH", entry.len().to_string())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                stand_in.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -181,7 +181,7 @@ pub(super) fn run_ssh(
     input: &[u8],
 ) -> Result<Vec<u8>> {
     // Only `syq receiver revoke` manages an enrollment, in the foreground.
-    let args = enrollment::enrollment_ssh_args_raw(target, route, remote_command, false);
+    let args = enrollment::enrollment_ssh_args_raw(target, route, remote_command, None);
     let mut command = Command::new("ssh");
     command
         .args(args)
@@ -431,15 +431,17 @@ pub(super) fn endpoint(login: &str, host: &str, port: Option<u16>) -> Result<Ssh
 
 /// The SSH agent the user's configuration selects for `target`: its
 /// `IdentityAgent`, else `SSH_AUTH_SOCK`.
+/// The SSH agent the configuration selects for the enrollment's login, and
+/// whether it would ask about a host key nobody knows.
 pub(super) fn configured_agent(
     target: &SshEndpoint,
     route: EnrollmentRoute<'_>,
-    background: bool,
-) -> Result<Option<PathBuf>> {
+    unattended: Option<enrollment::Unattended>,
+) -> Result<(Option<PathBuf>, bool)> {
     let output = Command::new("ssh")
         .arg("-G")
         .args(enrollment::enrollment_ssh_args_raw(
-            target, route, "", background,
+            target, route, "", unattended,
         ))
         .capture_output()
         .context("inspect the SSH configuration for the enrollment's login")?;
@@ -449,7 +451,27 @@ pub(super) fn configured_agent(
             target.label()
         );
     }
-    crate::agent_broker::configured_agent_socket(&output.stdout)
+    Ok((
+        crate::agent_broker::configured_agent_socket(&output.stdout)?,
+        enrollment::asks_about_new_host_keys(&output.stdout),
+    ))
+}
+
+/// Whether the configuration would ask about a host key of `endpoint`
+/// that nobody knows.
+fn asks_about_new_host_keys(endpoint: &SshEndpoint) -> Result<bool> {
+    let output = Command::new("ssh")
+        .arg("-G")
+        .args(endpoint.query_arguments())
+        .capture_output()
+        .context("inspect the SSH configuration for the enrollment's jump")?;
+    if !output.status.success() {
+        bail!(
+            "could not read the SSH configuration for {}",
+            endpoint.label()
+        );
+    }
+    Ok(enrollment::asks_about_new_host_keys(&output.stdout))
 }
 
 /// What one enrollment session sets up: a new enrollment, a retry of one
@@ -670,7 +692,22 @@ fn install_over_route(
     (plan, batch): (&Plan, bool),
     check: DestinationCheck<'_>,
 ) -> Result<Session> {
-    let agent = configured_agent(target, route.clone(), batch)?;
+    // Nobody watches a batch login: where the configuration would ask about
+    // a host key nobody knows, accept it the first time, as `accept-new`
+    // does, for this login and for the jump syq makes.
+    let (agent, login_asks) =
+        configured_agent(target, route.clone(), batch.then(Default::default))?;
+    let unattended = match &route {
+        _ if !batch => None,
+        EnrollmentRoute::ProxyJump { jump } => Some(enrollment::Unattended {
+            login_accepts_new: login_asks,
+            jump_accepts_new: asks_about_new_host_keys(jump)?,
+        }),
+        EnrollmentRoute::Configured => Some(enrollment::Unattended {
+            login_accepts_new: login_asks,
+            jump_accepts_new: false,
+        }),
+    };
     let temporary = crate::private_broker::private_temp_dir("syq-enroll-")?;
     let trace_path = temporary.path().join("ssh.log");
     let stage = stage_name(plan.id)?;
@@ -692,7 +729,7 @@ fn install_over_route(
             target,
             route.clone(),
             &remote,
-            batch,
+            unattended,
         ))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

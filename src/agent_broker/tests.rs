@@ -20,6 +20,9 @@ fn host_policy(user: &str, name: &str, key: KeyData) -> HostPolicy {
         connection_host: name.into(),
         port: 22,
         host_keys: vec![key],
+        authorities: Vec::new(),
+        revoked: Vec::new(),
+        unsupported: None,
         known_hosts_name: name.into(),
         host_key_algorithms: vec![algorithm],
         required_rsa_size: 1024,
@@ -376,8 +379,13 @@ fn dynamic_and_external_revocation_host_policies_fail_closed() {
         let config = format!(
                 "user backup\nhostname vault.internal\nport 22\nuserknownhostsfile /tmp/known\nhostkeyalgorithms ssh-ed25519\nrequiredrsasize 1024\n{policy}\n"
             );
-        let error = parse_ssh_config(config.as_bytes()).unwrap_err();
-        assert!(error.to_string().contains("constrained agent forwarding"));
+        // Exact-key uses, which bind agent signatures to the host, refuse
+        // it; OpenSSH's own checking reproduces it.
+        let config = parse_ssh_config(config.as_bytes()).unwrap();
+        assert!(config
+            .unsupported
+            .unwrap()
+            .contains("constrained agent forwarding"));
     }
 }
 
@@ -487,24 +495,24 @@ fn known_hosts_parser_keeps_plain_keys_and_tracks_ca_and_revocation() {
     );
     let mut trusted = Vec::new();
     let mut revoked = Vec::new();
-    let mut saw_ca = false;
+    let mut authorities = Vec::new();
     parse_known_host_output(
         &text,
         Path::new("known_hosts"),
         &mut trusted,
         &mut revoked,
-        &mut saw_ca,
+        &mut authorities,
     )
     .unwrap();
-    assert_eq!(trusted, [plain]);
+    assert_eq!(trusted, std::slice::from_ref(&plain));
     assert_eq!(revoked, [revoked_key]);
-    assert!(saw_ca);
+    assert_eq!(authorities, [plain]);
     assert!(parse_known_host_output(
         &format!("@unknown host {plain_text}\n"),
         Path::new("known_hosts"),
         &mut trusted,
         &mut revoked,
-        &mut saw_ca,
+        &mut authorities,
     )
     .is_err());
 }
