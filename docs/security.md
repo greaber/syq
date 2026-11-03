@@ -319,16 +319,25 @@ HostA connects to hostB with its own SSH configuration, which checks hostB's
 host key as its own `ssh` would: its known_hosts files, host certificate
 authorities, `KnownHostsCommand`, `StrictHostKeyChecking`, and the rest of its
 host-key settings. Syq overrides on the command line what this connection
-must not do: it uses the entry key first, no agent, no PKCS#11 or other
-security key provider, no control socket, forwarding, proxy, tunnel, local
-or remote command, or terminal, and it never prompts. Identity files
-hostA's configuration names are still offered after the entry key if hostB
-refuses it, and environment variables it sends go as far as hostB's sshd
-accepts them.
+must not do: it logs in with the entry key, with no agent, no PKCS#11 or
+other security key provider, no control socket, forwarding, proxy, tunnel,
+local or remote command, or terminal, and it never prompts. Only the entry
+key's own key type may log in, so certificates and other key types hostA's
+configuration names are never offered; if hostB refuses the entry key,
+hostA's own keys of that same type that its configuration names are offered
+after it, as with any `ssh` login. Environment variables hostA's
+configuration sends (`SendEnv`, `SetEnv`) go as far as hostB's sshd accepts
+them, and, as for hostA's other connections, `UpdateHostKeys` can record
+keys hostB announces in hostA's known_hosts.
 
 HostA also accepts the keys and host certificate authorities that your
 laptop's known_hosts lists for hostB, from a file named
-`known-to-the-machine-that-approved-this-copy`. A key that matches an entry
+`known-to-the-machine-that-approved-this-copy`, added to hostA's
+`GlobalKnownHostsFile`. OpenSSH reports a list of files and one quoted name
+containing spaces the same way, so where hostA's `GlobalKnownHostsFile`
+could be either, syq leaves it as configured and hostA does without your
+laptop's entries for that copy; your laptop likewise leaves out a
+known_hosts setting of its own that could be either. A key that matches an entry
 on either machine is accepted, so a key your laptop knows works even where
 hostA has an old one. A key that matches nothing while either machine lists
 some key for hostB is refused, as `ssh` refuses it, and the message names

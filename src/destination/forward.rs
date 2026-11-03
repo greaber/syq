@@ -1185,6 +1185,7 @@ pub(super) fn target_spec(target: &str) -> Result<crate::conn::RemoteSpec> {
         diagnostics: Default::default(),
         primed_control: Default::default(),
         forwarded: None,
+        resolved_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     })
 }

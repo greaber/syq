@@ -57,6 +57,7 @@ fn remote(host: &str, tcp: bool) -> Endpoint {
         diagnostics: Default::default(),
         primed_control: Default::default(),
         forwarded: None,
+        resolved_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     })
 }

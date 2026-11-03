@@ -884,4 +884,52 @@ finally:
     restore_source_known_hosts(saved_source)
     known_hosts.write_bytes(saved_runner)
 assert remote("sha256sum /tmp/syq-real-ssh/forward/hostkey-ecdsa").split()[0] == source_hash
+print("case: a user certificate the source's SSH configuration names does not replace the entry key", flush=True)
+# The destination accepts a certificate the source's configuration offers,
+# which OpenSSH would offer before any plain key: the copy must still log in
+# with the entry key and reach the enrolled receiver.
+authority = run("ssh", "source", "rm -rf /tmp/syq-real-ssh-usercert && mkdir -m 700 /tmp/syq-real-ssh-usercert && "
+                "cd /tmp/syq-real-ssh-usercert && ssh-keygen -q -t ed25519 -N '' -f ca && "
+                "ssh-keygen -q -t ed25519 -N '' -f user && ssh-keygen -q -s ca -I user -n syq user.pub && "
+                "cat ca.pub").strip()
+authorized = remote("cat ~/.ssh/authorized_keys")
+try:
+    run("ssh", "destination", "cat >> ~/.ssh/authorized_keys", stdin=f"cert-authority {authority}\n")
+    assert subprocess.run(["ssh", "source", "ssh -o BatchMode=yes -o IdentitiesOnly=yes "
+                           "-i /tmp/syq-real-ssh-usercert/user destination true"], timeout=40).returncode == 0
+    with_source_config("Host destination\n  IdentityFile /tmp/syq-real-ssh-usercert/user\n"
+                       "  CertificateFile /tmp/syq-real-ssh-usercert/user-cert.pub\n",
+                       lambda: copy("/tmp/syq-real-ssh/forward/hostkey-user-certificate",
+                                    auth=("--auth-from", "@laptop")))
+finally:
+    run("ssh", "destination", "umask 077; cat > ~/.ssh/authorized_keys", stdin=authorized)
+    run("ssh", "source", "rm -rf /tmp/syq-real-ssh-usercert")
+assert remote("sha256sum /tmp/syq-real-ssh/forward/hostkey-user-certificate").split()[0] == source_hash
+
+print("case: a global known-hosts name with a space is not split", flush=True)
+# The source's configuration names one file, quoted, whose name has a space,
+# holding a wrong key for the destination. The source's own ssh refuses the
+# destination; so does the copy, which cannot add the runner's knowledge to
+# that list without changing what it means.
+saved_source = source_known_hosts()
+try:
+    run("ssh", "source", "ssh-keygen -R destination >/dev/null 2>&1; rm -rf /tmp/syq-real-ssh-gk && "
+        "mkdir /tmp/syq-real-ssh-gk && ssh-keygen -q -t ed25519 -N '' -f /tmp/syq-real-ssh-gk/wrong && "
+        "printf 'destination %s\\n' \"$(cut -d' ' -f1,2 /tmp/syq-real-ssh-gk/wrong.pub)\" "
+        "> '/tmp/syq-real-ssh-gk/known hosts'")
+    def quoted_global():
+        assert subprocess.run(["ssh", "source", "ssh -o BatchMode=yes destination true"],
+                              timeout=40, capture_output=True).returncode != 0
+        refused = source_copy()
+        pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
+        assert len(pending) == 1, pending
+        run("syq", "persist", "receive", "approve", pending[0]["id"])
+        _, stderr = refused.communicate(timeout=90)
+        assert refused.returncode not in (0, 124), stderr
+        assert "Host key verification failed" in stderr, stderr
+    with_source_config('Host destination\n  GlobalKnownHostsFile "/tmp/syq-real-ssh-gk/known hosts"\n',
+                       quoted_global)
+finally:
+    restore_source_known_hosts(saved_source)
+    run("ssh", "source", "rm -rf /tmp/syq-real-ssh-gk")
 print("source-shell remote copy checks passed", flush=True)

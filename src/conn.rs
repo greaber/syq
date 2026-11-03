@@ -1703,6 +1703,10 @@ pub struct RemoteSpec {
     /// for pipelined control lookups.
     pub(crate) read_ahead: usize,
     pub(crate) forwarded: Option<std::sync::Arc<crate::destination::ReturnConnection>>,
+    /// The host the SSH configuration resolves `host` to, when already
+    /// known: an enrolled receiver's connection reads it once while
+    /// preparing its host-key checking.
+    pub(crate) resolved_host: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -1731,6 +1735,7 @@ impl RemoteSpec {
             diagnostics: Default::default(),
             primed_control: Default::default(),
             forwarded: None,
+            resolved_host: None,
             read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         }
     }
@@ -2830,6 +2835,9 @@ impl RemoteSpec {
             .and_then(|connection| connection.data_hostname())
         {
             return Some(host.to_owned());
+        }
+        if let Some(host) = &self.resolved_host {
+            return Some(host.clone());
         }
         if !self.rsh[0].ends_with("ssh") {
             return Some(self.host.clone());

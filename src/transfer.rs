@@ -655,6 +655,11 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 diagnostics: Default::default(),
                 primed_control: Default::default(),
                 forwarded,
+                resolved_host: args
+                    .receiver_hostname
+                    .as_ref()
+                    .filter(|(dialed, _)| dialed == h)
+                    .map(|(_, resolved)| resolved.clone()),
                 read_ahead: args.tuning_options.unwrap_or_default().pipeline_depth(),
             })
         }
