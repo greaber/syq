@@ -556,6 +556,30 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+/// Remove a revoked enrollment's state. A session that started before the
+/// revocation was marked can still be writing in it, as when it records a
+/// directive, and it stops at its next check: try again for a moment rather
+/// than leave a revocation half done.
+pub(super) fn remove_revoked_state(state: &Path) -> Result<()> {
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match fs::remove_dir_all(state) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("remove revoked receiver state {}", state.display()))
+            }
+        }
+    }
+}
+
 pub(crate) fn remote_revoke() -> Result<()> {
     let request: RevokeRequest = read_request("revocation request")?;
     if request.version != CONFIG_VERSION {
@@ -609,8 +633,7 @@ pub(super) fn revoke_for_account(
     }
     if let Some(leases) = &leases {
         active::revoke(&state, leases)?;
-        fs::remove_dir_all(&state)
-            .with_context(|| format!("remove revoked receiver state {}", state.display()))?;
+        remove_revoked_state(&state)?;
     }
     drop(directory);
     println!("revoked {}", request.id);

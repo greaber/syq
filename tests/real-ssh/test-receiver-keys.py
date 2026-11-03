@@ -6,7 +6,9 @@ key files, encrypted keys in the agent, agent-only keys, FIDO keys through
 the agent with the lab's provider, and a certificate login. Keys that cannot
 sign are refused before anything is installed. A new login key replaces only
 the trusted signer, a connection started before a refresh cannot start a new
-copy, and a copy running through a refresh finishes.
+copy, and a copy running through a refresh finishes. Connections that have
+not shown a signed copy yet are refused once 32 are starting, which one copy
+never reaches, and revoking works while they keep arriving.
 """
 import json
 import os
@@ -15,11 +17,28 @@ import shlex
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 
 PROVIDER = '/usr/local/lib/syq-test-sk.so'
 SOURCE_FILE = '/tmp/syq-real-ssh-key-source'
 STATE = Path.home() / '.local/state/syq/enrollments'
+REFUSED = b'other connections are starting copies on this enrollment'
+# The receiver's sessions on the destination: every session the entry key
+# starts runs it.
+RECEIVER_SESSIONS = '''
+import os
+sessions = []
+for pid in filter(str.isdigit, os.listdir('/proc')):
+    try:
+        command = open(f'/proc/{pid}/cmdline', 'rb').read()
+        status = open(f'/proc/{pid}/status').read()
+        started = int(open(f'/proc/{pid}/stat').read().rsplit(') ', 1)[1].split()[19])
+    except OSError:
+        continue
+    if command.split(b'\\0')[1:2] == [b'--restricted-receiver']:
+        sessions.append((started, int(status.split('PPid:')[1].split()[0])))
+'''
 
 
 def run(*args, **kwargs):
@@ -439,18 +458,8 @@ print(any(p.stat().st_size > 0 for p in Path({parent!r}).glob('.rotation-large.s
             # them start from the refreshed line, at the new generation, and
             # join the running copy. Every session runs the receiver; the
             # copy's control started first, and the others are its workers.
-            dropped = remote_text('python3 -c ' + shlex.quote('''
-import os, signal
-sessions = []
-for pid in filter(str.isdigit, os.listdir('/proc')):
-    try:
-        command = open(f'/proc/{pid}/cmdline', 'rb').read()
-        status = open(f'/proc/{pid}/status').read()
-        started = int(open(f'/proc/{pid}/stat').read().rsplit(') ', 1)[1].split()[19])
-    except OSError:
-        continue
-    if command.split(b'\\0')[1:2] == [b'--restricted-receiver']:
-        sessions.append((started, int(status.split('PPid:')[1].split()[0])))
+            dropped = remote_text('python3 -c ' + shlex.quote(RECEIVER_SESSIONS + '''
+import signal
 for _, parent in sorted(sessions)[1:]:
     os.kill(parent, signal.SIGKILL)
 print(len(sessions) - 1)
@@ -485,6 +494,76 @@ def remount(parent):
     print('a replaced destination directory kept the enrollment working', flush=True)
 
 
+def entry_ssh(directory):
+    return ['ssh', '-F', '/dev/null', '-i', str(directory / 'entry-key'), '-o', 'IdentitiesOnly=yes',
+            '-o', 'IdentityAgent=none', '-o', 'BatchMode=yes', '-o', 'ControlPath=none',
+            '-o', 'UserKnownHostsFile=/home/syq/.ssh/known_hosts', '-o', 'StrictHostKeyChecking=yes',
+            'syq@destination', 'syq --server']
+
+
+def session_slots(parent):
+    # One copy starts at most 32 connections at once, as many as the
+    # receiver has slots for, so none of a copy's workers is refused.
+    files = '/tmp/syq-real-ssh-slots'
+    run('ssh', 'source', f'rm -rf {files} && mkdir {files} && cd {files} && '
+        'for i in $(seq 2000); do echo $i > $i; done')
+    many = attempt('syq', 'cp', '--from', 'source', files, '--to', 'destination',
+                   '--as', f'{parent}/slots-many', '--no-tcp', '--no-progress',
+                   '--performance-tuning', 'workers=64')
+    log = (many.stdout + many.stderr).decode(errors='replace')
+    assert many.returncode == 0 and REFUSED.decode() not in log, log
+    assert remote_text(f'ls {parent}/slots-many | wc -l').strip() == '2000'
+    print('a copy with 64 workers had none refused', flush=True)
+
+    directory, record = enrollment()
+    receivers = 'python3 -c ' + shlex.quote(RECEIVER_SESSIONS + 'print(len(sessions))')
+    wait_for('the copy\'s sessions to end', lambda: (
+        int(remote_text(receivers)) == 0, remote_text(receivers).strip()))
+    holders = []
+    threads = []
+    stop = threading.Event()
+    arrivals = []
+    try:
+        # Sessions that send nothing hold their slots for 10 seconds.
+        # Start them a few at a time, within sshd's MaxStartups.
+        for _ in range(4):
+            holders += [subprocess.Popen(entry_ssh(directory), stdin=subprocess.PIPE,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        for _ in range(8)]
+            wait_for('sessions to take slots', lambda: (
+                int(remote_text(receivers)) >= len(holders), remote_text(receivers).strip()), seconds=8)
+        started = time.monotonic()
+        refused = attempt(*entry_ssh(directory), input=b'')
+        assert refused.returncode and REFUSED in refused.stderr, refused.stderr
+        assert time.monotonic() - started < 5, time.monotonic() - started
+        blocked = copy(f'{parent}/slots-full', check=False)
+        assert blocked.returncode and REFUSED in blocked.stderr, blocked.stderr
+        print('with every slot held, sessions and copies were refused at once', flush=True)
+
+        # Revoking removes the enrollment's state while sessions keep
+        # arriving and being refused.
+        def arrive():
+            while not stop.is_set():
+                arrivals.append(attempt(*entry_ssh(directory), input=b'').returncode)
+        threads += [threading.Thread(target=arrive) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        time.sleep(.5)
+        revoked = attempt('syq', 'receiver', 'revoke', bytes(record['id']).hex())
+        assert revoked.returncode == 0, revoked.stderr
+    finally:
+        stop.set()
+        for holder in holders:
+            holder.kill()
+            holder.wait()
+        for thread in threads:
+            thread.join()
+    assert arrivals and all(arrivals), arrivals
+    assert enrollment() == (None, None)
+    assert f'syq-enrollment:{bytes(record["id"]).hex()}' not in remote_text('cat ~/.ssh/authorized_keys')
+    print('revoking worked while sessions kept arriving', flush=True)
+
+
 def main():
     original_agent = os.environ['SSH_AUTH_SOCK']
     original_environment = dict(os.environ)
@@ -505,6 +584,7 @@ def main():
             certificate_login(lab, parent)
             rotation_and_generations(lab, parent)
             remount(parent)
+            session_slots(parent)
             print('Login keys sign restricted copies', flush=True)
         finally:
             try:

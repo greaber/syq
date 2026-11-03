@@ -73,8 +73,8 @@ an interrupted copy can leave an incomplete file whose metadata makes a
 retry skip it.
 
 For restricted remote copies, expressions are evaluated by the coordinator
-as copy preferences. They do not add receiver-enforced restrictions to a signed
-grant; the grant continues to enforce its destination scope and permissions.
+as copy preferences. They do not add receiver-enforced restrictions to the
+signed copy, whose destination scope and permissions the receiver enforces.
 
 ## Fields
 

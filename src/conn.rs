@@ -2372,8 +2372,9 @@ impl RemoteSpec {
             }
             let mut command = self.ssh_command(ssh_connection, crate::output::debug());
             let remote_command = if self.restricted_grant.is_some() {
-                // This text is inspected by the forced receiver through
-                // SSH_ORIGINAL_COMMAND; sshd replaces the requested executable.
+                // The entry key's forced command runs in place of this text,
+                // which the receiver ignores: the session's first frame says
+                // what it may do.
                 format!("syq {}", shell_words::join(&server_args))
             } else {
                 self.session_command(&server_args)
