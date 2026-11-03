@@ -58,6 +58,14 @@ pub(crate) const RETURN_GRANT: &str = "return-control-v1";
 const REQUEST_ROOT: &[u8] = b"/SYQ-RECEIVE";
 const RECONNECT_PENDING: i32 = 75;
 
+/// Whether ssh's error output says the server refused a remote forwarding,
+/// as OpenSSH reports it under `ExitOnForwardFailure`.
+fn refuses_remote_forwarding(ssh_error: &str) -> bool {
+    ssh_error
+        .lines()
+        .any(|line| line.contains("remote port forwarding failed for listen"))
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 enum Approval {
@@ -1705,6 +1713,15 @@ pub(crate) fn serve_background(
                 .is_some_and(|code| (1..128).contains(&code) && code != RECONNECT_PENDING)
             {
                 bail!("server rejected return connection: {error}; run syq persist connect {} on the receiving machine to retry", shell_words::quote(&spec.endpoint.label()));
+            }
+            // Dialing again cannot help a server whose configuration refuses
+            // the return socket; each attempt would only log in once more.
+            if !online && refuses_remote_forwarding(&error) {
+                bail!(
+                    "{} refuses remote forwarding, which receiving needs ({error}); allow remote Unix socket forwarding in its SSH server (OpenSSH 9.2 and later also need remote TCP forwarding allowed), then run syq persist connect {} on the receiving machine",
+                    spec.endpoint.label(),
+                    shell_words::quote(&spec.endpoint.label())
+                );
             }
             *state.lock().unwrap() = crate::receive_service::ConnectionState {
                 phase: "reconnecting".into(),

@@ -471,7 +471,10 @@ with you.
 For automatic reconnection to work, your SSH key or agent must be available and
 the server's host key must already be trusted. The background service cannot
 ask for a password. The server must allow remote Unix socket forwarding;
-OpenSSH 9.2 also requires permission for remote TCP forwarding.
+OpenSSH 9.2 also requires permission for remote TCP forwarding. When a server
+refuses it, receiving through that server stops instead of reconnecting, and
+`syq persist status` shows it as failed with the reason; the next command that
+connects to that server tries once more.
 
 The server command uses the matching helper installed by the receiving
 connection. If that helper is missing or does not recognize an option, update
