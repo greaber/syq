@@ -1,5 +1,6 @@
-// Product code writes stderr through crate::output, never std's eprint! or
-// eprintln!, which panic when stderr is closed (see clippy.toml).
+// Product code writes stdout and stderr through crate::output, never std's
+// print!, println!, eprint! or eprintln!, which panic when the stream is
+// closed (see clippy.toml).
 #![cfg_attr(not(test), deny(clippy::disallowed_macros))]
 
 // The receiver modules below forbid subprocess launches on macOS: SCM_RIGHTS
@@ -200,7 +201,7 @@ fn main() {
         return;
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("--build-identity") {
-        println!("{}", identity::build());
+        crate::output::command_println!("{}", identity::build());
         return;
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("--release-manifest-signing-payload") {

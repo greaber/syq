@@ -1991,7 +1991,7 @@ fn destinations(action: DestinationAction) -> Result<i32> {
             names.sort();
             names.dedup();
             for name in names {
-                println!(
+                crate::output::command_println!(
                     "@{name}\t{}",
                     if available(&name, Duration::from_secs(1)).is_ok() {
                         "online"
@@ -2017,7 +2017,7 @@ fn destinations(action: DestinationAction) -> Result<i32> {
                 bail!("destination @{name} is still registered; stop its receiver first");
             }
             identity::forget(&directory, &name)?;
-            println!("syq: forgot offline destination @{name}");
+            crate::output::command_println!("syq: forgot offline destination @{name}");
             Ok(0)
         }
         DestinationAction::Wait { name, timeout } => {

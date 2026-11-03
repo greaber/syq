@@ -248,14 +248,14 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         PersistAction::On { ephemeral: true } => {
             let scope = create_ephemeral_scope()?;
             // stdout is exactly a native path and newline for scripts.
-            let mut stdout = std::io::stdout().lock();
+            let mut stdout = crate::output::command_stdout();
             stdout.write_all(scope.as_os_str().as_bytes())?;
             stdout.write_all(b"\n")?;
         }
         PersistAction::On { ephemeral: false } => {
             let scope = domain.enable()?;
-            crate::output::human_stdout!("SSH connection persistence is on");
-            crate::output::human_stdout!("scope: {}", scope.display());
+            crate::output::command_human_stdout!("SSH connection persistence is on");
+            crate::output::command_human_stdout!("scope: {}", scope.display());
         }
         PersistAction::Off {} => {
             if domain.is_default() {
@@ -290,12 +290,12 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
             .filter_map(|(step, result)| result.err().map(|error| format!("{step}: {error:#}")))
             .collect();
             anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
-            crate::output::human_stdout!("SSH connection persistence is off");
+            crate::output::command_human_stdout!("SSH connection persistence is off");
         }
         PersistAction::Status { json } => {
             let enabled = domain.enabled()?;
             if !json {
-                crate::output::human_stdout!(
+                crate::output::command_human_stdout!(
                     "SSH connection persistence is {}",
                     if enabled { "on" } else { "off" }
                 );
@@ -306,12 +306,12 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     let authorized = crate::destination::ssh::persistent::status(&domain)?;
                     if json {
-                        println!(
+                        crate::output::command_println!(
                             "{}",
                             serde_json::json!({"enabled": enabled, "scope": scope, "connections": [], "authorized_ssh": authorized.rows, "authorized_ssh_errors": authorized.errors})
                         );
                     } else {
-                        crate::output::human_stdout!("connections: 0");
+                        crate::output::command_human_stdout!("connections: 0");
                         crate::destination::ssh::persistent::print_status(&authorized.rows);
                     }
                     anyhow::ensure!(
@@ -383,7 +383,7 @@ pub(crate) fn connect_domain(
     let was_enabled = domain.enabled()?;
     let scope = domain.enable()?;
     if !was_enabled {
-        crate::output::human_stdout!(
+        crate::output::command_human_stdout!(
             "SSH connection persistence is on (kept on if connecting fails; disable with syq persist off)"
         );
     }
@@ -415,7 +415,7 @@ pub(crate) fn connect_domain(
         forwarded: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
-    crate::output::human_stdout!("Connecting to {}...", remote.label());
+    crate::output::command_human_stdout!("Connecting to {}...", remote.label());
     // This uses the same pinned-helper bootstrap and authentication as a copy.
     // No source roots, data workers or filesystem operations are requested.
     let connection = remote.connect_with(true, false)?;
@@ -424,13 +424,15 @@ pub(crate) fn connect_domain(
     drop(connection);
     match receiving {
         Some(names) => {
-            crate::output::human_stdout!(
+            crate::output::command_human_stdout!(
                 "{} ready; receiving as @{}",
                 remote.label(),
                 names.join(", @")
             )
         }
-        None => crate::output::human_stdout!("{} ready; receiving is disabled", remote.label()),
+        None => {
+            crate::output::command_human_stdout!("{} ready; receiving is disabled", remote.label())
+        }
     }
     Ok(())
 }
@@ -1027,7 +1029,7 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
     }
     let authorized_ssh = crate::destination::ssh::persistent::status(domain)?;
     if json {
-        println!(
+        crate::output::command_println!(
             "{}",
             serde_json::json!({
                 "enabled": domain.enabled()?,
@@ -1043,11 +1045,11 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
         );
         return Ok(());
     }
-    crate::output::human_stdout!("scope ({kind}): {}", scope.display());
+    crate::output::command_human_stdout!("scope ({kind}): {}", scope.display());
     if let Some(error) = &receiving_error {
-        crate::output::human_stdout!("Receiving configuration failed: {error}");
+        crate::output::command_human_stdout!("Receiving configuration failed: {error}");
     }
-    crate::output::human_stdout!("connections: {}", connections.len());
+    crate::output::command_human_stdout!("connections: {}", connections.len());
     crate::destination::ssh::persistent::print_status(&authorized_ssh.rows);
     for connection in connections {
         let mut line = format!("  {}", connection.endpoint);
@@ -1097,7 +1099,7 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
                 ));
             }
         }
-        crate::output::human_stdout!("{line}");
+        crate::output::command_human_stdout!("{line}");
     }
     anyhow::ensure!(
         authorized_ssh.errors.is_empty(),

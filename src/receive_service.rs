@@ -81,7 +81,7 @@ impl Settings {
         self.enabled && (self.servers.is_empty() || self.servers.iter().any(|s| s == endpoint))
     }
     fn print_paths(&self) {
-        crate::output::human_stdout!(
+        crate::output::command_human_stdout!(
             "cwd: {} ({})",
             self.cwd.display(),
             if self.cwd_explicit {
@@ -91,15 +91,19 @@ impl Settings {
             }
         );
         if let Some(root) = &self.root {
-            crate::output::human_stdout!("root: {}", root.display());
+            crate::output::command_human_stdout!("root: {}", root.display());
         }
         match &self.auto_approve_root {
-            Some(root) => crate::output::human_stdout!("auto-approve-root: {}", root.display()),
+            Some(root) => {
+                crate::output::command_human_stdout!("auto-approve-root: {}", root.display())
+            }
             None => {
-                crate::output::human_stdout!("auto-approve-root: none (ask for every download)")
+                crate::output::command_human_stdout!(
+                    "auto-approve-root: none (ask for every download)"
+                )
             }
         }
-        crate::output::human_stdout!(
+        crate::output::command_human_stdout!(
             "connections: {}",
             if self.servers.is_empty() {
                 "all".into()
@@ -1411,7 +1415,7 @@ fn configure(domain: &Domain, options: Configure) -> Result<()> {
             failures.join("; ")
         );
     }
-    crate::output::human_stdout!("Receiving is on: {}", config.name);
+    crate::output::command_human_stdout!("Receiving is on: {}", config.name);
     config.print_paths();
     Ok(())
 }
@@ -1436,15 +1440,15 @@ fn pending(domain: &Domain, json: bool, wait: bool, timeout: u64) -> Result<()> 
         }
         if !wait || !requests.is_empty() {
             if json {
-                println!("{}", serde_json::to_string(&requests)?);
+                crate::output::command_println!("{}", serde_json::to_string(&requests)?);
             } else if requests.is_empty() {
-                crate::output::human_stdout!("No requests awaiting approval");
+                crate::output::command_human_stdout!("No requests awaiting approval");
             } else {
                 // Dim arguments naming files the server reads and this machine
                 // cannot check.
                 let terminal = std::io::IsTerminal::is_terminal(&std::io::stdout());
                 for request in requests {
-                    crate::output::human_stdout!(
+                    crate::output::command_human_stdout!(
                         "{}\n{}\nNotification: {}\n",
                         request.id,
                         request.description(domain, |word| if terminal {
@@ -1491,7 +1495,7 @@ fn decide(domain: &Domain, id: &str, allow: bool, remember: bool) -> Result<()> 
             if let Some(error) = response.decision_error {
                 bail!("{error}");
             }
-            crate::output::human_stdout!(
+            crate::output::command_human_stdout!(
                 "{} {id}",
                 if remember {
                     "Approved and remembered"
@@ -1524,7 +1528,7 @@ fn decide(domain: &Domain, id: &str, allow: bool, remember: bool) -> Result<()> 
                     remember,
                 },
             )?;
-            crate::output::human_stdout!(
+            crate::output::command_human_stdout!(
                 "{} {id}",
                 if remember {
                     "Approved and remembered"
@@ -1648,12 +1652,12 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                             .map(serde_json::to_value)
                             .collect::<std::result::Result<Vec<_>, _>>()?,
                     );
-                    println!("{}", serde_json::to_string(&rows)?);
+                    crate::output::command_println!("{}", serde_json::to_string(&rows)?);
                 } else if permissions.is_empty() && provider_permissions.is_empty() {
-                    crate::output::human_stdout!("No remembered account permissions");
+                    crate::output::command_human_stdout!("No remembered account permissions");
                 } else {
                     for item in permissions {
-                        crate::output::human_stdout!(
+                        crate::output::command_human_stdout!(
                             "{}  {} -> {} (receiving profile @{})",
                             item.id,
                             permission_account_label(&item.permission.source),
@@ -1662,7 +1666,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                         );
                     }
                     for item in provider_permissions {
-                        crate::output::human_stdout!(
+                        crate::output::command_human_stdout!(
                             "{}  {} -> {} (provider profile {})",
                             item.id,
                             item.permission.provider.label(),
@@ -1683,7 +1687,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                     // Keep the original store's ID validation and not-found diagnostic.
                     crate::receive_approval::accounts::remove(domain, &id)?;
                 }
-                crate::output::human_stdout!("Removed {id}; future authentications require approval. Already authenticated sessions may continue.");
+                crate::output::command_human_stdout!("Removed {id}; future authentications require approval. Already authenticated sessions may continue.");
             }
         },
         Action::Off { name } => {
@@ -1699,7 +1703,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
             }
             save_settings(domain, &config)?;
             apply_preferences(domain, &config)?;
-            crate::output::human_stdout!(
+            crate::output::command_human_stdout!(
                 "Selected receiving profiles are off; ordinary SSH persistence is unchanged"
             );
         }
@@ -1715,7 +1719,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
             config.profiles.remove(index);
             save_settings(domain, &config)?;
             apply_preferences(domain, &config)?;
-            crate::output::human_stdout!("Removed receiving profile {name}");
+            crate::output::command_human_stdout!("Removed receiving profile {name}");
         }
         Action::Status { json, name } => {
             let config = preferences(domain)?;
@@ -1750,7 +1754,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                 .filter(|p| name.as_ref().is_none_or(|n| n == &p.name))
                 .collect();
             if json {
-                println!(
+                crate::output::command_println!(
                     "{}",
                     serde_json::to_string(
                         &serde_json::json!({ "settings": selected[0], "profiles": selected, "connections": connections, "provider": local_provider })
@@ -1758,7 +1762,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                 );
             } else {
                 for config in selected {
-                    crate::output::human_stdout!(
+                    crate::output::command_human_stdout!(
                         "Receiving is {}: {}",
                         if config.enabled { "on" } else { "off" },
                         config.name
@@ -1767,7 +1771,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                 }
                 if let Some(provider) = local_provider {
                     for profile in provider.profiles {
-                        crate::output::human_stdout!(
+                        crate::output::command_human_stdout!(
                             "  local SSH provider {}: {} sessions ({} pending)",
                             profile.settings.name,
                             profile.sessions,
@@ -1777,7 +1781,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                 }
                 for state in connections {
                     if state.profiles.is_empty() {
-                        crate::output::human_stdout!(
+                        crate::output::command_human_stdout!(
                             "  {}: {}{}",
                             state.endpoint,
                             state.connection.phase,
@@ -1794,7 +1798,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                         .iter()
                         .filter(|p| name.as_ref().is_none_or(|n| n == &p.settings.name))
                     {
-                        crate::output::human_stdout!(
+                        crate::output::command_human_stdout!(
                             "  {} @{}: {} ({} pending){}",
                             state.endpoint,
                             profile.settings.name,

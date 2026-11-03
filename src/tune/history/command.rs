@@ -61,7 +61,7 @@ pub(crate) fn run(args: &[std::ffi::OsString]) -> Result<i32> {
         bail!("no tuning history has been recorded");
     }
     let db = open(&path)?;
-    let mut output = std::io::stdout().lock();
+    let mut output = crate::output::command_stdout();
     match matches.subcommand() {
         Some(("list", args)) => {
             writeln!(

@@ -1902,3 +1902,45 @@ fn unsupported_copy_controls_warn_without_changing_behavior() {
         assert!(!stderr_of(&output).contains("unsupported"), "{output:?}");
     }
 }
+
+/// A reader that stops early, as `head` does, closes syq's stdout. Commands
+/// that print rather than copy then end quietly with their usual status
+/// instead of panicking or reporting the broken pipe.
+#[test]
+fn closed_stdout_ends_printing_commands_quietly() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"mapped");
+    fs::create_dir(t.runtime()).unwrap();
+    for args in [
+        &["--version"][..],
+        &["-V"],
+        &["--build-identity"],
+        &["--help"],
+        &["--help-all"],
+        &["help", "cp"],
+        &["completion", "bash"],
+        &["completion", "zsh"],
+        &["persist", "status"],
+        &["persist", "status", "--json"],
+        &["map", "--cwd", &t.s("src"), "file", "--as", "copy"],
+    ] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("HOME", t.path("home"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .stdin(Stdio::null())
+            .stdout(writer)
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {}", stderr_of(&output));
+    }
+}

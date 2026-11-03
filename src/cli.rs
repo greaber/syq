@@ -793,7 +793,7 @@ impl Args {
                 std::process::exit(0);
             }
             "--version" | "-V" => {
-                println!("syq {}", env!("CARGO_PKG_VERSION"));
+                crate::output::command_println!("syq {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             // Installation lifecycle switches remain top-level. Internal
@@ -1207,6 +1207,10 @@ fn print_root_help(full: bool) {
         command.print_help()
     };
     result.unwrap_or_else(|error| {
+        // A reader that stopped early, as `head` does, has what it wanted.
+        if error.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
         crate::output::diagnostic!("syq: {error}");
         std::process::exit(1);
     });

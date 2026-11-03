@@ -453,10 +453,14 @@ pub(crate) fn show_topic(topics: &[std::ffi::OsString]) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("unknown help topic {topic:?}"))?
             .bin_name(format!("{parent} {topic}"));
     }
-    if full {
-        command.print_long_help()?;
+    let printed = if full {
+        command.print_long_help()
     } else {
-        command.print_help()?;
+        command.print_help()
+    };
+    match printed {
+        // A reader that stopped early, as `head` does, has what it wanted.
+        Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => Err(error.into()),
+        _ => Ok(()),
     }
-    Ok(())
 }

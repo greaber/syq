@@ -119,12 +119,92 @@ pub(crate) fn write_stdout(args: Arguments<'_>) -> io::Result<()> {
     writeln!(out, "{args}").and_then(|()| out.flush())
 }
 
+/// Set once stdout's reader has gone away, as `head` does after its lines:
+/// a command's later output to stdout is dropped without trying.
+static STDOUT_CLOSED: AtomicBool = AtomicBool::new(false);
+
 pub(crate) fn warn_stdout(error: &io::Error) {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Relaxed) {
         emit_diagnostic(format_args!(
             "syq: warning: could not write human output to stdout: {error}"
         ));
+    }
+}
+
+/// Print a command's own output as written, such as `--version`, a listing
+/// or JSON. Unlike a copy's human output, which warns when stdout is closed,
+/// a command's output ends quietly then, as when piped into `head`: the
+/// reader has what it wanted. Another write failure is reported once on
+/// stderr. Neither changes the command's outcome.
+pub(crate) fn emit_command_stdout(args: Arguments<'_>) {
+    if STDOUT_CLOSED.load(Relaxed) {
+        return;
+    }
+    let mut out = io::stdout().lock();
+    if let Err(error) = out.write_fmt(args).and_then(|()| out.flush()) {
+        command_stdout_failed(&error);
+    }
+}
+
+/// A command's own human output, escaped and placed as `human_stdout!`
+/// does, ending quietly when stdout is closed as `emit_command_stdout` does.
+pub(crate) fn emit_command_human_stdout(args: Arguments<'_>) {
+    if STDOUT_CLOSED.load(Relaxed) {
+        return;
+    }
+    if let Err(error) = write_stdout(format_args!("{}", safe_message(args))) {
+        command_stdout_failed(&error);
+    }
+}
+
+fn command_stdout_failed(error: &io::Error) {
+    if error.kind() == io::ErrorKind::BrokenPipe {
+        STDOUT_CLOSED.store(true, Relaxed);
+    } else {
+        warn_stdout(error);
+    }
+}
+
+/// Stdout for a command that writes its output as a stream: a closed stdout
+/// accepts and drops the rest, so the command ends with its usual status.
+/// Other write errors still reach the caller.
+pub(crate) fn command_stdout() -> CommandStdout {
+    CommandStdout(io::stdout().lock())
+}
+
+pub(crate) struct CommandStdout(io::StdoutLock<'static>);
+
+impl CommandStdout {
+    fn closed(&self, error: io::Error) -> io::Result<()> {
+        if error.kind() == io::ErrorKind::BrokenPipe {
+            STDOUT_CLOSED.store(true, Relaxed);
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+}
+
+impl Write for CommandStdout {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if STDOUT_CLOSED.load(Relaxed) {
+            return Ok(buffer.len());
+        }
+        match self.0.write(buffer) {
+            Err(error) => self.closed(error).map(|()| buffer.len()),
+            written => written,
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if STDOUT_CLOSED.load(Relaxed) {
+            return Ok(());
+        }
+        match self.0.flush() {
+            Err(error) => self.closed(error),
+            flushed => flushed,
+        }
     }
 }
 
@@ -156,6 +236,23 @@ pub(crate) fn pass_through(
         }
     }
 }
+
+macro_rules! command_print {
+    ($($arg:tt)*) => { $crate::output::emit_command_stdout(format_args!($($arg)*)) };
+}
+pub(crate) use command_print;
+
+macro_rules! command_human_stdout {
+    ($($arg:tt)*) => { $crate::output::emit_command_human_stdout(format_args!($($arg)*)) };
+}
+pub(crate) use command_human_stdout;
+
+macro_rules! command_println {
+    ($($arg:tt)*) => {
+        $crate::output::emit_command_stdout(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+pub(crate) use command_println;
 
 macro_rules! diagnostic {
     ($($arg:tt)*) => { $crate::output::emit_diagnostic(format_args!($($arg)*)) };

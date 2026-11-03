@@ -186,9 +186,9 @@ fn parse_action(argv: &[OsString]) -> Result<CompletionAction, clap::Error> {
 pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     let action = parse_action(argv).unwrap_or_else(|error| error.exit());
     match action {
-        CompletionAction::Bash => print!("{BASH_ADAPTER}"),
-        CompletionAction::Zsh => print!("{ZSH_ADAPTER}"),
-        CompletionAction::Fish => print!("{FISH_ADAPTER}"),
+        CompletionAction::Bash => crate::output::command_print!("{BASH_ADAPTER}"),
+        CompletionAction::Zsh => crate::output::command_print!("{ZSH_ADAPTER}"),
+        CompletionAction::Fish => crate::output::command_print!("{FISH_ADAPTER}"),
         CompletionAction::Cache { action } => run_cache(action)?,
         CompletionAction::Complete {
             shell,
@@ -248,10 +248,10 @@ fn run_cache(action: CacheAction) -> Result<()> {
         CacheAction::List => {
             let cache = read_cache()?;
             if cache.endpoints.is_empty() {
-                println!("completion endpoint cache is empty");
+                crate::output::command_println!("completion endpoint cache is empty");
             } else {
                 for endpoint in cache.endpoints {
-                    println!("{}", endpoint_label(&endpoint.endpoint()));
+                    crate::output::command_println!("{}", endpoint_label(&endpoint.endpoint()));
                 }
             }
         }
@@ -264,9 +264,9 @@ fn run_cache(action: CacheAction) -> Result<()> {
                 before != cache.endpoints.len()
             })?;
             if removed {
-                println!("forgot {}", endpoint_label(&endpoint));
+                crate::output::command_println!("forgot {}", endpoint_label(&endpoint));
             } else {
-                println!("{} was not cached", endpoint_label(&endpoint));
+                crate::output::command_println!("{} was not cached", endpoint_label(&endpoint));
             }
         }
         CacheAction::Clear => {
@@ -279,9 +279,9 @@ fn run_cache(action: CacheAction) -> Result<()> {
                 None => None,
             };
             match std::fs::remove_file(&path) {
-                Ok(()) => println!("completion endpoint cache cleared"),
+                Ok(()) => crate::output::command_println!("completion endpoint cache cleared"),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    println!("completion endpoint cache was already empty")
+                    crate::output::command_println!("completion endpoint cache was already empty")
                 }
                 Err(error) => {
                     return Err(error).with_context(|| format!("remove {}", path.display()))
@@ -498,7 +498,7 @@ fn details_requested() -> bool {
 }
 
 fn write_candidates(shell: CompletionShell, candidates: Vec<Candidate>) -> Result<()> {
-    let mut stdout = std::io::stdout().lock();
+    let mut stdout = crate::output::command_stdout();
     let mut seen = HashSet::new();
     for candidate in candidates {
         if candidate.value.contains(&0) || !seen.insert(candidate.value.clone()) {
