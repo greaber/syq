@@ -808,6 +808,11 @@ expands to. Some copies take fewer:
   sources. A receiving machine also limits the size of the request it
   approves, so long names lower that: to about 890 names of 20 characters, or
   460 of 50.
+- A [copy between two servers](remote-to-remote.md) passes its named sources
+  to the server that runs it on a command line, which holds 128 KiB, and each
+  path takes about a third more room there than its length. So 1,024 sources
+  fit when their paths average up to about 90 characters, and 500 when they
+  average up to about 190.
 - With `--prune`, a copy checks every named source against every other in
   one request, which holds about 950 sources with 8-character names, or 630
   with 20-character names.
