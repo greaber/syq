@@ -1340,6 +1340,44 @@ fn retained_operator_directory_reports_source_ancestry_without_following_suffix_
 /// A source's relation to the shared directories together is the first
 /// relation that refuses pruning, or that cannot be checked, found by
 /// comparing each pair, with each directory and ancestry walked only once.
+/// A bind mount of `source` at `target` for one test, removed when dropped.
+/// Only Linux has these calls, and only a superuser may make one.
+struct BindMount(#[allow(dead_code)] PathBuf);
+
+impl BindMount {
+    #[cfg(target_os = "linux")]
+    fn new(source: &Path, target: &Path) -> Option<Self> {
+        if !is_superuser() {
+            return None;
+        }
+        let source = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+        let target_name = std::ffi::CString::new(target.as_os_str().as_bytes()).unwrap();
+        let mounted = unsafe {
+            libc::mount(
+                source.as_ptr(),
+                target_name.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            ) == 0
+        };
+        mounted.then(|| Self(target.to_path_buf()))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn new(_source: &Path, _target: &Path) -> Option<Self> {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for BindMount {
+    fn drop(&mut self) {
+        let target = std::ffi::CString::new(self.0.as_os_str().as_bytes()).unwrap();
+        unsafe { libc::umount(target.as_ptr()) };
+    }
+}
+
 /// The shared walk gives every source the relations master's per-pair check
 /// gave it, over generated sources and destinations: nested and overlapping
 /// roots, `.` and `..`, missing and non-directory components, symlinks,
@@ -1409,33 +1447,13 @@ fn shared_ancestry_matches_masters_pairwise_check() {
         sources.push((other.path().join("p"), true));
         suffixes.extend(["shm", "shm/p", "shm/p/new"]);
     }
-    // A bind mount gives one directory a second place: as root, typically
-    // under `unshare --user --map-root-user --mount`.
+    // A bind mount gives one directory a second place: on Linux as root,
+    // typically under `unshare --user --map-root-user --mount`. Elsewhere the
+    // directory stays empty, an ordinary case.
     let bound = root.join("dst/a/bound");
     fs::create_dir(&bound).unwrap();
-    let mounted = is_superuser() && {
-        let source = std::ffi::CString::new(root.join("src").as_os_str().as_bytes()).unwrap();
-        let target = std::ffi::CString::new(bound.as_os_str().as_bytes()).unwrap();
-        unsafe {
-            libc::mount(
-                source.as_ptr(),
-                target.as_ptr(),
-                std::ptr::null(),
-                libc::MS_BIND,
-                std::ptr::null(),
-            ) == 0
-        }
-    };
-    struct Unmount(PathBuf, bool);
-    impl Drop for Unmount {
-        fn drop(&mut self) {
-            if self.1 {
-                let target = std::ffi::CString::new(self.0.as_os_str().as_bytes()).unwrap();
-                unsafe { libc::umount(target.as_ptr()) };
-            }
-        }
-    }
-    let _unmount = Unmount(bound.clone(), mounted);
+    let _bind = BindMount::new(&root.join("src"), &bound);
+    let mounted = _bind.is_some();
     suffixes.extend(["a/bound", "a/bound/x", "a/bound/x/new"]);
 
     let session = DescriptorSessionSlot::default();
