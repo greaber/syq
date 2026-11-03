@@ -800,12 +800,12 @@ with `--follow-src`, symlinks cannot lead outside the root. `-C` permits both.
 One copy accepts up to 1,024 named sources, such as the names a shell glob
 expands to. Some copies take fewer:
 
-- A copy that runs on an approval, such as a
-  [restricted copy between servers](remote-reference.md#enrollment) or a copy
-  a [receiving machine](receive.md) approves, carries its whole command in
-  that approval, which holds 256 KiB of it. So 1,024 named sources fit when
-  the arguments naming them average up to about 250 characters.
-- A [copy between two servers](remote-to-remote.md) passes its named sources
+- A copy a [receiving machine](receive.md) approves carries its whole
+  command in that approval, and the command can be at most 256 KiB. So 1,024
+  named sources fit when the arguments naming them average up to about 250
+  characters.
+- A [copy between two servers](remote-to-remote.md), including a
+  [restricted copy](remote-reference.md#enrollment), passes its named sources
   to the server that runs it on a command line, which holds 128 KiB, and each
   path takes about a third more room there than its length. So 1,024 sources
   fit when their paths average up to about 90 characters, and 500 when they

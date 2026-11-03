@@ -60,6 +60,9 @@ const MAX_REQUEST_MESSAGE: usize = 4 * 1024 * 1024;
 /// messages allow.
 const LARGE_MESSAGE_READS: usize = 4;
 static LARGE_READS: AtomicUsize = AtomicUsize::new(0);
+/// How long a message larger than an ordinary one may take to arrive: a
+/// few megabytes take a slow link longer than an ordinary message's deadline.
+pub(crate) const LARGE_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a registering server waits for the receiving laptop's handshake.
@@ -312,18 +315,23 @@ pub(crate) fn write_message(writer: &mut impl Write, message: &impl Serialize) -
     )
 }
 pub(crate) fn read_message<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
+    read_message_extending(reader, |_| ())
+}
+/// As `read_message`, calling `large` before reading a message larger than
+/// an ordinary one, to give it until `LARGE_MESSAGE_TIMEOUT`.
+pub(crate) fn read_message_extending<R: Read, T: DeserializeOwned>(
+    reader: &mut R,
+    large: impl FnOnce(&mut R),
+) -> Result<T> {
     let length = read_frame_length(reader, MAX_REQUEST_MESSAGE, "named destination message")?;
-    let _large = if length > MAX_MESSAGE {
-        let Some(read) = LargeRead::start() else {
-            // Read the rest without keeping it, so that the sender sees why.
-            std::io::copy(&mut reader.take(length as u64), &mut std::io::sink())?;
-            bail!(
-                "the receiving machine is busy reading {LARGE_MESSAGE_READS} other large requests; retry"
-            );
-        };
-        Some(read)
-    } else {
-        None
+    if length <= MAX_MESSAGE {
+        return read_frame_body(reader, length);
+    }
+    large(reader);
+    let Some(_read) = LargeRead::start() else {
+        // Read the rest without keeping it, so that the sender sees why.
+        std::io::copy(&mut reader.take(length as u64), &mut std::io::sink())?;
+        bail!("busy reading {LARGE_MESSAGE_READS} other large requests; retry");
     };
     read_frame_body(reader, length)
 }
@@ -501,10 +509,14 @@ pub(crate) fn read_socket_message<T: DeserializeOwned>(
     socket: &mut UnixStream,
     timeout: Duration,
 ) -> Result<T> {
-    read_message(&mut DeadlineSocket {
-        socket,
-        deadline: Instant::now() + timeout,
-    })
+    let started = Instant::now();
+    read_message_extending(
+        &mut DeadlineSocket {
+            socket,
+            deadline: started + timeout,
+        },
+        |reader| reader.deadline = reader.deadline.max(started + LARGE_MESSAGE_TIMEOUT),
+    )
 }
 
 fn connect_socket(
@@ -1095,6 +1107,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     let handoff::Selection {
         name, registration, ..
     } = selection;
+    let command = crate::approval_command::copy_command(args)?;
     let request = crate::restricted::named_request(
         args,
         crate::destination_results::ReceiptPolicy::unused()?,
@@ -1103,7 +1116,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     let (_, reply) = exchange(
         &registration,
         Message::Request {
-            command: crate::approval_command::current()?,
+            command,
             cwd: crate::approval_command::current_directory(),
             request: Box::new(request),
         },

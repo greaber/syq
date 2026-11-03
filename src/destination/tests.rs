@@ -923,8 +923,6 @@ fn named_copy_with_transport(tcp: bool) {
     );
 }
 
-/// The receiving machine never runs as root, so a laptop download accepts
-/// ownership and special files as any copy by an ordinary account does.
 /// As many named sources as any copy takes, with names long enough that
 /// their request is several times the size of an ordinary message.
 #[test]
@@ -1015,6 +1013,24 @@ fn only_a_few_large_messages_are_read_at_once() {
     assert_eq!(LARGE_READS.load(Ordering::Acquire), 0);
 }
 
+/// A large message may take longer to arrive than an ordinary one.
+#[test]
+fn a_large_message_may_arrive_after_the_ordinary_deadline() {
+    let mut bytes = Vec::new();
+    write_message(&mut bytes, &"x".repeat(MAX_MESSAGE)).unwrap();
+    let (mut client, mut server) = UnixStream::pair().unwrap();
+    let reader = std::thread::spawn(move || {
+        read_socket_message::<String>(&mut server, Duration::from_millis(100))
+            .map(|text| text.len())
+    });
+    client.write_all(&bytes[..4]).unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    client.write_all(&bytes[4..]).unwrap();
+    assert_eq!(reader.join().unwrap().unwrap(), MAX_MESSAGE);
+}
+
+/// The receiving machine never runs as root, so a laptop download accepts
+/// ownership and special files as any copy by an ordinary account does.
 #[test]
 fn named_copy_accepts_ownership_and_special_files() {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};

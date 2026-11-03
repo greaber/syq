@@ -1236,7 +1236,7 @@ fn run_remote(
             .then(|| {
                 crate::restricted::prepare_transfer(
                     args,
-                    crate::approval_command::current()?,
+                    crate::approval_command::copy_command(args)?,
                     srcs,
                     dst,
                     &coordinator_policy.login_user,
