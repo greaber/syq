@@ -2,9 +2,9 @@
 
 `python3 scripts/agent-coordination.py` coordinates sessions on one machine
 through shared files. It needs Python 3.9 or later on Linux or macOS. Reviews
-also need Git, `gh`, tmux, and the selected `claude` or `codex` executable.
-It does not install tools or inject terminal input. It starts reviewers with
-permission prompts turned off, at `xhigh` effort by default; see
+also need Git, `gh`, and the selected `claude` or `codex` executable. It does
+not install tools. It runs reviewers in the background with permission prompts
+turned off, at `xhigh` effort by default; see
 [Reviewer settings](#reviewer-settings). Reviewers receive access to the
 selected state directory with `--add-dir`.
 Run it from your task worktree. If that branch predates the tool, invoke the
@@ -130,8 +130,8 @@ python3 scripts/agent-coordination.py topic wait transfer-experiments --agent im
 
 The wait returns unread events and leaves them unread until `topic ack`. A
 timeout or interruption preserves the subscription and cursor; wait again when
-ready. This works for general coordination with either runtime, including
-review inboxes. It does not wake an agent that has stopped checking updates.
+ready. This works for general coordination with either runtime. It does not
+wake an agent that has stopped checking updates.
 
 ## Review and triage
 
@@ -151,48 +151,50 @@ Claude is the default reviewer; choose `--reviewer codex` for a Codex reviewer.
 [Reviewer settings](#reviewer-settings) lists the model, effort, and permission
 flags each one uses. The tool resolves the GitHub PR head and repository
 identity, checks that your clean task branch matches it, fetches the head/base
-commits using matching configured repository URLs, and creates one worktree,
-tmux window, and interactive reviewer session per request.
-Later rounds publish to that reviewer’s inbox topic; the same session receives
-the next prompt through `topic wait`. They reuse the window and advance the
-existing worktree without clearing `target/`, so builds can reuse artifacts. The
-worktree name includes the PR number and request ID, and stays stable as the SHA
-changes. A fork base without a configured remote uses its GitHub HTTPS URL.
-A dirty checkout is preserved and must be resolved before advancing.
-The window runs an ordinary interactive reviewer with an initial prompt; no
-keystrokes are injected. You can attach and discuss its findings. The reviewer
-reads the project’s existing `AGENTS.md`; no standing resource policy is added.
+commits using matching configured repository URLs, and creates one worktree and
+one reviewer session per request. Later rounds advance that worktree without
+clearing `target/`, so builds can reuse artifacts. The worktree name includes
+the PR number and request ID, and stays stable as the SHA changes. A fork base
+without a configured remote uses its GitHub HTTPS URL. A dirty checkout is
+preserved and must be resolved before advancing. The reviewer reads the
+project’s existing `AGENTS.md`; no standing resource policy is added.
+
+Each round runs one non-interactive reviewer process in the background,
+detached from the command that started it. The first round starts the
+reviewer's session and later rounds resume it, so the reviewer keeps its
+context; nobody can answer its questions while it runs. Its output goes to
+`reviewer.log` next to the round's prompt in the state directory. `review status
+REVIEW_ID` shows the process ID (`pid`), whether it is still `running`, and the
+`log` path. The process starts from the command that launched it, so it runs in
+that command's sandbox, if any, but it does not inherit the requesting agent's
+own Claude Code or Codex session variables.
 
 Each review round has its own prompt, immutable report, and triage Markdown.
-Reviewers finish their commands before submitting: publication allows the next
-round to advance the checkout. The existing conversation keeps its context;
-check HEAD and use the recorded SHA when discussing an earlier revision.
 The reviewer publishes by running the `review submit` command in its prompt,
 including the round number, reviewed SHA, and verdict (`clean`, `findings`, or
-`blocked`). A terminal answer or a process exiting successfully is not enough.
-After submitting, the reviewer follows `reviewer_next_action` and waits on its
-inbox topic in bounded calls. Timeouts are normal; they do not acknowledge or
-discard an update. If you interrupt to discuss findings, ask the reviewer to
-resume checking its inbox afterward. No injected keystroke competes with your
-input, but an agent that stops waiting will not wake itself. Completion, an
-explicit stop, or the round limit publishes a stop-waiting update.
+`blocked`), and then ends its turn, which ends the process. A final answer or a
+process exiting successfully is not enough. Submitting hands the checkout back
+to the implementer, so reviewers finish their commands first. When the next
+round is requested while the previous process is still finishing, the tool waits
+up to a minute for it to exit.
 
-If the reviewer exits without submitting, status becomes `failed`. Its tmux
-pane remains available. `review resume REVIEW_ID --agent NAME` resumes the
-saved Claude or Codex conversation in that same pane, without creating another
-window. It refuses to replace a live process. If the saved session ID was not
-recorded, supply its exact ID with `--session`; the tool does not guess from the
-most recent unrelated session. Requests created with the older per-round-window
-implementation cannot consume these updates; start a new request explicitly.
-Use the same tool version for all participants in a review request.
+If the process exits or dies without submitting, the status becomes `failed`
+and `next_action` names the log. `review resume REVIEW_ID --agent NAME` reruns
+that round in the same session, and `review next` starts a new round at the
+current PR head; both refuse while a reviewer process is running. Codex reports
+its session ID when it starts, and the tool records it. If none was recorded, a
+rerun starts a new Codex session unless you supply the exact ID with `--session`.
+A request started by an earlier, interactive version of this tool can still
+submit its report and be triaged; exit that interactive reviewer in its tmux
+pane before starting another round. Use the same tool version for all
+participants in a review request.
 
 To request an independent second reviewer, run another `review start` with
 `--additional-reviewer`, choosing Claude (the default) or Codex with
-`--reviewer`. It gets its own
-conversation, window, worktree, reports, round limit, and reviewer options, all
-reused across its own rounds. Each request is triaged separately; there is no
-automatic agreement rule between reviewers. Use collect or triage mode when you
-want to compare their reports before deciding on fixes.
+`--reviewer`. It gets its own session, process, worktree, reports, round limit,
+and reviewer settings, all reused across its own rounds. Each request is triaged
+separately; there is no automatic agreement rule between reviewers. Use collect
+or triage mode when you want to compare their reports before deciding on fixes.
 
 The requesting agent stays in the original conversation:
 
@@ -244,38 +246,44 @@ Previous reports/dispositions stay available, while reviewers are instructed to
 inspect the new code independently first. Review completion never grants merge
 permission. These are workflow instructions, not a sandbox around the agents.
 
-`review stop-loop REVIEW_ID --agent NAME` prevents continuation without killing
-an interactive reviewer or its jobs. An outstanding reviewer may still submit
-its report, but that submission does not restart the loop. The request’s worktree and reviewer
-window are retained for discussion; inspect cleanliness and running processes
-before removing them with normal Git/tmux commands.
+`review stop-loop REVIEW_ID --agent NAME` prevents continuation without stopping
+a running reviewer process. That reviewer may still submit its report, but the
+submission does not restart the loop. The request’s worktree is retained; check
+that its reviewer is no longer `running` and that the worktree is clean before
+removing it with `git worktree remove`.
 
 ### Reviewer settings
 
-Both reviewers start at `xhigh` effort with permission prompts turned off:
+Both reviewers run at `xhigh` effort with permission prompts turned off:
 
-| Reviewer | Default command, before the tool's own arguments and prompt |
-| --- | --- |
-| `claude` | `claude --model claude-opus-5-5 --effort xhigh --dangerously-skip-permissions` |
-| `codex` | `codex --model gpt-6-astra -c 'model_reasoning_effort="xhigh"' --dangerously-bypass-approvals-and-sandbox` |
+| Reviewer | Model | Effort and permission flags |
+| --- | --- | --- |
+| `claude` | `--model claude-opus-5-5` | `--effort xhigh --dangerously-skip-permissions` |
+| `codex` | `--model gpt-6-astra` | `-c 'model_reasoning_effort="xhigh"' --dangerously-bypass-approvals-and-sandbox` |
 
-The reviewer therefore runs any command it chooses as your user, without asking
-and, for Codex, without a sandbox. Start reviews only where you would run that
-tool the same way yourself.
+Claude runs as `claude -p --output-format stream-json --verbose`, with
+`--session-id` in the first round and `--resume` afterwards. Codex runs as
+`codex exec --json`, and later as `codex exec resume SESSION_ID`. The reviewer
+therefore runs any command it chooses as your user, without asking and, for
+Codex, without a sandbox. Start reviews only where you would run that tool the
+same way yourself.
 
 `--model MODEL` and `--effort LEVEL` override the defaults; lower effort suits
 small or test-only changes. For Codex, `--model gpt-6.1-sol` selects GPT-6.1
-Sol instead of GPT-6 Astra. To add any other argument, repeat
-`--reviewer-option` once per argument. Each value is one argument, with no shell
-interpretation; write a value that starts with `-` as `--reviewer-option=VALUE`.
-The request records these settings and uses them on the first launch and on
-`review resume`; later rounds continue in the same session. For example:
+Sol instead of GPT-6 Astra:
 
 ```sh
 python3 scripts/agent-coordination.py review start --pr 123 --agent implementation \
-  --reviewer codex --model gpt-6.1-sol --effort high --reviewer-option=--search \
-  --additional-reviewer --brief target/task-brief.md
+  --reviewer codex --model gpt-6.1-sol --effort high --additional-reviewer \
+  --brief target/task-brief.md
 ```
+
+To add any other argument, repeat `--reviewer-option` once per argument; for
+example, `--reviewer-option=--append-system-prompt --reviewer-option='Focus on
+the wire protocol.'` adds to a Claude reviewer's system prompt. Each value is
+one argument, with no shell interpretation; write a value that starts with `-`
+as `--reviewer-option=VALUE`. The request records these settings and uses them
+for every reviewer process it runs, including later rounds and reruns.
 
 ## Checks
 
