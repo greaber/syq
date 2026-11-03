@@ -136,6 +136,9 @@ pub struct Jobs {
     /// when first asked, then extended over the jobs planned since.
     destination_names: HashMap<(u64, u64), u32>,
     named: usize,
+    /// One bit for each job a worker has asked the destination to prepare
+    /// (`first_preparation`).
+    prepared: Vec<u64>,
 }
 
 /// The device and inode of a destination file other names may share.
@@ -210,6 +213,20 @@ impl Jobs {
 
     pub fn len(&self) -> usize {
         self.destinations.len()
+    }
+
+    /// Record that job `idx` is being prepared at the destination, and
+    /// whether this is its first preparation. A preparation repeated after
+    /// a dropped connection or a source change can find the partial file an
+    /// earlier one made.
+    pub fn first_preparation(&mut self, idx: usize) -> bool {
+        let (word, bit) = (idx / 64, 1u64 << (idx % 64));
+        if word >= self.prepared.len() {
+            self.prepared.resize(word + 1, 0);
+        }
+        let first = self.prepared[word] & bit == 0;
+        self.prepared[word] |= bit;
+        first
     }
 
     pub fn is_empty(&self) -> bool {

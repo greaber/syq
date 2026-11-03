@@ -1925,15 +1925,17 @@ impl Worker {
         // from this copy's own: one repeated after a dropped connection or a
         // source change can find the partial this copy made. A first
         // preparation whose reply was lost counts as finding none.
-        self.progress
-            .earlier_partials
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(idx)
-            .or_insert(
-                job.attempt == 0
-                    && matches!(&sent, Ok(Response::Prepared(prepared)) if prepared.has_candidates),
-            );
+        let first = self.sched.jobs.lock().unwrap().first_preparation(idx);
+        if first
+            && job.attempt == 0
+            && matches!(&sent, Ok(Response::Prepared(prepared)) if prepared.has_candidates)
+        {
+            self.progress
+                .earlier_partials
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(idx);
+        }
         let reply = change_ok(sent?, "prepare");
         // A restricted receiver now holds the file unfinished, unless the
         // preparation only looked and found nothing of it, as the receiver
