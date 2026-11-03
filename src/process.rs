@@ -263,6 +263,24 @@ pub(crate) fn capture_output_bounded(
     cancelled: &dyn Fn() -> bool,
     max_output_bytes: usize,
 ) -> std::io::Result<Output> {
+    capture_output_bounded_with(
+        command,
+        deadline,
+        cancelled,
+        max_output_bytes,
+        &mut std::thread::sleep,
+    )
+}
+
+/// `capture_output_bounded`, waiting with `wait` before each new look for
+/// the exit of a command that has closed its output.
+fn capture_output_bounded_with(
+    command: &mut Command,
+    deadline: std::time::Instant,
+    cancelled: &dyn Fn() -> bool,
+    max_output_bytes: usize,
+    wait: &mut dyn FnMut(std::time::Duration),
+) -> std::io::Result<Output> {
     use std::io::{self, Read};
     use std::os::fd::{AsRawFd, RawFd};
     use std::time::{Duration, Instant};
@@ -366,7 +384,7 @@ pub(crate) fn capture_output_bounded(
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error),
             }
-            std::thread::sleep(exit_wait.min(deadline.saturating_duration_since(Instant::now())));
+            wait(exit_wait.min(deadline.saturating_duration_since(Instant::now())));
             exit_wait = (exit_wait * 2).min(CHECK_INTERVAL);
             continue;
         }
@@ -542,28 +560,37 @@ mod bounded_tests {
     }
 
     #[test]
-    fn returns_soon_after_the_command_exits() {
+    fn looks_for_the_exit_soon_after_the_output_closes() {
         // A command that has closed its output is about to exit, as ssh is
-        // once it has printed its configuration. Waiting a whole polling
+        // once it has printed its configuration; waiting a whole check
         // interval for that would add the interval to every SSH
-        // configuration check. The fastest of a few attempts stays well
-        // under the old 20 ms interval even on a busy host.
-        let fastest = (0..5)
-            .map(|_| {
-                let started = Instant::now();
-                let output = capture(
-                    "printf done; exec >&- 2>&-; sleep 0.002",
-                    Duration::from_secs(5),
-                    &|| false,
-                    64,
-                )
-                .unwrap();
-                assert_eq!(output.stdout, b"done");
-                started.elapsed()
-            })
-            .min()
-            .unwrap();
-        assert!(fastest < Duration::from_millis(15), "{fastest:?}");
+        // configuration check. Record the waits rather than time the
+        // command, whose start-up time varies widely between hosts.
+        let mut waits = Vec::new();
+        let output = capture_output_bounded_with(
+            Command::new("sh").args(["-c", "printf done; exec >&- 2>&-; sleep 0.2"]),
+            Instant::now() + Duration::from_secs(10),
+            &|| false,
+            64,
+            &mut |wait| {
+                waits.push(wait);
+                std::thread::sleep(wait);
+            },
+        )
+        .unwrap();
+        assert_eq!(output.stdout, b"done");
+        assert!(output.status.success());
+        let interval = Duration::from_millis(20);
+        assert!(
+            waits
+                .first()
+                .is_some_and(|first| *first <= Duration::from_millis(1)),
+            "{waits:?}"
+        );
+        // Then less and less often, never longer than the check interval.
+        for pair in waits.windows(2) {
+            assert_eq!(pair[1], (pair[0] * 2).min(interval), "{waits:?}");
+        }
     }
 
     #[test]
