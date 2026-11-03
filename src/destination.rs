@@ -31,7 +31,7 @@ use crate::private_broker::{PrivateBroker, PrivateBrokerConfig, TrackedStream};
 pub(crate) mod account_copy;
 pub(crate) mod exec;
 mod forward;
-pub(crate) use forward::DeadlineIo;
+pub(crate) use forward::{DeadlineIo, HandshakeInput};
 pub(crate) mod handoff;
 mod identity;
 pub(crate) mod peer_bridge;

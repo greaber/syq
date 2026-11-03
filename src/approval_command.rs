@@ -7,7 +7,7 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 /// Commands are small; this bound only keeps a hostile request cheap to reject.
-const MAX_COMMAND_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_COMMAND_BYTES: usize = 256 * 1024;
 
 /// The requesting process's public command line, after options taken from the
 /// environment, without the program name.
@@ -90,7 +90,7 @@ pub(crate) fn check_copy(
 /// request deletes nothing, so only the command says so.
 pub(crate) fn dry_run_prunes(command: &[Vec<u8>]) -> Result<bool> {
     let args = parse(command)?;
-    Ok(args.dry_run && crate::restricted::requests_pruning(&args))
+    Ok(args.dry_run && crate::directive::requests_pruning(&args))
 }
 
 /// Validate the authorizer chosen on the requesting host. An omitted or `auto`

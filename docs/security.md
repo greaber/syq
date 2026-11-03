@@ -248,32 +248,40 @@ The protection has several parts:
    copy you authorize and uses it for every connection to the receiver,
    checking hostB's host key against the keys your laptop trusts. The entry
    key can start the receiver but authorizes nothing: anyone holding it,
-   including a server that ran an earlier copy, still needs a newly signed grant
-   to copy files. Your login key and SSH agent stay on your
-   laptop; no agent is forwarded. The entry key is stored unencrypted on your
-   laptop. Keep it dedicated to the receiver: authorizing it elsewhere would
-   give hostA that access too.
-3. **Sign the particular copy with your login key.** Your laptop signs a
-   grant stating the permitted destination paths, write and deletion
-   permissions, limits, and expiry, using the key you log in to hostB with.
-   HostB's receiver checks the signature against that key, including a FIDO
-   key's touch and PIN and a certificate's expiry, records that the
-   grant has been used, and enforces it throughout the transfer. HostA
-   cannot broaden the grant or redeem it again for a later copy. The
+   including a server that ran an earlier copy, still needs a copy you newly
+   signed to copy files. A connection made with the entry key has 10 seconds
+   to present one, or to join a copy already running, and the receiver
+   refuses a connection right away when 32 others are still doing so. One
+   copy starts at most 32 connections at once. A server that keeps the entry
+   key from an earlier copy can keep all 32 busy. While it does, copies that
+   start can fail and running copies cannot add or replace connections,
+   until you revoke the enrollment and enroll again, which replaces the
+   entry key.
+   Your login key and SSH agent stay on your laptop; no agent is forwarded.
+   The entry key is stored unencrypted on your laptop. Keep it dedicated to
+   the receiver: authorizing it elsewhere would give hostA that access too.
+3. **Sign the particular copy with your login key.** Your laptop signs the
+   copy's command, as you ran it, with its expiry, using the key you log in
+   to hostB with. HostB's receiver checks the signature against that key,
+   including a FIDO key's touch and PIN and a certificate's expiry, works out
+   the permitted destination paths, write and deletion permissions, and
+   limits from the command itself, as your laptop did, records that the copy
+   has started, and enforces those permissions throughout the transfer.
+   HostA cannot change the command or use it again for a later copy. The
    signature is made for syq copies alone and cannot pass as a login.
 4. **Check the outcome with hostB.** The receiver reports each change it
    makes, protected by a key hostB created during setup. HostA passes the
    reports to your laptop, which checks that they are hostB's and that hostA
    left none out, added none, and did not cut them short.
 
-An enrollment covers the whole account. Each copy's grant names its
+An enrollment covers the whole account. Each copy's command names its
 destination, which can be anywhere the account can write except the
 receiver's protected paths: the account's SSH configuration, syq's stored
 programs, enrollment state on either side, and receiving state, including
 syq's runtime directory (see [Enrollment](remote-reference.md#enrollment) for
 the list, and for the copies into a directory holding one that are refused).
 A file written elsewhere in the account, such as a shell startup file, can run code
-as the account, so a grant is as strong as a login. That is
+as the account, so a signed copy is as strong as a login. That is
 acceptable because only your login key can sign one, and you choose each
 destination.
 
@@ -307,15 +315,16 @@ would. See [Other authentication modes](remote-reference.md#other-authentication
 
 ### A compromised source server
 
-Suppose the grant permits hostA to copy into hostB's `/archive`. A compromised
-hostA can misuse the access that copy requires, but cannot grant itself more:
+Suppose the signed copy permits hostA to copy into hostB's `/archive`. A
+compromised hostA can misuse the access that copy requires, but cannot give
+itself more:
 
 HostA can:
 
 - Supply false contents, names, sizes, or timestamps.
 - Set any metadata the copy preserves, such as permissions, ACLs, or extended
   attributes, and with hard links give files in the scope new names.
-- Overwrite files where the grant permits overwriting.
+- Overwrite files where the signed copy permits overwriting.
 - Omit a source file and, if pruning is authorized, cause its destination copy
   to be deleted.
 - Inspect destination entries for copy planning and consume the allowed space.
@@ -326,15 +335,15 @@ HostA cannot:
 - Change the signed destination scope to write into `/etc` or an SSH
   configuration directory.
 - Overwrite existing files, change their permissions, owner or other
-  metadata, or give them new names with hard links, when the grant permits
-  only creating new ones, or delete files without permission.
+  metadata, or give them new names with hard links, when the signed copy
+  permits only creating new ones, or delete files without permission.
 - Exceed the signed byte, entry, or deletion limits.
-- Reuse the grant for another copy, use the entry key it keeps to start a
-  later copy without a newly signed grant, or use that key to run a
+- Reuse the signed copy for another copy, use the entry key it keeps to
+  start a later copy without one you newly signed, or use that key to run a
   shell.
 - Forge, alter, or cut short hostB's reports of its changes.
 
-A grant that permits only creating new files refuses hard links on
+A signed copy that permits only creating new files refuses hard links on
 filesystems whose link counts syq does not trust, such as SMB, SSHFS, and
 types syq does not recognize, because it cannot tell which file a link would
 name. On filesystems with neither an atomic no-replace rename nor hard links,
@@ -349,7 +358,7 @@ replaced, as in an ordinary copy; hostA decides when the copy looks names up
 and when it writes them.
 
 The filesystem limitations above still apply. HostB's account and receiver
-remain trusted to enforce the grant and report accurately. HostB's reports
+remain trusted to enforce the signed copy and report accurately. HostB's reports
 describe their work; they cannot prove that hostA supplied the right files. For
 example, they can accurately report that hostB wrote false contents provided by
 hostA.
@@ -475,8 +484,8 @@ and object settings, such as tags or Object Lock retention, within the
 authorizing credentials' permissions: some services accept request headers that
 a signature does not cover.
 Anyone with the URLs can reuse them until expiry; stopping receiving does not
-revoke them. Filesystem receiver roots, aggregate limits, and one-use grants
-do not apply.
+revoke them. Filesystem receiver roots, aggregate limits, and single-use
+signed copies do not apply.
 
 ## SSH account access
 
@@ -485,7 +494,7 @@ operation requests access to the destination account. Approval grants that
 account's authority, including arbitrary commands and access to its files.
 The displayed command is requester-supplied context; it is not an enforced
 command restriction. Copy paths, download roots, and byte limits do not constrain
-account permission. Explicit restricted-copy grants retain their own scope.
+account permission. Restricted copies you sign keep their own scope.
 
 **Allow** approves the source-account/destination-account pair for the current
 laptop-to-source receiving connection. **Remember** permits future authentications

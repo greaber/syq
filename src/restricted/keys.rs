@@ -439,7 +439,7 @@ pub(super) fn discover(
         if certificates.is_empty() {
             bail!("syq cannot find the certificate that logged in; load it into your SSH agent with its key (ssh-add), then retry");
         }
-        valid_certificates(certificates, super::now()?)?
+        valid_certificates(certificates, crate::directive::now()?)?
     } else {
         Vec::new()
     };

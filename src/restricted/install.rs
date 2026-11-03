@@ -57,39 +57,6 @@ pub(super) fn load_results_key(state: &Path) -> Result<PrivateKey> {
     PrivateKey::from_openssh(&encoded).context("parse results signing key")
 }
 
-/// The signer a grant names: the enrollment at one generation, so a grant
-/// issued before a refresh is refused after it.
-pub(super) fn signer_name(id: EnrollmentId, generation: u64) -> String {
-    format!("syq-enrollment-{id}-generation-{generation}")
-}
-
-pub(super) fn normalize_absolute(path: &std::ffi::OsStr, home: &Path) -> Result<PathBuf> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let bytes = path.as_bytes();
-    let raw = if bytes == b"~" {
-        home.to_path_buf()
-    } else if let Some(rest) = bytes.strip_prefix(b"~/") {
-        home.join(std::ffi::OsStr::from_bytes(rest))
-    } else if bytes.starts_with(b"/") {
-        PathBuf::from(path)
-    } else {
-        home.join(path)
-    };
-    let mut normalized = PathBuf::from("/");
-    for component in raw.components() {
-        match component {
-            std::path::Component::RootDir => {}
-            std::path::Component::Normal(component) => normalized.push(component),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                bail!("restricted destination must not contain .. components")
-            }
-            std::path::Component::Prefix(_) => bail!("unsupported destination prefix"),
-        }
-    }
-    Ok(normalized)
-}
-
 pub(super) fn requested_parent(destination: &Path) -> &Path {
     destination.parent().unwrap_or_else(|| Path::new("/"))
 }
@@ -589,6 +556,30 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+/// Remove a revoked enrollment's state. A session that started before the
+/// revocation was marked can still be writing in it, as when it records a
+/// directive, and it stops at its next check: try again for a moment rather
+/// than leave a revocation half done.
+pub(super) fn remove_revoked_state(state: &Path) -> Result<()> {
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match fs::remove_dir_all(state) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("remove revoked receiver state {}", state.display()))
+            }
+        }
+    }
+}
+
 pub(crate) fn remote_revoke() -> Result<()> {
     let request: RevokeRequest = read_request("revocation request")?;
     if request.version != CONFIG_VERSION {
@@ -642,8 +633,7 @@ pub(super) fn revoke_for_account(
     }
     if let Some(leases) = &leases {
         active::revoke(&state, leases)?;
-        fs::remove_dir_all(&state)
-            .with_context(|| format!("remove revoked receiver state {}", state.display()))?;
+        remove_revoked_state(&state)?;
     }
     drop(directory);
     println!("revoked {}", request.id);

@@ -214,15 +214,12 @@ impl Summary {
         getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("approval ID: {e}"))?;
         let permission = if request.copy.options.dry_run {
             "Preview only; no filesystem changes"
-        } else if request.copy.options.verify_only {
-            "Compare contents only; no filesystem changes"
         } else {
             use crate::delegation::ExistingDestinationPolicy::*;
             match request.copy.policy.existing {
                 Replace => "May create and overwrite matching entries",
                 Skip => "May create new entries; keep existing entries",
                 MustExist => "May change existing entries only",
-                UpdateIfOlder => bail!("unsupported receiving overwrite policy"),
             }
         };
         // Debug formatting preserves unusual bytes and escapes terminal
@@ -536,8 +533,6 @@ fn copy_notes(request: &crate::destination::CopyRequest, remote: bool) -> Vec<St
     let mut notes = Vec::new();
     if options.dry_run {
         notes.push("preview only".to_owned());
-    } else if options.verify_only {
-        notes.push("compares only, writes nothing".to_owned());
     } else {
         match request.copy.policy.existing {
             ExistingDestinationPolicy::Skip => notes.push("keeps existing files".to_owned()),
@@ -567,7 +562,7 @@ const UPDATE_IN_PLACE_WARNING: &str = "can write new contents into your existing
 fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
     let options = &request.copy.options;
     let extra = &request.constraints.extra_options;
-    if options.dry_run || options.verify_only {
+    if options.dry_run {
         return Vec::new();
     }
     let deletions = request.copy.limits.max_deletions;
@@ -1602,7 +1597,6 @@ mod tests {
                     preserve_devices: false,
                     compare_existing_by_content: false,
                     dry_run: false,
-                    verify_only: false,
                     compressed_transport: true,
                     tcp_port_lo: 47600,
                     tcp_port_hi: 47699,
@@ -2118,12 +2112,6 @@ mod tests {
         request.copy.options.dry_run = true;
         assert_eq!(copy_notes(&request, false), ["preview only"]);
         request.copy.options.dry_run = false;
-        request.copy.options.verify_only = true;
-        assert_eq!(
-            copy_notes(&request, false),
-            ["compares only, writes nothing"]
-        );
-        request.copy.options.verify_only = false;
         request.copy.policy.existing = ExistingDestinationPolicy::Skip;
         assert_eq!(copy_notes(&request, false), ["keeps existing files"]);
         assert_eq!(copy_notes(&request, true), ["keeps existing files"]);

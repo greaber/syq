@@ -13,7 +13,7 @@ control_path='unset'
 host='unset'
 next_is_control_path=false
 next_is_host=false
-restricted_worker=no
+entry_key=no
 return_receiver=no
 for argument do
     if [ "$next_is_host" = true ]; then
@@ -29,7 +29,7 @@ for argument do
     case "$argument" in
         ControlMaster=*) control_master=${argument#ControlMaster=} ;;
         ControlPath=*) control_path=${argument#ControlPath=} ;;
-        *--restricted-worker=*) restricted_worker=yes ;;
+        IdentityFile=*/entry-key) entry_key=yes ;;
         *--return-receiver*) return_receiver=yes ;;
         -S) next_is_control_path=true ;;
         --) next_is_host=true ;;
@@ -54,7 +54,18 @@ trace=${SYQ_REAL_SSH_TRACE_FILE:-/tmp/syq-real-ssh-ssh.trace}
 # Append fields so positional readers of the existing columns remain valid.
 printf 'phase=start\tpid=%s\thost=%s\tcontrol_master=%s\tcontrol_path=%s\tcontrol_socket=%s\tstrict_mux=%s\treturn_receiver=%s\n' \
     "$$" "$host" "$control_master" "$control_path" "$control_socket" "$strict_mux" "$return_receiver" >>"$trace"
-if [ "$restricted_worker" = yes ] && [ -f /tmp/syq-real-ssh-block-restricted-workers ]; then
+# Every connection to an enrolled receiver uses its entry key. The copy's
+# control connects first and its workers after it, so while the route test
+# blocks workers, the first of these connections passes and the rest fail.
+blocked=no
+if [ "$entry_key" = yes ] && [ -f /tmp/syq-real-ssh-block-restricted-workers ]; then
+    if [ -e /tmp/syq-real-ssh-block-restricted-workers.control ]; then
+        blocked=yes
+    else
+        : >/tmp/syq-real-ssh-block-restricted-workers.control
+    fi
+fi
+if [ "$blocked" = yes ]; then
     printf 'restricted SSH worker blocked by the route test\n' >&2
     status=255
 elif [ "$strict_mux" = yes ]; then

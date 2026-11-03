@@ -1638,7 +1638,7 @@ route_status=0
 syq cp --no-progress --no-tcp --performance-tuning workers=1 \
     --from source /tmp/syq-real-ssh/no-route-source \
     --to destination --as /tmp/syq-real-ssh/no-route-destination || route_status=$?
-ssh source 'rm /tmp/syq-real-ssh-block-restricted-workers'
+ssh source 'rm -f /tmp/syq-real-ssh-block-restricted-workers /tmp/syq-real-ssh-block-restricted-workers.control'
 test "$route_status" -ne 0
 ssh destination 'test ! -e /tmp/syq-real-ssh/no-route-destination'
 
