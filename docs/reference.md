@@ -794,6 +794,12 @@ Use `--root DIR` instead of `-C DIR` when selections must stay inside that
 directory. Sources must then be relative: `../private` is refused, and even
 with `--follow-src`, symlinks cannot lead outside the root. `-C` permits both.
 
+One copy accepts up to 1,024 named sources, such as the names a shell glob
+expands to. For more, select their parent directory with `--srcs-in` and leave
+out what you don't want with `--ignore` or `--where`, or split the copy. Each
+named source adds to the copy's setup time, and with `--prune` that time grows
+with the square of their number.
+
 ## Shell pipelines and file descriptors
 
 Use `--src-fd 0` to read bytes from standard input, or `--as-fd 1`
