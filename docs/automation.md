@@ -104,7 +104,9 @@ count fields are non-negative integers within the `u64` range.
 ### `run`
 
 Always first. Identifies the invocation with `run_id`, `started_at` (Unix
-seconds), `syq_version`, `mode` (`cp` or `rm`), `dry_run`, and `endpoints`.
+seconds), `syq_version` (what `syq --version` prints, such as `0.7.1`, or
+`0.7.1+dev.0123456789ab` for a development build), `mode` (`cp` or `rm`),
+`dry_run`, and `endpoints`.
 Endpoints identify role and kind (`local`, `ssh`, or `s3`). SSH endpoints carry
 host/user; S3 endpoints carry `host: "s3://BUCKET"` without a user. They omit
 credentials, headers, ports, and raw command arguments. Clients that predate S3

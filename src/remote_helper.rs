@@ -193,8 +193,8 @@ pub fn download_script(target: Target) -> String {
     let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
     let archive_url = format!("{RELEASE_BASE_URL}/{tag}/{}.gz", target.asset);
     let manifest_url = format!("{RELEASE_BASE_URL}/{tag}/syq-release-manifest.json");
-    let expected_version = format!("syq {}", env!("CARGO_PKG_VERSION"));
     let expected_identity = helper_identity();
+    let expected_version = format!("syq {}", crate::identity::version());
     format!(
         r#"set -u
 dir="{directory}"
@@ -338,8 +338,8 @@ trap - EXIT HUP INT TERM
 /// Install a verified release asset or the client executable over authenticated SSH.
 /// This path deliberately needs no remote downloader, hasher, or decompressor.
 pub fn upload_script(target: Target) -> String {
-    let expected_version = format!("syq {}", env!("CARGO_PKG_VERSION"));
     let expected_identity = helper_identity();
+    let expected_version = format!("syq {}", crate::identity::version());
     format!(
         r#"set -u
 install_umask=$(umask)
@@ -566,7 +566,7 @@ mod tests {
             .unwrap();
         let binary = format!(
             "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'syq {}'; else exit 1; fi\n",
-            env!("CARGO_PKG_VERSION")
+            crate::identity::version()
         );
         child
             .stdin

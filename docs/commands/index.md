@@ -90,4 +90,8 @@ root help. A trailing `--help` or `-h` selects common help.
 
 ## Build identity
 
-`syq --build-identity` prints the executable’s build identity. See [development builds](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md#another-platform-with-your-own-helpers).
+`syq --build-identity` prints the executable’s build identity. A release's
+identity is its version tag, such as `v0.7.1`. A development build's adds the
+revision it was built from, such as `v0.7.1+dev.0123456789ab`, and its
+`--version` and results stream report that version too. See
+[development builds](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md#another-platform-with-your-own-helpers).

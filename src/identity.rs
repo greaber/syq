@@ -9,6 +9,18 @@ pub const fn build() -> &'static str {
     env!("SYQ_BUILD_IDENTITY")
 }
 
+/// The version `--version` and the results stream report: a release's
+/// package version, and otherwise the build identity without its `v`, so
+/// that a development build, say `0.7.1+dev.0123456789ab`, is not mistaken
+/// for the release it was built from.
+pub fn version() -> &'static str {
+    if is_release_build() {
+        env!("CARGO_PKG_VERSION")
+    } else {
+        build().strip_prefix('v').unwrap_or(build())
+    }
+}
+
 /// The platform this executable was built for, reported by remote helpers in
 /// the wire handshake. This avoids a separate `uname` ssh round trip on a
 /// managed helper that is already installed.
@@ -73,6 +85,11 @@ mod tests {
             let release = format!("v{}", env!("CARGO_PKG_VERSION"));
             assert!(build().starts_with(&format!("{release}+dev.")));
             assert_ne!(build(), release);
+            if !is_release_build() {
+                assert_eq!(format!("v{}", version()), build());
+            }
+        } else {
+            assert_eq!(version(), env!("CARGO_PKG_VERSION"));
         }
     }
 }
