@@ -886,8 +886,9 @@ finally:
 assert remote("sha256sum /tmp/syq-real-ssh/forward/hostkey-ecdsa").split()[0] == source_hash
 print("case: a user certificate the source's SSH configuration names does not replace the entry key", flush=True)
 # The destination accepts a certificate the source's configuration offers,
-# which OpenSSH would offer before any plain key: the copy must still log in
-# with the entry key and reach the enrolled receiver.
+# which OpenSSH would offer before any plain key. A copy between the servers
+# started here, which the source coordinates with the entry key, must still
+# log in with it and reach the enrolled receiver.
 authority = run("ssh", "source", "rm -rf /tmp/syq-real-ssh-usercert && mkdir -m 700 /tmp/syq-real-ssh-usercert && "
                 "cd /tmp/syq-real-ssh-usercert && ssh-keygen -q -t ed25519 -N '' -f ca && "
                 "ssh-keygen -q -t ed25519 -N '' -f user && ssh-keygen -q -s ca -I user -n syq user.pub && "
@@ -899,8 +900,10 @@ try:
                            "-i /tmp/syq-real-ssh-usercert/user destination true"], timeout=40).returncode == 0
     with_source_config("Host destination\n  IdentityFile /tmp/syq-real-ssh-usercert/user\n"
                        "  CertificateFile /tmp/syq-real-ssh-usercert/user-cert.pub\n",
-                       lambda: copy("/tmp/syq-real-ssh/forward/hostkey-user-certificate",
-                                    auth=("--auth-from", "@laptop")))
+                       lambda: run("syq", "cp", "--from", "source",
+                                   "/tmp/syq-real-ssh/return-source/subdir/chunks.bin", "--to", "destination",
+                                   "--as", "/tmp/syq-real-ssh/forward/hostkey-user-certificate",
+                                   "--no-progress"))
 finally:
     run("ssh", "destination", "umask 077; cat > ~/.ssh/authorized_keys", stdin=authorized)
     run("ssh", "source", "rm -rf /tmp/syq-real-ssh-usercert")
