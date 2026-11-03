@@ -2189,3 +2189,29 @@ fn too_many_source_selectors_fail_with_advice_in_the_results() {
     );
     assert!(!t.path("dst").exists());
 }
+
+#[test]
+fn prune_with_too_many_long_source_names_fails_with_advice() {
+    // Pruning checks every named source against every other in one request,
+    // whose size grows with the square of their number and with their names.
+    let t = Tmp::new();
+    let names: Vec<String> = (0..320)
+        .map(|i| format!("dir-{i:03}-{}", "x".repeat(92)))
+        .collect();
+    for name in &names {
+        fs::create_dir_all(t.path(&format!("src/{name}"))).unwrap();
+    }
+    let base = t.s("src");
+    let destination = t.s("dst");
+    let mut args = vec!["cp", "--prune", "--cwd", base.as_str()];
+    args.extend(names.iter().map(String::as_str));
+    args.extend(["--into", destination.as_str()]);
+    let output = native_syq(&args);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("this copy names 320 sources, more than --prune can check at once"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--srcs-in"), "{stderr}");
+}

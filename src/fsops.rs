@@ -138,10 +138,13 @@ pub(crate) fn destination_fraction_matches(source: u32, destination: u32) -> boo
     source / precision == destination / precision
 }
 
+/// What to do instead of naming too many sources in one copy.
+pub(crate) const FEWER_SOURCES: &str = "select their parent directory with --srcs-in and narrow it with --ignore or --where, or split the copy";
+
 /// Why a copy naming more sources than one endpoint session accepts fails.
 fn too_many_sources(count: usize) -> String {
     format!(
-        "this copy names {count} sources, more than the {MAX_SOURCE_ROOTS} one copy accepts; select their parent directory with --srcs-in and narrow it with --ignore or --where, or split the copy"
+        "this copy names {count} sources, more than the {MAX_SOURCE_ROOTS} one copy accepts; {FEWER_SOURCES}"
     )
 }
 

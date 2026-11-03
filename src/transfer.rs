@@ -3945,6 +3945,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 ancestry_checks,
                 opts.may_widen_directory_permissions()
                     .then_some(selection_in_copy),
+                may_prune.then_some(srcs.len()),
             ) {
                 // A preview never widens a directory to check this. It writes
                 // nothing, so it goes on to report what it cannot inspect,
@@ -5524,11 +5525,13 @@ fn check_operator_directory(
 
 /// With `access`, owned directories the check must enter may briefly gain
 /// search permission; the value says whether the selected directory itself
-/// belongs to the copy.
+/// belongs to the copy. `pruned_sources` is the number of named sources when
+/// the copy prunes.
 fn check_operator_directory_ancestry(
     conn: &mut dyn Conn,
     checks: Vec<DirectoryAncestryCheck>,
     access: Option<bool>,
+    pruned_sources: Option<usize>,
 ) -> Result<Vec<Vec<DirectoryRelation>>> {
     let request = match access {
         Some(selection_in_copy) => Request::CheckOperatorDirectoryAncestryWithAccess {
@@ -5537,7 +5540,17 @@ fn check_operator_directory_ancestry(
         },
         None => Request::CheckOperatorDirectoryAncestry { checks },
     };
-    match ok(conn.call(request)?, "destination ancestry")? {
+    // Pruning checks every source against every copied directory, so the
+    // request grows with the square of the sources' number.
+    let too_many = pruned_sources.filter(|_| crate::proto::exceeds_message_limit(&request));
+    let reply = conn.call(request).map_err(|error| match too_many {
+        Some(count) => error.context(format!(
+            "this copy names {count} sources, more than --prune can check at once; {}",
+            crate::fsops::FEWER_SOURCES
+        )),
+        None => error,
+    })?;
+    match ok(reply, "destination ancestry")? {
         Response::DirectoryRelations(relations) => Ok(relations),
         other => bail!("unexpected response {other:?}"),
     }
