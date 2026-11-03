@@ -62,8 +62,9 @@ pub(crate) const MAX_CONNECTIONS: u16 = 128;
 const MAX_FILTER_RULES: usize = 4096;
 const MAX_FILTER_RULE_BYTES: usize = 4096;
 const MAX_FILTER_ROOTS: usize = 1024;
-/// Most destination paths one copy's rules may change.
-pub(crate) const MAX_MUTATION_SCOPES: usize = 1024;
+/// Most destination paths one copy's rules may change: the destination,
+/// and one for each of the most named sources a copy takes.
+pub(crate) const MAX_MUTATION_SCOPES: usize = crate::descriptor_broker::MAX_SOURCE_ROOTS + 1;
 const REDEMPTION_MAGIC: &[u8; 8] = b"SYQCLM\0\0";
 const REDEMPTION_RECORD_LEN: usize = REDEMPTION_MAGIC.len() + 8 + 32 + 32;
 
