@@ -5169,6 +5169,25 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             );
         }
     }
+    if !args.quiet && !aborted && !opts.dry_run {
+        let earlier = progress
+            .earlier_partials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        if earlier > 0 {
+            progress.eprintln(&earlier_partials_notice(
+                earlier,
+                &dst_ep,
+                args.restricted_grant.is_some(),
+                &if dst_is_dir {
+                    dst_root.clone()
+                } else {
+                    parent_path(&dst_root)
+                },
+            ));
+        }
+    }
     print_timings(&args, &progress);
     print_benchmark_observations(&opts);
     if args.stats && !args.quiet && !aborted {
@@ -5786,6 +5805,40 @@ fn ancestor_prefixes(path: &[u8]) -> impl Iterator<Item = &[u8]> {
     path.iter()
         .enumerate()
         .filter_map(|(index, byte)| (*byte == b'/').then_some(&path[..index]))
+}
+
+/// Tell the user that partial files an earlier copy left beside `files`
+/// copied files remain, and how to remove them from `directory` at the
+/// destination. A command-restricted receiver does not remove files, so
+/// there the command is only named.
+fn earlier_partials_notice(
+    files: usize,
+    destination: &Endpoint,
+    restricted: bool,
+    directory: &[u8],
+) -> String {
+    let directory = shell_words::quote(&display(directory)).into_owned();
+    let command = match destination {
+        Endpoint::Local { .. } => format!(" with: syq clean-partials {directory}"),
+        Endpoint::Remote(spec) if spec.local_process => {
+            format!(" with: syq clean-partials {directory}")
+        }
+        Endpoint::Remote(spec) if !restricted => {
+            format!(
+                " with: syq clean-partials --on {} {directory}",
+                spec.label()
+            )
+        }
+        Endpoint::Remote(_) => " with syq clean-partials".into(),
+    };
+    let (files, partials, them) = if files == 1 {
+        ("1 file".to_owned(), "a partial file", "it")
+    } else {
+        (format!("{files} files"), "partial files", "them")
+    };
+    format!(
+        "syq: {files} had {partials} from an earlier copy, left in place in case another copy is writing {them}; once none is, remove leftover partials{command}"
+    )
 }
 
 fn parent_path(path: &[u8]) -> PathBytes {

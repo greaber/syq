@@ -1937,6 +1937,17 @@ impl Worker {
         if holds {
             self.receiver_holds(idx);
         }
+        // On a first attempt the candidates are other copies' partials; a
+        // later attempt may find its own.
+        if let Ok(Response::Prepared(prepared)) = &reply {
+            if prepared.has_candidates && job.attempt == 0 {
+                self.progress
+                    .earlier_partials
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(idx);
+            }
+        }
         match reply? {
             Response::Prepared(prepared) => Ok(prepared),
             other => bail!("unexpected response {other:?}"),

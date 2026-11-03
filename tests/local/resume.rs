@@ -116,6 +116,59 @@ fn resume_from_partial() {
 
 #[cfg(debug_assertions)]
 #[test]
+fn retry_names_the_earlier_partials_it_leaves() {
+    let t = Tmp::new();
+    let data = prng(6 * 1024 * 1024 + 7, 9);
+    write(&t.path("src/big.bin"), &data);
+    fs::create_dir_all(t.path("dst")).unwrap();
+    let src = t.s("src/big.bin");
+    let dst = t.s("dst/");
+    let args = [
+        "--block-size",
+        "1M",
+        "--resource-limits",
+        "bandwidth=1G",
+        &src,
+        &dst,
+    ];
+    let partial = interrupted_partial(&args, &t.path("dst"));
+    {
+        let f = File::create(&partial).unwrap();
+        (&f).write_all(&data[..data.len() / 2]).unwrap();
+        f.set_len(data.len() as u64).unwrap();
+    }
+    let out = compat_command()
+        .args(args)
+        .arg("--no-progress")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst/big.bin")), data);
+    // The earlier copy's partial stays for other copies, so the retry says
+    // so and how to remove it.
+    assert!(partial.exists());
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("1 file had a partial file from an earlier copy"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("syq clean-partials {}", t.s("dst"))),
+        "{stderr}"
+    );
+
+    // Quiet runs stay quiet.
+    let quiet = compat_command()
+        .args(["-q", "-I"])
+        .args(args)
+        .run()
+        .unwrap();
+    assert_output_ok(&quiet);
+    assert!(!stderr_of(&quiet).contains("clean-partials"), "{quiet:?}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
 fn checksum_toggle_accepts_prior_partial_candidates() {
     let t = Tmp::new();
     let data = prng(6 * 1024 * 1024, 43);

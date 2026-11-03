@@ -378,7 +378,10 @@ within one machine that copies files whole does not: rerunning it copies those
 files whole again, so their partial files are removed.
 
 Partial files may remain after a successful retry, as can temporary files
-left by a copy that was killed. To remove them:
+left by a copy that was killed. A copy reads the partial files an earlier copy
+left, but does not remove them, since another copy may still be writing one;
+when it finds some, it says how many files had them and how to remove them.
+To remove them:
 
 ```sh
 syq clean-partials --dry-run -v backup
