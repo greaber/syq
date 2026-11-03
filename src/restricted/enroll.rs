@@ -592,16 +592,18 @@ fn run_session(
         "remains pending for a safe retry"
     };
     let id = plan.id;
-    let direct = install_over_route(
+    // The user's own login first, along the route the SSH configuration
+    // gives; then through `jump` when that cannot connect.
+    let configured = install_over_route(
         target,
-        EnrollmentRoute::Direct,
+        EnrollmentRoute::Configured,
         account,
         (&plan, batch),
         check,
     );
-    let session = match (direct, jump) {
+    let session = match (configured, jump) {
         (Ok(session), _) => session,
-        (Err(direct_error), Some(jump)) if is_enrollment_transport_failure(&direct_error) => {
+        (Err(configured_error), Some(jump)) if is_enrollment_transport_failure(&configured_error) => {
             install_over_route(
                 target,
                 EnrollmentRoute::ProxyJump { jump },
@@ -610,7 +612,7 @@ fn run_session(
                 check,
             )
             .with_context(|| {
-                format!("enrollment {id} {retry_state}; direct enrollment also failed: {direct_error:#}")
+                format!("enrollment {id} {retry_state}; enrolling along your SSH configuration's route also failed: {configured_error:#}")
             })?
         }
         (Err(error), _) => {

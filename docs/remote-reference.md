@@ -281,10 +281,11 @@ approved copy, and updates it after you upgrade syq, over its own SSH login,
 without prompts. Its login key must be able to sign without a terminal (in
 its agent, or an unencrypted key file), and its `known_hosts` must already
 hold the destination's exact host key: trust through a host certificate alone
-is refused, after approval. That login goes to the destination directly, or,
-when the authorizing machine cannot reach it, through the source, whose SSH
-server must then allow TCP forwarding for the authorizing machine's login on
-it. The authorizing machine then signs the approved copy and gives the source the enrollment's
+is refused, after approval. That login follows the authorizing machine's SSH
+configuration, including its jump hosts and proxy commands, and checks the
+destination's host key itself; when that cannot connect, it tries again
+through the source, whose SSH server must then allow TCP forwarding for the
+authorizing machine's login there. The authorizing machine then signs the approved copy and gives the source the enrollment's
 entry key and the destination host keys it trusts. The source connects to the
 destination's receiver at the address its own SSH configuration gives, sends
 file data directly over encrypted TCP, falling back to SSH between those same

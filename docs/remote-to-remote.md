@@ -73,8 +73,10 @@ and removes its access; completed writes remain. If cleanup fails, retry
 for which keys can sign, key changes, updates, and enrollments made by older
 versions.
 
-If your machine reaches hostB through hostA, add `--via hostA` to `enroll` or
-`revoke`.
+Setting up, refreshing, and revoking log in to hostB the way your SSH
+configuration routes `ssh` there, including its jump hosts and proxy
+commands. If that cannot connect, a copy started on your machine tries again
+through hostA. For `enroll` or `revoke`, add `--via hostA` for that retry.
 
 <a id="start-a-copy-from-the-source-server"></a>
 

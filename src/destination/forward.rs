@@ -498,8 +498,9 @@ impl Prepare {
             login: &self.login,
             // The copy needs the server that asked to reach the
             // destination's SSH port, so enrolling can go through it when
-            // this machine cannot reach the destination directly, as a copy
-            // started on this machine goes through its source.
+            // this machine cannot reach the destination along its own SSH
+            // configuration's route, as a copy started on this machine goes
+            // through its source.
             jump: Some(crate::enrollment::SshEndpoint::from_host(
                 user.as_deref(),
                 host,

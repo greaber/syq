@@ -29,8 +29,8 @@ pub(crate) struct Issue<'a> {
     pub host: &'a str,
     pub port: Option<u16>,
     pub login: &'a str,
-    /// A server to enroll through when the account cannot be reached
-    /// directly.
+    /// A server to enroll through when the account cannot be reached along
+    /// the route the SSH configuration gives.
     pub jump: Option<SshEndpoint>,
     /// The SSH agent the configuration selects for the account.
     pub agent: Option<&'a Path>,

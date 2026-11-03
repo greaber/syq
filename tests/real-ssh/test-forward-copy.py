@@ -472,12 +472,12 @@ copy("/tmp/syq-real-ssh/forward/after-held-setup")
 assert remote("sha256sum /tmp/syq-real-ssh/forward/after-held-setup").split()[0] == source_hash
 assert len(destination_enrollments()) == 1
 
-print("case: enrolling goes through the server that asked when the runner cannot reach the destination", flush=True)
-for enrollment in destination_enrollments():
-    run("syq", "receiver", "revoke", enrollment)
-# Lab servers refuse forwarding, so the server that asked runs a listener
-# that permits it, and the jump goes there.
-listener = json.loads(run("ssh", "source", "python3 -", stdin="""
+class ForwardingListener:
+    """An SSH listener on the source that permits forwarding, which the lab's
+    own servers refuse, trusted by the runner while it runs."""
+
+    def __enter__(self):
+        self.listener = json.loads(run("ssh", "source", "python3 -", stdin="""
 import json, pathlib, socket, subprocess, tempfile
 root = pathlib.Path(tempfile.mkdtemp(prefix="syq-real-ssh-jump-"))
 key = root / "host_key"
@@ -498,38 +498,89 @@ subprocess.run(["/usr/sbin/sshd", "-f", str(config), "-E", str(root / "sshd.log"
 print(json.dumps({"root": str(root), "port": port,
                   "key": " ".join(key.with_suffix(".pub").read_text().split()[:2])}))
 """))
-known_hosts = Path.home() / ".ssh/known_hosts"
-trusted = known_hosts.read_bytes()
+        self.port = self.listener["port"]
+        self.known_hosts = Path.home() / ".ssh/known_hosts"
+        self.trusted = self.known_hosts.read_bytes()
+        try:
+            def listening():
+                try:
+                    with socket.create_connection(("source", self.port), timeout=.5):
+                        return True, "listening"
+                except OSError as error:
+                    return False, str(error)
+            wait_until("the jump listener", listening)
+            with self.known_hosts.open("a") as hosts:
+                hosts.write(f"[source]:{self.port} {self.listener['key']}\n")
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def logins(self):
+        log = shlex.quote(self.listener["root"] + "/sshd.log")
+        return int(run("ssh", "source", f"grep -c 'Accepted publickey' {log} || true").strip() or 0)
+
+    def __exit__(self, *_):
+        self.known_hosts.write_bytes(self.trusted)
+        run("ssh", "source", "kill $(cat " + shlex.quote(self.listener["root"] + "/sshd.pid") + "); rm -rf "
+            + shlex.quote(self.listener["root"]))
+
+
+def enrollment_events(start):
+    events = trace_events(trace.read_text())[start:]
+    ends = {event["pid"]: event for event in events if event["phase"] == "end"}
+    starts = [event for event in events if event["phase"] == "start" and event.get("query") != "yes"]
+    logins = [(event, ends[event["pid"]]["status"]) for event in starts if event.get("enrollment") == "yes"]
+    return ([status for event, status in logins if event.get("via") == "no"],
+            [status for event, status in logins if event.get("via") == "yes"],
+            [event for event in starts if event.get("jump") == "yes"])
+
+
+print("case: enrolling follows the runner's configured jump host", flush=True)
+for enrollment in destination_enrollments():
+    run("syq", "receiver", "revoke", enrollment)
+config = Path.home() / ".ssh/config"
+original = config.read_bytes() if config.exists() else None
+with ForwardingListener() as listener:
+    try:
+        config.write_bytes(f"Host destination\n  ProxyJump syq@source:{listener.port}\n\n".encode()
+                           + (original or b""))
+        config.chmod(0o600)
+        start = trace_length()
+        copy("/tmp/syq-real-ssh/forward/configured-jump")
+        configured, via, jumps = enrollment_events(start)
+    finally:
+        if original is None:
+            config.unlink()
+        else:
+            config.write_bytes(original)
+        # OpenSSH starts a configured jump with its own path, not the lab's
+        # wrapper: the jump listener's log shows it instead.
+        jumped = listener.logins()
+# The runner's own login went through the configured jump and set
+# restricted copying up; nothing needed the retry through the server.
+assert configured and all(status == "0" for status in configured), (configured, via, jumps)
+assert via == [] and jumped >= 1, (configured, via, jumped)
+assert remote("sha256sum /tmp/syq-real-ssh/forward/configured-jump").split()[0] == source_hash
+assert len(destination_enrollments()) == 1
+
+print("case: enrolling goes through the server that asked when the runner cannot reach the destination", flush=True)
+for enrollment in destination_enrollments():
+    run("syq", "receiver", "revoke", enrollment)
 jump_port = Path("/tmp/syq-real-ssh-jump-port")
 unreachable = Path("/tmp/syq-real-ssh-unreachable-direct")
-try:
-    def listening():
-        try:
-            with socket.create_connection(("source", listener["port"]), timeout=.5):
-                return True, "listening"
-        except OSError as error:
-            return False, str(error)
-    wait_until("the jump listener", listening)
-    with known_hosts.open("a") as hosts:
-        hosts.write(f"[source]:{listener['port']} {listener['key']}\n")
-    jump_port.write_text(str(listener["port"]))
-    unreachable.touch()
-    start = trace_length()
-    copy("/tmp/syq-real-ssh/forward/through-server")
-    events = trace_events(trace.read_text())[start:]
-finally:
-    unreachable.unlink(missing_ok=True)
-    jump_port.unlink(missing_ok=True)
-    known_hosts.write_bytes(trusted)
-    run("ssh", "source", "kill $(cat " + shlex.quote(listener["root"] + "/sshd.pid") + "); rm -rf "
-        + shlex.quote(listener["root"]))
-ends = {event["pid"]: event for event in events if event["phase"] == "end"}
-direct = [event for event in events if event["phase"] == "start" and event.get("enrollment") == "yes"
-          and event.get("direct") == "yes" and event.get("query") != "yes"]
-assert direct and all(ends[event["pid"]]["status"] == "255" for event in direct), events
-jumps = [event for event in events if event["phase"] == "start" and event.get("jump") == "yes"
-         and event["host"].rsplit("@", 1)[-1] == "source"]
-assert jumps, events
+with ForwardingListener() as listener:
+    try:
+        jump_port.write_text(str(listener.port))
+        unreachable.touch()
+        start = trace_length()
+        copy("/tmp/syq-real-ssh/forward/through-server")
+        configured, via, jumps = enrollment_events(start)
+    finally:
+        unreachable.unlink(missing_ok=True)
+        jump_port.unlink(missing_ok=True)
+assert configured and all(status == "255" for status in configured), (configured, via, jumps)
+assert via and via[-1] == "0" and jumps, (configured, via, jumps)
 assert remote("sha256sum /tmp/syq-real-ssh/forward/through-server").split()[0] == source_hash
 assert len(destination_enrollments()) == 1
 

@@ -425,17 +425,17 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
             };
             let target = endpoint(&target_login, &host, port)?;
             let encoded = serde_json::to_vec(&request)?;
-            let direct = run_management_over_route(
+            let configured = run_management_over_route(
                 &target,
-                EnrollmentRoute::Direct,
+                EnrollmentRoute::Configured,
                 id,
                 ManagementAction::Revoke,
                 &encoded,
             );
-            match (direct, via.as_ref()) {
+            match (configured, via.as_ref()) {
                 (Ok(_), _) => {}
-                (Err(direct_error), Some(via))
-                    if is_enrollment_transport_failure(&direct_error) =>
+                (Err(configured_error), Some(via))
+                    if is_enrollment_transport_failure(&configured_error) =>
                 {
                     run_management_over_route(
                         &target,
@@ -444,7 +444,9 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
                         ManagementAction::Revoke,
                         &encoded,
                     )
-                    .with_context(|| format!("direct revocation also failed: {direct_error:#}"))?;
+                    .with_context(|| {
+                        format!("revoking along your SSH configuration's route also failed: {configured_error:#}")
+                    })?;
                 }
                 (Err(error), _) => return Err(error),
             }

@@ -46,7 +46,7 @@ syq receiver enroll [OPTIONS] <[USER@]HOST>
 
 | Argument / option | Meaning |
 |---|---|
-| `--via <ENDPOINT>` | Retry through this SSH jump host if the direct management connection fails |
+| `--via <ENDPOINT>` | Retry through this SSH jump host if the connection along your SSH configuration's route fails |
 
 <!-- /CLI -->
 
@@ -82,6 +82,6 @@ syq receiver revoke [OPTIONS] <ENROLLMENT-ID>
 
 | Argument / option | Meaning |
 |---|---|
-| `--via <ENDPOINT>` | Retry through this SSH jump host if the direct management connection fails |
+| `--via <ENDPOINT>` | Retry through this SSH jump host if the connection along your SSH configuration's route fails |
 
 <!-- /CLI -->

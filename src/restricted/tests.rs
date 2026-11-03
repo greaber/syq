@@ -17,7 +17,7 @@ fn enrollment_upload_selects_and_verifies_the_remote_platform() {
     if let Ok(case) = std::env::var("SYQ_ENROLLMENT_TEST_CHILD") {
         let result = run_management_over_route(
             &endpoint("receiver", "fixture", None).unwrap(),
-            EnrollmentRoute::Direct,
+            EnrollmentRoute::Configured,
             EnrollmentId::test_v4(1),
             ManagementAction::Revoke,
             b"{}",

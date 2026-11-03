@@ -1216,7 +1216,8 @@ fn run_remote(
                     port: dst.port,
                     login: &peer_policy.login_user,
                     // Enrolling can go through the source when the
-                    // destination cannot be reached directly.
+                    // destination cannot be reached along this machine's
+                    // SSH configuration's route.
                     jump: Some(crate::enrollment::SshEndpoint::from_parts(
                         &coordinator_policy.login_user,
                         srcs[0].host.as_deref().context("source host missing")?,

@@ -617,7 +617,12 @@ impl EnrollmentRemoteCommand {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EnrollmentRoute<'a> {
-    Direct,
+    /// The way the user's SSH configuration routes `ssh` to the account,
+    /// its jump hosts and proxy commands included: the user's own login,
+    /// as plain `ssh` makes it.
+    Configured,
+    /// Through `jump`, which receives only an opaque TCP stream, in place of
+    /// any route the configuration gives.
     ProxyJump { jump: &'a SshEndpoint },
 }
 
@@ -654,16 +659,10 @@ pub(crate) fn enrollment_ssh_args_raw(
         "PermitLocalCommand=no".to_owned(),
     ];
     match route {
-        EnrollmentRoute::Direct => {
-            // A route called direct must not inherit an implicit jump or proxy
-            // from ssh_config.
-            args.extend([
-                "-o".to_owned(),
-                "ProxyJump=none".to_owned(),
-                "-o".to_owned(),
-                "ProxyCommand=none".to_owned(),
-            ]);
-        }
+        // A jump or proxy the configuration names carries only the TCP
+        // stream; this login stays end to end with hostB, which it checks
+        // against the host keys the user trusts.
+        EnrollmentRoute::Configured => {}
         EnrollmentRoute::ProxyJump { jump } => {
             // -J does not apply destination command-line safety options to its
             // implicit jump process. A fixed ProxyCommand lets us constrain that
@@ -1038,14 +1037,29 @@ mod tests {
     }
 
     #[test]
-    fn direct_route_disables_implicit_ssh_config_proxies() {
+    fn the_configured_route_keeps_the_ssh_configurations_jumps_and_proxies() {
         let target = SshEndpoint::parse("backup@hostB").unwrap();
         let command = EnrollmentRemoteCommand::new(Path::new("/opt/syq/enroll"), &[]).unwrap();
-        let args = enrollment_ssh_args(&target, EnrollmentRoute::Direct, &command);
-        assert!(args.windows(2).any(|args| args == ["-o", "ProxyJump=none"]));
-        assert!(args
-            .windows(2)
-            .any(|args| args == ["-o", "ProxyCommand=none"]));
+        let args = enrollment_ssh_args(&target, EnrollmentRoute::Configured, &command);
+        // Nothing overrides the configuration's route...
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("ProxyJump") || arg.starts_with("ProxyCommand")));
+        assert!(!args.iter().any(|arg| arg == "-J"));
+        // ...and the login itself still forwards nothing and shares nothing.
+        for option in [
+            "ClearAllForwardings=yes",
+            "ControlMaster=no",
+            "ControlPath=none",
+            "ForwardX11=no",
+            "PermitLocalCommand=no",
+        ] {
+            assert!(
+                args.windows(2).any(|pair| pair == ["-o", option]),
+                "{option}"
+            );
+        }
+        assert_eq!(&args[..4], ["-a", "-x", "-k", "-T"]);
         assert_eq!(
             &args[args.len() - 3..],
             ["--", "backup@hostB", "/opt/syq/enroll"]

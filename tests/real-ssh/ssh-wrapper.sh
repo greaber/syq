@@ -17,7 +17,7 @@ entry_key=no
 query=no
 return_receiver=no
 enrollment=no
-direct=no
+via=no
 jump=no
 for argument do
     if [ "$next_is_host" = true ]; then
@@ -37,7 +37,8 @@ for argument do
         -G) query=yes ;;
         # Only the login that enrolls a destination asks for this.
         FingerprintHash=sha256) enrollment=yes ;;
-        ProxyJump=none) direct=yes ;;
+        # The retry through a server names its own jump.
+        ProxyCommand=ssh\ *) via=yes ;;
         -W) jump=yes ;;
         *--return-receiver*) return_receiver=yes ;;
         -S) next_is_control_path=true ;;
@@ -61,8 +62,8 @@ fi
 
 trace=${SYQ_REAL_SSH_TRACE_FILE:-/tmp/syq-real-ssh-ssh.trace}
 # Append fields so positional readers of the existing columns remain valid.
-printf 'phase=start\tpid=%s\thost=%s\tcontrol_master=%s\tcontrol_path=%s\tcontrol_socket=%s\tstrict_mux=%s\treturn_receiver=%s\tentry_key=%s\tquery=%s\tenrollment=%s\tdirect=%s\tjump=%s\n' \
-    "$$" "$host" "$control_master" "$control_path" "$control_socket" "$strict_mux" "$return_receiver" "$entry_key" "$query" "$enrollment" "$direct" "$jump" >>"$trace"
+printf 'phase=start\tpid=%s\thost=%s\tcontrol_master=%s\tcontrol_path=%s\tcontrol_socket=%s\tstrict_mux=%s\treturn_receiver=%s\tentry_key=%s\tquery=%s\tenrollment=%s\tvia=%s\tjump=%s\n' \
+    "$$" "$host" "$control_master" "$control_path" "$control_socket" "$strict_mux" "$return_receiver" "$entry_key" "$query" "$enrollment" "$via" "$jump" >>"$trace"
 # The route test slows this machine's reading of the destination's SSH
 # configuration, so that approving a copy takes a while.
 if [ "$query" = yes ] && [ "$host" = destination ] && [ -f /tmp/syq-real-ssh-slow-config ]; then
@@ -104,10 +105,10 @@ if [ "$enrollment" = yes ] && [ "$query" = no ] && [ -f /tmp/syq-real-ssh-hold-e
         waited=$((waited + 1))
     done
 fi
-# The fallback test makes the destination unreachable from the laptop
-# directly, and sends the jump through the server that asked to a listener
-# that permits it.
-if [ "$enrollment" = yes ] && [ "$direct" = yes ] && [ "$query" = no ] &&
+# The fallback test makes the destination unreachable along the laptop's
+# own route, and sends the retry through the server that asked to a
+# listener that permits it.
+if [ "$enrollment" = yes ] && [ "$via" = no ] && [ "$query" = no ] &&
     [ -f /tmp/syq-real-ssh-unreachable-direct ]; then
     blocked_message="ssh: connect to host $host port 22: Network is unreachable"
     blocked=yes
