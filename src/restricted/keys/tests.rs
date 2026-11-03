@@ -546,6 +546,34 @@ fn certify(ca: &Path, public_key: &Path, principal: &str, validity: &str, option
     run(command.arg(public_key), "certify the test key");
 }
 
+/// Certify `key` as `backup` for `hours`, like `certify` but built in Rust:
+/// `ssh-keygen` before OpenSSH 9.x cannot set `verify-required`.
+fn certify_in_rust(ca: &Path, key: &PublicKey, certificate: &Path, hours: u64, options: &[&str]) {
+    let ca = PrivateKey::read_openssh_file(ca).unwrap();
+    let now = now() as u64;
+    let mut builder = ssh_key::certificate::Builder::new_with_random_nonce(
+        &mut ssh_key::rand_core::OsRng,
+        key.key_data().clone(),
+        now - 60,
+        now + hours * 3600,
+    )
+    .unwrap();
+    builder
+        .key_id("fixture")
+        .unwrap()
+        .valid_principal("backup")
+        .unwrap();
+    for &option in options {
+        match option {
+            "verify-required" => builder.critical_option(option, ""),
+            _ => builder.extension(option, ""),
+        }
+        .unwrap();
+    }
+    let signed = builder.sign(&ca).unwrap().to_openssh().unwrap();
+    fs::write(certificate, signed).unwrap();
+}
+
 #[test]
 fn certificates_never_extend_what_the_login_allowed() {
     // Reviewer reproducer: a one-hour login must not record a one-year
@@ -736,14 +764,7 @@ fn fido_certificates_keep_their_touch_and_pin_requirements() {
             key.public_key().to_openssh().unwrap(),
         )
         .unwrap();
-        let _ = fs::remove_file(&certificate_path);
-        certify(
-            &ca,
-            &handle.with_extension("pub"),
-            "backup",
-            "-1m:+1h",
-            options,
-        );
+        certify_in_rust(&ca, key.public_key(), &certificate_path, 1, options);
         let certificate = read_certificate(&certificate_path).unwrap();
         let authorized = if line.is_empty() {
             String::new()
@@ -783,14 +804,7 @@ fn fido_certificates_keep_their_touch_and_pin_requirements() {
             0,
         ),
     ] {
-        let _ = fs::remove_file(&certificate_path);
-        certify(
-            &ca,
-            &handle.with_extension("pub"),
-            "backup",
-            "-1m:+1h",
-            options,
-        );
+        certify_in_rust(&ca, untouched.public_key(), &certificate_path, 1, options);
         let (_agent, socket) = security_key_agent(untouched.public_key().clone(), expected);
         let login = discover(
             &trace(
@@ -809,17 +823,16 @@ fn fido_certificates_keep_their_touch_and_pin_requirements() {
     // in, so the touch is skipped only when every one allows it, a PIN is
     // needed when any asks, and the earliest expiry is kept.
     let mut issued = Vec::new();
-    for (options, validity) in [
-        (&["no-touch-required"][..], "-1m:+1h"),
-        (&[][..], "-1m:+2h"),
-        (&["no-touch-required", "verify-required"][..], "-1m:+3h"),
+    for (options, hours) in [
+        (&["no-touch-required"][..], 1),
+        (&[][..], 2),
+        (&["no-touch-required", "verify-required"][..], 3),
     ] {
-        let _ = fs::remove_file(&certificate_path);
-        certify(
+        certify_in_rust(
             &ca,
-            &handle.with_extension("pub"),
-            "backup",
-            validity,
+            untouched.public_key(),
+            &certificate_path,
+            hours,
             options,
         );
         issued.push(read_certificate(&certificate_path).unwrap());
