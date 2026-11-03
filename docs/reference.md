@@ -798,13 +798,24 @@ directory. Sources must then be relative: `../private` is refused, and even
 with `--follow-src`, symlinks cannot lead outside the root. `-C` permits both.
 
 One copy accepts up to 1,024 named sources, such as the names a shell glob
-expands to. A [copy between two servers](remote-to-remote.md) that uses
-restricted copying on the destination takes fewer, because its signed approval
-lists each one: about 900 short names, fewer when the destination paths are
-long. For more, select their parent directory with `--srcs-in` and
-leave out what you don't want with `--ignore` or `--where`, or split the copy.
-Each named source adds to the copy's setup time, and with `--prune` that time
-grows with the square of their number.
+expands to. Some copies take fewer:
+
+- A copy that runs on an approval, such as a
+  [restricted copy between servers](remote-reference.md#enrollment) or a copy
+  a [receiving machine](receive.md) approves, lists in that approval the
+  destination and each path a named source is copied to, at most 1,024 paths
+  in all. Copied into a directory, such a copy takes up to 1,023 named
+  sources. A receiving machine also limits the size of the request it
+  approves, so long names lower that: to about 890 names of 20 characters, or
+  460 of 50.
+- With `--prune`, a copy checks every named source against every other in
+  one request, which holds about 950 sources with 8-character names, or 630
+  with 20-character names.
+
+For more, select their parent directory with `--srcs-in` and leave out what
+you don't want with `--ignore` or `--where`, or split the copy. Each named
+source adds to the copy's setup time, and with `--prune` that time grows with
+the square of their number.
 
 ## Shell pipelines and file descriptors
 
