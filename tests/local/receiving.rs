@@ -2486,9 +2486,92 @@ fn a_server_rejecting_the_login_is_redialed_less_often() {
         refused_receiving_is_not_redialed(
             ssh_error,
             "cannot log in to test-server",
-            "trying again in 30 s, or as soon as a command connects to test-server",
+            " s, or sooner when a command connects to test-server",
         );
     }
+}
+
+/// A command that connects tries a rejected login again at once, though no
+/// sooner than a while after its last attempt, so commands that come every
+/// few seconds, such as completion, do not log in again each time.
+#[cfg(debug_assertions)]
+#[test]
+fn a_command_retries_a_rejected_login_no_more_than_once_a_while() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    fs::create_dir(t.path("root")).unwrap();
+    fs::create_dir(t.path("home")).unwrap();
+    let ssh = fake_ssh(&t);
+    executable(
+        &t.path("refusing-bin/ssh"),
+        format!(
+            "#!/bin/sh\n\
+             for argument in \"$@\"; do\n\
+             \x20   if [ \"$argument\" = -R ]; then\n\
+             \x20       echo dialed >> \"$FAKE_FORWARD_LOG\"\n\
+             \x20       echo 'syq@test-server: Permission denied (publickey).' >&2\n\
+             \x20       exit 255\n\
+             \x20   fi\n\
+             done\n\
+             exec {} \"$@\"\n",
+            ssh.display()
+        )
+        .as_bytes(),
+    );
+    let scope = ephemeral_scope(&t);
+    let _off = ScopeOff(&t, scope.clone());
+    let run = |args: &[&str]| {
+        persistence_command(&t, args)
+            .args(["--pscope", scope.to_str().unwrap()])
+            .env("HOME", t.path("home"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("FAKE_FORWARD_LOG", t.path("forward.log"))
+            .env("SYQ_TEST_COMMAND_RETRY_MS", "2000")
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", t.path("refusing-bin").display()),
+            )
+            .run()
+            .unwrap()
+    };
+    assert_output_ok(&run(&[
+        "receive",
+        "on",
+        "--notify",
+        "off",
+        "--root",
+        &t.s("root"),
+        "--all-connections",
+    ]));
+    let connect = || {
+        let output = run(&[
+            "connect",
+            "test-server",
+            "--timeout",
+            "20",
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+        ]);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            stderr_of(&output).contains("cannot log in to test-server"),
+            "{output:?}"
+        );
+    };
+    let dials = || fs::read(t.path("forward.log")).unwrap().len() / b"dialed\n".len();
+    connect();
+    assert_eq!(dials(), 1);
+    // Soon after, a command reports the failure without logging in again.
+    connect();
+    assert_eq!(dials(), 1);
+    // Once the interval has passed, it tries again at once; the
+    // connection's own first retry is still 30 seconds away.
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    connect();
+    assert_eq!(dials(), 2);
 }
 
 /// It does try again by itself, as an agent unlocked after sleep needs.
@@ -2578,7 +2661,7 @@ fn a_rejected_receiving_login_is_retried_by_itself() {
 /// Turn receiving on for a fake `test-server` whose receiving connection
 /// fails with `ssh_error`, and check that it is dialed once and then fails
 /// with a status containing `reason` and `detail`, and that connecting again
-/// dials it again at once.
+/// soon after does not dial it again.
 fn refused_receiving_is_not_redialed(ssh_error: &str, reason: &str, detail: &str) {
     let t = Tmp::new();
     fs::create_dir(t.runtime()).unwrap();
@@ -2630,7 +2713,7 @@ fn refused_receiving_is_not_redialed(ssh_error: &str, reason: &str, detail: &str
         &t.s("root"),
         "--all-connections",
     ]));
-    for dials in [b"dialed\n".as_slice(), b"dialed\ndialed\n"] {
+    for _ in 0..2 {
         let started = std::time::Instant::now();
         let connect = run(&[
             "connect",
@@ -2650,7 +2733,7 @@ fn refused_receiving_is_not_redialed(ssh_error: &str, reason: &str, detail: &str
         // A redial on the reconnecting schedule would come one second
         // after the refusal, then two more.
         std::thread::sleep(std::time::Duration::from_secs(4));
-        assert_eq!(read(&t.path("forward.log")), dials, "{ssh_error}");
+        assert_eq!(read(&t.path("forward.log")), b"dialed\n", "{ssh_error}");
         let status = run(&["receive", "status", "--json"]);
         assert_output_ok(&status);
         let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();

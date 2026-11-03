@@ -525,6 +525,13 @@ pub(crate) struct ConnectionState {
     pub phase: String,
     pub error: Option<String>,
     pub ssh_pid: Option<u32>,
+    /// When the connection last started to log in.
+    #[serde(skip)]
+    pub attempted: Option<Instant>,
+    /// When a failed connection tries again by itself, and the rest of the
+    /// status's sentence about it. `shown` renders the time left.
+    #[serde(skip)]
+    pub retry: Option<(Instant, String)>,
 }
 impl Default for ConnectionState {
     fn default() -> Self {
@@ -532,7 +539,22 @@ impl Default for ConnectionState {
             phase: "starting".into(),
             error: None,
             ssh_pid: None,
+            attempted: None,
+            retry: None,
         }
+    }
+}
+impl ConnectionState {
+    /// The state as a status shows it, with the time left before a retry.
+    fn shown(&self) -> Self {
+        let mut shown = self.clone();
+        if let (Some(error), Some((at, rest))) = (&shown.error, &self.retry) {
+            shown.error = Some(format!(
+                "{error}; trying again in {}{rest}",
+                crate::destination::retry_wait(at.saturating_duration_since(Instant::now()))
+            ));
+        }
+        shown
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -949,11 +971,14 @@ impl Drop for SocketCleanup {
 }
 struct Worker {
     stop: Arc<AtomicBool>,
+    /// Dropped to wake the thread from its waits as soon as it is stopped.
+    wake: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<Result<()>>>,
 }
 impl Drop for Worker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        drop(self.wake.take());
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -971,6 +996,7 @@ impl ProfileWorker {
         let approvals = Arc::new(crate::receive_approval::Queue::new(domain.clone()));
         approvals.set_notifications(config.notifications);
         let stop = Arc::new(AtomicBool::new(false));
+        let (wake, woken) = std::sync::mpsc::channel();
         let (thread_state, thread_approvals, thread_stop, thread_config) = (
             state.clone(),
             approvals.clone(),
@@ -988,16 +1014,17 @@ impl ProfileWorker {
                     thread_config,
                     spec,
                     thread_stop,
+                    woken,
                     thread_state.clone(),
                     thread_approvals,
                 )
             };
             if let Err(error) = &result {
-                *thread_state.lock().unwrap() = ConnectionState {
-                    phase: "failed".into(),
-                    error: Some(format!("{error:#}")),
-                    ssh_pid: None,
-                };
+                let mut state = thread_state.lock().unwrap();
+                state.phase = "failed".into();
+                state.error = Some(format!("{error:#}"));
+                state.ssh_pid = None;
+                state.retry = None;
             }
             result
         });
@@ -1007,6 +1034,7 @@ impl ProfileWorker {
             approvals,
             _worker: Worker {
                 stop,
+                wake: Some(wake),
                 thread: Some(thread),
             },
         }
@@ -1014,7 +1042,7 @@ impl ProfileWorker {
     fn snapshot(&self) -> ProfileStatus {
         ProfileStatus {
             settings: self.config.clone(),
-            connection: self.state.lock().unwrap().clone(),
+            connection: self.state.lock().unwrap().shown(),
             pending: self.approvals.snapshots(),
         }
     }
@@ -1034,7 +1062,17 @@ fn reconcile(
         };
         worker.approvals.set_notifications(profile.notifications);
         worker.config = profile.clone();
-        !(retry && worker.state.lock().unwrap().phase == "failed")
+        // A command restarts a failed connection, trying again at once,
+        // but no sooner than a while after its last attempt: commands such
+        // as completion may come every few seconds, and each retry of a
+        // rejected login is another failed login on the server.
+        !(retry && {
+            let state = worker.state.lock().unwrap();
+            state.phase == "failed"
+                && state.attempted.is_none_or(|attempted| {
+                    attempted.elapsed() >= crate::destination::command_retry_interval()
+                })
+        })
     });
     for profile in config
         .profiles
@@ -1061,6 +1099,7 @@ fn aggregate(profiles: &[ProfileStatus]) -> (String, ConnectionState) {
             phase: "disabled".into(),
             error: None,
             ssh_pid: None,
+            ..Default::default()
         });
     (name, connection)
 }
@@ -1290,6 +1329,7 @@ fn statuses(domain: &Domain) -> Result<Vec<Status>> {
                         phase: "inactive".into(),
                         error: None,
                         ssh_pid: None,
+                        ..Default::default()
                     },
                 })
             })
@@ -1958,10 +1998,12 @@ mod tests {
                 phase: "online".into(),
                 error: None,
                 ssh_pid: Some(42),
+                ..Default::default()
             })),
             approvals: approvals.clone(),
             _worker: Worker {
                 stop: stop.clone(),
+                wake: None,
                 thread: None,
             },
         }];
@@ -2178,6 +2220,7 @@ mod tests {
                         phase: "failed".into(),
                         error: Some("e".repeat(8192)),
                         ssh_pid: None,
+                        ..Default::default()
                     },
                 }
             })

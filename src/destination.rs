@@ -75,18 +75,32 @@ fn login_retry_first() -> Duration {
     LOGIN_RETRY_FIRST
 }
 
+/// How long after a failed receiving connection's last attempt a command
+/// connecting to its server may restart it.
+pub(crate) fn command_retry_interval() -> Duration {
+    // Tests shorten it to see a command restart the connection.
+    #[cfg(debug_assertions)]
+    if let Some(millis) = std::env::var("SYQ_TEST_COMMAND_RETRY_MS")
+        .ok()
+        .and_then(|millis| millis.parse().ok())
+    {
+        return Duration::from_millis(millis);
+    }
+    LOGIN_RETRY_FIRST
+}
+
 fn next_login_retry(wait: Duration) -> Duration {
     (wait * 2).min(LOGIN_RETRY_MAX)
 }
 
-/// A retry wait as the status shows it: whole seconds below a minute,
-/// otherwise whole minutes.
-fn retry_wait(wait: Duration) -> String {
-    let seconds = wait.as_secs();
-    if seconds < 60 {
+/// A wait as a status shows it: whole seconds, rounded up, below two
+/// minutes, otherwise the nearest whole minute.
+pub(crate) fn retry_wait(wait: Duration) -> String {
+    let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+    if seconds < 120 {
         format!("{seconds} s")
     } else {
-        format!("{} min", seconds / 60)
+        format!("{} min", (seconds + 30) / 60)
     }
 }
 
@@ -1566,6 +1580,8 @@ pub(crate) fn serve_background(
     config: crate::receive_service::Settings,
     spec: crate::receive_service::ServiceSpec,
     stop: Arc<AtomicBool>,
+    // Disconnected when `stop` is set, which ends its waits at once.
+    woken: mpsc::Receiver<()>,
     state: Arc<Mutex<crate::receive_service::ConnectionState>>,
     approvals: Arc<crate::receive_approval::Queue>,
 ) -> Result<()> {
@@ -1688,11 +1704,14 @@ pub(crate) fn serve_background(
                     .spawn_guarded()
                     .context("start receiving SSH connection")?,
             );
-            *state.lock().unwrap() = crate::receive_service::ConnectionState {
-                phase: "connecting".into(),
-                error: None,
-                ssh_pid: Some(child.0.id()),
-            };
+            {
+                let mut state = state.lock().unwrap();
+                state.phase = "connecting".into();
+                state.error = None;
+                state.ssh_pid = Some(child.0.id());
+                state.attempted = Some(Instant::now());
+                state.retry = None;
+            }
             let (ready, readiness) = mpsc::sync_channel(1);
             let mut stdout = child.0.stdout.take().unwrap();
             let reader = std::thread::spawn(move || {
@@ -1723,7 +1742,7 @@ pub(crate) fn serve_background(
                 if !online && connected.elapsed() >= Duration::from_secs(30) {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                let _ = woken.recv_timeout(Duration::from_millis(50));
             }
             let exit = child.0.try_wait()?;
             drop(child);
@@ -1764,7 +1783,8 @@ pub(crate) fn serve_background(
             // that does not match is tried again less and less often: it may
             // only be an agent still locked after sleep. The status says why
             // meanwhile, and a command that connects to the server restarts
-            // this connection, trying again at once.
+            // this connection, trying again at once once a while has passed
+            // since this attempt (`command_retry_interval`).
             let login = (!online)
                 .then(|| crate::conn::login_rejection(&error))
                 .flatten();
@@ -1772,34 +1792,35 @@ pub(crate) fn serve_background(
                 Some(advice) => {
                     let wait = login_delay;
                     login_delay = next_login_retry(login_delay);
-                    *state.lock().unwrap() = crate::receive_service::ConnectionState {
-                        phase: "failed".into(),
-                        error: Some(format!(
-                            "cannot log in to {} ({error}): {advice}; trying again in {}, or as soon as a command connects to {}",
-                            spec.endpoint.label(),
-                            retry_wait(wait),
+                    let mut state = state.lock().unwrap();
+                    state.phase = "failed".into();
+                    state.error = Some(format!(
+                        "cannot log in to {} ({error}): {advice}",
+                        spec.endpoint.label()
+                    ));
+                    state.ssh_pid = None;
+                    state.retry = Some((
+                        Instant::now() + wait,
+                        format!(
+                            ", or sooner when a command connects to {}",
                             spec.endpoint.label()
-                        )),
-                        ssh_pid: None,
-                    };
+                        ),
+                    ));
                     wait
                 }
                 None => {
-                    *state.lock().unwrap() = crate::receive_service::ConnectionState {
-                        phase: "reconnecting".into(),
-                        error: Some(error),
-                        ssh_pid: None,
-                    };
+                    let mut state = state.lock().unwrap();
+                    state.phase = "reconnecting".into();
+                    state.error = Some(error);
+                    state.ssh_pid = None;
+                    state.retry = None;
                     if online && connected.elapsed() >= Duration::from_secs(60) {
                         delay = Duration::from_secs(1);
                     }
                     delay
                 }
             };
-            let until = Instant::now() + wait;
-            while !stop.load(Ordering::Acquire) && Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(100));
-            }
+            let _ = woken.recv_timeout(wait);
             if login.is_none() {
                 delay = (delay * 2).min(Duration::from_secs(30));
             }

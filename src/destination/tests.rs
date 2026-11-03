@@ -1791,6 +1791,20 @@ fn a_rejected_login_waits_longer_each_time_up_to_ten_minutes() {
     }
     assert_eq!(
         shown,
-        ["30 s", "1 min", "2 min", "4 min", "8 min", "10 min", "10 min"]
+        ["30 s", "60 s", "2 min", "4 min", "8 min", "10 min", "10 min"]
+    );
+    // Times left are rounded up to whole seconds, then to the nearest
+    // minute from two minutes on.
+    let wait = |millis| super::retry_wait(std::time::Duration::from_millis(millis));
+    assert_eq!(
+        [
+            wait(0),
+            wait(1),
+            wait(29_001),
+            wait(119_000),
+            wait(149_000),
+            wait(151_000)
+        ],
+        ["0 s", "1 s", "30 s", "119 s", "2 min", "3 min"]
     );
 }

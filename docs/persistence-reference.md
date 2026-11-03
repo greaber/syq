@@ -475,11 +475,12 @@ OpenSSH 7.8 and later also require permission for remote TCP forwarding:
 `AllowStreamLocalForwarding` and `AllowTcpForwarding` must both allow `remote`
 or `yes`. When a server refuses it, receiving through that server stops
 instead of reconnecting, and `syq persist status` shows it as failed with the
-reason; the next command that connects to that server tries once more. When a
-server rejects your login or presents a host key that does not match,
-receiving tries again after 30 seconds, then waits twice as long each time, up
-to 10 minutes; meanwhile `syq persist status` shows it as failed with the
-reason, and the next command that connects to that server tries again at once.
+reason. When a server rejects your login or presents a host key that does not
+match, receiving tries again after 30 seconds, then waits twice as long each
+time, up to 10 minutes; meanwhile `syq persist status` shows it as failed with
+the reason and when it tries next. In both cases a command that connects to
+that server tries again at once if at least 30 seconds have passed since the
+last attempt.
 
 The server command uses the matching helper installed by the receiving
 connection. If that helper is missing or does not recognize an option, update
