@@ -828,18 +828,29 @@ pub(crate) struct ReceiverConnection {
     additions: Vec<String>,
     /// The configured GlobalKnownHostsFile value, as `ssh -G` prints it.
     global: String,
+    /// Whether the configuration sets a KnownHostsCommand of its own.
+    known_hosts_command: bool,
+    /// Whether this ssh has KnownHostsCommand: OpenSSH 8.5, which also
+    /// renamed PubkeyAcceptedKeyTypes.
+    supports_known_hosts_command: bool,
     /// This ssh's name for the option listing the public key algorithms it
     /// may log in with.
     accepted_algorithms: &'static str,
 }
 
-/// A GlobalKnownHostsFile value from `ssh -G` that can be given back to
-/// OpenSSH with one more file and mean the same files: one without
-/// whitespace, or OpenSSH's compiled default list. `ssh -G` prints a list
-/// space-separated after removing quotes, so any other value with
-/// whitespace could be one quoted name or several, and is not reproduced.
-fn exact_known_hosts_list(value: &str, compiled_default: impl FnOnce() -> Option<String>) -> bool {
-    !value.contains(char::is_whitespace) || compiled_default().as_deref() == Some(value)
+/// How the approving machine's known_hosts entries join this machine's.
+#[derive(Debug, PartialEq, Eq)]
+enum ApprovingKeys {
+    /// Through a KnownHostsCommand that prints them: OpenSSH adds its output
+    /// to the configured files, which stay exactly as configured.
+    Command,
+    /// As one more global file, when the configuration has a
+    /// KnownHostsCommand of its own or this ssh has none, and the configured
+    /// GlobalKnownHostsFile has no whitespace, so it can be given back.
+    GlobalFile,
+    /// Not at all: `ssh -G` prints a list of files and one quoted name with
+    /// spaces the same way, so a value with whitespace cannot be given back.
+    Omitted,
 }
 
 impl ReceiverConnection {
@@ -877,25 +888,15 @@ impl ReceiverConnection {
         Self::parse(std::str::from_utf8(&output.stdout).context("SSH configuration is not UTF-8")?)
     }
 
-    /// OpenSSH's compiled default GlobalKnownHostsFile list, from `ssh -G`
-    /// without any configuration.
-    fn compiled_global(program: &str, host: &str) -> Option<String> {
-        let mut query = std::process::Command::new(program);
-        query
-            .args(["-G", "-F", "/dev/null", "--", host])
-            .stdin(std::process::Stdio::null());
-        let output = crate::process::capture_output_bounded(
-            &mut query,
-            std::time::Instant::now() + std::time::Duration::from_secs(10),
-            &|| false,
-            1 << 20,
-        )
-        .ok()
-        .filter(|output| output.status.success())?;
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .find_map(|line| line.strip_prefix("globalknownhostsfile "))
-            .map(|value| value.trim().to_owned())
+    /// How the approving machine's entries can join this machine's.
+    fn approving_keys(&self) -> ApprovingKeys {
+        if self.supports_known_hosts_command && !self.known_hosts_command {
+            ApprovingKeys::Command
+        } else if !self.global.contains(char::is_whitespace) {
+            ApprovingKeys::GlobalFile
+        } else {
+            ApprovingKeys::Omitted
+        }
     }
 
     pub(crate) fn parse(output: &str) -> Result<Self> {
@@ -950,34 +951,44 @@ impl ReceiverConnection {
                 additions.push(option.to_owned());
             }
         }
-        let accepted_algorithms = if value("pubkeyacceptedkeytypes").is_some()
-            && value("pubkeyacceptedalgorithms").is_none()
-        {
-            "PubkeyAcceptedKeyTypes"
-        } else {
-            "PubkeyAcceptedAlgorithms"
-        };
+        // OpenSSH 8.5 renamed the option and added KnownHostsCommand; `ssh
+        // -G` prints the option whatever its value.
+        let modern = value("pubkeyacceptedalgorithms").is_some();
         Ok(Self {
             hostname: hostname.to_owned(),
             lookup,
             additions,
             global: value("globalknownhostsfile").unwrap_or("none").to_owned(),
-            accepted_algorithms,
+            known_hosts_command: value("knownhostscommand").is_some_and(|value| value != "none"),
+            supports_known_hosts_command: modern,
+            accepted_algorithms: if modern {
+                "PubkeyAcceptedAlgorithms"
+            } else {
+                "PubkeyAcceptedKeyTypes"
+            },
         })
     }
 
-    /// The `-o` arguments syq adds, with `approving`, the approving
-    /// machine's known_hosts lines, as one more global file when there is
-    /// one: OpenSSH records a newly accepted key only in the first user file.
+    /// The `-o` arguments syq adds, with `approving`, the file of the
+    /// approving machine's known_hosts lines, joined as `approving_keys`
+    /// says. OpenSSH records a newly accepted key only in the first user
+    /// file either way.
     fn arguments(&self, approving: Option<&std::path::Path>) -> Vec<String> {
-        let global = approving.map(|approving| match self.global.as_str() {
-            "none" => approving.display().to_string(),
-            files => format!("{files} {}", approving.display()),
+        let joined = approving.and_then(|approving| match self.approving_keys() {
+            ApprovingKeys::Command => Some(format!(
+                "KnownHostsCommand=/usr/bin/env cat {}",
+                approving.display()
+            )),
+            ApprovingKeys::GlobalFile => Some(match self.global.as_str() {
+                "none" => format!("GlobalKnownHostsFile={}", approving.display()),
+                files => format!("GlobalKnownHostsFile={files} {}", approving.display()),
+            }),
+            ApprovingKeys::Omitted => None,
         });
         self.additions
             .iter()
             .cloned()
-            .chain(global.map(|global| format!("GlobalKnownHostsFile={global}")))
+            .chain(joined)
             .flat_map(|option| ["-o".to_owned(), option])
             .collect()
     }
@@ -1153,22 +1164,17 @@ pub(crate) fn prepare_receiver_ssh_with(
         destination.port,
         &host,
     )?;
-    // The approving machine's knowledge joins this machine's only where the
-    // configured global list can be given back exactly.
-    let union = exact_known_hosts_list(&connection.global, || {
-        ReceiverConnection::compiled_global(&command[0], &host)
-    });
-    if !union && crate::output::debug() {
-        crate::output::diagnostic!(
-            "syq: checking the receiver's host key without the approving machine's known hosts: GlobalKnownHostsFile {:?} could be one quoted name or several",
-            connection.global
-        );
-    }
+
     // Only the entry key's own algorithms may log in: a certificate or
     // another key type the configuration names is never offered, and
     // another key of the same type only after the entry key, if the
     // destination refuses it.
     let algorithms = match crate::restricted::parse_entry_key(entry_key)?.algorithm() {
+        // An ssh older than 8.5 (from 7.6) matches an RSA key by its key
+        // type.
+        ssh_key::Algorithm::Rsa { .. } if !connection.supports_known_hosts_command => {
+            "rsa-sha2-512,rsa-sha2-256,ssh-rsa".to_owned()
+        }
         ssh_key::Algorithm::Rsa { .. } => "rsa-sha2-512,rsa-sha2-256".to_owned(),
         algorithm => algorithm.as_str().to_owned(),
     };
@@ -1176,6 +1182,7 @@ pub(crate) fn prepare_receiver_ssh_with(
     // known_hosts files use for the destination.
     let lookup = &connection.lookup;
     let mut approving = String::new();
+    let mut approving_entries = 0;
     for line in known_hosts.lines() {
         let (marker, rest) = match line.split_once(' ') {
             Some((marker @ ("@cert-authority" | "@revoked"), rest)) => (Some(marker), rest),
@@ -1190,12 +1197,24 @@ pub(crate) fn prepare_receiver_ssh_with(
             approving.push(' ');
         }
         approving.push_str(&format!("{lookup} {}\n", key.to_openssh()?));
+        approving_entries += 1;
+    }
+    // The approving machine's knowledge, when it has any, joins this
+    // machine's without changing what this machine's configuration names.
+    let union = approving_entries > 0 && connection.approving_keys() != ApprovingKeys::Omitted;
+    if approving_entries > 0 && !union && !args.quiet {
+        crate::output::diagnostic!(
+            "syq: checking the destination's host key without what the approving machine knows about it: this machine's GlobalKnownHostsFile {:?} could be one quoted name or several",
+            connection.global
+        );
     }
     // An interrupted copy removes the entry key too; only SIGKILL leaves it.
     let directory = crate::private_broker::SignalCleanedDir::new("syq-receiver-hosts-")?;
     let path = directory.path().join(APPROVING_KNOWN_HOSTS);
-    std::fs::write(&path, approving)?;
-    crate::agent_broker::validate_openssh_option_path(&path, "receiver known-hosts file")?;
+    if union {
+        std::fs::write(&path, approving)?;
+        crate::agent_broker::validate_openssh_option_path(&path, "receiver known-hosts file")?;
+    }
     let key = directory.path().join("entry-key");
     {
         use std::os::unix::fs::OpenOptionsExt as _;

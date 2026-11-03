@@ -821,13 +821,11 @@ fn parse_compiled_global_known_hosts(value: &str) -> Result<Vec<PathBuf>> {
 }
 
 /// The known_hosts files a configured value names. `ssh -G` prints a list
-/// space-separated after removing quotes, so a value with whitespace could
-/// be one quoted name or several. Exact-key uses refuse such a value, and
-/// any relative or unexpanded path, through `unsupported`. What this machine
-/// tells another reads a value with whitespace only when it cannot be one
-/// name: no file has the whole value as its name, and every piece is an
-/// existing absolute file. Otherwise it leaves the value out rather than
-/// read a file the user did not choose.
+/// space-separated after removing quotes, so a configured value with
+/// whitespace could be one quoted name or several: it is left out, and
+/// exact-key uses refuse it, through `unsupported`, as they refuse a
+/// relative or unexpanded path. OpenSSH's compiled default list, when the
+/// configuration does not set the directive, is read as the list it is.
 fn append_known_hosts_files(
     files: &mut Vec<PathBuf>,
     value: &str,
@@ -844,34 +842,20 @@ fn append_known_hosts_files(
         files.extend(compiled_default.files.iter().cloned());
         return;
     }
-    let usable = |part: &str| -> Option<PathBuf> {
-        let path = PathBuf::from(part);
-        (!part.contains('%') && !part.starts_with('~') && path.is_absolute()).then_some(path)
-    };
-    if !value.contains(char::is_whitespace) {
-        match usable(value) {
-            Some(path) => files.push(path),
-            None => {
-                unsupported.get_or_insert_with(|| {
-                    format!("relative or unexpanded known_hosts path {value:?} in `ssh -G` output")
-                });
-            }
-        }
+    if value.contains(char::is_whitespace) {
+        unsupported.get_or_insert_with(|| format!(
+            "ambiguous known_hosts filenames in `ssh -G` output {value:?}; OpenSSH removes quoting, so constrained agent forwarding accepts only one whitespace-free configured file per directive"
+        ));
         return;
     }
-    unsupported.get_or_insert_with(|| format!(
-        "ambiguous known_hosts filenames in `ssh -G` output {value:?}; OpenSSH removes quoting, so constrained agent forwarding accepts only one whitespace-free configured file per directive"
-    ));
-    if Path::new(value).exists() {
+    let path = PathBuf::from(value);
+    if value.contains('%') || value.starts_with('~') || !path.is_absolute() {
+        unsupported.get_or_insert_with(|| {
+            format!("relative or unexpanded known_hosts path {value:?} in `ssh -G` output")
+        });
         return;
     }
-    let pieces: Option<Vec<PathBuf>> = value
-        .split_whitespace()
-        .map(|part| usable(part).filter(|path| path.is_file()))
-        .collect();
-    if let Some(pieces) = pieces {
-        files.extend(pieces);
-    }
+    files.push(path);
 }
 
 fn configured_host_key_allowed(config: &EffectiveSshConfig, key: &KeyData) -> bool {

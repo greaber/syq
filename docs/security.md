@@ -331,13 +331,17 @@ them, and, as for hostA's other connections, `UpdateHostKeys` can record
 keys hostB announces in hostA's known_hosts.
 
 HostA also accepts the keys and host certificate authorities that your
-laptop's known_hosts lists for hostB, from a file named
-`known-to-the-machine-that-approved-this-copy`, added to hostA's
-`GlobalKnownHostsFile`. OpenSSH reports a list of files and one quoted name
-containing spaces the same way, so where hostA's `GlobalKnownHostsFile`
-could be either, syq leaves it as configured and hostA does without your
-laptop's entries for that copy; your laptop likewise leaves out a
-known_hosts setting of its own that could be either. A key that matches an entry
+laptop's known_hosts lists for hostB. Syq gives them to hostA's `ssh`
+through a `KnownHostsCommand` that prints a file named
+`known-to-the-machine-that-approved-this-copy`, so hostA's own known_hosts
+settings stay exactly as configured. Where hostA's configuration sets a
+`KnownHostsCommand` of its own, which stays, or hostA's OpenSSH is older
+than 8.5, the file is added to hostA's `GlobalKnownHostsFile` instead, but
+only when that setting contains no whitespace: OpenSSH reports a list of
+files and one quoted name containing spaces the same way. Otherwise hostA
+does without your laptop's entries for that copy, and the copy says so. Your
+laptop leaves out a known_hosts setting of its own that contains whitespace,
+other than OpenSSH's own default list. A key that matches an entry
 on either machine is accepted, so a key your laptop knows works even where
 hostA has an old one. A key that matches nothing while either machine lists
 some key for hostB is refused, as `ssh` refuses it, and the message names

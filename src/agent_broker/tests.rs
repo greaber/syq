@@ -208,11 +208,11 @@ fn ambiguous_or_relative_known_hosts_filenames_fail_closed() {
     }
 }
 
-/// What this machine tells a server about a host: a value with whitespace
-/// is read as a list only when it cannot be one quoted name, judged by the
-/// keys actually selected.
+/// What this machine tells a server about a host: a configured value with
+/// whitespace could be one quoted name or several, so it is left out,
+/// judged by the keys actually selected.
 #[test]
-fn known_hosts_lists_are_read_only_when_they_cannot_be_one_name() {
+fn known_hosts_values_with_whitespace_are_left_out() {
     let temporary = crate::test_support::tempdir().unwrap();
     let key = |name: &str| {
         let key = ssh_key::PrivateKey::random(
@@ -224,35 +224,37 @@ fn known_hosts_lists_are_read_only_when_they_cannot_be_one_name() {
         std::fs::write(temporary.path().join(name), line).unwrap();
         key.public_key().key_data().clone()
     };
-    let quoted = key("known hosts");
+    key("known hosts");
     let known = key("known");
-    let other = key("other");
+    key("other");
     let selected = |value: &str| {
         let mut files = Vec::new();
         let mut unsupported = None;
         append_known_hosts_files(&mut files, value, None, true, &mut unsupported);
-        // Exact-key uses refuse any value with whitespace.
+        // Exact-key uses refuse such a value.
         assert!(unsupported.is_some(), "{value}");
         let (keys, _) =
             read_known_host_keys(&OsString::from("ssh-keygen"), "vault", &files).unwrap();
         keys
     };
     let directory = temporary.path().display();
-    // `"…/known hosts"`, one quoted name: a file has that whole name, so
-    // nothing is read, rather than `…/known`, which the user did not choose.
+    // `"…/known hosts"`, one quoted name, and an unquoted list of existing
+    // files look the same: neither is read, so `…/known` never is.
     assert!(selected(&format!("{directory}/known hosts")).is_empty());
-    // An unquoted list of existing files: both are read.
-    let both = selected(&format!("{directory}/known {directory}/other"));
-    assert!(both.contains(&known) && both.contains(&other) && !both.contains(&quoted));
-    // A piece that does not exist could be part of one name: nothing.
-    assert!(selected(&format!("{directory}/known {directory}/missing")).is_empty());
-    assert!(selected(&format!("{directory}/known relative")).is_empty());
-    // One name without whitespace is read as before.
+    assert!(selected(&format!("{directory}/known {directory}/other")).is_empty());
+    // One name without whitespace is read.
     let mut files = Vec::new();
     let mut unsupported = None;
-    append_known_hosts_files(&mut files, "/tmp/only", None, true, &mut unsupported);
-    assert_eq!(files, [PathBuf::from("/tmp/only")]);
+    append_known_hosts_files(
+        &mut files,
+        &format!("{directory}/known"),
+        None,
+        true,
+        &mut unsupported,
+    );
     assert!(unsupported.is_none());
+    let (keys, _) = read_known_host_keys(&OsString::from("ssh-keygen"), "vault", &files).unwrap();
+    assert_eq!(keys, [known]);
 }
 
 #[test]

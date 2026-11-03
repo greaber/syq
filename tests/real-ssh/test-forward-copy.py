@@ -909,30 +909,44 @@ finally:
     run("ssh", "source", "rm -rf /tmp/syq-real-ssh-usercert")
 assert remote("sha256sum /tmp/syq-real-ssh/forward/hostkey-user-certificate").split()[0] == source_hash
 
-print("case: a global known-hosts name with a space is not split", flush=True)
-# The source's configuration names one file, quoted, whose name has a space,
-# holding a wrong key for the destination. The source's own ssh refuses the
-# destination; so does the copy, which cannot add the runner's knowledge to
-# that list without changing what it means.
+def approved_source_copy():
+    """Run `source_copy()`, approve it, and return its status and errors."""
+    process = source_copy()
+    pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
+    assert len(pending) == 1, pending
+    run("syq", "persist", "receive", "approve", pending[0]["id"])
+    _, stderr = process.communicate(timeout=90)
+    return process.returncode, stderr
+
+
+print("case: the server's own KnownHostsCommand is kept", flush=True)
+# The source knows the destination only through a KnownHostsCommand of its
+# own. The runner's entries cannot join through another command, and the
+# source's default GlobalKnownHostsFile list looks like one quoted name to
+# `ssh -G`, so they are left out, and the copy says so.
+WITHOUT = "without what the approving machine knows about it"
 saved_source = source_known_hosts()
+right = run("ssh-keyscan", "-T", "5", "destination")
 try:
-    run("ssh", "source", "ssh-keygen -R destination >/dev/null 2>&1; rm -rf /tmp/syq-real-ssh-gk && "
-        "mkdir /tmp/syq-real-ssh-gk && ssh-keygen -q -t ed25519 -N '' -f /tmp/syq-real-ssh-gk/wrong && "
-        "printf 'destination %s\\n' \"$(cut -d' ' -f1,2 /tmp/syq-real-ssh-gk/wrong.pub)\" "
-        "> '/tmp/syq-real-ssh-gk/known hosts'")
-    def quoted_global():
-        assert subprocess.run(["ssh", "source", "ssh -o BatchMode=yes destination true"],
-                              timeout=40, capture_output=True).returncode != 0
-        refused = source_copy()
-        pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
-        assert len(pending) == 1, pending
-        run("syq", "persist", "receive", "approve", pending[0]["id"])
-        _, stderr = refused.communicate(timeout=90)
-        assert refused.returncode not in (0, 124), stderr
-        assert "Host key verification failed" in stderr, stderr
-    with_source_config('Host destination\n  GlobalKnownHostsFile "/tmp/syq-real-ssh-gk/known hosts"\n',
-                       quoted_global)
+    run("ssh", "source", "ssh-keygen -R destination >/dev/null 2>&1; rm -rf /tmp/syq-real-ssh-khc && "
+        "mkdir /tmp/syq-real-ssh-khc && cat > /tmp/syq-real-ssh-khc/hosts", stdin=right)
+    status, stderr = with_source_config(
+        "Host destination\n  StrictHostKeyChecking yes\n"
+        "  KnownHostsCommand /usr/bin/env cat /tmp/syq-real-ssh-khc/hosts\n",
+        approved_source_copy)
+    assert status == 0, stderr
+    assert WITHOUT in stderr, stderr
+    print("the source's own KnownHostsCommand decided", flush=True)
+    # The same, with the source's command knowing nothing: only the runner
+    # knows the destination, and its entries are left out, so the copy is
+    # refused, as the source's own ssh would refuse it.
+    status, stderr = with_source_config(
+        "Host destination\n  StrictHostKeyChecking yes\n  KnownHostsCommand /bin/true\n",
+        approved_source_copy)
+    assert status not in (0, 124), stderr
+    assert WITHOUT in stderr and "Host key verification failed" in stderr, stderr
+    print("without the runner's entries, the copy was refused and said why", flush=True)
 finally:
     restore_source_known_hosts(saved_source)
-    run("ssh", "source", "rm -rf /tmp/syq-real-ssh-gk")
+    run("ssh", "source", "rm -rf /tmp/syq-real-ssh-khc")
 print("source-shell remote copy checks passed", flush=True)

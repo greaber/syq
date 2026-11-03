@@ -925,7 +925,8 @@ const RECEIVER_CONFIG: &str = "user backup\n\
     port 2222\n\
     stricthostkeychecking ask\n\
     userknownhostsfile /home/u/.ssh/known_hosts /home/u/.ssh/known_hosts2\n\
-    globalknownhostsfile /etc/ssh/ssh_known_hosts\n\
+    globalknownhostsfile /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2\n\
+    pubkeyacceptedalgorithms ssh-ed25519,rsa-sha2-512\n\
     sessiontype default\n\
     stdinnull no\n\
     forkafterauthentication no\n\
@@ -951,7 +952,7 @@ fn the_coordinator_adds_only_what_its_own_configuration_needs() {
     assert_eq!(connection.lookup, "[backup.example.net]:2222");
     // Nobody can answer `ask` here: accept a new host, as accept-new does.
     // Everything else stays as configured, and the approving machine's
-    // knowledge comes after this machine's own global files.
+    // knowledge joins through a command, beside the configured files.
     assert_eq!(connection.hostname, "backup.example.net");
     assert_eq!(connection.accepted_algorithms, "PubkeyAcceptedAlgorithms");
     assert_eq!(
@@ -960,7 +961,7 @@ fn the_coordinator_adds_only_what_its_own_configuration_needs() {
             "-o",
             "StrictHostKeyChecking=accept-new",
             "-o",
-            "GlobalKnownHostsFile=/etc/ssh/ssh_known_hosts /tmp/approving",
+            "KnownHostsCommand=/usr/bin/env cat /tmp/approving",
         ]
     );
     for configured in ["yes", "true", "no", "false", "accept-new"] {
@@ -1012,19 +1013,11 @@ fn the_coordinator_adds_only_what_its_own_configuration_needs() {
         ReceiverConnection::parse(&format!("{RECEIVER_CONFIG}hostkeyalias backup-alias\n"))
             .unwrap();
     assert_eq!(aliased.lookup, "backup-alias");
-    let no_global = ReceiverConnection::parse(&RECEIVER_CONFIG.replace(
-        "globalknownhostsfile /etc/ssh/ssh_known_hosts",
-        "globalknownhostsfile none",
-    ))
-    .unwrap();
-    assert!(no_global
-        .arguments(Some(std::path::Path::new("/tmp/approving")))
-        .contains(&"GlobalKnownHostsFile=/tmp/approving".to_owned()));
-    // Without the approving machine's file, the configured list stands.
-    assert!(!connection
-        .arguments(None)
-        .iter()
-        .any(|argument| argument.starts_with("GlobalKnownHostsFile")));
+    // Without the approving machine's file, nothing is added.
+    assert_eq!(
+        connection.arguments(None),
+        ["-o", "StrictHostKeyChecking=accept-new"]
+    );
     // An older ssh names the accepted algorithms its own way.
     let older =
         ReceiverConnection::parse("hostname backup\nport 22\npubkeyacceptedkeytypes ssh-ed25519\n")
@@ -1033,25 +1026,74 @@ fn the_coordinator_adds_only_what_its_own_configuration_needs() {
     assert!(ReceiverConnection::parse("port 22\n").is_err());
 }
 
-/// A configured GlobalKnownHostsFile is given back with one more file only
-/// when that means the same files: one name, or OpenSSH's own default list.
+/// The approving machine's entries join through a KnownHostsCommand, which
+/// leaves the configured files as they are. Where the configuration has a
+/// command of its own, or this ssh has none, they become one more global
+/// file only when the configured value has no whitespace: `ssh -G` prints a
+/// list and one quoted name with spaces the same way.
 #[test]
-fn the_approving_machines_file_joins_only_a_global_list_given_back_exactly() {
-    let default = || Some("/etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2".to_owned());
-    assert!(exact_known_hosts_list(
-        "/etc/ssh/ssh_known_hosts",
-        || unreachable!()
-    ));
-    assert!(exact_known_hosts_list("none", || unreachable!()));
-    assert!(exact_known_hosts_list(
-        "/etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2",
-        default
-    ));
-    // One quoted name with a space, or a list of other files: `ssh -G`
-    // prints both the same way.
-    assert!(!exact_known_hosts_list("/srv/known hosts", default));
-    assert!(!exact_known_hosts_list("/srv/a /srv/b", default));
-    assert!(!exact_known_hosts_list("/srv/a /srv/b", || None));
+fn the_approving_machines_entries_join_without_guessing_file_lists() {
+    let approving = Some(std::path::Path::new("/tmp/approving"));
+    let joined = |config: &str| {
+        let connection = ReceiverConnection::parse(config).unwrap();
+        (
+            connection.approving_keys(),
+            connection
+                .arguments(approving)
+                .into_iter()
+                .filter(|argument| {
+                    argument.starts_with("KnownHostsCommand")
+                        || argument.starts_with("GlobalKnownHostsFile")
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(
+        joined(RECEIVER_CONFIG),
+        (
+            ApprovingKeys::Command,
+            vec!["KnownHostsCommand=/usr/bin/env cat /tmp/approving".to_owned()]
+        )
+    );
+    // The configuration's own command stays.
+    let own = format!("{RECEIVER_CONFIG}knownhostscommand /usr/local/bin/hosts %H\n");
+    assert_eq!(joined(&own), (ApprovingKeys::Omitted, Vec::new()));
+    let single = own.replace(
+        "globalknownhostsfile /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2",
+        "globalknownhostsfile /etc/ssh/ssh_known_hosts",
+    );
+    assert_eq!(
+        joined(&single),
+        (
+            ApprovingKeys::GlobalFile,
+            vec!["GlobalKnownHostsFile=/etc/ssh/ssh_known_hosts /tmp/approving".to_owned()]
+        )
+    );
+    let none = own.replace(
+        "globalknownhostsfile /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2",
+        "globalknownhostsfile none",
+    );
+    assert_eq!(
+        joined(&none),
+        (
+            ApprovingKeys::GlobalFile,
+            vec!["GlobalKnownHostsFile=/tmp/approving".to_owned()]
+        )
+    );
+    // An ssh older than 8.5 has no KnownHostsCommand.
+    let older = RECEIVER_CONFIG.replace(
+        "pubkeyacceptedalgorithms ssh-ed25519,rsa-sha2-512",
+        "pubkeyacceptedkeytypes ssh-ed25519,rsa-sha2-512",
+    );
+    assert_eq!(joined(&older), (ApprovingKeys::Omitted, Vec::new()));
+    assert_eq!(
+        joined(&older.replace(
+            "globalknownhostsfile /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2",
+            "globalknownhostsfile /etc/ssh/ssh_known_hosts",
+        ))
+        .0,
+        ApprovingKeys::GlobalFile
+    );
 }
 
 /// With real OpenSSH: under the receiver command and what syq adds, a
@@ -1125,8 +1167,10 @@ fn the_entry_key_session_keeps_its_hardening_under_this_machines_configuration()
         "stricthostkeychecking accept-new",
         "userknownhostsfile none",
         "casignaturealgorithms ssh-ed25519",
+        // The configuration's own command stays, and its default global
+        // list could be one quoted name: the approving machine's entries
+        // are left out rather than guessed at.
         "knownhostscommand /bin/true %H %K",
-        "globalknownhostsfile /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2 /tmp/approving",
     ] {
         assert!(has(line), "{line}\n{effective}");
     }
@@ -1233,9 +1277,12 @@ fn receiver_ssh_uses_the_entry_key_first_and_checks_host_keys_as_this_machine_do
     let approving = guard.path().join(APPROVING_KNOWN_HOSTS);
     let key = guard.path().join("entry-key");
     assert!(command.contains(&format!(
-        "GlobalKnownHostsFile=/etc/ssh/ssh_known_hosts {}",
+        "KnownHostsCommand=/usr/bin/env cat {}",
         approving.display()
     )));
+    assert!(!command
+        .iter()
+        .any(|argument| argument.starts_with("GlobalKnownHostsFile")));
     assert!(command.contains(&format!("IdentityFile={}", key.display())));
     // Written under the name this machine's own configuration uses.
     assert_eq!(
@@ -1257,39 +1304,32 @@ fn receiver_ssh_uses_the_entry_key_first_and_checks_host_keys_as_this_machine_do
     drop(guard);
     assert!(!approving.exists() && !key.exists());
 
-    // A global list that could be one quoted name is left as configured,
-    // without the approving machine's file.
-    let ambiguous = crate::test_support::tempdir().unwrap();
-    let ssh = ambiguous.path().join("ssh");
-    crate::test_support::write_executable(
-        &ssh,
-        format!(
-            "#!/bin/sh\ncase \"$*\" in *-F*/dev/null*) printf 'globalknownhostsfile /etc/ssh/a /etc/ssh/b\\n' ;; *) printf '%s' '{}' ;; esac\n",
-            RECEIVER_CONFIG.replace(
-                "globalknownhostsfile /etc/ssh/ssh_known_hosts",
-                "globalknownhostsfile /srv/known hosts"
-            )
-        ),
-        0o700,
+    // With a KnownHostsCommand of its own and a global value that could be
+    // one quoted name, the configuration stays as it is, without the
+    // approving machine's entries.
+    let configured = crate::test_support::tempdir().unwrap();
+    let ssh = stand_in_ssh(
+        configured.path(),
+        &format!("{RECEIVER_CONFIG}knownhostscommand /usr/local/bin/hosts %H\n"),
     );
     let mut words = shell_words::split(&receiver_rsh(Some(2222))).unwrap();
     words[0] = ssh.display().to_string();
     args.rsh = Some(shell_words::join(&words));
     let guard = prepare_receiver_ssh_with(&mut args, &known_hosts, entry_key.as_bytes()).unwrap();
     let command = parse_rsh(&args.rsh).unwrap();
-    assert!(!command
-        .iter()
-        .any(|argument| argument.starts_with("GlobalKnownHostsFile")));
+    assert!(!command.iter().any(|argument| {
+        argument.starts_with("GlobalKnownHostsFile") || argument.starts_with("KnownHostsCommand")
+    }));
     drop(guard);
 
-    // An approving machine that knows nothing leaves this machine's own.
+    // An approving machine that knows nothing adds nothing.
     args.rsh = Some(template.clone());
     let guard = prepare_receiver_ssh_with(&mut args, "", entry_key.as_bytes()).unwrap();
-    assert!(
-        std::fs::read_to_string(guard.path().join(APPROVING_KNOWN_HOSTS))
-            .unwrap()
-            .is_empty()
-    );
+    assert!(!guard.path().join(APPROVING_KNOWN_HOSTS).exists());
+    let command = parse_rsh(&args.rsh).unwrap();
+    assert!(!command.iter().any(|argument| {
+        argument.starts_with("GlobalKnownHostsFile") || argument.starts_with("KnownHostsCommand")
+    }));
     drop(guard);
     args.rsh = Some(template.clone());
     assert!(
