@@ -19,10 +19,12 @@ fn receiver_state(id: EnrollmentId) -> Result<(PathBuf, ReceiverEnrollment)> {
 /// How many sessions an entry key may have open on one enrollment before
 /// they have shown a verified directive or a running copy's worker ticket.
 /// Former coordinators keep the entry key, so this bounds what they can start
-/// without a fresh directive.
-const UNVERIFIED_SESSIONS: u64 = 8;
-/// How long a session has to take one of those slots and send its first
-/// frame.
+/// without a fresh directive. A coordinator sets up at most this many
+/// workers at once, so one copy's workers never take more slots than there
+/// are; a worker refused when several copies start at once is retried by its
+/// coordinator.
+const UNVERIFIED_SESSIONS: usize = crate::conn::MAX_CONCURRENT_CONNECTS;
+/// How long a session has to send its first frame.
 const ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 /// The largest first frame a session may send.
 const MAX_ADMISSION_BYTES: usize = crate::directive::MAX_SIGNED_BYTES + 64;
@@ -86,47 +88,46 @@ impl Admission {
 pub(super) struct UnverifiedSlot(#[allow(dead_code)] File);
 
 impl UnverifiedSlot {
-    /// Take a free slot of the `slots`, waiting for one until `deadline`.
-    pub(super) fn take(state: &Path, slots: u64, deadline: Instant) -> Result<Self> {
-        loop {
-            for slot in 0..slots {
-                let file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .mode(0o600)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                    .open(state.join(format!("session-slot-{slot}")))
-                    .context("open the enrollment's session slots")?;
-                let metadata = file.metadata()?;
-                if !metadata.is_file()
-                    || metadata.nlink() != 1
-                    || metadata.uid() != unsafe { libc::geteuid() }
-                    || metadata.mode() & 0o7777 != 0o600
-                {
-                    bail!("the enrollment's session slots must be private, singly linked regular files");
-                }
+    /// Take a free slot of the `slots`, or refuse the session at once when
+    /// there is none. No session waits for a slot, so no more than `slots`
+    /// unverified sessions run.
+    pub(super) fn take(state: &Path, slots: usize) -> Result<Self> {
+        for slot in 0..slots {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(state.join(format!("session-slot-{slot}")))
+                .context("open the enrollment's session slots")?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file()
+                || metadata.nlink() != 1
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o7777 != 0o600
+            {
+                bail!(
+                    "the enrollment's session slots must be private, singly linked regular files"
+                );
+            }
+            loop {
                 // SAFETY: the descriptor stays open for the call.
                 if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
                     return Ok(Self(file));
                 }
                 let error = std::io::Error::last_os_error();
-                if !matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                ) {
-                    return Err(error).context("lock a session slot");
+                match error.kind() {
+                    std::io::ErrorKind::Interrupted => {}
+                    std::io::ErrorKind::WouldBlock => break,
+                    _ => return Err(error).context("lock a session slot"),
                 }
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                bail!(
-                    "{slots} other connections are already waiting to start a copy on this enrollment; try again, or replace its entry key with `syq receiver revoke` and enroll again if this persists"
-                );
-            }
-            std::thread::sleep(remaining.min(Duration::from_millis(20)));
         }
+        bail!(
+            "{slots} other connections are starting copies on this enrollment; try again shortly, or replace its entry key with `syq receiver revoke` and enroll again if this persists"
+        )
     }
 }
 
@@ -151,7 +152,9 @@ pub(crate) fn admit_session(enrollment: &str, generation: &str) -> Result<Sessio
         .context("restricted receiver generation must be a number")?;
     let deadline = Instant::now() + ADMISSION_TIMEOUT;
     let (state, config) = receiver_state(enrollment)?;
-    let slot = UnverifiedSlot::take(&state, UNVERIFIED_SESSIONS, deadline)?;
+    // A revoked enrollment starts nothing, even while its revocation runs.
+    active::require_not_revoked(&state)?;
+    let slot = UnverifiedSlot::take(&state, UNVERIFIED_SESSIONS)?;
     // Read exactly the frame from the session's input, unbuffered, so the
     // copy's own protocol after it stays where the server reads it.
     let mut input = File::from(

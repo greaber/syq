@@ -25,9 +25,10 @@ SHA = "a" * 40
 
 class DispatchTests(unittest.TestCase):
     def invoke(self, args, *, dirty=False, remote=SHA, watch_status=0, response=None,
-               label_input=True):
+               label_input=True, provider_input=False):
         self.payload = None
-        workflow = "inputs:\n      timeout:\n" + ("      label:\n" if label_input else "")
+        workflow = ("inputs:\n      timeout:\n" + ("      label:\n" if label_input else "")
+                    + ("      provider:\n" if provider_input else ""))
 
         def output(*cmd, **kwargs):
             if cmd[:3] == ("gh", "repo", "view"):
@@ -98,13 +99,16 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(self.payload["inputs"]["cargo_cache"], "true")
         self.assertEqual(self.payload["inputs"]["timeout"], "3")
 
-    def test_intel_requires_github_provider(self):
-        with self.assertRaises(SystemExit):
-            self.invoke(["--runner", "macos-intel", "--", "true"])
-        self.assertIsNone(self.payload)
-        self.invoke(["--runner", "macos-intel", "--provider", "github", "--", "true"])
+    def test_github_provider_is_selected_only_where_the_workflow_offers_a_choice(self):
+        self.invoke(["--runner", "macos-intel", "--", "true"])
         self.assertEqual(self.payload["inputs"]["runner"], "macos-intel")
+        self.assertNotIn("provider", self.payload["inputs"])
+        # An older branch's workflow would otherwise default to another provider.
+        self.invoke(["--runner", "linux", "--", "true"], provider_input=True)
         self.assertEqual(self.payload["inputs"]["provider"], "github")
+        with self.assertRaises(SystemExit):
+            self.invoke(["--provider", "github", "--", "true"])
+        self.assertIsNone(self.payload)
 
     def test_missing_run_id_is_not_success(self):
         with self.assertRaises(ValueError):

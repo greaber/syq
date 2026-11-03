@@ -2322,37 +2322,56 @@ fn a_session_reads_exactly_one_bounded_first_frame() {
 }
 
 #[test]
-fn unverified_sessions_share_a_few_slots_until_the_deadline() {
+fn unverified_sessions_beyond_the_slots_are_refused_at_once() {
     let temporary = crate::test_support::tempdir().unwrap();
     let state = temporary.path().join("state");
     fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
-    let deadline = |milliseconds| Instant::now() + std::time::Duration::from_millis(milliseconds);
-    let first = UnverifiedSlot::take(&state, 2, deadline(1000)).unwrap();
-    let second = UnverifiedSlot::take(&state, 2, deadline(1000)).unwrap();
-    let started = Instant::now();
-    let error = UnverifiedSlot::take(&state, 2, deadline(200))
-        .err()
-        .unwrap()
-        .to_string();
+    let first = UnverifiedSlot::take(&state, 2).unwrap();
+    let second = UnverifiedSlot::take(&state, 2).unwrap();
+    let error = UnverifiedSlot::take(&state, 2).err().unwrap().to_string();
     assert!(error.contains("2 other connections"), "{error}");
-    assert!(started.elapsed() >= std::time::Duration::from_millis(200));
-    // A slot frees when its session is verified or ends, and a session
-    // waiting for one takes it.
-    let waiting = {
-        let state = state.clone();
-        std::thread::spawn(move || UnverifiedSlot::take(&state, 2, deadline(5000)).map(drop))
-    };
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // A slot frees when its session is verified or ends.
     drop(first);
-    waiting.join().unwrap().unwrap();
-    drop(second);
+    let third = UnverifiedSlot::take(&state, 2).unwrap();
+    drop((second, third));
     // A slot that is not a private regular file is refused.
     fs::set_permissions(
         state.join("session-slot-0"),
         fs::Permissions::from_mode(0o644),
     )
     .unwrap();
-    assert!(UnverifiedSlot::take(&state, 2, deadline(100)).is_err());
+    assert!(UnverifiedSlot::take(&state, 2).is_err());
+}
+
+#[test]
+fn a_revoked_enrollments_state_goes_while_a_session_still_writes_in_it() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let state = temporary.path().join("state");
+    fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+    for name in 0..64 {
+        fs::write(state.join(format!("record-{name}")), b"").unwrap();
+    }
+    // A session that started before the revocation keeps creating files
+    // until the directory is gone.
+    let writer = {
+        let state = state.clone();
+        std::thread::spawn(move || {
+            for name in 0.. {
+                if fs::write(state.join(format!("late-{name}")), b"").is_err() {
+                    return name;
+                }
+                if name == 2000 {
+                    return name;
+                }
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+            unreachable!()
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    install::remove_revoked_state(&state).unwrap();
+    writer.join().unwrap();
+    assert!(!state.exists());
 }
 
 #[test]
