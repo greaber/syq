@@ -476,6 +476,9 @@ class ForwardingListener:
     """An SSH listener on the source that permits forwarding, which the lab's
     own servers refuse, trusted by the runner while it runs."""
 
+    def __init__(self, trust=True):
+        self.trust = trust
+
     def __enter__(self):
         self.listener = json.loads(run("ssh", "source", "python3 -", stdin="""
 import json, pathlib, socket, subprocess, tempfile
@@ -509,8 +512,9 @@ print(json.dumps({"root": str(root), "port": port,
                 except OSError as error:
                     return False, str(error)
             wait_until("the jump listener", listening)
-            with self.known_hosts.open("a") as hosts:
-                hosts.write(f"[source]:{self.port} {self.listener['key']}\n")
+            if self.trust:
+                with self.known_hosts.open("a") as hosts:
+                    hosts.write(f"[source]:{self.port} {self.listener['key']}\n")
         except BaseException:
             self.__exit__(None, None, None)
             raise
@@ -549,6 +553,17 @@ with ForwardingListener() as listener:
         start = trace_length()
         copy("/tmp/syq-real-ssh/forward/configured-jump")
         configured, via, jumps = enrollment_events(start)
+        assert len(destination_enrollments()) == 1
+        # Enrolling from the command line takes the same route, and the
+        # jump's own SSH trace stays out of the terminal.
+        for enrollment in destination_enrollments():
+            run("syq", "receiver", "revoke", enrollment)
+        before = listener.logins()
+        enrolled = subprocess.run(["syq", "receiver", "enroll", "destination"],
+                                  capture_output=True, text=True, timeout=90)
+        assert enrolled.returncode == 0, enrolled
+        assert "debug1:" not in enrolled.stderr and "debug3:" not in enrolled.stderr, enrolled.stderr
+        assert listener.logins() > before
     finally:
         if original is None:
             config.unlink()
@@ -563,6 +578,85 @@ assert configured and all(status == "0" for status in configured), (configured, 
 assert via == [] and jumped >= 1, (configured, via, jumped)
 assert remote("sha256sum /tmp/syq-real-ssh/forward/configured-jump").split()[0] == source_hash
 assert len(destination_enrollments()) == 1
+
+def receive_service_pids():
+    found = []
+    for entry in Path("/proc").iterdir():
+        try:
+            if entry.name.isdigit() and b"--receive-service" in (entry / "cmdline").read_bytes().split(b"\0"):
+                if alive(int(entry.name)):
+                    found.append(int(entry.name))
+        except OSError:
+            pass
+    return found
+
+
+def restart_receiving(environment):
+    """Start the receiving service again, with `environment` added."""
+    run("syq", "persist", "receive", "off")
+    try:
+        wait_until("the receiving service to stop", lambda: (not receive_service_pids(), receive_service_pids()),
+                   seconds=15)
+    except AssertionError:
+        for pid in receive_service_pids():
+            os.kill(pid, signal.SIGTERM)
+        wait_until("the receiving service to end", lambda: (not receive_service_pids(), receive_service_pids()))
+    result = subprocess.run(["syq", "persist", "receive", "on", "--name", "laptop", "--notify", "off"],
+                            env=dict(os.environ, **environment), capture_output=True, text=True, timeout=40)
+    assert result.returncode == 0, result
+    run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
+    pids = receive_service_pids()
+    assert pids, "no receiving service"
+    environ = Path(f"/proc/{pids[0]}/environ").read_bytes().split(b"\0")
+    for name, value in environment.items():
+        assert f"{name}={value}".encode() in environ, (name, environ)
+
+
+print("case: the retry through the server that asked never prompts for it or trusts a new key", flush=True)
+for enrollment in destination_enrollments():
+    run("syq", "receiver", "revoke", enrollment)
+askpass_root = Path(tempfile.mkdtemp(prefix="syq-real-ssh-askpass-"))
+askpass = askpass_root / "askpass"
+askpass_used = askpass_root / "used"
+askpass.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(askpass_used))}\necho yes\n")
+askpass.chmod(0o755)
+restart_receiving({"SSH_ASKPASS": str(askpass), "SSH_ASKPASS_REQUIRE": "force", "DISPLAY": "fixture"})
+jump_port = Path("/tmp/syq-real-ssh-jump-port")
+unreachable = Path("/tmp/syq-real-ssh-unreachable-direct")
+config = Path.home() / ".ssh/config"
+original = config.read_bytes() if config.exists() else None
+try:
+    with ForwardingListener(trust=False) as listener:
+        try:
+            # This machine's own configuration would trust a new key for the
+            # server, and the service could ask through askpass.
+            config.write_bytes(b"Host source\n  StrictHostKeyChecking accept-new\n\n" + (original or b""))
+            config.chmod(0o600)
+            hosts = (Path.home() / ".ssh/known_hosts").read_bytes()
+            jump_port.write_text(str(listener.port))
+            unreachable.touch()
+            refused = source_copy()
+            pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
+            assert len(pending) == 1, pending
+            run("syq", "persist", "receive", "approve", pending[0]["id"])
+            _, stderr = refused.communicate(timeout=120)
+            assert refused.returncode not in (0, 124), stderr
+            # The hop's own reason reaches the requester.
+            assert "Host key verification failed" in stderr, stderr
+            assert (Path.home() / ".ssh/known_hosts").read_bytes() == hosts
+            assert not askpass_used.exists()
+            assert destination_enrollments() == []
+            assert listener.logins() == 0
+        finally:
+            unreachable.unlink(missing_ok=True)
+            jump_port.unlink(missing_ok=True)
+            if original is None:
+                config.unlink(missing_ok=True)
+            else:
+                config.write_bytes(original)
+finally:
+    restart_receiving({})
+remote("test ! -e /tmp/syq-real-ssh/forward/first-use")
 
 print("case: enrolling goes through the server that asked when the runner cannot reach the destination", flush=True)
 for enrollment in destination_enrollments():

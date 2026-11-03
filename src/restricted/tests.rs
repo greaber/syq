@@ -2322,6 +2322,27 @@ fn a_session_reads_exactly_one_bounded_first_frame() {
 }
 
 #[test]
+fn a_failed_login_reports_what_ssh_said_in_its_trace() {
+    let trace = "debug1: Reading configuration data /etc/ssh/ssh_config\n\
+                 debug3: resolve_host: lookup backup:22\n\
+                 ssh: Could not resolve hostname backup: Name or service not known\n";
+    assert_eq!(
+        ssh_reason(trace).unwrap(),
+        "ssh: Could not resolve hostname backup: Name or service not known"
+    );
+    let refused = "debug1: Authentications that can continue: publickey\n\
+                   debug1: No more authentication methods to try.\n\
+                   syq@backup: Permission denied (publickey).\n";
+    assert_eq!(
+        ssh_reason(refused).unwrap(),
+        "syq@backup: Permission denied (publickey)."
+    );
+    assert!(ssh_reason("debug1: only debug output\n").is_none());
+    let long = format!("{}\n", "x".repeat(1000));
+    assert_eq!(ssh_reason(&long).unwrap().len(), 300);
+}
+
+#[test]
 fn unverified_sessions_beyond_the_slots_are_refused_at_once() {
     let temporary = crate::test_support::tempdir().unwrap();
     let state = temporary.path().join("state");

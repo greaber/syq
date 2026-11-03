@@ -626,6 +626,18 @@ pub enum EnrollmentRoute<'a> {
     ProxyJump { jump: &'a SshEndpoint },
 }
 
+/// What a login nobody is watching, such as the receiving service's, adds
+/// ahead of the user's configuration, for itself and for a jump syq makes:
+/// never prompt, never trust a new host key, and give up on a server that
+/// stops answering.
+const BACKGROUND_LOGIN: [&str; 5] = [
+    "BatchMode=yes",
+    "StrictHostKeyChecking=yes",
+    "ConnectTimeout=10",
+    "ServerAliveInterval=15",
+    "ServerAliveCountMax=3",
+];
+
 /// Arguments for the trusted local OpenSSH client that enrolls HostB.  A jump
 /// host receives only an opaque TCP stream; it never receives an agent socket
 /// or an authenticated HostB session.
@@ -634,15 +646,24 @@ pub fn enrollment_ssh_args(
     route: EnrollmentRoute<'_>,
     remote_command: &EnrollmentRemoteCommand,
 ) -> Vec<String> {
-    enrollment_ssh_args_raw(target, route, remote_command.as_str())
+    enrollment_ssh_args_raw(target, route, remote_command.as_str(), false)
 }
 
+/// `background`: nobody is watching this login (see `BACKGROUND_LOGIN`).
 pub(crate) fn enrollment_ssh_args_raw(
     target: &SshEndpoint,
     route: EnrollmentRoute<'_>,
     remote_command: &str,
+    background: bool,
 ) -> Vec<String> {
-    let mut args = vec![
+    // SSH takes the first value of each option, and the command line's
+    // before its configuration's.
+    let policy: &[&str] = if background { &BACKGROUND_LOGIN } else { &[] };
+    let mut args: Vec<String> = policy
+        .iter()
+        .flat_map(|option| ["-o".to_owned(), (*option).to_owned()])
+        .collect();
+    args.extend([
         "-a".to_owned(),
         "-x".to_owned(),
         "-k".to_owned(),
@@ -657,7 +678,7 @@ pub(crate) fn enrollment_ssh_args_raw(
         "ForwardX11=no".to_owned(),
         "-o".to_owned(),
         "PermitLocalCommand=no".to_owned(),
-    ];
+    ]);
     match route {
         // A jump or proxy the configuration names carries only the TCP
         // stream; this login stays end to end with hostB, which it checks
@@ -668,9 +689,15 @@ pub(crate) fn enrollment_ssh_args_raw(
             // implicit jump process. A fixed ProxyCommand lets us constrain that
             // process explicitly while the inner SSH connection remains local and
             // end-to-end with HostB.
+            // A login nobody is watching passes its policy on: OpenSSH gives
+            // its proxy command none of its own options.
+            let policy: String = policy
+                .iter()
+                .map(|option| format!(" -o {option}"))
+                .collect();
             args.push("-o".to_owned());
             args.push(format!(
-                "ProxyCommand=ssh -a -x -k -T -o ClearAllForwardings=yes -o ControlMaster=no -o ControlPath=none -o ForwardX11=no -o PermitLocalCommand=no -W '[%h]:%p' {}",
+                "ProxyCommand=ssh -a -x -k -T{policy} -o ClearAllForwardings=yes -o ControlMaster=no -o ControlPath=none -o ForwardX11=no -o PermitLocalCommand=no -W '[%h]:%p' {}",
                 jump.proxy_target()
             ));
         }
@@ -1034,6 +1061,77 @@ mod tests {
         assert_eq!(target.label(), "backup@[2001:db8::1]:2222");
         assert!(args.iter().any(|arg| arg == "backup@2001:db8::1"));
         assert!(!args.iter().any(|arg| arg.contains("[2001:db8::1]")));
+    }
+
+    #[test]
+    fn a_background_login_gives_its_policy_to_the_jump_syq_makes() {
+        let target = SshEndpoint::parse("backup@hostB").unwrap();
+        let jump = SshEndpoint::parse("user@hostA").unwrap();
+        let proxy = |background| {
+            let args = enrollment_ssh_args_raw(
+                &target,
+                EnrollmentRoute::ProxyJump { jump: &jump },
+                "/opt/syq/enroll",
+                background,
+            );
+            let proxy = args
+                .iter()
+                .find_map(|arg| arg.strip_prefix("ProxyCommand="))
+                .unwrap()
+                .to_owned();
+            (args, proxy)
+        };
+        let (args, command) = proxy(true);
+        for option in BACKGROUND_LOGIN {
+            assert!(
+                args.windows(2).any(|pair| pair == ["-o", option]),
+                "{option}"
+            );
+            assert!(command.contains(&format!(" -o {option} ")), "{command}");
+        }
+        // A foreground login, as `--via` makes, may still ask.
+        let (args, command) = proxy(false);
+        assert!(!args.iter().any(|arg| arg.starts_with("BatchMode")));
+        assert!(!command.contains("BatchMode"), "{command}");
+
+        // The jump's own options win over a configuration that would trust a
+        // new host key or ask for a passphrase.
+        let (_, command) = proxy(true);
+        let temporary = crate::test_support::tempdir().unwrap();
+        let config = temporary.path().join("config");
+        std::fs::write(
+            &config,
+            "Host *\n  StrictHostKeyChecking accept-new\n  BatchMode no\n  ConnectTimeout 300\n",
+        )
+        .unwrap();
+        let words = shell_words::split(&command).unwrap();
+        let (program, options) = words.split_first().unwrap();
+        assert_eq!(program, "ssh");
+        let output = std::process::Command::new("ssh")
+            .arg("-G")
+            .arg("-F")
+            .arg(&config)
+            .args(
+                options
+                    .iter()
+                    .map(|word| word.replace("%h", "hostB").replace("%p", "22")),
+            )
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let effective = String::from_utf8(output.stdout).unwrap();
+        for setting in [
+            "batchmode yes",
+            "stricthostkeychecking true",
+            "connecttimeout 10",
+            "serveraliveinterval 15",
+            "serveralivecountmax 3",
+        ] {
+            assert!(
+                effective.lines().any(|line| line == setting),
+                "{setting}\n{effective}"
+            );
+        }
     }
 
     #[test]

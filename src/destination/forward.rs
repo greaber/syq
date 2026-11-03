@@ -318,6 +318,10 @@ impl Receiver {
         inputs: crate::directive::Inputs,
         mut stream: TrackedStream,
     ) -> Result<()> {
+        // The server waits this long for the reply, from when it asked: the
+        // decision, then the setup. Cancellation ends the setup sooner when
+        // the server goes.
+        let budget = Instant::now() + REQUEST_TIMEOUT + SETUP_TIMEOUT;
         let request_lock = self.request_lock.try_lock().map_err(|_| {
             anyhow::anyhow!("another transfer is awaiting approval; retry after it is decided")
         })?;
@@ -448,7 +452,10 @@ impl Receiver {
                 agent: policy.agent_socket().map(Path::to_path_buf),
                 allow_enrollment: !args.dry_run,
             },
-            Instant::now() + SETUP_TIMEOUT,
+            // Setting restricted copying up can upload syq, which takes a
+            // while on a slow link: give it what is left of the server's
+            // wait, not only the time after the decision.
+            budget,
             &cancelled,
         )
         .with_context(|| format!("approve the copy to {target:?}"))?;
@@ -559,9 +566,25 @@ fn prepare_in_child(
         })
     })();
     let status = child.close();
+    // The setup's own SSH writes its errors, and the remote installer's,
+    // here; its login's reasons are already in the reply.
+    let wrote = !child.errors.lock().unwrap().is_empty();
+    let output = if wrote {
+        format!("; its output: {}", child.errors())
+    } else {
+        String::new()
+    };
     match reply {
         Ok(Prepared::Signed(signed)) => Ok(signed),
-        Ok(Prepared::Refused(error)) => Err(anyhow::anyhow!(error)),
+        Ok(Prepared::Refused(error)) => Err(anyhow::anyhow!("{error}{output}")),
+        Err(error) if Instant::now() >= deadline => {
+            let account = format!("{}@{}", request.login, request.host);
+            Err(error).with_context(|| {
+                format!(
+                    "the copy's setup did not finish while the server waited{output}. If it was setting up or updating restricted copying on {account}, run `syq receiver enroll {account}` on this machine, which has no time limit, then try the copy again"
+                )
+            })
+        }
         Err(error) => Err(error)
             .with_context(|| format!("the copy's setup stopped ({status:?}): {}", child.errors())),
     }
@@ -1339,6 +1362,14 @@ mod tests {
                 .err()
                 .unwrap();
             assert!(started.elapsed() < Duration::from_secs(10), "{error:#}");
+            // Running out of time says how to set up without a time limit;
+            // a requester that went needs nothing more.
+            assert_eq!(
+                format!("{error:#}")
+                    .contains("run `syq receiver enroll alice@backup` on this machine"),
+                !requester_goes,
+                "{error:#}"
+            );
             let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
                 .unwrap()
                 .trim()
@@ -1353,6 +1384,41 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
+    }
+
+    #[test]
+    fn a_refused_setup_keeps_what_the_child_wrote() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let reply = temporary.path().join("reply");
+        let mut frame = Vec::new();
+        write_message(
+            &mut frame,
+            &Prepared::Refused("restricted enrollment SSH to alice@backup failed".into()),
+        )
+        .unwrap();
+        std::fs::write(&reply, frame).unwrap();
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            &format!(
+                "cat > /dev/null; echo 'installer: no space left' >&2; cat {}",
+                shell_words::quote(reply.to_str().unwrap())
+            ),
+        ]);
+        let error = prepare_in_child(
+            command,
+            &prepare_request(),
+            Instant::now() + Duration::from_secs(30),
+            &|| false,
+        )
+        .err()
+        .unwrap();
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with("restricted enrollment SSH to alice@backup failed"),
+            "{message}"
+        );
+        assert!(message.contains("installer: no space left"), "{message}");
     }
 
     #[test]

@@ -133,6 +133,24 @@ pub(super) fn enrollment_ssh_error(
     })
 }
 
+/// What SSH itself said about a login that failed: the last lines of its
+/// trace that are not debug output, such as "Permission denied (publickey)."
+/// or a host name it could not resolve. Logging to a file, SSH writes these
+/// only there.
+pub(super) fn ssh_reason(trace: &str) -> Option<String> {
+    let lines: Vec<&str> = trace
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("debug"))
+        .collect();
+    let reason = lines[lines.len().saturating_sub(3)..]
+        .iter()
+        .map(|line| line.chars().take(300).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("; ");
+    (!reason.is_empty()).then_some(reason)
+}
+
 pub(super) fn is_enrollment_transport_failure(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
@@ -147,7 +165,8 @@ pub(super) fn run_ssh(
     remote_command: &str,
     input: &[u8],
 ) -> Result<Vec<u8>> {
-    let args = enrollment::enrollment_ssh_args_raw(target, route, remote_command);
+    // Only `syq receiver revoke` manages an enrollment, in the foreground.
+    let args = enrollment::enrollment_ssh_args_raw(target, route, remote_command, false);
     let mut command = Command::new("ssh");
     command
         .args(args)
@@ -400,10 +419,13 @@ pub(super) fn endpoint(login: &str, host: &str, port: Option<u16>) -> Result<Ssh
 pub(super) fn configured_agent(
     target: &SshEndpoint,
     route: EnrollmentRoute<'_>,
+    background: bool,
 ) -> Result<Option<PathBuf>> {
     let output = Command::new("ssh")
         .arg("-G")
-        .args(enrollment::enrollment_ssh_args_raw(target, route, ""))
+        .args(enrollment::enrollment_ssh_args_raw(
+            target, route, "", background,
+        ))
         .capture_output()
         .context("inspect the SSH configuration for the enrollment's login")?;
     if !output.status.success() {
@@ -633,37 +655,29 @@ fn install_over_route(
     (plan, batch): (&Plan, bool),
     check: DestinationCheck<'_>,
 ) -> Result<Session> {
-    let agent = configured_agent(target, route.clone())?;
+    let agent = configured_agent(target, route.clone(), batch)?;
     let temporary = crate::private_broker::private_temp_dir("syq-enroll-")?;
     let trace_path = temporary.path().join("ssh.log");
     let stage = stage_name(plan.id)?;
     let remote = in_sh(&install_remote_command(&stage));
     let mut command = Command::new("ssh");
+    // The trace goes to the file alone. With -v, OpenSSH would also start a
+    // configured jump with -v, which writes its own trace to stderr.
     command
-        .args(["-vvv", "-o", "FingerprintHash=sha256", "-E"])
+        .args([
+            "-o",
+            "LogLevel=DEBUG3",
+            "-o",
+            "FingerprintHash=sha256",
+            "-E",
+        ])
         .arg(&trace_path);
-    if batch {
-        // SSH takes the first value of each option, so these come before
-        // the user's configuration. Nobody is watching a batch login, so it
-        // also gives up on a server that stops answering.
-        command.args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=yes",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ServerAliveInterval=15",
-            "-o",
-            "ServerAliveCountMax=3",
-        ]);
-    }
     command
         .args(enrollment::enrollment_ssh_args_raw(
             target,
             route.clone(),
             &remote,
+            batch,
         ))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -735,10 +749,17 @@ fn install_over_route(
             } else {
                 group.wait()?
             };
+            let reason = fs::read_to_string(&trace_path)
+                .ok()
+                .as_deref()
+                .and_then(ssh_reason);
             return Err(enrollment_ssh_error(
                 target,
                 status.code() == Some(255),
-                error,
+                match reason {
+                    Some(reason) => format!("{error:#} ({reason})"),
+                    None => format!("{error:#}"),
+                },
             ));
         }
     };
@@ -847,8 +868,14 @@ fn install_over_route(
     }
     let status = group.wait()?;
     if !status.success() {
+        let reason = fs::read_to_string(&trace_path)
+            .ok()
+            .as_deref()
+            .and_then(ssh_reason)
+            .map(|reason| format!(": {reason}"))
+            .unwrap_or_default();
         bail!(
-            "installation over SSH failed ({status}); retry, or run `syq receiver revoke {}`",
+            "installation over SSH failed ({status}){reason}; retry, or run `syq receiver revoke {}`",
             plan.id
         );
     }
