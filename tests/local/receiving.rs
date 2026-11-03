@@ -2589,11 +2589,11 @@ fn commands_retry_a_rejected_login_no_more_than_once_a_while() {
             .as_str()
             .unwrap_or_default()
             .to_owned();
-        let seconds = error
+        // None while an attempt is under way, before it has failed again.
+        error
             .split_once("trying again in ")
             .and_then(|(_, rest)| rest.split_once(" s,"))
-            .and_then(|(seconds, _)| seconds.parse::<u64>().ok());
-        seconds.unwrap_or_else(|| panic!("{status}"))
+            .and_then(|(seconds, _)| seconds.parse::<u64>().ok())
     };
     connect();
     assert_eq!(dials(), 1);
@@ -2603,7 +2603,7 @@ fn commands_retry_a_rejected_login_no_more_than_once_a_while() {
     // persist connect tries again at once, starting over.
     connect();
     assert_eq!(dials(), 2);
-    assert!(retry_in() <= 30);
+    assert!(retry_in().is_some_and(|seconds| seconds <= 30));
     // Once the interval has passed, a copy wakes the connection, which
     // tries at once and then waits longer than it did before.
     std::thread::sleep(std::time::Duration::from_secs(9));
@@ -2616,7 +2616,7 @@ fn commands_retry_a_rejected_login_no_more_than_once_a_while() {
     wait_for(
         "the longer wait",
         std::time::Duration::from_secs(20),
-        || retry_in() > 40,
+        || retry_in().is_some_and(|seconds| seconds > 40),
     );
 }
 
