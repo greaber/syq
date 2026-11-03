@@ -532,17 +532,13 @@ fn certificate_logins_trust_the_key_until_the_certificate_expires() {
     assert!(error.to_string().contains("certificate"), "{error:#}");
 }
 
-/// Certify `public_key` as `principal` for `validity`, with extra
-/// `ssh-keygen -O` options.
-fn certify(ca: &Path, public_key: &Path, principal: &str, validity: &str, options: &[&str]) {
+/// Certify `public_key` as `principal` for `validity`.
+fn certify(ca: &Path, public_key: &Path, principal: &str, validity: &str) {
     let mut command = Command::new("ssh-keygen");
     command
         .args(["-q", "-s"])
         .arg(ca)
         .args(["-I", "fixture", "-n", principal, "-V", validity]);
-    for option in options {
-        command.args(["-O", option]);
-    }
     run(command.arg(public_key), "certify the test key");
 }
 
@@ -590,13 +586,13 @@ fn certificates_never_extend_what_the_login_allowed() {
     keygen(&ca, "ed25519", None, "");
     keygen(&path, "ed25519", None, "");
     let public_path = path.with_extension("pub");
-    certify(&ca, &public_path, "backup", "-1m:+1h", &[]);
+    certify(&ca, &public_path, "backup", "-1m:+1h");
     let certificate_path = directory.path().join("identity-cert.pub");
     let authenticated_path = directory.path().join("authenticated-cert.pub");
     fs::copy(&certificate_path, &authenticated_path).unwrap();
     let authenticated = read_certificate(&authenticated_path).unwrap();
     assert!(agent.ssh_add(&[path.as_os_str()]));
-    certify(&ca, &public_path, "unrelated-account", "-1m:+52w", &[]);
+    certify(&ca, &public_path, "unrelated-account", "-1m:+52w");
     assert!(agent.ssh_add(&[path.as_os_str()]));
     let public = PublicKey::new(authenticated.public_key().clone(), "");
     let name = authenticated_path.to_str().unwrap();
@@ -645,7 +641,7 @@ fn certificates_never_extend_what_the_login_allowed() {
     // An expired certificate, or one not valid yet, left in the agent is
     // never the one recorded.
     for validity in ["-2h:-1h", "+1h:+52w"] {
-        certify(&ca, &public_path, "backup", validity, &[]);
+        certify(&ca, &public_path, "backup", validity);
         assert!(agent.ssh_add(&[path.as_os_str()]));
     }
     let login = discover(
@@ -662,7 +658,7 @@ fn certificates_never_extend_what_the_login_allowed() {
 
     // Another valid certificate for the login account that ends later
     // changes nothing.
-    certify(&ca, &public_path, "backup", "-1m:+2h", &[]);
+    certify(&ca, &public_path, "backup", "-1m:+2h");
     assert!(agent.ssh_add(&[path.as_os_str()]));
     let login = discover(
         &trace(name, &public, true),
@@ -683,7 +679,7 @@ fn certificates_never_extend_what_the_login_allowed() {
     let role = directory.path().join("role");
     keygen(&role, "ed25519", None, "");
     let role_public_path = role.with_extension("pub");
-    certify(&ca, &role_public_path, "backup-role", "-1m:+1h", &[]);
+    certify(&ca, &role_public_path, "backup-role", "-1m:+1h");
     let role_certificate = directory.path().join("role-cert.pub");
     let role_authenticated = directory.path().join("role-authenticated-cert.pub");
     fs::copy(&role_certificate, &role_authenticated).unwrap();
@@ -691,7 +687,7 @@ fn certificates_never_extend_what_the_login_allowed() {
         .unwrap()
         .valid_before();
     assert!(agent.ssh_add(&[role.as_os_str()]));
-    certify(&ca, &role_public_path, "backup", "-1m:+52w", &[]);
+    certify(&ca, &role_public_path, "backup", "-1m:+52w");
     assert!(agent.ssh_add(&[role.as_os_str()]));
     let ca_public = fs::read_to_string(ca.with_extension("pub")).unwrap();
     let login = discover(
@@ -710,7 +706,7 @@ fn certificates_never_extend_what_the_login_allowed() {
     // Only expired certificates: refused with a clear message.
     let lone = directory.path().join("lone");
     keygen(&lone, "ed25519", None, "");
-    certify(&ca, &lone.with_extension("pub"), "backup", "-2h:-1h", &[]);
+    certify(&ca, &lone.with_extension("pub"), "backup", "-2h:-1h");
     let lone_certificate = directory.path().join("lone-cert.pub");
     let lone_public = PublicKey::read_openssh_file(&lone.with_extension("pub")).unwrap();
     let error = discover(
