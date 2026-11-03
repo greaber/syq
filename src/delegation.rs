@@ -1,22 +1,21 @@
-//! Signed receiver authorization core.
+//! Receiver authorization core: what a copy may do at its destination, the
+//! login key that signs its directive, and the record of directives used.
 //!
-//! The forced receiver verifies and redeems a grant here, then converts the
-//! resulting `VerifiedGrant` into `restricted::RestrictedAuthority`. That
-//! separate type binds every protocol request to the destination it resolves
-//! in the session; verification by itself remains deliberately incapable of
-//! filesystem access.
+//! The forced receiver verifies and redeems a directive (`crate::directive`)
+//! here, and turns the rules derived from its command into
+//! `restricted::RestrictedAuthority`. That separate type binds every protocol
+//! request to the destination it resolves in the session; verification by
+//! itself has no filesystem access beyond the record of used directives.
 //!
-//! The wire representation deliberately signs a typed, canonical binary grant
-//! rather than a command line. The signature is an OpenSSH SSHSIG in the fixed
-//! [`SSHSIG_NAMESPACE`], made by the user's login key and verified here in
-//! Rust against the [`TrustedSigner`] the enrollment recorded, including a FIDO
-//! key's touch and PIN flags and a certificate's expiry. A fresh random
-//! [`RequestId`] is a replay nonce; durable redeeming gives at-most-once
-//! redemption, not exactly-once execution across a receiver crash.
-//! The ID is a separate type and size from the stable copy IDs in
-//! `proto`.
-//! Redeemed IDs are rejected from the pinned redeem store before the signature
-//! is checked.
+//! The signature is an OpenSSH SSHSIG in the directive namespace, made by
+//! the user's login key and verified here in Rust against the
+//! [`TrustedSigner`] the enrollment recorded, including a FIDO key's touch and
+//! PIN flags and a certificate's expiry. A fresh random [`RequestId`] is a
+//! replay nonce; durable redeeming gives at-most-once redemption, not
+//! exactly-once execution across a receiver crash. The ID is a separate type
+//! and size from the stable copy IDs in `proto`. Redeemed IDs are refused from
+//! the pinned redeem store before the signature is checked.
+//!
 //!
 //! "Durable" here means that redeem contents and directory-entry changes are
 //! flushed with ordinary `fsync` through [`File::sync_all`] on a local filesystem
@@ -39,7 +38,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use ssh_key::{HashAlg, LineEnding, PrivateKey};
+use ssh_key::HashAlg;
 use std::ffi::{CString, OsStr};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -51,20 +50,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub(crate) const SSHSIG_NAMESPACE: &str = "syq-grant@greaber.github";
-const WIRE_MAGIC: &[u8; 8] = b"SYQGRNT\0";
-const WIRE_HEADER_LEN: usize = WIRE_MAGIC.len() + 4 + 4;
-const MAX_GRANT_BYTES: usize = 32 * 1024;
-const MAX_SIGNATURE_BYTES: usize = 16 * 1024;
-const MAX_ENVELOPE_BYTES: usize = WIRE_HEADER_LEN + MAX_GRANT_BYTES + MAX_SIGNATURE_BYTES;
+pub(crate) const MAX_SIGNATURE_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_PATH_BYTES: usize = 4096;
 const MAX_LOGIN_BYTES: usize = 256;
-const MAX_SIGNER_BYTES: usize = 512;
-const MAX_GRANT_VALIDITY_SECS: i64 = 24 * 60 * 60;
-/// Upper bound on how far past issuance a grant may let a transfer run.
-const MAX_FINISH_WINDOW_SECS: i64 = 30 * 24 * 60 * 60;
 const MAX_CLOCK_SKEW_SECS: i64 = 5 * 60;
-const MAX_UNIX_TIMESTAMP: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
+pub(crate) const MAX_UNIX_TIMESTAMP: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
 pub(crate) const MAX_ENTRIES: u64 = 1_000_000_000_000;
 // Keep later accounting representable in both signed and unsigned counters.
 pub(crate) const MAX_COPY_BYTES: u64 = i64::MAX as u64;
@@ -75,6 +65,7 @@ const MAX_FILTER_ROOTS: usize = 1024;
 const REDEMPTION_MAGIC: &[u8; 8] = b"SYQCLM\0\0";
 const REDEMPTION_RECORD_LEN: usize = REDEMPTION_MAGIC.len() + 8 + 32 + 32;
 
+use crate::directive::Directive;
 use crate::enrollment::EnrollmentId;
 
 /// A one-redemption nonce generated independently for every signed request.
@@ -86,8 +77,8 @@ impl RequestId {
     /// A fresh nonce whose first 8 bytes are the big-endian issue time, so
     /// hex redeem filenames sort chronologically for inspection. The
     /// remaining 24 random bytes carry uniqueness; the timestamp is
-    /// organizational only — verifiers rely on the envelope signature and
-    /// the redeem store, never on this prefix. IMPORTANT: Any future expiry
+    /// organizational only — verifiers rely on the directive's signature
+    /// and the redeem store, never on this prefix. IMPORTANT: Any future expiry
     /// or pruning decision MUST read `redeemed_at` from the
     /// redeem record (see `validate_redeem_record`), never infer it from the
     /// filename.
@@ -99,7 +90,13 @@ impl RequestId {
         Ok(Self(bytes))
     }
 
-    fn validate(self) -> Result<()> {
+    /// A fixed ID for tests that compare derivations.
+    #[cfg(test)]
+    pub(crate) fn test(byte: u8) -> Self {
+        Self([byte; 32])
+    }
+
+    pub(crate) fn validate(self) -> Result<()> {
         if self.0.iter().all(|byte| *byte == 0) {
             bail!("request ID must be random and nonzero");
         }
@@ -112,13 +109,8 @@ impl RequestId {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum GrantOperation {
-    Copy(CopyOperation),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CopyOperation {
-    /// Canonically spelled absolute target path. This is only a signed name;
+    /// Canonically spelled absolute target path. This is only a name;
     /// receiver authorization resolves it beneath the confinement root handle.
     pub destination: Vec<u8>,
     /// Exact receiver-side mutation roots derived locally from the source
@@ -155,7 +147,6 @@ pub(crate) enum ExistingDestinationPolicy {
     Replace,
     /// Create missing entries without modifying pre-existing entries.
     Skip,
-    UpdateIfOlder,
     MustExist,
 }
 
@@ -168,21 +159,12 @@ pub(crate) enum DeletionPolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PublicationPolicy {
     AtomicStaged,
-    /// The in-place policy of earlier releases, under which a receiver
-    /// wrote existing files in place. A receiver now treats it as
-    /// `InPlaceNew`, which allows less. A named destination never receives
-    /// it: its requests come only from a matching build.
-    InPlace,
     /// `--in-place=new`: new files may be written directly at their final
-    /// names, and existing files are replaced as under `AtomicStaged`. A
-    /// variant of its own, so that a receiver from before it, which would
-    /// read `InPlace` as permission to write existing files in place,
-    /// refuses the grant instead.
+    /// names, and existing files are replaced as under `AtomicStaged`.
     InPlaceNew,
     /// `--in-place=update`: as `InPlaceNew`, and an existing file the
     /// receiver can vouch for (`fsops::vouch::update_refusal`) is updated in
-    /// place too. A receiver from before it refuses the grant, rather than
-    /// writing existing files in place without those checks.
+    /// place too.
     InPlaceUpdate,
 }
 
@@ -210,8 +192,6 @@ pub(crate) struct CopyOptions {
     pub preserve_devices: bool,
     pub compare_existing_by_content: bool,
     pub dry_run: bool,
-    // Legacy signed grants use this bit to forbid writes; preserve its encoding.
-    pub verify_only: bool,
     pub compressed_transport: bool,
     pub tcp_port_lo: u16,
     pub tcp_port_hi: u16,
@@ -227,63 +207,13 @@ pub(crate) struct CopyLimits {
     pub max_deletions: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// What one approved copy may do at its destination: the rules derived from
+/// its command, and the approval they came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Grant {
     pub enrollment_id: EnrollmentId,
-    pub target_login: String,
-    pub signer: String,
     pub request_id: RequestId,
-    pub issued_at: i64,
-    pub not_before: i64,
-    /// The receiver must redeem the grant by this wall-clock time.
-    pub start_by: i64,
-    /// The transfer must finish by this wall-clock time.
-    pub finish_by: i64,
-    pub operation: GrantOperation,
-}
-
-impl Grant {
-    fn validate_static(&self) -> Result<()> {
-        self.enrollment_id.validate()?;
-        self.request_id.validate()?;
-        validate_identity("target login", &self.target_login, MAX_LOGIN_BYTES, false)?;
-        validate_identity("signer", &self.signer, MAX_SIGNER_BYTES, true)?;
-
-        for (name, value) in [
-            ("issued-at", self.issued_at),
-            ("not-before", self.not_before),
-            ("start-by", self.start_by),
-            ("finish-by", self.finish_by),
-        ] {
-            if !(0..=MAX_UNIX_TIMESTAMP).contains(&value) {
-                bail!("grant {name} timestamp is out of range");
-            }
-        }
-        if self.not_before > self.issued_at
-            || self.issued_at > self.start_by
-            || self.start_by > self.finish_by
-        {
-            bail!("grant times must satisfy not-before <= issued-at <= start-by <= finish-by");
-        }
-        let validity = self
-            .start_by
-            .checked_sub(self.not_before)
-            .ok_or_else(|| anyhow!("grant validity interval overflow"))?;
-        if validity == 0 || validity > MAX_GRANT_VALIDITY_SECS {
-            bail!("grant start-by time must be between 1 second and 24 hours after not-before");
-        }
-        let finish_window = self
-            .finish_by
-            .checked_sub(self.issued_at)
-            .ok_or_else(|| anyhow!("grant finish window overflow"))?;
-        if finish_window > MAX_FINISH_WINDOW_SECS {
-            bail!("grant finish-by time is more than 30 days after issue");
-        }
-
-        match &self.operation {
-            GrantOperation::Copy(copy) => copy.validate(),
-        }
-    }
+    pub copy: CopyOperation,
 }
 
 impl CopyOperation {
@@ -366,26 +296,25 @@ impl FilterPolicy {
             self.destination_roots.dedup();
         }
     }
-    fn validate(&self, grant: &Grant) -> Result<()> {
+    fn validate(&self, copy: &CopyOperation) -> Result<()> {
         if self.ignore.len() > MAX_FILTER_RULES {
-            bail!("signed filter-rule count exceeds the supported range");
+            bail!("filter-rule count exceeds the supported range");
         }
         for rule in &self.ignore {
             if rule.len() > MAX_FILTER_RULE_BYTES || rule.contains('\0') {
-                bail!("signed filter rule is outside the supported range");
+                bail!("filter rule is outside the supported range");
             }
         }
-        crate::scan::build_ignore(&self.ignore).context("validate signed filter policy")?;
+        crate::scan::build_ignore(&self.ignore).context("validate filter policy")?;
         if self.ignore.is_empty() {
             if !self.destination_roots.is_empty() {
-                bail!("signed filter roots require filter rules");
+                bail!("filter roots require filter rules");
             }
         } else {
             if self.destination_roots.is_empty() || self.destination_roots.len() > MAX_FILTER_ROOTS
             {
-                bail!("signed filter-root count is outside the supported range");
+                bail!("filter-root count is outside the supported range");
             }
-            let GrantOperation::Copy(copy) = &grant.operation;
             for root in &self.destination_roots {
                 validate_absolute_path(root)?;
                 if !copy.mutation_scopes.iter().any(|scope| {
@@ -394,7 +323,7 @@ impl FilterPolicy {
                             && root.starts_with(&scope.path)
                             && root.get(scope.path.len()) == Some(&b'/'))
                 }) {
-                    bail!("signed filter root is outside the destination mutation scopes");
+                    bail!("filter root is outside the destination mutation scopes");
                 }
             }
             if self
@@ -402,7 +331,7 @@ impl FilterPolicy {
                 .windows(2)
                 .any(|roots| roots[0] >= roots[1])
             {
-                bail!("signed filter roots must be sorted and unique");
+                bail!("filter roots must be sorted and unique");
             }
         }
         // `delete_excluded` is also a scan policy: with it, the coordinator
@@ -410,31 +339,26 @@ impl FilterPolicy {
         // exactly that. It therefore stays meaningful when deletion is
         // forbidden (a dry run, or a zero deletion budget); the receiver's
         // deletion policy still refuses every actual removal.
-        let _ = grant;
         Ok(())
     }
 }
 
-/// Signed precondition on the placement root itself. The receiver checks it
-/// once against the confinement root when the grant is redeemed, and `New`
+/// Precondition on the placement root itself. The receiver checks it once
+/// against the confinement root when the copy starts, and `New`
 /// additionally forces no-replace creation of that root, so a remote source
 /// coordinator cannot turn `--into-new` into an update of an existing tree.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum RootExistence {
     #[default]
     Any,
-    /// The signed destination must not exist when the grant is redeemed.
+    /// The destination must not exist when the copy starts.
     New,
-    /// The signed destination must already exist when the grant is redeemed;
-    /// a directory placement additionally requires a directory.
+    /// The destination must already exist when the copy starts; a
+    /// directory placement additionally requires a directory.
     Existing,
 }
 
-const EXTRA_OPTIONS_EXTENSION: &str = "copy-options-v1";
-
-/// Copy options released after the signed `CopyOptions`. They are signed in
-/// a grant extension, so a receiver that predates them refuses the grant
-/// instead of silently dropping them.
+/// Copy options beyond `CopyOptions`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ExtraCopyOptions {
     pub hardlinks: bool,
@@ -490,13 +414,34 @@ impl ExtraCopyOptions {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct GrantBody {
-    grant: Grant,
-    max_file_data_bytes_per_second: u64,
-    filters: FilterPolicy,
-    root_existence: RootExistence,
-    receipt_policy: crate::destination_results::ReceiptPolicy,
+/// Check the rules derived for a destination before a receiver uses them:
+/// bounded, consistent, and with filter roots sorted as the receiver matches
+/// them.
+pub(crate) fn validate_rules(
+    copy: &CopyOperation,
+    constraints: &mut GrantConstraints,
+) -> Result<()> {
+    copy.validate()?;
+    constraints.filters.normalize();
+    constraints.filters.validate(copy)?;
+    constraints.receipt_policy.validate()?;
+    if let Some(algorithm) = &constraints.tcp_congestion {
+        crate::cli::parse_tcp_congestion(algorithm).map_err(anyhow::Error::msg)?;
+    }
+    if let Some(expected) = constraints
+        .hashing
+        .as_ref()
+        .and_then(|hashing| hashing.expected_hash.as_ref())
+    {
+        expected.validate()?;
+    }
+    if constraints.mapping.is_some() && copy.policy.deletion != DeletionPolicy::Forbid {
+        bail!("mapping authorization does not permit pruning");
+    }
+    if constraints.extra_options.acls && !copy.options.preserve_permissions {
+        bail!("ACL preservation requires permission preservation");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -510,420 +455,42 @@ fn test_receipt_policy() -> crate::destination_results::ReceiptPolicy {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SignedGrantEnvelope {
-    pub grant: Grant,
-    pub max_file_data_bytes_per_second: u64,
-    pub filters: FilterPolicy,
-    pub root_existence: RootExistence,
-    pub receipt_policy: crate::destination_results::ReceiptPolicy,
-    /// Canonical OpenSSH armored SSHSIG bytes.
-    pub signature: Vec<u8>,
-    pub tcp_congestion: Option<String>,
-    pub mapping: Option<crate::mapping::Authorization>,
-    pub hashing: Option<crate::hashing::CopyHashing>,
-    pub extra_options: ExtraCopyOptions,
-}
-
-impl SignedGrantEnvelope {
-    #[cfg(test)]
-    fn new(grant: Grant, max_file_data_bytes_per_second: u64, signature: Vec<u8>) -> Self {
-        Self {
-            grant,
-            max_file_data_bytes_per_second,
-            filters: FilterPolicy::default(),
-            root_existence: RootExistence::Any,
-            receipt_policy: test_receipt_policy(),
-            tcp_congestion: None,
-            mapping: None,
-            hashing: None,
-            extra_options: ExtraCopyOptions::default(),
-            signature,
-        }
-    }
-
-    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-        self.grant.validate_static()?;
-        validate_canonical_sshsig(&self.signature)?;
-        let body = canonical_body_bytes(
-            &self.grant,
-            self.max_file_data_bytes_per_second,
-            &self.filters,
-            self.root_existence,
-            &self.receipt_policy,
-            self.tcp_congestion.as_deref(),
-            self.mapping.as_ref(),
-            self.hashing.as_ref(),
-            &self.extra_options,
-        )?;
-        if body.len() > MAX_GRANT_BYTES {
-            bail!("canonical grant exceeds {MAX_GRANT_BYTES} bytes");
-        }
-        if self.signature.len() > MAX_SIGNATURE_BYTES {
-            bail!("SSHSIG exceeds {MAX_SIGNATURE_BYTES} bytes");
-        }
-        let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body.len() + self.signature.len());
-        out.extend_from_slice(WIRE_MAGIC);
-        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        out.extend_from_slice(&(self.signature.len() as u32).to_be_bytes());
-        out.extend_from_slice(&body);
-        out.extend_from_slice(&self.signature);
-        Ok(out)
-    }
-
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() > MAX_ENVELOPE_BYTES {
-            bail!("signed grant envelope exceeds size limit");
-        }
-        if bytes.len() < WIRE_HEADER_LEN || &bytes[..WIRE_MAGIC.len()] != WIRE_MAGIC {
-            bail!("not a SYQ signed grant envelope");
-        }
-        let grant_len = u32::from_be_bytes(bytes[8..12].try_into().expect("fixed header")) as usize;
-        let signature_len =
-            u32::from_be_bytes(bytes[12..16].try_into().expect("fixed header")) as usize;
-        if grant_len == 0 || grant_len > MAX_GRANT_BYTES {
-            bail!("signed grant length is outside the supported range");
-        }
-        if signature_len == 0 || signature_len > MAX_SIGNATURE_BYTES {
-            bail!("SSHSIG length is outside the supported range");
-        }
-        let expected = WIRE_HEADER_LEN
-            .checked_add(grant_len)
-            .and_then(|length| length.checked_add(signature_len))
-            .ok_or_else(|| anyhow!("signed grant envelope length overflow"))?;
-        if bytes.len() != expected {
-            bail!("signed grant envelope length is noncanonical");
-        }
-        let body_bytes = &bytes[WIRE_HEADER_LEN..WIRE_HEADER_LEN + grant_len];
-        let (body, extension): (GrantBody, &[u8]) =
-            postcard::take_from_bytes(body_bytes).context("decode signed grant")?;
-        let (tcp_congestion, mapping, hashing, extra_options) = if extension.is_empty() {
-            (None, None, None, ExtraCopyOptions::default())
-        } else {
-            let (kind, rest): (String, &[u8]) =
-                postcard::take_from_bytes(extension).context("decode signed grant extension")?;
-            match kind.as_str() {
-                "tcp-congestion-v1" => (
-                    Some(postcard::from_bytes(rest)?),
-                    None,
-                    None,
-                    ExtraCopyOptions::default(),
-                ),
-                "mapping-v1" => {
-                    let (tcp, mapping): (Option<String>, crate::mapping::Authorization) =
-                        postcard::from_bytes(rest)?;
-                    (tcp, Some(mapping), None, ExtraCopyOptions::default())
-                }
-                "copy-hashing-v2" => {
-                    let (tcp, mapping, hashing): (
-                        Option<String>,
-                        Option<crate::mapping::Authorization>,
-                        crate::hashing::CopyHashing,
-                    ) = postcard::from_bytes(rest)?;
-                    (tcp, mapping, Some(hashing), ExtraCopyOptions::default())
-                }
-                EXTRA_OPTIONS_EXTENSION => postcard::from_bytes(rest)?,
-                _ => bail!("unknown signed grant extension"),
-            }
-        };
-        let GrantBody {
-            grant,
-            max_file_data_bytes_per_second,
-            filters,
-            root_existence,
-            receipt_policy,
-        } = body;
-        if canonical_body_bytes(
-            &grant,
-            max_file_data_bytes_per_second,
-            &filters,
-            root_existence,
-            &receipt_policy,
-            tcp_congestion.as_deref(),
-            mapping.as_ref(),
-            hashing.as_ref(),
-            &extra_options,
-        )? != body_bytes
-        {
-            bail!("signed grant uses a noncanonical encoding");
-        }
-        grant.validate_static()?;
-        filters.validate(&grant)?;
-        receipt_policy.validate()?;
-        let signature = bytes[WIRE_HEADER_LEN + grant_len..].to_vec();
-        validate_canonical_sshsig(&signature)?;
-        Ok(Self {
-            grant,
-            max_file_data_bytes_per_second,
-            filters,
-            root_existence,
-            receipt_policy,
-            signature,
-            tcp_congestion,
-            mapping,
-            hashing,
-            extra_options,
-        })
-    }
-
-    fn signing_payload(&self) -> Result<Vec<u8>> {
-        signing_payload(
-            &self.grant,
-            self.max_file_data_bytes_per_second,
-            &self.filters,
-            self.root_existence,
-            &self.receipt_policy,
-            self.tcp_congestion.as_deref(),
-            self.mapping.as_ref(),
-            self.hashing.as_ref(),
-            &self.extra_options,
-        )
-    }
-}
-
-/// Validate an ephemeral request before an approval can authorize outbound SSH.
-/// This does not sign, redeem, or touch any durable authority state.
-pub(crate) fn validate_return_request(request: &crate::destination::CopyRequest) -> Result<()> {
-    let grant = Grant {
-        enrollment_id: EnrollmentId::random(),
-        target_login: "return".into(),
-        signer: "return".into(),
-        request_id: RequestId::fresh(0)?,
-        issued_at: 0,
-        not_before: 0,
-        start_by: 60,
-        finish_by: 3600,
-        operation: GrantOperation::Copy(request.copy.clone()),
-    };
-    let mut policy = request.constraints.clone();
-    policy.filters.normalize();
-    signing_payload(
-        &grant,
-        policy.max_file_data_bytes_per_second,
-        &policy.filters,
-        policy.root_existence,
-        &policy.receipt_policy,
-        policy.tcp_congestion.as_deref(),
-        policy.mapping.as_ref(),
-        policy.hashing.as_ref(),
-        &policy.extra_options,
-    )?;
-    Ok(())
-}
-
-pub(crate) fn sign_grant(
-    grant: Grant,
-    constraints: GrantConstraints,
-    private_key: &PrivateKey,
-) -> Result<Vec<u8>> {
-    sign_grant_with(grant, constraints, |payload| {
-        if private_key.is_encrypted() {
-            bail!("cannot sign a grant with an encrypted enrollment key");
-        }
-        Ok(private_key
-            .sign(SSHSIG_NAMESPACE, HashAlg::Sha256, payload)
-            .context("sign restricted transfer grant")?
-            .to_pem(LineEnding::LF)
-            .context("encode restricted transfer SSHSIG")?
-            .into_bytes())
-    })
-}
-
-pub(crate) fn sign_grant_with(
-    grant: Grant,
-    constraints: GrantConstraints,
-    sign: impl FnOnce(&[u8]) -> Result<Vec<u8>>,
-) -> Result<Vec<u8>> {
-    let GrantConstraints {
-        max_file_data_bytes_per_second,
-        mut filters,
-        root_existence,
-        receipt_policy,
-        tcp_congestion,
-        mapping,
-        hashing,
-        extra_options,
-    } = constraints;
-    filters.normalize();
-    filters.validate(&grant)?;
-    let payload = signing_payload(
-        &grant,
-        max_file_data_bytes_per_second,
-        &filters,
-        root_existence,
-        &receipt_policy,
-        tcp_congestion.as_deref(),
-        mapping.as_ref(),
-        hashing.as_ref(),
-        &extra_options,
-    )?;
-    let signature = sign(&payload)?;
-    SignedGrantEnvelope {
-        grant,
-        max_file_data_bytes_per_second,
-        filters,
-        root_existence,
-        receipt_policy,
-        signature,
-        tcp_congestion,
-        mapping,
-        hashing,
-        extra_options,
-    }
-    .encode()
-}
-
-#[cfg(test)]
-fn signing_payload_default(grant: &Grant, max_file_data_bytes_per_second: u64) -> Result<Vec<u8>> {
-    signing_payload(
-        grant,
-        max_file_data_bytes_per_second,
-        &FilterPolicy::default(),
-        RootExistence::Any,
-        &test_receipt_policy(),
-        None,
-        None,
-        None,
-        &ExtraCopyOptions::default(),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn signing_payload(
-    grant: &Grant,
-    max_file_data_bytes_per_second: u64,
-    filters: &FilterPolicy,
-    root_existence: RootExistence,
-    receipt_policy: &crate::destination_results::ReceiptPolicy,
-    tcp_congestion: Option<&str>,
-    mapping: Option<&crate::mapping::Authorization>,
-    hashing: Option<&crate::hashing::CopyHashing>,
-    extra_options: &ExtraCopyOptions,
-) -> Result<Vec<u8>> {
-    grant.validate_static()?;
-    filters.validate(grant)?;
-    let body = canonical_body_bytes(
-        grant,
-        max_file_data_bytes_per_second,
-        filters,
-        root_existence,
-        receipt_policy,
-        tcp_congestion,
-        mapping,
-        hashing,
-        extra_options,
-    )?;
-    if body.len() > MAX_GRANT_BYTES {
-        bail!("canonical grant exceeds {MAX_GRANT_BYTES} bytes");
-    }
-    let mut out = Vec::with_capacity(WIRE_MAGIC.len() + 4 + body.len());
-    out.extend_from_slice(WIRE_MAGIC);
-    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    out.extend_from_slice(&body);
-    Ok(out)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn canonical_body_bytes(
-    grant: &Grant,
-    max_file_data_bytes_per_second: u64,
-    filters: &FilterPolicy,
-    root_existence: RootExistence,
-    receipt_policy: &crate::destination_results::ReceiptPolicy,
-    tcp_congestion: Option<&str>,
-    mapping: Option<&crate::mapping::Authorization>,
-    hashing: Option<&crate::hashing::CopyHashing>,
-    extra_options: &ExtraCopyOptions,
-) -> Result<Vec<u8>> {
-    receipt_policy.validate()?;
-    // Preserve the released v0.4.1 body byte for byte when no override is
-    // requested. Its reader checks canonical re-encoding and rejects trailing
-    // extensions, so it cannot silently discard this signed constraint.
-    let mut bytes = postcard::to_stdvec(&GrantBody {
-        grant: grant.clone(),
-        max_file_data_bytes_per_second,
-        filters: filters.clone(),
-        root_existence,
-        receipt_policy: receipt_policy.clone(),
-    })
-    .context("encode canonical signed grant")?;
-    if let Some(algorithm) = tcp_congestion {
-        crate::cli::parse_tcp_congestion(algorithm).map_err(anyhow::Error::msg)?;
-    }
-    if let Some(expected) = hashing.and_then(|hashing| hashing.expected_hash.as_ref()) {
-        expected.validate()?;
-    }
-    if mapping.is_some() {
-        let GrantOperation::Copy(copy) = &grant.operation;
-        if copy.policy.deletion != DeletionPolicy::Forbid {
-            bail!("mapping authorization does not permit pruning");
-        }
-    }
-    if !extra_options.is_default() {
-        let GrantOperation::Copy(copy) = &grant.operation;
-        if extra_options.acls && !copy.options.preserve_permissions {
-            bail!("ACL preservation requires permission preservation");
-        }
-        // Released receivers reject this unknown extension, so a grant
-        // carrying these options never reaches a receiver that ignores them.
-        bytes.extend(postcard::to_stdvec(&(
-            EXTRA_OPTIONS_EXTENSION,
-            (tcp_congestion, mapping, hashing, extra_options),
-        ))?);
-    } else if let Some(hashing) = hashing {
-        bytes.extend(postcard::to_stdvec(&(
-            "copy-hashing-v2",
-            tcp_congestion,
-            mapping,
-            hashing,
-        ))?);
-    } else if let Some(mapping) = mapping {
-        bytes.extend(postcard::to_stdvec(&(
-            "mapping-v1",
-            tcp_congestion,
-            mapping,
-        ))?);
-    } else if let Some(algorithm) = tcp_congestion {
-        bytes.extend(postcard::to_stdvec(&("tcp-congestion-v1", algorithm))?);
-    }
-    Ok(bytes)
-}
-
-fn validate_identity(name: &str, value: &str, maximum: usize, slash_allowed: bool) -> Result<()> {
-    if value.is_empty() || value.len() > maximum {
-        bail!("grant {name} length is outside the supported range");
+/// Check an account name: bounded, without control characters or `/`.
+pub(crate) fn validate_identity(name: &str, value: &str) -> Result<()> {
+    if value.is_empty() || value.len() > MAX_LOGIN_BYTES {
+        bail!("the {name} name's length is outside the supported range");
     }
     if value
         .chars()
-        .any(|character| character.is_control() || (!slash_allowed && character == '/'))
+        .any(|character| character.is_control() || character == '/')
     {
-        bail!("grant {name} contains a forbidden character");
+        bail!("the {name} name contains a forbidden character");
     }
     Ok(())
 }
 
 fn validate_absolute_path(path: &[u8]) -> Result<()> {
     if path.is_empty() || path.len() > MAX_PATH_BYTES || path[0] != b'/' {
-        bail!("grant destination must be a bounded absolute path");
+        bail!("destination must be a bounded absolute path");
     }
     if path.contains(&0) {
-        bail!("grant destination contains NUL");
+        bail!("destination contains NUL");
     }
     if path == b"/" {
         return Ok(());
     }
     if path.ends_with(b"/") {
-        bail!("grant destination has a noncanonical trailing slash");
+        bail!("destination has a noncanonical trailing slash");
     }
     for component in path[1..].split(|byte| *byte == b'/') {
         if component.is_empty() || component == b"." || component == b".." {
-            bail!("grant destination has a noncanonical path component");
+            bail!("destination has a noncanonical path component");
         }
     }
     Ok(())
 }
 
-fn validate_canonical_sshsig(signature: &[u8]) -> Result<()> {
+pub(crate) fn validate_canonical_sshsig(signature: &[u8]) -> Result<()> {
     if signature.is_empty() || signature.len() > MAX_SIGNATURE_BYTES {
         bail!("SSHSIG length is outside the supported range");
     }
@@ -977,10 +544,13 @@ pub(crate) struct ClockObservation {
     pub monotonic: Instant,
 }
 
+/// What a receiver expects of a directive: its own enrollment, generation,
+/// account and build, and the time it observed.
 pub(crate) struct ReceiverContext<'a> {
     pub enrollment_id: EnrollmentId,
+    pub generation: u64,
     pub target_login: &'a str,
-    pub expected_signer: &'a str,
+    pub build: &'a str,
     pub clock: ClockObservation,
     pub clock_skew_seconds: i64,
 }
@@ -1020,21 +590,12 @@ impl ReceiverContext<'_> {
         Ok(self.wall_time_bounds_at(observed_at)?.1)
     }
 
-    fn validate_at(&self, grant: &Grant, observed_at: Instant) -> Result<i64> {
+    /// Check the directive's binding and times, and return the latest the
+    /// time can be now.
+    fn validate_at(&self, directive: &Directive, observed_at: Instant) -> Result<i64> {
         let (earliest_now, latest_now) = self.wall_time_bounds_at(observed_at)?;
         self.enrollment_id.validate()?;
-        validate_identity(
-            "expected target login",
-            self.target_login,
-            MAX_LOGIN_BYTES,
-            false,
-        )?;
-        validate_identity(
-            "expected signer",
-            self.expected_signer,
-            MAX_SIGNER_BYTES,
-            true,
-        )?;
+        validate_identity("expected account", self.target_login)?;
         if !(0..=MAX_UNIX_TIMESTAMP).contains(&earliest_now)
             || !(0..=MAX_UNIX_TIMESTAMP).contains(&latest_now)
         {
@@ -1043,38 +604,51 @@ impl ReceiverContext<'_> {
         if !(0..=MAX_CLOCK_SKEW_SECS).contains(&self.clock_skew_seconds) {
             bail!("receiver clock skew allowance is outside the supported range");
         }
-        if grant.enrollment_id != self.enrollment_id {
-            bail!("grant is for a different receiver enrollment");
+        let binding = &directive.binding;
+        if directive.build != self.build {
+            bail!(
+                "the copy was approved for a receiver of syq {}, and this receiver runs {}",
+                directive.build,
+                self.build
+            );
         }
-        if grant.target_login != self.target_login {
-            bail!("grant is for a different target login");
+        if binding.enrollment != self.enrollment_id {
+            bail!("the directive is for a different enrollment");
         }
-        if grant.signer != self.expected_signer {
-            bail!("grant names an unexpected signer");
+        if binding.generation != self.generation {
+            bail!(
+                "the directive is for generation {} of enrollment {}, which is now at generation {}",
+                binding.generation,
+                self.enrollment_id,
+                self.generation
+            );
+        }
+        if binding.account != self.target_login {
+            bail!("the directive is for a different account");
         }
         let latest_acceptable_issue = earliest_now
             .checked_add(self.clock_skew_seconds)
             .ok_or_else(|| anyhow!("receiver time overflow"))?;
-        if grant.issued_at > latest_acceptable_issue {
-            bail!("grant was issued too far in the future");
+        if directive.issued_at > latest_acceptable_issue {
+            bail!("the directive was issued too far in the future");
         }
         let latest_for_start = earliest_now
             .checked_add(self.clock_skew_seconds)
             .ok_or_else(|| anyhow!("receiver time overflow"))?;
-        if latest_for_start < grant.not_before {
-            bail!("grant is not yet valid");
+        if latest_for_start < directive.not_before {
+            bail!("the directive is not yet valid");
         }
         let earliest_for_expiry = latest_now
             .checked_sub(self.clock_skew_seconds)
             .ok_or_else(|| anyhow!("receiver time overflow"))?;
-        if earliest_for_expiry > grant.start_by {
-            bail!("grant start-by time has passed");
+        if earliest_for_expiry > directive.start_by {
+            bail!("the directive's start-by time has passed");
         }
         Ok(latest_now)
     }
 }
 
-/// The login key a receiver trusts to sign its grants, with what each
+/// The login key a receiver trusts to sign its directives, with what each
 /// signature must also show: a FIDO key's touch (user presence) and PIN (user
 /// verification) flags, and a certificate login's expiry. Verification is
 /// done here in Rust; no other program takes part.
@@ -1268,8 +842,8 @@ pub(crate) fn verify_signature(
 /// counter of a FIDO signature only for `sk-ssh-ed25519@openssh.com`; for
 /// `sk-ecdsa-sha2-nistp256@openssh.com` it writes them inside the signature
 /// string. `SshSig::from_pem` then fails on the result with "length
-/// invalid", and OpenSSH cannot read it either, so every grant signed with
-/// a FIDO ECDSA login key would be refused. Decoding is correct.
+/// invalid", and OpenSSH cannot read it either, so every directive signed
+/// with a FIDO ECDSA login key would be refused. Decoding is correct.
 pub(crate) fn armored_sshsig(
     key: &ssh_key::public::KeyData,
     namespace: &str,
@@ -1319,26 +893,7 @@ pub(crate) fn security_key_flags(signature: &ssh_key::SshSig) -> Result<u8> {
     Ok(bytes[index])
 }
 
-/// Evidence that the signature, target binding, time bounds, and one-time
-/// replay redeem all succeeded. The restricted receiver consumes this into its
-/// independently enforced request authority and monotonic execution deadline.
-#[derive(Debug)]
-pub(crate) struct VerifiedGrant {
-    #[allow(dead_code)]
-    grant: Grant,
-    max_file_data_bytes_per_second: u64,
-    filters: FilterPolicy,
-    root_existence: RootExistence,
-    receipt_policy: crate::destination_results::ReceiptPolicy,
-    grant_digest: [u8; 32],
-    execution_deadline: Instant,
-    pub tcp_congestion: Option<String>,
-    pub mapping: Option<crate::mapping::Authorization>,
-    pub hashing: Option<crate::hashing::CopyHashing>,
-    extra_options: ExtraCopyOptions,
-}
-
-/// Signed receiver policy carried alongside the copy grant.
+/// The destination's rules beyond the copy operation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct GrantConstraints {
     pub max_file_data_bytes_per_second: u64,
@@ -1370,107 +925,77 @@ impl Default for GrantConstraints {
     }
 }
 
-impl VerifiedGrant {
-    #[cfg(test)]
-    pub(crate) fn execution_deadline(&self) -> Instant {
-        self.execution_deadline
-    }
-
-    pub(crate) fn into_parts(self) -> (Grant, GrantConstraints, [u8; 32], Instant) {
-        (
-            self.grant,
-            GrantConstraints {
-                max_file_data_bytes_per_second: self.max_file_data_bytes_per_second,
-                filters: self.filters,
-                root_existence: self.root_existence,
-                receipt_policy: self.receipt_policy,
-                tcp_congestion: self.tcp_congestion,
-                mapping: self.mapping,
-                hashing: self.hashing,
-                extra_options: self.extra_options,
-            },
-            self.grant_digest,
-            self.execution_deadline,
-        )
-    }
+/// Evidence that the signature, binding, time bounds, and one-time replay
+/// redeem of a directive all succeeded.
+#[derive(Debug)]
+pub(crate) struct VerifiedDirective {
+    /// Binds the destination's results to this directive.
+    pub digest: [u8; 32],
+    pub execution_deadline: Instant,
 }
 
-pub(crate) fn verify_and_redeem(
+/// Verify `encoded` against `context` and `signer`, derive what it allows
+/// with `derive`, and only then record it as used. Nothing is recorded for
+/// a directive that any check, or the derivation, refuses.
+pub(crate) fn verify_and_redeem<T>(
     encoded: &[u8],
     context: &ReceiverContext<'_>,
     signer: &TrustedSigner,
     replay: &ReplayStore,
-) -> Result<VerifiedGrant> {
-    let envelope = SignedGrantEnvelope::decode(encoded)?;
+    derive: impl FnOnce(&Directive) -> Result<T>,
+) -> Result<(T, VerifiedDirective)> {
+    let signed = crate::directive::Signed::decode(encoded)?;
+    let directive = &signed.directive;
     let observed_at = Instant::now();
-    context.validate_at(&envelope.grant, observed_at)?;
-    let payload = envelope.signing_payload()?;
-    let replay_digest: [u8; 32] = Sha256::digest(&payload).into();
-    let grant_digest = grant_transcript_digest(&payload);
-    replay.reject_if_redeemed(envelope.grant.request_id, replay_digest)?;
+    context.validate_at(directive, observed_at)?;
+    let replay_digest: [u8; 32] = Sha256::digest(&signed.payload).into();
+    replay.reject_if_redeemed(directive.request_id, replay_digest)?;
     // A certificate's expiry is judged with the clock skew in the signer's
-    // favour, like the grant's own start-by time.
+    // favour, like the directive's own start-by time.
     let (_, latest_now) = context.wall_time_bounds_at(observed_at)?;
     signer.verify(
-        SSHSIG_NAMESPACE,
-        &payload,
-        &envelope.signature,
+        crate::directive::NAMESPACE,
+        &signed.payload,
+        &signed.signature,
         latest_now.saturating_sub(context.clock_skew_seconds),
     )?;
-    replay.redeem_after_lock(envelope.grant.request_id, replay_digest, || {
-        context.validate_at(&envelope.grant, Instant::now())
+    // Only a signed command reaches the parser, and a directive whose rules
+    // cannot be derived stays unused.
+    let derived = derive(directive)?;
+    replay.redeem_after_lock(directive.request_id, replay_digest, || {
+        context.validate_at(directive, Instant::now())
     })?;
     let verified_at = Instant::now();
-    let verified_wall_time = context.validate_at(&envelope.grant, verified_at)?;
+    let verified_wall_time = context.validate_at(directive, verified_at)?;
     let execution_deadline = execution_deadline(
-        &envelope.grant,
+        directive.finish_by,
         context.clock_skew_seconds,
         verified_wall_time,
         verified_at,
     )?;
-    Ok(VerifiedGrant {
-        grant: envelope.grant,
-        max_file_data_bytes_per_second: envelope.max_file_data_bytes_per_second,
-        filters: envelope.filters,
-        root_existence: envelope.root_existence,
-        receipt_policy: envelope.receipt_policy,
-        tcp_congestion: envelope.tcp_congestion,
-        mapping: envelope.mapping,
-        hashing: envelope.hashing,
-        extra_options: envelope.extra_options,
-        grant_digest,
-        execution_deadline,
-    })
-}
-
-pub(crate) fn signed_grant_digest(encoded: &[u8]) -> Result<[u8; 32]> {
-    let envelope = SignedGrantEnvelope::decode(encoded)?;
-    Ok(grant_transcript_digest(&envelope.signing_payload()?))
-}
-
-fn grant_transcript_digest(payload: &[u8]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"syq-grant-transcript@greaber.github\0");
-    hasher.update(&(payload.len() as u64).to_be_bytes());
-    hasher.update(payload);
-    *hasher.finalize().as_bytes()
+    Ok((
+        derived,
+        VerifiedDirective {
+            digest: signed.digest(),
+            execution_deadline,
+        },
+    ))
 }
 
 fn execution_deadline(
-    grant: &Grant,
+    finish_by: i64,
     clock_skew_seconds: i64,
     current_wall_time: i64,
     verified_at: Instant,
 ) -> Result<Instant> {
-    let finish_by = grant
-        .finish_by
+    let finish_by = finish_by
         .checked_add(clock_skew_seconds)
-        .ok_or_else(|| anyhow!("grant finish-by overflow"))?;
+        .ok_or_else(|| anyhow!("directive finish-by overflow"))?;
     let remaining = finish_by
         .checked_sub(current_wall_time)
-        .ok_or_else(|| anyhow!("grant remaining finish window overflow"))?;
+        .ok_or_else(|| anyhow!("directive remaining finish window overflow"))?;
     if remaining <= 0 {
-        bail!("grant finish-by time passed while it was being verified and redeemed");
+        bail!("the directive's finish-by time passed while it was being verified");
     }
     verified_at
         .checked_add(Duration::from_secs(remaining as u64))
@@ -1715,7 +1240,7 @@ fn validate_redeem_record(record: &[u8], request: RequestId, digest: [u8; 32]) -
         bail!("replay state request ID does not match its filename");
     }
     if record[48..80] != digest {
-        bail!("request ID was already redeemed by a different signed grant");
+        bail!("request ID was already redeemed by a different directive");
     }
     Ok(())
 }

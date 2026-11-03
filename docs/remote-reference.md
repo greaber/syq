@@ -104,12 +104,12 @@ on the server. To end it, run `syq receiver revoke ID`, or remove every
 comment. `syq receiver list` shows the fingerprint of the key each enrollment
 trusts.
 
-Whether the receiver accepts a grant depends only on the login key's
+Whether the receiver accepts a copy depends only on the login key's
 signature, its touch and PIN policy, and a certificate's expiry. Options such
 as `from=` or `expiry-time=` on your key's `authorized_keys` line, a
 certificate's other critical options, such as `source-address` or
 `force-command`, and revoking a certificate or its authority on the server do
-not stop a grant your key signs. Revoke the enrollment to stop them.
+not stop a copy your key signs. Revoke the enrollment to stop them.
 
 After you change syq builds, the next copy logs in once to install the
 matching receiver and rewrite syq's line. An SSH connection opened before that

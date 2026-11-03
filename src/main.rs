@@ -20,6 +20,7 @@ mod descriptor_broker;
 mod descriptor_copy;
 mod destination;
 mod destination_results;
+mod directive;
 pub mod enrollment;
 mod expression;
 #[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
@@ -256,7 +257,7 @@ fn main() {
             std::process::exit(2);
         }
         fsops::reserve_startup_descriptors();
-        if let Err(error) = restricted::run_receiver(enrollment, generation) {
+        if let Err(error) = server::run_checker(enrollment, generation) {
             crate::output::diagnostic!("syq restricted receiver: {error:#}");
             std::process::exit(1);
         }

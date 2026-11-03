@@ -120,21 +120,9 @@ fn ticket_parts(ticket: &str) -> Result<(&str, [u8; 32])> {
     Ok((directory, secret))
 }
 
-pub(super) fn worker_command(original: &str) -> Result<Option<String>> {
-    if original.len() > 128 * 1024 {
-        bail!("restricted receiver command exceeds size limit");
-    }
-    let words = shell_words::split(original).context("parse restricted receiver command")?;
-    if words.len() == 3 && words[0] == "syq" && words[1] == "--server" {
-        if let Some(ticket) = words[2].strip_prefix("--restricted-worker=") {
-            ticket_parts(ticket)?;
-            return Ok(Some(ticket.to_owned()));
-        }
-    }
-    Ok(None)
-}
-
-fn join(ticket: &str) -> Result<UnixStream> {
+/// Connect to the running copy `ticket` names in this enrollment's state
+/// directory, the current directory, and present the ticket's secret.
+pub(super) fn join(ticket: &str) -> Result<UnixStream> {
     let (directory, secret) = ticket_parts(ticket)?;
     super::active::require_not_revoked(Path::new("."))?;
     let directory = Path::new(directory);
@@ -145,13 +133,6 @@ fn join(ticket: &str) -> Result<UnixStream> {
     socket.write_all(&secret)?;
     socket.set_write_timeout(None)?;
     Ok(socket)
-}
-
-/// Hand this SSH session's input and output to the live receiver, which
-/// serves them, and wait until it has.
-pub(super) fn connect(ticket: &str) -> Result<()> {
-    crate::descriptor_broker::hand_over_standard_streams(join(ticket)?)
-        .context("hand the restricted SSH worker to the receiver")
 }
 
 #[cfg(test)]
@@ -379,27 +360,5 @@ mod tests {
         .unwrap();
         refused();
         drop(broker);
-    }
-
-    #[test]
-    fn worker_command_accepts_only_a_bounded_enrollment_local_ticket() {
-        let secret = "ab".repeat(32);
-        let valid = format!("syq --server --restricted-worker=w-Ab1234:{secret}");
-        assert!(worker_command(&valid).unwrap().is_some());
-        for directory in ["../other", "/tmp/socket", "w-../../escape", "w-:", "w-\\x"] {
-            assert!(worker_command(&format!(
-                "syq --server {}",
-                shell_words::quote(&format!("--restricted-worker={directory}:{secret}"))
-            ))
-            .is_err());
-        }
-        for command in [
-            "sh",
-            "syq --server --restricted-worker=x",
-            "syq --server --restricted-worker=w-a:00",
-        ] {
-            assert!(!matches!(worker_command(command), Ok(Some(_))));
-        }
-        assert!(worker_command(&format!("{valid} extra")).unwrap().is_none());
     }
 }
