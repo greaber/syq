@@ -2341,24 +2341,29 @@ fn a_failed_login_reports_what_ssh_said_in_its_trace() {
     let long = format!("{}\n", "x".repeat(1000));
     assert_eq!(ssh_reason(&long, true).unwrap().len(), 300);
 
-    // After the login, the lines SSH writes without a prefix are progress.
-    // When the remote command failed, SSH said nothing about it...
+    // After the login, what SSH writes without a prefix is its progress, and
+    // the open channels it lists, indented, when the session closes. When
+    // the remote command failed, SSH said nothing about it...
     let worked = "debug1: Server accepts key: /home/syq/.ssh/id_ed25519 ED25519 SHA256:x\n\
                   Authenticated to backup ([192.0.2.7]:22) using \"publickey\".\n\
-                  debug1: Exit status 1\n\
+                  debug1: client_input_channel_req: channel 0 rtype exit-status reply 0\n\
+                  debug3: channel 0: status: The following connections are open:\n  \
+                  #0 client-session (t4 [session] r0 i3/0 o3/0 e[write]/0 fd -1/-1/7 sock -1 cc -1 io 0x00/0x00)\n\
+                  \n\
                   Transferred: sent 41500000, received 2000 bytes, in 3.1 seconds\n\
-                  Bytes per second: sent 13387096.8, received 645.2\n";
+                  Bytes per second: sent 13387096.8, received 645.2\n\
+                  debug1: Exit status 1\n";
     assert!(ssh_reason(worked, false).is_none());
-    // ...and when the connection broke after it, the reason is not the
-    // progress around it.
+    assert!(ssh_reason(worked, true).is_none());
+    // ...and when the connection broke after it, SSH says why on its
+    // stderr, not in the trace: the trace gives no reason.
     let dropped = "Authenticated to backup ([192.0.2.7]:22) using \"publickey\".\n\
-                   Connection to backup closed by remote host.\n\
+                   debug3: channel 0: status: The following connections are open:\n  \
+                   #0 client-session (t4 [session] r0 i0/0 o0/0 e[write]/0 fd 4/5/6 sock -1 cc -1 io 0x01/0x00)\n\
+                   \n\
                    Transferred: sent 4100, received 2000 bytes, in 3.1 seconds\n\
                    Bytes per second: sent 1322.6, received 645.2\n";
-    assert_eq!(
-        ssh_reason(dropped, true).unwrap(),
-        "Connection to backup closed by remote host."
-    );
+    assert!(ssh_reason(dropped, true).is_none());
 }
 
 #[test]

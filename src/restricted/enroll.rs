@@ -145,15 +145,18 @@ pub(super) fn ssh_reason(trace: &str, ssh_failed: bool) -> Option<String> {
     }
     let lines: Vec<&str> = trace
         .lines()
-        .map(str::trim)
         .filter(|line| {
-            !line.is_empty()
+            !line.trim().is_empty()
                 && !line.starts_with("debug")
+                // An indented line continues a debug line, such as the
+                // open channels listed when the session closes.
+                && !line.starts_with(char::is_whitespace)
                 // The progress SSH reports at this log level.
                 && !line.starts_with("Authenticated to ")
                 && !line.starts_with("Transferred: ")
                 && !line.starts_with("Bytes per second: ")
         })
+        .map(str::trim)
         .collect();
     let reason = lines[lines.len().saturating_sub(3)..]
         .iter()
