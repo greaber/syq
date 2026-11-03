@@ -1,3 +1,4 @@
+import itertools
 import json
 import os
 from pathlib import Path
@@ -108,7 +109,7 @@ def alive(group):
         return True
     # Linux lists an exited process that nobody has reaped yet as a zombie;
     # it does nothing more. Check the leader first, then the rest of the group.
-    for stat in (proc / str(group) / 'stat', *proc.glob('[0-9]*/stat')):
+    for stat in itertools.chain([proc / str(group) / 'stat'], proc.glob('[0-9]*/stat')):
         try:
             state, _parent, process_group = stat.read_text().rsplit(')', 1)[1].split()[:3]
         except (OSError, ValueError):
@@ -468,6 +469,16 @@ def resume(store, review_id, agent, session_id=None):
 def worker_group(group, review_id):
     """Whether a process group is still this request's: its live leader runs the worker. A group
     whose leader has exited keeps its ID reserved while members remain, so it cannot be reused."""
+    leader = Path('/proc') / str(group)
+    if Path('/proc').is_dir():
+        try:
+            state = (leader / 'stat').read_text().rsplit(')', 1)[1].split()[0]
+            arguments = (leader / 'cmdline').read_bytes().split(b'\0')
+        except (OSError, IndexError):
+            return True
+        expected = [b'review', b'worker', review_id.encode()]
+        return state == 'Z' or any(arguments[i:i + 3] == expected for i in range(len(arguments)))
+    # macOS has no /proc.
     result = subprocess.run(['ps', '-ww', '-o', 'stat=,command=', '-p', str(group)],
                             capture_output=True, text=True, timeout=10)
     if result.returncode or not result.stdout.strip():

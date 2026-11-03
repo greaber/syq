@@ -484,6 +484,18 @@ class CoordinationTests(unittest.TestCase):
         self.assertIn('interrupted', failed['reason'])
         self.assertEqual(self.running_processes({review['pid']}), {})
 
+    def test_stop_ends_a_running_reviewer_after_checking_its_leader(self):
+        from coordination import reviews
+        self.review_setup()
+        review = self.review(behavior='hold')
+        self.wait_launched(review)
+        self.assertTrue(reviews.worker_group(review['pid'], review['id']))
+        self.assertFalse(reviews.worker_group(review['pid'], 'review-0000000000000000'))
+        self.assertFalse(reviews.worker_group(os.getpid(), review['id']))
+        stopped = self.cmd('review', 'stop', review['id'], '--agent', 'implementer')
+        self.assertEqual((stopped['status'], stopped['running']), ('failed', False))
+        self.assertEqual(self.running_processes({review['pid']}), {})
+
     def test_reviewer_outliving_a_killed_worker_counts_as_running_until_stopped(self):
         self.review_setup()
         review = self.review(behavior='hold')

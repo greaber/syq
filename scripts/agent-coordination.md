@@ -169,7 +169,9 @@ directory under `reviews/` when you no longer need it. `review status REVIEW_ID`
 shows the process ID (`pid`), whether it is still `running`, and the `log` path.
 The `pid` leads a process group that also holds the reviewer; `review stop
 REVIEW_ID --agent NAME` ends that group, first with SIGTERM and then SIGKILL,
-and leaves the round `failed`. The process starts from the command that
+and leaves the round `failed`. Commands the reviewer started in sessions of
+their own, as Claude does for each Bash command, are outside that group and may
+outlive it. The process starts from the command that
 launched it, so it runs in that command's sandbox, if any, but it does not
 inherit the requesting agent's own Claude Code or Codex session variables. If
 reviewers fail as soon as they start, read the log; when the requesting agent
