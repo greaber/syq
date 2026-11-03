@@ -441,6 +441,7 @@ fn excessive_probe_candidates_fail_before_resolution() {
             source: DataAddressSource::RemoteInterface,
             reachable: None,
             selected: false,
+            same_as_ssh_target: false,
         })
         .collect();
     assert!(probe_reachable(&mut candidates, 1)
@@ -2239,6 +2240,7 @@ fn probe_reachable_probes_each_socket_address_once() {
         source: DataAddressSource::RemoteInterface,
         reachable: None,
         selected: false,
+        same_as_ssh_target: false,
     };
     let mut candidates = vec![
         candidate("127.0.0.1"),
@@ -2294,6 +2296,7 @@ fn replay_probe_results(
             source: DataAddressSource::RemoteInterface,
             reachable: None,
             selected: false,
+            same_as_ssh_target: false,
         })
         .collect();
     let mut remaining = vec![0; candidates.len()];
@@ -2877,4 +2880,47 @@ fn local_worker_initialization_preserves_descriptor_exhaustion() {
     let rejection: anyhow::Error = WorkerInitializationError("destination changed".into()).into();
     assert!(is_worker_initialization_error(&rejection));
     assert!(!crate::resources::exhausted(&rejection));
+}
+
+#[test]
+fn ssh_target_name_marks_the_advertised_addresses_it_resolved_to() {
+    let candidate = |address: &str, source| TcpCandidate {
+        address: address.into(),
+        speed_mbps: 0,
+        source,
+        reachable: None,
+        selected: false,
+        same_as_ssh_target: false,
+    };
+    let v4 = SocketAddr::from(([192, 0, 2, 5], 47600));
+    let v6 = SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 5], 47600));
+    let other = SocketAddr::from(([10, 0, 0, 5], 47600));
+    let mut candidates = vec![
+        candidate("10.0.0.5", DataAddressSource::RemoteInterface),
+        candidate("backup", DataAddressSource::SshTarget),
+        candidate("192.0.2.5", DataAddressSource::RemoteInterface),
+    ];
+    mark_ssh_target_addresses(&mut candidates, &[vec![other], vec![v4], vec![v4]]);
+    let marks = |candidates: &[TcpCandidate]| {
+        candidates
+            .iter()
+            .map(|candidate| candidate.same_as_ssh_target)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(marks(&candidates), [false, true, true]);
+    // A name leading to an address nobody advertised keeps its own line.
+    mark_ssh_target_addresses(&mut candidates, &[vec![other], vec![v4, v6], vec![v4]]);
+    assert_eq!(marks(&candidates), [false, false, true]);
+    // One that resolved to nothing matches nothing.
+    mark_ssh_target_addresses(&mut candidates, &[vec![other], vec![], vec![v4]]);
+    assert_eq!(marks(&candidates), [false, false, false]);
+}
+
+#[test]
+fn tcp_candidates_keep_the_return_connection_encoding() {
+    // As builds before same_as_ssh_target sent and expect a candidate.
+    let old = r#"{"address":"192.0.2.5","speed_mbps":0,"source":"SshTarget","reachable":true,"selected":true}"#;
+    let candidate: TcpCandidate = serde_json::from_str(old).unwrap();
+    assert!(!candidate.same_as_ssh_target);
+    assert_eq!(serde_json::to_string(&candidate).unwrap(), old);
 }

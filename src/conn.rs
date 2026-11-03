@@ -1565,6 +1565,12 @@ pub struct TcpCandidate {
     /// None means the probe did not finish before route selection.
     pub reachable: Option<bool>,
     pub selected: bool,
+    /// Whether this address and the SSH target name lead to the same place:
+    /// for an advertised address, the name resolved to it; for the SSH
+    /// target, every address the name resolved to was advertised too.
+    /// Diagnostics then show the address once, under the name the user gave.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub same_as_ssh_target: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2730,6 +2736,7 @@ impl RemoteSpec {
                 source: DataAddressSource::RemoteInterface,
                 reachable: None,
                 selected: false,
+                same_as_ssh_target: false,
             })
             .collect();
         // Always also try the name we reached ssh through: a server behind
@@ -2752,6 +2759,7 @@ impl RemoteSpec {
                         source: DataAddressSource::SshTarget,
                         reachable: None,
                         selected: false,
+                        same_as_ssh_target: false,
                     },
                 );
             }
@@ -3057,6 +3065,8 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) -> Result<()> {
         }
     }
 
+    mark_ssh_target_addresses(candidates, &resolved);
+
     // Probe each distinct socket address once. An advertised literal and the
     // ssh target name commonly resolve to the same address; one probe answers
     // for every candidate that led there.
@@ -3100,6 +3110,32 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) -> Result<()> {
         std::time::Instant::now() + timeout + std::time::Duration::from_millis(100),
     );
     Ok(())
+}
+
+/// Note which advertised addresses the SSH target name resolved to, and
+/// whether it resolved to nothing else (`TcpCandidate::same_as_ssh_target`).
+fn mark_ssh_target_addresses(candidates: &mut [TcpCandidate], resolved: &[Vec<SocketAddr>]) {
+    let Some(target) = candidates
+        .iter()
+        .position(|candidate| candidate.source == DataAddressSource::SshTarget)
+    else {
+        return;
+    };
+    let target_addresses = &resolved[target];
+    let mut advertised = std::collections::HashSet::new();
+    for (index, addresses) in resolved.iter().enumerate() {
+        if index == target {
+            continue;
+        }
+        advertised.extend(addresses.iter().copied());
+        candidates[index].same_as_ssh_target = addresses
+            .iter()
+            .any(|address| target_addresses.contains(address));
+    }
+    candidates[target].same_as_ssh_target = !target_addresses.is_empty()
+        && target_addresses
+            .iter()
+            .all(|address| advertised.contains(address));
 }
 
 fn collect_probe_results(
