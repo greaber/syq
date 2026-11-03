@@ -848,6 +848,103 @@ fn a_failed_copy_does_not_retry_a_worker_connection() {
     assert!(!stderr_of(&out).contains("injected worker"), "{out:?}");
 }
 
+/// An ssh-shaped fixture whose independent logins (`ControlPath=none`) take
+/// `FAKE_WORKER_LOGIN_SECONDS`, like a slow server. The control connection and
+/// channels on it start at once. Each slow login records its own PID and its
+/// timer's; like ssh, it takes its timer with it when terminated.
+fn fake_ssh_with_slow_worker_logins(t: &Tmp) -> PathBuf {
+    let path = t.path("bin/ssh");
+    executable(
+        &path,
+        br#"#!/bin/sh
+if [ "$1" = -V ]; then
+    printf 'OpenSSH_9.9p1, fake\n' >&2
+    exit 0
+fi
+independent=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -O) if [ "$2" = check ]; then exit 0; fi; shift 2 ;;
+        -o) if [ "$2" = ControlPath=none ]; then independent=1; fi; shift 2 ;;
+        -l|-p|-S) shift 2 ;;
+        --) shift; break ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+shift
+if [ -n "$independent" ]; then
+    timer=
+    trap 'if [ -n "$timer" ]; then kill "$timer"; fi; exit 143' TERM
+    sleep "$FAKE_WORKER_LOGIN_SECONDS" &
+    timer=$!
+    printf '%s %s\n' "$$" "$timer" >> "$FAKE_WORKER_LOGINS"
+    wait "$timer"
+    trap - TERM
+fi
+HOME="$FAKE_REMOTE_HOME"
+PATH="$FAKE_REMOTE_BIN:/usr/bin:/bin"
+export HOME PATH
+unset SSH_CONNECTION
+exec /bin/sh -c "$1"
+"#,
+    );
+    path
+}
+
+/// Once the data is copied, a copy does not wait for worker logins it no
+/// longer needs: it ends them, leaves no login process behind, and reports
+/// nothing about them.
+#[test]
+fn a_finished_copy_does_not_wait_for_slow_worker_logins() {
+    let t = Tmp::new();
+    let ssh = fake_ssh_with_slow_worker_logins(&t);
+    t.expose_remote_syq();
+    let data = prng(16 * 1024 * 1024, 7);
+    write(&t.path("src/file"), &data);
+    let logins = t.path("worker-logins");
+    let started = std::time::Instant::now();
+    let out = compat_command()
+        .arg("-e")
+        .arg(&ssh)
+        .args([
+            "--syq-no-bootstrap",
+            "--syq-no-tcp",
+            "--performance-tuning=workers=4",
+            "--no-progress",
+            "-a",
+        ])
+        .arg(t.s("src/file"))
+        .arg(format!("fake:{}", t.s("dst")))
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_WORKER_LOGINS", &logins)
+        .env("FAKE_WORKER_LOGIN_SECONDS", "30")
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .run()
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), data);
+    assert_eq!(stderr_of(&out), "", "{out:?}");
+    let logins = fs::read_to_string(&logins).unwrap_or_default();
+    assert!(!logins.is_empty(), "no worker login started: {out:?}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "the copy waited {elapsed:?} for worker logins it no longer needed"
+    );
+    let pids: Vec<i32> = logins
+        .split_whitespace()
+        .map(|pid| pid.parse().unwrap())
+        .collect();
+    wait_for(
+        "abandoned worker logins to end",
+        std::time::Duration::from_secs(5),
+        || pids.iter().all(|&pid| unsafe { libc::kill(pid, 0) } != 0),
+    );
+}
+
 #[test]
 fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     let t = Tmp::new();

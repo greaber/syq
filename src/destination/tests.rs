@@ -1454,7 +1454,7 @@ fn named_workers_refuse_mutations_before_transport_shutdown() {
             spec.finish_tcp_setup(pending).unwrap();
         }
         let mut worker = crate::conn::Endpoint::Remote(spec.clone())
-            .connect_with_copy_capabilities(false, None, Vec::new(), false)
+            .connect_with_copy_capabilities(false, None, Vec::new(), false, None)
             .unwrap();
         assert_eq!(worker.transport_stats().is_some(), tcp);
         let (finished, observed) = mpsc::channel();
@@ -1539,7 +1539,7 @@ fn named_tcp_workers_obey_limits_and_revocation() {
         drop(intruder);
         let endpoint = crate::conn::Endpoint::Remote(spec.clone());
         let mut worker = endpoint
-            .connect_with_copy_capabilities(false, None, Vec::new(), false)
+            .connect_with_copy_capabilities(false, None, Vec::new(), false, None)
             .unwrap();
         assert!(
             worker.transport_stats().is_some(),
@@ -1625,7 +1625,7 @@ fn named_tcp_connect_failure_uses_approved_ssh_worker() {
     }
     let endpoint = crate::conn::Endpoint::Remote(spec.clone());
     let mut worker = endpoint
-        .connect_with_copy_capabilities(false, None, Vec::new(), false)
+        .connect_with_copy_capabilities(false, None, Vec::new(), false, None)
         .unwrap();
     assert_eq!(spec.data_transport(), crate::conn::DataTransport::Ssh);
     assert!(worker.transport_stats().is_none());
@@ -1664,7 +1664,7 @@ fn named_tcp_workers_connect_concurrently() {
             std::thread::spawn(move || {
                 start.wait();
                 let mut worker = endpoint
-                    .connect_with_copy_capabilities(false, None, Vec::new(), false)
+                    .connect_with_copy_capabilities(false, None, Vec::new(), false, None)
                     .unwrap();
                 assert!(
                     worker.transport_stats().is_some(),
@@ -1711,7 +1711,7 @@ fn named_tcp_idle_and_partial_arrivals_do_not_block_worker() {
     partial.write_all(&[0; 16]).unwrap();
     let endpoint = crate::conn::Endpoint::Remote(spec);
     let mut worker = endpoint
-        .connect_with_copy_capabilities(false, None, Vec::new(), false)
+        .connect_with_copy_capabilities(false, None, Vec::new(), false, None)
         .unwrap();
     assert!(
         worker.transport_stats().is_some(),

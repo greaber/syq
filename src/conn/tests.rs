@@ -74,7 +74,7 @@ fn tcp_only_source_worker_failure_is_terminal_without_ssh_fallback() {
     });
     let endpoint = super::Endpoint::Remote(spec.clone());
     let error = endpoint
-        .connect_with_sources(false, Vec::new(), false)
+        .connect_with_sources(false, Vec::new(), false, None)
         .err()
         .unwrap();
     assert!(super::is_non_retryable_connect_error(&error), "{error:#}");
@@ -232,6 +232,7 @@ fn response_start_precedes_payload_and_buffered_replies_have_no_wait() {
         observation: Default::default(),
         child: None,
         approved_login: None,
+        worker_setup: None,
         w: FrameWriter::new(Box::new(std::io::sink()), false),
         rx: Some(rx),
         replies: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
@@ -484,10 +485,10 @@ fn local_workers_clone_the_control_descriptor_session_in_process() {
     // reaches the control connection's process-local registry instead.
     std::fs::remove_file(roots[0].ticket.broker_path()).unwrap();
     endpoint
-        .connect_with_sources(false, roots.clone(), false)
+        .connect_with_sources(false, roots.clone(), false, None)
         .unwrap();
     let error = Endpoint::local()
-        .connect_with_sources(false, roots, false)
+        .connect_with_sources(false, roots, false, None)
         .err()
         .expect("a fresh local endpoint must not share another session");
     assert!(format!("{error:#}").contains("connect to descriptor broker"));
@@ -519,7 +520,9 @@ fn local_source_worker_rejects_destination_mutation_requests() {
         panic!("unexpected source registration response: {response:?}")
     };
     let source_marker = roots[0].selection.join(b"marker").unwrap();
-    let mut source = endpoint.connect_with_sources(false, roots, false).unwrap();
+    let mut source = endpoint
+        .connect_with_sources(false, roots, false, None)
+        .unwrap();
 
     let response = source
         .call(Request::ReadRange {
@@ -776,6 +779,7 @@ fn inactive_remote_stream_fence_does_not_write_or_take_the_reader() {
         observation: Default::default(),
         child: None,
         approved_login: None,
+        worker_setup: None,
         w: FrameWriter::new(Box::new(CountWrites(writes.clone())), false),
         rx: Some(rx.into()),
         replies: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
@@ -1054,6 +1058,7 @@ fn hello_carries_destination_initialization_before_readiness() {
         observation: Default::default(),
         child: None,
         approved_login: None,
+        worker_setup: None,
         w: FrameWriter::new(Box::new(socket), false),
         rx: Some(rx),
         replies: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
@@ -1112,6 +1117,7 @@ fn unexpected_hello_response_reports_version_skew_without_retry() {
         observation: Default::default(),
         child: None,
         approved_login: None,
+        worker_setup: None,
         w: FrameWriter::new(Box::new(socket), false),
         rx: Some(rx),
         replies: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
@@ -1162,6 +1168,7 @@ fn ssh_exit_255_wins_over_a_missing_wire_preamble() {
         observation: Default::default(),
         child: Some(child),
         approved_login: None,
+        worker_setup: None,
         w: FrameWriter::new(Box::new(std::io::sink()), false),
         rx: None,
         replies: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
@@ -1220,6 +1227,7 @@ fn dropping_a_pipe_connection_closes_stdin_before_waiting_for_the_peer() {
         observation: Default::default(),
         child: Some(child),
         approved_login: None,
+        worker_setup: None,
         w: FrameWriter::new(Box::new(stdin), false),
         rx: None,
         replies: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
@@ -1367,6 +1375,7 @@ fn a_full_reply_byte_limit_still_drains_replies_while_requests_are_sent() {
         observation: Default::default(),
         child: None,
         approved_login: None,
+        worker_setup: None,
         w: FrameWriter::new(Box::new(socket), false),
         rx: Some(rx),
         replies: REQUESTS,
@@ -1525,6 +1534,7 @@ fn repeatedly_retiring_timed_out_tcp_connections_joins_their_readers() {
             observation: Default::default(),
             child: None,
             approved_login: None,
+            worker_setup: None,
             w: FrameWriter::new(Box::new(writer), false),
             rx: Some(rx),
             replies: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
@@ -1605,6 +1615,7 @@ fn hostile_scan_cannot_deliver_excluded_entries_to_the_planner() {
             observation: Default::default(),
             child: None,
             approved_login: None,
+            worker_setup: None,
             w: FrameWriter::new(Box::new(Vec::new()), false),
             rx: Some(rx),
             replies: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
@@ -1880,7 +1891,8 @@ fn worker_tcp_fallback_survives_broken_stderr() {
                 roots: Vec::new(),
                 send_budget: None
             },
-            false
+            false,
+            None
         )
         .is_err());
     assert!(marker.exists(), "worker never attempted SSH fallback");
@@ -1981,6 +1993,7 @@ fn first_ssh_worker_retries_independently_after_mux_rejection() {
         },
         true,
         false,
+        None,
     );
     assert!(result.is_err()); // The independent attempt reports a missing helper.
     assert_eq!(
@@ -2447,6 +2460,7 @@ fn connection_replaying(responses: &[Response]) -> RemoteConn {
         observation: Default::default(),
         child: None,
         approved_login: None,
+        worker_setup: None,
         w: FrameWriter::new(Box::new(std::io::sink()), false),
         rx: Some(rx),
         replies: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
@@ -2811,6 +2825,7 @@ fn batch_acknowledgments_reach_progress_before_the_worker_consumes_them() {
         observation: Default::default(),
         child: None,
         approved_login: None,
+        worker_setup: None,
         w: FrameWriter::new(Box::new(client.try_clone().unwrap()), false),
         rx: Some(rx),
         replies: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
@@ -2923,4 +2938,81 @@ fn tcp_candidates_keep_the_return_connection_encoding() {
     let candidate: TcpCandidate = serde_json::from_str(old).unwrap();
     assert!(!candidate.same_as_ssh_target);
     assert_eq!(serde_json::to_string(&candidate).unwrap(), old);
+}
+
+#[test]
+fn ending_worker_setups_ends_a_login_in_progress_and_later_retry_waits() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let script = temporary.path().join("ssh");
+    let started_file = temporary.path().join("started");
+    crate::test_support::write_executable(
+        &script,
+        format!(
+            "#!/bin/sh\necho $$ > {started}.tmp\nmv {started}.tmp {started}\nexec sleep 30\n",
+            started = shell_words::quote(started_file.to_str().unwrap()),
+        ),
+        0o700,
+    );
+    let mut spec = RemoteSpec::local_receiver(true);
+    spec.local_process = false;
+    spec.rsh = vec![script.to_string_lossy().into_owned()];
+    let setups = std::sync::Arc::new(WorkerSetups::default());
+    let canceller = {
+        let (setups, started_file) = (setups.clone(), started_file.clone());
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !started_file.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            setups.cancel();
+        })
+    };
+    let started = std::time::Instant::now();
+    let result = spec.connect_retried(
+        false,
+        true,
+        ConnectionRole::SourceWorker {
+            roots: Vec::new(),
+            send_budget: None,
+        },
+        false,
+        false,
+        Some(&setups),
+    );
+    canceller.join().unwrap();
+    let Err(error) = result else {
+        panic!("a login that never finishes connected");
+    };
+    assert!(error.is::<SetupCancelled>(), "{error:#}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "waited {:?} for the cancelled login",
+        started.elapsed()
+    );
+    // The connection reaped its login process before returning.
+    let pid: libc::pid_t = std::fs::read_to_string(&started_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "login {pid} survived");
+
+    // Later setups neither wait before a retry nor start another login.
+    let started = std::time::Instant::now();
+    assert!(setups.sleep(std::time::Duration::from_secs(30)).is_err());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    std::fs::remove_file(&started_file).unwrap();
+    let result = spec.connect_retried(
+        false,
+        true,
+        ConnectionRole::SourceWorker {
+            roots: Vec::new(),
+            send_budget: None,
+        },
+        false,
+        false,
+        Some(&setups),
+    );
+    assert!(result.is_err_and(|error| error.is::<SetupCancelled>()));
+    assert!(!started_file.exists(), "a cancelled setup started a login");
 }

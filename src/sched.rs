@@ -611,6 +611,7 @@ pub struct Sched {
     /// Files a command-restricted receiver is writing and has not
     /// published: it lists each as failed if the copy ends without it.
     receiver_holds: Mutex<HashSet<usize>>,
+    worker_setups: Arc<crate::conn::WorkerSetups>,
 }
 
 impl Sched {
@@ -643,6 +644,20 @@ impl Sched {
             block,
             min_split: min_split.max(2 * block),
             receiver_holds: Mutex::new(HashSet::new()),
+            worker_setups: Default::default(),
+        }
+    }
+
+    /// Worker connections being set up for this copy.
+    pub fn worker_setups(&self) -> &Arc<crate::conn::WorkerSetups> {
+        &self.worker_setups
+    }
+
+    /// Once the copy has finished or failed, a worker connection still being
+    /// set up can never be used. End those setups rather than wait for them.
+    pub fn end_unneeded_worker_setups(&self) {
+        if self.is_aborted() || self.finished() {
+            self.worker_setups.cancel();
         }
     }
 
@@ -789,12 +804,14 @@ impl Sched {
         self.inner.lock().unwrap().scan_done = true;
         self.cv.notify_all();
         self.tune_cv.notify_one();
+        self.end_unneeded_worker_setups();
     }
 
     pub fn abort(&self) {
         self.inner.lock().unwrap().abort = true;
         self.cv.notify_all();
         self.tune_cv.notify_one();
+        self.worker_setups.cancel();
     }
 
     pub fn is_aborted(&self) -> bool {

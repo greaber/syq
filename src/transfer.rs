@@ -1300,7 +1300,8 @@ fn attempt_small_copy(
             drop(planning.take());
             let setup = progress.clock.setup.begin();
             // Read through the engine's source-worker path.
-            let Ok(mut reader) = src_ep.connect_with_sources(args.compress, roots.to_vec(), true)
+            let Ok(mut reader) =
+                src_ep.connect_with_sources(args.compress, roots.to_vec(), true, None)
             else {
                 return Ok(SmallCopy::Reconnect);
             };
@@ -2927,8 +2928,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     // the remaining independent connections finish logging in.
                     // TCP and custom remote shells keep their existing policy.
                     let reuse_control = reuse_startup_ssh(id, autotune);
+                    let setups = Some(sched.worker_setups());
                     let conns = src_ep
-                        .connect_with_sources(compress, initial_sources.clone(), reuse_control)
+                        .connect_with_sources(
+                            compress,
+                            initial_sources.clone(),
+                            reuse_control,
+                            setups,
+                        )
                         .and_then(|src| {
                             let copy_sources =
                                 if opts.copy_policy(bwlimit.is_some()).allows_receiver_copy() {
@@ -2943,6 +2950,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                     initial_destination.clone(),
                                     copy_sources,
                                     reuse_control,
+                                    setups,
                                 )?,
                             ))
                         });
@@ -3022,7 +3030,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                     1 << (failures - 1)
                                 );
                             }
-                            std::thread::sleep(std::time::Duration::from_secs(1 << (failures - 1)));
+                            // Stops early when the copy ends; the loop then returns.
+                            let _ = sched
+                                .worker_setups()
+                                .sleep(std::time::Duration::from_secs(1 << (failures - 1)));
                             continue;
                         }
                     };
@@ -3120,7 +3131,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                     1 << (failures - 1)
                                 );
                             }
-                            std::thread::sleep(std::time::Duration::from_secs(1 << (failures - 1)));
+                            let _ = sched
+                                .worker_setups()
+                                .sleep(std::time::Duration::from_secs(1 << (failures - 1)));
                         }
                         Err(error) => {
                             gate.mark_failed(id);
@@ -3132,7 +3145,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             let spawned = if refused {
                 Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
             } else {
-                std::thread::Builder::new().spawn(work)
+                let ended = failed_schedule.clone();
+                std::thread::Builder::new().spawn(move || {
+                    let result = work();
+                    // A worker that leaves because the copy ended releases the
+                    // join from waiting on peers that are still connecting.
+                    ended.end_unneeded_worker_setups();
+                    result
+                })
             };
             match spawned {
                 Ok(thread) => workers.lock().unwrap().push(thread),
