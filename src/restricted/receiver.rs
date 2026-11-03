@@ -321,7 +321,7 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
         .try_get_matches_from(
             std::iter::once(OsString::from("syq receiver")).chain(argv[2..].iter().cloned()),
         )
-        .unwrap_or_else(|error| error.exit());
+        .unwrap_or_else(|error| crate::output::exit_with(error));
     crate::fsops::reserve_startup_descriptors();
     let (command, options) = matches.subcommand().expect("subcommand required");
     let via = || -> Result<Option<SshEndpoint>> {

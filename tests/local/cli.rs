@@ -1918,6 +1918,7 @@ fn closed_stdout_ends_printing_commands_quietly() {
         &["--help"],
         &["--help-all"],
         &["help", "cp"],
+        &["cp", "--help"],
         &["completion", "bash"],
         &["completion", "zsh"],
         &["persist", "status"],
@@ -1942,5 +1943,53 @@ fn closed_stdout_ends_printing_commands_quietly() {
             .unwrap();
         assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
         assert!(output.stderr.is_empty(), "{args:?}: {}", stderr_of(&output));
+    }
+}
+
+/// Output that cannot be written for another reason, as to a full disk,
+/// fails the command with one error naming the cause, so a truncated file is
+/// never reported as success. Coreutils behaves the same way.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_full_stdout_fails_printing_commands() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"mapped");
+    fs::create_dir(t.runtime()).unwrap();
+    for args in [
+        &["--version"][..],
+        &["--build-identity"],
+        &["--help"],
+        &["help", "cp"],
+        &["cp", "--help"],
+        &["completion", "bash"],
+        &["persist", "status"],
+        &["persist", "status", "--json"],
+        &["map", "--cwd", &t.s("src"), "file", "--as", "copy"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("HOME", t.path("home"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .stdin(Stdio::null())
+            .stdout(File::create("/dev/full").unwrap())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        let stderr = stderr_of(&output);
+        assert!(
+            !output.status.success() && output.status.code().is_some(),
+            "{args:?}: {output:?}"
+        );
+        assert_eq!(
+            stderr.matches("No space left on device").count(),
+            1,
+            "{args:?}: {stderr}"
+        );
+        assert!(!stderr.contains("panicked"), "{args:?}: {stderr}");
     }
 }

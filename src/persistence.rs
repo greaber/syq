@@ -185,7 +185,9 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     let matches = command_for_help()
         .try_get_matches_from(&full_argv)
         .unwrap_or_else(|error| {
-            crate::receive_service::option_migration_hint(&full_argv, error).exit()
+            crate::output::exit_with(crate::receive_service::option_migration_hint(
+                &full_argv, error,
+            ))
         });
     let command = PersistCommand::from_arg_matches(&matches)?;
     crate::fsops::reserve_startup_descriptors();

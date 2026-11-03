@@ -778,7 +778,7 @@ impl Args {
         let Some(command) = argv.first().and_then(|arg| arg.to_str()) else {
             if argv.is_empty() {
                 print_root_help(false);
-                std::process::exit(0);
+                crate::output::exit(0);
             }
             bail!("command name is not valid UTF-8");
         };
@@ -790,18 +790,18 @@ impl Args {
             "map" => parse_native(&argv[1..], Interface::NativeMap),
             "--help" | "-h" | "--help-all" => {
                 print_root_help(command == "--help-all");
-                std::process::exit(0);
+                crate::output::exit(0);
             }
             "--version" | "-V" => {
                 crate::output::command_println!("syq {}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
+                crate::output::exit(0);
             }
             // Installation lifecycle switches remain top-level. Internal
             // helper switches are handled in main.
             "--self-update" | "--register-standalone-install" => {
                 let matches = crate::help::lifecycle().try_get_matches_from(
                     std::iter::once(OsString::from("syq")).chain(argv.iter().cloned())
-                ).unwrap_or_else(|error| error.exit());
+                ).unwrap_or_else(|error| crate::output::exit_with(error));
                 let mut args = native_engine_defaults();
                 args.self_update = matches.get_flag("self_update");
                 args.register_standalone_install = matches.get_flag("register_standalone_install");
@@ -826,7 +826,7 @@ impl Args {
         full_argv.extend(argv.iter().cloned());
         let matches = crate::help::filesystem(Args::command())
             .try_get_matches_from(full_argv)
-            .unwrap_or_else(|error| error.exit());
+            .unwrap_or_else(|error| crate::output::exit_with(error));
         let mut args = Args::from_arg_matches(&matches)?;
         // rsync updates existing files in place.
         args.in_place_update = args.inplace;
@@ -1209,10 +1209,10 @@ fn print_root_help(full: bool) {
     result.unwrap_or_else(|error| {
         // A reader that stopped early, as `head` does, has what it wanted.
         if error.kind() == std::io::ErrorKind::BrokenPipe {
-            std::process::exit(0);
+            crate::output::exit(0);
         }
         crate::output::diagnostic!("syq: {error}");
-        std::process::exit(1);
+        crate::output::exit(1);
     });
 }
 
@@ -1835,7 +1835,7 @@ fn parse_clean_partials(argv: &[OsString]) -> Result<Args> {
     full.extend_from_slice(argv);
     let matches = crate::help::filesystem(CleanPartialsCommand::command())
         .try_get_matches_from(full)
-        .unwrap_or_else(|error| error.exit());
+        .unwrap_or_else(|error| crate::output::exit_with(error));
     let parsed = CleanPartialsCommand::from_arg_matches(&matches)?;
     let endpoint = parse_native_endpoint(parsed.on.as_deref())?;
     if endpoint.is_none() && parsed.auth_from.is_some() {
@@ -2671,7 +2671,7 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
     full_argv.extend_from_slice(argv);
     let matches = crate::help::filesystem(NativeMapCommand::command())
         .try_get_matches_from(full_argv)
-        .unwrap_or_else(|error| error.exit());
+        .unwrap_or_else(|error| crate::output::exit_with(error));
     let mut parsed = NativeMapCommand::from_arg_matches(&matches)?;
 
     // Keep `-C` out of selector paths so emitted `src` values stay relative

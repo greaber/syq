@@ -165,16 +165,23 @@ fn max_files_per_process() -> Option<libc::rlim_t> {
 }
 
 fn main() {
+    run();
+    // A command that returned normally succeeds, unless its output could
+    // not all be written (crate::output::exit).
+    crate::output::exit(0);
+}
+
+fn run() {
     #[cfg(target_os = "linux")]
     process::restore_self_started_name();
     let argv = match use_version::enter(std::env::args_os().collect()) {
         Ok(argv) => argv,
         Err(error) => {
             if let Some(error) = error.downcast_ref::<clap::Error>() {
-                error.exit();
+                crate::output::exit_with(error);
             }
             crate::output::diagnostic!("syq: {error:#}");
-            std::process::exit(1);
+            crate::output::exit(1);
         }
     };
     let environment_options = cli::EnvironmentOptions::take_from_environment();
@@ -185,13 +192,13 @@ fn main() {
         Ok(argv) => argv,
         Err(error) => {
             crate::output::diagnostic!("syq: {error:#}");
-            std::process::exit(1);
+            crate::output::exit(1);
         }
     };
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("help") {
         if let Err(error) = help::show_topic(&argv[2..]) {
             crate::output::diagnostic!("syq: {error:#}");
-            std::process::exit(2);
+            crate::output::exit(2);
         }
         return;
     }
@@ -209,36 +216,36 @@ fn main() {
             crate::output::diagnostic!(
                 "syq: --release-manifest-signing-payload requires one manifest path"
             );
-            std::process::exit(2);
+            crate::output::exit(2);
         }
         fsops::reserve_startup_descriptors();
         if let Err(e) = update::write_manifest_signing_payload(std::path::Path::new(&argv[2])) {
             crate::output::diagnostic!("syq: {e:#}");
-            std::process::exit(1);
+            crate::output::exit(1);
         }
         return;
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("--restricted-install") {
         if argv.len() != 2 {
             crate::output::diagnostic!("syq: restricted installer takes no command-line arguments");
-            std::process::exit(2);
+            crate::output::exit(2);
         }
         fsops::reserve_startup_descriptors();
         if let Err(error) = restricted::remote_install() {
             crate::output::diagnostic!("syq restricted installer: {error:#}");
-            std::process::exit(1);
+            crate::output::exit(1);
         }
         return;
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("--restricted-revoke") {
         if argv.len() != 2 {
             crate::output::diagnostic!("syq: restricted revoker takes no command-line arguments");
-            std::process::exit(2);
+            crate::output::exit(2);
         }
         fsops::reserve_startup_descriptors();
         if let Err(error) = restricted::remote_revoke() {
             crate::output::diagnostic!("syq restricted revoker: {error:#}");
-            std::process::exit(1);
+            crate::output::exit(1);
         }
         return;
     }
@@ -253,18 +260,18 @@ fn main() {
             crate::output::diagnostic!(
                 "syq: restricted receiver requires exactly --enrollment=ID --generation=N"
             );
-            std::process::exit(2);
+            crate::output::exit(2);
         };
         if argv.len() != 4 {
             crate::output::diagnostic!(
                 "syq: restricted receiver requires exactly --enrollment=ID --generation=N"
             );
-            std::process::exit(2);
+            crate::output::exit(2);
         }
         fsops::reserve_startup_descriptors();
         if let Err(error) = server::run_checker(enrollment, generation) {
             crate::output::diagnostic!("syq restricted receiver: {error:#}");
-            std::process::exit(1);
+            crate::output::exit(1);
         }
         return;
     }
@@ -272,7 +279,7 @@ fn main() {
         fsops::reserve_startup_descriptors();
         if let Err(error) = session_pool::run(&argv[2..]) {
             crate::output::diagnostic!("syq session pool: {error:#}");
-            std::process::exit(1);
+            crate::output::exit(1);
         }
         return;
     }
@@ -287,7 +294,7 @@ fn main() {
             && argv.get(2).and_then(|arg| arg.to_str()) == Some("--local-receiver");
         if let Err(e) = server::run(local_receiver) {
             crate::output::diagnostic!("syq server: {e:#}");
-            std::process::exit(1);
+            crate::output::exit(1);
         }
         return;
     }
@@ -296,95 +303,95 @@ fn main() {
     // the return-helper handoff, which both of those may perform.
     if let Err(error) = environment_options.insert(&mut argv) {
         crate::output::diagnostic!("syq: {error:#}");
-        std::process::exit(2);
+        crate::output::exit(2);
     }
     destination::handoff::record_command_line(&argv);
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("ssh") {
         match destination::ssh::run(&argv[1..]) {
-            Ok(code) => std::process::exit(code),
+            Ok(code) => crate::output::exit(code),
             Err(error) => {
                 if let Some(error) = error.downcast_ref::<clap::Error>() {
-                    error.exit();
+                    crate::output::exit_with(error);
                 }
                 crate::output::diagnostic!("syq ssh: {error:#}");
-                std::process::exit(255);
+                crate::output::exit(255);
             }
         }
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("exec") {
         match destination::exec::run(&argv[1..]) {
-            Ok(code) => std::process::exit(code),
+            Ok(code) => crate::output::exit(code),
             Err(error) => {
                 if let Some(error) = error.downcast_ref::<clap::Error>() {
-                    error.exit();
+                    crate::output::exit_with(error);
                 }
                 crate::output::diagnostic!("syq exec: {error:#}");
-                std::process::exit(1);
+                crate::output::exit(1);
             }
         }
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("cat") {
         fsops::reserve_startup_descriptors();
         match janky_cat::run(&argv[2..]) {
-            Ok(code) => std::process::exit(code),
+            Ok(code) => crate::output::exit(code),
             Err(error) => {
                 crate::output::diagnostic!("syq cat: {error:#}");
-                std::process::exit(1);
+                crate::output::exit(1);
             }
         }
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("persist") {
         match persistence::run(&argv[2..]) {
-            Ok(code) => std::process::exit(code),
+            Ok(code) => crate::output::exit(code),
             Err(error) => {
                 crate::output::diagnostic!("syq persist: {error:#}");
-                std::process::exit(1);
+                crate::output::exit(1);
             }
         }
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("_ls") {
         match s3::listing::run(&argv[2..]) {
-            Ok(code) => std::process::exit(code),
+            Ok(code) => crate::output::exit(code),
             Err(error) => {
                 crate::output::diagnostic!("syq _ls: {error:#}");
-                std::process::exit(1);
+                crate::output::exit(1);
             }
         }
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("tuning-cache") {
         match tune::history::run(&argv[2..]) {
-            Ok(code) => std::process::exit(code),
+            Ok(code) => crate::output::exit(code),
             Err(error) => {
                 crate::output::diagnostic!("syq tuning-cache: {error:#}");
-                std::process::exit(1);
+                crate::output::exit(1);
             }
         }
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("completion") {
         match completion::run(&argv[2..]) {
-            Ok(code) => std::process::exit(code),
+            Ok(code) => crate::output::exit(code),
             Err(error) => {
                 crate::output::diagnostic!("syq completion: {error:#}");
-                std::process::exit(1);
+                crate::output::exit(1);
             }
         }
     }
     if let Some(result) = restricted::dispatch_receiver_command(&argv) {
         match result {
-            Ok(code) => std::process::exit(code),
+            Ok(code) => crate::output::exit(code),
             Err(error) => {
                 crate::output::diagnostic!("syq: {error:#}");
-                std::process::exit(1);
+                crate::output::exit(1);
             }
         }
     }
     if let Some(result) = receive_service::dispatch(&argv).or_else(|| destination::dispatch(&argv))
     {
         match result {
-            Ok(code) => std::process::exit(code),
+            Ok(code) => crate::output::exit(code),
             Err(error) => {
                 crate::output::diagnostic!("syq: {error:#}");
-                std::process::exit(1);
+                crate::output::exit(1);
             }
         }
     }
@@ -392,10 +399,10 @@ fn main() {
         Ok(a) => a,
         Err(e) => {
             if let Some(error) = e.downcast_ref::<clap::Error>() {
-                error.exit();
+                crate::output::exit_with(error);
             }
             crate::output::diagnostic!("syq: {e:#}");
-            std::process::exit(2);
+            crate::output::exit(2);
         }
     };
     fsops::reserve_startup_descriptors();
@@ -404,29 +411,29 @@ fn main() {
     if args.self_update {
         if let Err(e) = update::self_update() {
             crate::output::diagnostic!("syq: {e:#}");
-            std::process::exit(1);
+            crate::output::exit(1);
         }
         return;
     }
     if args.register_standalone_install {
         if let Err(e) = update::register_standalone_install() {
             crate::output::diagnostic!("syq: {e:#}");
-            std::process::exit(1);
+            crate::output::exit(1);
         }
         return;
     }
     if let Err(error) = persistence::mark_explicit_scope(&mut args) {
         crate::output::diagnostic!("syq: {error:#}");
-        std::process::exit(2);
+        crate::output::exit(2);
     }
     if let Err(error) = destination::account_copy::prepare_handoff(&args) {
         crate::output::diagnostic!("syq: {error:#}");
-        std::process::exit(2);
+        crate::output::exit(2);
     }
     if args.interface != cli::Interface::NativeCp && args.s3.is_none() {
         if let Err(error) = destination::prepare(&mut args) {
             crate::output::diagnostic!("syq: {error:#}");
-            std::process::exit(2);
+            crate::output::exit(2);
         }
     }
     let quiet = args.quiet;
@@ -448,11 +455,11 @@ fn main() {
             if code == 0 {
                 update::after_success(quiet);
             }
-            std::process::exit(code)
+            crate::output::exit(code)
         }
         Err(e) => {
             crate::output::diagnostic!("syq: {e:#}");
-            std::process::exit(1);
+            crate::output::exit(1);
         }
     }
 }

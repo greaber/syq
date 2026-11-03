@@ -122,6 +122,10 @@ pub(crate) fn write_stdout(args: Arguments<'_>) -> io::Result<()> {
 /// Set once stdout's reader has gone away, as `head` does after its lines:
 /// a command's later output to stdout is dropped without trying.
 static STDOUT_CLOSED: AtomicBool = AtomicBool::new(false);
+/// Set once a command's output could not be written for another reason, as
+/// to a full disk: the failure has been reported, later output is dropped,
+/// and `exit` fails the command.
+static STDOUT_FAILED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn warn_stdout(error: &io::Error) {
     static WARNED: AtomicBool = AtomicBool::new(false);
@@ -132,13 +136,18 @@ pub(crate) fn warn_stdout(error: &io::Error) {
     }
 }
 
+fn command_stdout_lost() -> bool {
+    STDOUT_CLOSED.load(Relaxed) || STDOUT_FAILED.load(Relaxed)
+}
+
 /// Print a command's own output as written, such as `--version`, a listing
-/// or JSON. Unlike a copy's human output, which warns when stdout is closed,
-/// a command's output ends quietly then, as when piped into `head`: the
-/// reader has what it wanted. Another write failure is reported once on
-/// stderr. Neither changes the command's outcome.
+/// or JSON. As coreutils do, a closed stdout ends the output quietly, as
+/// when piped into `head`: the reader has what it wanted. Any other write
+/// failure, as to a full disk, is reported once and fails the command when
+/// it exits (`exit`), so truncated output never looks complete. A copy's
+/// human output (`human_stdout!`) instead only warns.
 pub(crate) fn emit_command_stdout(args: Arguments<'_>) {
-    if STDOUT_CLOSED.load(Relaxed) {
+    if command_stdout_lost() {
         return;
     }
     let mut out = io::stdout().lock();
@@ -148,9 +157,9 @@ pub(crate) fn emit_command_stdout(args: Arguments<'_>) {
 }
 
 /// A command's own human output, escaped and placed as `human_stdout!`
-/// does, ending quietly when stdout is closed as `emit_command_stdout` does.
+/// does, with failures handled as `emit_command_stdout` handles them.
 pub(crate) fn emit_command_human_stdout(args: Arguments<'_>) {
-    if STDOUT_CLOSED.load(Relaxed) {
+    if command_stdout_lost() {
         return;
     }
     if let Err(error) = write_stdout(format_args!("{}", safe_message(args))) {
@@ -161,50 +170,74 @@ pub(crate) fn emit_command_human_stdout(args: Arguments<'_>) {
 fn command_stdout_failed(error: &io::Error) {
     if error.kind() == io::ErrorKind::BrokenPipe {
         STDOUT_CLOSED.store(true, Relaxed);
-    } else {
-        warn_stdout(error);
+    } else if !STDOUT_FAILED.swap(true, Relaxed) {
+        emit_diagnostic(format_args!("syq: cannot write to stdout: {error}"));
     }
 }
 
-/// Stdout for a command that writes its output as a stream: a closed stdout
-/// accepts and drops the rest, so the command ends with its usual status.
-/// Other write errors still reach the caller.
+/// End the process with `code`. A command whose output could not all be
+/// written, except to a closed stdout, fails with 1 instead of succeeding.
+pub(crate) fn exit(code: i32) -> ! {
+    let code = if code == 0 && STDOUT_FAILED.load(Relaxed) {
+        1
+    } else {
+        code
+    };
+    std::process::exit(code)
+}
+
+/// Print a command-line error, help or version from clap, and exit as
+/// `Error::exit` does, except that help or a version that could not be
+/// written to stdout fails as other command output does.
+pub(crate) fn exit_with(error: impl std::borrow::Borrow<clap::Error>) -> ! {
+    let error = error.borrow();
+    let printed = error.print();
+    if !error.use_stderr() {
+        if let Err(failure) = printed {
+            command_stdout_failed(&failure);
+        }
+    }
+    exit(error.exit_code())
+}
+
+/// Stdout for a command that writes its output as a stream. It handles
+/// failures as `emit_command_stdout` does: after a closed stdout or another
+/// failure it accepts and drops the rest, so callers go on, and `exit`
+/// decides the status. Dropping it flushes what it holds.
 pub(crate) fn command_stdout() -> CommandStdout {
     CommandStdout(io::stdout().lock())
 }
 
 pub(crate) struct CommandStdout(io::StdoutLock<'static>);
 
-impl CommandStdout {
-    fn closed(&self, error: io::Error) -> io::Result<()> {
-        if error.kind() == io::ErrorKind::BrokenPipe {
-            STDOUT_CLOSED.store(true, Relaxed);
-            Ok(())
-        } else {
-            Err(error)
-        }
-    }
-}
-
 impl Write for CommandStdout {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        if STDOUT_CLOSED.load(Relaxed) {
+        if command_stdout_lost() {
             return Ok(buffer.len());
         }
         match self.0.write(buffer) {
-            Err(error) => self.closed(error).map(|()| buffer.len()),
+            Err(error) => {
+                command_stdout_failed(&error);
+                Ok(buffer.len())
+            }
             written => written,
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if STDOUT_CLOSED.load(Relaxed) {
+        if command_stdout_lost() {
             return Ok(());
         }
-        match self.0.flush() {
-            Err(error) => self.closed(error),
-            flushed => flushed,
+        if let Err(error) = self.0.flush() {
+            command_stdout_failed(&error);
         }
+        Ok(())
+    }
+}
+
+impl Drop for CommandStdout {
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 

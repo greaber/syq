@@ -184,7 +184,7 @@ fn parse_action(argv: &[OsString]) -> Result<CompletionAction, clap::Error> {
 }
 
 pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
-    let action = parse_action(argv).unwrap_or_else(|error| error.exit());
+    let action = parse_action(argv).unwrap_or_else(|error| crate::output::exit_with(error));
     match action {
         CompletionAction::Bash => crate::output::command_print!("{BASH_ADAPTER}"),
         CompletionAction::Zsh => crate::output::command_print!("{ZSH_ADAPTER}"),
