@@ -176,7 +176,8 @@ pub(super) struct Issued {
     login: String,
     /// What this machine's known_hosts files say about the destination.
     known_hosts: String,
-    /// What they leave out of its configuration, for a notice.
+    /// What they leave out of its configuration, without its value, for a
+    /// notice.
     known_hosts_left_out: Option<String>,
     /// The destination as the directive's rules name it.
     destination: Vec<u8>,
@@ -453,7 +454,8 @@ impl Receiver {
             entry_key: prepared.entry_key,
             login: policy.login_user.clone(),
             known_hosts: policy.known_hosts_for_others()?,
-            known_hosts_left_out: policy.left_out(),
+            // The configured value stays here: it can hold commands and paths.
+            known_hosts_left_out: policy.left_out_kind().map(str::to_owned),
             destination: prepared.destination,
             max_delete,
         };

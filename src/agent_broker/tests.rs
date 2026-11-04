@@ -445,11 +445,15 @@ fn dynamic_and_external_revocation_host_policies_fail_closed() {
         // Exact-key uses, which bind agent signatures to the host, refuse
         // it; OpenSSH's own checking reproduces it.
         let config = parse_ssh_config(config.as_bytes()).unwrap();
-        assert!(config
-            .unsupported
-            .unwrap()
+        let unsupported = config.unsupported.unwrap();
+        assert!(unsupported
             .broker_error()
             .contains("constrained agent forwarding"));
+        // This machine's notice names the value; what another machine is
+        // told does not.
+        let (_, value) = policy.split_once(' ').unwrap();
+        assert!(unsupported.notice().contains(value));
+        assert!(!unsupported.kind().contains(value));
     }
 }
 

@@ -162,9 +162,15 @@ impl HostPolicy {
     }
 
     /// Why what this machine tells another about the host's key leaves part
-    /// of its configuration out, if it does.
+    /// of its configuration out, if it does, with the configured value.
     pub(crate) fn left_out(&self) -> Option<String> {
         self.unsupported.as_ref().map(Unreproduced::notice)
+    }
+
+    /// The same, without configured values, which can hold commands and
+    /// paths: for another machine to show.
+    pub(crate) fn left_out_kind(&self) -> Option<&'static str> {
+        self.unsupported.as_ref().map(Unreproduced::kind)
     }
 
     /// Refuse a host this machine does not trust through exact plain keys,
@@ -527,8 +533,10 @@ fn inspect_ssh_configuration_at(
 #[derive(Clone, Copy, Debug, Default)]
 struct KnownHostsConfigured {
     // An uncertain directive may have produced a single filename which
-    // flattens to the compiled-default list. Simple literal absolute paths
-    // cannot do that, even in an unrelated Host/Match block.
+    // flattens to the compiled-default list. A literal absolute or `~/` path
+    // has no space, so it cannot, even in an unrelated Host/Match block.
+    // (`ssh -G` expands `~` only in UserKnownHostsFile; a `~/`
+    // GlobalKnownHostsFile is then left out as unexpanded.)
     user: bool,
     global: bool,
 }
@@ -692,6 +700,18 @@ impl Unreproduced {
             Self::UnusablePath(value) => {
                 format!("its known_hosts path {value:?} is relative or unexpanded")
             }
+        }
+    }
+
+    /// What another machine is not told, without the configured value.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::KnownHostsCommand(_) => "its KnownHostsCommand is not run for that",
+            Self::RevokedHostKeys(_) => "its RevokedHostKeys file is not read for that",
+            Self::AmbiguousFiles(_) => {
+                "one of its known_hosts settings could be one quoted name or several"
+            }
+            Self::UnusablePath(_) => "one of its known_hosts paths is relative or unexpanded",
         }
     }
 }

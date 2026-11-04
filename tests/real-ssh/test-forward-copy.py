@@ -761,6 +761,14 @@ def with_source_config(text, action):
         run("ssh", "source", "umask 077; cat > ~/.ssh/config", stdin=original)
 
 
+def copy_between_servers(path):
+    """Copy from the source to the destination, started here; return its status and errors."""
+    result = subprocess.run(["syq", "cp", "--from", "source", "/tmp/syq-real-ssh/return-source/subdir/chunks.bin",
+                             "--to", "destination", "--as", path, "--no-progress"],
+                            capture_output=True, text=True, timeout=90)
+    return result.returncode, result.stderr
+
+
 print("case: the server checks the destination's key with its own SSH configuration", flush=True)
 assert len(destination_enrollments()) == 1
 saved_source = source_known_hosts()
@@ -807,8 +815,15 @@ try:
     _, stderr = changed.communicate(timeout=90)
     assert changed.returncode not in (0, 124), stderr
     assert "Host key verification failed" in stderr, stderr
-    assert ("the approving machine's known_hosts lists a different key for destination; "
-            "if that key is out of date, remove it there with `ssh-keygen -R destination`") in stderr, stderr
+    refusal = ("the approving machine's known_hosts lists a different key for destination; "
+               "if that key is out of date, remove it there with `ssh-keygen -R destination`")
+    assert refusal in stderr, stderr
+    assert not source_knows("destination")
+    # The same for a copy between the servers started here, which the source
+    # coordinates.
+    status, stderr = copy_between_servers("/tmp/syq-real-ssh/forward/hostkey-runner-contradicts")
+    assert status != 0, stderr
+    assert "Host key verification failed" in stderr and refusal in stderr, stderr
     assert not source_knows("destination")
     print("a key only the runner knows that contradicts the one presented was refused", flush=True)
 
@@ -973,14 +988,21 @@ finally:
 print("case: the runner says what of its own host-key checking the server cannot use", flush=True)
 # The runner's own KnownHostsCommand is not run for the source; the source
 # still checks the destination with what it and the runner's files know.
+# The server is told only which setting, not its value.
 runner_config = Path.home() / ".ssh/config"
 original_config = runner_config.read_bytes()
 try:
     runner_config.write_bytes(b"Host destination\n  KnownHostsCommand /bin/true\n\n" + original_config)
     status, stderr = approved_source_copy()
+    between_status, between_stderr = copy_between_servers("/tmp/syq-real-ssh/forward/hostkey-runner-command")
 finally:
     runner_config.write_bytes(original_config)
 assert status == 0, stderr
 assert ("without some of what the approving machine knows about it: "
-        'its KnownHostsCommand "/bin/true" is not run for that') in stderr, stderr
+        "its KnownHostsCommand is not run for that") in stderr, stderr
+assert "/bin/true" not in stderr, stderr
+# A copy between the servers started here says so here, with the value.
+assert between_status == 0, between_stderr
+assert ("the source checks the destination's host key without some of what this machine knows about it: "
+        'its KnownHostsCommand "/bin/true" is not run for that') in between_stderr, between_stderr
 print("source-shell remote copy checks passed", flush=True)
