@@ -176,6 +176,8 @@ pub(super) struct Issued {
     login: String,
     /// What this machine's known_hosts files say about the destination.
     known_hosts: String,
+    /// What they leave out of its configuration, for a notice.
+    known_hosts_left_out: Option<String>,
     /// The destination as the directive's rules name it.
     destination: Vec<u8>,
     /// This machine's deletion limit for the copy.
@@ -251,6 +253,15 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
     args.auth_from = crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name));
     args.restricted_grant = Some(issued.directive);
     args.rsh = Some(crate::remote_to_remote::receiver_rsh(endpoint.port));
+    if let Some(left_out) = issued.known_hosts_left_out.filter(|_| !args.quiet) {
+        crate::output::diagnostic!(
+            "syq: checking the destination's host key without some of what the approving machine knows about it: {}",
+            left_out
+                .chars()
+                .filter(|character| !character.is_control())
+                .collect::<String>()
+        );
+    }
     let keys = crate::remote_to_remote::prepare_receiver_ssh_with(
         args,
         &issued.known_hosts,
@@ -441,8 +452,8 @@ impl Receiver {
             directive: prepared.directive,
             entry_key: prepared.entry_key,
             login: policy.login_user.clone(),
-            known_hosts: policy
-                .known_hosts_for_others(crate::remote_to_remote::RECEIVER_HOST_ALIAS)?,
+            known_hosts: policy.known_hosts_for_others()?,
+            known_hosts_left_out: policy.left_out(),
             destination: prepared.destination,
             max_delete,
         };
@@ -1185,7 +1196,7 @@ pub(super) fn target_spec(target: &str) -> Result<crate::conn::RemoteSpec> {
         diagnostics: Default::default(),
         primed_control: Default::default(),
         forwarded: None,
-        resolved_host: None,
+        receiver_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     })
 }

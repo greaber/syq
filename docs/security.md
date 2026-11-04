@@ -331,29 +331,44 @@ them, and, as for hostA's other connections, `UpdateHostKeys` can record
 keys hostB announces in hostA's known_hosts.
 
 HostA also accepts the keys and host certificate authorities that your
-laptop's known_hosts lists for hostB. Syq gives them to hostA's `ssh`
-through a `KnownHostsCommand` that prints a file named
-`known-to-the-machine-that-approved-this-copy`, so hostA's own known_hosts
-settings stay exactly as configured. Where hostA's configuration sets a
-`KnownHostsCommand` of its own, which stays, or hostA's OpenSSH is older
-than 8.5, the file is added to hostA's `GlobalKnownHostsFile` instead, but
-only when that setting contains no whitespace: OpenSSH reports a list of
-files and one quoted name containing spaces the same way. Otherwise hostA
-does without your laptop's entries for that copy, and the copy says so. Your
-laptop leaves out a known_hosts setting of its own that contains whitespace,
-other than OpenSSH's own default list. A key that matches an entry
-on either machine is accepted, so a key your laptop knows works even where
-hostA has an old one. A key that matches nothing while either machine lists
-some key for hostB is refused, as `ssh` refuses it, and the message names
-the file with the other key; with `StrictHostKeyChecking no`, hostA accepts
-it, as its `ssh` would. When neither machine knows hostB, hostA follows its
-own setting, except that nobody can answer the question `ask`, the default,
-would ask. So `ask` works like `accept-new`: hostA accepts the key it is
-shown the first time and records it in its own known_hosts, and later
-connections are checked against it. Your laptop's own login to hostB, which
-sets up restricted copying, checks hostB's key with your laptop's SSH
-configuration in the same way, records a newly accepted key in your
-laptop's known_hosts, and asks you only when it runs in a terminal.
+laptop's known_hosts lists for hostB, and refuses the keys it marks revoked.
+Syq gives them to hostA's `ssh` through a `KnownHostsCommand`, so hostA's
+own known_hosts settings stay exactly as configured. Where hostA's
+configuration sets a `KnownHostsCommand` of its own, which stays, or hostA's
+OpenSSH is older than 8.5, syq instead adds a file named
+`known-to-the-machine-that-approved-this-copy` to hostA's
+`GlobalKnownHostsFile`, but only when that setting is one word. OpenSSH
+reports a list of files and one quoted name containing spaces the same way,
+and its default setting lists two files. So on those hosts, unless
+`GlobalKnownHostsFile` names a single file, hostA checks hostB's key without
+your laptop's entries, and the copy says so. HostA still connects whenever
+its own configuration accepts hostB's key. In the same way, your laptop
+leaves out what it cannot read as its `ssh` does, such as its own
+`KnownHostsCommand`, or a known_hosts setting that contains whitespace. It
+reads OpenSSH's default list only where its configuration names known_hosts
+files nowhere, or only as plain absolute or `~/` paths. The copy says when
+your laptop left something out.
+
+A key that matches an entry on either machine is accepted, so a key your
+laptop knows works even where hostA has an old one. A key that matches
+nothing while either machine lists a plain key of the same type for hostB is
+refused, as `ssh` refuses it. When the other key is your laptop's, ssh's
+message calls it `KnownHostsCommand-HOSTNAME`, or names the file above, and
+suggests fixing hostA's files; syq adds a line saying that your laptop's
+known_hosts lists a different key, with the `ssh-keygen -R` command to run
+there if that key is out of date. A host certificate authority listed on
+either machine does not refuse a key presented without a certificate from
+it; hostA treats that key as it would treat a host it has not seen, and
+`StrictHostKeyChecking yes` refuses it. With `StrictHostKeyChecking no`,
+hostA accepts such a key, as its `ssh` would. When neither machine knows
+hostB, hostA follows its own setting, except that nobody can answer the
+question `ask`, the default, would ask. So `ask` works like `accept-new`:
+hostA accepts the key it is shown the first time and records it in its own
+known_hosts, and later connections are checked against it. Your laptop's own
+login to hostB, which sets up restricted copying, checks hostB's key with
+your laptop's SSH configuration in the same way, records a newly accepted
+key in your laptop's known_hosts, and asks you only when it runs in a
+terminal.
 
 Accepting a new key means that someone who can intercept that first
 connection could present their own key. They could not use the entry key or

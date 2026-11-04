@@ -815,10 +815,10 @@ fn constrained_destination_rsh(
 /// what syq adds to the command for it. The configuration itself checks the
 /// host key, as `ssh` would: its known_hosts files, host certificate
 /// authorities, KnownHostsCommand and StrictHostKeyChecking. Syq adds the
-/// approving machine's knowledge as one more global file, accepts a host
-/// nobody knows the first time where the configuration would ask, which
-/// nobody can answer, and overrides the session options a configuration
-/// can set that the entry key's session must not use.
+/// approving machine's knowledge where it can, as `approving_keys` says,
+/// accepts a host nobody knows the first time where the configuration would
+/// ask, which nobody can answer, and overrides the session options a
+/// configuration can set that the entry key's session must not use.
 pub(crate) struct ReceiverConnection {
     /// The host the configuration resolves the destination to.
     hostname: String,
@@ -897,6 +897,28 @@ impl ReceiverConnection {
         } else {
             ApprovingKeys::Omitted
         }
+    }
+
+    /// How ssh's messages name the file of the approving machine's entries:
+    /// a KnownHostsCommand's output by its own label.
+    fn approving_label(&self) -> &'static str {
+        match self.approving_keys() {
+            ApprovingKeys::Command => "KnownHostsCommand-",
+            _ => APPROVING_KNOWN_HOSTS,
+        }
+    }
+
+    /// Why the approving machine's entries cannot join this machine's.
+    fn omission_cause(&self) -> String {
+        let cause = if self.known_hosts_command {
+            "this machine's configuration has a KnownHostsCommand of its own"
+        } else {
+            "this machine's ssh is older than OpenSSH 8.5"
+        };
+        format!(
+            "{cause}, and its GlobalKnownHostsFile {:?} has more than one word",
+            self.global
+        )
     }
 
     pub(crate) fn parse(output: &str) -> Result<Self> {
@@ -1002,7 +1024,6 @@ pub(crate) const ENTRY_KEY_STDIN: &str = "SYQ_INTERNAL_NATIVE_ENTRY_KEY";
 /// Set with the entry key: this many bytes of the copy's signed directive
 /// follow it on the coordinator's input.
 pub(crate) const DIRECTIVE_STDIN: &str = "SYQ_INTERNAL_NATIVE_DIRECTIVE";
-pub(crate) const RECEIVER_HOST_ALIAS: &str = "syq-enrolled-receiver";
 /// The identity of the coordinator's SSH command to the receiver until the
 /// coordinator puts its copy of the entry key there. An SSH command that
 /// keeps it has no identity, and fails.
@@ -1178,19 +1199,22 @@ pub(crate) fn prepare_receiver_ssh_with(
         ssh_key::Algorithm::Rsa { .. } => "rsa-sha2-512,rsa-sha2-256".to_owned(),
         algorithm => algorithm.as_str().to_owned(),
     };
-    // What the approving machine knows, under the name this machine's own
-    // known_hosts files use for the destination.
+    // What the approving machine knows, which it lists under its own name
+    // for the destination, under the name this machine's own known_hosts
+    // files use.
     let lookup = &connection.lookup;
     let mut approving = String::new();
     let mut approving_entries = 0;
+    let mut approving_name = None;
     for line in known_hosts.lines() {
         let (marker, rest) = match line.split_once(' ') {
             Some((marker @ ("@cert-authority" | "@revoked"), rest)) => (Some(marker), rest),
             _ => (None, line),
         };
-        let key = rest
-            .strip_prefix(&format!("{RECEIVER_HOST_ALIAS} "))
-            .context("invalid receiver known-hosts alias")?;
+        let (name, key) = rest
+            .split_once(' ')
+            .context("invalid receiver known-hosts line")?;
+        approving_name.get_or_insert(name);
         let key = ssh_key::PublicKey::from_openssh(key).context("invalid receiver host key")?;
         if let Some(marker) = marker {
             approving.push_str(marker);
@@ -1204,8 +1228,8 @@ pub(crate) fn prepare_receiver_ssh_with(
     let union = approving_entries > 0 && connection.approving_keys() != ApprovingKeys::Omitted;
     if approving_entries > 0 && !union && !args.quiet {
         crate::output::diagnostic!(
-            "syq: checking the destination's host key without what the approving machine knows about it: this machine's GlobalKnownHostsFile {:?} could be one quoted name or several",
-            connection.global
+            "syq: checking the destination's host key without what the approving machine knows about it: {}",
+            connection.omission_cause()
         );
     }
     // An interrupted copy removes the entry key too; only SIGKILL leaves it.
@@ -1232,7 +1256,21 @@ pub(crate) fn prepare_receiver_ssh_with(
         "-o".to_owned(),
         format!("{}={algorithms}", connection.accepted_algorithms),
     ]);
-    args.receiver_hostname = Some((host, connection.hostname));
+    // A refused key names the approving machine's own name for the host,
+    // when that can be shown as it is.
+    let approving = union.then(|| {
+        let name = approving_name
+            .filter(|name| name.bytes().all(|byte| byte.is_ascii_graphic()))
+            .unwrap_or(&host);
+        (connection.approving_label(), name.to_owned())
+    });
+    args.receiver_host = Some((
+        host,
+        crate::conn::ReceiverHost {
+            hostname: connection.hostname,
+            approving,
+        },
+    ));
     let identity = command
         .iter_mut()
         .find(|argument| *argument == ENTRY_KEY_PLACEHOLDER)
@@ -1491,7 +1529,12 @@ fn run_remote(
             // The coordinator gets the entry key on its input and uses it
             // for every SSH connection to the receiver, so the copy needs
             // nothing more from this machine: no agent is forwarded.
-            receiver_known_hosts = Some(peer_policy.known_hosts_for_others(RECEIVER_HOST_ALIAS)?);
+            receiver_known_hosts = Some(peer_policy.known_hosts_for_others()?);
+            if let Some(left_out) = peer_policy.left_out().filter(|_| !args.quiet) {
+                crate::output::diagnostic!(
+                    "syq: the source checks the destination's host key without some of what this machine knows about it: {left_out}"
+                );
+            }
             constrained_rsh = Some(receiver_rsh(Some(peer_policy.port())));
             restricted_destination_path = Some(prepared.destination);
             restricted_grant = Some(prepared.directive);
@@ -1586,7 +1629,7 @@ fn run_remote(
             diagnostics: Default::default(),
             primed_control: Default::default(),
             forwarded: None,
-            resolved_host: None,
+            receiver_host: None,
             read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         }
     };

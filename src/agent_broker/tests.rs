@@ -200,7 +200,7 @@ fn ambiguous_or_relative_known_hosts_filenames_fail_closed() {
             );
         // Exact-key uses refuse it; reading what the files hold does not.
         let config = parse_ssh_config(output.as_bytes()).unwrap();
-        let reason = config.unsupported.unwrap();
+        let reason = config.unsupported.unwrap().broker_error();
         assert!(
             reason.contains("known_hosts"),
             "unexpected reason for {value:?}: {reason}"
@@ -288,6 +288,7 @@ fn configured_value_identical_to_flattened_defaults_fails_closed() {
     assert!(config
         .unsupported
         .unwrap()
+        .broker_error()
         .contains("ambiguous known_hosts"));
 }
 
@@ -364,6 +365,7 @@ fn openssh_quoted_default_collision_is_rejected_end_to_end() {
     assert!(config
         .unsupported
         .unwrap()
+        .broker_error()
         .contains("ambiguous known_hosts"));
 }
 
@@ -373,7 +375,9 @@ fn unrelated_literal_known_hosts_options_preserve_real_default_lists() {
     let defaults = KnownHostsDefaults::from_openssh(&defaults_output.output).unwrap();
     let temp = crate::test_support::tempdir().unwrap();
     let config = temp.path().join("ssh_config");
-    std::fs::write(&config, b"Host unrelated.example\n  UserKnownHostsFile /tmp/private-known-hosts\n  GlobalKnownHostsFile=/dev/null\n").unwrap();
+    // A literal absolute or `~/` name has no space, so it cannot be read as
+    // the default list, wherever it is set.
+    std::fs::write(&config, b"Host unrelated.example\n  UserKnownHostsFile /tmp/private-known-hosts\n  GlobalKnownHostsFile=/dev/null\nHost work\n  UserKnownHostsFile ~/.ssh/known_hosts_work ~/.ssh/known_hosts_work2\n").unwrap();
     let output = Command::new("ssh")
         .args(["-G", "-vvv", "-F"])
         .arg(&config)
@@ -399,7 +403,8 @@ fn unrelated_literal_known_hosts_options_preserve_real_default_lists() {
     for uncertain in [
         b"UserKnownHostsFile \"/tmp/a /tmp/b\"".as_slice(),
         b"UserKnownHostsFile /tmp/a\\ /tmp/b",
-        b"UserKnownHostsFile ~/.ssh/known_hosts",
+        b"UserKnownHostsFile ~other/.ssh/known_hosts",
+        b"UserKnownHostsFile \"~/.ssh/known hosts\"",
         b"UserKnownHostsFile ${HOME}/.ssh/known_hosts",
         b"UserKnownHostsFile /tmp/%h",
     ] {
@@ -443,6 +448,7 @@ fn dynamic_and_external_revocation_host_policies_fail_closed() {
         assert!(config
             .unsupported
             .unwrap()
+            .broker_error()
             .contains("constrained agent forwarding"));
     }
 }

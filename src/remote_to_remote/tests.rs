@@ -1058,6 +1058,15 @@ fn the_approving_machines_entries_join_without_guessing_file_lists() {
     // The configuration's own command stays.
     let own = format!("{RECEIVER_CONFIG}knownhostscommand /usr/local/bin/hosts %H\n");
     assert_eq!(joined(&own), (ApprovingKeys::Omitted, Vec::new()));
+    // ssh names the command's output by its own label, and a file by its
+    // name; an omission says why.
+    let label = |config: &str| ReceiverConnection::parse(config).unwrap().approving_label();
+    assert_eq!(label(RECEIVER_CONFIG), "KnownHostsCommand-");
+    assert_eq!(label(&own), APPROVING_KNOWN_HOSTS);
+    assert!(ReceiverConnection::parse(&own)
+        .unwrap()
+        .omission_cause()
+        .starts_with("this machine's configuration has a KnownHostsCommand of its own, "));
     let single = own.replace(
         "globalknownhostsfile /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2",
         "globalknownhostsfile /etc/ssh/ssh_known_hosts",
@@ -1086,6 +1095,10 @@ fn the_approving_machines_entries_join_without_guessing_file_lists() {
         "pubkeyacceptedkeytypes ssh-ed25519,rsa-sha2-512",
     );
     assert_eq!(joined(&older), (ApprovingKeys::Omitted, Vec::new()));
+    assert!(ReceiverConnection::parse(&older)
+        .unwrap()
+        .omission_cause()
+        .starts_with("this machine's ssh is older than OpenSSH 8.5, "));
     assert_eq!(
         joined(&older.replace(
             "globalknownhostsfile /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2",
@@ -1224,10 +1237,9 @@ fn receiver_ssh_uses_the_entry_key_first_and_checks_host_keys_as_this_machine_do
     let host_key = host.public_key().to_openssh().unwrap();
     let authority_key = authority.public_key().to_openssh().unwrap();
     // What the approving machine knows: a key and a host certificate
-    // authority, under syq's placeholder name.
-    let known_hosts = format!(
-        "{RECEIVER_HOST_ALIAS} {host_key}\n@cert-authority {RECEIVER_HOST_ALIAS} {authority_key}\n"
-    );
+    // authority, under its own name for the destination.
+    let known_hosts =
+        format!("backup-alias {host_key}\n@cert-authority backup-alias {authority_key}\n");
     let entry =
         ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ed25519)
             .unwrap();
@@ -1296,10 +1308,14 @@ fn receiver_ssh_uses_the_entry_key_first_and_checks_host_keys_as_this_machine_do
         std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
         0o600
     );
-    // The copy's TCP data goes to the host this inspection resolved.
+    // The copy's TCP data goes to the host this inspection resolved, and a
+    // refused key names the approving machine's own name for the host.
+    let (dialed, receiver) = args.receiver_host.take().unwrap();
+    assert_eq!(dialed, "backup");
+    assert_eq!(receiver.hostname, "backup.example.net");
     assert_eq!(
-        args.receiver_hostname,
-        Some(("backup".to_owned(), "backup.example.net".to_owned()))
+        receiver.approving,
+        Some(("KnownHostsCommand-", "backup-alias".to_owned()))
     );
     drop(guard);
     assert!(!approving.exists() && !key.exists());
@@ -1320,6 +1336,7 @@ fn receiver_ssh_uses_the_entry_key_first_and_checks_host_keys_as_this_machine_do
     assert!(!command.iter().any(|argument| {
         argument.starts_with("GlobalKnownHostsFile") || argument.starts_with("KnownHostsCommand")
     }));
+    assert_eq!(args.receiver_host.take().unwrap().1.approving, None);
     drop(guard);
 
     // An approving machine that knows nothing adds nothing.
@@ -1336,6 +1353,19 @@ fn receiver_ssh_uses_the_entry_key_first_and_checks_host_keys_as_this_machine_do
         prepare_receiver_ssh_with(&mut args, "@cert-authority * bad", entry_key.as_bytes())
             .is_err()
     );
+    // A name that cannot be shown as it is gives way to the host dialed.
+    args.rsh = Some(template.clone());
+    let guard = prepare_receiver_ssh_with(
+        &mut args,
+        &format!("backup\u{1b}[2J {host_key}\n"),
+        entry_key.as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        args.receiver_host.take().unwrap().1.approving,
+        Some(("KnownHostsCommand-", "backup".to_owned()))
+    );
+    drop(guard);
     // A command that already checks host keys its own way is refused.
     args.rsh = Some(format!("{template} -o StrictHostKeyChecking=no"));
     assert!(prepare_receiver_ssh_with(&mut args, &known_hosts, entry_key.as_bytes()).is_err());
@@ -1396,10 +1426,7 @@ fn an_interrupted_coordinator_removes_its_entry_key() {
         .unwrap();
         let directory = prepare_receiver_ssh_with(
             &mut args,
-            &format!(
-                "{RECEIVER_HOST_ALIAS} {}\n",
-                host.public_key().to_openssh().unwrap()
-            ),
+            &format!("backup {}\n", host.public_key().to_openssh().unwrap()),
             entry.as_bytes(),
         )
         .unwrap();
@@ -1496,7 +1523,7 @@ fn the_coordinator_reads_the_entry_key_and_directive_from_its_input() {
         );
         args.directive_stdin = Some(directive.len());
         args.receiver_known_hosts = Some(format!(
-            "{RECEIVER_HOST_ALIAS} {}\n",
+            "backup {}\n",
             host.public_key().to_openssh().unwrap()
         ));
         args.rsh = Some(receiver_rsh(Some(2222)));

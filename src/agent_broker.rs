@@ -60,7 +60,7 @@ pub struct HostPolicy {
     revoked: Vec<KeyData>,
     /// Host-key policy the configuration sets that syq does not reproduce,
     /// such as KnownHostsCommand, which only exact-key uses refuse.
-    unsupported: Option<String>,
+    unsupported: Option<Unreproduced>,
     known_hosts_name: String,
     host_key_algorithms: Vec<String>,
     required_rsa_size: usize,
@@ -133,11 +133,13 @@ impl HostPolicy {
         Ok(lines)
     }
 
-    /// What this machine's known_hosts files say about the host, under
-    /// `alias`: its keys, the host certificate authorities they name for it,
-    /// and the keys they revoke. A server that checks the host's key itself
-    /// adds these to what it knows. Empty when this machine knows nothing.
-    pub(crate) fn known_hosts_for_others(&self, alias: &str) -> Result<String> {
+    /// What this machine's known_hosts files say about the host, under the
+    /// name they list it under: its keys, the host certificate authorities
+    /// they name for it, and the keys they revoke. A server that checks the
+    /// host's key itself adds these to what it knows. Empty when this
+    /// machine knows nothing.
+    pub(crate) fn known_hosts_for_others(&self) -> Result<String> {
+        let alias = &self.known_hosts_name;
         let mut lines = String::new();
         for key in &self.listed_keys {
             lines.push_str(&format!(
@@ -159,12 +161,18 @@ impl HostPolicy {
         Ok(lines)
     }
 
+    /// Why what this machine tells another about the host's key leaves part
+    /// of its configuration out, if it does.
+    pub(crate) fn left_out(&self) -> Option<String> {
+        self.unsupported.as_ref().map(Unreproduced::notice)
+    }
+
     /// Refuse a host this machine does not trust through exact plain keys,
     /// which binding agent signatures to the host needs.
     pub(crate) fn require_exact_host_keys(&self) -> Result<()> {
         let host = &self.known_hosts_name;
         if let Some(unsupported) = &self.unsupported {
-            bail!("{unsupported}");
+            bail!("{}", unsupported.broker_error());
         }
         if self.host_keys.is_empty() {
             if !self.authorities.is_empty() {
@@ -604,8 +612,9 @@ fn contains_ambiguous_known_hosts_directive(contents: &[u8], keyword: &[u8]) -> 
             .trim_ascii_start();
         // Do not reproduce SSH quoting, expansion or conditional matching.
         // Conservatively retain ambiguity for every spelling other than a
-        // literal absolute filename list or `none`. In that small subset,
-        // spaces can only separate filenames, never belong to one filename.
+        // list of literal absolute or `~/` filenames, or `none`. In that
+        // small subset, spaces can only separate filenames, never belong to
+        // one filename.
         let mut words = arguments
             .split(|byte| byte.is_ascii_whitespace())
             .filter(|word| !word.is_empty())
@@ -614,9 +623,10 @@ fn contains_ambiguous_known_hosts_directive(contents: &[u8], keyword: &[u8]) -> 
             return true;
         }
         words.any(|word| {
+            let path = word.strip_prefix(b"~").unwrap_or(word);
             word != b"none"
-                && (!word.starts_with(b"/")
-                    || !word
+                && (!path.starts_with(b"/")
+                    || !path
                         .iter()
                         .all(|byte| byte.is_ascii_alphanumeric() || b"/._-+:@,=".contains(byte)))
         })
@@ -632,7 +642,58 @@ struct EffectiveSshConfig {
     files: Vec<PathBuf>,
     host_key_algorithms: Vec<String>,
     required_rsa_size: usize,
-    unsupported: Option<String>,
+    unsupported: Option<Unreproduced>,
+}
+
+/// Host-key configuration that what this machine reads from its known_hosts
+/// files does not reproduce.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Unreproduced {
+    KnownHostsCommand(String),
+    RevokedHostKeys(String),
+    /// A known_hosts value with whitespace, which could be one quoted name
+    /// or several.
+    AmbiguousFiles(String),
+    /// A relative or unexpanded known_hosts path.
+    UnusablePath(String),
+}
+
+impl Unreproduced {
+    /// Why exact-key uses refuse the host.
+    pub(crate) fn broker_error(&self) -> String {
+        match self {
+            Self::KnownHostsCommand(value) => format!(
+                "KnownHostsCommand is configured as {value:?}; constrained agent forwarding cannot safely reproduce dynamic OpenSSH host-key policy"
+            ),
+            Self::RevokedHostKeys(value) => format!(
+                "RevokedHostKeys is configured as {value:?}; constrained agent forwarding does not yet query OpenSSH KRL revocations"
+            ),
+            Self::AmbiguousFiles(value) => format!(
+                "ambiguous known_hosts filenames in `ssh -G` output {value:?}; OpenSSH removes quoting, so constrained agent forwarding accepts only one whitespace-free configured file per directive"
+            ),
+            Self::UnusablePath(value) => {
+                format!("relative or unexpanded known_hosts path {value:?} in `ssh -G` output")
+            }
+        }
+    }
+
+    /// What another machine is not told, for a notice.
+    pub(crate) fn notice(&self) -> String {
+        match self {
+            Self::KnownHostsCommand(value) => {
+                format!("its KnownHostsCommand {value:?} is not run for that")
+            }
+            Self::RevokedHostKeys(value) => {
+                format!("its RevokedHostKeys {value:?} is not read for that")
+            }
+            Self::AmbiguousFiles(value) => {
+                format!("its known_hosts setting {value:?} could be one quoted name or several")
+            }
+            Self::UnusablePath(value) => {
+                format!("its known_hosts path {value:?} is relative or unexpanded")
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -724,14 +785,10 @@ fn parse_ssh_config_with_defaults(
                     Some(value.parse::<usize>().context("invalid RequiredRSASize")?);
             }
             "knownhostscommand" if value != "none" => {
-                unsupported = Some(format!(
-                    "KnownHostsCommand is configured as {value:?}; constrained agent forwarding cannot safely reproduce dynamic OpenSSH host-key policy"
-                ));
+                unsupported = Some(Unreproduced::KnownHostsCommand(value.to_owned()));
             }
             "revokedhostkeys" if value != "none" => {
-                unsupported = Some(format!(
-                    "RevokedHostKeys is configured as {value:?}; constrained agent forwarding does not yet query OpenSSH KRL revocations"
-                ));
+                unsupported = Some(Unreproduced::RevokedHostKeys(value.to_owned()));
             }
             "userknownhostsfile" => {
                 append_known_hosts_files(
@@ -831,7 +888,7 @@ fn append_known_hosts_files(
     value: &str,
     compiled_default: Option<&KnownHostsDefault>,
     configured: bool,
-    unsupported: &mut Option<String>,
+    unsupported: &mut Option<Unreproduced>,
 ) {
     if value == "none" {
         return;
@@ -843,16 +900,12 @@ fn append_known_hosts_files(
         return;
     }
     if value.contains(char::is_whitespace) {
-        unsupported.get_or_insert_with(|| format!(
-            "ambiguous known_hosts filenames in `ssh -G` output {value:?}; OpenSSH removes quoting, so constrained agent forwarding accepts only one whitespace-free configured file per directive"
-        ));
+        unsupported.get_or_insert_with(|| Unreproduced::AmbiguousFiles(value.to_owned()));
         return;
     }
     let path = PathBuf::from(value);
     if value.contains('%') || value.starts_with('~') || !path.is_absolute() {
-        unsupported.get_or_insert_with(|| {
-            format!("relative or unexpanded known_hosts path {value:?} in `ssh -G` output")
-        });
+        unsupported.get_or_insert_with(|| Unreproduced::UnusablePath(value.to_owned()));
         return;
     }
     files.push(path);

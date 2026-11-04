@@ -20,8 +20,9 @@ connects to, not for the name you typed. See
 The authentication broker (`--peer-auth broker`) needs your laptop to trust
 both servers through exact plain host keys in known_hosts:
 host-certificate-only trust, `KnownHostsCommand`, and `RevokedHostKeys` are
-unsupported there, and custom known-hosts paths must be one absolute filename
-per configured user/global directive. The default known-hosts file list works.
+unsupported there, and custom known-hosts paths must be one absolute or `~/`
+filename per configured user/global directive. The default known-hosts file
+list works.
 Syq reports unsupported configurations instead of relaxing host verification.
 
 ## Enrollment

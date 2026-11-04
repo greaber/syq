@@ -1703,10 +1703,20 @@ pub struct RemoteSpec {
     /// for pipelined control lookups.
     pub(crate) read_ahead: usize,
     pub(crate) forwarded: Option<std::sync::Arc<crate::destination::ReturnConnection>>,
-    /// The host the SSH configuration resolves `host` to, when already
-    /// known: an enrolled receiver's connection reads it once while
-    /// preparing its host-key checking.
-    pub(crate) resolved_host: Option<String>,
+    /// An enrolled receiver's connection, as preparing its host-key
+    /// checking found it.
+    pub(crate) receiver_host: Option<std::sync::Arc<ReceiverHost>>,
+}
+
+/// What preparing an enrolled receiver's host-key checking found.
+#[derive(Clone, Debug)]
+pub(crate) struct ReceiverHost {
+    /// The host the SSH configuration resolves the receiver's host to.
+    pub(crate) hostname: String,
+    /// When the approving machine's known_hosts entries joined this
+    /// machine's: how ssh's messages name them, and the name the approving
+    /// machine lists the host under.
+    pub(crate) approving: Option<(&'static str, String)>,
 }
 
 #[derive(Debug, Default)]
@@ -1735,7 +1745,7 @@ impl RemoteSpec {
             diagnostics: Default::default(),
             primed_control: Default::default(),
             forwarded: None,
-            resolved_host: None,
+            receiver_host: None,
             read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         }
     }
@@ -2398,8 +2408,13 @@ impl RemoteSpec {
             command
         };
         let independent_approved = login.is_some();
+        let classify = classify_ssh_failure || independent_approved;
+        let approving = self
+            .receiver_host
+            .as_ref()
+            .and_then(|receiver| receiver.approving.as_ref());
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(
-            if (classify_ssh_failure || independent_approved) && !self.local_process {
+            if (classify || approving.is_some()) && !self.local_process {
                 Stdio::piped()
             } else {
                 Stdio::inherit()
@@ -2424,7 +2439,12 @@ impl RemoteSpec {
                 return Err(error);
             }
         };
-        let ssh_failure = match child.stderr.take().map(ssh_auth::capture).transpose() {
+        let ssh_failure = match child
+            .stderr
+            .take()
+            .map(|stderr| ssh_auth::capture(stderr, approving.map(|(named, _)| *named)))
+            .transpose()
+        {
             Ok(reader) => reader,
             Err(error) => {
                 let _ = child.kill();
@@ -2509,14 +2529,29 @@ impl RemoteSpec {
             // Drain diagnostics before reporting any error, including helper
             // errors. A ProxyCommand descendant may keep stderr open after ssh
             // exits, so bound the wait and leave unclassified failures alone.
-            let failure = ssh_failure.and_then(|failure| {
-                failure
+            let diagnosis = ssh_failure.and_then(|diagnosis| {
+                diagnosis
                     .recv_timeout(std::time::Duration::from_millis(100))
                     .ok()
                     .flatten()
             });
-            if let Some(ssh_error) = error.downcast_mut::<SshConnectError>() {
-                ssh_error.failure = failure;
+            if let (Some((_, name)), Some(diagnosis)) = (approving, &diagnosis) {
+                // ssh names the approving machine's entries with a label no
+                // file here has, and suggests fixing this machine's files.
+                if diagnosis.failure == Some(ssh_auth::Failure::HostKey) && diagnosis.names_marker
+                {
+                    crate::output::diagnostic!(
+                        "syq: the approving machine's known_hosts lists a different key for {}; if that key is out of date, remove it there with `ssh-keygen -R {}`",
+                        self.host,
+                        shell_words::quote(name)
+                    );
+                }
+            }
+            if let Some(ssh_error) = error
+                .downcast_mut::<SshConnectError>()
+                .filter(|_| classify)
+            {
+                ssh_error.failure = diagnosis.and_then(|diagnosis| diagnosis.failure);
             }
             if independent_approved && is_ssh_authorization_fallback_error(&error) {
                 // Authentication/policy refusal cannot improve on retry. In
@@ -2836,8 +2871,8 @@ impl RemoteSpec {
         {
             return Some(host.to_owned());
         }
-        if let Some(host) = &self.resolved_host {
-            return Some(host.clone());
+        if let Some(receiver) = &self.receiver_host {
+            return Some(receiver.hostname.clone());
         }
         if !self.rsh[0].ends_with("ssh") {
             return Some(self.host.clone());

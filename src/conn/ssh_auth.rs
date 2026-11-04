@@ -22,7 +22,19 @@ impl Failure {
     }
 }
 
-pub(super) fn capture(mut stderr: ChildStderr) -> std::io::Result<Receiver<Option<Failure>>> {
+/// What a finished connection's SSH diagnostics showed.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Diagnosis {
+    pub(super) failure: Option<Failure>,
+    /// Whether they mention the text `capture` was given.
+    pub(super) names_marker: bool,
+}
+
+/// Pass `stderr` through live and report what it showed once it closes.
+pub(super) fn capture(
+    mut stderr: ChildStderr,
+    marker: Option<&'static str>,
+) -> std::io::Result<Receiver<Option<Diagnosis>>> {
     let (send, receive) = mpsc::sync_channel(1);
     std::thread::Builder::new().spawn(move || {
         // Keep diagnostics live, including partial lines, with bounded storage.
@@ -47,7 +59,12 @@ pub(super) fn capture(mut stderr: ChildStderr) -> std::io::Result<Receiver<Optio
                 }
             }
         }
-        let _ = send.send(classify(&tail));
+        let names_marker =
+            marker.is_some_and(|marker| String::from_utf8_lossy(&tail).contains(marker));
+        let _ = send.send(Some(Diagnosis {
+            failure: classify(&tail),
+            names_marker,
+        }));
     })?;
     Ok(receive)
 }
@@ -145,5 +162,35 @@ mod tests {
         ] {
             assert_eq!(classify(diagnostic.as_bytes()), None, "{diagnostic}");
         }
+    }
+
+    #[test]
+    fn capture_reports_whether_the_diagnostics_name_a_marker() {
+        let diagnose = |marker| {
+            let mut child = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    "echo 'Offending ED25519 key in KnownHostsCommand-HOSTNAME:1' >&2; echo 'Host key verification failed.' >&2",
+                ])
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let diagnosis = capture(child.stderr.take().unwrap(), marker)
+                .unwrap()
+                .recv()
+                .unwrap()
+                .unwrap();
+            child.wait().unwrap();
+            (diagnosis.failure, diagnosis.names_marker)
+        };
+        assert_eq!(
+            diagnose(Some("KnownHostsCommand-")),
+            (Some(Failure::HostKey), true)
+        );
+        assert_eq!(
+            diagnose(Some("known-to-the-machine-that-approved-this-copy")),
+            (Some(Failure::HostKey), false)
+        );
+        assert_eq!(diagnose(None), (Some(Failure::HostKey), false));
     }
 }

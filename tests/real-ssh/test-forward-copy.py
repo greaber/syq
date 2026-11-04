@@ -792,6 +792,26 @@ try:
     assert "/.ssh/known_hosts" in stderr, stderr
     print("a key that contradicts the server's own was refused", flush=True)
 
+    # A key only the runner knows that contradicts the one presented:
+    # refused, and the copy says to fix the runner's known_hosts, since
+    # OpenSSH names the runner's entries by a label no file has.
+    run("ssh", "source", "ssh-keygen -R destination >/dev/null 2>&1 || true")
+    wrong = run("ssh", "source", "cut -d' ' -f1,2 /tmp/syq-real-ssh-wrong-key.pub").strip()
+    run("ssh-keygen", "-R", "destination", "-f", str(known_hosts))
+    with known_hosts.open("a") as hosts:
+        hosts.write(f"destination {wrong}\n")
+    changed = source_copy()
+    pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
+    assert len(pending) == 1, pending
+    run("syq", "persist", "receive", "approve", pending[0]["id"])
+    _, stderr = changed.communicate(timeout=90)
+    assert changed.returncode not in (0, 124), stderr
+    assert "Host key verification failed" in stderr, stderr
+    assert ("the approving machine's known_hosts lists a different key for destination; "
+            "if that key is out of date, remove it there with `ssh-keygen -R destination`") in stderr, stderr
+    assert not source_knows("destination")
+    print("a key only the runner knows that contradicts the one presented was refused", flush=True)
+
     # What either machine knows is accepted: the runner's key for the
     # destination wins over the server's stale one, and over its strict
     # setting for a host it does not know, without recording anything there.
@@ -935,7 +955,7 @@ try:
         "  KnownHostsCommand /usr/bin/env cat /tmp/syq-real-ssh-khc/hosts\n",
         approved_source_copy)
     assert status == 0, stderr
-    assert WITHOUT in stderr, stderr
+    assert f"{WITHOUT}: this machine's configuration has a KnownHostsCommand of its own" in stderr, stderr
     print("the source's own KnownHostsCommand decided", flush=True)
     # The same, with the source's command knowing nothing: only the runner
     # knows the destination, and its entries are left out, so the copy is
@@ -949,4 +969,18 @@ try:
 finally:
     restore_source_known_hosts(saved_source)
     run("ssh", "source", "rm -rf /tmp/syq-real-ssh-khc")
+
+print("case: the runner says what of its own host-key checking the server cannot use", flush=True)
+# The runner's own KnownHostsCommand is not run for the source; the source
+# still checks the destination with what it and the runner's files know.
+runner_config = Path.home() / ".ssh/config"
+original_config = runner_config.read_bytes()
+try:
+    runner_config.write_bytes(b"Host destination\n  KnownHostsCommand /bin/true\n\n" + original_config)
+    status, stderr = approved_source_copy()
+finally:
+    runner_config.write_bytes(original_config)
+assert status == 0, stderr
+assert ("without some of what the approving machine knows about it: "
+        'its KnownHostsCommand "/bin/true" is not run for that') in stderr, stderr
 print("source-shell remote copy checks passed", flush=True)
