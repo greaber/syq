@@ -70,9 +70,11 @@ objects.
   ownership, and symlink target with the object. Downloads restore symlinks
   and modification times, using S3 Last-Modified when an object has no stored
   time; add `--copy-metadata=permissions,ownership` to restore permissions and
-  ownership too. Updating the metadata of an existing object rewrites it within
-  S3, as described under [Copies between S3 buckets](#copies-between-s3-buckets).
-  Special files are unsupported.
+  ownership too. When contents already match, the destination keeps its
+  metadata unless `--copy-metadata` selects attributes to update, such as
+  `mtime`; updating an object's metadata rewrites it within S3, as described
+  under [Copies between S3 buckets](#copies-between-s3-buckets). Special files
+  are unsupported.
 - **Updates:** `--if-exists=keep`, `--into-new`, and `--as-new` protect
   individual objects against concurrent creation, as reliably as your storage
   service's consistency guarantees allow. Prefix checks are not transactional.
