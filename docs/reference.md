@@ -78,11 +78,8 @@ syq cp --from server project     # fetch project into your current directory
 
 SSH endpoints use `[USER@]HOST[:PORT]`, for example `alice@server:2222`.
 Enclose IPv6 addresses in brackets: `alice@[2001:db8::1]:2222`.
-A colon in a native path is simply part of the path.
-
-For TCP data connections, syq can try other addresses advertised by the same
-receiver if the initial address is unreachable. See
-[TCP access](server-tuning.md#make-tcp-reachable) if copies fall back to SSH.
+A colon in a native path is simply part of the path. If copies fall back to
+SSH when you expect TCP, see [TCP access](server-tuning.md#make-tcp-reachable).
 
 Use `--to @NAME` to send local source files to a registered receiving machine.
 The `@` is required: `--to laptop` selects an SSH destination, while
@@ -98,9 +95,8 @@ For two SSH endpoints, see [Copy between servers](remote-to-remote.md).
 ### Transport compression
 
 Remote filesystem copies compress data in transit by default, adjusting
-compression to the observed transfer speed. Blocks that do not shrink enough
-are sent uncompressed. Use `--no-compress` to disable transport compression,
-for example when comparing its effect on CPU use and copy speed.
+compression to the transfer speed. Use `--no-compress` to turn it off, for
+example to compare its effect on CPU use and copy speed.
 
 <a id="output-and-diagnostics"></a>
 <a id="performance-and-time-limits"></a>
@@ -108,23 +104,16 @@ for example when comparing its effect on CPU use and copy speed.
 ## Progress
 
 Syq shows a progress bar in a terminal, with elapsed time, speed, and an
-estimated finish time. When syq reads and writes a large local file itself,
-progress advances as it goes; when the filesystem clones the file or copies it
-internally, progress jumps when that finishes. The final summary reports
-copied and skipped files and any errors. For filesystem copies, elapsed time and average speed measure selected
-file work, including reads, hashing, writes, per-file metadata, waits, and retries.
-They exclude setup before file work and finalization after it.
+estimated finish time. Use `--progress` to show it when output is redirected,
+or `--no-progress` to hide it. Elapsed time and speed cover the file work
+itself, not setup before it or finalization after it.
 
-Interactive copies also show a compact timing line: setup, planning, transfer,
-finalization, and total. Helper installation appears separately when needed;
-total includes it. `--stats` and `--progress` also show this line when output is
-redirected. The [automation reference](automation.md#result) defines the
-measurements and their machine-readable `timings` fields. Add `-v` to list
-copied paths.
-
-Use `--progress` to show the bar when output is redirected, or `--no-progress`
-to hide it. For connection details and ways to investigate performance, see
-[Speed](speed.md).
+The final summary reports copied and skipped files and any errors; add `-v` to
+list copied paths. Interactive copies also print a timing line with setup,
+planning, transfer, finalization, any helper installation, and the total;
+`--stats` and `--progress` print it when output is redirected. The
+[automation reference](automation.md#result) defines these measurements. For
+connection details and ways to investigate performance, see [Speed](speed.md).
 
 ## Choose a destination
 
@@ -150,12 +139,10 @@ Syq refuses to replace a directory with a file, or a file with a directory.
 See [filename and type conflicts](commands/cp.md#filename-and-type-conflicts)
 when copying between filesystems with different naming rules.
 
-An rclone mount works as a source in any mode, but to be a destination it
-needs rclone's `--vfs-cache-mode writes` or `full`. In rclone's default mode a
-file can only be written once, from start to end, and
-[rclone's documentation](https://rclone.org/commands/rclone_mount/#vfs-file-caching)
-says most applications need write caching; most syq copies and updates fail
-there.
+An rclone mount works as a source, but as a destination it needs rclone's
+`--vfs-cache-mode writes` or `full`. In rclone's default mode a file can only
+be written once, from start to end, so most syq copies and updates fail there;
+see [rclone's file caching](https://rclone.org/commands/rclone_mount/#vfs-file-caching).
 
 ## Choose which existing files to update
 
@@ -170,48 +157,25 @@ differ. Existing directories remain containers. Choose another policy with `--if
 | `update` (default) | Update differing contents and apply requested metadata |
 | `update-if-older` | Keep newer destinations; otherwise update differing contents |
 
-Comparison is independent of this policy: matching size and modification time
-can establish equality; `--hash` requests content comparison. If
-`error-if-different` cannot establish equality from metadata, local/SSH copies and S3
-uploads/downloads compare contents before accepting an existing regular file.
-Bucket-to-bucket copies require matching object metadata or identifiers; see
-[S3 copies](object-storage.md#copies-between-s3-buckets). Explicit metadata requests apply after
-contents are accepted unchanged. A content conflict leaves that file's metadata
-alone too. `--as-new` and `--into-new` apply only to the destination you name;
-`--if-exists` applies to each entry the copy places.
+How syq compares files is separate from the policy: matching size and
+modification time count as equal unless you add `--hash`. When
+`error-if-different` cannot establish equality from size and time, it compares
+contents before accepting a file; bucket-to-bucket copies instead require
+matching object metadata or identifiers (see
+[S3 copies](object-storage.md#copies-between-s3-buckets)). Requested metadata
+is applied only after the contents are accepted, so a content conflict leaves
+that file's metadata alone. `--as-new` and `--into-new` apply only to the
+destination you name; `--if-exists` applies to each entry the copy places.
 
-With `error`, `error-if-different` and `--as-new`, syq publishes a new file at a
-name only while the name is still free: if a file appears there first, syq keeps
-it and reports that file's copy as failed. Likewise, `--into-new` creates its
-directory only while the name is free: if one appears there first, the copy
-stops without writing into it. On filesystems with neither an atomic
-no-replace rename nor hard links, such as FAT and exFAT on macOS and rclone
-mounts, syq checks that a file's name is free and then renames, so a file
-another program creates there in the instant between the two can be replaced.
-
-With `keep` (and `syq rsync --ignore-existing`), a file that appears in a
-destination directory before syq puts its own there is kept, and syq skips it
-with a note, as it skips one it found at the start. On filesystems that can't
-rename without replacing, syq renames its file into place with no check, so a
-file another program creates there in the moment before is replaced; rsync
-doesn't guard against that either. A restricted receiver, the receiving side
-of a copy that a [receiving machine](receive.md) approves or of a
-[restricted copy between servers](remote-reference.md#enrollment), does the
-same only where it found the name free itself while planning the copy, by
-looking it up or because the directory it goes into was missing or empty or was created
-by the receiver, and only once; it never replaces a file it found there,
-whatever the sender asks. At any other name it links its file into place,
-which keeps a file that appears there first. It notes at most about 3.7
-million names in one copy and links any name it couldn't note. In an S3
-bucket, an object that appears under `keep` is kept, but that file's copy is
-reported as failed (`S3 PUT failed`).
-
-With `syq rsync --existing`, syq replaces only the files its scan found, by
-renaming its file over whatever the name holds by then: a file another
-program replaces or removes in the meantime is replaced, or created again.
-rsync behaves the same way. A restricted receiver replaces only files it
-found there itself, while planning the copy or with a look of its own just
-before, whatever the sender says.
+`error`, `error-if-different` and `--as-new` also refuse a file another
+program creates at the name during the copy: syq keeps that file and reports
+its copy as failed. `keep` keeps it too and skips it, though in an S3 bucket
+that file's copy is reported as failed. `--into-new` stops without writing into
+a directory that appears first. `update` and `update-if-older` replace the
+file. A file created in the last moment before syq renames its own into place
+can still be replaced under `keep` on filesystems without an atomic no-replace
+rename, such as NFS, and under `keep`, the error policies and `--as-new` on FAT
+and exFAT on macOS and on rclone mounts.
 
 See [Update policies](commands/cp.md#update-policies) for supported combinations.
 
@@ -226,23 +190,17 @@ files selected for copying in `syq cp`.
 | `aligned-block` | Compare each replaced file with the destination file and reuse matching blocks at the same offsets; shifted blocks and blocks from other files are not matched |
 | `locality` (default) | Use `whole-file` for local copies and `aligned-block` when a syq endpoint is remote |
 
-When a syq endpoint is remote, `locality` compares every replaced file, as
-rsync does by default, and sends only the blocks that differ. Comparing costs
-about a read of the old file on the destination. A file that grew keeps the
-blocks before its new data; unlike rsync, only blocks at the same offsets
-match. `locality` treats paths on mounted network filesystems as local. It
-chooses by endpoint location, without measuring link or filesystem speed. To
-choose explicitly:
+With a remote syq endpoint, `locality` compares every file it replaces, as
+rsync does by default, and sends only the blocks that differ; comparing costs
+about a read of the old file on the destination. Unlike rsync, only blocks at
+the same offsets match, so data appended to a file is cheap to send but data
+inserted near its start is not. `locality` treats mounted network filesystems
+as local. To choose explicitly:
 
 ```sh
 syq cp --srcs-in source --to server --into destination \
   --transfer-strategy whole-file
 ```
-
-All strategies keep size/time skips, explicit `--hash` comparisons, integrity
-checks, and partial-file resume. Changed files are always replaced atomically.
-The strategy does not fix worker counts or request sizes; automatic tuning
-remains enabled.
 
 `syq rsync` uses rsync's spellings: `-W` / `--whole-file` selects whole-file
 copying; `--no-W` / `--no-whole-file` selects aligned-block reuse. If both are
@@ -347,44 +305,30 @@ Ignored paths are also protected from pruning.
 
 ## Resume an interrupted copy
 
-Rerunning a copy can reuse completed files and matching parts of interrupted
-files. Placement conditions and `--if-exists` apply on every run. A `-new`
-placement or `--if-exists=error` can therefore prevent a retry once entries have
-been created. With `--if-exists=error-if-different`, a retry rejects a differing
-final file: it cannot distinguish incomplete output from a pre-existing file
-that must remain untouched. Changing to `--if-exists=update` authorizes updates
-to all differing selected files; it does not preserve the original policy.
+Rerunning a copy reuses completed files and matching parts of interrupted
+files. Placement conditions and `--if-exists` apply on every run, so a `-new`
+placement or `--if-exists=error` can prevent a retry once entries have been
+created. With `--if-exists=error-if-different`, a retry rejects a differing
+final file, because it cannot tell incomplete output from a file that must
+remain untouched. Changing to `--if-exists=update` allows updates to all
+differing selected files.
 
-Syq assembles each updated file beside the destination and replaces it when
-complete. Resuming from that partial file does not depend on
-[`--transfer-strategy`](#choose-a-transfer-strategy), which controls
-comparison against an existing final destination. With `--in-place=new`, a new
-file's interrupted bytes are in the final file itself, and with
-`--in-place=update` an existing file's too; a rerun reuses them only as the
-transfer strategy allows.
+A directory the interrupted copy created may still have temporary permissions,
+and a retry treats it as an existing directory, so its permissions and
+modification time can differ from an uninterrupted copy's.
+`--copy-metadata=permissions,mtime` makes them match the source.
 
-A copy may temporarily make a newly created directory writable while filling it,
-or keep it open only to its owner until its copied ACL is applied. After
-interruption, syq cannot distinguish that directory from a pre-existing
-directory. A retry treats it as an existing container, so its permissions and
-modification time may differ from an uninterrupted copy. Explicit
-`--copy-metadata=permissions,mtime` makes those attributes match the source.
+If you interrupt a copy with Ctrl-C or SIGTERM, or its connection to a remote
+syq is lost, the receiving side removes its temporary files but keeps larger
+partial files for a later copy to resume from. A copy within one machine that
+copies files whole cannot reuse them, so it removes them. With `--in-place`,
+the interrupted bytes are in the final file itself, and a rerun reuses them
+only as the [transfer strategy](#choose-a-transfer-strategy) allows.
 
-If you interrupt a copy with Ctrl-C or stop it with SIGTERM, or its
-connection to a remote syq is lost, the receiving side removes the temporary
-files it created before it exits, taking at most half a second. It keeps
-partial files of 1 MiB or more for a later copy to resume from. Syq creates a
-partial file at the file's full size, so one is kept even when little was
-written to it. Remote copies, and copies with a bandwidth cap or
-`--performance-tuning copy-path=ranges`, reuse matching data from them. A copy
-within one machine that copies files whole does not, so it removes those
-files' partial files when interrupted; rerunning it copies the files whole again.
-
-Partial files may remain after a successful retry, as can temporary files
-left by a copy that was killed. A copy reads the partial files an earlier copy
-left, but does not remove them, since another copy may still be writing one;
-when it finds some, it says how many files had them and how to remove them.
-To remove them:
+Partial files may remain after a successful retry, and a copy that was killed
+can leave temporary files. Syq does not remove them during a copy, since
+another copy may still be writing one, but says how many files had them. To
+remove them:
 
 ```sh
 syq clean-partials --dry-run -v backup
@@ -396,12 +340,8 @@ recovery entries that need inspection before removal.
 
 ## Check file contents
 
-Syq normally skips files whose size and modification time match. FAT keeps
-modification times in two-second steps, so when syq copies into a directory on
-FAT, times less than two seconds apart count as matching, as rsync's
-`--modify-window=1` would make them (not when it updates one named file, copies
-with `--existing`, or copies to a restricted receiver). Use `--hash` to compare
-contents instead; a file whose contents already match is left alone:
+Syq normally skips files whose size and modification time match. Use `--hash`
+to compare contents instead; a file whose contents already match is left alone:
 
 ```sh
 syq cp --hash --srcs-in project --into backup
@@ -413,9 +353,14 @@ compare and copies the rest whole, so files that already match may be
 rewritten. With the default strategy, that means comparing every file when a
 syq endpoint is remote, and copying every file on the same machine.
 
+FAT keeps modification times in two-second steps, so when syq copies into a
+directory on FAT, times less than two seconds apart count as matching, as
+rsync's `--modify-window=1` would make them. This does not apply when syq
+updates one named file, copies with `--existing`, or copies to a restricted
+receiver.
+
 Use [per-file expected hashes in mappings](integrity-checking.md#expected-hashes)
 to require known contents, including when reusing destination bytes.
-
 Use [`--dry-run --hash`](#preview-changes) to compare without copying.
 
 The [Integrity checking reference](integrity-checking.md) covers timestamp
@@ -427,25 +372,19 @@ writers or copy a snapshot.
 
 By default, syq builds each file beside its final name and renames it into
 place when complete. `--in-place=new` writes the files the copy creates
-directly at their final names instead:
+directly at their final names instead, which saves a temporary name and a
+rename for each new file:
 
 ```sh
 syq cp --in-place=new large-file --to server --into /backup
 ```
 
-This avoids a temporary name and a rename for each new file. Readers can see
-a new file before it is complete, and an interruption leaves it incomplete
-at its final name; a rerun finishes it. Once the file has its final metadata,
-syq checks that the name still leads to the file it created, on filesystems
-whose link counts it trusts ([Copy metadata](#copy-metadata) lists those it
-does not), and reports the file as failed if it does not.
+Readers can see a new file before it is complete, and an interruption leaves
+it incomplete at its final name until a rerun finishes it. Existing files are
+still replaced as without the option, which needs write permission on their
+directory and room for a second copy.
 
-With `--in-place=new`, an existing file is still replaced as without the
-option: syq builds the new version beside it and renames it over the name.
-Replacing a file needs write permission on its directory and room for a
-second copy.
-
-`--in-place=update` also writes into an existing file where it is, and only
+`--in-place=update` also writes into existing files where they are, and only
 the parts that changed, so a small change to a large file needs no second
 copy (`syq rsync --inplace` does the same):
 
@@ -460,164 +399,45 @@ This has two risks:
 - An interruption leaves the file partly updated, a mixture of old and new
   contents, until a rerun finishes it.
 
-Updating in place also assumes that nothing else writes to the file during the
-copy.
+It also assumes that nothing else writes to the file during the copy.
 
-Syq updates a file in place only when it has no other names, on a filesystem
-whose link counts syq trusts (see [Copy metadata](#copy-metadata)), and
-belongs to the account syq runs as, as the files syq creates there show. Run
-as root, syq needs the file to already have the owner and group the copy
-gives it: without `--copy-metadata=ownership`, those of a file root creates
-there, so another user's file is replaced. The file must have no
-set-user-ID or set-group-ID bit or file capability, the copy must add none
-and set or remove no `security.*` or `trusted.*` attribute, and nobody may
-be able to open the file whom its final permissions would keep out: its
-permission bits must be among the final ones, its group the final one or
-unable to read or write it, and its ACL the one it ends with. That is the ACL
-the copy gives it when it copies ACLs, and otherwise the one a new file there
-would get from its folder's default ACL, or none. On macOS, without ACL
-copying, a file with an ACL, or in a folder that passes ACL entries on to new
-files, is always replaced. Syq replaces any other existing file. The summary,
-and `replaced_not_in_place` in [`--results`](automation.md), say how many
-files it replaced and why. A dry run's counts are estimates: it cannot see
-everything the copy checks, such as file capabilities, ACLs it does not copy,
-or files in use as programs.
+Syq updates a file in place only when that can't give anyone access the copy
+would not, and replaces any other existing file, for example one with other
+names or another owner, or any file on a filesystem
+[where syq can't tell it has no other names](#how-syq-changes-existing-files-and-directories).
+The summary, and `replaced_not_in_place` in
+[`--results`](automation.md#result), say how many it replaced and why; a dry
+run's counts are estimates.
 
-New files written in place keep owner-write permission until the copy
-succeeds and applies their final permissions. When the copy gives them a
-different group than they start with, or sets their ACL, they are open only to
-their owner until then. On macOS, a copy that sets the group but not the ACL
-leaves new files with the ACL entries they inherit from their directory, as
-those are part of their final permissions. An interrupted copy can leave a file
-owner-only, and a rerun keeps that mode unless it also copies permissions.
-See [Update policies](commands/cp.md#update-policies) before combining
-in-place writes with other copy policies.
+Files written in place keep owner-write permission, and some stay open only to
+their owner, until the copy succeeds and applies their final permissions. An
+interrupted copy can leave them that way, and a rerun keeps that mode unless it
+also copies permissions. See [Update policies](commands/cp.md#update-policies)
+before combining in-place writes with other copy policies.
 
 <a id="preserve-metadata"></a>
 
 ## Copy metadata
 
 Creating a named file or updating its contents sets its modification time to
-the source time. Accepting unchanged contents leaves destination metadata alone.
-Use `--copy-metadata=mtime` to make modification times match even on unchanged
-files. If identical files have different modification times, accepting them can
-require reading their full contents again on each run, including downloading an
-S3 object when no usable stored hash is available. Copying `mtime` lets later
-runs use the size/time comparison. Other metadata can be selected the same way, for example
-`--copy-metadata=permissions,ownership`. `times` is an alias for `mtime`.
-Explicit mapping `metadata.mtime` also sets the requested destination time.
-Syq sets symlink modification times only on filesystems where it knows the call
-sets the link itself, such as ext4, XFS, btrfs, ZFS, NFS and APFS. Elsewhere it
-leaves them alone: on SSHFS, for example, the call would change the file the link
-points to instead. Reruns then ignore those symlinks' times, except when syq
-updates one named file, copies with `--existing`, or copies to a restricted
-receiver: those copies report such symlinks as changed on every rerun.
-S3-to-S3 copies also support [content headers, user metadata, tags, and storage
+the source time. Accepting unchanged contents leaves destination metadata
+alone. Use `--copy-metadata=mtime` (or its alias `times`) to make modification
+times match on unchanged files too. Otherwise identical files with different
+times may have their contents read again on every run, including downloading
+an S3 object that has no usable stored hash. A mapping's explicit
+`metadata.mtime` also sets the destination time. S3-to-S3 copies also support
+[content headers, user metadata, tags, and storage
 class](object-storage.md#copies-between-s3-buckets).
 
-When only an existing file's metadata differs, syq changes it in place if the
-file has no other names, the filesystem's link counts can be trusted, and the
-change adds no set-user-ID or set-group-ID bit and sets or removes no
-`security.*` or `trusted.*` attribute. Run as another account, syq also needs
-the file to belong to it, as the files it creates there show (on NFS that
-squashes users, that is not the account itself). Off the local filesystems that show owners
-faithfully (ext4, XFS, btrfs, ZFS, tmpfs, overlayfs, f2fs, APFS and HFS+),
-syq learns that owner from a file it creates; where it has created none yet,
-it creates and removes one, which leaves that directory's modification time
-changed. A dry run creates nothing and assumes the account itself. Run as
-root, it changes in place what the file's owner could change, such as its
-permissions, times, ordinary extended attributes and ACLs, and replaces the
-file to give it another owner or group.
-Otherwise it replaces the file as if its contents had changed.
-Access times, which `atimes` restores, are set in place on any file. A
-replaced file gets a new inode number, needs write permission on its directory
-and room for a second copy, and does not keep attributes the copy does not
-select, such as ACLs or extended attributes without `acls` or `xattrs`. Syq
-does not trust link counts on SMB, SSHFS and other FUSE filesystems, NFS
-mounted with `nocto`, CephFS mounted with `ino32`, or filesystems it does not
-recognize, nor on macOS anywhere but APFS and HFS+, so its NFS, SMB, FAT and
-exFAT volumes count as untrusted too. There a metadata-only change rewrites
-every affected file, which takes as long as copying it. A dry run counts such
-files as rewritten. Narrowing permissions in place does not cut off a process
-that already has the file open. A symlink, device or named pipe whose metadata
-differs is created again with it and replaces the old one.
-
-Existing files and directories keep their destination permissions unless you
-request permission or ACL metadata; the requested final permissions still
-apply. When a directory you own lacks the write or search permission a change
-needs, `--widen-dirs` (`--syq-widen-dirs` for `syq rsync`) decides whether syq
-briefly adds the owner permission it lacks: search to pass through it, write
-to change its entries, and read to list it.
-
-- `none`, the `syq cp` default, never does. Syq names the directory once (a dry
-  run lists it too), and the changes in it fail.
-- `rsync`, the `syq rsync` default, widens the directories the copy includes, as
-  rsync does: the destination of a contents copy, an existing `--as`
-  directory, and the directories beneath them that the copy fills or prunes,
-  also with `--if-exists=keep`. It does not widen the directory a named source
-  or an `--as` target goes into, or enter destination-only directories it
-  cannot read.
-- `all` also widens the directory the copy goes into and the directories above
-  it, including the one where syq creates missing parents, and enters unreadable
-  destination-only directories to prune them.
-
-Under `none` and `rsync`, both commands refuse, as rsync does, a destination
-they cannot search: the `--into` directory, an existing `--as` directory, or
-the directory another `--as` target goes into. A change that fails in a
-directory you own suggests the mode that would have made it. Syq restores each directory's exact mode after copying and pruning,
-also when the copy fails, unless you request permissions. Other processes can
-see the temporary permissions, and a crash or forced termination can leave
-them in place. Root skips widening. A restricted receiver widens only as the approved
-mode allows, never above the directory that holds the `--into` directory or
-the `--as` target (on a receiving machine started with `--root`, the
-directory that holds its root), and its approval
-prompt says when a copy can open folders you own to read or change them:
-adding read shows the sender the names inside.
-
-Dry runs never change permissions. A dry run reports a directory you own but
-cannot search as not inspected, and exits with status 23.
-
 New files use the source read, write, and execute permissions, limited by the
-umask, or by the directory's default ACL if it has one.
-For example, a new script with mode `755` stays executable with umask `022`.
-
-To preserve source permissions and ownership as well:
+umask, or by the directory's default ACL if it has one. For example, a new
+script with mode `755` stays executable with umask `022`. Existing files and
+directories keep their destination permissions unless you request permission
+or ACL metadata. To preserve source permissions and ownership as well:
 
 ```sh
 syq cp --copy-metadata=permissions,ownership project --into backup
 ```
-
-A directory receives its copied permissions and ACLs after its contents: a
-read-only directory could not take them, and adding entries changes its
-modification time anyway. Until then, syq limits who can enter or list it:
-
-- A new directory starts with the source's permissions and owner access,
-  limited as a new file's are. `syq rsync` removes that owner access after the
-  contents if the source lacks it, as rsync does.
-  With `--copy-metadata=ownership`, it takes its copied owner and group before
-  syq copies files into it. If it could start out with another group, it is
-  open only to its owner until then.
-- A new directory whose ACL is still to be copied is open only to its owner.
-- When permissions or ownership are copied, the destination of `src/` or
-  `--srcs-in` is open only to its owner until it has its copied permissions,
-  owner and group, which it gets before syq copies files into it.
-- With `--copy-metadata=permissions`, an existing directory that allows more
-  than its source is restricted to the source's permissions before syq
-  creates anything in it; its owner keeps access until the copy finishes.
-  With `--copy-metadata=ownership`, it also takes its copied owner and group
-  then.
-- An S3 download creates a directory that has a directory marker open only to
-  its owner until the marker's metadata is applied.
-
-Some directories get their copied metadata only at the end, or are already
-open:
-
-- Anyone who opened an existing directory before syq restricted it can keep
-  listing the names syq creates in it.
-- With `--copy-metadata=acls` on macOS, a new directory keeps the entries it
-  inherits from its parent's ACL until its own ACL is copied.
-- In an S3 download with `--copy-metadata=permissions`, an existing directory
-  is restricted to its marker's permissions only at the end.
 
 | Syq option | Corresponding rsync option |
 |---|---|
@@ -632,37 +452,17 @@ open:
 
 Setting ownership requires suitable destination permissions. See the
 [rsync option definitions](https://download.samba.org/pub/rsync/rsync.1#opt--perms)
-and [metadata details](commands/cp.md#metadata-details).
+and [metadata details](commands/cp.md#metadata-details). Neither
+`syq rsync -a` nor the `syq cp` defaults select hard links, ACLs, xattrs,
+access times, or birth times. Descriptors, stream mappings, and S3 reject
+these; descriptor copies of regular files support only `mtime`,
+`permissions`, and `ownership`. None of these options preserves filesystem
+flags such as immutable or append-only, restores ctime or inode numbers, or
+creates rsync `--fake-super` backup records.
 
-With `--copy-metadata=hardlinks`, selected names for the same source regular file
-share one destination inode. This works for local and SSH filesystem copies,
-including updates, reruns, and `--in-place`. Only names eligible under the
-overwrite policy join the group; links outside the selected sources are not
-reconstructed. Existing extra destination links are not necessarily split.
-Syq gives new names only to an existing destination file that belongs to the
-account syq runs as, as the files it creates there show; it replaces any
-other. Run as root, syq gives them to a file that already has the owner and
-group a new copy of it would get. A group whose metadata changes is replaced and its names
-linked to the new file, since its file has other names.
+### Hard links, ACLs, and extended attributes
 
-Hardlink preservation scans all selected sources before changing the destination.
-Large trees therefore take longer to start copying and require memory for the
-complete file list.
-
-A group transfers one payload. Creating another name is reported as a successful
-file operation with zero transferred bytes. Conflicting per-path metadata fails
-the copy. Every supplied expected hash must match the shared contents: omitted
-hashes impose no requirement, identical hashes are checked once, and different
-algorithms are checked together in one read. Different values for the same
-algorithm are rejected before copying the group. Hardlinks across destination
-filesystems fail visibly. On a filesystem without hard links, such as FAT,
-exFAT or an rclone mount, syq copies one name of each group and reports each
-other name as failed, with the missing hard links as the reason.
-Hardlink preservation rejects a copy whose sources include a symlink or
-special file with several names, and descriptors, streams, and S3 reject it.
-`syq rsync -a` does not include `-H`; add it explicitly.
-
-Add ACLs and xattrs for filesystem archival copies on Linux or macOS:
+Add hard links, ACLs and xattrs for archival copies on Linux or macOS:
 
 ```sh
 syq cp --copy-metadata=permissions,ownership,specials,hardlinks,acls,xattrs --srcs-in source --into backup
@@ -670,99 +470,113 @@ syq cp --copy-metadata=permissions,ownership,specials,hardlinks,acls,xattrs --sr
 syq rsync -aHAX --numeric-ids source/ backup/
 ```
 
-On Linux, ACL preservation copies POSIX access ACLs and directory default ACLs using
-numeric IDs. It also preserves permissions. It removes destination named ACL
-entries or default ACLs absent from the source, including on unchanged files.
-A mapping's explicit mode changes the access ACL's owner, mask (or group), and
-other permissions as `chmod` does. POSIX ACLs do not apply to Linux symlinks;
-NFSv4 ACL conversion is unsupported. On macOS, it copies the native ordered
-allow/deny entries, UUID principals and inheritance flags, removing destination
-entries absent from the source. It does not translate principal names or UUIDs
-between hosts. Both endpoints must use the same ACL model; Linux↔macOS ACL
-conversion is rejected before destination setup.
-Selecting multiple hardlink names with a macOS ACL containing a deletion-denying
-entry is rejected before copying: that ACL prevents publishing the additional
-names. Copy those names independently without `-H` to preserve their ACLs.
-Copying just one selected name remains supported, including with `-H`.
+With `hardlinks`, selected names for the same source regular file share one
+destination inode, on local and SSH filesystem copies. Links to files outside
+the selected sources are not reconstructed. Syq scans all selected sources
+before changing the destination, so large trees take longer to start copying
+and need memory for the complete file list. Hard links across destination
+filesystems fail. On a filesystem without hard links, such as FAT, exFAT or an
+rclone mount, syq copies one name of each group and reports the others as
+failed. A source symlink or special file with several names is rejected.
 
-Xattr preservation copies names and binary values, including empty values,
-and removes destination-only attributes within the selected namespace scope.
-A nonroot Linux source selects `user.*`; a root Linux source selects all namespaces except
-`system.*`, including `security.selinux` and `security.capability`. ACL attributes
-are handled only by ACL preservation. Excluded namespaces remain untouched.
-Reading or applying a selected attribute can require privileges; failures make
-the copy unsuccessful. Each inode's selected ACLs and xattrs must fit within
-4 MiB, and individual names and values must fit the destination platform's limits.
+On Linux, `acls` copies POSIX access ACLs and directory default ACLs by
+numeric ID, and also preserves permissions. It removes destination ACL entries
+absent from the source, including on unchanged files. A mapping's explicit
+mode changes the access ACL as `chmod` does. NFSv4 ACLs are not supported. On
+macOS, it copies the native entries with their UUID principals and inheritance
+flags, without translating principals between hosts. Both endpoints must use
+the same ACL model; copying ACLs between Linux and macOS is rejected before
+anything changes.
 
-On macOS, xattrs include Finder information, resource forks and application
-attributes. ACL storage and filesystem compression attributes are excluded;
-compressed contents are copied as logical bytes. Changing a user resource fork
-on an existing compressed destination is rejected; copy to an uncompressed
-destination for that case. Across Linux and macOS, Linux `user.NAME` corresponds
-to macOS `NAME`. Other Linux namespaces cannot be copied to macOS and are
-rejected. On macOS-to-macOS copies, names are preserved literally.
+`xattrs` copies names and values and removes destination-only attributes in
+the selected namespaces. A Linux source read by an ordinary user selects
+`user.*`; read by root, it selects every namespace except `system.*`,
+including `security.selinux` and `security.capability`. On macOS, xattrs
+include Finder information, resource forks and application attributes;
+filesystem compression attributes are left out, and compressed files are
+copied as their contents. Between Linux and macOS, Linux `user.NAME`
+corresponds to macOS `NAME`; other Linux namespaces cannot be copied to macOS.
 
-| Linux entry type | Hardlinks (`-H`) | ACLs (`-A`) | Xattrs (`-X`) |
-|---|---|---|---|
-| Regular file | Selected source group | Access ACL | Selected namespaces |
-| Directory | Not applicable | Access and default ACL | Selected namespaces |
-| Symlink | Non-regular groups rejected | Not applicable | Attributes on the link itself, where supported |
-| FIFO, device, socket | Non-regular groups rejected | Access ACL, where supported | Selected namespaces, where supported |
+ACLs and xattrs also apply to directories and special files, and xattrs to
+symlinks, where the filesystem supports it. Reading or setting them can
+require privileges, and failures make the copy unsuccessful. Each file's
+selected ACLs and xattrs must fit within 4 MiB. Copying special files requires
+`specials` (`-D`, included in `-a`), and creating devices requires suitable
+privileges.
 
-Copying special files also requires `--copy-metadata=specials` or `-D` (included in
-`-a`), and creating devices requires suitable privileges. Filesystem restrictions
-on particular attribute namespaces still apply.
+### Times and sparse files
 
-ACLs and xattrs work for local and SSH filesystem copies, including
-updates, unchanged-content reruns, and `--in-place`. macOS also supports native
-metadata on directories, symlinks and copied special nodes where the filesystem
-permits it.
-Descriptors, stream mappings, and S3 reject these options; descriptor copies
-of regular files support only `mtime`, `permissions`, and `ownership`. Neither
-`syq rsync -a` nor the `syq cp` defaults select ACLs, xattrs, hardlinks, or
-access times.
+Where a filesystem can't set a symlink's own modification time, such as
+SSHFS, syq leaves it alone.
 
-These options do not preserve filesystem flags such as immutable or append-only,
-restore ctime or inode numbers, or create rsync `--fake-super` backup records.
+`--copy-metadata=atimes` (rsync `-U`/`--atimes`) gives destination entries the
+access times their source had before syq read it; Linux requires kernel 5.8 or
+later. Separately, `--open-noatime` asks the system not to update source access
+times while syq reads; `-UU` selects both. Linux permits that only for a file's
+owner or a privileged process, and where it is unavailable syq warns and
+continues.
+`--copy-metadata=crtimes` (rsync `-N`/`--crtimes`) preserves birth times when
+the source filesystem reports them and the destination is a macOS filesystem
+that can set them; Linux destinations reject it.
 
-Use `--copy-metadata=atimes` (rsync `-U`/`--atimes`) to restore access times captured
-before reading the source. It covers regular files, directories, links themselves,
-and copied special nodes on local and SSH filesystem copies. Linux
-requires kernel 5.8 or later; macOS support depends on the filesystem. Restoration
-runs after content checks and copying, including metadata-only updates and reruns.
-Reading copied files afterward can change their access times again. Descriptors,
-streams, and S3 reject this option.
+Use `--sparse` (rsync `-S`) to turn written runs of zeros into holes on local
+or SSH filesystem copies; it is not part of `-a` or the `syq cp` defaults. It
+preserves contents and length, not the source's exact layout. The destination
+filesystem must support sparse files, and resumed and in-place writes also
+need hole punching; a failed hole operation makes the copy unsuccessful.
+Unchanged files and reused blocks are not rewritten just to change their
+allocation. Descriptors, streams, and S3 reject this option.
 
-`--open-noatime` requests file reads without updating access times. Repeating
-`-U` (`-UU`) enables it too. Linux permits this for a file's owner or a process
-with suitable privileges. If unavailable, syq warns and continues; this option
-does not promise unchanged source access times, including directory scans and
-symlink reads. Destination access-time preservation remains independently selected
-and restoration errors make the copy unsuccessful.
+### How syq changes existing files and directories
 
-Use `--copy-metadata=crtimes` (rsync `-N`/`--crtimes`) to preserve birth (creation)
-times. The source filesystem must report birth times and the destination must
-be macOS with a filesystem that permits setting them. Linux destinations reject
-this option before copying. It supports the same copies and entry types as
-access-time preservation. Neither `syq rsync -a` nor the `syq cp` defaults
-select it. Inode change time (`ctime`) cannot normally be restored.
+When only an existing file's metadata differs, syq changes it in place if it
+can tell the file has no other names, the file belongs to the account syq runs
+as, and the change adds no set-ID bit and changes no security attribute. Run
+as root, it changes in place whatever the file's owner could change, and
+replaces the file to give it another owner or group.
+Otherwise syq rewrites the file as if its contents had changed: that takes as
+long as copying it, needs write permission on its directory and room for a
+second copy, gives the file a new inode number, and drops attributes the copy
+does not select, such as ACLs or extended attributes. Access times are always
+set in place. A symlink, device or named pipe whose metadata differs is
+created again.
 
-Use `--sparse` (rsync `-S`) to turn written zero ranges into holes on local or
-SSH filesystem copies. It applies to regular files, independently of
-metadata options, and neither `syq rsync -a` nor the `syq cp` defaults select
-it. It preserves bytes and length, not an exact source extent layout. Eligible
-local clones still use filesystem cloning; other writes skip zeros or clear old
-blocks into holes.
-The destination filesystem must support sparse files; ranged, resumed, and
-in-place writes also require hole punching. A failed hole operation makes the
-copy unsuccessful. Filesystem allocation units can limit the space reclaimed by
-in-place hole punches, especially with small comparison blocks. Unchanged files
-and reused blocks are not rewritten just to change their allocation.
-Descriptors, streams, and S3 reject this option.
+Syq can't tell whether a file has other names on some filesystems, such as
+SMB, SSHFS and other FUSE filesystems, filesystems it does not recognize, and
+on macOS anything but APFS and HFS+. There every metadata-only change rewrites
+the file, and `--in-place=update` replaces files instead of updating them.
 
-Sparse mode avoids full-size preallocation. Syq also avoids reserving uncompressed
-space for btrfs files that request compression, either through the mount options
-or an inherited directory setting, so writes can use filesystem compression.
+A directory receives its copied permissions and ACLs after its contents. Until
+then, syq keeps a new directory open only to its owner whenever its final group
+or ACL could keep others out, and with `--copy-metadata=permissions` it narrows
+an existing directory that allows more than its source before creating anything
+in it. Someone who opened an existing directory earlier can keep listing the
+names syq creates in it.
+
+When a directory you own lacks the write or search permission a change needs,
+`--widen-dirs` (`--syq-widen-dirs` for `syq rsync`) decides whether syq
+briefly adds the owner permission it lacks: search to pass through it, write
+to change its entries, and read to list it.
+
+- `none`, the `syq cp` default, never does. Syq names the directory once (a dry
+  run lists it too), and the changes in it fail.
+- `rsync`, the `syq rsync` default, widens the directories the copy includes,
+  as rsync does: the destination of a contents copy, an existing `--as`
+  directory, and the directories beneath them that the copy fills or prunes.
+  It does not widen the directory a named source or an `--as` target goes
+  into, or enter destination-only directories it cannot read.
+- `all` also widens the directory the copy goes into and the directories above
+  it, and enters unreadable destination-only directories to prune them.
+
+Under `none` and `rsync`, both commands refuse a destination they cannot
+search, as rsync does. Syq restores each directory's exact mode afterwards,
+also when the copy fails, unless you request permissions. Other
+processes can see the temporary permissions, and a crash can leave them in
+place. On a receiving machine, the approval prompt says when a copy can open
+folders you own; adding read permission shows the sender the names inside.
+
+Dry runs never change permissions. A dry run reports a directory you own but
+cannot search as not inspected, and exits with status 23.
 
 ## Symlinks
 
@@ -804,23 +618,11 @@ directory. Sources must then be relative: `../private` is refused, and even
 with `--follow-src`, symlinks cannot lead outside the root. `-C` permits both.
 
 One copy accepts up to 1,024 named sources, such as the names a shell glob
-expands to. Some copies take fewer:
-
-- A copy a [receiving machine](receive.md) approves carries its whole
-  command in that approval, and the command can be at most 256 KiB. So 1,024
-  named sources fit when the arguments naming them average up to about 250
-  characters.
-- A [copy between two servers](remote-to-remote.md), including a
-  [restricted copy](remote-reference.md#enrollment), passes its named sources
-  to the server that runs it on a command line, unless it runs with
-  `--coordinate-at local`. The command line holds 128 KiB, and each path takes
-  about a third more room there than its length. So 1,024 sources
-  fit when their paths average up to about 90 characters, and 500 when they
-  average up to about 190.
-
-For more, select their parent directory with `--srcs-in` and leave out what
-you don't want with `--ignore` or `--where`, or split the copy. Each named
-source adds to the copy's setup time.
+expands to, and fewer with long paths when a [receiving machine](receive.md)
+approves the copy or a server coordinates a
+[copy between two servers](remote-to-remote.md). For more, select their parent
+directory with `--srcs-in` and leave out what you don't want with `--ignore`
+or `--where`, or split the copy.
 
 ## Shell pipelines and file descriptors
 
