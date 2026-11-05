@@ -4,7 +4,6 @@ use crate::process::CommandExt as _;
 use anyhow::{bail, ensure, Context, Result};
 use clap::Args;
 use std::fs;
-use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -33,7 +32,7 @@ pub(crate) fn run(domain: &super::Domain, command: ExportCommand) -> Result<i32>
         explicit,
     )?;
     let config = export(&requested, cached.endpoint(), cached.control())?;
-    std::io::stdout().lock().write_all(config.as_bytes())?;
+    crate::output::command_print!("{config}");
     Ok(0)
 }
 

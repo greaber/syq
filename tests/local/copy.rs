@@ -839,3 +839,67 @@ fn local_receiver_starts_from_a_reinstalled_same_build() {
     assert!(status.success(), "{status:?}: {stderr}");
     assert_eq!(read(&t.path("dst/file")), b"contents");
 }
+
+/// A worker that fails unexpectedly holds a file the others would wait for
+/// forever. The copy fails instead, saying why, and leaves no process behind.
+#[cfg(debug_assertions)]
+#[test]
+fn a_panicking_worker_fails_the_copy() {
+    use std::os::unix::process::CommandExt as _;
+    let t = Tmp::new();
+    for name in ["a", "b", "c", "d"] {
+        write(&t.path(&format!("src/{name}")), &prng(6 * 1024 * 1024, 7));
+    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command
+        .args(["cp", "--srcs-in", &t.s("src"), "--into", &t.s("dst")])
+        .args(["--performance-tuning", "workers=4", "--no-progress"])
+        .args(["--results", &t.s("run.ndjson")])
+        .env("SYQ_TEST_WORKER_PANIC", t.s("dst/b"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = command.start().unwrap();
+    let group = -(child.id() as i32);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            unsafe { libc::kill(group, libc::SIGKILL) };
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "the copy hung after a worker panicked\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains(
+            "syq: worker: internal error: a transfer worker panicked: injected worker panic"
+        ),
+        "{stderr}"
+    );
+    let records: Vec<serde_json::Value> = String::from_utf8(read(&t.path("run.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        records.iter().any(|record| record["type"] == "error"
+            && record["message"]
+                .as_str()
+                .unwrap()
+                .contains("a transfer worker panicked")),
+        "{records:?}"
+    );
+    assert_eq!(records.last().unwrap()["exit_code"], 1, "{records:?}");
+    // The copy's own processes, such as its local receiver, end with it.
+    wait_for(
+        "the failed copy's processes to end",
+        std::time::Duration::from_secs(10),
+        || (unsafe { libc::kill(group, 0) }) != 0,
+    );
+}

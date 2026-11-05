@@ -387,7 +387,7 @@ impl PreparedRange<'_> {
         worker.begin(source, copied, self.range.end);
         self.active = true;
         if crate::output::debug() {
-            eprintln!(
+            crate::output::diagnostic!(
                 "syq: source read-ahead started: {copied}..{}",
                 self.range.end
             );

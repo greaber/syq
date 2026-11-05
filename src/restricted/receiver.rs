@@ -344,7 +344,7 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
         .try_get_matches_from(
             std::iter::once(OsString::from("syq receiver")).chain(argv[2..].iter().cloned()),
         )
-        .unwrap_or_else(|error| error.exit());
+        .unwrap_or_else(|error| crate::output::exit_with(error));
     crate::fsops::reserve_startup_descriptors();
     let (command, options) = matches.subcommand().expect("subcommand required");
     let via = || -> Result<Option<SshEndpoint>> {
@@ -365,7 +365,7 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
                 .collect::<HashSet<_>>();
             for (metadata, _) in active {
                 let target = endpoint(&metadata.target_login, &metadata.host, metadata.port)?;
-                println!(
+                crate::output::command_println!(
                     "{}\tactive\t{}\t{}\t{}",
                     metadata.id,
                     target.label(),
@@ -376,7 +376,7 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
             for (pending, _) in load_pending_enrollments()? {
                 if !active_ids.contains(&pending.id) {
                     let target = endpoint(&pending.target_login, &pending.host, pending.port)?;
-                    println!("{}\tpending\t{}", pending.id, target.label());
+                    crate::output::command_println!("{}\tpending\t{}", pending.id, target.label());
                 }
             }
             Ok(0)
@@ -388,7 +388,7 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
             let (login, host) = enrollment_account(account)?;
             let via = via()?;
             let (metadata, _, _) = enroll(&host, None, &login, (via.as_ref(), false), true, None)?;
-            println!(
+            crate::output::command_println!(
                 "enrolled {} for {}",
                 metadata.id,
                 endpoint(&metadata.target_login, &metadata.host, metadata.port)?.label(),
@@ -451,7 +451,7 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
                 (Err(error), _) => return Err(error),
             }
             remove_local_enrollment(&directory)?;
-            println!("revoked {id} from {}", target.label());
+            crate::output::command_println!("revoked {id} from {}", target.label());
             Ok(0)
         })()),
         _ => unreachable!("receiver subcommand validated by clap"),

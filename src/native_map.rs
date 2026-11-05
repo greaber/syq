@@ -181,8 +181,7 @@ struct PendingMapEntry {
 
 pub fn run(args: &Args) -> Result<i32> {
     let options = Options::from_args(args);
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
+    let mut out = std::io::BufWriter::new(crate::output::command_stdout());
     if args.s3.is_some() {
         crate::s3::map::run(args, &options, &mut out)?;
     } else if args.locations[0].is_remote() {

@@ -1774,8 +1774,13 @@ fn run_remote(
                 Some(relay) => bridge.run(&remote_cmd, mapping, move |stdout| {
                     relay_stdout(stdout, relay).map(Some)
                 }),
-                None => bridge.run(&remote_cmd, mapping, |mut stdout| {
-                    std::io::copy(&mut stdout, &mut std::io::stdout())?;
+                None => bridge.run(&remote_cmd, mapping, |stdout| {
+                    // A closed stdout must not fail or stall the copy.
+                    if let Some(error) =
+                        crate::output::pass_through(stdout, &mut std::io::stdout())?
+                    {
+                        crate::output::warn_stdout(&error);
+                    }
                     Ok(None)
                 }),
             };

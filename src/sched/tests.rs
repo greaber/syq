@@ -1416,6 +1416,34 @@ fn destination_names_count_the_jobs_planned_for_each_linked_file() {
     assert_eq!(jobs.destination_names(3), 3);
 }
 
+/// A worker that gives a probed file back for another connection must not
+/// let the copy look finished meanwhile: a peer woken in that moment would
+/// leave, and the copy's ending would cancel the setups it still needs.
+#[test]
+fn a_requeued_probe_never_lets_the_copy_look_finished() {
+    let sched = Arc::new(Sched::new(64, 128));
+    sched.watch_worker_setups();
+    let idx = sched.push_file(test_job(b"file", 4096));
+    sched.release_preflighted_work();
+    sched.scan_done();
+    assert!(matches!(sched.next(), Item::File(claimed) if claimed == idx));
+    let peer = {
+        let sched = sched.clone();
+        std::thread::spawn(move || sched.next())
+    };
+    // Hold the peer waiting, then give the file back as a failed probe on
+    // a dead transport does.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(!peer.is_finished());
+    sched.requeue_probed(idx);
+    assert!(!sched.finished());
+    assert!(!sched.worker_setups().cancelled());
+    let Item::File(taken) = peer.join().unwrap() else {
+        panic!("the peer left although the file was queued again");
+    };
+    assert_eq!(taken, idx);
+}
+
 #[test]
 fn only_a_jobs_first_preparation_is_first() {
     let mut jobs = Jobs::default();

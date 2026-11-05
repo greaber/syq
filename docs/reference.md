@@ -811,14 +811,10 @@ expands to. Some copies take fewer:
   about a third more room there than its length. So 1,024 sources
   fit when their paths average up to about 90 characters, and 500 when they
   average up to about 190.
-- With `--prune`, a copy checks every named source against every other in
-  one request, which holds about 950 sources with 8-character names, or 630
-  with 20-character names.
 
 For more, select their parent directory with `--srcs-in` and leave out what
 you don't want with `--ignore` or `--where`, or split the copy. Each named
-source adds to the copy's setup time, and with `--prune` that time grows with
-the square of their number.
+source adds to the copy's setup time.
 
 ## Shell pipelines and file descriptors
 

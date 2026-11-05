@@ -686,7 +686,7 @@ pub(crate) fn status(domain: &Domain) -> Result<StatusSnapshot> {
 
 pub(crate) fn print_status(rows: &[Status]) {
     for row in rows {
-        crate::output::human_stdout!(
+        crate::output::command_human_stdout!(
             "  {} through {}  {} (reusable account access)\n    SSH control socket: {}",
             row.requested.host,
             row.authorizer,
@@ -864,7 +864,7 @@ pub(crate) fn connect(domain: &Domain, request: SessionRequest) -> Result<()> {
         &AuthFrom::Provider(authorizer.clone()),
     )?
     .context("SSH account connection missing after approval")?;
-    crate::output::human_stdout!(
+    crate::output::command_human_stdout!(
         "{} ready through {}; account access remains available while the provider is connected\nSSH control socket: {}",
         cached.endpoint().host, authorizer, cached.control().display()
     );

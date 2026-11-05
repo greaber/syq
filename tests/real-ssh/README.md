@@ -113,7 +113,7 @@ the old `~/.cache/syq/helpers`, before the remaining scenarios reuse those
 helpers.
 
 The source sshd permits remote Unix socket forwarding for named return transfers
-(OpenSSH 9.2 also requires remote TCP forwarding permission). The destination
+(OpenSSH 7.8 and later also require remote TCP forwarding permission). The destination
 keeps forwarding disabled. The core runner also hosts a loopback sshd for an
 isolated requester account without the laptop's keys. The ordinary-provider case
 uses a separate disposable SSH listener that permits local Unix forwarding;

@@ -1903,6 +1903,120 @@ fn unsupported_copy_controls_warn_without_changing_behavior() {
     }
 }
 
+/// A reader that stops early, as `head` does, closes syq's stdout. Commands
+/// that print rather than copy then end quietly with their usual status
+/// instead of panicking or reporting the broken pipe.
+#[test]
+fn closed_stdout_ends_printing_commands_quietly() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"mapped");
+    fs::create_dir(t.runtime()).unwrap();
+    for args in [
+        &["--version"][..],
+        &["-V"],
+        &["--build-identity"],
+        &["--help"],
+        &["--help-all"],
+        &["help", "cp"],
+        &["cp", "--help"],
+        &["completion", "bash"],
+        &["completion", "zsh"],
+        &["persist", "status"],
+        &["persist", "status", "--json"],
+        &["map", "--cwd", &t.s("src"), "file", "--as", "copy"],
+    ] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("HOME", t.path("home"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .stdin(Stdio::null())
+            .stdout(writer)
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {}", stderr_of(&output));
+    }
+}
+
+/// Output that cannot be written for another reason, as to a full disk,
+/// fails the command with one error naming the cause, so a truncated file is
+/// never reported as success. Coreutils behaves the same way.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_full_stdout_fails_printing_commands() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"mapped");
+    fs::create_dir(t.runtime()).unwrap();
+    for args in [
+        &["--version"][..],
+        &["--build-identity"],
+        &["--help"],
+        &["help", "cp"],
+        &["cp", "--help"],
+        &["completion", "bash"],
+        &["persist", "status"],
+        &["persist", "status", "--json"],
+        &["map", "--cwd", &t.s("src"), "file", "--as", "copy"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("HOME", t.path("home"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .stdin(Stdio::null())
+            .stdout(File::create("/dev/full").unwrap())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        let stderr = stderr_of(&output);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+        assert_eq!(
+            stderr.matches("No space left on device").count(),
+            1,
+            "{args:?}: {stderr}"
+        );
+        assert!(!stderr.contains("panicked"), "{args:?}: {stderr}");
+    }
+}
+
+/// A streaming command stops at a closed stdout instead of finishing work
+/// nobody reads: this map would fail on its second source, which it reaches
+/// only after writing every entry of the first.
+#[test]
+fn a_closed_stdout_stops_a_streaming_command() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("src/big")).unwrap();
+    // Far more than a pipe holds.
+    for index in 0..3000 {
+        fs::write(t.path(&format!("src/big/file-{index:05}")), b"").unwrap();
+    }
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["map", "--cwd", &t.s("src"), "big", "absent"])
+        .stdin(Stdio::null())
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{}", stderr_of(&output));
+}
+
 #[test]
 fn version_reports_the_build_identity() {
     // A development build must not claim to be the release it was built

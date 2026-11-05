@@ -30,6 +30,50 @@ pub(super) fn candidate_status(candidate: &TcpCandidate, fastest: u32) -> String
     format!("reachable, {speed}, not selected ({reason})")
 }
 
+/// One line per probed data address. An advertised address the host's name
+/// `host` also leads to is named after it, and the name's own line is left
+/// out when it leads nowhere else.
+pub(super) fn candidate_lines(host: &str, probe: &crate::conn::TcpProbe) -> Vec<String> {
+    let fastest = probe
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.reachable == Some(true))
+        .map(|candidate| candidate.speed_mbps)
+        .max()
+        .unwrap_or(0);
+    // Preflight may have selected the name rather than the same address
+    // advertised later in the list.
+    let target_selected = probe.candidates.iter().any(|candidate| {
+        candidate.source == DataAddressSource::SshTarget
+            && candidate.same_as_ssh_target
+            && candidate.selected
+    });
+    probe
+        .candidates
+        .iter()
+        .filter_map(|candidate| {
+            let mut shown = candidate.clone();
+            let name = match (candidate.source, candidate.same_as_ssh_target) {
+                (DataAddressSource::SshTarget, true) => return None,
+                (DataAddressSource::SshTarget, false) if candidate.address == host => {
+                    " (SSH target)".to_owned()
+                }
+                (DataAddressSource::SshTarget, false) => format!(" (SSH target {host})"),
+                (DataAddressSource::RemoteInterface, true) => {
+                    shown.selected |= target_selected;
+                    format!(" ({host})")
+                }
+                (DataAddressSource::RemoteInterface, false) => String::new(),
+            };
+            Some(format!(
+                "TCP {}{name}: {}",
+                data_address(&candidate.address, probe.port),
+                candidate_status(&shown, fastest)
+            ))
+        })
+        .collect()
+}
+
 pub(super) fn one_line(message: &str) -> String {
     message
         .lines()
@@ -110,24 +154,8 @@ pub(super) fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
     print_remote_control_diagnostics(spec, args);
     let diagnostics = spec.diagnostics();
     if let Some(probe) = &diagnostics.tcp_probe {
-        let fastest = probe
-            .candidates
-            .iter()
-            .filter(|candidate| candidate.reachable == Some(true))
-            .map(|candidate| candidate.speed_mbps)
-            .max()
-            .unwrap_or(0);
-        for candidate in &probe.candidates {
-            let source = if candidate.source == DataAddressSource::SshTarget {
-                " (SSH target)"
-            } else {
-                ""
-            };
-            crate::output::diagnostic!(
-                "  TCP {}{source}: {}",
-                data_address(&candidate.address, probe.port),
-                candidate_status(candidate, fastest)
-            );
+        for line in candidate_lines(&spec.host, probe) {
+            crate::output::diagnostic!("  {line}");
         }
         let remote = probe.congestion_control.as_deref().unwrap_or("unavailable");
         let (listener, connector) = if crate::destination::is_named(&spec.restricted_grant) {
@@ -363,6 +391,7 @@ mod tests {
             source: DataAddressSource::RemoteInterface,
             reachable: None,
             selected: false,
+            same_as_ssh_target: false,
         };
         assert_eq!(
             candidate_status(&candidate, 0),
@@ -370,5 +399,62 @@ mod tests {
         );
         candidate.reachable = Some(false);
         assert_eq!(candidate_status(&candidate, 0), "not reachable");
+    }
+
+    #[test]
+    fn an_address_the_host_name_leads_to_is_shown_once_under_the_name() {
+        let candidate = |address: &str, source, selected, same_as_ssh_target| TcpCandidate {
+            address: address.into(),
+            speed_mbps: 0,
+            source,
+            reachable: Some(true),
+            selected,
+            same_as_ssh_target,
+        };
+        let probe = |candidates| crate::conn::TcpProbe {
+            port: 47600,
+            encrypted: true,
+            congestion_control: None,
+            candidates,
+        };
+        use DataAddressSource::*;
+        // The name resolved to the advertised address only.
+        assert_eq!(
+            candidate_lines(
+                "backup",
+                &probe(vec![
+                    candidate("192.0.2.5", RemoteInterface, true, true),
+                    candidate("backup", SshTarget, false, true),
+                ])
+            ),
+            ["TCP 192.0.2.5:47600 (backup): reachable, link speed unknown, selected by preflight"]
+        );
+        // Preflight chose the name, ahead of the same overlay address
+        // advertised after it.
+        assert_eq!(
+            candidate_lines(
+                "backup",
+                &probe(vec![
+                    candidate("backup", SshTarget, true, true),
+                    candidate("100.64.0.5", RemoteInterface, false, true),
+                ])
+            ),
+            ["TCP 100.64.0.5:47600 (backup): reachable, link speed unknown, selected by preflight"]
+        );
+        // Behind NAT the name leads elsewhere; an SSH configuration may
+        // also give the address itself.
+        assert_eq!(
+            candidate_lines(
+                "backup",
+                &probe(vec![
+                    candidate("10.0.0.5", RemoteInterface, false, false),
+                    candidate("198.51.100.7", SshTarget, true, false),
+                ])
+            ),
+            [
+                "TCP 10.0.0.5:47600: reachable, link speed unknown, not selected (link speeds unknown; first reachable path preferred)",
+                "TCP 198.51.100.7:47600 (SSH target backup): reachable, link speed unknown, selected by preflight",
+            ]
+        );
     }
 }
