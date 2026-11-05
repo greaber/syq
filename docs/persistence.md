@@ -12,19 +12,16 @@ You can close the terminal afterward. To enable persistence for connections
 opened by later syq commands instead, run `syq persist on`. Open connections
 also make [remote path completion](install.md#shell-completion) faster.
 
-Persistence also applies to an `--rsh` (or rsync `-e`) command that runs `ssh`
-with its own options, such as `-e 'ssh -p 2222 -i key'`. Each set of options
-keeps its own connection, so a login made with one key, jump host, or
-configuration file is never reused by a command that asked for another.
-Options that manage SSH connection sharing themselves, such as `-S` or
-`ControlMaster`, and remote shells other than `ssh` connect each time instead.
+With an `--rsh` (or rsync `-e`) command that runs `ssh` with its own options,
+each set of options keeps its own connection, so a login is never reused by a
+command that asked for another.
 
 In the default persistence domain, copies, remote file operations, and
-`persist connect` also start receiving, unless you have turned it off.
-Receiving lets connected servers request file copies to your machine, commands
-on it, and authorization for copies between servers, each with approval on
-your machine; see [Use your laptop from a server](receive.md). It starts only
-on connections made with your plain `ssh`.
+`persist connect` also start receiving on allowed servers, unless you have
+turned it off. Receiving lets connected servers request file copies to your
+machine, commands on it, and authorization for copies between servers, each
+with approval on your machine; see [Use your laptop from a server](receive.md).
+It starts only on connections made with your plain `ssh`.
 
 To keep SSH connections open only for commands you start locally, turn
 receiving off with `syq persist receive off`. The persistent SSH login remains
@@ -33,10 +30,11 @@ is no longer available. See [Persistent connections](security.md#persistent-conn
 for the security implications.
 
 Inspect connections with `syq persist status`. Close them, including receiving
-connections, with `syq persist off`; your saved settings stay. For an
+connections, with `syq persist off`, which keeps your saved settings. For an
 independent set of connections and settings, create an
 [isolated domain](persistence-reference.md#isolated-script-scopes) and pass its
-path with `--pscope`; fresh domains start with receiving off.
+path with `--pscope`. A fresh domain starts with receiving off, and
+`syq persist --pscope PATH off` removes it with its settings.
 
 Receiving reconnects after a network interruption or laptop sleep, and other
 SSH connections reopen on their next use. An interrupted copy still needs to be
@@ -54,8 +52,8 @@ so that the next command to that server starts sooner:
 - Receiving through the server, when receiving is on, until `syq persist off`
   or `syq persist receive off`.
 
-The command that starts them says so in one line that names `syq persist off`.
-`syq persist status` shows what is running.
+A copy or other file command that starts them says so in one line that names
+`syq persist off`. `syq persist status` shows what is running.
 
 ## Reuse laptop-authorized account access
 

@@ -40,8 +40,8 @@ and commands start in your home directory. The command prints the receiving
 name. The examples below use `@laptop`; replace it with your own name.
 
 You can close that terminal and make requests from any shell on the server,
-including an existing tmux session. Later persistent connections from your
-laptop start receiving too, unless you turn it off.
+including an existing tmux session. Later persistent connections to allowed
+servers start receiving too, unless you turn it off.
 
 ### Optional name and directory
 
@@ -83,8 +83,9 @@ syq persist receive deny REQUEST_ID
 ```
 
 Approving a copy trusts the server to supply its contents. Requests expire after
-five minutes and are never approved automatically. To use only terminal
-approval, run `syq persist receive on --name laptop --notify off`.
+five minutes. If a prompt is missing or dismissed, the request stays pending.
+To use only terminal approval, run
+`syq persist receive on --name laptop --notify off`.
 
 ### Names and paths
 
@@ -186,41 +187,31 @@ See [`syq ssh`](commands/ssh.md) for commands, terminals, and requirements.
 ## Use an SSH authorization provider
 
 An ordinary SSH server can supply authorization instead of a connected laptop.
-Install the same syq build on the requesting machine and provider. On the provider,
-load the destination keys into its local SSH agent and enable receiving from that
-environment:
+Install the same syq build on both machines. On the provider, load the
+destination keys into its SSH agent and enable receiving from that
+environment; then save the provider's SSH endpoint where you work:
 
 ```sh
+# On the provider:
 syq persist receive on --notify off
-```
 
-On the machine where you work, save the provider's SSH endpoint:
-
-```sh
+# Where you work:
 syq persist auth-from alice@provider:2222
 syq ssh hostB -- hostname
-syq cp results --to hostB
 ```
 
-The first command logs in to the provider with your own SSH credentials, and the
-provider asks for approval of the destination account. Inspect and approve
-requests there with `syq persist receive pending` and
-`syq persist receive approve REQUEST_ID`. Later commands reuse both
-connections. Your agent is not forwarded, and commands and file data travel
-directly to hostB, which your own SSH configuration names.
+Approve each destination account on the provider with
+`syq persist receive pending` and `syq persist receive approve REQUEST_ID`.
+Your agent is not forwarded, and commands and file data travel directly to
+hostB. The provider's SSH server must allow local forwarding
+(`AllowTcpForwarding` and `AllowStreamLocalForwarding` set to `local` or
+`yes`), and the login key's `authorized_keys` entry must not block it with
+`restrict` or `no-port-forwarding`. After updating syq, run
+`syq persist receive on` on the provider again.
 
-The provider's SSH server must allow local forwarding: both
-`AllowTcpForwarding` and `AllowStreamLocalForwarding` must allow `local` or
-`yes`, and the login key's `authorized_keys` entry must not block forwarding
-with `restrict` or `no-port-forwarding`. Syq uses the provider's first
-receiving profile in its default persistence domain, which must be enabled.
-After updating syq, run `syq persist receive on` on the provider to restart its
-service with the matching build.
-
-This uses a full SSH login to the provider account. Anyone who can log in to
-that account can use its credentials independently of syq's approval controls.
-It centralizes credentials but does not make that account a restricted shared
-authorization service. See [provider trust](security.md#ordinary-ssh-authorization-providers).
+Anyone who can log in to the provider account can use its credentials without
+going through syq's approval controls; see
+[provider trust](security.md#ordinary-ssh-authorization-providers).
 
 ## Authorize copies between servers
 

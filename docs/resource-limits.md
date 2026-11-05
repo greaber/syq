@@ -26,13 +26,12 @@ syq cp data --to server --into backup --resource-limits bandwidth=10M
 
 For ordinary SSH and TCP copies, this limits the bytes syq sends to 10 MiB/s
 across all workers. It counts compressed bytes, so compressible files can copy
-at a higher rate; connection setup and IP and TCP headers are not counted.
-A relay between two servers applies the rate to each leg separately. Local, S3
-and descriptor copies, and copies a receiving machine approves, count file
-data before compression.
+at a higher rate. A relay between two servers applies the rate to each leg
+separately. Local, S3 and descriptor copies, and copies a receiving machine
+approves, count file data before compression.
 
 Short bursts remain possible because of buffering. Where the limit counts file
-data, [`bw-pacing`](tuning.md#average-rate-and-burst-patterns) chooses how
+data, [`bw-pacing`](tuning.md#transfer-controls) chooses how
 requests are spaced. Uploads to S3 can burst by up to one part, and copies
 between buckets are not paced, since their data does not pass through this
 machine. A capped local copy uses normal copying instead of filesystem
@@ -53,8 +52,8 @@ Rates accept decimals and case-insensitive suffixes:
 | `B` | Bytes per second |
 
 For example, `1024` and `1M` both select 1 MiB/s. Rates are rounded to the
-nearest KiB/s, and a final `+1` or `-1` adjusts the scaled value by one byte
-first. Zero disables the cap; nonzero values below 512 bytes/s are rejected.
+nearest KiB/s. Zero disables the cap; nonzero values below 512 bytes/s are
+rejected.
 
 ## Concurrency ceilings
 
@@ -65,10 +64,9 @@ syq cp data --to server --into backup --resource-limits workers=4,bandwidth=10M
 Syq can adjust the filesystem copy-worker count up to four. By contrast,
 `--performance-tuning workers=4` fixes four worker slots. Worker counts do not
 include directory scanning or control connections, and do not cap total
-threads, sockets, CPU use, or memory. Automatic adjustment goes up to 256
-filesystem copy workers, and syq uses fewer, saying so, when an endpoint's
-open-file limit or other resources run short; raising that limit can allow
-more.
+threads, sockets, CPU use, or memory. Syq uses fewer workers, and says so,
+when an endpoint's open-file limit or other resources run short; raising that
+limit can allow more.
 
 Use `workers` only for filesystem copies and the S3 keys only for S3 copies.
 S3 ceilings are nested: object and per-object part counts also share the

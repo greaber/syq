@@ -76,7 +76,6 @@ across a wide range of higher counts.
 
 ## Measure and track improvements
 
-Use [syq-bench](https://greaber.github.io/syq-bench/reproduce.html) for repeatable
-comparisons. Record the commands, versions, mounts, cache state, and other load,
-and measure the copy and any later flush separately. See
-[performance tuning](tuning.md) to compare worker counts and request sizes.
+Use [syq-bench](https://greaber.github.io/syq-bench/reproduce.html) for
+repeatable comparisons, and see [performance tuning](tuning.md) to compare
+settings.

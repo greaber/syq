@@ -116,9 +116,9 @@ Placement, preview, existence policies, compression, reporting, transfer tuning,
 and resource limits apply. `--stream-concurrency` limits active entries
 separately from network workers.
 
-Stream entries cannot use a remote coordinator, `--detach`, a
-[receiving machine](receive.md) (`@NAME`), `--in-place`, pruning, tree filters,
-source metadata policies, content comparison, or size filters; select entries
-and check sizes in the calling program instead. These restrictions also apply
-to pathname entries in a mixed batch; use separate calls when their options
-differ.
+Stream entries cannot use a remote coordinator, `--detach`, a [receiving
+machine](receive.md) (`@NAME`), `--in-place`, pruning, tree filters, source
+metadata policies, content comparison, or size filters. Use a known expected
+hash instead of content comparison, and select entries and sizes in the calling
+program. These restrictions also apply to pathname entries in a mixed batch;
+use separate calls when their options differ.

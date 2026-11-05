@@ -107,9 +107,6 @@ Filters are last-match-wins with `!` re-inclusion, unlike rsync's first-match
 rules. Check the [gitignore examples](reference.md#ignoring-paths) when
 converting a filtered command.
 
-The [compatibility tests](https://github.com/greaber/syq/tree/master/tests/rsync-compat)
-record comparison evidence and version-specific details.
-
 ## Compare without copying
 
 ```sh

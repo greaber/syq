@@ -51,6 +51,8 @@ syq --version-is '>=0.7.1' cp photos --into backup
 syq --version-is '>=0.7.1, <0.8.0 | >=1.0.0, <2.0.0' cp photos --into backup
 ```
 
+An expression combines version comparisons:
+
 | Syntax | Meaning |
 | --- | --- |
 | `x.y.z` or `==x.y.z` | Exactly that version |
@@ -79,11 +81,7 @@ Use `syq --self-update` on the server to update that command, or the standalone
 installer above if it is missing. See [SSH helper installation](environment.md#ssh-helper-installation)
 for custom helpers and installation exceptions.
 
-## Try a benchmark
-
-Compare syq with rsync on your own machines, or with rsync and cp locally.
-See [Quick comparison](speed.md#quick-comparison) for the script and how to
-read its results.
+<a id="try-a-benchmark"></a>
 
 ## Updates
 

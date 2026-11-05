@@ -96,7 +96,7 @@ Keep the copy and the laptop's receiving connection open until it finishes.
 
 HostB's SSH server must allow remote Unix-socket forwarding, and on OpenSSH
 7.8 and later remote TCP forwarding too. Copying over SSH needs a writable
-`~/.ssh/authorized_keys` on hostC. See
+`~/.ssh/authorized_keys` on hostC for a temporary restricted key. See
 [Approved account copies](remote-reference.md#approved-account-copies)
 for option support.
 

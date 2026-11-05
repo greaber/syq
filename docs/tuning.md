@@ -21,6 +21,8 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
   --performance-tuning copy-path=ranges,request-size=1M,pipeline-depth=8
 ```
 
+<a id="average-rate-and-burst-patterns"></a>
+
 | Key | Default | Accepted values |
 |---|---|---|
 | `workers` | Automatic | 1 through 65536 filesystem workers, fewer when there is less work |
@@ -31,7 +33,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 | `batch-files` | Up to 2048 | 1 through 4096 files per worker batch |
 | `batch-bytes` | 16 MiB | 512 bytes through 64 MiB per worker batch |
 | `split-min-size` | 32 MiB | 1 byte through 1 GiB: the smallest part of a file an idle worker can take over from another |
-| `bw-pacing` | `125ms` | `average`, or an integer interval from `1ms` through `10s`; requires a nonzero `--resource-limits bandwidth=RATE` |
+| `bw-pacing` | `125ms` | How a nonzero `--resource-limits bandwidth=RATE` paces file data in local, descriptor, and receiver-approved copies: an integer interval from `1ms` through `10s` sends smaller requests at that spacing, and `average` waits for each request's byte budget, which can arrive in bursts. Ordinary SSH and TCP copies ignore it; S3 copies reject it |
 
 Sizes accept `K`, `M`, and `G`, using powers of 1024. Unknown keys, repeated
 keys, and out-of-range values fail the command. Explicit request, block,
@@ -87,8 +89,7 @@ Syq remembers useful starting worker counts from successful filesystem copies
 and keeps adjusting as the next copy runs. A remembered count is matched to
 the route, filesystems, transport, and copy settings, and is only a starting
 point. On macOS and Linux, remote copies also keep separate counts for each
-local network, identified by the hardware addresses of its default routers,
-without asking for location permission.
+local network.
 
 `--performance-tuning workers=N` bypasses the remembered count, and
 `--resource-limits workers=N` caps it. Set `SYQ_TUNING_CACHE` to an empty value
@@ -120,37 +121,33 @@ contract. Clearing history also resets remembered starting counts.
 S3 copies do not record timelines. When a server coordinates a copy, the
 history is on that server; run the inspection commands there.
 
-The default file is `~/.cache/syq/tuning.history-v1.sqlite`.
-`SYQ_TUNING_HISTORY` selects another file, and an empty value disables history.
-`SYQ_TUNING_HISTORY_SIZE` sets how much history to keep, default and minimum
-`10M`. See [Environment](environment.md#other-variables) for related variables.
+See [Environment](environment.md#other-variables) for the history file's
+location and size.
 
 ## Filesystem tuning examples
 
+<a id="recording-a-comparison"></a>
+
 Use disposable destinations when comparing settings, and restore the same
-initial destination before each run. Larger requests and deeper pipelines can
-increase memory use.
+initial destination before each run. With overrides, `-v` reports the effective
+settings and a final `syq: tuning observed:` line. See
+[Quick comparison](speed.md#quick-comparison) for a benchmark script.
 
 ### Compare block reuse with full replacement
 
-Choose `--transfer-strategy=aligned-block` or `whole-file` to compare block reuse
-with full replacement. See [transfer strategies](reference.md#choose-a-transfer-strategy)
-for defaults and interactions.
+To measure what [block reuse](reference.md#choose-a-transfer-strategy) costs
+and saves, compare the two strategies without copy shortcuts, keeping worker
+counts, request sizes, and cache preparation identical:
 
 ```sh
 syq cp --srcs-in source --into destination \
-  --transfer-strategy aligned-block
+  --performance-tuning copy-path=ranges --transfer-strategy aligned-block
+syq cp --srcs-in source --into destination \
+  --performance-tuning copy-path=ranges --transfer-strategy whole-file
 ```
 
-With block reuse, syq compares each replaced file with the destination and
-sends only the blocks that differ, then still writes a complete new file
-unless the filesystem supports reflinks. Comparison can use up to 64 MiB of
-destination buffers per worker, so more workers use more memory.
-
-To isolate comparison and reuse costs, compare
-`--performance-tuning=copy-path=ranges --transfer-strategy=aligned-block`
-with `--performance-tuning=copy-path=ranges --transfer-strategy=whole-file`,
-keeping worker counts, request sizes, and cache preparation identical.
+Comparison can use up to 64 MiB of destination buffers per worker, so more
+workers use more memory.
 
 ### Scattered edits in existing files
 
@@ -169,20 +166,15 @@ with `comparison-block-size`.
 
 ### Streaming and request windows
 
-`copy-path=streaming` streams every remote range, and `copy-path=auto-streaming`
-streams every range that the small-file and whole-file shortcuts don't handle.
-To compare pipeline depths instead, hold the worker count and request size
-fixed:
+To compare pipeline depths, hold the worker count and request size fixed:
 
 ```sh
 syq cp data.bin --to host --as /scratch/pipeline.bin --performance-tuning workers=1 -v \
   --performance-tuning copy-path=ranges,request-size=1M,pipeline-depth=4
 ```
 
-Repeat with `pipeline-depth=8` and `16`, using a fresh destination each time.
-These allow up to 4, 8, and 16 MiB of outstanding requests per endpoint per
-worker. Compare with the defaults too; larger windows may add memory use
-without improving speed.
+Repeat with `pipeline-depth=8` and `16`, and compare with the defaults too;
+larger windows may add memory use without improving speed.
 
 ### Batch size and splitting
 
@@ -196,23 +188,3 @@ syq cp --srcs-in small-files --to server --into /scratch/benchmark-small \
 Larger batches hold more data in memory, and an interrupted batch restarts its
 files from the beginning. Lower `split-min-size` values let idle workers share
 large files more finely; higher values mean fewer handoffs.
-
-### Average rate and burst patterns
-
-Ordinary SSH and TCP copies pace compressed bytes at the sender and ignore
-`bw-pacing`; syq prints a notice if you set it. S3 copies do not accept it.
-For local, descriptor, and receiver-approved copies, `bw-pacing` chooses how
-requests are paced:
-
-- `125ms` (default): send smaller requests at regular intervals. The first
-  request starts immediately, so short copies can exceed the average rate.
-- `average`: wait for each request's byte budget before sending it. A 2 MiB
-  request at 1 MiB/s waits about two seconds, then can arrive in a burst.
-
-### Recording a comparison
-
-Use the same reporting options and fresh destinations for each run.
-`--stats` adds counters without changing the transfer route. With overrides,
-`-v` reports the effective settings and a final `syq: tuning observed:` line.
-Check elapsed time, exit status, and copied contents. See
-[Quick comparison](speed.md#quick-comparison) for the benchmark script.

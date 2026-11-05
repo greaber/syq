@@ -84,19 +84,6 @@ see how they change over time; see
 Compare the same workload and direction using empty test destinations.
 A second copy into the same destination may just measure skipping existing files.
 
-## TCP data connections
-
-SSH authenticates remote copies. When reachable, encrypted TCP carries file
-data on a port in `47600–47699`; otherwise copies use SSH on the same route and
-say so in one line. See [Make TCP reachable](server-tuning.md#make-tcp-reachable)
-for firewall settings.
-
-Use `--no-tcp` to send data over SSH without trying TCP, or `--tcp-ports LO-HI`
-to choose a port range. On Linux, `--tcp-congestion ALGO` selects an available
-congestion control algorithm. `--no-tcp-encryption` disables data encryption
-and authentication; use it only on a trusted network. Restricted receivers
-refuse it.
-
 ## Local copies and NFS
 
 For local copies, syq uses the filesystem's copy optimizations automatically
@@ -104,34 +91,34 @@ when it can. On filesystems that support cloning, this can avoid physically
 copying every byte, so the displayed rate can exceed disk throughput. You can
 also copy to or from a mounted NFS directory using its local path.
 
-## Limit bandwidth
-
-Use `--resource-limits bandwidth=RATE` to leave bandwidth for other work:
-
-```sh
-syq cp data --to server --into /backup --resource-limits bandwidth=10M
-```
-
-This limits the whole copy to about 10 MiB/s, with short bursts. See
-[Resource limits](resource-limits.md) for what is counted on each route.
-
+<a id="tcp-data-connections"></a>
+<a id="limit-bandwidth"></a>
 <a id="options-that-change-the-tradeoff"></a>
-
 <a id="compression-and-in-place-writes"></a>
-
-## Compression
-
-`--no-compress` can help when compression costs more CPU time than it saves
-in network traffic; see [Transport compression](reference.md#transport-compression).
-
+<a id="compression"></a>
 <a id="how-many-connections"></a>
 <a id="benchmark-tuning"></a>
 <a id="streaming-and-request-windows"></a>
 <a id="batch-size-and-splitting"></a>
 <a id="average-rate-and-burst-patterns"></a>
 <a id="recording-a-comparison"></a>
+<a id="investigate-tuning"></a>
 
-## Investigate tuning
+## Other options
 
-Manual connection counts and other [tuning options](tuning.md) are for
-troubleshooting and development. Normal copies should not need them.
+Remote copies send file data over encrypted TCP on a port in `47600–47699`
+when it is reachable, and otherwise fall back to SSH, except for
+[downloads your laptop approves per copy](receive.md#authorize-copies-between-servers),
+which need TCP. See [Make TCP reachable](server-tuning.md#make-tcp-reachable)
+for firewall settings. `--no-tcp` uses
+SSH without trying TCP, `--tcp-ports LO-HI` chooses another port range, and on
+Linux `--tcp-congestion ALGO` selects a congestion control algorithm.
+`--no-tcp-encryption` disables data encryption and authentication; use it only
+on a trusted network. Restricted receivers refuse it.
+
+`--resource-limits bandwidth=RATE` leaves bandwidth for other work; see
+[Resource limits](resource-limits.md). `--no-compress` can help when
+compression costs more CPU time than it saves in network traffic; see
+[Transport compression](reference.md#transport-compression). Manual connection
+counts and other [tuning options](tuning.md) are for troubleshooting; normal
+copies should not need them.

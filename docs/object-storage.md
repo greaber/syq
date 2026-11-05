@@ -29,11 +29,10 @@ See [S3 copies](tuning.md#s3-copies) for concurrency and part sizes.
 
 ### Retries
 
-Retries wait longer each time and keep their concurrency slots, so throttling
-also slows new work. With the default of 10, a single request can keep
-retrying for a minute or more. If 8 requests in a row fail after all their
-retries, `syq cp` and `syq rm` stop instead of trying the remaining objects;
-rerun the command once the service is available.
+With the default of 10, a single request can keep retrying for a minute or
+more. If 8 requests in a row fail after all their retries, `syq cp` and
+`syq rm` stop instead of trying the remaining objects; rerun the command once
+the service is available.
 
 ## Upload and download
 
@@ -128,11 +127,9 @@ defaults unless overridden with `--s3-write-header` or, for bucket copies,
 `--copy-metadata=storage-class`. Copying a storage class can affect storage
 costs and require restoring an archived object first.
 
-Syq decides whether two objects match from the hashes it stores with its
-uploads, from a whole-object SHA-256 or CRC64NVME checksum the provider reports
-for both, or else from equal ETags or equal sizes and modification times. It
-does not download objects to compare them, so `--hash`, `--hash-or-copy`, and
-expected hashes are unsupported on this route. Use
+Syq decides whether two objects match from what the service and syq's own
+metadata report, and never downloads objects to compare them, so `--hash`,
+`--hash-or-copy`, and expected hashes are unsupported on this route. Use
 `--if-exists=error-if-different` to reject copies whose contents cannot be
 shown to match.
 
@@ -162,9 +159,9 @@ With `--src-fd` or `--as-fd`, `cp` transfers the raw contents of one exact
 UTF-8 key instead of a prefix tree, without a local temporary file. See
 [File descriptors](commands/cp.md#file-descriptors) for examples.
 
-S3 descriptor copies send four 16 MiB parts in parallel by default, buffering
-about one part for each. An upload of unknown length stops at 10,000 parts, 156.25 GiB at the default part size;
-set a larger `--performance-tuning s3-part-size=SIZE` before starting a larger
+S3 descriptor copies buffer about 80 MiB at the default 16 MiB part size. An
+upload of unknown length stops at 10,000 parts, 156.25 GiB at that size; set a
+larger `--performance-tuning s3-part-size=SIZE` before starting a larger
 upload. There is no restart recovery. An upload replaces the object only on
 completion, and on failure syq tries to abort the multipart upload, which may
 otherwise need provider tools to clean up. A lost completion response can mean
