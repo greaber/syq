@@ -60,6 +60,11 @@ pub(crate) use receiver::*;
 pub(crate) use ssh::start as start_ssh_workers;
 use statefs::*;
 
+/// The effective account's login name, for messages; `None` if unknown.
+pub(crate) fn current_account_name() -> Option<String> {
+    current_account().ok().map(|(name, _)| name)
+}
+
 // Generation 7: one enrollment per account, whose directives the user's own login
 // key signs. Released enrollments (generations 3 to 6, from v0.4.0 to v0.7.1)
 // keep their state in other directories; this build never reads them.

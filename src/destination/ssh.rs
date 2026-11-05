@@ -22,10 +22,10 @@ pub(crate) mod workers;
     long_about = "Open an SSH shell or run a command. With no command, open a shell. Like ssh, the remote shell interprets command arguments joined with spaces; quote shell syntax for the remote shell. This differs from syq exec --on @NAME, which passes literal arguments."
 )]
 struct SshCommand {
-    /// Authorization source; omitted uses SYQ_AUTH_FROM, then the saved preference, then native SSH
+    /// Whose SSH access to use: this machine's own (auto or ssh), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST); omitted uses SYQ_AUTH_FROM, then the saved choice, then auto
     #[arg(long, value_name = "auto|ssh|@NAME|HOST", value_parser = crate::cli::parse_auth_from)]
     auth_from: Option<AuthFrom>,
-    /// Use connections and authorization preferences from this persistence scope
+    /// Use the isolated connections and settings that `syq persist on --ephemeral` created at PATH
     #[arg(long, value_name = "PATH")]
     pscope: Option<PathBuf>,
     /// Request a terminal, including when running a command
@@ -95,6 +95,9 @@ fn parse_command(argv: &[OsString]) -> Result<(Invocation, Option<AuthFrom>, Opt
     }
     let destination = crate::cli::parse_native_endpoint(Some(&parsed.destination))?
         .context("SSH destination is missing")?;
+    if let Some(name) = destination.host.strip_prefix('@') {
+        bail!("@{name} is a receiving name, not an SSH server; to run a command on that machine, use `syq exec --on @{name} -- COMMAND`");
+    }
     validate_endpoint(&destination)?;
     if parsed.command.iter().any(|arg| arg.as_bytes().contains(&0)) {
         bail!("SSH command arguments must not contain NUL");
@@ -213,6 +216,9 @@ pub(crate) fn validate_host_key_alias(alias: &str) -> Result<()> {
 }
 
 pub(crate) fn validate_endpoint(endpoint: &NativeEndpoint) -> Result<()> {
+    if let Some(name) = endpoint.host.strip_prefix('@') {
+        bail!("@{name} is a receiving name, not an SSH server");
+    }
     if endpoint.host.is_empty()
         || endpoint.host.starts_with('-')
         || !endpoint

@@ -320,12 +320,17 @@ depend on the request:
 
 | `kind` | Request | Fields |
 | --- | --- | --- |
-| Absent | Copy to this machine or an approved destination | `destination`, `permission`, `max_bytes`, `max_entries`, `max_delete`, `preserve_permissions` |
+| Absent | Copy to this machine or an approved destination | `destination`, `permission`, `max_bytes`, `max_entries`, `max_delete`, `preserve_permissions`, optional `warnings` |
 | `command` | Command on this machine | `argv`, `cwd`, `permission` |
 | `ssh` | SSH account access through a receiving connection | `destination`, `permission`, `reusable`, optional `account` |
 | `provider_ssh` | SSH account access through an ordinary SSH provider login | `destination`, `permission`, `provider_account` |
 | `source` | Read selected source paths for a copy | `source`, `scopes`, `permission`, `max_bytes`, `max_entries` |
 | `storage` | Storage access | `description` |
+
+`warnings` lists what a copy lets the server do beyond copying plain files, as
+display text that completes "The server …", for example
+`can delete up to 3 files or folders anywhere in the destination`. It is absent
+or empty when there is nothing to warn about.
 
 `account` contains `profile`, `source`, and `destination`. Each account
 identity has an `endpoint`, trusted SHA256 fingerprints in `host_keys`, and an

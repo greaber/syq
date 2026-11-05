@@ -982,11 +982,14 @@ fn receiver_destinations_require_sigil_and_never_fall_back() {
     assert!(!explicit.status.success());
     let error = stderr_of(&explicit);
     assert!(
-        error.contains("could not connect to receiving machine"),
+        error.contains("could not reach the receiving machine"),
         "{error}"
     );
     assert!(!error.contains("offline"), "{error}");
-    assert!(error.contains("syq persist connect SERVER"), "{error}");
+    assert!(
+        error.contains("run `syq persist connect HOST` on that machine"),
+        "{error}"
+    );
     assert!(!t.path("ssh-used").exists());
     // An older process can hand a selected bare receiver to this helper.
     // Reject that spelling rather than reinterpret its pinned destination as SSH.
@@ -1067,6 +1070,150 @@ fn receiver_destinations_require_sigil_and_never_fall_back() {
         !t.path("ssh-used").exists(),
         "a denied return copy switched to SSH"
     );
+}
+
+/// A leading `@NAME` is a receiving name in every command, never an SSH login
+/// with an empty user name. An unknown name, or a command that cannot use a
+/// receiving machine, fails at once and says what to do, without running ssh.
+#[test]
+fn unknown_receiving_names_never_reach_ssh_and_say_what_to_do() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"source");
+    let recorder = b"#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SSH_MARKER\"\nexit 255\n";
+    executable_support::write_executable(&t.path("bin/ssh"), recorder, 0o700);
+    executable_support::write_executable(&t.path("bin/record-rsh"), recorder, 0o700);
+    let rsh = t.s("bin/record-rsh");
+    let mut path = vec![t.path("bin")];
+    path.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(path).unwrap();
+    let syq = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_STATE_HOME", t.path("state"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .env("PATH", &path)
+            .env("SSH_MARKER", t.path("ssh-used"))
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .env_remove("SYQ_AUTH_FROM")
+            .current_dir(t.path(""))
+            .stdin(Stdio::null())
+            .capture_output()
+            .unwrap()
+    };
+    // Refused before receiving settings are saved.
+    let refused = syq(&["persist", "receive", "on", "--connection", "@master"]);
+    assert!(!refused.status.success());
+    assert!(
+        stderr_of(&refused).contains("@master is a receiving name, not an SSH server: --connection takes the SSH server this machine should connect to"),
+        "{}",
+        stderr_of(&refused)
+    );
+    assert!(!t.path("config").exists(), "receiving settings were saved");
+    // Control: the same commands with an SSH host do reach both recorders.
+    for args in [
+        &["cp", ".kube", "--from", "server"][..],
+        &["rsync", "-e", &rsh, "server:.kube", "copy/"],
+    ] {
+        let output = syq(args);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(
+            t.path("ssh-used").exists(),
+            "{args:?} did not run ssh: {}",
+            stderr_of(&output)
+        );
+        fs::remove_file(t.path("ssh-used")).unwrap();
+    }
+    let run = |args: &[&str]| {
+        let output = syq(args);
+        let error = stderr_of(&output);
+        assert!(!output.status.success(), "{args:?} succeeded: {error}");
+        assert!(
+            !t.path("ssh-used").exists(),
+            "{args:?} ran ssh: {}\n{error}",
+            String::from_utf8_lossy(&fs::read(t.path("ssh-used")).unwrap())
+        );
+        error
+    };
+    let copy_from = [
+        "cannot copy from receiving machine @master",
+        "run `syq cp PATH --to HOST` on it, where HOST is how it reaches this server",
+    ];
+    for args in [
+        &["cp", ".kube", "--from", "@master"][..],
+        &["cp", ".kube", "--from", "@master", "--rsh", &rsh],
+        &["cp", ".kube", "--from", "@master", "--to", "server"],
+        &["rsync", "-e", &rsh, "@master:.kube", "copy/"],
+    ] {
+        let error = run(args);
+        for expected in copy_from {
+            assert!(error.contains(expected), "{args:?}: {error}");
+        }
+    }
+    let error = run(&["rsync", "-e", &rsh, "source", "@master:copy"]);
+    assert!(
+        error.contains("receiving machine @master cannot be used with syq rsync")
+            && error.contains("`syq cp SOURCE --to @master`"),
+        "{error}"
+    );
+    for (args, command) in [
+        (&["rm", "--on", "@master", "x"][..], "syq rm"),
+        (&["map", "--from", "@master", "x"], "syq map"),
+    ] {
+        let error = run(args);
+        assert!(
+            error.contains(&format!(
+                "receiving machine @master cannot be used with {command}"
+            )) && error.contains("`syq exec --on @master -- COMMAND`"),
+            "{error}"
+        );
+    }
+    let error = run(&["ssh", "@master"]);
+    assert!(
+        error.contains("@master is a receiving name, not an SSH server")
+            && error.contains("`syq exec --on @master -- COMMAND`"),
+        "{error}"
+    );
+    let error = run(&["persist", "connect", "@master"]);
+    assert!(
+        error.contains("@master is a receiving name, not an SSH server: run `syq persist connect HOST` on the receiving machine itself"),
+        "{error}"
+    );
+    // A supported command with an unknown name says which names exist and
+    // how the receiving machine connects.
+    let unknown = |registered: &str| {
+        for args in [
+            &["cp", "source", "--to", "@master"][..],
+            &["cp", "source", "--to", "@master", "--rsh", &rsh],
+            &["exec", "--on", "@master", "--", "true"],
+        ] {
+            let error = run(args);
+            assert!(
+                error.contains(&format!(
+                    "no receiving machine named @master is connected to this server account{registered}"
+                )),
+                "{args:?}: {error}"
+            );
+            assert!(
+                error.contains("To connect a receiving machine, run `syq persist connect HOST` on it (for example your laptop), where HOST is how it reaches this server"),
+                "{error}"
+            );
+            assert!(!error.contains("restarted"), "{error}");
+        }
+    };
+    unknown(".");
+    // Looking up a name creates the private registry directory.
+    let registry = t.path(".syq-destinations-v3");
+    fs::create_dir_all(&registry).unwrap();
+    fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
+    write(&registry.join("laptop.json"), b"{}");
+    unknown("; did you mean @laptop?");
+    write(&registry.join("desk.json"), b"{}");
+    unknown(". Names registered here: @desk, @laptop.");
 }
 
 #[test]

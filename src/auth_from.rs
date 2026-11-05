@@ -78,13 +78,13 @@ impl std::fmt::Display for Provider {
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct PreferenceCommand {
-    /// Authorization for later commands; omit to show saved defaults
+    /// Value to save, as for --auth-from; omit to show the saved choices
     #[arg(value_name = "auto|ssh|@NAME|HOST", value_parser = crate::cli::parse_auth_from)]
     value: Option<AuthFrom>,
     /// Apply to this exact destination hostname or SSH alias, for any login/port
     #[arg(long = "for", value_name = "HOST", value_parser = host_key)]
     host: Option<String>,
-    /// Remove the selected override so it inherits the default
+    /// Remove the saved choice for --for HOST, or without --for, reset the default to auto
     #[arg(long, conflicts_with = "value")]
     reset: bool,
 }

@@ -11,11 +11,9 @@ pub(crate) fn configure(command: Command) -> Command {
 fn advanced_description(path: &str) -> Option<&'static str> {
     match path {
         "syq map" => Some("Print source-to-destination mappings as NDJSON"),
-        "syq receiver" => Some("Manage manual receiver enrollment and recovery"),
+        "syq receiver" => Some("Manage restricted copying on server accounts"),
         "syq receiver enroll" => Some("Manually enroll or refresh a server account"),
-        "syq persist destinations" => {
-            Some("Inspect shared receiving names; --pscope does not filter them")
-        }
+        "syq persist destinations" => Some("On a server, list or release receiving names"),
         "syq persist receive wait" | "syq persist destinations wait" => {
             Some("Wait for a connection with a deadline")
         }
@@ -265,9 +263,7 @@ pub(crate) fn filesystem(command: Command) -> Command {
             });
         }
         // Shared parser fields need command-specific explanations.
-        if rm && id == "syq_path" {
-            arg = arg.help("Use this exact syq executable on the remote removal endpoint");
-        } else if rm && id == "verbose" {
+        if rm && id == "verbose" {
             arg = arg.help("List removed paths");
         } else if rm && id == "performance_tuning" {
             // Removal accepts only its own concurrency key, never the copy keys.
@@ -341,25 +337,25 @@ pub(crate) fn root() -> Command {
         .arg(Arg::new("version").short('V').long("version").action(ArgAction::Version).help("Print version"))
         .version(crate::identity::version())
         .arg(Arg::new("version_is").long("version-is").value_name("EXPR")
-            .help("Require the invoked release to match EXPR (before the command and other options)")
-            .long_help("Require the invoked release to match EXPR before running anything. Bare x.y.z means exact equality; operators: == != < <= > >=. Commas mean AND; | means OR, with AND binding more tightly. Quote expressions in the shell. Development builds are unsupported. Put --version-is and --use-version before the command, in either order."))
+            .help("Stop unless the syq you invoked matches EXPR (before the command and other options)")
+            .long_help("Stop with an error, before doing anything else, unless the syq you invoked matches EXPR. Bare x.y.z means exactly that version; operators: == != < <= > >=. Commas mean AND; | means OR, with AND binding more tightly. Quote expressions in the shell. Development builds always fail the check. Put --version-is and --use-version before the command, in either order."))
         .arg(Arg::new("use_version").long("use-version").value_name("VERSION")
             .help("Run an exact official release, downloading it if needed (before the command and other options)"))
         .arg(Arg::new("self_update").long("self-update").action(ArgAction::SetTrue)
             .help("Install the newest signed release (standalone installs); Homebrew: brew upgrade syq"))
         .disable_help_subcommand(true)
         .subcommand(Command::new("cp").about("Copy files and directories, optionally removing destination-only files"))
-        .subcommand(Command::new("ssh").about("Open an SSH shell or command with native or approved account access"))
-        .subcommand(Command::new("exec").about("Run a command on a named receiving machine after local approval"))
+        .subcommand(Command::new("ssh").about("Open an SSH shell or run a command, using your own or approved SSH access"))
+        .subcommand(Command::new("exec").about("From a server, run a command on a receiving machine after it approves"))
         .subcommand(Command::new("rm").about("Remove selected files and directory trees"))
-        .subcommand(Command::new("clean-partials").about("Delete syq partial files in directory trees"))
+        .subcommand(Command::new("clean-partials").about("Delete partial files that interrupted syq copies left in directory trees"))
         .subcommand(Command::new("_ls").hide(true).about("List S3 objects (experimental; interface may change)"))
         .subcommand(Command::new("map").about("Print source-to-destination mappings as NDJSON"))
         .subcommand(Command::new("rsync").about("Copy using rsync-compatible syntax"))
-        .subcommand(Command::new("persist").about("Manage persistent connections, receiving, and return destinations"))
+        .subcommand(Command::new("persist").about("Keep SSH connections open, and receive files and requests from connected servers"))
         .subcommand(Command::new("completion").about("Generate shell completion and manage cached endpoint suggestions"))
         .subcommand(Command::new("tuning-cache").about("Inspect and clear local transfer tuning history"))
-        .subcommand(Command::new("receiver").about("Enroll, list, or revoke command-restricted receivers"))
+        .subcommand(Command::new("receiver").about("Set up, list, or revoke restricted copying on server accounts"))
         .subcommand(Command::new("help").about("Show help for a command, e.g. syq help cp")))
 }
 
@@ -392,7 +388,8 @@ pub(crate) fn receiver() -> Command {
     };
     configure(
         Command::new("syq receiver")
-            .about("Manage command-restricted receiver enrollments")
+            .about("Manage restricted copying on server accounts")
+            .long_about("Manage restricted copying, which lets another server copy files into a server account without getting a login there; this machine authorizes each copy. Each account set up for it is an enrollment.")
             .subcommand_required(true)
             .subcommand(
                 Command::new("enroll")
@@ -407,10 +404,10 @@ pub(crate) fn receiver() -> Command {
                     )
                     .arg(via()),
             )
-            .subcommand(Command::new("list").about("List local active and pending enrollments"))
+            .subcommand(Command::new("list").about("List this machine's enrollments, active and pending"))
             .subcommand(
                 Command::new("revoke")
-                    .about("Stop active receivers and remove their enrollment from both machines")
+                    .about("Stop an enrollment's active copies and remove it from both machines")
                     .arg(
                         Arg::new("id")
                             .required(true)
