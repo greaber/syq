@@ -1,13 +1,11 @@
 # Pull and push DVC data
 
 [`dvc_syq.py`](https://github.com/greaber/syq/blob/master/examples/dvc-syq/dvc_syq.py)
-pulls and pushes DVC data with syq. It plans the copies and passes them to syq
-as a batch. Use it to try syq's transfers with your existing DVC repository.
-
-It is a short program written with the [Python SDK](python.md), meant to be
-used, read, and adapted. DVC keeps working alongside it: both use the same
-cache and the same remote, so `dvc status`, `dvc push`, and `dvc pull` treat
-the script's results as their own.
+pulls and pushes DVC data with syq, so you can try syq's transfers on an
+existing DVC repository. It is a short program built on the
+[Python SDK](python.md), meant to be used, read, and adapted. It shares DVC's
+cache and remote, so `dvc status`, `dvc push`, and `dvc pull` treat its results
+as their own.
 
 ## Run it
 
@@ -33,9 +31,8 @@ dvc-syq fetch -R datasets
 dvc-syq push models/speech.dvc
 ```
 
-`uv tool upgrade dvc-syq` fetches the current version. The script is also a
-single file that declares its own dependencies, so you can download it and
-run it without installing anything: `uv run dvc_syq.py pull -R datasets`.
+`uv tool upgrade dvc-syq` updates it. You can also run the downloaded file
+without installing it: `uv run dvc_syq.py pull -R datasets`.
 
 These options have the same meaning as in DVC:
 
@@ -55,9 +52,9 @@ These are the script's own:
 
 ## How it works
 
-DVC's current cache layout names objects after their MD5. The same relative
-path identifies an object in the cache and remote; a separate checkout step
-gives workspace files their original names.
+DVC names each object after its MD5, at the same relative path in the cache
+and the remote. The script downloads missing objects to the same path in the
+cache, then copies each one to the name recorded in its `.dvc` file:
 
 ```python
 def object_path(md5):
@@ -72,22 +69,21 @@ checkout = [MappingEntry(src=object_path(md5), dst=path) for path, md5 in tracke
 client.cp(mapping=checkout, cwd=".dvc/cache", into=".")
 ```
 
-Each list is a [mapping](mappings.md): pairs of source and destination paths
-that syq copies in one run. A push is the first copy in reverse, and
-`if_exists="keep"` makes it skip objects the remote already has. With `--verify`,
-download mappings carry the expected MD5 so syq can check the completed file
-before adding it to the cache. Older DVC text objects can use a newline-normalized
-MD5; the script checks those after download and removes mismatches. Files already
-in the cache are skipped.
+Each list is a [mapping](mappings.md) that syq copies in one run. A push is the
+first copy in reverse, and `if_exists="keep"` skips objects the remote already
+has. With `--verify`, each download carries its expected MD5, so syq checks the
+file before it enters the cache. Older DVC text objects can have an MD5 of
+their newline-normalized contents; the script checks those itself after
+download and removes mismatches.
 
 ## Differences from DVC
 
 - A target is required. DVC pulls or pushes the whole repository when you
   name none; here that is `-R .`.
-- Remotes can be local directories, `ssh://host/path` without an explicit
-  port, or `s3://bucket/prefix`. For S3 the script reads `profile` and
-  `endpointurl` from the DVC remote and otherwise uses your usual AWS
-  credentials. Remotes that use DVC's cloud versioning are refused.
-- Data brought in with `dvc import` is skipped with a message, because it
-  lives in another repository's remote. Use `dvc pull` for it.
+- Remotes can be local directories, `ssh://host/path` without a port, or
+  `s3://bucket/prefix`. For S3 the script reads `profile` and `endpointurl`
+  from the DVC remote and otherwise uses your usual AWS credentials. Remotes
+  with DVC's cloud versioning are refused.
+- Data from `dvc import` lives in another repository's remote, so the script
+  skips it; use `dvc pull` for it.
 - DVC options not listed above, such as `--all-branches`, are not available.
