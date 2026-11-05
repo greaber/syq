@@ -913,11 +913,21 @@ pub(crate) fn protect_keeper_inheritance(command: &mut Command) -> Result<()> {
     Ok(())
 }
 
+/// What the keeper sends the command that started it: that it asked for
+/// approval, then its result. `Ok` and `Err` match how `Result` serializes.
+#[derive(Serialize, Deserialize)]
+enum KeeperMessage {
+    Asking { who: String, what: String },
+    Ok(String),
+    Err(String),
+}
+
 fn start(domain: &Domain, request: SessionRequest, plan: resolution::Plan) -> Result<()> {
     anyhow::ensure!(
         generation_open(domain, &plan.generation)?,
         "SSH account setup was cancelled"
     );
+    let startup_host = request.destination.host.clone();
     let startup = Startup {
         command: crate::approval_command::current()?,
         authorizer: request.provider,
@@ -945,17 +955,27 @@ fn start(domain: &Domain, request: SessionRequest, plan: resolution::Plan) -> Re
     protect_keeper_inheritance(&mut process)?;
     let mut process = Starting(Some(process.spawn_guarded()?));
     super::super::write_message(&mut parent, &startup)?;
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    let reader = std::thread::spawn(move || {
-        let result: Result<std::result::Result<String, String>> =
-            super::super::read_message(&mut parent);
-        let _ = sender.send(result);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+    let reader = std::thread::spawn(move || loop {
+        let message: Result<KeeperMessage> = super::super::read_message(&mut parent);
+        let last = !matches!(message, Ok(KeeperMessage::Asking { .. }));
+        if sender.send(message).is_err() || last {
+            break;
+        }
     });
     let deadline = Instant::now() + Duration::from_secs(360);
-    let mut progress = Instant::now();
+    let started = Instant::now();
+    let mut said = false;
     let result = loop {
         match receiver.recv_timeout(POLL) {
-            Ok(result) => break result,
+            Ok(Ok(KeeperMessage::Asking { who, what })) => {
+                super::super::notices::waiting(&who, &what);
+                said = true;
+                continue;
+            }
+            Ok(Ok(KeeperMessage::Ok(reply))) => break Ok(Ok(reply)),
+            Ok(Ok(KeeperMessage::Err(error))) => break Ok(Err(error)),
+            Ok(Err(error)) => break Err(error),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 break Err(anyhow::anyhow!(
                     "SSH connection setup ended without readiness"
@@ -971,11 +991,11 @@ fn start(domain: &Domain, request: SessionRequest, plan: resolution::Plan) -> Re
                 "SSH connection setup exceeded its approval/start deadline"
             ));
         }
-        if progress.elapsed() >= Duration::from_secs(5) {
-            crate::output::diagnostic!(
-                "syq: waiting for account approval and SSH connection readiness"
-            );
-            progress = Instant::now();
+        // Without a request, the keeper waits for another command's request
+        // for the same account, or for the SSH connection to start.
+        if !said && started.elapsed() >= Duration::from_secs(5) {
+            crate::output::diagnostic!("syq: still setting up SSH access to {}", startup_host);
+            said = true;
         }
     };
     if result.as_ref().is_ok_and(|reply| reply.is_ok()) {
@@ -1059,7 +1079,7 @@ fn keeper(startup: Startup) -> Result<()> {
             cached_selected(&domain, &request.provider, &request.destination, selected)?
         {
             return super::super::write_message(
-                &mut std::io::stdout(),
+                &mut std::io::stdout().lock(),
                 &Ok::<_, String>(cached.endpoint().host.clone()),
             );
         }
@@ -1086,6 +1106,17 @@ fn keeper(startup: Startup) -> Result<()> {
     std::thread::Builder::new()
         .name("syq-ssh-approve".into())
         .spawn(move || {
+            // The keeper's stderr goes nowhere; the foreground says it waits.
+            let asking = || {
+                let _ = super::super::write_message(
+                    // Locked for the whole frame, so the keeper's result cannot split it.
+                    &mut std::io::stdout().lock(),
+                    &KeeperMessage::Asking {
+                        who: approval_request.provider.label(),
+                        what: format!("SSH access to {}", approval_request.destination.host),
+                    },
+                );
+            };
             let _ = sender.send(super::super::ssh_auth::authorize_expected(
                 &approval_domain,
                 &approval_request,
@@ -1093,6 +1124,7 @@ fn keeper(startup: Startup) -> Result<()> {
                 &selected.provider,
                 &selected.policy,
                 &approval_local,
+                &asking,
             ));
         })?;
     let approval_deadline = Instant::now() + Duration::from_secs(330);
@@ -1223,7 +1255,7 @@ fn keeper(startup: Startup) -> Result<()> {
     temporary.persist(&path)?;
     let _index = Index(path);
     super::super::write_message(
-        &mut std::io::stdout(),
+        &mut std::io::stdout().lock(),
         &Ok::<_, String>(format!(
             "{}@{}:{}; SSH control socket: {}",
             endpoint.user.as_deref().unwrap_or(""),
@@ -1406,7 +1438,7 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
         let result = super::super::read_message(&mut std::io::stdin()).and_then(keeper);
         if let Err(error) = result {
             let _ = super::super::write_message(
-                &mut std::io::stdout(),
+                &mut std::io::stdout().lock(),
                 &Err::<String, _>(format!("{error:#}")),
             );
             return Err(error);

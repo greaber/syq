@@ -46,7 +46,8 @@ An explicit `--auth-from` (`--syq-auth-from` for `syq rsync`), including `auto`,
 wins over all of them.
 `--reset --for HOST` removes one override; `--reset` restores the default to
 `auto` while keeping host overrides. Omit the value to show saved choices, or
-add `--for HOST` to show that host's effective choice.
+add `--for HOST` to show that host's effective choice. Both also show when
+`SYQ_AUTH_FROM` overrides the saved choices.
 
 Defaults apply to `syq ssh`, copies using approved account connections, and the
 SSH endpoints of `rsync`, `rm`, `map`, and `clean-partials`. A copy explicitly

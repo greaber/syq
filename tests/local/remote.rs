@@ -427,7 +427,8 @@ fn a_dead_agent_socket_inside_tmux_is_replaced_by_the_session_socket() {
         let used = fs::read_to_string(t.path("ssh-agent")).unwrap();
         (PathBuf::from(used.trim_end()), t.path("tmux-used").exists())
     };
-    let tmux = Some("/tmp/tmux-fixture/default,1234,0");
+    let tmux_value = "/tmp/tmux-fixture/default,1234,0";
+    let tmux = Some(tmux_value);
 
     // The shell's socket is gone, as after reattaching from a new login:
     // ssh gets the session's socket, where an agent answers.
@@ -441,6 +442,26 @@ fn a_dead_agent_socket_inside_tmux_is_replaced_by_the_session_socket() {
     }
     // Outside tmux nothing changes, and tmux is not asked.
     assert_eq!(run(None, &dead, &session(&live)), (dead.clone(), false));
+    // A path that exists turns the agent off on purpose.
+    let off = Path::new("/dev/null");
+    assert_eq!(run(tmux, off, &session(&live)), (off.to_path_buf(), false));
+
+    // A command that cannot start ssh does not ask tmux.
+    let _ = fs::remove_file(t.path("tmux-used"));
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "source", "--as", "copy"])
+        .env("HOME", t.path(""))
+        .env("PATH", &paths)
+        .env("SYQ_NO_UPDATE_CHECK", "1")
+        .env("SSH_AUTH_SOCK", &dead)
+        .env("SYQ_TEST_TMUX_VALUE", session(&live))
+        .env("TMUX", tmux_value)
+        .env_remove("SYQ_AUTH_FROM")
+        .current_dir(t.path(""))
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert!(!t.path("tmux-used").exists());
 }
 
 fn add_remote_tool(t: &Tmp, name: &str) {

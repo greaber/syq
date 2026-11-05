@@ -1778,7 +1778,7 @@ impl HeldLaptop {
         // ssh -G reports the default identity file; logging in is refused.
         executable_support::write_executable(
             &t.path("bin/ssh"),
-            b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_8.9p1 >&2; exit 0; fi\nfor argument; do\n  if [ \"$argument\" = -G ]; then printf 'user fixture-user\\nhostname resolved-backup\\nport 2222\\nidentityfile ~/.ssh/id_ed25519\\n'; exit 0; fi\ndone\nprintf '%s\\n' \"${SSH_AUTH_SOCK-unset}\" >> \"$HOME/ssh-used\"\necho 'fixture-user@backup: Permission denied (publickey).' >&2\nexit 255\n",
+            b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_8.9p1 >&2; exit 0; fi\nfor argument; do\n  if [ \"$argument\" = -G ]; then printf 'user fixture-user\\nhostname resolved-backup\\nport 2222\\nhostkeyalgorithms ssh-ed25519\\nidentityfile ~/.ssh/id_ed25519\\n'; exit 0; fi\ndone\nprintf '%s\\n' \"${SSH_AUTH_SOCK-unset}\" >> \"$HOME/ssh-used\"\necho 'fixture-user@backup: Permission denied (publickey).' >&2\nexit 255\n",
             0o700,
         );
         let mut paths = vec![t.path("bin")];
@@ -1819,6 +1819,21 @@ impl HeldLaptop {
         let (request_sender, requests) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel::<()>();
         let stop = laptop.stop.clone();
+        // What the laptop's SSH configuration says about backup, for
+        // account access.
+        let key = ssh_key::PrivateKey::new(
+            ssh_key::private::Ed25519Keypair::from_seed(&[9; 32]).into(),
+            "",
+        )
+        .unwrap()
+        .public_key()
+        .to_openssh()
+        .unwrap();
+        let resolved = serde_json::json!({
+            "endpoint": {"user": "fixture-user", "host": "resolved-backup", "port": 2222},
+            "host_algorithms": "ssh-ed25519",
+            "known_hosts": format!("syq-approved-peer {key}\n"),
+        });
         laptop.responder = Some(std::thread::spawn(move || {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 let mut socket = match listener.accept() {
@@ -1838,18 +1853,23 @@ impl HeldLaptop {
                 let mut bytes = vec![0; u32::from_be_bytes(length) as usize];
                 socket.read_exact(&mut bytes).unwrap();
                 let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                let response = if envelope["message"] == "Ping" {
-                    serde_json::json!("Ready")
+                let responses = if envelope["message"] == "Ping" {
+                    vec![serde_json::json!("Ready")]
+                } else if envelope["message"].get("ResolveLocalSsh").is_some() {
+                    vec![serde_json::json!("Ready"), resolved.clone()]
                 } else {
+                    // A copy, or account access: what a person approves.
                     request_sender.send(envelope).unwrap();
                     released
                         .recv_timeout(Duration::from_secs(60))
                         .expect("the test releases each held request");
-                    serde_json::json!({"Error": "copy denied by fixture"})
+                    vec![serde_json::json!({"Error": "denied by fixture"})]
                 };
-                let bytes = serde_json::to_vec(&response).unwrap();
-                let _ = socket.write_all(&(bytes.len() as u32).to_be_bytes());
-                let _ = socket.write_all(&bytes);
+                for response in responses {
+                    let bytes = serde_json::to_vec(&response).unwrap();
+                    let _ = socket.write_all(&(bytes.len() as u32).to_be_bytes());
+                    let _ = socket.write_all(&bytes);
+                }
             }
         }));
         laptop.requests = requests;
@@ -1942,14 +1962,15 @@ impl Drop for HeldLaptop {
 
 #[test]
 fn automatic_fallback_explains_failed_credentials_and_says_at_once_that_it_waits() {
+    use std::os::unix::net::UnixListener;
     let laptop = HeldLaptop::new();
     let t = &laptop.t;
     let asking = "asking @laptop to approve this copy to backup";
+    let upload = || laptop.command(&["cp", "source", "--to", "backup"]);
 
     // No agent and no key files: asking the laptop is the ordinary way to
     // authorize this copy, so syq says only that it waits for approval.
-    let (status, stderr, requests) =
-        laptop.run(&mut laptop.command(&["cp", "source", "--to", "backup"]));
+    let (status, stderr, requests) = laptop.run(&mut upload());
     assert!(!status.success());
     assert_eq!(requests.len(), 1, "{stderr}");
     assert!(requests[0]["message"].get("Forward").is_some());
@@ -1959,28 +1980,23 @@ fn automatic_fallback_explains_failed_credentials_and_says_at_once_that_it_waits
             == "syq: waiting up to 5 minutes for @laptop to approve this copy to backup; approve it there in the desktop prompt or with `syq persist receive pending`"),
         "{stderr}"
     );
-    assert!(stderr.contains("copy denied by fixture"), "{stderr}");
+    assert!(stderr.contains("denied by fixture"), "{stderr}");
 
-    // A key file the destination rejected.
+    // A key file that did not get this machine in.
     write(&t.path(".ssh/id_ed25519"), b"fixture key");
-    let (status, stderr, requests) =
-        laptop.run(&mut laptop.command(&["cp", "source", "--to", "backup"]));
+    let (status, stderr, requests) = laptop.run(&mut upload());
     assert!(!status.success());
     assert_eq!(requests.len(), 1, "{stderr}");
     assert!(
         stderr.lines().any(|line| line
-            == format!("syq: backup did not accept this machine's SSH keys; {asking}. To avoid this, authorize one of them on backup")),
+            == format!("syq: this machine could not log in to backup with its SSH keys; {asking}. To avoid this, make sure this machine's key is authorized on backup and available to its SSH agent")),
         "{stderr}"
     );
     fs::remove_file(t.path(".ssh/id_ed25519")).unwrap();
 
     // An agent socket where nothing answers, outside tmux.
     let dead = t.path("dead-agent.sock");
-    let (status, stderr, requests) = laptop.run(
-        laptop
-            .command(&["cp", "source", "--to", "backup"])
-            .env("SSH_AUTH_SOCK", &dead),
-    );
+    let (status, stderr, requests) = laptop.run(upload().env("SSH_AUTH_SOCK", &dead));
     assert!(!status.success());
     assert_eq!(requests.len(), 1, "{stderr}");
     assert!(
@@ -1992,6 +2008,57 @@ fn automatic_fallback_explains_failed_credentials_and_says_at_once_that_it_waits
         fs::read_to_string(t.path("ssh-used")).unwrap(),
         format!("unset\nunset\n{}\n", dead.display())
     );
+
+    // An agent that refuses to list its keys has not shown that this
+    // machine has none.
+    let sockets = test_support::short_tempdir().unwrap();
+    let socket = sockets.path().join("agent");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let agent = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 5];
+        stream.read_exact(&mut request).unwrap();
+        // SSH_AGENT_FAILURE
+        stream.write_all(&[0, 0, 0, 1, 5]).unwrap();
+    });
+    let (status, stderr, requests) = laptop.run(upload().env("SSH_AUTH_SOCK", &socket));
+    agent.join().unwrap();
+    assert!(!status.success());
+    assert_eq!(requests.len(), 1, "{stderr}");
+    assert!(
+        stderr.lines().any(|line| line
+            == format!("syq: this machine could not log in to backup, and the SSH agent at {} refused to list its keys; {asking}. To fix this, restart that agent", socket.display())),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn account_access_says_at_once_that_it_waits_for_the_laptop() {
+    let laptop = HeldLaptop::new();
+    // The keeper that asks for account access has no stderr of its own; the
+    // command says that it waits as soon as the request goes out.
+    for command in [
+        laptop.command(&["cp", "source", "--to", "backup", "--auth-from", "@laptop"]),
+        {
+            let mut command = laptop.command(&["cp", "source", "--to", "backup"]);
+            command.env("SYQ_AUTH_FROM", "@laptop");
+            command
+        },
+    ] {
+        let mut command = command;
+        let (status, stderr, requests) = laptop.run(&mut command);
+        assert!(!status.success());
+        assert_eq!(requests.len(), 1, "{stderr}");
+        assert!(requests[0]["message"].get("LocalSsh").is_some(), "{stderr}");
+        assert!(
+            stderr.lines().any(|line| line
+                == "syq: waiting up to 5 minutes for @laptop to approve SSH access to backup; approve it there in the desktop prompt or with `syq persist receive pending`"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("denied by fixture"), "{stderr}");
+        assert!(!stderr.contains("still setting up"), "{stderr}");
+        assert!(!laptop.t.path("ssh-used").exists(), "{stderr}");
+    }
 }
 
 #[test]

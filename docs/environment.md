@@ -54,10 +54,12 @@ Diagnostic formats can change between versions. For scripts, use
 
 Inside tmux, a shell keeps the `SSH_AUTH_SOCK` it started with, which stops
 working when you reattach from a new SSH login: that login's agent socket is
-gone. When the socket no longer exists, syq asks tmux for the session's
-current `SSH_AUTH_SOCK` and, if an agent answers there, uses it for the
-programs it starts, such as `ssh`, as a new shell in that session would. To
-fix the shell itself, run `eval "$(tmux show-environment -s SSH_AUTH_SOCK)"`.
+gone. When a command that can use SSH finds that the socket no longer
+exists, syq asks tmux for the session's current `SSH_AUTH_SOCK` and, if an
+agent you own answers there, uses it for the programs it starts, such as
+`ssh`, as a new shell in that session would. A path that exists, such as
+`/dev/null` to turn the agent off, is left alone. To fix the shell itself, run
+`eval "$(tmux show-environment -s SSH_AUTH_SOCK)"`.
 
 ## Local state
 

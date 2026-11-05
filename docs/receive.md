@@ -278,9 +278,10 @@ for routing details.
 
 If hostA has no SSH credentials of its own, asking your laptop is simply how
 the copy gets authorized, and syq asks without a warning, as agent forwarding
-would. If hostA has credentials that did not work, such as keys hostB does not
-accept or an `SSH_AUTH_SOCK` where no agent answers, syq still asks your
-laptop, but first prints one line saying what went wrong and how to fix it.
+would. If hostA has credentials that did not work, such as keys that do not
+get it into hostB or an `SSH_AUTH_SOCK` where no agent answers, syq still asks
+your laptop, but first prints one line saying what went wrong and how to fix
+it.
 
 Inside tmux, a shell keeps the `SSH_AUTH_SOCK` it started with, which stops
 working after you reattach from a new SSH login. Syq then uses the tmux
@@ -288,7 +289,17 @@ session's current one, so your agent keeps working for syq; see
 [Environment](environment.md#other-variables).
 
 To choose authorization for every command in a shell or a script, such as one
-a coding agent runs, set `SYQ_AUTH_FROM` to any value `--auth-from` takes, for
-example `@laptop` for the account access described above. An explicit
-`--auth-from` still wins. `SYQ_CP_OPTIONS` adds other options to every
-`syq cp`; see [Environment](environment.md).
+a coding agent runs, set `SYQ_AUTH_FROM` to any value `--auth-from` takes. It
+overrides your saved choices, including per-host ones, and an explicit
+`--auth-from` still wins over it. The choices trade convenience for reach:
+
+- `auto`, the default, uses hostA's own SSH access and asks your laptop to
+  approve each eligible copy when that fails. Each approval covers only the
+  paths it shows.
+- `@laptop` asks once for access to each destination account, as described
+  above. Like forwarding your SSH agent, that access lets the server run any
+  command as that account while it lasts.
+- `ssh` uses only hostA's own SSH access and never asks your laptop.
+
+`SYQ_CP_OPTIONS` adds other options to every `syq cp`; see
+[Environment](environment.md).

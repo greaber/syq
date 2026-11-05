@@ -43,8 +43,12 @@ pub(super) fn asking(
                 "no SSH agent answers at {}, the IdentityAgent for {host}, so this machine could not log in; {asking}. To fix this, start that agent or change IdentityAgent in your SSH configuration",
                 socket.display()
             ),
+            Credentials::AgentFailed { socket, reason } => format!(
+                "this machine could not log in to {host}, and the SSH agent at {} {reason}; {asking}. To fix this, restart that agent",
+                socket.display()
+            ),
             Credentials::Present => format!(
-                "{host} did not accept this machine's SSH keys; {asking}. To avoid this, authorize one of them on {host}"
+                "this machine could not log in to {host} with its SSH keys; {asking}. To avoid this, make sure this machine's key is authorized on {host} and available to its SSH agent"
             ),
         },
         _ => format!("{}; {asking}", error.root_cause()),
@@ -55,13 +59,18 @@ pub(super) fn asking(
 /// What this machine had to offer when ssh reported rejected credentials.
 #[derive(Debug, PartialEq, Eq)]
 enum Credentials {
-    /// No agent keys and no key files: nothing was there to reject.
+    /// No agent keys, key files or PKCS#11 provider: nothing to offer.
     None,
     /// Nothing answers at the agent socket ssh used. `environment` says
     /// whether that socket came from `SSH_AUTH_SOCK` rather than an
     /// `IdentityAgent` setting.
     DeadAgent { socket: PathBuf, environment: bool },
-    /// Keys the destination did not accept, or credentials syq could not
+    /// The agent is there but did not list its keys, for `reason`.
+    AgentFailed {
+        socket: PathBuf,
+        reason: &'static str,
+    },
+    /// Keys that did not get this machine in, or credentials syq could not
     /// rule out.
     Present,
 }
@@ -86,7 +95,8 @@ fn credentials(spec: &crate::conn::RemoteSpec) -> Credentials {
     classify(
         &config,
         agent.map(|socket| {
-            let answer = crate::agent_socket::inspect(&socket, Duration::from_secs(2));
+            let answer =
+                crate::agent_socket::inspect(&socket, Instant::now() + Duration::from_secs(2));
             (socket, answer)
         }),
         |path| path.exists(),
@@ -111,8 +121,18 @@ fn classify(
                 environment,
             };
         }
+        Some((socket, Agent::Failed(reason))) => {
+            return Credentials::AgentFailed { socket, reason };
+        }
         Some((_, Agent::Identities(0))) | None => {}
-        Some((_, Agent::Identities(_) | Agent::Unreadable)) => return Credentials::Present,
+        Some((_, Agent::Identities(_))) => return Credentials::Present,
+    }
+    // A PKCS#11 provider holds keys that neither the agent nor files show.
+    if config
+        .lines()
+        .any(|line| line.starts_with("pkcs11provider ") && line != "pkcs11provider none")
+    {
+        return Credentials::Present;
     }
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let key_files = config
@@ -152,12 +172,34 @@ mod tests {
             classify(defaults, Some((socket.clone(), Agent::Identities(0))), none),
             Credentials::None
         );
-        for answer in [Agent::Identities(1), Agent::Unreadable] {
-            assert_eq!(
-                classify(defaults, Some((socket.clone(), answer)), none),
-                Credentials::Present
-            );
-        }
+        assert_eq!(
+            classify(defaults, Some((socket.clone(), Agent::Identities(1))), none),
+            Credentials::Present
+        );
+        // An agent that fails to list its keys is not an empty one.
+        assert_eq!(
+            classify(
+                defaults,
+                Some((socket.clone(), Agent::Failed("refused to list its keys"))),
+                none
+            ),
+            Credentials::AgentFailed {
+                socket: socket.clone(),
+                reason: "refused to list its keys"
+            }
+        );
+        assert_eq!(
+            classify(
+                &format!("{defaults}pkcs11provider /usr/lib/token.so\n"),
+                None,
+                none
+            ),
+            Credentials::Present
+        );
+        assert_eq!(
+            classify(&format!("{defaults}pkcs11provider none\n"), None, none),
+            Credentials::None
+        );
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
         let ed25519 = home.join(".ssh/id_ed25519");
         assert_eq!(

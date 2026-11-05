@@ -265,8 +265,9 @@ When a receiving machine is asked, syq prints one line saying why, unless
 this machine simply has no SSH credentials to offer: no keys in its agent and
 none of the key files its SSH configuration names. Asking the receiving
 machine is then the normal way to authorize the copy. Otherwise the line names
-what went wrong and how to fix it: the server did not accept this machine's
-keys, nothing answers at the agent socket SSH uses, or the SSH error itself.
+what went wrong and how to fix it: this machine's keys did not get it in,
+nothing answers at the agent socket SSH uses, the agent there did not list
+its keys, or the SSH error itself.
 Unsupported copy options use only the source
 machine's SSH access. Helper setup and copy errors do not trigger another
 authorization attempt. Once approval is requested, refusal or failure ends

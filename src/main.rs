@@ -165,6 +165,25 @@ fn max_files_per_process() -> Option<libc::rlim_t> {
         .then_some(value as libc::rlim_t)
 }
 
+/// Whether a parsed copy, removal or listing names an SSH endpoint, so that
+/// it can start ssh. Receiving names and object storage use no SSH login.
+fn reaches_ssh(args: &cli::Args) -> bool {
+    if args.s3.is_some() {
+        return false;
+    }
+    let ssh = |location: &cli::Location| {
+        location
+            .host
+            .as_deref()
+            .is_some_and(|host| !host.starts_with('@'))
+    };
+    args.locations.iter().any(ssh)
+        || args
+            .paths
+            .iter()
+            .any(|path| cli::Location::parse(path).is_ok_and(|location| ssh(&location)))
+}
+
 fn main() {
     run();
     // A command that returned normally succeeds, unless its output could
@@ -302,8 +321,14 @@ fn run() {
         crate::output::exit_on_error(&error, 2, "syq");
     }
     destination::handoff::record_command_line(&argv);
-    // Before the commands below start ssh, or any thread.
-    agent_socket::repair_from_tmux();
+    // Commands that can start ssh, before they start it or any thread. The
+    // copy commands check their endpoints after parsing, below.
+    if matches!(
+        argv.get(1).and_then(|arg| arg.to_str()),
+        Some("ssh" | "exec" | "persist" | "receiver")
+    ) {
+        agent_socket::repair_from_tmux();
+    }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("ssh") {
         match destination::ssh::run(&argv[1..]) {
             Ok(code) => crate::output::exit(code),
@@ -393,6 +418,9 @@ fn run() {
             crate::output::exit_on_error(&e, 2, "syq");
         }
     };
+    if reaches_ssh(&args) {
+        agent_socket::repair_from_tmux();
+    }
     fsops::reserve_startup_descriptors();
     args.warn_unsupported_options();
     args.normalize();

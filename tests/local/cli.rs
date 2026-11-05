@@ -1145,6 +1145,22 @@ fn auth_from_environment_sets_the_choice_below_the_command_line() {
         stderr_of(&out)
     );
     assert!(!tried_ssh());
+    // Showing the choices says what the variable overrides.
+    let shown = |args: &[&str], choice| String::from_utf8(command(args, choice).stdout).unwrap();
+    let show = ["persist", "auth-from", "--for", "backup"];
+    assert_eq!(shown(&show, None), "backup: @nosuch\n");
+    assert_eq!(
+        shown(&show, Some("ssh")),
+        "backup: ssh (SYQ_AUTH_FROM; saved: @nosuch)\n"
+    );
+    assert_eq!(
+        shown(&["persist", "auth-from", "--for", "other"], Some("ssh")),
+        "other: ssh (SYQ_AUTH_FROM; saved: auto, default)\n"
+    );
+    assert_eq!(
+        shown(&["persist", "auth-from"], Some("ssh")),
+        "default: auto\nbackup: @nosuch\nSYQ_AUTH_FROM: ssh (overrides the saved choices above)\n"
+    );
     // An empty value is the same as none.
     let out = command(&upload, Some(""));
     assert!(

@@ -416,16 +416,37 @@ pub(crate) fn run(domain: &Domain, command: PreferenceCommand) -> Result<i32> {
     } else {
         load(domain)?
     };
+    // The variable decides for every host while it is set.
+    let variable = match environment(std::env::var_os(ENVIRONMENT)) {
+        Ok(choice) => choice,
+        Err(error) => {
+            crate::output::diagnostic!("syq: warning: {error:#}");
+            None
+        }
+    };
     if let Some(host) = &command.host {
-        crate::output::command_human_stdout!(
-            "{host}: {}{}",
+        let saved = format!(
+            "{}{}",
             spelling(&config.selected(host)?),
             if config.hosts.contains_key(host) {
                 ""
             } else {
-                " (default)"
+                ", default"
             }
         );
+        match &variable {
+            Some(choice) => crate::output::command_human_stdout!(
+                "{host}: {} ({ENVIRONMENT}; saved: {saved})",
+                spelling(choice)
+            ),
+            None if config.hosts.contains_key(host) => {
+                crate::output::command_human_stdout!("{host}: {saved}")
+            }
+            None => crate::output::command_human_stdout!(
+                "{host}: {} (default)",
+                spelling(&config.selected(host)?)
+            ),
+        }
     } else {
         crate::output::command_human_stdout!(
             "default: {}",
@@ -433,6 +454,12 @@ pub(crate) fn run(domain: &Domain, command: PreferenceCommand) -> Result<i32> {
         );
         for (host, value) in &config.hosts {
             crate::output::command_human_stdout!("{host}: {value}");
+        }
+        if let Some(choice) = &variable {
+            crate::output::command_human_stdout!(
+                "{ENVIRONMENT}: {} (overrides the saved choices above)",
+                spelling(choice)
+            );
         }
     }
     Ok(0)
