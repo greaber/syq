@@ -5341,6 +5341,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         let tcp_stats = format_tcp_stats(&transport_stats.lock().unwrap(), has_ssh_data);
         print_statistics(&opts, &progress, &connections, &tcp_stats);
     }
+    // The live display leaves its final counts on screen, and a copy that
+    // stopped on an error prints no summary after them. Say that it failed,
+    // so the error is not left above a line that reads like a finished copy.
+    if aborted && progress.enabled {
+        progress.eprintln(stopped_copy_footer(errors));
+    }
     if let Some(results) = progress.results_writer() {
         results.emit_result(&terminal);
     }
@@ -5349,6 +5355,16 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         dst_ctl.detach();
     }
     Ok(exit_code)
+}
+
+/// The last line of a copy that stopped on an error while the progress
+/// display was shown.
+fn stopped_copy_footer(errors: u64) -> &'static str {
+    match errors {
+        0 => "syq: copy failed",
+        1 => "syq: copy failed; see the error above",
+        _ => "syq: copy failed; see the errors above",
+    }
 }
 
 /// The message a panic was raised with, when it has one.

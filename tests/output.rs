@@ -301,3 +301,57 @@ fn fatal_deferred_metadata_error_leaves_final_incomplete_counts() {
     );
     assert!(!stderr.contains("%  done"), "{stderr:?}");
 }
+
+#[test]
+fn a_copy_stopped_by_an_error_ends_with_the_failure_after_its_progress() {
+    let directory = crate::test_support::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    fs::write(root.join("source"), b"data").unwrap();
+    fs::create_dir(root.join("existing")).unwrap();
+    let error = "syq: destination existing is an existing directory; \
+                 cannot replace it with non-directory source source";
+    let run = |extra: &[&str]| {
+        command(&root)
+            .args(["cp", "source", "--as", "existing"])
+            .args(extra)
+            .spawn_guarded()
+            .and_then(|child| child.wait_with_output())
+            .unwrap()
+    };
+
+    // The progress display ends with its final counts, so the failure follows them.
+    let output = run(&["--progress", "--results", "shown.json"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let (before, after) = stderr
+        .split_once("incomplete  0 B/0 B")
+        .expect("final incomplete counts");
+    assert!(before.contains(error), "{stderr:?}");
+    assert!(
+        after.ends_with("\nsyq: copy failed; see the error above\n"),
+        "{stderr:?}"
+    );
+    assert!(fs::read_dir(root.join("existing"))
+        .unwrap()
+        .next()
+        .is_none());
+
+    // Without the display, and with -q, the error is the only output.
+    for extra in [&[][..], &["-q", "--progress"][..]] {
+        let output = run(extra);
+        assert_eq!(output.status.code(), Some(1), "{extra:?}");
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            format!("{error}\n"),
+            "{extra:?}"
+        );
+    }
+
+    // The result stream is the same either way.
+    run(&["--results", "hidden.json"]);
+    for result in ["shown.json", "hidden.json"] {
+        let record = terminal(&root.join(result));
+        assert_eq!(record["status"], "aborted", "{result}");
+        assert_eq!(record["errors"], 1, "{result}");
+    }
+}
