@@ -256,8 +256,9 @@ still be running. The coordinating server needs `/bin/kill` and either
 ## Authorization selection
 
 For `syq cp` between this machine and one SSH server, omitted `--auth-from`
-uses your [saved authorization choice](persistence-reference.md#authorization-defaults),
-or `auto` if none is set. `--auth-from auto` tries this machine's native SSH
+uses `SYQ_AUTH_FROM` when it is set, then your
+[saved authorization choice](persistence-reference.md#authorization-defaults),
+or `auto` if neither is set. `--auth-from auto` tries this machine's native SSH
 access, regardless of existing approved account connections.
 SSH keeps its normal prompts and configured
 timeouts. If SSH
@@ -268,7 +269,16 @@ machine uses its own SSH configuration and trusted host keys. Timeouts,
 temporary DNS failures, and unrecognized SSH errors end the attempt without
 trying a receiving machine.
 Offline or unsupported receiving connections are skipped. With none available,
-the SSH error is reported. Unsupported copy options use only the source
+the SSH error is reported.
+
+When a receiving machine is asked, syq prints one line saying why, unless
+this machine simply has no SSH credentials to offer: no keys in its agent and
+none of the key files its SSH configuration names. Asking the receiving
+machine is then the normal way to authorize the copy. Otherwise the line names
+what went wrong and how to fix it: this machine's keys did not get it in,
+nothing answers at the agent socket SSH uses, the agent there did not list
+its keys, or the SSH error itself.
+Unsupported copy options use only the source
 machine's SSH access. Helper setup and copy errors do not trigger another
 authorization attempt. Once approval is requested, refusal or failure ends
 the attempt. Elapsed time includes authorization setup; handoffs to older helpers

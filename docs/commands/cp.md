@@ -8,7 +8,8 @@ syq cp --srcs-in project --to server --into backup --dry-run -v
 ```
 
 Put source selectors and `--mapping` before `--to` or a placement option.
-For scripting, see [environment variables](../environment.md)
+For scripting, `SYQ_CP_OPTIONS` supplies extra arguments and `SYQ_AUTH_FROM`
+chooses authorization; see [environment variables](../environment.md)
 and [results](../automation.md).
 
 <!-- CLI: cp -->
@@ -102,7 +103,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--no-compress` | Disable transport compression |
 | `--receiver-max-entries <N>` | Command-restricted receiver ceiling: refuse to touch more than N destination entries |
 | `--receiver-max-bytes <SIZE>` | Command-restricted receiver ceiling: refuse to write more than SIZE bytes of file data in total |
-| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Override saved authorization: try native SSH (auto), require native SSH (ssh), or authorize through @NAME or an SSH host (@NAME also supports S3 copies). Eligible native copies can request laptop authorization after SSH failure |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Override SYQ_AUTH_FROM and saved authorization: try native SSH (auto), require native SSH (ssh), or authorize through @NAME or an SSH host (@NAME also supports S3 copies). Eligible native copies can request laptop authorization after SSH failure |
 | `--coordinate-at <COORDINATE_AT>` | Choose the endpoint that runs the coordinator<br><br>Possible values:<br>- auto: Run locally unless both endpoints are remote, then run at the source<br>- src: Run the coordinator at the source endpoint<br>- dst: Run the coordinator at the destination endpoint<br>- local: Keep the coordinator on the invoking machine and relay the data there<br><br>[default: auto] |
 | `--rsh <COMMAND>` | Remote shell command (default: ssh); the command owns SSH and agent policy when set. An ssh command keeps shared and persistent connections unless its options configure connection sharing; -v shares them only within the run |
 | `--syq-path <PATH>` | Use this remote syq executable instead of installing a helper |

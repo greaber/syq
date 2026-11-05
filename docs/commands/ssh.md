@@ -30,7 +30,7 @@ syq ssh [OPTIONS] <HOST> [-- [COMMAND]...]
 
 | Argument / option | Meaning |
 |---|---|
-| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Authorization source; omitted uses the saved preference, then native SSH |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Authorization source; omitted uses SYQ_AUTH_FROM, then the saved preference, then native SSH |
 | `--pscope <PATH>` | Use connections and authorization preferences from this persistence scope |
 | `-t` | Request a terminal, including when running a command |
 | `-T` | Disable terminal allocation |

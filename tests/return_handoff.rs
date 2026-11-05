@@ -51,7 +51,10 @@ impl Fixture {
             .env("HOME", self.temp.path())
             .env("XDG_CONFIG_HOME", self.temp.path().join("config"))
             .env("XDG_RUNTIME_DIR", self.temp.path().join("runtime"))
-            .env("SYQ_NO_UPDATE_CHECK", "1");
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .env_remove("SSH_AUTH_SOCK")
+            .env_remove("SYQ_AUTH_FROM")
+            .env_remove("TMUX");
         command
     }
 
@@ -66,7 +69,8 @@ impl Fixture {
         fs::create_dir(&bin).unwrap();
         fs::create_dir(self.temp.path().join("runtime")).unwrap();
         let ssh = bin.join("ssh");
-        executable_support::write_executable(&ssh, b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_8.9p1 >&2; exit 0; fi\nprintf 'connect\\n' >> \"$HOME/ssh-used\"\nprintf 'Permission denied (publickey).\\n' >&2\nexit 255\n", 0o700);
+        // `ssh -G` inspects the configuration without connecting.
+        executable_support::write_executable(&ssh, b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_8.9p1 >&2; exit 0; fi\nfor argument; do [ \"$argument\" = -G ] && exit 0; done\nprintf 'connect\\n' >> \"$HOME/ssh-used\"\nprintf 'Permission denied (publickey).\\n' >&2\nexit 255\n", 0o700);
         let listener = UnixListener::bind(self.temp.path().join("absent.sock")).unwrap();
         listener.set_nonblocking(true).unwrap();
         let marker = self.temp.path().join("ssh-used");
@@ -144,11 +148,7 @@ fn assert_failure(output: &Output, text: &str) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains(text), "{stderr}");
     assert!(!stderr.contains("private-test-credential"), "{stderr}");
-    assert!(!stderr.contains("requesting permission"), "{stderr}");
-    assert!(
-        !stderr.contains("requesting command permission"),
-        "{stderr}"
-    );
+    assert!(!stderr.contains("waiting up to"), "{stderr}");
 }
 
 #[test]

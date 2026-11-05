@@ -1723,6 +1723,8 @@ fn remote_path_candidates(
     .transpose()?;
     let domain = crate::persistence::Domain::select(pscope.as_deref())?;
     let auth_from = crate::auth_from::resolve(&domain, &endpoint.host, explicit)?;
+    // Before the listing thread starts ssh, and before any thread.
+    crate::agent_socket::repair_from_tmux();
     let endpoint_for_thread = endpoint.clone();
     let directory_for_thread = directory.path;
     let root_for_thread = directory.confined_root;
