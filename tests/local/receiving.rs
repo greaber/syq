@@ -3103,7 +3103,13 @@ fn a_receiving_service_switches_to_a_new_build_at_its_path_once_idle() {
         installed.request(serde_json::json!({"version": 2, "stop": false, "stop_if_idle": true}));
     assert!(answer.get("stopping").is_none(), "{answer}");
     std::thread::sleep(std::time::Duration::from_secs(1));
-    assert!(!switched.exists());
+    let state = status();
+    assert_eq!(state["busy"]["requests"], 1, "{state}");
+    assert!(
+        !switched.exists(),
+        "{:?}: {state}",
+        fs::read_to_string(&switched)
+    );
 
     // Once the request ends and a quiet while passes, it runs the new
     // build's connect, for this server and scope, without prompts.
