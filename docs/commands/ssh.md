@@ -9,10 +9,9 @@ syq ssh hostB -- hostname
 ```
 
 To authorize through your laptop while working on another server, first
-[connect the laptop to that server](../receive.md#set-up-receiving), then use
-`syq ssh --auth-from @laptop hostB`. Your laptop approves the destination account
-and checks its trusted host keys. The requesting server's SSH configuration
-chooses the account, address, and route; session traffic follows that route.
+[connect the laptop to that server](../receive.md#set-up-receiving), then run
+`syq ssh --auth-from @laptop hostB`. The server's SSH configuration still
+chooses the account, address, and route, and the session follows that route.
 
 <!-- CLI: ssh -->
 ```text
@@ -99,12 +98,10 @@ port-forwarding options.
 
 Without `--auth-from`, syq uses your [saved choice](../persistence-reference.md#authorization-defaults),
 or `auto` when none is saved. For `syq ssh`, `auto` and `ssh` both run native
-SSH once, with your ordinary SSH configuration and syq's persistent connections
-when they are enabled. They do not use an approved account connection, and a
-failed login or command is never retried through a receiving machine.
-
-To ask your laptop directly, use `--auth-from @NAME` or save it as your choice.
-An ordinary SSH endpoint, such as `--auth-from alice@provider:2222`, uses an
-[SSH authorization provider](../receive.md#use-an-ssh-authorization-provider)
-instead. Either way, syq opens or reuses an approved account connection; you do
-not need to run `persist connect` first.
+SSH once, without using an approved account connection, and never fall back to
+a receiving machine. To authorize through your laptop, use
+`--auth-from @NAME`; to use an
+[SSH authorization provider](../receive.md#use-an-ssh-authorization-provider),
+give its endpoint, such as `--auth-from alice@provider:2222`. Either way, syq
+opens or reuses an approved account connection, so you do not need to run
+`persist connect` first.
