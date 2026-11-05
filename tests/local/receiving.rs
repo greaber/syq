@@ -1164,10 +1164,10 @@ fn unknown_receiving_names_never_reach_ssh_and_say_what_to_do() {
     let registry = t.path(".syq-destinations-v3");
     fs::create_dir_all(&registry).unwrap();
     fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
-    write(&registry.join("selaptop.json"), b"{}");
-    unknown("; did you mean @selaptop?");
+    write(&registry.join("laptop.json"), b"{}");
+    unknown("; did you mean @laptop?");
     write(&registry.join("desk.json"), b"{}");
-    unknown(". Names registered here: @desk, @selaptop.");
+    unknown(". Names registered here: @desk, @laptop.");
 }
 
 #[test]

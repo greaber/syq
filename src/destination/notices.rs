@@ -320,9 +320,9 @@ mod tests {
             none.contains("run `syq persist receive on --connection HOST` there instead"),
             "{none}"
         );
-        let one = not_connected("master", &["selaptop".into()], account);
+        let one = not_connected("master", &["laptop".into()], account);
         assert!(
-            one.starts_with("no receiving machine named @master is connected to this server account; did you mean @selaptop?\n"),
+            one.starts_with("no receiving machine named @master is connected to this server account; did you mean @laptop?\n"),
             "{one}"
         );
         let names: Vec<String> = (0..10).map(|n| format!("m{n}")).collect();
@@ -337,13 +337,13 @@ mod tests {
         for message in [&none, &one, &many] {
             assert!(!message.contains("restarted"), "{message}");
         }
-        let offline = offline("selaptop", account);
+        let offline = offline("laptop", account);
         assert!(
-            offline.starts_with("receiving machine @selaptop is registered on this server account but not connected; it may have restarted or lost its connection.\nTo reconnect it, run `syq persist connect HOST` on that machine (for example your laptop), where HOST is how it reaches this server (this server account is alice@j5)."),
+            offline.starts_with("receiving machine @laptop is registered on this server account but not connected; it may have restarted or lost its connection.\nTo reconnect it, run `syq persist connect HOST` on that machine (for example your laptop), where HOST is how it reaches this server (this server account is alice@j5)."),
             "{offline}"
         );
         assert!(
-            offline.ends_with("release the name with `syq persist destinations forget selaptop`."),
+            offline.ends_with("release the name with `syq persist destinations forget laptop`."),
             "{offline}"
         );
         assert!(unreachable(account).contains("run `syq persist connect HOST` on that machine (for example your laptop), where HOST is how it reaches this server (this server account is alice@j5)"));
@@ -352,7 +352,7 @@ mod tests {
             "@master is a receiving name, not an SSH server: run `syq persist connect HOST` on the receiving machine itself (for example your laptop), where HOST is the SSH server it should connect to (this machine is alice@j5)"
         );
         assert!(copy_from("master", account).ends_with("run `syq cp PATH --to HOST` on it, where HOST is how it reaches this server (this server account is alice@j5)."));
-        assert!(outdated("selaptop", "syq ssh", account).contains(
+        assert!(outdated("laptop", "syq ssh", account).contains(
             "update syq on that machine, then run `syq persist connect HOST` on it (for example your laptop)"
         ));
         // Without a known account, the hint is simply left out.
