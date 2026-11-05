@@ -2,7 +2,11 @@
 
 Copy directly between servers without copying your private keys to either server
 or giving one server unrestricted access to your SSH agent. Your machine
-authorizes the copy and shows the results; the file data bypasses it.
+authorizes the copy and shows the results, but the file data doesn't pass
+through it.
+
+Most copies need only the first section. The others cover starting a copy in
+a server's shell, and what to do when the servers can't connect directly.
 
 ## Run the copy from your laptop
 
@@ -22,6 +26,12 @@ HostA gets permission for this transfer only. HostB checks that permission
 and reports what it changed. See [A compromised source server](security.md#a-compromised-source-server)
 for what this protects against. Keep the command on your laptop running until
 the copy finishes; the copy stops if it ends.
+
+<a id="mirror-a-directory"></a>
+
+Most copy options work as usual, including `--prune` to mirror a directory;
+see [Limits and unsupported options](remote-reference.md#limits-and-unsupported-options)
+for the exceptions.
 
 ### What you need
 
@@ -61,11 +71,11 @@ syq receiver list
 syq receiver revoke ID
 ```
 
-Use the ID from `list`. Revocation stops active copies for that enrollment
-and removes its access; completed writes remain. See
-[Enrollment](remote-reference.md#enrollment) for which keys can sign, FIDO
-touches, key changes, and updates. If you used syq 0.7.1 or earlier, remove
-its [old enrollments](remote-reference.md#enrollments-from-older-versions).
+Use the ID from `list`. Revoking stops active copies for that enrollment and
+removes its access; completed writes remain. See
+[Enrollment](remote-reference.md#enrollment) for which keys can sign. If you
+used syq 0.7.1 or earlier, remove its
+[old enrollments](remote-reference.md#enrollments-from-older-versions).
 
 If your machine cannot reach hostB, a copy tries again through hostA; for
 `enroll` or `revoke`, add `--via hostA`.
@@ -74,12 +84,12 @@ If your machine cannot reach hostB, a copy tries again through hostA; for
 
 ## Run the copy from a server
 
-You can also start a copy in the source server's shell and use your laptop's
-SSH credentials to authorize it. This uses a receiving connection from your
-laptop; see [Authorize copies between servers](receive.md#authorize-copies-between-servers)
-for setup, approval, and connectivity requirements.
+When you're working in the source server's shell, you can start the copy
+there and have your laptop authorize it; see
+[Authorize copies between servers](receive.md#authorize-copies-between-servers).
 
-From a third server, first request reusable account access to both endpoints:
+To copy between two other servers from a third one, first request reusable
+access to both accounts:
 
 ```sh
 syq persist connect hostB --auth-from @laptop
@@ -88,24 +98,12 @@ syq cp --from hostB --srcs-in data --to hostC --into /archive --auth-from @lapto
 ```
 
 Approve each account on the laptop; this gives the requesting server
-[full access to both accounts](security.md#ssh-account-access). HostB receives
-only permission for this copy to hostC, and file data goes directly from hostB
-to hostC. Keep the copy and the laptop's receiving connection open until it
-finishes. HostB's SSH server must allow remote forwarding; see
-[Approved account copies](remote-reference.md#approved-account-copies) for
-requirements and option support.
-
-## Mirror a directory
-
-From your laptop:
-
-```sh
-syq cp --prune --max-delete 100 --from hostA --srcs-in data --to hostB --into-existing /archive
-```
-
-This updates `/archive` and removes extras. If more than 100 removals are
-planned, none are performed and the command exits 25. Preview first with
-`--dry-run -v`.
+[full access to both accounts](security.md#ssh-account-access). HostB gets
+permission only for this copy to hostC, and file data goes directly between
+them. Keep the copy and the laptop's receiving
+connection open until it finishes. HostB's SSH server must allow remote
+forwarding; see [Approved account copies](remote-reference.md#approved-account-copies)
+for requirements.
 
 ## Other routes and authentication
 
@@ -116,9 +114,11 @@ cannot connect directly. To relay explicitly:
 syq cp --coordinate-at local --from hostA --srcs-in data --to hostB --into /archive
 ```
 
-This uses your machine's bandwidth and ordinary SSH access to each endpoint.
+This sends the data through your machine, using its bandwidth and your usual
+SSH logins to both servers.
 
-Other authentication modes can use server-held credentials, a destination-
-restricted SSH agent, or full agent forwarding. They grant different authority;
-see the [Remote copy reference](remote-reference.md) before choosing one.
-That page also covers detached copies, results from the destination, and direct-mode limits.
+Other ways to authenticate use credentials kept on a server, an SSH agent
+restricted to the destination, or full agent forwarding. Each grants different
+authority; see the [Remote copy reference](remote-reference.md) before
+choosing one. That page also covers detached copies, results from the
+destination, and limits on direct copies.

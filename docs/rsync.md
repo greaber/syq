@@ -1,7 +1,7 @@
 # Use rsync-style commands
 
-Use `syq rsync` for familiar rsync flags and source/destination syntax with
-syq's transfer engine. It supports local copies, SSH pushes, and SSH pulls:
+`syq rsync` accepts familiar rsync flags and source and destination syntax,
+and copies with syq. It supports local copies, SSH pushes, and SSH pulls:
 
 ```sh
 syq rsync -av project/ backup/project/
@@ -18,9 +18,9 @@ Add `-n` to preview a copy without changing source or destination files:
 syq rsync -avn project/ server:backup/project/
 ```
 
-Remote copies use syq's protocol and helper, installed automatically over SSH;
-see [Automatic installation on SSH servers](install.md#automatic-installation-on-ssh-servers).
-They cannot communicate with an rsync server or daemon. To copy between two
+Remote copies run syq on the server, which it installs automatically over
+SSH; see [Automatic installation on SSH servers](install.md#automatic-installation-on-ssh-servers).
+They can't talk to an rsync server or daemon. To copy between two
 servers, use [native `syq cp`](remote-to-remote.md).
 
 Before adapting an existing command or script, check
