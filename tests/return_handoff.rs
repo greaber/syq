@@ -505,7 +505,7 @@ fn copy_while_the_receiver_switches(switched_to: &str) -> (Output, Vec<serde_jso
     let fifo = fixture.temp.path().join("mapping");
     let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
     assert!(status.success());
-    let child = fixture
+    let mut child = fixture
         .command(&[
             "cp",
             "--mapping",
@@ -531,12 +531,20 @@ fn copy_while_the_receiver_switches(switched_to: &str) -> (Output, Vec<serde_jso
         {
             Ok(file) => break file,
             Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                if child.try_wait().unwrap().is_some() {
+                    done.store(true, std::sync::atomic::Ordering::Release);
+                    panic!(
+                        "the copy ended before it read its mapping: {:?}",
+                        child.wait_with_output().unwrap()
+                    );
+                }
                 assert!(Instant::now() < deadline, "the copy never read its mapping");
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(error) => panic!("{error}"),
         }
     };
+
     register_at(
         fixture.temp.path(),
         &sockets.path().join("new.sock"),
