@@ -142,6 +142,14 @@ upgrading, or remove them by hand: on the server, delete the
 then `~/.local/share/syq/restricted` and `~/.local/libexec/syq-receiver`; on
 your machine, delete `~/.local/state/syq/restricted`.
 
+A copy between servers that sends its data over SSH can add a temporary line
+to the destination account's `~/.ssh/authorized_keys`. Its comment starts with
+`syq-copy-worker-`, and its command runs syq with `--return-ssh-worker`. The
+copy removes the line when it ends, but a copy that is killed, or whose server
+restarts, leaves the line behind, and syq does not remove it later. A leftover
+line lets nothing in: only its copy held the key, and that copy has ended.
+Delete such lines when no copy to that account is running.
+
 Enrollment detects the destination platform and installs a matching executable.
 Source builds require compatible platforms; `--syq-path` does not select the
 restricted receiver. See [Developing syq](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md#direct-server-to-server-copies)
