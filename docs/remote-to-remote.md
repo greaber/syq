@@ -20,40 +20,32 @@ syq cp --from hostA --srcs-in big --to hostB --into big
 
 HostA gets permission for this transfer only. HostB checks that permission
 and reports what it changed. See [A compromised source server](security.md#a-compromised-source-server)
-for what this protects against.
+for what this protects against. Keep the command on your laptop running until
+the copy finishes; the copy stops if it ends.
 
 ### What you need
 
-- SSH access from your machine to both servers. Your SSH configuration
-  checks their host keys, and asks about a server it has not seen before.
-  HostA checks hostB's key with its own SSH configuration; see
+- SSH access from your machine to both servers. HostA checks hostB's host key
+  with its own SSH configuration; see
   [how hostA checks hostB's key](security.md#how-hosta-checks-hostbs-key).
-- A login to hostB with an SSH key that can sign on your machine: a key file
-  without a passphrase, or a key loaded in your SSH agent. Passphrase-protected,
-  FIDO, and PKCS#11 or PIV keys must be in the agent. Password and multi-factor
+- A login to hostB with an SSH key your machine can sign with: a key in your
+  SSH agent, or a key file without a passphrase. Password and multi-factor
   logins cannot authorize these copies.
 - OpenSSH 7.2 or newer on hostB, with a writable `~/.ssh/authorized_keys`.
-- SSH connectivity from hostA to hostB. A reachable TCP data port
-  on hostB, normally in `47600–47699`, enables encrypted TCP workers; see
-  [Make TCP reachable](server-tuning.md#make-tcp-reachable). Otherwise
-  the copy uses SSH workers on the same hostA-to-hostB route. `--no-tcp` selects
-  SSH directly.
+- SSH connectivity from hostA to hostB. Copies are faster when hostA can also
+  reach a TCP data port on hostB; see [Make TCP reachable](server-tuning.md#make-tcp-reachable).
 - An existing parent directory for the destination.
 - A hostB login other than root.
 
-The copy stops if your laptop command ends, so keep it running until the copy finishes.
-
 ### First copy and access management
 
-The first copy to your hostB account sets up restricted copying there. It
-logs in with your usual SSH key, adds one line to hostB's `authorized_keys`
-whose key can only start syq's receiver, and installs syq in
-`~/.local/lib/syq` on hostB. From then on, the key you log in with signs each
-copy on your machine, and hostB checks that signature before writing
-anything. HostA receives that signed authorization and the receiver's entry
-key, which cannot authorize anything by itself. Later copies to any directory of that account
-reuse the setup. With a FIDO key, each copy needs one touch, and a copy that
-sets up or refreshes restricted copying needs about three.
+The first copy to your hostB account sets up restricted copying there, using
+your usual SSH login: it adds one line to hostB's `~/.ssh/authorized_keys` whose
+key can only start syq's receiver, and installs syq in `~/.local/lib/syq`.
+After that, your machine signs each copy with the key you log in with, and
+hostB checks the signature before writing anything. With a FIDO key, each copy
+needs one touch, and a copy that sets up or refreshes restricted copying needs
+about three.
 
 To set up hostB ahead of time, including before a dry run:
 
@@ -70,17 +62,15 @@ syq receiver revoke ID
 ```
 
 Use the ID from `list`. Revocation stops active copies for that enrollment
-and removes its access; completed writes remain. If cleanup fails, retry
-`receiver revoke`. See [Enrollment](remote-reference.md#enrollment)
-for which keys can sign, key changes, and updates. Enrollments made by syq
-0.7.1 and earlier do not appear in `list`; see
-[Enrollments from older versions](remote-reference.md#enrollments-from-older-versions)
+and removes its access; completed writes remain. See
+[Enrollment](remote-reference.md#enrollment) for which keys can sign, key
+changes, and updates. Enrollments made by syq 0.7.1 and earlier do not appear
+in `list`; see [Enrollments from older versions](remote-reference.md#enrollments-from-older-versions)
 to remove them.
 
-Setting up, refreshing, and revoking log in to hostB the way your SSH
-configuration routes `ssh` there, including its jump hosts and proxy
-commands. If that cannot connect, a copy started on your machine tries again
-through hostA. For `enroll` or `revoke`, add `--via hostA` for that retry.
+Setting up and revoking log in to hostB the way your SSH configuration routes
+`ssh` there. If that cannot connect, a copy started on your machine tries
+again through hostA; for `enroll` or `revoke`, add `--via hostA`.
 
 <a id="start-a-copy-from-the-source-server"></a>
 
@@ -101,15 +91,13 @@ syq cp --from hostB --srcs-in data --to hostC --into /archive --auth-from @lapto
 
 Approve each account on the laptop. The requesting server has full access to
 those accounts while the approvals remain open. HostB receives only permission
-for the current copy to hostC; file data goes directly from hostB to hostC,
-using TCP when reachable or SSH otherwise. `--no-tcp` selects SSH directly.
-Keep the copy and laptop receiving connection open until it finishes.
+for the current copy to hostC, and file data goes directly from hostB to hostC.
+Keep the copy and the laptop's receiving connection open until it finishes.
 
-HostB's SSH server must allow remote Unix-socket forwarding for the copy's
-control connection, and OpenSSH 7.8 and later also require remote TCP
-forwarding to be allowed. This does not forward an SSH agent. SSH data workers need
-writable `~/.ssh/authorized_keys` on hostC for a temporary restricted key.
-See [Approved account copies](remote-reference.md#approved-account-copies)
+HostB's SSH server must allow remote Unix-socket forwarding, and on OpenSSH
+7.8 and later remote TCP forwarding too. Copying over SSH needs a writable
+`~/.ssh/authorized_keys` on hostC. See
+[Approved account copies](remote-reference.md#approved-account-copies)
 for option support.
 
 ## Mirror a directory
@@ -126,10 +114,8 @@ planned, none are performed and the command exits 25. Preview first with
 
 ## Other routes and authentication
 
-Copies started from your laptop can switch between encrypted TCP and SSH on
-the selected route. Syq never silently relays file data through your machine
-when a direct connection fails.
-If the servers cannot connect directly, explicitly relay through your machine:
+Syq never silently relays file data through your machine when the servers
+cannot connect directly. To relay explicitly:
 
 ```sh
 syq cp --coordinate-at local --from hostA --srcs-in data --to hostB --into /archive

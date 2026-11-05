@@ -14,12 +14,10 @@ sudo ufw allow from <trusted-client-address> to any port 47600:47699 proto tcp
 ```
 
 Allow the range in any cloud firewall too. Check the transport with
-`syq cp -vv --stats`. Ordinary copies fall back to SSH on the same route when
-TCP is blocked, and say so. To [Run the copy from a server](remote-to-remote.md#run-the-copy-from-a-server)
-with your laptop’s approval, direct encrypted TCP must be reachable.
-
-On Linux, syq can also discover TCP addresses on IP over InfiniBand (IPoIB)
-interfaces.
+`syq cp -vv --stats`. When TCP is blocked, copies fall back to SSH and say so,
+except [downloads your laptop approves per copy](receive.md#authorize-copies-between-servers),
+which need TCP. On Linux, syq also finds addresses on IP over InfiniBand
+(IPoIB) interfaces.
 
 ### Tailscale
 
@@ -46,7 +44,7 @@ syq cp --tcp-congestion bbr --stats data --to server --into /backup
 ```
 
 Use the same data, a fresh destination, and both transfer directions.
-The option applies to syq's TCP sockets. If BBR is missing, see the
+If BBR is missing, see the
 [administrator setup guidance](https://github.com/google/bbr/blob/master/Documentation/bbr-faq.md#how-can-i-try-out-linux-tcp-bbr).
 
 ## Let SSH connections start promptly
@@ -67,14 +65,7 @@ Validate changes with `sshd -t`, then reload SSH using your system's procedure.
 Keep an administrative session open. See [OpenSSH's settings](https://man.openbsd.org/sshd_config#MaxStartups).
 
 <a id="check-local-storage-placement"></a>
-
-## Keep free space available
-
-Leave room for growth and allocation; the useful margin depends on your
-filesystem and workload. XFS's [reserved-block pool](https://man7.org/linux/man-pages/man2/ioctl_xfs_setresblks.2.html)
-can enforce headroom even for root writes. An enlarged reserve reduces usable
-space and must be reapplied after mounting; preserve the original emergency
-allowance when lowering it.
+<a id="keep-free-space-available"></a>
 
 ## Reduce allocation contention
 
@@ -86,7 +77,6 @@ across a wide range of higher counts.
 ## Measure and track improvements
 
 Use [syq-bench](https://greaber.github.io/syq-bench/reproduce.html) for repeatable
-comparisons. Record the commands, versions, mounts, cache state, and other load.
-Keep reporting and flush settings consistent across runs. Measure copy-command
-completion and any subsequent flush separately. See
+comparisons. Record the commands, versions, mounts, cache state, and other load,
+and measure the copy and any later flush separately. See
 [performance tuning](tuning.md) to compare worker counts and request sizes.

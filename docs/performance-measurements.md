@@ -21,71 +21,65 @@ or lose its remote connection while the copy continues.
 ## Worker time
 
 Worker `fractions` divide each state's accumulated duration by `observed_ns`,
-including waits still in progress. They sum to one when activity was observed;
-an empty object means none was observed. `cumulative_fractions` uses all observed
-worker time since collection began. Both exclude time that connection tuning
-keeps workers parked; `parked_ns` and `cumulative_parked_ns` report that time
-separately in nanoseconds. These are
-fractions of worker time, not command elapsed time. `observed` includes retired
-workers; `active` excludes retired workers and workers `parked` by connection tuning. `awaiting_work`
-counts workers waiting for a scheduler job. Compare this with `scan_done` to
-investigate insufficient work supply.
+including waits still in progress, and sum to one when activity was observed;
+an empty object means none was. `cumulative_fractions` covers all worker time
+since collection began. These are fractions of worker time, not command elapsed
+time. Both exclude time that connection tuning keeps workers parked, which
+`parked_ns` and `cumulative_parked_ns` report separately. `observed` counts
+retired workers too; `active` excludes retired and parked workers.
+`awaiting_work` counts workers waiting for a job; compare it with `scan_done`
+to see whether scanning supplies work fast enough.
 
 `source_request` and `source_response` cover sending a request and awaiting its
-response. `destination_send` and `destination_ack` cover sending writes and waiting
-for replies; synchronous local work can occur inside these calls. `pacing` covers
-logical-byte bandwidth waits. Ordinary SSH and TCP copies wait inside transport writes:
-these waits contribute to `destination_send` on pushes and `source_response` on
-pulls. `other_work` is remaining worker activity. A source-response wait alone
-cannot distinguish storage, CPU, transport or downstream backpressure.
+response. `destination_send` and `destination_ack` cover sending writes and
+waiting for replies. `pacing` covers bandwidth-limit waits that count file
+data; ordinary SSH and TCP copies wait inside transport writes instead, which
+shows up in `destination_send` on pushes and `source_response` on pulls.
+`other_work` is remaining worker activity. A source-response wait alone cannot
+distinguish storage, CPU, transport, or downstream backpressure.
 
 ## Endpoint operations
 
-Endpoint `actors` separate filesystem operations, server communication and Linux
-read-ahead helpers. `cumulative_actors` reports the same measurements since the
-connection subscribed, including when its latest sample has not advanced. Labels
-include worker IDs to distinguish connections. Their fractions use each actor's
-own observed time; do not add fractions across actors or to worker fractions.
+Endpoint `actors` separate filesystem operations, server communication, and
+Linux read-ahead. `cumulative_actors` reports the same measurements since the
+connection subscribed. Labels include worker IDs to distinguish connections.
+Fractions use each actor's own observed time; do not add them across actors or
+to worker fractions.
 
-`source_read` measures demand-read syscalls, including reads used to hash existing destination data; `hashing` measures
-content hashing; `destination_write` measures write syscalls, and on a Linux
-network filesystem, where a batch's small files are written in parallel, it also
-includes setting their metadata. `filesystem_copy` keeps a combined measurement where
-filesystem copy operations do not separate reads and writes. `handling` covers
-remaining filesystem request work. Server `request_wait` covers its request queue
-and `response_send` covers serialization and writing replies. Server idleness
-does not by itself prove a transport limit.
-
-`prefetch_advice` measures Linux read-ahead advice calls; its `bytes` are requested
-bytes, not bytes physically read. `prefetch_fence` measures waiting for outstanding
-advice before releasing or shrinking a range. Read and write byte counters count
-completed operations; filesystem-copy bytes are logical bytes and may include
-cloning or offload.
+`source_read` measures read calls, including reads of existing destination
+data for hashing; `hashing` measures content hashing; `destination_write`
+measures writes. `filesystem_copy` combines reads and writes where the
+filesystem's copy operation does not separate them. `handling` covers
+remaining filesystem request work. Server `request_wait` covers its request
+queue and `response_send` covers writing replies; an idle server does not by
+itself prove a transport limit. `prefetch_advice` measures read-ahead requests,
+whose `bytes` were requested rather than read, and `prefetch_fence` measures
+waiting for them. Byte counters count completed operations; filesystem-copy
+bytes are logical and may include cloning.
 
 ## Process CPU
 
 `cpu` is the interval delta; `cumulative_cpu` is the delta since collection began
-for that process. Process identities apply only to this run. Helper `helper_cpu`
-is part of its process CPU, so do not count it twice. Live Linux helper CPU uses
-kernel clock ticks; short intervals can report zero.
+for that process. Process identities apply only to this run. A helper's
+`helper_cpu` is part of its process CPU, so do not count it twice. Short
+intervals can report zero for Linux helpers.
 
 ## Sample timing
 
-Remote reports arrive at response boundaries and on connection retirement.
-`sample_age_ms` measures time since receipt, so network delivery delay is additional
-and clocks on different hosts need not agree. `state_at_sample` is the state at that
-report. When no newer report arrives, endpoint `sample_duration_ms` is null and `actors` is
-empty; process CPU deltas are null too. A blocked remote call can therefore leave
-stale evidence. Endpoint intervals can span several coordinator intervals. The
-first remote CPU sample establishes a baseline and has no delta.
+Remote reports arrive with responses and when a connection retires, so they
+can be older than the coordinator's sample. `sample_age_ms` measures time since
+the report arrived, so network delay comes on top, and host clocks need not
+agree.
+`state_at_sample` is the state at that report. When no newer report has
+arrived, endpoint `sample_duration_ms` and process CPU deltas are null and
+`actors` is empty. The first remote CPU sample has no delta.
 
 ## TCP counters
 
 `tcp` and `tcp_delta` describe the coordinator end of a TCP socket; `peer_tcp` and
 `peer_tcp_delta` describe the remote end at its reported sample. The raw counters
 include RTT and retransmissions; deltas include receive-window-limited and
-send-buffer-limited durations. Local counters are sampled by the progress ticker;
-the final reading is retained after retirement. Null means unavailable, whereas
-zero is a measurement. See the [schema](https://github.com/greaber/syq/blob/master/schemas/automation.schema.json) for the
+send-buffer-limited durations. Null means unavailable, whereas zero is a
+measurement. See the [schema](https://github.com/greaber/syq/blob/master/schemas/automation.schema.json) for the
 complete field definitions.
 

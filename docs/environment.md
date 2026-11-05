@@ -18,9 +18,8 @@ SYQ_CP_OPTIONS='--resource-limits bandwidth=10M' ./nightly-backup.sh
 ```
 
 The value is parsed with shell-style quoting and inserted before the command's
-other arguments. Repeating an option follows the same rules as repeating it
-on the command line. Syq removes these three variables before launching SSH,
-helpers, or other programs; the rest of the environment is passed through.
+other arguments. Syq does not pass these variables on to the programs it
+starts.
 
 ## Choose authorization through the environment
 
@@ -41,25 +40,22 @@ SYQ_AUTH_FROM=@laptop ./agent-task.sh
 |---|---|
 | `SSL_CERT_FILE`, `SSL_CERT_DIR` | Replace the system CA roots for HTTPS; see [HTTPS certificates](security.md#https-certificates) |
 | `SYQ_NO_UPDATE_CHECK`, `DO_NOT_TRACK` | Disable update reminders; see [Updates](install.md#updates) |
-| `SYQ_TUNING_CACHE` | An empty value turns off tuning history, even when `SYQ_TUNING_HISTORY` is set. Otherwise, when `SYQ_TUNING_HISTORY` is unset, the history is kept at this path with its extension replaced by `.history-v1.sqlite`. See [Remembered connection counts](tuning.md#remembered-connection-counts) |
-| `SYQ_TUNING_HISTORY` | Select the local tuning history; empty disables it. See [Tuning history](tuning.md#inspect-tuning-history) |
+| `SYQ_TUNING_CACHE` | Base path for tuning history; an empty value turns history off, even when `SYQ_TUNING_HISTORY` is set. See [Remembered connection counts](tuning.md#remembered-connection-counts) |
+| `SYQ_TUNING_HISTORY` | Tuning history file to use instead; empty disables history. See [Tuning history](tuning.md#inspect-tuning-history) |
 | `SYQ_TUNING_HISTORY_SIZE` | History retention target, default `10M` |
 | `SYQ_DEBUG` | Add internal diagnostics to stderr |
 | `SYQ_S3_DIAGNOSTICS=1` | Add S3 request diagnostics to stderr |
-| `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR` | Relocate cache, preference, and runtime files. Syq ignores a relative value, as the XDG specification requires. They do not move [stored releases](#stored-releases-and-helpers). |
+| `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR` | Relocate cache, preference, and runtime files, but not [stored releases](#stored-releases-and-helpers); relative values are ignored |
 
 Diagnostic formats can change between versions. For scripts, use
 [automation results](automation.md). Usual system variables such as `HOME`,
 `TMPDIR`, and `SSH_AUTH_SOCK` also apply.
 
 Inside tmux, a shell keeps the `SSH_AUTH_SOCK` it started with, which stops
-working when you reattach from a new SSH login: that login's agent socket is
-gone. When a command that can use SSH finds that the socket no longer
-exists, syq asks tmux for the session's current `SSH_AUTH_SOCK` and, if an
-agent you own answers there, uses it for the programs it starts, such as
-`ssh`, as a new shell in that session would. A path that exists, such as
-`/dev/null` to turn the agent off, is left alone. To fix the shell itself, run
-`eval "$(tmux show-environment -s SSH_AUTH_SOCK)"`.
+working when you reattach from a new SSH login. When that socket no longer
+exists, syq uses the tmux session's current agent, if one you own answers, for
+the programs it starts, as a new shell in that session would. To fix the shell
+itself, run `eval "$(tmux show-environment -s SSH_AUTH_SOCK)"`.
 
 ## Local state
 
@@ -79,15 +75,13 @@ Default locations include:
 | `~/.local/state/syq/enrollments/` | Your restricted-copy enrollments, with their entry keys |
 | `~/.local/share/syq/enrollments/` | A server's enrollment state |
 
-Copies can proceed when optional caches cannot be written, and syq does not
-create a missing home directory to hold them. Copies do need a little space for
-private sockets in the temporary directory on each machine: `TMPDIR` when it is
-set, otherwise `/tmp`. Persistent connections need a
-writable runtime directory. If `syq persist on` enabled persistence but syq
-cannot use its setting or runtime directory, a copy warns and connects without
-persistence. See [Enrollment](remote-reference.md#enrollment)
-for receiver state and [Names and profiles](persistence-reference.md#names-and-profiles)
-for backing up or replacing a receiving identity.
+Copies proceed when optional caches cannot be written, but they need a little
+space for private sockets in the temporary directory on each machine: `TMPDIR`
+when it is set, otherwise `/tmp`. Persistent connections need a writable
+runtime directory; without one, a copy warns and connects without persistence.
+See [Enrollment](remote-reference.md#enrollment) for receiver state and
+[Names and profiles](persistence-reference.md#names-and-profiles) for backing
+up or replacing a receiving identity.
 
 ## Stored releases and helpers
 
@@ -100,57 +94,37 @@ directory per release and one below it per platform:
 
 That covers releases you select with
 [`--use-version`](install.md#choose-a-version-for-a-script), helpers syq
-downloads to upload to an SSH server, and, on the server, the helper syq
-installs there, which is also the receiver for
-[restricted copies](remote-reference.md#enrollment) by that build. A home directory shared by several machines keeps a separate
-executable for each platform. A development build uses its build identity in
-place of the release. The store is always in your home directory; XDG
-variables do not move it.
+uploads to SSH servers, and, on a server, the helper syq installs there, which
+also receives [restricted copies](remote-reference.md#enrollment).
 
 Syq does not remove old releases from the store. To remove one you no longer
-use, delete its directory, for example `~/.local/lib/syq/v0.7.1`; syq
-downloads or installs it again if it is needed later. On a server that accepts
-restricted copies, keep any release that a syq line in `~/.ssh/authorized_keys`
-names; see [Enrollment](remote-reference.md#enrollment).
+use, or replace a damaged one, delete its directory, for example
+`~/.local/lib/syq/v0.7.1`; syq downloads or installs it again if it is needed
+later. On a server that accepts restricted copies, keep any release that a syq
+line in `~/.ssh/authorized_keys` names; see [Enrollment](remote-reference.md#enrollment).
 
-Syq starts a stored release only when you own its directories and files in the
-store and nobody else can write them, as syq creates them. `~/.local/lib/syq`
-itself may be a symbolic link, for example to a larger disk; the directory it
-leads to must meet the same rule. Otherwise syq stops and names the problem:
-fix the permissions, or delete what it names and syq installs the release
-again. Setting up restricted copying on a server applies the same rule to the
-receiver it would use there, and uses a stored build only when it is exactly
-the build being set up, by SHA-256; otherwise it uploads and stores that
-build.
-
-If the store, or the home directory it would be created in, belongs to another
-user, syq refuses to use or create it: run syq as that user, or with `HOME` set
-to your own home directory. This happens when you run syq as root with another
-user's `HOME`, for example in a CI container that runs as root with another
-user's home directory mounted.
-
-On filesystems that show the same owner and mode for every file, such as FAT,
-exFAT, NTFS, SMB shares and WSL's `/mnt/c`, owners and modes cannot show who
-may change a release. There syq checks a stored release against its signed
-manifest on every run instead, which takes longer, and does not refuse a home
-directory because of the owner it shows.
-
-The store trusts the directories above it; see
-[Downloaded executables](security.md#downloaded-executables).
+Syq starts a stored release only when you own its files and directories and
+nobody else can write them. `~/.local/lib/syq` may be a symbolic link, for
+example to a larger disk, if the directory it leads to meets the same rule.
+Otherwise syq stops and names the problem: fix the permissions, or delete what
+it names and syq installs the release again. If the store or your home
+directory belongs to another user, as when a CI container runs syq as root
+with another user's home directory mounted, run syq as that user or set `HOME`
+to your own home directory. On filesystems that show the same owner for every
+file, such as FAT, NTFS, SMB shares, and WSL's `/mnt/c`, syq instead checks a
+stored release against its signed manifest on every run, which takes longer.
+See [Downloaded executables](security.md#downloaded-executables) for what the
+store trusts.
 
 Earlier releases kept their helpers in `~/.cache/syq/helpers`. Syq no longer
-reads that directory, and you can delete it on each machine. Those releases
-still use it themselves, including when you select one with `--use-version`.
+reads that directory, and you can delete it on each machine unless you still
+run those releases, including with `--use-version`.
 
 ## SSH helper installation
 
-SSH helpers are installed under `~/.local/lib/syq/` on the server too. If that
-directory cannot be created, select an installed helper with `--syq-path`, or
-use `--no-bootstrap` when a matching syq is on the server's `PATH`.
-
-When an official release installs a helper, it also tries to install the command
-at `~/.local/bin/syq`. Completion and background connections can trigger this
-step. Failure to install the command does not stop the copy. Reusing an
-installed helper does not repeat the command installation; use the standalone
-installer if the command is missing. Development builds and connections using
-`--syq-path` or `--no-bootstrap` do not install the command.
+Syq [installs its helper](install.md#automatic-installation-on-ssh-servers)
+under `~/.local/lib/syq/` on the server. If that directory cannot be created,
+select an installed helper with `--syq-path`, or use `--no-bootstrap` when a
+matching syq is on the server's `PATH`; neither installs the `syq` command on
+the server. Syq tries to install that command only along with the helper, so
+use the standalone installer if it goes missing later.

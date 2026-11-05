@@ -12,89 +12,65 @@ hash from a trusted source to check authenticity; see [Expected hashes](#expecte
 
 ## Comparison
 
-Syq normally skips files whose size and modification time match. For filesystem
-copies, `syq cp` compares whole seconds exactly and ignores as many trailing
-fractional digits as are zero in the destination timestamp: destination
-`.120000000` seconds matches source `.123456789`, and a whole-second destination
-timestamp ignores the source fraction entirely. This accommodates destinations
-that truncate fractional seconds. `syq rsync` compares whole seconds, as rsync
-does. FAT keeps modification times in two-second steps, so when either command
-copies into a directory on FAT, times less than two seconds apart count as
-matching; [Check file contents](reference.md#check-file-contents) lists the
-exceptions.
+Syq normally skips files whose size and modification time match. `syq cp`
+compares filesystem timestamps at the precision the destination keeps: it
+ignores as many trailing fractional digits as are zero in the destination
+timestamp, so destination `.120000000` seconds matches source `.123456789`, and
+a whole-second destination ignores the source fraction entirely. `syq rsync`
+compares whole seconds, as rsync does. When either command copies into a
+directory on FAT, which keeps times in two-second steps, times less than two
+seconds apart count as matching; [Check file contents](reference.md#check-file-contents)
+lists the exceptions. A difference outside that precision causes a check even
+when the source is older.
 
-Local/S3 copies compare timestamps exactly, including stored nanoseconds.
-Uploads need syq metadata on the existing object for this shortcut. Downloads
-use the stored source timestamp, or S3's modification time in whole seconds when
-syq metadata is absent.
+Copies between local files and S3 compare timestamps exactly, using the time
+syq stores with each uploaded object. Downloads of objects without one use
+S3's modification time in whole seconds.
 
-A timestamp difference outside that precision triggers checking even when the
-source is older. Use `--hash` to check contents even when size and timestamp
-match:
+Use `--hash` to check contents even when size and timestamp match:
 
 ```sh
 syq cp --hash --srcs-in project --into backup
 ```
 
-`--hash` uses BLAKE3. In rsync syntax, use `-c` or `--checksum` for the same
-comparison. The comparison only decides which files need copying: a file whose
+`--hash` uses BLAKE3; in rsync syntax, use `-c` or `--checksum`. A file whose
 contents already match is left alone, keeping its inode and any other hard
-links to it, and only its metadata is updated. A file that differs is copied
-the same way as without `--hash`, so local copies keep the filesystem's copy
-optimizations.
+links to it, and only its metadata is updated.
 
-`--hash-or-copy` also stops trusting matching size and timestamp, but compares
-only the files that the
+`--hash-or-copy` (rsync `-I` or `--ignore-times`) also stops trusting matching
+size and timestamp, but compares only the files the
 [transfer strategy](reference.md#choose-a-transfer-strategy) would compare and
 copies the rest whole, so a file whose contents already match may be
-rewritten. With the default strategy, copies with a remote syq endpoint compare
-every file and keep those that match, and same-machine copies copy every file. In rsync syntax, use `-I` or `--ignore-times`; `-c`
-takes precedence when both are given. A dry run with `--hash-or-copy` compares
-where the copy would compare, and lists the files the copy would write.
+rewritten. `-c` takes precedence when both are given.
 
-File uploads store a whole-file hash in the object's syq metadata: BLAKE3,
-unless a `transfer` algorithm or expected hash selects another. When a local/S3
-copy has matching size but a different timestamp, syq compares the local file
-with that stored hash when one is available. A matching hash avoids uploading or
-downloading the object and leaves the destination timestamp alone;
-`error-if-different` copies also use stored hashes. `--hash` needs a stored
-BLAKE3 hash; without one, syq reads the object's contents to compute it.
+Uploads store a whole-file hash in the object's syq metadata. When a copy
+between local files and S3 finds matching sizes but different timestamps, syq
+compares the local file with that stored hash, if there is one, instead of
+transferring the object. `--hash` needs a stored BLAKE3 hash; without one, syq
+reads the object to compute it.
 
 ## Payload checks
 
-SSH and encrypted TCP retain their transport authentication independently.
-`--no-tcp-encryption` turns on `transfer=xxh3-128` unless `--integrity-checking`
-sets `transfer`, including `transfer=off`. That check catches data corrupted in
-transit, but no checksum authenticates unencrypted traffic: an attacker can
-replace both the data and its checksum.
+SSH and encrypted TCP authenticate the data they carry. `--no-tcp-encryption`
+turns on `transfer=xxh3-128` unless `--integrity-checking` sets `transfer`,
+including `transfer=off`. That check catches data corrupted in transit, but no
+checksum authenticates unencrypted traffic: an attacker can replace both the
+data and its checksum.
 
 Syq doesn't write data that fails the check. Depending on how the file was
 being sent, it either sends the file again in the same run, or reports it as
 failed with `data corrupted in transit; rerun the command to retry` and ends
-with exit status 23.
+with exit status 23. For a complete check of a local copy, use an
+[expected hash](#expected-hashes).
 
-For a complete check of a local copy, use an [expected hash](#expected-hashes).
-
-For local/S3 copies, uploads over HTTPS rely on it to protect the transfer and
-send no request checksum. Uploads to a plain `http://` endpoint send Content-MD5,
-which the destination checks and the request signature covers, so bytes changed
-in transit are rejected. Syq also sends Content-MD5 to a destination that
-requires a checksum, as AWS does for buckets with an Object Lock default
-retention period. When a destination reports that it received corrupted data,
-syq warns and resends it, within its [`--s3-retries`](object-storage.md#retries) retries. With
-[storage authorization](object-storage.md#authorize-from-your-laptop), uploads
-send SHA-256 or MD5 request checksums. With a `transfer` algorithm, downloads
-also check the object's stored hash when it has one; use an expected hash for
-objects without a stored hash. See
-[Filesystem differences](object-storage.md#filesystem-differences).
-
-Server-side S3 copies preserve stored hashes without reading or verifying
-object bodies. They do not support content-hash comparison, extra transfer
-hashing, or expected hashes.
-
-Filesystem descriptor copies accept `transfer=ALGORITHM` for optional payload
-checks. S3 descriptor copies reject extra transfer hashing because they do not
-store syq hash metadata. Descriptor copies do not reread the result.
+For S3, HTTPS protects uploads; uploads to a plain `http://` endpoint send
+Content-MD5, so the service rejects data changed in transit. Syq resends data
+the service reports as corrupted, within its [`--s3-retries`](object-storage.md#retries).
+With a `transfer` algorithm, downloads also check the object's stored hash when
+it has one. Copies between buckets preserve stored hashes without reading the
+objects, and do not support content comparison, transfer hashing, or expected
+hashes. S3 descriptor copies also reject transfer hashing, and descriptor
+copies do not reread the result.
 
 <a id="expected-digests"></a>
 
@@ -104,13 +80,12 @@ Supply `expected_hash` on individual [mapping entries](commands/map.md#mapping-f
 to require known whole-file contents. The expectation includes its algorithm
 and hexadecimal value, independently of the comparison and transfer settings.
 
-Syq checks the complete result, including reused bytes. A mismatch fails the
-file. Checking happens before replacing an existing destination. A file
-written in place, a new file with `--in-place=new` or one that
-`--in-place=update` updates, is already at its name, and keeps the copied
-contents when the check fails. Matching size and
-time allow syq to check the existing destination first and skip copying if its
-hash matches. Selection filters still apply. Dry runs do not check expectations.
+Syq checks the complete result, including reused bytes, and a mismatch fails
+the file. The check happens before an existing destination is replaced, but a
+file written in place, with `--in-place=new` or `--in-place=update`, is already
+at its name and keeps the copied contents when the check fails. When size and
+time match, syq checks the existing destination and skips copying if its hash
+matches. Selection filters still apply. Dry runs do not check expectations.
 
 ## Compare without copying
 
@@ -130,34 +105,27 @@ machine-readable output, add [`--results`](automation.md); for two servers, see
 
 A copy reads files over time. If another program changes them while syq is
 reading, the result may combine data from different moments. Syq does not
-create a snapshot; use a filesystem snapshot or stop the writer when you need
-a consistent view. Filesystem-to-filesystem copies recheck source size and
-modification time after reading, before replacing the destination. A detected
-change can trigger a retry; a failed check leaves the previous destination in
-place. These checks do not detect every concurrent change. Both `--in-place`
-modes let destination readers see incomplete files, including after an
-interrupted copy.
+create a snapshot; use a filesystem snapshot or stop the writer when you need a
+consistent view. Filesystem copies recheck each source's size and modification
+time before replacing the destination; a change causes a retry or leaves the
+previous destination in place. These checks do not detect every concurrent
+change. Both `--in-place` modes let destination readers see incomplete files,
+including after an interrupted copy.
 
-On Linux's ext2/3/4, XFS, Btrfs, ZFS and tmpfs filesystems, syq checks that
-blocks reused when replacing a destination file still match what it compared,
-even if another program writes the existing file in the meantime. For files
-of 1 MiB or more, syq takes a read lease on the existing file before comparing
-it. If another program opens the file for writing before syq has copied the
-reused blocks, or already has it open for writing, syq reads those blocks back
-and checks them. That program's open waits up to about 20 ms; an open that
-does not wait fails and must be retried. If syq is suspended while it holds a
-lease, for example with Ctrl-Z, the open waits up to the kernel's lease-break
-time, 45 seconds by default. On macOS and on Linux filesystems
-outside that list, including OverlayFS, F2FS, network and FUSE filesystems,
-another program writing a destination file while syq updates it can leave the
-published file with that program's bytes. For network storage, copying over
-SSH to a receiver on one of the supported Linux filesystems avoids this
-limitation.
+When syq replaces a destination file on Linux ext2/3/4, XFS, Btrfs, ZFS, or
+tmpfs, it makes sure the blocks it reuses from the old file still match what it
+compared, even if another program writes that file meanwhile. While syq
+protects a file of 1 MiB or more this way, another program opening it for
+writing waits up to about 20 ms, or up to the kernel's lease-break time, 45
+seconds by default, if syq is suspended; an open that does not wait fails and
+must be retried. On macOS and on other Linux filesystems, including OverlayFS,
+F2FS, network and FUSE filesystems, a program writing a destination file while
+syq updates it can leave its bytes in the published file. For network storage,
+copying over SSH to a receiver on one of the supported Linux filesystems avoids
+this.
 
-On Linux, and on NFS or SMB destinations mounted on macOS, normal file copies
-check for delayed write errors before replacing files. This catches failures
-such as a full NFS export reporting an error after accepting writes, and keeps
-the previous destination in place. The macOS check flushes writes on NFS and
-SMB; local filesystems do not incur that flush. This protection does not cover
-every delayed write error. Successful completion does not guarantee that the
-copy will survive an immediate power loss.
+On Linux, and on NFS or SMB destinations mounted on macOS, syq checks for
+delayed write errors, such as a full NFS export, before replacing files, and
+keeps the previous destination when it finds one. This does not catch every
+delayed write error, and a successful copy may not survive an immediate power
+loss.

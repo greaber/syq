@@ -30,22 +30,18 @@ syq persist receive on --connection server
 ```
 
 This enables persistence, saves the server as this profile's allowed connection,
-and waits until receiving is ready. Repeat `--connection` to allow and connect
-several endpoints; each supplied list replaces the saved list. Without
-`--connection`, enabling receiving or changing its settings applies to allowed
-active and future syq connections without dialing saved servers. Use
-`syq persist connect server` when you want to prepare a connection before working
-there; an ordinary `ssh server` session does not enable receiving.
+and waits until receiving is ready. Repeat `--connection` to allow several
+servers; each list you give replaces the saved one. An ordinary `ssh server`
+session does not start receiving; use `syq persist connect server` to connect
+without copying anything.
 
 By default, your receiving name is your laptop's short hostname, and downloads
 and commands start in your home directory. The command prints the receiving
 name. The examples below use `@laptop`; replace it with your own name.
 
 You can close that terminal and make requests from any shell on the server,
-including an existing tmux session. In the default persistence domain, receiving
-also starts automatically with persistent connections unless you have turned it
-off or restricted the profile. Fresh [isolated domains](persistence-reference.md#isolated-script-scopes)
-start with receiving off; add `--pscope PATH` to configure and manage one.
+including an existing tmux session. Later persistent connections from your
+laptop start receiving too, unless you turn it off.
 
 ### Optional name and directory
 
@@ -57,8 +53,8 @@ mkdir -p ~/Downloads/server
 syq persist receive on --name laptop --cwd ~/Downloads/server --connection server
 ```
 
-This configures the profile and connects it. `--cwd` sets the starting directory
-for downloads and commands. Omitted settings retain their saved values.
+`--cwd` sets the starting directory for downloads and commands. Settings you
+leave out keep their saved values.
 
 ## Copy files to your laptop
 
@@ -70,20 +66,15 @@ syq cp report.pdf --to @laptop --as reports/latest.pdf
 ```
 
 File data uses encrypted TCP when your laptop can reach a data port on the
-server, with SSH as a fallback. Your laptop opens both connections; it still
-needs no incoming port. Use `--no-tcp` to send all data through SSH.
-See [Make TCP reachable](server-tuning.md#make-tcp-reachable) for server setup.
+server, and SSH otherwise; see [Make TCP reachable](server-tuning.md#make-tcp-reachable).
 
 ### Approving copies
 
 By default, each incoming copy waits for approval **on your laptop**. The prompt
-names the server and the directory the command ran in, then shows what is
-copied where, a warning for each option that lets the server do more than copy
-files (such as pruning or copying permissions), and the server's syq command;
-choose **Allow once** or **Deny**.
-To see the complete request, including its limits, run
-`syq persist receive pending` in a local terminal. You can also approve or
-deny there:
+shows the server, what is copied where, and a warning for each option that
+lets the server do more than copy files, such as pruning or copying
+permissions. Choose **Allow once** or **Deny**. You can also see the complete
+request, and approve or deny it, in a local terminal:
 
 ```sh
 syq persist receive pending
@@ -92,10 +83,8 @@ syq persist receive deny REQUEST_ID
 ```
 
 Approving a copy trusts the server to supply its contents. Requests expire after
-five minutes. While a command waits for approval, it says so on the server's
-stderr, also when it runs without a terminal, so a log or a script shows why it
-is waiting. If a prompt is missing or dismissed, the request stays pending;
-it is never approved automatically. To use only terminal approval, run `syq persist receive on --name laptop --notify off`.
+five minutes and are never approved automatically. To use only terminal
+approval, run `syq persist receive on --name laptop --notify off`.
 
 ### Names and paths
 
@@ -113,17 +102,14 @@ syq persist receive on --name laptop --root ~/Downloads/server
 ```
 
 With `--root`, incoming paths must be relative and stay inside that directory,
-even when following symlinks. Use `--no-root` to remove this restriction;
-changing `--cwd` does not remove it. Unless you set `--cwd`, the starting
-directory follows the hard root, then the automatic approval root, then your
-home directory. See [Directories](persistence-reference.md#directories) for
-changing or resetting these settings.
+even when following symlinks. Use `--no-root` to remove this restriction. See
+[Directories](persistence-reference.md#directories) for how the starting
+directory and roots interact.
 
 Changing a profile's settings, other than `--notify`, stops its active copies,
-commands, and pending requests, except copies you approved from a server to
-another server: those run until they finish, until someone interrupts them on
-the server, or until you revoke the destination's enrollment with
-`syq receiver revoke`. Other profiles keep working.
+commands, and pending requests. Copies you approved between two servers keep
+running; see [Copying between servers](security.md#copying-between-servers)
+for how to stop them.
 
 <a id="unattended-copies"></a>
 
@@ -135,18 +121,13 @@ Choose a directory for downloads that do not need approval:
 syq persist receive on --name laptop --auto-approve-root ~/Downloads/server
 ```
 
-Downloads confined to that directory need no approval; downloads elsewhere ask.
-Some options, such as copying ACLs or widening folders, still ask; the prompt
-says why.
-`--root`, if configured, remains a hard boundary even with approval.
-Automatic approval trusts all processes running as the connected server accounts,
-including for overwrites inside that directory. You can
-[limit a profile to particular connections](persistence-reference.md#choose-allowed-connections).
-
-Commands on your laptop, restricted copies between servers, and storage
-authorization require their own approval. SSH account access can use a current
-session permission or an explicitly remembered permission. See
-[Receivers](security.md#receivers) for the trust boundary.
+Downloads confined to that directory need no approval; downloads elsewhere,
+and some options such as copying ACLs, still ask. `--root`, if configured,
+remains a hard boundary. Automatic approval trusts all processes running as
+the connected server accounts, including to overwrite files inside that
+directory. You can [limit a profile to particular connections](persistence-reference.md#choose-allowed-connections).
+Commands, restricted copies between servers, and storage authorization still
+need their own approval; see [Receivers](security.md#receivers) for the trust boundary.
 
 To require approval for every download again:
 
@@ -161,9 +142,7 @@ it makes, such as files written and directories created). Pruning
 is off until you set a deletion limit; a copy that would delete more removes
 nothing. Change limits with
 `syq persist receive on --name laptop --max-bytes SIZE --max-entries N --max-delete N`.
-
-Most copy options work here, including `--in-place`; copies are refused
-while syq runs as root. See
+Copies are refused while syq runs as root. See
 [copy limits](persistence-reference.md#copy-limits) for details.
 
 ## Run commands on your laptop
@@ -175,8 +154,8 @@ syq exec --on @laptop --cwd /path/to/project -- make
 syq exec --on @laptop --cwd /path/to/project -- open report.html
 ```
 
-The second command uses macOS's `open` program to display a report. Replace
-it with any program installed on your laptop.
+The second command opens a report with macOS's `open`; any program installed
+on your laptop works.
 
 Every command requires approval on your laptop and runs with your local user's
 permissions, including access to files and credentials. **The download root
@@ -223,23 +202,20 @@ syq ssh hostB -- hostname
 syq cp results --to hostB
 ```
 
-The first operation connects to the provider using your machine's native SSH
-credentials. Your machine's SSH configuration determines `hostB`'s address,
-account, and route. The provider checks trusted host keys and asks for
-destination-account approval. Inspect and approve requests there with
-`syq persist receive pending` and `syq persist receive approve REQUEST_ID`.
-Later commands reuse both connections; `persist connect` is optional.
-Your agent is not forwarded, and commands and file data travel directly to hostB.
+The first command logs in to the provider with your own SSH credentials, and the
+provider asks for approval of the destination account. Inspect and approve
+requests there with `syq persist receive pending` and
+`syq persist receive approve REQUEST_ID`. Later commands reuse both
+connections. Your agent is not forwarded, and commands and file data travel
+directly to hostB, which your own SSH configuration names.
+
 The provider's SSH server must allow local forwarding: both
-`AllowTcpForwarding` and `AllowStreamLocalForwarding` must allow `local` or `yes`.
-The login key must permit forwarding too: `restrict` or `no-port-forwarding`
-in its `authorized_keys` entry blocks this connection unless forwarding is
-explicitly enabled. After updating syq, run `syq persist receive on` locally on
-the provider to restart its service with the matching build.
-Syq uses the provider's first configured receiving profile in its default
-persistence domain; that profile must be enabled. Remote profile and domain
-selection are not supported. See [provider selection](persistence-reference.md#approved-account-connections)
-for how this differs from a local `--pscope`.
+`AllowTcpForwarding` and `AllowStreamLocalForwarding` must allow `local` or
+`yes`, and the login key's `authorized_keys` entry must not block forwarding
+with `restrict` or `no-port-forwarding`. Syq uses the provider's first
+receiving profile in its default persistence domain, which must be enabled.
+After updating syq, run `syq persist receive on` on the provider to restart its
+service with the matching build.
 
 This uses a full SSH login to the provider account. Anyone who can log in to
 that account can use its credentials independently of syq's approval controls.
@@ -258,48 +234,26 @@ syq cp --from hostB /archive/results --into . --auth-from @laptop
 Selecting `@laptop` asks for access to hostB's account on first use. The approval
 permits arbitrary commands and file access as that account. See
 [account permissions](persistence-reference.md#account-permissions) for the
-approval's lifetime and how to manage it on the laptop.
+approval's lifetime and how to manage it on the laptop. File data travels
+directly between the servers, and you do not need to forward your agent.
 
-Uploads and downloads reuse the approved login and support `--no-tcp`, helper
-overrides, and `--in-place`. File data travels directly between the servers.
-You do not need to run `persist connect` first or forward your agent.
+`--auth-from` and the `SYQ_AUTH_FROM` [environment variable](environment.md#choose-authorization-through-the-environment)
+choose how much to trust hostA:
 
-With `auto`, eligible copies can instead ask for restricted per-copy approval
-after native SSH fails. That approval names permitted paths and applies transfer
-limits. A restricted upload uses hostB's
-[enrollment](remote-reference.md#enrollment), as copies between servers started
-from your laptop do: the first one sets it up, over your laptop's SSH login.
-Your laptop signs each approved copy, and hostA then connects to hostB's
-receiver itself, over direct TCP or SSH, and finishes the copy even if your
-laptop disconnects. Restricted source-read downloads require direct TCP and do
-not write SSH authorization on the source. Account-approved downloads can use
-SSH in either direction. See [authorization selection](remote-reference.md#authorization-selection)
-for routing details.
-
-If hostA has no SSH credentials of its own, asking your laptop is simply how
-the copy gets authorized, and syq asks without a warning, as agent forwarding
-would. If hostA has credentials that did not work, such as keys that do not
-get it into hostB or an `SSH_AUTH_SOCK` where no agent answers, syq still asks
-your laptop, but first prints one line saying what went wrong and how to fix
-it.
-
-Inside tmux, a shell keeps the `SSH_AUTH_SOCK` it started with, which stops
-working after you reattach from a new SSH login. Syq then uses the tmux
-session's current one, so your agent keeps working for syq; see
-[Environment](environment.md#other-variables).
-
-To choose authorization for every command in a shell or a script, such as one
-a coding agent runs, set `SYQ_AUTH_FROM` to any value `--auth-from` takes. It
-overrides your saved choices, including per-host ones, and an explicit
-`--auth-from` still wins over it. The choices trade convenience for reach:
-
-- `auto`, the default, uses hostA's own SSH access and asks your laptop to
-  approve each eligible copy when that fails. Each approval covers only the
-  paths it shows.
+- `auto`, the default, uses hostA's own SSH access. When that fails, it asks
+  your laptop to approve just this copy; the approval names the permitted
+  paths and applies your laptop's copy limits. If hostA's own credentials
+  failed rather than being absent, syq first prints one line saying what went
+  wrong.
 - `@laptop` asks once for access to each destination account, as described
   above. Like forwarding your SSH agent, that access lets the server run any
   command as that account while it lasts.
 - `ssh` uses only hostA's own SSH access and never asks your laptop.
 
-`SYQ_CP_OPTIONS` adds other options to every `syq cp`; see
-[Environment](environment.md).
+An upload approved under `auto` finishes even if your laptop disconnects. The
+first one to an account sets up hostB's
+[enrollment](remote-reference.md#enrollment) over your laptop's SSH login. A
+download approved this way needs a direct encrypted TCP connection between the
+servers; account access with `@laptop` works over SSH too. See [authorization
+selection](remote-reference.md#authorization-selection) for the options each
+route supports.

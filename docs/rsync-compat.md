@@ -14,29 +14,25 @@ See [`syq rsync`](commands/rsync.md) for all accepted options.
 | `--ignore-existing` | Keeps an existing non-directory even where the source would create a directory |
 | Type changes | Refuses replacement between a directory and any non-directory, even when the directory is empty |
 | `--update` | Checks mtimes only for regular files; replacements between non-directory types still occur |
-| Read-only destination directories | Like rsync, briefly adds owner access to directories the copy includes, but then restores each one's exact mode; rsync can leave owner read and search added. `--syq-widen-dirs=none` or `all` widens nothing or more ([details](reference.md#copy-metadata)) |
+| Read-only destination directories | Briefly adds owner access, as rsync does, but then restores each directory's exact mode; `--syq-widen-dirs` changes this ([details](reference.md#copy-metadata)) |
 | Resume | Keeps syq partial files a later copy can resume from; cannot reuse rsync partials |
 | Existing files | Often replaced where rsync changes them in place; see [below](#existing-files) |
-| Delta transfer | Reuses matching blocks at the same offsets in the corresponding destination file; shifted blocks are not matched. Local copies default to whole-file and remote copies to block reuse. `-W` / `--whole-file` disables reuse; `--no-W` / `--no-whole-file` enables it |
+| Delta transfer | Reuses matching blocks only at the same offsets in the destination file. Local copies default to whole-file and remote copies to block reuse; `-W` / `--whole-file` disables reuse and `--no-W` enables it |
 | `--rsync-path PATH` | Exact syq executable path, not a shell fragment |
 | Remote-to-remote | Refused; use native `syq cp` |
 
 ### Existing files
 
-Rsync changes the following in place, through every name a file has. Syq
-gives the name a new file instead, with a new inode number, and other names
-of the old file keep it as it was:
+Rsync changes some files in place, through every name a file has. In these
+cases syq gives the name a new file instead, and other hard links keep the old
+one:
 
 - With `--inplace`, a file with other hard links, another owner, or wider
   permissions than the copy gives it ([In-place writes](reference.md#in-place-writes)).
-  Other existing files are updated in place, as rsync does.
-- When only metadata changed, a file with other hard links, or one not owned
-  as syq expects, is replaced. Access times (`-U`) are still set in place.
-- On filesystems whose link counts syq does not trust (such as SMB, SSHFS,
-  NFS mounted with `nocto`, and macOS volumes other than APFS and HFS+),
-  every metadata-only change rewrites the file.
-- Symlinks, named pipes and devices whose metadata changes are created
-  again.
+- When only metadata changed, a file with other hard links or an unexpected
+  owner, and any file on filesystems whose link counts syq does not trust,
+  such as SMB, SSHFS, and some NFS and macOS volumes.
+- Symlinks, named pipes, and devices whose metadata changes.
 
 See [Copy metadata](reference.md#copy-metadata) for the details.
 
@@ -44,20 +40,11 @@ Scan and copy errors prevent deletion. A destination that contains its source
 on the same host cannot be pruned. Preview deletion scope with `--dry-run -v`;
 see [deletion rules](reference.md#mirror-a-directory).
 
-`syq rsync` uses rsync's default size-and-whole-second timestamp quick check.
-Native `syq cp` also compares fractional seconds at the precision suggested by
-the destination timestamp; see [timestamp matching](integrity-checking.md#comparison).
-Use `-c` to compare contents when size and timestamp match; source timestamps
-are preserved, so ordinary clock skew does not require the source timestamp
-to be newer. `-I` (`--ignore-times`) also stops skipping those files, but
-compares only those that block reuse would compare (by default, every file in
-a remote copy) and copies the rest whole, so files that already match may be
-rewritten.
-
-Without `-p`, existing files keep their destination permissions. On Linux, new
-files use the source permission bits limited by the destination parent's default
-ACL, or by the receiving process's umask when that parent has no default ACL.
-Use `-p` to preserve source permissions and `-A` to preserve source ACLs.
+`syq rsync` uses rsync's default size-and-whole-second timestamp quick check;
+see [timestamp matching](integrity-checking.md#comparison). Use `-c` to compare
+contents when size and timestamp match. `-I` (`--ignore-times`) compares only
+the files block reuse would compare, by default every file in a remote copy,
+and copies the rest whole, so files that already match may be rewritten.
 
 Syq uses numeric IDs and keeps partial files a later copy can resume from (see
 [Resume an interrupted copy](reference.md#resume-an-interrupted-copy)), so
@@ -85,16 +72,14 @@ ranges into sparse holes. See the
 | Daemon connections | `rsync://`, `host::module` |
 
 Unsupported common flags are rejected with an explanation. Selected symlink
-targets are copied unchanged. `--insecure-links` does not enable any of the
-unsupported descendant-link options.
+targets are copied unchanged. `--insecure-links` only relaxes the ownership
+check on symlinks in paths you type; it does not follow symlinks beneath a
+selected source.
 
 ## File-list parsing and help
 
 `--files-from` cannot combine with syq ignore rules or deletion. A listed
-source whose parent is a symlink fails that entry with exit 23, without
-creating its implied destination parent. `--insecure-links` only relaxes the
-ownership check on symlinks in typed local paths; it does not allow symlink
-traversal beneath a selected source, including entries from `--files-from`.
+source whose parent is a symlink fails that entry with exit 23.
 
 Other parsing differences:
 
@@ -104,9 +89,8 @@ Other parsing differences:
 - `.` and `/` are rejected as root entries.
 - Use `--from0` for NUL separators; `-0` is unsupported.
 
-Blank entries and comment-looking names starting with `#` or `;` are ignored
-in both separator modes. Use `./#name` for a literal name. The paths are relative to one source directory; destination parents are
-created as needed.
+Blank entries and names starting with `#` or `;` are ignored in both separator
+modes; use `./#name` for a literal name.
 
 `-h` alone does not show help; use `--help` or `--help-all`.
 
