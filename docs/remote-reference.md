@@ -64,9 +64,8 @@ When the key syq recorded can no longer sign, for example because you removed
 it from your agent after switching keys, the next copy logs in again and
 trusts your current key. While the old key can still sign, syq keeps using it;
 run `syq receiver enroll HOST` to switch to your current login key now.
-`syq receiver list` shows the key each enrollment trusts.
-After you change syq builds, the next copy logs in once to update the
-receiver.
+`syq receiver list` shows the key each enrollment trusts. After you change syq
+builds, the next copy logs in once to update the receiver.
 
 Only `syq receiver revoke ID`, or deleting syq's line from `authorized_keys`,
 ends an enrollment. Removing or revoking your login key, certificate, or
@@ -142,8 +141,7 @@ the login, cannot verify the host key, cannot resolve the name, or is refused,
 syq asks the first available receiving machine, in alphabetical order of
 name, to approve just this copy. After a timeout, a temporary DNS failure, or
 any other SSH error, or with no receiving machine available, syq reports the
-SSH error. A refusal or failure
-on the receiving machine ends the copy.
+SSH error. A refusal or failure on the receiving machine ends the copy.
 
 Per-copy approval does not work with a root login on the destination,
 `--detach`, `--rsh`, `--syq-path`, `--no-bootstrap`, other `--peer-auth` or

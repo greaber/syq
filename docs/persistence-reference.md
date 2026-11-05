@@ -70,9 +70,9 @@ scp -F hostB.ssh report hostB:report
 GIT_SSH_COMMAND='ssh -F hostB.ssh' git clone hostB:project.git
 ```
 
-`HOST` must match the login, host, and port that opened the connection. The
-file contains no private key and works only while the connection is open, so
-export it again after reconnecting.
+The host you export must match the login, host, and port that opened the
+connection. The file contains no private key and works only while the connection
+is open, so export it again after reconnecting.
 
 Account access needs:
 
@@ -97,10 +97,10 @@ available. An agent that requires confirmation or a touch asks for each one.
 An [SSH authorization provider](receive.md#use-an-ssh-authorization-provider)
 needs the same syq build as the machines that use it. The first receiving
 profile in its default domain (the one `receive status` lists first) must be
-enabled. Its SSH server must allow local
-forwarding (`AllowTcpForwarding` and `AllowStreamLocalForwarding` set to
-`local` or `yes`), and the login key's `authorized_keys` entry must not
-disable it with `restrict` or `no-port-forwarding`.
+enabled. Its SSH server must allow local forwarding (`AllowTcpForwarding` and
+`AllowStreamLocalForwarding` set to `local` or `yes`), and the login key's
+`authorized_keys` entry must not disable it with `restrict` or
+`no-port-forwarding`.
 
 ### Account permissions
 
@@ -200,7 +200,7 @@ independent settings:
 |---|---|---|
 | `--cwd DIR` | Starting directory for relative paths | `--auto-cwd` |
 | `--root DIR` | Hard boundary for downloads, even with approval | `--no-root` |
-| `--auto-approve-root DIR` | Downloads confined here skip approval, except with `--widen-dirs all` | `--no-auto-approve-root` |
+| `--auto-approve-root DIR` | Downloads confined here, including pruning up to `--max-delete`, skip approval, except with `--widen-dirs all` | `--no-auto-approve-root` |
 
 Each must be an existing directory, and neither root can be `/`. Without
 `--cwd`, downloads start in the hard root if set, otherwise the automatic
@@ -228,11 +228,12 @@ pruning copy that plans more deletions than your `--max-delete` or
 `--max-entries`, or its own `--max-delete`, deletes nothing and exits 25, and so
 does its dry run, so you can check first.
 
-Copies to a receiving name cannot preserve hard links, ACLs, extended
-attributes, or access or birth times, and cannot use `--open-noatime` or
-`--sparse`; the other `--copy-metadata` options work. They are refused while
-syq runs as root on the receiving machine, and they never follow a destination
-symlink, even with `--follow-dst`; name the link's target instead.
+Copies to a receiving name are refused while syq runs as root on the receiving
+machine. They cannot preserve hard links, ACLs, extended attributes, or access
+or birth times, and cannot use `--open-noatime` or `--sparse`; the other
+`--copy-metadata` options work as for any copy by an account other than root.
+They never follow a destination symlink, even with `--follow-dst`; name the
+link's target instead.
 
 ## Connection lifetime and waits
 

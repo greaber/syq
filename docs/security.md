@@ -371,9 +371,10 @@ entries during planning, and use disk space.
 By default, copies start in your home directory and are not confined to it;
 `syq persist receive on --root DIRECTORY` confines them. Automatic approval
 (`--auto-approve-root`) trusts the allowed server accounts to overwrite files
-inside its root without asking; a copy with `--widen-dirs all`, or one that
-replaces the root directory itself, still asks. Choose an inbox whose contents
-are not automatically executed or loaded as trusted configuration.
+inside its root without asking and, when the profile sets `--max-delete`, to
+delete up to that many entries per copy; a copy with `--widen-dirs all`, or one
+that replaces the root directory itself, still asks. Choose an inbox whose
+contents are not automatically executed or loaded as trusted configuration.
 
 Another client cannot claim your receiving name: reconnecting under it needs
 your receiver's private key, which stays on your machine and grants no SSH
