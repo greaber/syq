@@ -1405,7 +1405,7 @@ exit 255
             "{}",
             stderr_of(&failed)
         );
-        assert!(!stderr_of(&failed).contains("requesting permission"));
+        assert!(!stderr_of(&failed).contains("waiting up to"));
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
@@ -1468,6 +1468,9 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
             .env("XDG_RUNTIME_DIR", t.path("runtime"))
             .env("PATH", &paths)
             .env("SYQ_NO_UPDATE_CHECK", "1")
+            .env_remove("SSH_AUTH_SOCK")
+            .env_remove("SYQ_AUTH_FROM")
+            .env_remove("TMUX")
             .current_dir(t.path(""));
         command
     };
@@ -1606,9 +1609,16 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     );
     assert!(!refused.status.success());
     assert_eq!(fs::read_to_string(t.path("ssh-used")).unwrap(), "connect\n");
+    // This machine has no SSH credentials at all: asking the laptop is the
+    // ordinary way to authorize the copy, so syq says only that it waits.
+    assert!(
+        !stderr_of(&refused).contains("asking @laptop"),
+        "{}",
+        stderr_of(&refused)
+    );
     assert!(
         stderr_of(&refused).lines().any(|line| line
-            == "syq: backup: SSH connection failed (exit status: 255): credentials were rejected; trying authorization through @laptop"),
+            == "syq: waiting up to 5 minutes for @laptop to approve this copy to backup; approve it there in the desktop prompt or with `syq persist receive pending`"),
         "{}",
         stderr_of(&refused)
     );
@@ -1745,6 +1755,243 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
         "{stderr}"
     );
     assert_eq!(fs::read_to_string(t.path("ssh-used")).unwrap(), "connect\n");
+}
+
+/// A receiving machine for `auto` fallback tests: it answers discovery,
+/// and holds each copy request until the test releases it, then refuses it.
+struct HeldLaptop {
+    t: Tmp,
+    paths: std::ffi::OsString,
+    requests: std::sync::mpsc::Receiver<serde_json::Value>,
+    release: std::sync::mpsc::Sender<()>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    responder: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HeldLaptop {
+    fn new() -> Self {
+        use std::os::unix::net::UnixListener;
+        use std::time::Duration;
+        let t = Tmp::new();
+        fs::create_dir(t.path("runtime")).unwrap();
+        write(&t.path("source"), b"payload");
+        // ssh -G reports the default identity file; logging in is refused.
+        executable_support::write_executable(
+            &t.path("bin/ssh"),
+            b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_8.9p1 >&2; exit 0; fi\nfor argument; do\n  if [ \"$argument\" = -G ]; then printf 'user fixture-user\\nhostname resolved-backup\\nport 2222\\nidentityfile ~/.ssh/id_ed25519\\n'; exit 0; fi\ndone\nprintf '%s\\n' \"${SSH_AUTH_SOCK-unset}\" >> \"$HOME/ssh-used\"\necho 'fixture-user@backup: Permission denied (publickey).' >&2\nexit 255\n",
+            0o700,
+        );
+        let mut paths = vec![t.path("bin")];
+        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+        let paths = std::env::join_paths(paths).unwrap();
+        let mut laptop = Self {
+            t,
+            paths,
+            requests: std::sync::mpsc::channel().1,
+            release: std::sync::mpsc::channel().0,
+            stop: Default::default(),
+            responder: None,
+        };
+        let identity = String::from_utf8(
+            laptop
+                .command(&["--build-identity"])
+                .capture_output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let registry = laptop.t.path(".syq-destinations-v3");
+        fs::create_dir(&registry).unwrap();
+        fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_path = laptop.t.path("return.sock");
+        let registration = serde_json::json!({
+            "version": 3,
+            "identity": identity.trim(),
+            "program": env!("CARGO_BIN_EXE_syq").as_bytes(),
+            "socket": socket_path,
+            "secret": "laptop",
+        });
+        let file = registry.join("laptop.json");
+        write(&file, &serde_json::to_vec(&registration).unwrap());
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (request_sender, requests) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let stop = laptop.stop.clone();
+        laptop.responder = Some(std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut socket = match listener.accept() {
+                    Ok((socket, _)) => socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut length = [0; 4];
+                socket.read_exact(&mut length).unwrap();
+                let mut bytes = vec![0; u32::from_be_bytes(length) as usize];
+                socket.read_exact(&mut bytes).unwrap();
+                let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let response = if envelope["message"] == "Ping" {
+                    serde_json::json!("Ready")
+                } else {
+                    request_sender.send(envelope).unwrap();
+                    released
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("the test releases each held request");
+                    serde_json::json!({"Error": "copy denied by fixture"})
+                };
+                let bytes = serde_json::to_vec(&response).unwrap();
+                let _ = socket.write_all(&(bytes.len() as u32).to_be_bytes());
+                let _ = socket.write_all(&bytes);
+            }
+        }));
+        laptop.requests = requests;
+        laptop.release = release;
+        laptop
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(args)
+            .env("HOME", self.t.path(""))
+            .env("XDG_CONFIG_HOME", self.t.path("config"))
+            .env("XDG_RUNTIME_DIR", self.t.path("runtime"))
+            .env("PATH", &self.paths)
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .env_remove("SSH_AUTH_SOCK")
+            .env_remove("SYQ_AUTH_FROM")
+            .env_remove("TMUX")
+            .current_dir(self.t.path(""));
+        command
+    }
+
+    /// Run `command` without a terminal. When it asks for approval, check
+    /// that it has already said on stderr that it waits, while the request is
+    /// still held, then release the request. Returns the exit status, all of
+    /// stderr, and the requests made.
+    fn run(
+        &self,
+        command: &mut Command,
+    ) -> (std::process::ExitStatus, String, Vec<serde_json::Value>) {
+        use std::io::BufRead;
+        use std::time::{Duration, Instant};
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let (line_sender, lines) = std::sync::mpsc::channel::<String>();
+        let reader = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stderr).lines() {
+                let _ = line_sender.send(line.unwrap());
+            }
+        });
+        let mut seen = Vec::new();
+        let mut requests = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "syq did not finish: {seen:?}");
+            seen.extend(lines.try_iter());
+            if let Ok(request) = self.requests.recv_timeout(Duration::from_millis(10)) {
+                let waiting = Instant::now() + Duration::from_secs(10);
+                while !seen
+                    .iter()
+                    .any(|line| line.contains("waiting up to 5 minutes for @laptop"))
+                {
+                    assert!(
+                        Instant::now() < waiting,
+                        "syq did not say that it waits for approval while it waited: {seen:?}"
+                    );
+                    if let Ok(line) = lines.recv_timeout(Duration::from_millis(10)) {
+                        seen.push(line);
+                    }
+                }
+                requests.push(request);
+                self.release.send(()).unwrap();
+            }
+        };
+        reader.join().unwrap();
+        seen.extend(lines.try_iter());
+        (status, seen.join("\n"), requests)
+    }
+}
+
+impl Drop for HeldLaptop {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // A request still held after a failed check is released at once.
+        self.release = std::sync::mpsc::channel().0;
+        if let Some(responder) = self.responder.take() {
+            let _ = responder.join();
+        }
+    }
+}
+
+#[test]
+fn automatic_fallback_explains_failed_credentials_and_says_at_once_that_it_waits() {
+    let laptop = HeldLaptop::new();
+    let t = &laptop.t;
+    let asking = "asking @laptop to approve this copy to backup";
+
+    // No agent and no key files: asking the laptop is the ordinary way to
+    // authorize this copy, so syq says only that it waits for approval.
+    let (status, stderr, requests) =
+        laptop.run(&mut laptop.command(&["cp", "source", "--to", "backup"]));
+    assert!(!status.success());
+    assert_eq!(requests.len(), 1, "{stderr}");
+    assert!(requests[0]["message"].get("Forward").is_some());
+    assert!(!stderr.contains(asking), "{stderr}");
+    assert!(
+        stderr.lines().any(|line| line
+            == "syq: waiting up to 5 minutes for @laptop to approve this copy to backup; approve it there in the desktop prompt or with `syq persist receive pending`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("copy denied by fixture"), "{stderr}");
+
+    // A key file the destination rejected.
+    write(&t.path(".ssh/id_ed25519"), b"fixture key");
+    let (status, stderr, requests) =
+        laptop.run(&mut laptop.command(&["cp", "source", "--to", "backup"]));
+    assert!(!status.success());
+    assert_eq!(requests.len(), 1, "{stderr}");
+    assert!(
+        stderr.lines().any(|line| line
+            == format!("syq: backup did not accept this machine's SSH keys; {asking}. To avoid this, authorize one of them on backup")),
+        "{stderr}"
+    );
+    fs::remove_file(t.path(".ssh/id_ed25519")).unwrap();
+
+    // An agent socket where nothing answers, outside tmux.
+    let dead = t.path("dead-agent.sock");
+    let (status, stderr, requests) = laptop.run(
+        laptop
+            .command(&["cp", "source", "--to", "backup"])
+            .env("SSH_AUTH_SOCK", &dead),
+    );
+    assert!(!status.success());
+    assert_eq!(requests.len(), 1, "{stderr}");
+    assert!(
+        stderr.lines().any(|line| line
+            == format!("syq: SSH_AUTH_SOCK names {}, where no SSH agent answers, so this machine could not log in to backup; {asking}. To fix this, point SSH_AUTH_SOCK at a running agent, or unset it", dead.display())),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(t.path("ssh-used")).unwrap(),
+        format!("unset\nunset\n{}\n", dead.display())
+    );
 }
 
 #[test]

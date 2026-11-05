@@ -8,6 +8,7 @@
 
 mod advanced;
 mod agent_broker;
+mod agent_socket;
 mod approval_command;
 mod auth_from;
 mod bwlimit;
@@ -301,6 +302,8 @@ fn run() {
         crate::output::exit_on_error(&error, 2, "syq");
     }
     destination::handoff::record_command_line(&argv);
+    // Before the commands below start ssh, or any thread.
+    agent_socket::repair_from_tmux();
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("ssh") {
         match destination::ssh::run(&argv[1..]) {
             Ok(code) => crate::output::exit(code),

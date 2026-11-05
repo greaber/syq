@@ -242,10 +242,31 @@ fn load(domain: &Domain) -> Result<Config> {
     read(&path(domain)?)
 }
 
-/// Explicit flags bypass disk reads, including `auto`. Preference lookup uses
-/// the typed hostname/alias, without an SSH connection or config expansion.
+/// Sets the choice for every command, above saved choices and below an
+/// explicit `--auth-from`.
+const ENVIRONMENT: &str = "SYQ_AUTH_FROM";
+
+/// The choice `SYQ_AUTH_FROM` sets; empty is the same as unset.
+fn environment(value: Option<std::ffi::OsString>) -> Result<Option<AuthFrom>> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .with_context(|| format!("{ENVIRONMENT} is not valid UTF-8"))?;
+    crate::cli::parse_auth_from(value)
+        .map(Some)
+        .with_context(|| format!("{ENVIRONMENT}={value:?} is not auto, ssh, @NAME or an SSH host"))
+}
+
+/// Explicit flags bypass disk reads, including `auto`; so does
+/// `SYQ_AUTH_FROM`. Preference lookup uses the typed hostname/alias, without
+/// an SSH connection or config expansion.
 pub(crate) fn resolve(domain: &Domain, host: &str, explicit: Option<AuthFrom>) -> Result<AuthFrom> {
     if let Some(choice) = explicit {
+        return Ok(choice);
+    }
+    if let Some(choice) = environment(std::env::var_os(ENVIRONMENT))? {
         return Ok(choice);
     }
     load(domain)?.selected(host)
@@ -254,7 +275,11 @@ pub(crate) fn resolve(domain: &Domain, host: &str, explicit: Option<AuthFrom>) -
 pub(crate) fn selected_context<T>(result: Result<T>, mode: &AuthFrom, explicit: bool) -> Result<T> {
     match mode {
         AuthFrom::Provider(provider) if !explicit => result.with_context(|| {
-            format!("authorization provider {provider} comes from the saved auth-from choice")
+            if std::env::var_os(ENVIRONMENT).is_some_and(|value| !value.is_empty()) {
+                format!("authorization provider {provider} comes from {ENVIRONMENT}")
+            } else {
+                format!("authorization provider {provider} comes from the saved auth-from choice")
+            }
         }),
         _ => result,
     }
@@ -491,6 +516,25 @@ mod tests {
         let config = update(&path, None, None, true).unwrap();
         assert_eq!(config.selected("backup").unwrap(), AuthFrom::Auto);
     }
+    #[test]
+    fn environment_choice_parses_like_the_option_and_empty_means_unset() {
+        assert_eq!(environment(None).unwrap(), None);
+        assert_eq!(environment(Some("".into())).unwrap(), None);
+        assert_eq!(
+            environment(Some("ssh".into())).unwrap(),
+            Some(AuthFrom::Ssh)
+        );
+        assert_eq!(
+            environment(Some("@laptop".into())).unwrap(),
+            Some(AuthFrom::Provider(Provider::Return("laptop".into())))
+        );
+        let error = environment(Some("@bad/name".into())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("SYQ_AUTH_FROM=\"@bad/name\""),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn host_keys_reject_logins_and_ports_and_keep_ipv6_spelling() {
         for host in ["backup", "BACKUP", "192.0.2.1", "2001:db8::1"] {

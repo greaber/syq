@@ -25,7 +25,7 @@ mod local;
 mod replies;
 mod reverse_tcp;
 mod ssh_auth;
-pub(crate) use ssh_auth::login_rejection;
+pub(crate) use ssh_auth::{login_rejection, Failure as SshLoginFailure};
 mod ssh_multiplexer;
 mod tcp_socket;
 pub(crate) use replies::Replies;
@@ -462,10 +462,15 @@ fn is_ssh_connect_error(error: &anyhow::Error) -> bool {
 }
 
 pub(crate) fn is_ssh_authorization_fallback_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
+    ssh_authorization_failure(error).is_some()
+}
+
+/// The recognized SSH failure that permits asking another machine.
+pub(crate) fn ssh_authorization_failure(error: &anyhow::Error) -> Option<SshLoginFailure> {
+    error.chain().find_map(|cause| {
         cause
             .downcast_ref::<SshConnectError>()
-            .is_some_and(|error| error.failure.is_some())
+            .and_then(|error| error.failure)
     })
 }
 

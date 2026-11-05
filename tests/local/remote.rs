@@ -382,6 +382,67 @@ fn native_rejects_unknown_relay_option() {
     );
 }
 
+#[test]
+fn a_dead_agent_socket_inside_tmux_is_replaced_by_the_session_socket() {
+    use std::os::unix::net::UnixListener;
+    let t = Tmp::new();
+    write(&t.path("source"), b"payload");
+    // ssh records the agent socket it was given; tmux reports the session's.
+    executable(
+        &t.path("bin/ssh"),
+        b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_8.9p1 >&2; exit 0; fi\nprintf '%s\\n' \"${SSH_AUTH_SOCK-unset}\" > \"$HOME/ssh-agent\"\necho 'Permission denied (publickey).' >&2\nexit 255\n",
+    );
+    executable(
+        &t.path("bin/tmux"),
+        b"#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/tmux-used\"\n[ \"$*\" = 'show-environment SSH_AUTH_SOCK' ] || exit 1\nprintf '%s\\n' \"$SYQ_TEST_TMUX_VALUE\"\n",
+    );
+    let mut paths = vec![t.path("bin")];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let paths = std::env::join_paths(paths).unwrap();
+    let sockets = test_support::short_tempdir().unwrap();
+    let live = sockets.path().join("live");
+    let _agent = UnixListener::bind(&live).unwrap();
+    let dead = sockets.path().join("dead");
+    let gone = sockets.path().join("gone");
+    let session = |socket: &Path| format!("SSH_AUTH_SOCK={}", socket.display());
+    let run = |tmux: Option<&str>, shell: &Path, session: &str| {
+        let _ = fs::remove_file(t.path("tmux-used"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(["cp", "source", "--to", "backup", "--auth-from", "ssh"])
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("PATH", &paths)
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .env("SSH_AUTH_SOCK", shell)
+            .env("SYQ_TEST_TMUX_VALUE", session)
+            .env_remove("SYQ_AUTH_FROM")
+            .current_dir(t.path(""));
+        match tmux {
+            Some(tmux) => command.env("TMUX", tmux),
+            None => command.env_remove("TMUX"),
+        };
+        let out = command.run().unwrap();
+        assert!(!out.status.success(), "{}", stderr_of(&out));
+        let used = fs::read_to_string(t.path("ssh-agent")).unwrap();
+        (PathBuf::from(used.trim_end()), t.path("tmux-used").exists())
+    };
+    let tmux = Some("/tmp/tmux-fixture/default,1234,0");
+
+    // The shell's socket is gone, as after reattaching from a new login:
+    // ssh gets the session's socket, where an agent answers.
+    assert_eq!(run(tmux, &dead, &session(&live)), (live.clone(), true));
+    // An answering shell socket stays, without asking tmux.
+    assert_eq!(run(tmux, &live, &session(&gone)), (live.clone(), false));
+    // Nothing answers at the session's socket either, or the session has
+    // none: nothing changes.
+    for value in [session(&gone), "-SSH_AUTH_SOCK".into()] {
+        assert_eq!(run(tmux, &dead, &value), (dead.clone(), true), "{value}");
+    }
+    // Outside tmux nothing changes, and tmux is not asked.
+    assert_eq!(run(None, &dead, &session(&live)), (dead.clone(), false));
+}
+
 fn add_remote_tool(t: &Tmp, name: &str) {
     let destination = t.path(&format!("remote-bin/{name}"));
     if destination.exists() {

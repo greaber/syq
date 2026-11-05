@@ -4,7 +4,7 @@ use std::process::ChildStderr;
 use std::sync::mpsc::{self, Receiver};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Failure {
+pub(crate) enum Failure {
     Credentials,
     HostKey,
     Hostname,

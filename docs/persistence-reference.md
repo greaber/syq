@@ -40,8 +40,10 @@ account access.
 A `--for HOST` override wins over the default. Matching uses the exact hostname
 or SSH alias typed in the command, for every login and port; aliases are
 not expanded through SSH configuration or DNS. `--for` takes no login or port.
+`SYQ_AUTH_FROM` in the environment wins over both saved settings, for one shell
+or script; see [Environment](environment.md#choose-authorization-through-the-environment).
 An explicit `--auth-from` (`--syq-auth-from` for `syq rsync`), including `auto`,
-wins over both saved settings.
+wins over all of them.
 `--reset --for HOST` removes one override; `--reset` restores the default to
 `auto` while keeping host overrides. Omit the value to show saved choices, or
 add `--for HOST` to show that host's effective choice.

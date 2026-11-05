@@ -546,9 +546,9 @@ fn authorize_expected_inner(
         existing_account_only,
     };
     if !existing_account_only {
-        crate::output::diagnostic!(
-            "syq: requesting SSH account access from {}; approve on that machine",
-            request.provider.label()
+        super::notices::waiting(
+            &request.provider.label(),
+            &format!("SSH access to {}", request.destination.host),
         );
     }
     let (mut stream, reply) = match &request.provider {

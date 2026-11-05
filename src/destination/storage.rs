@@ -25,7 +25,7 @@ pub(crate) fn connect(name: &str, request: Request) -> Result<(UnixStream, Confi
     if registration.identity != crate::identity::build() {
         bail!("storage authorization requires matching syq builds; reconnect from the authorizing machine with this build");
     }
-    crate::output::diagnostic!("syq: requesting storage permission from @{name}; approve on that machine with its desktop prompt or syq persist receive pending");
+    super::notices::waiting(&format!("@{name}"), "this storage access");
     let (mut stream, reply) = exchange(
         &registration,
         Message::Storage {

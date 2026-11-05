@@ -31,6 +31,7 @@ use crate::private_broker::{PrivateBroker, PrivateBrokerConfig, TrackedStream};
 pub(crate) mod account_copy;
 pub(crate) mod exec;
 mod forward;
+mod notices;
 pub(crate) use forward::{DeadlineIo, HandshakeInput};
 pub(crate) mod handoff;
 mod identity;
@@ -1170,7 +1171,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         args,
         crate::destination_results::ReceiptPolicy::unused()?,
     )?;
-    crate::output::diagnostic!("syq: requesting permission from @{name} (up to 300 seconds; approve on the receiving machine with its desktop prompt or syq persist receive pending)");
+    notices::waiting(&format!("@{name}"), "this copy");
     let (_, reply) = exchange(
         &registration,
         Message::Request {

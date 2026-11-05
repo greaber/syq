@@ -144,11 +144,7 @@ fn assert_failure(output: &Output, text: &str) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains(text), "{stderr}");
     assert!(!stderr.contains("private-test-credential"), "{stderr}");
-    assert!(!stderr.contains("requesting permission"), "{stderr}");
-    assert!(
-        !stderr.contains("requesting command permission"),
-        "{stderr}"
-    );
+    assert!(!stderr.contains("waiting up to"), "{stderr}");
 }
 
 #[test]

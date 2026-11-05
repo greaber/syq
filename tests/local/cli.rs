@@ -1069,6 +1069,103 @@ fn environment_options_apply_to_the_command_and_never_reach_children() {
 }
 
 #[test]
+fn auth_from_environment_sets_the_choice_below_the_command_line() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"payload");
+    // Native SSH records each login and refuses it.
+    executable(
+        &t.path("bin/ssh"),
+        b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_8.9p1 >&2; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\necho 'Permission denied (publickey).' >&2\nexit 255\n",
+    );
+    let mut paths = vec![t.path("bin")];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let paths = std::env::join_paths(paths).unwrap();
+    let command = |args: &[&str], choice: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("PATH", &paths)
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .env_remove("SSH_AUTH_SOCK")
+            .env_remove("TMUX")
+            .current_dir(t.path(""));
+        match choice {
+            Some(choice) => command.env("SYQ_AUTH_FROM", choice),
+            None => command.env_remove("SYQ_AUTH_FROM"),
+        };
+        command.run().unwrap()
+    };
+    let tried_ssh = || {
+        let tried = t.path("ssh-used").exists();
+        let _ = fs::remove_file(t.path("ssh-used"));
+        tried
+    };
+    fs::create_dir(t.path("runtime")).unwrap();
+    let upload = ["cp", "source", "--to", "backup"];
+
+    // A local copy has no SSH endpoint for the choice to apply to.
+    let out = command(&["cp", "source", "--as", "copy"], Some("@laptop"));
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("copy")), b"payload");
+
+    // A provider from the environment is used without trying native SSH,
+    // and a failure says where the choice came from.
+    let out = command(&upload, Some("@nosuch"));
+    assert!(!out.status.success());
+    assert!(
+        stderr_of(&out).contains("authorization provider @nosuch comes from SYQ_AUTH_FROM"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(!tried_ssh());
+
+    // The command line wins over the environment.
+    let out = command(
+        &[&upload[..], &["--auth-from", "ssh"]].concat(),
+        Some("@nosuch"),
+    );
+    assert!(!out.status.success());
+    assert!(tried_ssh(), "{}", stderr_of(&out));
+
+    // The environment wins over a saved choice.
+    assert_output_ok(&command(
+        &["persist", "auth-from", "@nosuch", "--for", "backup"],
+        None,
+    ));
+    let out = command(&upload, Some("ssh"));
+    assert!(!out.status.success());
+    assert!(tried_ssh(), "{}", stderr_of(&out));
+    let out = command(&upload, None);
+    assert!(
+        stderr_of(&out).contains("comes from the saved auth-from choice"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(!tried_ssh());
+    // An empty value is the same as none.
+    let out = command(&upload, Some(""));
+    assert!(
+        stderr_of(&out).contains("comes from the saved auth-from choice"),
+        "{}",
+        stderr_of(&out)
+    );
+
+    // An invalid value names the variable before anything connects.
+    let out = command(&upload, Some("bad/name"));
+    assert!(!out.status.success());
+    assert!(
+        stderr_of(&out)
+            .contains("SYQ_AUTH_FROM=\"bad/name\" is not auto, ssh, @NAME or an SSH host"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(!tried_ssh());
+}
+
+#[test]
 fn environment_options_never_reach_internal_server_entry_points() {
     for argv in [vec!["rsync", "--server"], vec!["--server"]] {
         let out = Command::new(env!("CARGO_BIN_EXE_syq"))

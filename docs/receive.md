@@ -92,7 +92,9 @@ syq persist receive deny REQUEST_ID
 ```
 
 Approving a copy trusts the server to supply its contents. Requests expire after
-five minutes. If a prompt is missing or dismissed, the request stays pending;
+five minutes. While a command waits for approval, it says so on the server's
+stderr, also when it runs without a terminal, so a log or a script shows why it
+is waiting. If a prompt is missing or dismissed, the request stays pending;
 it is never approved automatically. To use only terminal approval, run `syq persist receive on --name laptop --notify off`.
 
 ### Names and paths
@@ -273,3 +275,18 @@ laptop disconnects. Restricted source-read downloads require direct TCP and do
 not write SSH authorization on the source. Account-approved downloads can use
 SSH in either direction. See [authorization selection](remote-reference.md#authorization-selection)
 for routing details.
+
+If hostA has no SSH credentials of its own, asking your laptop is simply how
+the copy gets authorized, and syq asks without a warning, as agent forwarding
+would. If hostA has credentials that did not work, such as keys hostB does not
+accept or an `SSH_AUTH_SOCK` where no agent answers, syq still asks your
+laptop, but first prints one line saying what went wrong and how to fix it. Inside tmux, a
+shell keeps the `SSH_AUTH_SOCK` it started with, which stops working after you
+reattach from a new SSH login; syq then uses the tmux session's current one,
+so your agent keeps working for syq.
+
+To choose authorization for every command in a shell or a script, such as one
+a coding agent runs, set `SYQ_AUTH_FROM` to any value `--auth-from` takes, for
+example `@laptop` for the account access described above. An explicit
+`--auth-from` still wins. `SYQ_CP_OPTIONS` adds other options to every
+`syq cp`; see [Environment](environment.md).
