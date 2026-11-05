@@ -139,16 +139,8 @@ impl LoginWatch {
                 super::record_attempt(&control, &super::Attempt::new("login", Some(error.clone())));
                 defer_after_login(&control);
                 crate::output::diagnostic!("syq persist: {error}");
-                unsafe {
-                    // End what this switch started, but not this process
-                    // before it exits with its status; whoever started the
-                    // switch then ends anything left in its group.
-                    if libc::getpgrp() == libc::getpid() {
-                        libc::signal(libc::SIGTERM, libc::SIG_IGN);
-                        libc::kill(0, libc::SIGTERM);
-                    }
-                    libc::_exit(LOGIN_NEEDED_EXIT);
-                }
+                end_own_group();
+                unsafe { libc::_exit(LOGIN_NEEDED_EXIT) }
             });
         }
         Self(done)
@@ -160,6 +152,20 @@ impl Drop for LoginWatch {
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    }
+}
+
+/// Before a switch exits as needing the user: end what it started that
+/// stays in its process group, such as a ProxyJump ssh or `ssh-sk-helper`
+/// still waiting for a touch, but not this process itself. Whoever started
+/// the switch also ends the group once it exits, but the command that
+/// started one may be gone by then.
+pub(crate) fn end_own_group() {
+    unsafe {
+        if libc::getpgrp() == libc::getpid() {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            libc::kill(0, libc::SIGTERM);
+        }
     }
 }
 
@@ -724,13 +730,8 @@ fn start(
 ) -> Result<(mpsc::Receiver<std::result::Result<(), Ended>>, libc::pid_t)> {
     check_runnable(path).with_context(|| format!("will not run {}", path.display()))?;
     let mut output = tempfile::tempfile().context("create a temporary file for its output")?;
-    let mut command = Command::new(path);
+    let mut command = switch_command(path, args);
     command
-        .args(args)
-        .env("SYQ_NO_UPDATE_CHECK", "1")
-        // Without a terminal, ssh would otherwise ask through a desktop
-        // dialog. A login that needs the user fails and says so instead.
-        .env("SSH_ASKPASS_REQUIRE", "never")
         .stdin(Stdio::null())
         .stdout(output.try_clone()?)
         .stderr(output.try_clone()?);
@@ -762,6 +763,21 @@ fn start(
         let _ = sender.send(result);
     });
     Ok((done, group))
+}
+
+/// The command that switches with the build at `path`. It is the
+/// service's own switch, even when a command started this service
+/// (`STARTED_BY_COMMAND`).
+fn switch_command(path: &Path, args: &[OsString]) -> Command {
+    let mut command = Command::new(path);
+    command
+        .args(args)
+        .env("SYQ_NO_UPDATE_CHECK", "1")
+        .env_remove(STARTED_BY_COMMAND)
+        // Without a terminal, ssh would otherwise ask through a desktop
+        // dialog. A login that needs the user fails and says so instead.
+        .env("SSH_ASKPASS_REQUIRE", "never");
+    command
 }
 
 /// The last line a failed command printed, which says why.
@@ -1018,6 +1034,18 @@ mod tests {
         });
         assert!(follower.report().is_none());
         assert_eq!(switches(&path), 1);
+    }
+
+    /// A service's own switch is never taken for one a command started,
+    /// even in a service that a command's switch started, which passed that
+    /// on to it: it would hold commands off after a login that needs the
+    /// user, though status says the next one in a terminal tries again.
+    #[test]
+    fn a_services_own_switch_is_not_taken_for_a_commands() {
+        let command = switch_command(Path::new("/nonexistent/syq"), &["persist".into()]);
+        assert!(command
+            .get_envs()
+            .any(|(name, value)| name == STARTED_BY_COMMAND && value.is_none()));
     }
 
     /// Another update after a switch could not log in is asked about, and

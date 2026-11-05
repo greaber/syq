@@ -3061,8 +3061,11 @@ fi
 # rejects, while the control connection and helper setup still work.
 case " $* " in
     *" ControlPath=none "*" PermitLocalCommand=no "*|*" PermitLocalCommand=no "*" ControlPath=none "*)
-        # Wait, as for a touch of a security key that nobody gives.
+        # Wait, as for a touch of a security key that nobody gives, with a
+        # process of its own, as a ProxyJump ssh or ssh-sk-helper.
         if [ -n "${FAKE_SSH_HANG_DIRECT:-}" ]; then
+            sleep 600 &
+            echo $! > "$FAKE_SSH_HANG_DIRECT.child"
             echo $$ > "$FAKE_SSH_HANG_DIRECT"
             exec sleep 600
         fi
@@ -4160,16 +4163,20 @@ fn a_switch_whose_login_gets_no_answer_waits_for_the_user() {
             std::time::Duration::from_secs(20),
             || fs::read_to_string(&hung).is_ok_and(|pid| !pid.trim().is_empty()),
         );
-        let ssh: libc::pid_t = fs::read_to_string(&hung).unwrap().trim().parse().unwrap();
-        (switch, ssh)
+        let pid = |path: &Path| -> libc::pid_t {
+            fs::read_to_string(path).unwrap().trim().parse().unwrap()
+        };
+        (switch, pid(&hung), pid(&hung.with_extension("pid.child")))
     };
-    let (mut first, ssh) = switch("8000");
+    let (mut first, ssh, child) = switch("8000");
     let started = std::time::Instant::now();
     let status = first.wait().unwrap();
     assert_eq!(status.code(), Some(78), "{status:?}");
     assert!(started.elapsed() < std::time::Duration::from_secs(8));
+    // The switch ends its ssh's own processes too, though nobody ends its
+    // group after it, as when the command that started it is gone.
     wait_for("ssh to end", std::time::Duration::from_secs(10), || {
-        ended(ssh)
+        ended(ssh) && ended(child)
     });
     let shown = installed.persist(syq, &["status", "--json"]);
     assert_output_ok(&shown);
@@ -4189,11 +4196,11 @@ fn a_switch_whose_login_gets_no_answer_waits_for_the_user() {
 
     // Ending the switch's group, as its time limit or the service that
     // started it does, ends its login with it.
-    let (mut second, ssh) = switch("60000");
+    let (mut second, ssh, child) = switch("60000");
     unsafe { libc::kill(-(second.id() as libc::pid_t), libc::SIGKILL) };
     second.wait().unwrap();
     wait_for("ssh to end", std::time::Duration::from_secs(10), || {
-        ended(ssh)
+        ended(ssh) && ended(child)
     });
     installed.request(serde_json::json!({"version": 2, "stop": true}));
     old.join().unwrap();

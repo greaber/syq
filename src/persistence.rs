@@ -264,6 +264,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                             .is_some()
                     {
                         crate::output::diagnostic!("syq persist: {error:#}");
+                        crate::receive_service::switch::end_own_group();
                         return Ok(crate::receive_service::switch::LOGIN_NEEDED_EXIT);
                     }
                 }
@@ -522,7 +523,16 @@ fn connect_receiving(
         // A switch runs in the background: a login that needs the user fails
         // rather than asks, as receiving's own reconnects do.
         rsh: if when_idle {
-            vec!["ssh".into(), "-o".into(), "BatchMode=yes".into()]
+            // An unreachable server fails soon, as an ordinary failure,
+            // rather than at the login's deadline as one that needs the user
+            // (`switch::LoginWatch`); as the login check does.
+            vec![
+                "ssh".into(),
+                "-o".into(),
+                "BatchMode=yes".into(),
+                "-o".into(),
+                "ConnectTimeout=10".into(),
+            ]
         } else {
             vec!["ssh".into()]
         },

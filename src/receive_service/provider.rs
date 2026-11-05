@@ -980,7 +980,11 @@ fn start(domain: &Domain) -> Result<()> {
     let (mut startup, child_output) = crate::process::with_inheritance_guard(UnixStream::pair)?;
     startup.set_read_timeout(Some(STOP_TIMEOUT))?;
     let mut command = crate::process::self_command()?;
-    command.arg(INTERNAL).arg(domain.runtime_path());
+    // Its own switches are not a command's (`switch::STARTED_BY_COMMAND`).
+    command
+        .arg(INTERNAL)
+        .arg(domain.runtime_path())
+        .env_remove(super::switch::STARTED_BY_COMMAND);
     if let Some(path) = crate::process::started_from() {
         command.arg(path);
     }

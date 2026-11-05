@@ -938,7 +938,11 @@ pub(crate) fn busy_notice(
 /// current reads one directory and each service's small record, and
 /// contacts nothing; it contacts a stale one at most once a minute
 /// (`claim_switch_attempt`), so a cooling down, busy or unresponsive
-/// service costs commands nothing meanwhile.
+/// service costs commands nothing meanwhile. The exception is a service
+/// whose switch waits for the user to log in: a command without a terminal
+/// gives its claim back, so that the next one with a terminal can try at
+/// once, and such commands each ask that service for its status, at most
+/// 50 ms (`REFRESH_ANSWER`) and usually about 1 ms.
 pub(crate) fn refresh_outdated(domain: &Domain, quiet: bool) {
     if !domain.enabled().unwrap_or(false) {
         return;
@@ -1713,7 +1717,11 @@ impl Started {
 }
 fn spawn(control: &Path) -> Result<Started> {
     let mut command = crate::process::self_command()?;
-    command.arg("--receive-service").arg(control);
+    // Its own switches are not a command's (`switch::STARTED_BY_COMMAND`).
+    command
+        .arg("--receive-service")
+        .arg(control)
+        .env_remove(switch::STARTED_BY_COMMAND);
     if let Some(path) = crate::process::started_from() {
         command.arg(path);
     }
