@@ -1,161 +1,132 @@
 # Persistence details
 
-See [`syq persist`](commands/persist.md) for the option list.
-
-For everyday setup, start with [Keep connections open](persistence.md) or
-[Use your laptop from a server](receive.md).
-
-Persistence commands use the default domain unless you select an isolated one
-with `--pscope PATH`, before or after any `persist` subcommand. Each domain has
-its own connections, authorization defaults, receiving profiles, and
-remembered account permissions. See [Isolated script scopes](#isolated-script-scopes)
-for creation, lifetime, and cleanup.
+This page answers questions that come up after setup. To set up, start with
+[Keep connections open](persistence.md) or
+[Use your laptop from a server](receive.md);
+[`syq persist`](commands/persist.md) lists every option. Commands use the
+default persistence domain unless you pass `--pscope PATH` for an
+[isolated one](#isolated-script-scopes).
 
 ## Account access
 
-A server can log in to other servers with your laptop's SSH access, as shown
-in [Open a shell on another server](receive.md#open-a-shell-on-another-server).
-This section covers the choices, requirements, and lifetime of that access;
-see [SSH account access](security.md#ssh-account-access) for what approving it
+These sections cover choosing, setting up, and ending a server's use of your
+laptop's SSH access, as in
+[Open a shell on another server](receive.md#open-a-shell-on-another-server).
+See [SSH account access](security.md#ssh-account-access) for what approving it
 grants.
 
 ### Authorization defaults
 
-`--auth-from` chooses how a command authorizes its SSH logins:
+`--auth-from` chooses who authorizes a command's SSH logins:
 
 | Value | Meaning |
 |---|---|
-| `auto` (default) | Use this machine's own SSH access. A copy between this machine and one server can then ask a receiving machine to approve just that copy; see [Authorization selection](remote-reference.md#authorization-selection). Other commands run native SSH once. |
-| `ssh` | Use only this machine's own SSH access, ignoring approved account connections |
-| `@NAME` | Use or request access to the destination account through that receiving machine, without first trying this machine's own access; fails if the machine is unavailable or refuses |
+| `auto` (default) | This machine's own SSH access. If that fails, a copy between this machine and one other server can ask a receiving machine to approve just that copy; see [Authorization selection](remote-reference.md#authorization-selection). |
+| `ssh` | Only this machine's own SSH access |
+| `@NAME` | Only access to the destination account through that receiving machine, never this machine's own |
 | `[USER@]HOST[:PORT]` | The same, through an [SSH authorization provider](#ssh-authorization-providers) |
 
-To save a choice on a server, for all hosts or for one:
+To avoid typing the option on a server, save a choice there:
 
 ```sh
-syq persist auth-from @laptop
-syq persist auth-from ssh --for backup
-syq persist auth-from
-syq persist auth-from --reset --for backup
-syq persist auth-from --reset
+syq persist auth-from @laptop                # default for all hosts
+syq persist auth-from ssh --for backup       # choice for one host
+syq persist auth-from                        # show saved choices
+syq persist auth-from --reset --for backup   # remove one host's choice
+syq persist auth-from --reset                # restore the default to auto
 ```
 
 A command uses the first of these that is set:
 
-1. Its `--auth-from` option (`--syq-auth-from` for `syq rsync`), including `auto`.
-2. The `SYQ_AUTH_FROM` environment variable, for one shell or script. An empty
-   value counts as unset.
-3. A saved `--for HOST` choice. It matches the exact hostname or SSH alias
-   typed in the command, for every login and port, without expanding aliases.
+1. Its `--auth-from` option (`--syq-auth-from` for `syq rsync`).
+2. The `SYQ_AUTH_FROM` environment variable; an empty value counts as unset.
+3. The saved choice for the host name exactly as typed in the command, without
+   expanding aliases.
 4. The saved default.
 5. `auto`.
 
-`--reset --for HOST` removes one host's choice; `--reset` restores the default
-to `auto` and keeps host choices. Omit the value to show saved choices, or add
-`--for HOST` to show that host's effective choice; both say when
-`SYQ_AUTH_FROM` overrides them. Choices are saved in `auth-from.json` in the
-selected domain.
-
-Saved choices and `SYQ_AUTH_FROM` apply to every command that takes
-`--auth-from`, whether or not persistence is on: `syq ssh`, `persist connect`,
-`persist ssh-config`, and the SSH endpoints of `cp`, `rsync`, `rm`, `map`, and
-`clean-partials`. So with `@laptop` saved, `syq persist connect hostB` opens an
-approved account connection rather than an ordinary persistent one. A copy
-with `--coordinate-at local` selects access separately for each endpoint. Custom `--rsh` routes, copies to receiving names, and object storage
-keep their own authentication; S3 storage authorization needs an explicit
+Saved choices apply to every command that takes `--auth-from`, whether or not
+persistence is on, so with `@laptop` saved, `syq persist connect hostB` opens
+an approved account connection. They do not affect a custom `--rsh` command,
+copies to receiving names, or object storage; S3 needs an explicit
 `--auth-from @NAME`.
 
 ### Approved account connections
 
-Commands selecting `@NAME` or an SSH provider open an approved account
-connection when they need one, and `syq persist connect HOST --auth-from @NAME`
-opens one in advance. Neither enables ordinary persistence or receiving on
-`HOST`. Later commands that select the same provider reuse the connection,
-including `ssh`, copies, `rsync`, `rm`, `map`, `clean-partials`, and
-descriptor copies; for copies between two other servers, see
-[Approved account copies](remote-reference.md#approved-account-copies). Remote
-path completion reuses a matching connection, but never requests approval or
-opens one. `persist status --json` lists these connections in
-[`authorized_ssh`](automation.md#connection-status), and `syq persist off`
-closes them.
+After you approve account access, the server keeps an approved account
+connection to that account and reuses it for later commands that select the
+same provider, including copies, `rsync`, `rm`, and `map`. To open one in
+advance, run `syq persist connect HOST --auth-from @NAME`. `syq persist off`
+closes them, and `persist status --json` lists them in
+[`authorized_ssh`](automation.md#connection-status).
+
+To use an approved connection with plain `ssh`, `scp`, Git, or rsync, export
+an OpenSSH configuration for it:
+
+```sh
+syq persist ssh-config hostB > hostB.ssh
+ssh -F hostB.ssh hostB hostname
+scp -F hostB.ssh report hostB:report
+GIT_SSH_COMMAND='ssh -F hostB.ssh' git clone hostB:project.git
+```
+
+The host you export must match the login, host, and port that opened the
+connection. The file contains no private key and works only while the connection
+is open, so export it again after reconnecting.
 
 Account access needs:
 
 - OpenSSH 8.9 or newer for the requesting server's SSH client and the
   destination's SSH server.
-- Exact plain host keys for both servers, trusted by the laptop; host
-  certificates alone are not enough. The laptop looks up each key under the
-  alias you typed, with any port you wrote, or your `HostKeyAlias`, in its own
-  SSH configuration, so an alias may lead to different addresses on the two
-  machines as long as both reach the same host.
-- The laptop's key loaded in its SSH agent. The requesting server's SSH
-  configuration chooses the destination account, address, port, and route,
-  and its `IdentityFile` and `IdentitiesOnly` settings choose which keys to
-  offer: an `IdentityFile` naming a public key selects the matching key in the
-  laptop's agent, and a `CertificateFile` can pair a user certificate with it.
+- Your laptop's key in its SSH agent.
+- Plain host keys for both servers that your laptop trusts; host certificates
+  alone are not enough. Your laptop looks up each key under the host name typed
+  on the server, or the `HostKeyAlias` its own SSH configuration gives that
+  name.
 
-When a copy uses SSH for file data, because TCP is unavailable or you chose
-`--no-tcp`, each data connection logs in under the same permission without
-another approval prompt. The laptop or provider must stay available, and
-withdrawing the permission stops the copy. An agent that requires
-confirmation or a hardware-key touch asks for each connection.
+The requesting server's SSH configuration chooses the destination account,
+address, port, and route. An `IdentityFile` there that names a public key
+selects the matching key in your laptop's agent.
 
-`syq persist ssh-config HOST` prints an OpenSSH configuration for one approved
-connection, for use with `ssh -F FILE`, `scp`, `sftp`, Git, or rsync:
-
-```sh
-syq persist ssh-config hostB > hostB.ssh
-ssh -F hostB.ssh hostB hostname
-GIT_SSH_COMMAND='ssh -F hostB.ssh' git clone hostB:project.git
-rsync -e 'ssh -F hostB.ssh' report hostB:report
-```
-
-`HOST` must match the login, host spelling, and port that opened the
-connection. The command never requests approval or opens a login, and the file
-contains no private key. Once the connection closes, tools using the file fail
-without trying other authentication, so export it again after reconnecting.
-Use its absolute path when a tool runs from another directory.
+When a copy carries file data over SSH, each SSH connection logs in under the
+same permission without another prompt, so the laptop or provider must stay
+available. An agent that requires confirmation or a touch asks for each one.
 
 ### SSH authorization providers
 
 An [SSH authorization provider](receive.md#use-an-ssh-authorization-provider)
-needs the same syq build as the machines that use it. Its default domain's
-first receiving profile must be enabled. Its SSH server must allow local
-forwarding (`AllowTcpForwarding` and `AllowStreamLocalForwarding` set to
-`local` or `yes`), and the login key's `authorized_keys` entry must not block
-it with `restrict` or `no-port-forwarding`.
+needs the same syq build as the machines that use it. The first receiving
+profile in its default domain (the one `receive status` lists first) must be
+enabled. Its SSH server must allow local forwarding (`AllowTcpForwarding` and
+`AllowStreamLocalForwarding` set to `local` or `yes`), and the login key's
+`authorized_keys` entry must not disable it with `restrict` or
+`no-port-forwarding`.
 
 ### Account permissions
 
 **Allow** lasts until the laptop's receiving connection to the requesting
 server ends, or for a provider, until that provider login ends. **Remember**
-keeps the permission for later connections through the same receiving profile,
-until you remove it. See [SSH account access](security.md#ssh-account-access)
-for exactly what each covers.
-
-Decide pending requests with the desktop prompt or locally, and manage
-remembered permissions on the laptop:
+lasts until you remove it:
 
 ```sh
-syq persist receive approve REQUEST_ID
 syq persist receive approve REQUEST_ID --remember
-syq persist receive deny REQUEST_ID
 syq persist receive permissions list
 syq persist receive permissions remove PERMISSION_ID
 ```
 
-`--remember` is accepted only for account-access requests. To stop further
-access, run `syq persist off` on the requesting server to close its
-connections, and `syq persist receive off` on the laptop to end session
-permissions and stop further authorization; see
+To cut off access, run `syq persist off` on the requesting server and
+`syq persist receive off` on the laptop; see
 [SSH account access](security.md#ssh-account-access) for what this does not
-undo. Add `--pscope PATH` on either machine for an isolated domain. Remembered permissions belong to the laptop's selected domain: a new
-domain on the laptop starts without them, and a new domain on the server does
-not revoke what that server account was already granted.
+undo. Remembered permissions belong to the laptop's domain. Creating a new
+domain on the server does not revoke what that server account was already
+granted.
 
 ## Names and profiles
 
-Give a project its own receiving name and directory:
+To use different receiving names, directories, or approval rules for different
+work, create receiving profiles. Each has its own name, starting directory,
+roots, limits, and allowed servers, and a new one starts with the usual
+defaults rather than another profile's settings:
 
 ```sh
 mkdir -p ~/work/project
@@ -163,52 +134,30 @@ syq persist receive on --name laptop --cwd ~ --connection server
 syq persist receive on --name project --root ~/work/project --connection server
 ```
 
-Both profiles work from the same server account: `syq cp results --to @project`
-and `syq cp report.pdf --to @laptop`. Each profile has its own directory, copy
-root, limits, automatic approval root, and background connection to each
-allowed server. New profiles start with the usual defaults, including asking
-for approval; they do not inherit another profile's trust or confinement
-settings. Up to 32 profiles can be saved.
+On the server, `syq cp results --to @project` and
+`syq cp report.pdf --to @laptop` then use different profiles.
 
 ### Change or stop a profile
 
-`receive on --name NAME` creates a profile or updates that name's settings;
-omitted options keep their saved values. It enables persistence in the selected
-domain and applies the profile to allowed connections, active and future. It
-connects only the endpoints supplied with `--connection` in this invocation,
-and waits for receiving to become ready on them. If one fails, the settings
-stay saved and healthy connections keep running, but the command exits
-unsuccessfully. Use `persist connect HOST` to start another connection.
-Without `--name`, `receive on` updates the first saved profile, shown first by
-`receive status`.
+`receive on --name NAME` creates or updates a profile; options you omit keep
+their saved values. Without `--name`, it updates the first profile that
+`receive status` lists. It connects to the servers you give with
+`--connection` and waits until receiving is ready on them. If one connection
+fails, the settings stay saved and the others keep running, but the command
+exits unsuccessfully.
 
-```sh
-syq persist receive status
-syq persist receive status --name project
-syq persist receive off --name project
-syq persist receive on --name project
-syq persist receive remove project
-syq persist receive wait server --name laptop --timeout 30
-```
-
-Changing a profile's access settings, stopping it, or removing it cancels only
-that profile's copies, commands, and pending approvals; other profiles keep
-working, and changing only `--notify` or repeating unchanged settings cancels
-nothing. A copy the profile approved from one server to another is the
-exception: once approved, it no longer needs this machine, and runs until it
-finishes, until someone interrupts it on the server, or until you revoke the
+Changing a profile's access settings, stopping it, or removing it cancels that
+profile's running copies, commands, and pending approvals; changing only
+`--notify` cancels nothing. Copies it approved between two servers keep running
+until they finish, someone interrupts them on the server, or you revoke the
 destination's enrollment with `syq receiver revoke`. `receive off` without a
-name stops all profiles; `receive on` enables the first profile, and
-`receive on --name NAME` enables another. Removing the first profile makes the
-next saved profile the default. `pending`, `approve`, and `deny` work across
-the selected domain's profiles, and `pending` names the receiving profile of
-each request.
+name stops every profile.
 
 <a id="choose-allowed-servers"></a>
 
 ### Choose allowed connections
 
-To give one server account an inbox for downloads that do not need approval:
+To give one server account an inbox for downloads that need no approval:
 
 ```sh
 mkdir -p ~/Downloads/work
@@ -216,221 +165,139 @@ syq persist receive on --name work-inbox --connection work \
   --auto-approve-root ~/Downloads/work
 ```
 
-On `work`, use `syq cp results --to @work-inbox`. Other connections cannot
-use that profile. Your general profile can still ask for approval on every
-download.
+On `work`, use `syq cp results --to @work-inbox`. Other servers cannot use
+that profile, and your general profile can still ask before every download.
 
-Profiles default to all SSH connections in their domain. `--connection ENDPOINT`
-restricts a profile to that exact SSH destination as used on the receiving
-machine. Use the endpoint shown by `persist status`: for example `work`,
-`alice@work`, or `alice@work:2222`. Matching includes an explicitly selected
-user and port; it does not expand SSH aliases or equate omitted ports with
-explicit ports. An alias reaches the account and host your local SSH
-configuration gives it, so changing that configuration can change which
-account an allowed alias reaches; the server cannot choose its own identity
-for this check.
-
-Repeat `--connection` to supply several endpoints. Each supplied list replaces
-the saved list and connects the supplied endpoints; omitting `--connection`
-keeps the restriction without connecting dormant endpoints.
-`--all-connections` clears the restriction and starts receiving on active
-connections. Changes apply to existing persistent connections too.
+Without `--connection`, a profile accepts every SSH connection in its domain.
+Each `--connection` matches the destination exactly as your laptop connects to
+it, as `persist status` shows it (`work`, `alice@work`, or `alice@work:2222`),
+without expanding aliases. Because the match uses your laptop's name for the
+server, changing your SSH configuration can change which account an allowed
+name reaches. Each list you give replaces the saved one, and
+`--all-connections` removes the restriction.
 
 ### Move a name to another machine
 
-Names belong to a server account and stay assigned to their original receiving
-machine when it disconnects. Another laptop cannot claim the same name, even
-while the original is offline. Stopping receiving or removing a local profile
-does not release its server-side name.
-
-To replace a laptop, stop its receiving connection, then run
-`syq persist destinations forget laptop` on the server. Run
-`syq persist connect server` on the replacement laptop to claim the released
-name. A rejected connection needs this explicit retry. Forgetting a live
-connection is refused.
+A receiving name stays with the machine that claimed it, even while that
+machine is offline, so another laptop cannot take it over. To move it, stop
+receiving on the old laptop, run `syq persist destinations forget laptop` on
+the server, then run `syq persist connect server` on the new laptop.
 
 ### Back up the receiving identity
 
-Syq generates one receiver key per local account, shared by receiving profiles,
-persistence domains, and syq versions, in
-`~/.syq-receiver-identity/identity_ed25519`. It is independent of your SSH
-login keys and profile settings. Keep that directory across upgrades, and
-include it in private backups if you want to restore the same identity; losing
-it means releasing the old names on each server. Copying it to another machine
-gives that machine the same receiver identity, but only one connection can hold
-a name: while the old one is still responsive, the replacement is rejected, and
-an unresponsive one must time out first. Use different profile names to
-receive on both machines at once.
+Your receiving names are tied to the key in `~/.syq-receiver-identity/`, which
+all profiles, domains, and syq versions share. Keep it in private backups; if
+you lose it, you have to `forget` your names on each server. Another machine
+with a copy of it has the same identity, but only one machine can hold a name at
+a time, so give machines that receive at the same time different profile names.
 
 ## Directories
 
-The three directory settings are independent:
+To control where downloads land and which need approval, use these
+independent settings:
 
 | Setting | Purpose | Clear it with |
 |---|---|---|
 | `--cwd DIR` | Starting directory for relative paths | `--auto-cwd` |
 | `--root DIR` | Hard boundary for downloads, even with approval | `--no-root` |
-| `--auto-approve-root DIR` | Downloads confined here skip approval, except with some options | `--no-auto-approve-root` |
+| `--auto-approve-root DIR` | Downloads confined here, including pruning up to `--max-delete`, skip approval, except with `--widen-dirs all` | `--no-auto-approve-root` |
 
-Each requires an existing directory with a UTF-8 path; neither root can be `/`.
-An explicit cwd must be inside the hard root, if set. Otherwise the starting
-directory is the hard root, the automatic approval root, or your home directory,
-in that order.
+Each must be an existing directory, and neither root can be `/`. Without
+`--cwd`, downloads start in the hard root if set, otherwise the automatic
+approval root if set, otherwise your home directory.
 
-Downloads outside the automatic approval root ask for approval, provided they
-stay within the hard root if one is set. Symlinks cannot grant automatic writes
-outside the approval root. Replacing the automatic root directory itself
-requires approval, and is prohibited when it is also the hard root. These roots
-do not restrict approved commands or the destinations of approved copies to
-other servers.
+Downloads outside the hard root are refused, even with approval; inside it,
+downloads outside the automatic approval root ask. Symlinks cannot extend
+automatic approval outside its root, and replacing that root directory itself
+asks, or is refused when it is also the hard root. Neither root restricts
+approved commands or copies you approve between servers.
 
-## Copy limits
+<a id="copy-limits"></a>
 
-Copies to a receiving name use encrypted TCP connections that the receiving
-machine opens to the sending server, falling back to SSH when TCP is
-unreachable. `--no-tcp` forces SSH; `--tcp-ports` selects the listening port
-range on the sending server. The receiving connection must stay open
-throughout the copy.
+## Copy limits and restrictions
 
-Copies support directories, symlinks, modification times, filters, hashing,
-resume, mappings, the `--copy-metadata` options, `--sparse`, `--in-place`,
-and the [overwrite policies](reference.md#choose-which-existing-files-to-update).
-Copies are refused while syq runs as root, so ownership and special files work
-as for any copy by an ordinary account. Named copies do not follow a
-destination symlink, even with `--follow-dst`; name the directory the link
-points to instead.
+Each copy to a receiving name may write up to 100 GiB and one million entries
+by default. Entries are the changes it makes, such as files written,
+directories created, metadata changes, and deletions. Change the limits with
+`syq persist receive on --max-bytes 20G --max-entries 100000`; the sender can
+only lower them. They apply per copy, so repeated copies can still fill the
+disk.
 
-Each copy is limited to 100 GiB and one million entries by default, counting
-entries as [restricted copies](remote-reference.md#limits-and-unsupported-options)
-do. Change these ceilings with
-`syq persist receive on --max-bytes 20G --max-entries 100000`. Lower limits
-requested by the sender also apply. Limits are per copy, so repeated copies can
-fill the disk.
+A pruning copy is refused until you set a positive `--max-delete`. After that, a
+pruning copy that plans more deletions than your `--max-delete` or
+`--max-entries`, or its own `--max-delete`, deletes nothing and exits 25, and so
+does its dry run, so you can check first.
 
-Pruning is disabled unless the laptop sets a positive `--max-delete`; until
-then, a pruning copy is refused, and so is a dry run of it. A pruning copy
-that plans more deletions than the laptop's `--max-delete` or `--max-entries`,
-or than its own `--max-delete`, deletes nothing and exits 25. A dry run of it
-exits 25 too, so you can check first.
+Copies to a receiving name are refused while syq runs as root on the receiving
+machine. They cannot preserve hard links, ACLs, extended attributes, or access
+or birth times, and cannot use `--open-noatime` or `--sparse`; the other
+`--copy-metadata` options work as for any copy by an account other than root.
+They never follow a destination symlink, even with `--follow-dst`; name the
+link's target instead.
 
 ## Connection lifetime and waits
 
-`persist on` enables persistence for subsequent syq SSH connections.
-`persist connect server` enables it and connects immediately; with receiving
-enabled, it waits until receiving is ready. `--timeout 30` limits that wait
-after SSH and helper setup, not authentication or installation. Failure leaves
-persistence enabled, and connecting again reuses a healthy connection without
-cancelling its requests.
+`syq persist connect server` connects right away and, with receiving on, waits
+until receiving is ready. `--timeout 30` limits that wait, not the SSH login
+or installing syq on the server. `syq ssh` reuses or opens a persistent login
+but does not start receiving.
 
-Default-domain connections have no idle expiry. In an explicit domain, idle
-SSH connections expire after five to ten minutes. An enabled receiving service
-keeps its connection until you stop it and reconnects after interruptions;
-other SSH logins reopen on their next use. Syq installs no login service, so
-connect again after a reboot. Copies are not queued or retried automatically.
-After you update syq, receiving services and the SSH authorization provider
-switch to the new version by themselves once no copy, command, login, or
-approval is in progress.
+In an isolated domain, idle SSH connections close after five to ten minutes;
+in the default domain they stay open. Syq installs no login service, so
+connect again after a reboot. After you update syq, receiving and the SSH
+authorization provider switch to the new version by themselves once no copy,
+command, login, or approval is in progress.
 
-Use `syq persist receive wait server --timeout 30` to wait without starting or
-restarting a connection. `syq ssh` can open or reuse a persistent SSH login,
-but does not start receiving; use a file operation or `persist connect` for that.
-On the server:
-
-```sh
-syq persist destinations list
-syq persist destinations wait laptop --timeout 30
-syq persist destinations forget laptop
-```
-
-`forget` releases the name assignment while its connection is stopped. For structured
-status and approval requests, see [connection status](automation.md#connection-status).
+To wait in a script without starting a connection, run
+`syq persist receive wait server --timeout 30` on the laptop, or
+`syq persist destinations wait laptop --timeout 30` on the server. For
+structured status, see [connection status](automation.md#connection-status).
 
 ## Isolated script scopes
 
-`syq persist on --ephemeral` prints the path of a new, independent domain.
-Pass it to later commands with `--pscope PATH` (`--syq-pscope PATH` for rsync).
-For example, on a server with a laptop receiving connection:
+To keep a script's connections and settings apart, create an isolated domain
+and pass its path to each command with `--pscope PATH` (`--syq-pscope PATH`
+for rsync):
 
 ```sh
 scope=$(syq persist on --ephemeral)
 syq persist --pscope "$scope" auth-from @laptop
 syq ssh --pscope "$scope" hostB -- hostname
 syq cp --pscope "$scope" report --to hostB --as report
-syq persist --pscope "$scope" status
 syq persist --pscope "$scope" off
 ```
 
-Fresh domains use default authorization choices and start with receiving off;
-they do not copy your default domain's settings or approved connections. To
-receive through one on your laptop, run
-`syq persist --pscope PATH receive on --name project --connection server`,
-choosing a receiving name that is not already connected to that server
-account. Use the same `--pscope PATH` for its status, pending requests,
-approvals, and remembered-permission management.
+A new domain starts with receiving off and default authorization choices, and
+shares none of the default domain's settings or connections. To receive
+through one on your laptop, run
+`syq persist --pscope PATH receive on --name project --connection server` with
+a name not already connected to that server account.
 
-A domain does not isolate processes running as the same OS account; see
-[Persistent connections](security.md#persistent-connections). Receiving names
-are shared by all domains; see
-[`persist destinations`](commands/persist.md#syq-persist-destinations).
+`persist off` on an isolated domain closes its connections and deletes its
+settings and remembered permissions; the path cannot be reused. On the default
+domain, it only closes connections. A domain does not isolate processes of the
+same account from each other (see
+[Persistent connections](security.md#persistent-connections)), and all domains
+share receiving names.
 
-Scoped `persist off` closes that domain's connections and receiving services,
-then removes its settings and remembered permissions; the path cannot be
-reused afterwards. Default `persist off` closes default-domain connections but
-keeps its saved settings and remembered permissions.
+<a id="updating-connections"></a>
 
 ## Setup and recovery
 
-Linux desktop prompts need libnotify 0.7.10 or later and a running notification
-service. macOS uses a native dialog. Start receiving from a terminal in your
-desktop session. After changing sessions, run `syq persist receive off`, then
-enable the profiles you need from a terminal in the new session.
-`--notify off` selects terminal approval; `--notify desktop` restores prompts.
-`syq persist receive pending` shows complete requests and prompt errors. A
-prompt's note that a copy replaces existing files is advisory; destination
-entries can change before copying.
+If approval prompts do not appear, start receiving from a terminal in your
+desktop session; after logging in to a new session, run
+`syq persist receive off` and enable your profiles again from there. Linux
+prompts need libnotify 0.7.10 or later and a notification service.
+`syq persist receive pending` shows requests and prompt errors, and
+`--notify off` switches to terminal approval. A prompt's note that a copy
+replaces existing files is only advisory, because files can change before the
+copy runs.
 
-Start the connection from your laptop with
-`syq persist receive on --connection server`, or use `syq persist connect server`
-to keep the current receiving configuration.
-Opening a plain SSH session does not enable receiving, and connecting onward
-from that server to another host does not carry your laptop's receiving name
-with you.
-
-For automatic reconnection to work, your SSH key or agent must be available and
-the server's host key must already be trusted; the background service cannot
-ask for a password. The server must allow remote Unix socket forwarding, and
-OpenSSH 7.8 and later also require permission for remote TCP forwarding:
-`AllowStreamLocalForwarding` and `AllowTcpForwarding` must both allow `remote`
-or `yes`. When a server refuses forwarding, receiving through it stops. When a
-server rejects your login or presents a host key that does not match,
-receiving retries with growing waits of up to 10 minutes. In both cases
-`syq persist status` shows the failure and its reason, and
-`syq persist connect server` tries again at once.
-
-The server command uses the matching helper installed by the receiving
-connection. If that helper is missing or does not recognize an option, update
-syq on both machines.
-
-## Updating connections
-
-After upgrading syq on both machines, run `syq persist connect server` on the
-receiving machine for each server you use, adding `--pscope PATH` for a scoped
-domain. The new version replaces the receiving service the older one left
-running and keeps your settings. If receiving was disabled, enable it first
-with `syq persist receive on`, or enable and connect together with
-`syq persist receive on --connection server`. You do not need
-`syq persist off` before upgrading; for a scoped domain it would also delete
-that domain's settings and remembered permissions.
-
-Requests that were waiting for approval do not carry over: run them again on
-the server and approve the new requests. Session permissions (**Allow**) end
-with the old receiving connection, so the next account access asks again
-unless you chose **Remember**.
-
-Manage receiving with the new version afterwards. An older binary may refuse
-settings that a newer one wrote, does not manage scoped domains a newer version
-created, and does not enforce receiving-name assignments, so use updated syq
-commands on the server and stop older receiving services before switching
-versions. Saved names, directories, and limits carry over. Settings using the
-former `--approve always` now require approval; choose `--auto-approve-root`
-explicitly to enable unattended downloads.
+If receiving does not reconnect, check that your SSH key or agent is available
+and that the server's host key is already trusted; the background service
+cannot ask for a password. The server must allow remote forwarding:
+`AllowStreamLocalForwarding` and, from OpenSSH 7.8, `AllowTcpForwarding` set
+to `remote` or `yes`. When a server refuses forwarding, receiving through it
+stops; after a rejected login or changed host key, it retries with waits of up
+to 10 minutes. `syq persist status` shows the reason, and
+`syq persist connect server` retries at once.

@@ -8,7 +8,10 @@ pub(crate) fn command_for_help() -> Command {
             .about("Inspect and clear local transfer tuning history")
             .subcommand_required(true)
             .subcommand(
-                Command::new("list").about("List recent transfers").arg(
+                Command::new("list")
+                    .about("List recent transfers, newest first")
+                    .long_about("List recent transfers, newest first. WORKERS is the worker count that older syq versions saved for later copies to start with; transfers recorded by this version show ?.")
+                    .arg(
                     Arg::new("limit")
                         .long("limit")
                         .value_name("N")
@@ -45,7 +48,7 @@ pub(crate) fn command_for_help() -> Command {
                     ),
             )
             .subcommand(
-                Command::new("clear").about("Delete recorded history and filesystem startup hints"),
+                Command::new("clear").about("Delete recorded history, so later copies choose their starting worker counts afresh"),
             ),
     )
 }

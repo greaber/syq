@@ -1,14 +1,14 @@
 # syq rsync
 
-Copy with rsync-style arguments:
+Run an rsync command with syq by putting `syq` in front of it:
 
 ```sh
 syq rsync -av project/ server:backup/project/
 ```
 
 Check [Rsync compatibility](../rsync-compat.md) before replacing a script.
-Trailing slashes follow rsync's rules. Here `-h` means human-readable sizes;
-use `--help` for help. `SYQ_RSYNC_OPTIONS` supplies
+As in rsync, trailing slashes matter and `-h` means human-readable sizes; use
+`--help` for help. `SYQ_RSYNC_OPTIONS` adds
 [extra arguments](../environment.md#add-options-through-the-environment).
 
 <!-- CLI: rsync -->
@@ -25,13 +25,13 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | `-a, --archive` | Archive mode; same as -rlptgoD |
 | `-r, --recursive` | Recurse into directories |
 | `-l, --links` | Copy symlinks as symlinks |
-| `--insecure-links` | Follow symlinks in this machine's rsync operator paths regardless of ownership (local only, as in rsync) |
+| `--insecure-links` | Follow symlinks in the local paths you give, whoever owns them (as in rsync) |
 | `-H, --hard-links` | Preserve hard links between selected regular files |
 | `-A, --acls` | Preserve native Linux or macOS ACLs; implies permissions |
 | `-X, --xattrs` | Preserve extended attributes |
 | `-p, --perms` | Preserve permissions |
 | `-t, --times` | Preserve modification times |
-| `-U, --atimes...` | Preserve access times; repeat to request source no-atime reads |
+| `-U, --atimes...` | Preserve access times; give it twice to also apply --open-noatime |
 | `-N, --crtimes` | Preserve birth (creation) times; requires a macOS destination |
 | `--open-noatime` | Request reads without access-time updates; warn and continue if unavailable |
 | `-S, --sparse` | Turn written zero ranges into sparse holes |
@@ -44,7 +44,7 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | `-P` | Same as --progress --partial |
 | `--partial` | No-op accepted for rsync compatibility (syq keeps partial files a later copy can resume from) |
 | `-c, --checksum` | Skip quick check; compare file contents block by block and repair differences |
-| `-I, --ignore-times` | Don't skip files whose size and modification time match: compare them where blocks are reused (by default, with a remote syq endpoint) and copy the rest whole |
+| `-I, --ignore-times` | Don't skip files whose size and modification time match: compare them where blocks are reused (by default, between different machines) and copy the rest whole |
 | `--inplace` | Update existing files in place, writing only what changed, as syq cp --in-place=update does. Cannot be combined with -u or --ignore-existing, which would skip a file that an interrupted update left incomplete |
 | `--syq-ignore <PATTERN>` | Syq extension: skip paths matching a gitignore-style PATTERN (repeatable). Skipping a directory skips its whole subtree, so to copy only *.jpg use: --syq-ignore '*' --syq-ignore '!*/' --syq-ignore '!*.jpg' |
 | `--syq-ignore-from <FILE>` | Syq extension: read gitignore-style patterns from FILE (repeatable) |
@@ -75,20 +75,20 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | `-z, --compress` | Compress remote data in transit automatically (default) |
 | `--no-compress` | Disable transport compression |
 | `-e, --rsh <COMMAND>` | Remote shell command (default: ssh); when set, it controls SSH options and agent forwarding |
-| `--syq-auth-from <auto\|ssh\|@NAME\|HOST>` | Override SYQ_AUTH_FROM and saved authorization with auto, native SSH (ssh), or an authorization provider (@NAME or HOST). When omitted, use SYQ_AUTH_FROM, then the saved choice, then auto |
-| `--rsync-path <PATH>` | Use this exact syq executable on the remote instead of the managed helper |
-| `--syq-no-bootstrap` | Syq extension: require syq on the remote PATH instead of installing a versioned helper |
+| `--syq-auth-from <auto\|ssh\|@NAME\|HOST>` | Whose SSH access to use: this machine's own (auto or ssh), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST). When omitted, use SYQ_AUTH_FROM, then the saved choice, then auto |
+| `--rsync-path <PATH>` | Run the remote syq at PATH instead of syq's automatically installed copy |
+| `--syq-no-bootstrap` | Syq extension: run the syq found in the remote $PATH instead of syq's automatically installed copy |
 | `--syq-no-tcp-encryption` | Syq extension: send TCP data without encryption or authentication; use only on trusted networks |
 | `--syq-no-tcp` | Syq extension: send all data over ssh instead of separate TCP data connections |
 | `--syq-tcp-ports <LO-HI>` | Syq extension: port range the remote listens on for TCP data connections<br><br>[default: 47600-47699] |
 | `--syq-tcp-congestion <ALGO>` | Syq extension: use this congestion-control algorithm for TCP data sockets (Linux only) |
-| `--syq-pscope <PATH>` | Syq extension: use an isolated persistence domain created by `syq persist on --ephemeral`; requires the default ssh or an -e ssh command |
+| `--syq-pscope <PATH>` | Syq extension: use the isolated connections and settings that `syq persist on --ephemeral` created at PATH; requires the default ssh or an -e ssh command |
 
 ## Performance tuning
 
 | Argument / option | Meaning |
 |---|---|
-| `-B, --block-size <SIZE>` | Comparison and reuse block size (64K through 64M)<br><br>[default: 4M] |
+| `-B, --block-size <SIZE>` | Block size for comparing files and reusing matching blocks (64K through 64M)<br><br>[default: 4M] |
 | `-W, --whole-file` | Copy selected files whole; the default for local copies |
 | `--no-whole-file` | Reuse matching blocks at the same offsets in the destination file; the default for remote copies<br><br>[alias: --no-W] |
 | `--performance-tuning <KEY=VALUE,...>` | [Workers, request sizes, and copy methods](../tuning.md) |

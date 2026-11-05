@@ -2,14 +2,14 @@
 
 # syq exec
 
-Run a command on a connected receiving machine, with approval on that machine:
+Run a command on your laptop from a server, with approval on the laptop:
 
 ```sh
 syq exec --on @laptop --cwd work/project -- cargo test
 ```
 
 See [Run commands on your laptop](../receive.md#run-commands-on-your-laptop)
-for setup and examples.
+for setup.
 
 <!-- CLI: exec -->
 ```text
@@ -26,8 +26,8 @@ syq exec [OPTIONS] --on <@NAME> -- <PROGRAM>...
 
 | Argument / option | Meaning |
 |---|---|
-| `--on <@NAME>` | Receiving name; requires a live return connection (never falls back to SSH) |
-| `-C, --cwd <DIR>` | Working directory on that machine, relative to its receiving directory<br><br>[default: .] |
+| `--on <@NAME>` | Receiving name of the machine to run on; it must be connected to this server now, and syq never uses SSH instead |
+| `-C, --cwd <DIR>` | Working directory on that machine, relative to its receiving profile's starting directory<br><br>[default: .] |
 
 ## Help and version
 
@@ -40,10 +40,10 @@ syq exec [OPTIONS] --on <@NAME> -- <PROGRAM>...
 
 ## Approve each command locally
 
-Every command needs approval on the receiving machine, even when copies are
-approved automatically. Review the program, arguments, requesting server, and
-working directory. If the desktop prompt is missing or truncated, answer the
-request from a local terminal:
+Every command needs approval on the laptop, even when copies are approved
+automatically. Review the program, arguments, requesting server, and working
+directory before you approve it. If the desktop prompt is missing or truncated,
+answer from a terminal on the laptop:
 
 ```sh
 syq persist receive pending
@@ -51,45 +51,39 @@ syq persist receive approve REQUEST_ID
 syq persist receive deny REQUEST_ID
 ```
 
-Requests expire after five minutes. Commands run with your local user's
-permissions; the receiving `--root` and copy limits do not contain them.
-See [Commands on your laptop](../security.md#running-commands-on-your-laptop) for the
-trust boundary.
+A request expires after five minutes. Approved commands run with your full
+user permissions: the receiving `--root` and copy limits do not restrict them.
+See [Commands on your laptop](../security.md#running-commands-on-your-laptop).
 
 ## Arguments and working directories
 
-Put `--` before the program. Everything after it is passed as a literal
-argument, including strings starting with `--`, and no shell runs on the
-receiving machine. To use shell syntax, run a shell:
+Put `--` before the program. Everything after it is passed as given, with no
+shell, so run a shell when you need shell syntax:
 
 ```sh
 syq exec --on @laptop --cwd work/project -- sh -c 'cargo build && ./target/debug/demo'
 ```
 
-`--cwd DIR` (or `-C DIR`) is relative to the receiving profile's starting
-directory, which `persist receive status` shows, and defaults to it. Absolute
-paths and `..` can select elsewhere, but `~` is not expanded. The directory
-must exist.
-
-The command inherits the receiving service's environment, including `PATH` and
-its desktop session, not the server's. To change them, restart receiving from a
-terminal in the session you want. Stdin is closed and there is no terminal.
+Without `--cwd`, the command runs in the receiving profile's directory, which
+`syq persist receive status` shows. A relative `--cwd` is resolved from there,
+an absolute one is used as given, and `~` is not expanded. The command gets the
+environment of the receiving service on the laptop, including its `PATH`, not
+the server's; to change it, restart receiving from a terminal in the session you
+want. It has no terminal and no standard input.
 
 ## Output, completion and cancellation
 
-Stdout and stderr stream back to your terminal, and syq returns the command's
-exit code, or `128 + signal` if a signal killed it. Setup failures, and losing
-the connection before the status arrives, also exit nonzero. Commands are not
-retried, and completed file changes are not rolled back.
+Output streams back to your terminal, and `syq exec` exits with the command's
+exit code, or `128 + signal` if a signal killed it. Setup failures and a lost
+connection also exit nonzero.
 
 Interrupting the request, stopping or changing receiving, or losing the
-connection kills the command's process group without running its cleanup
-handlers. Processes left in that group are also stopped when the program exits,
-but detached processes and applications started through macOS `open` can
-survive.
+connection kills the command's process group at once, without cleanup
+handlers. When the command exits, syq also stops anything left in its process
+group. Detached processes and applications started with macOS `open` can keep
+running.
 
 ## Execution details
 
-A request allows up to 256 arguments (16 KiB in total) and a 4096-byte working
-directory path. Each server connection allows one pending approval and eight
-running commands.
+A request allows up to 256 arguments (16 KiB in total). Each server connection
+allows one pending approval and eight running commands.

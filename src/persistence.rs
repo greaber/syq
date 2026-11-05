@@ -31,11 +31,11 @@ const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope\n";
 #[derive(Parser, Debug)]
 #[command(
     name = "syq persist",
-    about = "Manage persistent SSH connections, receiving, and return destinations",
-    long_about = "Manage reusable SSH connections and background receiving. syq persist on keeps connections open for later commands, and syq persist connect HOST connects now. Receiving asks you to approve each copy by default; configure it with syq persist receive. For an isolated setup, see on --ephemeral and --pscope."
+    about = "Keep SSH connections open, and receive files and requests from connected servers",
+    long_about = "syq persist on keeps SSH connections open for later syq commands, and syq persist connect HOST connects now. Receiving lets connected servers send files and requests to this machine, each with your approval by default; set it up with syq persist receive. For an isolated setup, see on --ephemeral and --pscope."
 )]
 struct PersistCommand {
-    /// Select an isolated persistence domain instead of the default domain
+    /// Use the isolated connections and settings at PATH instead of the default ones
     #[arg(long, global = true, value_name = "PATH")]
     pscope: Option<PathBuf>,
     #[command(subcommand)]
@@ -44,28 +44,27 @@ struct PersistCommand {
 
 #[derive(Subcommand, Debug)]
 enum PersistAction {
-    /// Choose default authorization for server copies and SSH sessions
+    /// Save the --auth-from choice that later commands use by default
     AuthFrom(crate::auth_from::PreferenceCommand),
-    /// Export native OpenSSH configuration for one already approved account connection
+    /// Print an OpenSSH config that lets ssh, scp, or Git use an approved connection
     SshConfig(ssh_config::ExportCommand),
-    /// Configure receiving and decide incoming copy or command requests
+    /// Set up receiving, and approve or deny incoming copy and command requests
     Receive(crate::receive_service::ReceiveCommand),
-    /// Inspect named return destinations available to this server account
     Destinations(crate::destination::Destinations),
-    /// Connect with native SSH or request approved account access
+    /// Connect to a server now and keep the connection open for later commands
     Connect {
         /// SSH endpoint ([USER@]HOST[:PORT]); receiving names are not accepted
         host: String,
-        /// Authorize a reusable destination-account login through @NAME or an SSH provider
+        /// Whose SSH access to connect with: this machine's own (auto or ssh), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST)
         #[arg(long, value_name = "auto|ssh|@NAME|HOST")]
         auth_from: Option<String>,
-        /// Use this remote syq executable instead of installing a matching helper
+        /// Run the remote syq at PATH instead of syq's automatically installed copy
         #[arg(long, value_name = "PATH", conflicts_with = "no_bootstrap")]
         syq_path: Option<String>,
-        /// Use syq on the remote PATH instead of installing a matching helper
+        /// Run the syq found in the remote $PATH instead of syq's automatically installed copy
         #[arg(long)]
         no_bootstrap: bool,
-        /// Wait this many seconds for receiving after connecting
+        /// After connecting, wait up to this many seconds for receiving to be ready
         #[arg(long, value_name = "SECONDS", default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: u64,
         /// Replace a receiving service from another build only once it is
@@ -73,17 +72,17 @@ enum PersistAction {
         #[arg(long, hide = true)]
         when_idle: bool,
     },
-    /// Enable persistent connections for later syq commands
+    /// Keep SSH connections open for later syq commands
     On {
-        /// Create an ephemeral scope and print its path instead of changing the user setting
+        /// Create a new isolated set of connections and settings and print its path for --pscope, instead of turning persistence on for your user
         #[arg(long, conflicts_with = "pscope")]
         ephemeral: bool,
     },
-    /// Disable persistence and close its live SSH control connections
+    /// Turn persistence off and close its SSH connections, including receiving; a set made by on --ephemeral is deleted with its settings
     Off {},
     /// Show connection readiness and any receiving problem
     Status {
-        /// Print structured connection state
+        /// Print the status as JSON
         #[arg(long)]
         json: bool,
     },

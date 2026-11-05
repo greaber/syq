@@ -1,15 +1,16 @@
 # syq rm
 
-Remove local files, remote filesystem entries, or S3 objects.
-See [Remove files](../remove.md) for selection rules and
-[Versions and deletion](../object-storage.md#versions-and-deletion) for versioned objects.
+Remove local files, files on an SSH server, or S3 objects. See
+[Remove files](../remove.md) and, for versioned buckets,
+[Versions and deletion](../object-storage.md#versions-and-deletion).
 
 ```sh
 syq rm --src-dir old-output --dry-run -v
 ```
 
-For scripting, see [environment variables](../environment.md)
-and [Removal records](../automation.md#removal-records).
+In scripts, `SYQ_RM_OPTIONS` adds arguments (see
+[environment variables](../environment.md)), and
+[Removal records](../automation.md#removal-records) describes `--results`.
 
 <!-- CLI: rm -->
 ```text
@@ -21,10 +22,10 @@ syq rm [OPTIONS] --srcs-in DIR
 
 | Argument / option | Meaning |
 |---|---|
-| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Use approved SSH account access, or request S3 authorization from a receiving machine |
-| `--syq-path <PATH>` | Use this exact syq executable on the remote removal endpoint |
-| `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |
-| `--pscope <PATH>` | Use an isolated persistence domain created by `syq persist on --ephemeral` |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Whose SSH access to use: this machine's own (auto or ssh), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST); @NAME also authorizes S3 removal |
+| `--syq-path <PATH>` | Run the remote syq at PATH instead of syq's automatically installed copy |
+| `--no-bootstrap` | Run the syq found in the remote $PATH instead of syq's automatically installed copy |
+| `--pscope <PATH>` | Use the isolated connections and settings that `syq persist on --ephemeral` created at PATH |
 
 <a id="copy-policy-and-filtering"></a>
 
@@ -45,10 +46,10 @@ syq rm [OPTIONS] --srcs-in DIR
 | Argument / option | Meaning |
 |---|---|
 | `--on <ENDPOINT>` | Removal endpoint ([USER@]HOST[:PORT] or s3://BUCKET); omitted means local |
-| `-C, --cwd <DIR>` | Resolve relative selectors from DIR at the removal endpoint |
+| `-C, --cwd <DIR>` | Resolve relative paths from DIR on the removal endpoint |
 | `--root <DIR>` | Confine resolution and removal beneath DIR |
 | `--follow` | Like --follow-src; also follow symlinks in the --results path |
-| `--follow-src` | Follow symlinks in --cwd, --root, and selector parent directories; always unlink a final selected symlink |
+| `--follow-src` | Follow symlinks in --cwd, --root, and the parent directories of selected paths; a selected symlink itself is always removed as a link |
 | `--src <PATH>` | Select a non-directory object (repeatable) |
 | `--srcs-in <DIR>` | Recursively select a directory's contents, keeping the directory (repeatable) |
 | `--src-non-dir <PATH>` | Select a non-directory object (repeatable) |
@@ -93,8 +94,8 @@ syq rm [OPTIONS] --srcs-in DIR
 
 ## Selection rules
 
-Named paths, `--src`, and `--src-non-dir` require non-directories. Use
-`--src-dir` to remove a directory recursively, or `--srcs-in` to remove its
-contents and keep the directory; both reject a final symlink even when
-following is enabled. Syq checks every selection before deleting anything.
-Filters are not supported.
+Named paths, `--src`, and `--src-non-dir` remove only non-directories. Use
+`--src-dir` to remove a directory and its contents, or `--srcs-in` to empty it;
+both refuse a final symlink. Syq checks every selector first, so one naming the
+wrong kind of object stops the run before anything is removed; a missing one
+does not. `rm` has no filters.
