@@ -1187,16 +1187,41 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         crate::destination_results::ReceiptPolicy::unused()?,
     )?;
     notices::waiting(&format!("@{name}"), "this copy");
-    let (_, reply) = exchange(
-        &registration,
-        Message::Request {
-            command,
-            cwd: crate::approval_command::current_directory(),
-            request: Box::new(request),
-        },
-        REQUEST_TIMEOUT + Duration::from_secs(10),
-        None,
-    )?;
+    let cwd = crate::approval_command::current_directory();
+    let ask = |registration: &Registration| {
+        exchange(
+            registration,
+            Message::Request {
+                command: command.clone(),
+                cwd: cwd.clone(),
+                request: Box::new(request.clone()),
+            },
+            REQUEST_TIMEOUT + Duration::from_secs(10),
+            None,
+        )
+    };
+    let (registration, reply) = match ask(&registration) {
+        Ok((_, reply)) => (registration, reply),
+        Err(error) => {
+            // The receiving machine may have switched its connection to
+            // another syq build since this command chose it, as after an
+            // update, while the command read its input. Nothing has been
+            // copied yet: ask the new connection once, if this build can.
+            let Ok(current) = load_registration(&name) else {
+                return Err(error);
+            };
+            if (&current.socket, &current.secret) == (&registration.socket, &registration.secret) {
+                return Err(error);
+            }
+            anyhow::ensure!(
+                current.identity == crate::identity::build(),
+                "@{name} switched to syq {} while this command was starting; run the command again",
+                current.identity
+            );
+            let (_, reply) = ask(&current)?;
+            (current, reply)
+        }
+    };
     let Reply::Approved(approved) = reply else {
         bail!("unexpected named destination response");
     };
@@ -1604,6 +1629,35 @@ fn ssh_command(endpoint: &crate::persistence::EndpointRecord) -> Command {
         cmd.arg("-p").arg(port.to_string());
     }
     cmd
+}
+/// Log in to `endpoint` as a receiving connection does (`ssh_command`),
+/// without forwarding anything, to learn whether a new receiving service
+/// could before an old one is stopped for it. On failure, whether the server
+/// rejected the login (`conn::login_rejection`), and what ssh said.
+pub(crate) fn check_receiving_login(
+    endpoint: &crate::persistence::EndpointRecord,
+) -> std::result::Result<(), (bool, String)> {
+    let mut command = ssh_command(endpoint);
+    command.arg("--").arg(&endpoint.host).arg("true");
+    let output = crate::process::capture_output_bounded(
+        &mut command,
+        Instant::now() + Duration::from_secs(60),
+        &|| false,
+        64 * 1024,
+    )
+    .map_err(|error| (false, error.to_string()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let message = stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("ssh failed")
+        .to_owned();
+    Err((crate::conn::login_rejection(&stderr).is_some(), message))
 }
 fn pin_receiving_source(
     command: &mut Command,

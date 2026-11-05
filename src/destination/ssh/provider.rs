@@ -464,6 +464,28 @@ impl Drop for OwnedRecord {
     }
 }
 
+/// A keeper another syq build left, as after this machine updated syq,
+/// cannot serve this build: ask it to stop (as `stop_all` does) instead of
+/// waiting out the setup deadline. Its record names its build; one this
+/// build cannot read is another build's too. Returns whether it asked.
+fn stop_other_build_keeper(domain: &Domain, provider: &Provider) -> Result<bool> {
+    let other = match read_record(domain, provider) {
+        Ok(Some(record)) => record.build != crate::identity::build(),
+        Ok(None) => false,
+        Err(_) => true,
+    };
+    if other {
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(record_path(domain, provider)?.with_extension("stop"))?;
+    }
+    Ok(other)
+}
+
 fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
     if let Some(record) = existing(domain, provider)? {
         return Ok(record);
@@ -475,9 +497,13 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
     let lock = lock_file(&path.with_extension("lock"), true)?;
     let signals = foreground::Signals::new()?;
     let deadline = Instant::now() + SETUP;
+    let mut replacing = false;
     while !try_lock(&lock)? {
         if let Some(record) = existing(domain, provider)? {
             return Ok(record);
+        }
+        if !replacing {
+            replacing = stop_other_build_keeper(domain, provider)?;
         }
         anyhow::ensure!(
             Instant::now() < deadline && signals.received.load(Ordering::Acquire) == 0,
@@ -1113,6 +1139,26 @@ mod tests {
             .unwrap();
         write_record(&domain, &record).unwrap();
         (root, domain, record)
+    }
+
+    /// After this machine updates syq, the keeper the old build left is
+    /// asked to stop, which its record says, rather than waited on; one of
+    /// this build is left alone.
+    #[test]
+    fn a_keeper_another_build_left_is_asked_to_stop() {
+        let (_root, domain, mut record) = cleanup_fixture();
+        let stop = record_path(&domain, &record.provider)
+            .unwrap()
+            .with_extension("stop");
+        assert!(!stop_other_build_keeper(&domain, &record.provider).unwrap());
+        assert!(!stop.exists());
+        assert!(active(&domain, &record));
+        record.build = "v0.0.1+other-build".into();
+        write_record(&domain, &record).unwrap();
+        assert!(stop_other_build_keeper(&domain, &record.provider).unwrap());
+        assert!(stop.exists());
+        // The keeper ends at its next look at its record.
+        assert!(!active(&domain, &record));
     }
 
     #[cfg(target_os = "linux")]

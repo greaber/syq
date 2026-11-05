@@ -148,12 +148,12 @@ pub(super) fn reconnect(problem: &str, here: Option<&Here>) -> String {
     )
 }
 
-/// The syq on `@name` is too old for `what`. Once syq is updated there, its
-/// receiving connection switches to the new version by itself when idle
-/// (`receive_service::switch`), so nothing else needs to be run.
+/// The syq on `@name` is too old for `what`. Such an old receiving
+/// connection cannot follow an update by itself; any syq command run on
+/// that machine after the update switches it (`receive_service::refresh_outdated`).
 pub(super) fn outdated(name: &str, what: &str) -> String {
     format!(
-        "the syq connected as @{name} does not support {what}; update syq on that machine, where receiving then switches to the new version once idle"
+        "the syq connected as @{name} does not support {what}; update syq on that machine and run any syq command there"
     )
 }
 
@@ -384,9 +384,8 @@ mod tests {
         assert!(copy_from("master", here).ends_with(&format!(
             "run `syq cp PATH --to HOST` on it, where HOST is how it reaches this server {server}."
         )));
-        assert!(outdated("laptop", "syq ssh").ends_with(
-            "update syq on that machine, where receiving then switches to the new version once idle"
-        ));
+        assert!(outdated("laptop", "syq ssh")
+            .ends_with("update syq on that machine and run any syq command there"));
         assert!(reconnect("the registration for @laptop is invalid", here).ends_with(
             &format!("is invalid; to reconnect, run `syq persist connect HOST` on the receiving machine (for example your laptop), where HOST is how it reaches this server {server}")
         ));

@@ -317,11 +317,17 @@ pub(crate) const SWITCH_PROVIDER: &str = "switch-provider";
 /// Replace a provider from another build with one from this build once it
 /// is idle, as a provider's switch to a new build asks. Leave one that
 /// follows another installed syq file, as `Replace::WhenIdle` does.
+///
+/// A provider that agreed to stop is only waited for, never sent a stop:
+/// another may start meanwhile, and is looked at in turn.
 pub(super) fn switch_when_idle(domain: &Domain) -> Result<()> {
     if !domain.enabled()? || !preferences(domain)?.enabled() {
         return Ok(());
     }
-    if let Some(state) = running(domain, ANSWER_TIMEOUT, || Control::Status)? {
+    for _ in 0..4 {
+        let Some(state) = running(domain, ANSWER_TIMEOUT, || Control::Status)? else {
+            return start(domain);
+        };
         if state.build == crate::identity::build() {
             return refresh(domain);
         }
@@ -332,16 +338,44 @@ pub(super) fn switch_when_idle(domain: &Domain) -> Result<()> {
             );
             return Ok(());
         }
-        if state.busy.is_some() && !query(domain, Control::StopIfIdle)?.stopping {
-            crate::output::command_human_stdout!(
-                "The SSH authorization provider keeps running syq {} until its logins and requests finish",
-                state.build
-            );
-            return Ok(());
-        }
-        stop(domain)?;
+        let pid = if state.busy.is_none() {
+            // One from before syq followed updates has only a stop.
+            query(domain, Control::Stop)?.pid
+        } else {
+            let answer = query(domain, Control::StopIfIdle)?;
+            if !answer.stopping {
+                crate::output::command_human_stdout!(
+                    "The SSH authorization provider keeps running syq {} until its requests finish",
+                    state.build
+                );
+                return Ok(());
+            }
+            answer.pid
+        };
+        await_exit(domain, pid)?;
     }
-    ensure(domain)
+    Ok(())
+}
+
+/// Wait for provider process `pid`, which is stopping, to give up the
+/// lock: until it has exited, or another provider answers.
+fn await_exit(domain: &Domain, pid: u32) -> Result<()> {
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    while is_running(domain)? {
+        match query(domain, Control::Status) {
+            Ok(state) if state.pid != pid => return Ok(()),
+            Ok(_) => {}
+            Err(_) if !process_alive(pid) => return Ok(()),
+            Err(_) => {}
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "local SSH authorization provider did not stop in {}",
+            domain.runtime_path().display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
 }
 
 /// Stop a provider from another build, and report whether there was one.
@@ -407,7 +441,8 @@ struct Service {
     stop: Arc<AtomicBool>,
     streams: Arc<ConnectionRegistry>,
     inner: Mutex<Inner>,
-    /// Logins and requests being handled, besides local control requests.
+    /// Requests being handled for attached logins, such as authorizing an
+    /// account login; not the attachments themselves.
     requests: AtomicUsize,
     /// The path the provider follows, and its switch to a new build.
     started_from: Option<String>,
@@ -490,24 +525,24 @@ impl Service {
         );
         Ok(())
     }
-    /// Logins open through it, requests being handled, and requests
-    /// waiting for approval.
+    /// Requests being handled and requests waiting for approval. Logins
+    /// attached to the provider do not count: switching to another build
+    /// ends them, and with them their session permissions (Allow), as any
+    /// reconnect does; the requester attaches again on its next use.
     fn busy(&self) -> usize {
         let inner = self.inner.lock().unwrap();
         self.requests.load(Ordering::SeqCst)
-            + inner.sessions.len()
             + inner
                 .profiles
                 .values()
                 .map(|profile| profile.approvals.snapshots().len())
                 .sum::<usize>()
     }
-    /// Stop if nothing is in progress; whether it did. A login or request
+    /// Stop if nothing is in progress (`busy`); whether it did. A request
     /// counted after this check finds the provider stopping and is refused.
     fn stop_if_idle(&self) -> bool {
         let inner = self.inner.lock().unwrap();
         let idle = self.requests.load(Ordering::SeqCst) == 0
-            && inner.sessions.is_empty()
             && inner
                 .profiles
                 .values()
@@ -639,8 +674,6 @@ impl Service {
             hello.build == crate::identity::build(),
             "local provider build changed"
         );
-        self.requests.fetch_add(1, Ordering::SeqCst);
-        let _counted = Counted(&self.requests);
         let request: Access =
             crate::destination::read_message(&mut crate::destination::DeadlineIo {
                 inner: &mut stream,
@@ -666,6 +699,8 @@ impl Service {
             }
 
             Access::Request { session, operation } => {
+                self.requests.fetch_add(1, Ordering::SeqCst);
+                let _counted = Counted(&self.requests);
                 let result = (|| {
                     validate_ticket(&session)?;
                     self.admit()?;
@@ -899,6 +934,13 @@ pub(super) fn ensure(domain: &Domain) -> Result<()> {
         }
         stop(domain)?;
     }
+    start(domain)
+}
+
+/// Start this build's provider; one that starts meanwhile from this build
+/// serves instead.
+fn start(domain: &Domain) -> Result<()> {
+    domain.ensure_runtime()?;
     let (mut startup, child_output) = crate::process::with_inheritance_guard(UnixStream::pair)?;
     startup.set_read_timeout(Some(STOP_TIMEOUT))?;
     let mut command = crate::process::self_command()?;
@@ -1042,14 +1084,16 @@ impl Runtime {
         if let Some(scope) = self.service.domain.explicit_path() {
             switch_args.extend([OsString::from("--pscope"), scope.into()]);
         }
-        // With a path to follow, wake now and then to look at it.
-        let wait = if self.follower.is_some() { 1000 } else { -1 };
         let result = (|| {
             while !self.service.stop.load(Ordering::Acquire) {
+                // With a path to follow, wake when it is next due.
+                let mut wait = -1;
                 if let Some(follower) = &mut self.follower {
                     let service = &self.service;
-                    follower.tick(&|| service.busy() == 0, &switch_args);
+                    // Its switch is local and never logs in.
+                    follower.tick(&|| service.busy() == 0, &|| false, &switch_args);
                     *service.switch.lock().unwrap() = follower.report();
+                    wait = follower.due().as_millis().clamp(1, 60_000) as i32;
                 }
                 // Completion is queued before waking poll; join also covers the
                 // short interval between that wake and the thread's return.
@@ -1223,30 +1267,44 @@ mod tests {
         service.close();
     }
 
-    /// The provider stops to switch builds only with no login open and no
-    /// request in progress, and admits nothing once it decided to stop.
+    /// The provider stops to switch builds only with no request in
+    /// progress. A login attached to it, held open by its requester's
+    /// keeper, does not keep it: the switch ends it and its session
+    /// permissions, as a reconnect does, and the provider admits nothing
+    /// once it decided to stop.
     #[test]
-    fn a_provider_stops_to_switch_only_when_idle() {
+    fn a_provider_with_an_attached_login_stops_to_switch_when_no_request_runs() {
         let (_directory, domain, _) = fixture();
-        let service = Service::new(domain, None).unwrap();
-        let (ticket, _session) = service.open_identified(None, identity).unwrap();
+        let service = Arc::new(Service::new(domain, None).unwrap());
+        let (ticket, session) = service.open_identified(None, identity).unwrap();
+        session.grants.lock().unwrap().insert("account".into(), 0);
+        // The keeper holds the attachment open.
+        let (mut keeper, server) = pair(&service);
+        let socket = server.try_clone().unwrap();
+        let (thread_service, thread_session, expected) =
+            (service.clone(), session.clone(), ticket.session.clone());
+        let attachment = std::thread::spawn(move || {
+            thread_service.hold_attachment(server, socket, ticket, thread_session)
+        });
+        let received: std::result::Result<Ticket, String> =
+            crate::destination::read_message(&mut keeper).unwrap();
+        assert_eq!(received.unwrap().session, expected);
+        assert_eq!(service.busy(), 0);
+        // A request through the attached login keeps it.
+        service.requests.fetch_add(1, Ordering::SeqCst);
         assert_eq!(service.busy(), 1);
         assert!(!service.stop_if_idle());
-        service
-            .inner
-            .lock()
-            .unwrap()
-            .sessions
-            .remove(&ticket.session);
-        service.requests.fetch_add(1, Ordering::SeqCst);
-        assert!(!service.stop_if_idle());
         service.requests.fetch_sub(1, Ordering::SeqCst);
-        assert_eq!(service.busy(), 0);
         assert!(service.stop_if_idle());
         assert!(service.snapshot(None).stopping);
         let error = service.open_identified(None, identity).err().unwrap();
         assert!(error.to_string().contains("stopping"), "{error}");
+        // Stopping ends the attachment and its permissions.
         service.close();
+        attachment.join().unwrap().unwrap();
+        assert_eq!(keeper.read(&mut [0]).unwrap(), 0);
+        assert!(session.closed.load(Ordering::Acquire));
+        assert!(session.grants.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -121,7 +121,7 @@ pub(super) fn verify_receiver_with_timeout(
         "cannot verify receiver identity; reconnect with an updated syq on the receiving machine",
     )?;
     let Reply::Identity(proof) = reply else {
-        bail!("receiver did not provide an identity proof; update syq on the receiving machine");
+        bail!("receiver did not provide an identity proof; update syq on the receiving machine and run any syq command there");
     };
     verify(proof, name, &challenge, &registration.secret, owner)
 }

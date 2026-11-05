@@ -1,24 +1,32 @@
 //! Following syq updates. A receiving service, or the SSH authorization
-//! provider, remembers the path it was started from: the path the user runs,
-//! such as a Homebrew link, not the file it resolves to. Every few seconds it
-//! looks at that path. Once the path holds another build and nothing is in
-//! progress, the service runs that build's own command to replace it, as
-//! `syq persist connect` does by hand: the new build installs its helper on
-//! the server, stops this service once it is still idle, and starts its own.
+//! provider, remembers the path it was started from: the path given to
+//! exec, such as a Homebrew link, not the file it resolves to. A script
+//! that runs syq, such as a version manager's shim, is never that path: the
+//! script's own exec of syq is. Every few seconds the service looks at that
+//! path. Once the path holds another build and nothing is in progress, the
+//! service runs that build's own command to replace it, as `syq persist
+//! connect` does by hand: the new build installs its helper on the server,
+//! stops this service once it is still idle, and starts its own.
 //!
-//! Loops. A service follows only changes made to its path while it runs:
-//! whatever the path held when it started is its baseline, and a file that
-//! reports this same build becomes the new baseline. The service a switch
-//! starts takes the new file as its baseline, so it never switches again
-//! until the file changes again, even when the path is a wrapper that starts
-//! some other build. Two installed copies do not fight either: each service
-//! follows only its own path, and commands replace a service from another
-//! build only when it cannot follow its path by itself or its path holds
-//! the command's own file (`receive_service::Replace`). Running `persist
-//! connect` by hand still replaces any build at once.
+//! Loops. The service a switch starts runs the file at its path, which is
+//! its baseline, so it switches again only once that file changes again. A
+//! service started while its path already held another file, as when an
+//! update landed during a switch, asks that file for its build once and
+//! switches if it is another. A file reporting this same build becomes the
+//! new baseline. Two installed copies do not fight: each service follows
+//! only its own path, and commands replace a service from another build only
+//! when it cannot follow its path by itself, its path holds the command's
+//! own file and its switch failed, or nothing follows (`Replace`,
+//! `refresh_outdated`). A version manager that keeps each version in its
+//! own directory therefore looks like a second installed copy, and its
+//! services switch only by `syq persist connect`. Running that by hand
+//! still replaces any build at once.
 //!
 //! A switch that fails leaves this service running and says why in its
-//! status, then tries again with growing waits.
+//! status. One that could not log in to the server without the user waits
+//! until the user is there: a syq command to that server, which logs in as
+//! usual and leaves a live control connection the switch can use. Other
+//! failures are tried again with growing waits.
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -40,7 +48,7 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const RETRY_FIRST: Duration = Duration::from_secs(30);
 const RETRY_MAX: Duration = Duration::from_secs(600);
 /// How long a switch may run before it counts as failed.
-const SWITCH_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const SWITCH_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long a receiving connection must have had no request before it
 /// counts as idle: one copy's steps, such as identifying the receiver,
 /// asking for approval and opening the copy, arrive as separate requests a
@@ -75,13 +83,33 @@ fn retry_after(first: Duration, attempts: u32) -> Duration {
     (first * 2u32.pow(doublings)).min(RETRY_MAX.max(first))
 }
 
+/// How a `persist connect --when-idle` that cannot log in to the server
+/// without the user exits. This crosses builds: a service of one build reads
+/// it from the command of the build it switches to.
+pub(crate) const LOGIN_NEEDED_EXIT: i32 = 78;
+
+/// How long commands wait before starting another switch to a connection
+/// whose switch could not log in without the user: each attempt is a
+/// failed login in the server's logs.
+pub(crate) const LOGIN_RETRY: Duration = Duration::from_secs(600);
+
+/// A switch to a new build could not log in to this server without the user.
+#[derive(Debug)]
+pub(crate) struct LoginNeeded(pub(crate) String);
+impl std::fmt::Display for LoginNeeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "logging in to {} needs you", self.0)
+    }
+}
+
 /// What a status shows about following an update.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Report {
     /// The build the followed file now holds, when known.
     #[serde(default)]
     pub(crate) to: Option<String>,
-    /// `waiting` until nothing is in progress, `switching`, or `failed`.
+    /// `waiting` until nothing is in progress, `switching`, `login` until a
+    /// syq command to the server logs in, or `failed`.
     pub(crate) phase: String,
     #[serde(default)]
     pub(crate) error: Option<String>,
@@ -98,6 +126,10 @@ impl Report {
         match self.phase.as_str() {
             "waiting" => format!("switches to {to} once idle"),
             "switching" => format!("switching to {to}"),
+            "login" => format!(
+                "switches to {to} after your next syq command to this server, since it could not log in by itself ({})",
+                self.error.as_deref().unwrap_or("login failed")
+            ),
             _ => format!(
                 "cannot switch to {to}: {}",
                 self.error.as_deref().unwrap_or("unknown error")
@@ -152,50 +184,117 @@ pub(crate) fn follows_other_file(started_from: Option<&str>) -> bool {
     follows(started_from) == Follows::OtherFile
 }
 
-/// Refuse to run a file that someone other than this user or root could
-/// have put there, as the binary store refuses its releases: the file and
-/// the directories holding it and any link to it must belong to this user or
-/// root, and nobody else may write them. A directory with the sticky bit,
-/// such as /tmp, may be writable by others, who cannot replace its entries.
+/// Refuse to run a file that an arbitrary other account could have put
+/// there, or pointed the path at. Every directory resolving `path` passes
+/// through, including through each symbolic link on the way, must belong to
+/// this user or root and must not be writable by every account, as
+/// `remote_user_install` refuses such directories. So must the file, which
+/// must also be executable. Group write is allowed: Homebrew's directories,
+/// and any directory made under a 002 umask, are group writable, and the
+/// user's own commands run syq from them anyway. A directory with the sticky
+/// bit, such as /tmp, may be writable by every account, who cannot replace
+/// the entries others own there; an entry used in one must belong to this
+/// user or root.
 pub(crate) fn check_runnable(path: &Path) -> Result<()> {
+    use std::ffi::OsStr;
+    use std::path::Component;
     let user = unsafe { libc::geteuid() };
-    let file =
-        std::fs::canonicalize(path).with_context(|| format!("resolve {}", path.display()))?;
-    let metadata =
-        std::fs::metadata(&file).with_context(|| format!("inspect {}", file.display()))?;
-    anyhow::ensure!(
-        metadata.is_file() && metadata.mode() & 0o111 != 0,
-        "{} is not an executable file",
-        file.display()
-    );
-    let owner = |metadata: &std::fs::Metadata| metadata.uid() == user || metadata.uid() == 0;
-    anyhow::ensure!(
-        owner(&metadata) && metadata.mode() & 0o022 == 0,
-        "{} must belong to you or root, and nobody else may write it",
-        file.display()
-    );
-    let link_directory = path
-        .parent()
-        .map(std::fs::canonicalize)
-        .transpose()
-        .with_context(|| format!("resolve the directory of {}", path.display()))?;
-    for directory in file.parent().into_iter().chain(link_directory.as_deref()) {
+    let trusted = |metadata: &std::fs::Metadata| metadata.uid() == user || metadata.uid() == 0;
+    // Whether every account may add entries to `directory`, after refusing
+    // it if one could replace them.
+    let directory = |directory: &Path| -> Result<bool> {
         let metadata = std::fs::metadata(directory)
             .with_context(|| format!("inspect {}", directory.display()))?;
-        let sticky = metadata.mode() & 0o1000 != 0;
+        let shared = metadata.mode() & 0o002 != 0;
         anyhow::ensure!(
-            owner(&metadata) && (metadata.mode() & 0o022 == 0 || sticky),
-            "the directory {} must belong to you or root, and nobody else may write it",
+            trusted(&metadata) && (!shared || metadata.mode() & 0o1000 != 0),
+            "the directory {} must belong to you or root, and other accounts may not write it",
             directory.display()
         );
+        Ok(shared)
+    };
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let components = |path: &Path| -> Vec<std::ffi::OsString> {
+        path.components()
+            .filter_map(|component| match component {
+                Component::Normal(name) => Some(name.to_owned()),
+                Component::ParentDir => Some("..".into()),
+                _ => None,
+            })
+            .rev()
+            .collect()
+    };
+    // Names still to resolve, the next one last.
+    let mut pending = components(&absolute);
+    let mut current = PathBuf::from("/");
+    let mut shared = directory(&current)?;
+    let mut links = 0;
+    while let Some(name) = pending.pop() {
+        if name == OsStr::new("..") {
+            current.pop();
+            shared = directory(&current)?;
+            continue;
+        }
+        let entry = current.join(&name);
+        let metadata = std::fs::symlink_metadata(&entry)
+            .with_context(|| format!("resolve {}", path.display()))?;
+        anyhow::ensure!(
+            !shared || trusted(&metadata),
+            "{} must belong to you or root, since every account can write {}",
+            entry.display(),
+            current.display()
+        );
+        if metadata.file_type().is_symlink() {
+            links += 1;
+            anyhow::ensure!(
+                links <= 40,
+                "{} has too many symbolic links",
+                path.display()
+            );
+            let target = std::fs::read_link(&entry)
+                .with_context(|| format!("read the link {}", entry.display()))?;
+            if target.is_absolute() {
+                current = PathBuf::from("/");
+                shared = directory(&current)?;
+            }
+            pending.extend(components(&target));
+            continue;
+        }
+        if pending.is_empty() {
+            anyhow::ensure!(
+                metadata.is_file() && metadata.mode() & 0o111 != 0,
+                "{} is not an executable file",
+                entry.display()
+            );
+            anyhow::ensure!(
+                trusted(&metadata) && metadata.mode() & 0o002 == 0,
+                "{} must belong to you or root, and other accounts may not write it",
+                entry.display()
+            );
+            return Ok(());
+        }
+        anyhow::ensure!(metadata.is_dir(), "{} is not a directory", entry.display());
+        shared = directory(&entry)?;
+        current = entry;
     }
-    Ok(())
+    anyhow::bail!("{} is not an executable file", path.display())
+}
+
+/// How a switch's command failed: what it said, and whether it could not
+/// log in without the user (`LOGIN_NEEDED_EXIT`).
+struct Ended {
+    error: String,
+    login: bool,
 }
 
 /// A started switch: the command's exit, and its process group.
 struct Running {
     build: String,
-    done: mpsc::Receiver<std::result::Result<(), String>>,
+    done: mpsc::Receiver<std::result::Result<(), Ended>>,
     group: libc::pid_t,
     started: Instant,
     killed: bool,
@@ -217,6 +316,12 @@ enum State {
         error: String,
         retry: Instant,
     },
+    /// The last attempt could not log in without the user; try again once
+    /// the user is there (`present`).
+    Login {
+        build: String,
+        error: String,
+    },
 }
 
 /// Follows the file a service was started from (see the module comment).
@@ -231,13 +336,31 @@ pub(crate) struct Follower {
 }
 
 impl Follower {
+    /// Follow `path`. When it holds the file this process runs, that is the
+    /// baseline; otherwise, as after an update during the switch that
+    /// started this service, the file is asked for its build at the first
+    /// look.
     pub(crate) fn new(path: PathBuf) -> Self {
+        let runs_it = file_at(&path).is_some() && file_at(&path) == crate::process::running_image();
         Self {
-            baseline: seen_at(&path),
+            baseline: if runs_it { seen_at(&path) } else { None },
             path,
             next_check: Instant::now() + check_interval(),
             attempts: 0,
             state: State::Current,
+        }
+    }
+
+    /// How long until `tick` has something to do: a service that sleeps
+    /// between requests wakes then.
+    pub(crate) fn due(&self) -> Duration {
+        let now = Instant::now();
+        match &self.state {
+            State::Current | State::Login { .. } => self.next_check.saturating_duration_since(now),
+            State::Failed { retry, .. } => retry.saturating_duration_since(now),
+            State::Probing(_) | State::Waiting { .. } | State::Switching(_) => {
+                Duration::from_millis(200)
+            }
         }
     }
 
@@ -247,7 +370,14 @@ impl Follower {
 
     /// Look at the path when due. When it holds another build and `idle`
     /// says nothing is in progress, run `args` with that build to switch.
-    pub(crate) fn tick(&mut self, idle: &dyn Fn() -> bool, args: &[OsString]) {
+    /// After a switch could not log in, `present` says when the user is
+    /// there to let it: a live control connection to the server.
+    pub(crate) fn tick(
+        &mut self,
+        idle: &dyn Fn() -> bool,
+        present: &dyn Fn() -> bool,
+        args: &[OsString],
+    ) {
         let now = Instant::now();
         let state = std::mem::replace(&mut self.state, State::Current);
         self.state = match state {
@@ -319,7 +449,14 @@ impl Follower {
                     self.next_check = now + retry_after(retry_first(), self.attempts);
                     State::Current
                 }
-                Ok(Err(error)) => self.failed(Some(running.build), error),
+                Ok(Err(Ended { error, login: true })) => {
+                    self.next_check = now + check_interval();
+                    State::Login {
+                        build: running.build,
+                        error,
+                    }
+                }
+                Ok(Err(Ended { error, .. })) => self.failed(Some(running.build), error),
                 Err(mpsc::TryRecvError::Disconnected) => self.failed(
                     Some(running.build),
                     "the switching command ended without a result".into(),
@@ -340,6 +477,21 @@ impl Follower {
                     // Ask the file again: it may have changed meanwhile.
                     self.next_check = now;
                     State::Current
+                }
+            }
+            State::Login { build, error } => {
+                if now < self.next_check {
+                    State::Login { build, error }
+                } else {
+                    self.next_check = now + check_interval();
+                    if present() {
+                        // Ask the file again, then switch over the live
+                        // connection once idle.
+                        self.next_check = now;
+                        State::Current
+                    } else {
+                        State::Login { build, error }
+                    }
                 }
             }
         };
@@ -380,6 +532,11 @@ impl Follower {
                 phase: "switching".into(),
                 error: None,
             }),
+            State::Login { build, error } => Some(Report {
+                to: Some(build.clone()),
+                phase: "login".into(),
+                error: Some(error.clone()),
+            }),
             State::Failed {
                 build,
                 error,
@@ -402,7 +559,7 @@ impl Follower {
 fn start(
     path: &Path,
     args: &[OsString],
-) -> Result<(mpsc::Receiver<std::result::Result<(), String>>, libc::pid_t)> {
+) -> Result<(mpsc::Receiver<std::result::Result<(), Ended>>, libc::pid_t)> {
     check_runnable(path).with_context(|| format!("will not run {}", path.display()))?;
     let mut output = tempfile::tempfile().context("create a temporary file for its output")?;
     let mut command = Command::new(path);
@@ -431,8 +588,14 @@ fn start(
     std::thread::spawn(move || {
         let result = match child.wait() {
             Ok(status) if status.success() => Ok(()),
-            Ok(status) => Err(last_line(&mut output).unwrap_or_else(|| status.to_string())),
-            Err(error) => Err(error.to_string()),
+            Ok(status) => Err(Ended {
+                error: last_line(&mut output).unwrap_or_else(|| status.to_string()),
+                login: status.code() == Some(LOGIN_NEEDED_EXIT),
+            }),
+            Err(error) => Err(Ended {
+                error: error.to_string(),
+                login: false,
+            }),
         };
         let _ = sender.send(result);
     });
@@ -503,7 +666,7 @@ mod tests {
         while !done(follower) {
             assert!(Instant::now() < deadline, "{:?}", follower.report());
             follower.next_check = Instant::now();
-            follower.tick(idle, &["persist".into(), "connect".into()]);
+            follower.tick(idle, &|| false, &["persist".into(), "connect".into()]);
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -514,19 +677,26 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// A service follows only what changes at its path after it starts. The
-    /// file there when it started, even another build such as a wrapper, and
-    /// a reinstall of this same build, start nothing; another build that
-    /// replaces it starts the switch, once idle.
+    /// The file a service runs is its baseline, and starts nothing. A file
+    /// of this same build, at the start or installed again later, becomes
+    /// the baseline; another build that replaces it starts the switch, once
+    /// idle.
     #[test]
-    fn only_another_build_installed_while_running_starts_a_switch() {
+    fn only_another_build_at_the_path_starts_a_switch() {
+        let running = std::env::current_exe().unwrap();
+        assert_eq!(Follower::new(running.clone()).baseline, seen_at(&running));
+
         let directory = crate::test_support::tempdir().unwrap();
         let path = directory.path().join("syq");
-        script(&path, "v0.0.0-wrapper");
+        script(&path, crate::identity::build());
         let mut follower = Follower::new(path.clone());
+        assert_eq!(follower.baseline, None);
+        tick_until(&mut follower, &|| true, |follower| {
+            follower.baseline == seen_at(&path)
+        });
         for _ in 0..3 {
             follower.next_check = Instant::now();
-            follower.tick(&|| true, &[]);
+            follower.tick(&|| true, &|| false, &[]);
             assert!(matches!(follower.state, State::Current));
         }
 
@@ -543,7 +713,7 @@ mod tests {
             matches!(follower.state, State::Waiting { .. })
         });
         for _ in 0..20 {
-            follower.tick(&|| false, &[]);
+            follower.tick(&|| false, &|| false, &[]);
         }
         assert_eq!(switches(&path), 0);
         assert_eq!(
@@ -556,6 +726,99 @@ mod tests {
             std::fs::read_to_string(path.with_extension("log")).unwrap(),
             "persist connect\n"
         );
+    }
+
+    /// A service started after its path already took another build, as when
+    /// an update landed during the switch that started it, switches to that
+    /// build too.
+    #[test]
+    fn another_build_already_at_the_path_at_the_start_starts_a_switch() {
+        let directory = crate::test_support::tempdir().unwrap();
+        let path = directory.path().join("syq");
+        script(&path, "v99.0.0");
+        let mut follower = Follower::new(path.clone());
+        tick_until(&mut follower, &|| true, |_| switches(&path) == 1);
+    }
+
+    /// A Homebrew-style install: the followed path is a link in a group
+    /// writable directory, and an update only points it at another
+    /// version's directory.
+    #[test]
+    fn a_link_that_is_pointed_at_another_version_starts_a_switch() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = crate::test_support::tempdir().unwrap();
+        let bin = directory.path().join("bin");
+        let cellar = directory.path().join("Cellar");
+        for version in ["1", "2"] {
+            std::fs::create_dir_all(cellar.join(version)).unwrap();
+        }
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o775)).unwrap();
+        script(&cellar.join("1/syq"), crate::identity::build());
+        script(&cellar.join("2/syq"), "v99.0.0");
+        let path = bin.join("syq");
+        std::os::unix::fs::symlink("../Cellar/1/syq", &path).unwrap();
+        let mut follower = Follower::new(path.clone());
+        tick_until(&mut follower, &|| true, |follower| {
+            follower.baseline == seen_at(&path)
+        });
+        // Relink, as `brew upgrade` does: the old version's file is unchanged.
+        std::os::unix::fs::symlink("../Cellar/2/syq", bin.join("syq.new")).unwrap();
+        std::fs::rename(bin.join("syq.new"), &path).unwrap();
+        // The switch runs the link, which the new service then follows.
+        tick_until(&mut follower, &|| true, |_| switches(&path) == 1);
+    }
+
+    /// A switch that cannot log in without the user is not tried again on
+    /// a timer. It waits until the user is there: a live control
+    /// connection to the server, as a syq command to it leaves.
+    #[test]
+    fn a_switch_that_needs_the_user_to_log_in_waits_for_the_user() {
+        let directory = crate::test_support::tempdir().unwrap();
+        let path = directory.path().join("syq");
+        script(&path, crate::identity::build());
+        let mut follower = Follower::new(path.clone());
+        tick_until(&mut follower, &|| true, |follower| {
+            follower.baseline == seen_at(&path)
+        });
+        let new = path.with_extension("new");
+        crate::test_support::write_executable(
+            &new,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --build-identity ]; then echo v99.0.0; exit 0; fi\n\
+                 printf '%s\\n' \"$*\" >> \"$0.log\"\n\
+                 echo 'syq persist: logging in to server needs you: Permission denied (publickey).' >&2\n\
+                 exit {LOGIN_NEEDED_EXIT}\n"
+            ),
+            0o755,
+        );
+        std::fs::rename(&new, &path).unwrap();
+        tick_until(&mut follower, &|| true, |follower| {
+            matches!(follower.state, State::Login { .. })
+        });
+        let report = follower.report().unwrap();
+        assert_eq!(report.phase, "login");
+        assert!(
+            report
+                .describe()
+                .starts_with("switches to syq v99.0.0 after your next syq command to this server"),
+            "{}",
+            report.describe()
+        );
+        // No user, no attempt, however long it waits.
+        for _ in 0..20 {
+            follower.next_check = Instant::now();
+            follower.tick(&|| true, &|| false, &[]);
+        }
+        assert_eq!(switches(&path), 1);
+        // A live control connection lets it try again at once.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while switches(&path) < 2 {
+            assert!(Instant::now() < deadline, "{:?}", follower.report());
+            follower.next_check = Instant::now();
+            follower.tick(&|| true, &|| true, &[]);
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// A switch that fails says why and tries again after a wait; one that
@@ -588,7 +851,7 @@ mod tests {
         );
         // Nothing runs again before the wait is over.
         for _ in 0..20 {
-            follower.tick(&|| true, &[]);
+            follower.tick(&|| true, &|| false, &[]);
         }
         assert_eq!(switches(&path), 1);
         assert_eq!(follower.attempts, 1);
@@ -612,27 +875,46 @@ mod tests {
     }
 
     #[test]
-    fn a_file_others_could_write_is_not_run() {
+    fn a_file_another_account_could_replace_is_not_run() {
         use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
         let directory = crate::test_support::tempdir().unwrap();
-        let path = directory.path().join("syq");
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let path = bin.join("syq");
         script(&path, "v99.0.0");
         check_runnable(&path).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o775)).unwrap();
+        // Group write, as in Homebrew's directories or under a 002 umask.
+        mode(&bin, 0o775);
+        mode(&path, 0o775);
+        check_runnable(&path).unwrap();
+        // Write for every account is refused, for the file and its directory.
+        mode(&path, 0o777);
         let error = check_runnable(&path).unwrap_err().to_string();
-        assert!(error.contains("nobody else may write it"), "{error}");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let shared = directory.path().join("shared");
-        std::fs::create_dir(&shared).unwrap();
-        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
-        // A link in a directory others can write could be pointed elsewhere.
-        let link = shared.join("syq");
-        std::os::unix::fs::symlink(&path, &link).unwrap();
-        let error = check_runnable(&link).unwrap_err().to_string();
+        assert!(error.contains("other accounts may not write it"), "{error}");
+        mode(&path, 0o755);
+        mode(&bin, 0o777);
+        let error = check_runnable(&path).unwrap_err().to_string();
         assert!(error.contains("the directory"), "{error}");
-        // With the sticky bit, others cannot replace it.
-        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
-        check_runnable(&link).unwrap();
+        mode(&bin, 0o755);
+
+        // A link through a directory every account can write, anywhere on
+        // the way, could be pointed elsewhere.
+        let shared = directory.path().join("shared");
+        let start = directory.path().join("start");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::create_dir(&start).unwrap();
+        std::os::unix::fs::symlink(&path, shared.join("hop")).unwrap();
+        std::os::unix::fs::symlink(shared.join("hop"), start.join("syq")).unwrap();
+        check_runnable(&start.join("syq")).unwrap();
+        mode(&shared, 0o777);
+        let error = check_runnable(&start.join("syq")).unwrap_err().to_string();
+        assert!(error.contains(&shared.display().to_string()), "{error}");
+        // With the sticky bit, others cannot replace the link this user owns.
+        mode(&shared, 0o1777);
+        check_runnable(&start.join("syq")).unwrap();
         let error = check_runnable(&directory.path().join("missing"))
             .unwrap_err()
             .to_string();
@@ -641,7 +923,7 @@ mod tests {
         // The follower reports a refused file instead of running it.
         let mut follower = Follower::new(path.clone());
         script(&path, "v99.0.0");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+        mode(&path, 0o777);
         tick_until(&mut follower, &|| true, |follower| {
             matches!(follower.state, State::Failed { .. })
         });

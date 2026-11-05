@@ -142,6 +142,11 @@ pub(crate) fn parse_for_approval(argv: &[OsString], expected: &str) -> Result<Se
 pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     let (request, explicit, scope) = parse_command(argv)?;
     let domain = crate::persistence::Domain::select(scope.as_deref())?;
+    // A command handed off to another build's helper leaves the services to
+    // the build that started them.
+    if !super::handoff::handed_off() {
+        crate::receive_service::refresh_outdated(&domain, false);
+    }
     let explicit_mode = explicit.is_some();
     let mode = crate::auth_from::resolve(&domain, &request.destination.host, explicit)?;
     crate::fsops::reserve_startup_descriptors();
