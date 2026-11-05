@@ -86,6 +86,9 @@ pub struct Progress {
     copy_last_ns: AtomicU64,
     term: Mutex<TermState>,
     stop: AtomicBool,
+    /// Whether the live display started. A command that fails before it
+    /// does has no counts to show, only its error.
+    ticker_started: AtomicBool,
     /// `--results`: machine-readable NDJSON outcome stream, set once after
     /// construction so workers and the planner reach it with no plumbing.
     results: std::sync::OnceLock<Arc<crate::results::ResultsWriter>>,
@@ -226,6 +229,7 @@ impl Progress {
                 observation: None,
             }),
             stop: AtomicBool::new(false),
+            ticker_started: AtomicBool::new(false),
             results: std::sync::OnceLock::new(),
         })
     }
@@ -477,10 +481,12 @@ impl Progress {
     }
 
     pub fn render(&self) {
-        self.render_status(None);
+        self.render_status(None, true);
     }
 
-    fn render_status(&self, status: Option<&str>) {
+    /// Sample progress for the results stream, and draw it unless `draw` is
+    /// false.
+    fn render_status(&self, status: Option<&str>, draw: bool) {
         let mut t = self.term.lock().unwrap();
         let now = Instant::now();
         let done = self.bytes_done.load(Relaxed);
@@ -529,7 +535,7 @@ impl Progress {
                 });
             }
         }
-        if !self.enabled {
+        if !self.enabled || !draw {
             return;
         }
         let age = now - t.samples.back().unwrap().0;
@@ -605,10 +611,15 @@ impl Progress {
 
     /// Leave the final bar visible. Call after joining the ticker, with the
     /// actual operation outcome; a full byte counter alone is not success.
+    /// A failure before the live display started draws no bar: its zero
+    /// counts would only stand between the user and the error.
     pub fn finish(&self, success: bool) {
         self.finish_transfer();
         self.clock.finish();
-        self.render_status(Some(if success { "done" } else { "incomplete" }));
+        self.render_status(
+            Some(if success { "done" } else { "incomplete" }),
+            success || self.ticker_started.load(Relaxed),
+        );
         if self.enabled {
             crate::output::finish_progress();
         }
@@ -632,6 +643,7 @@ impl Progress {
         {
             return None;
         }
+        self.ticker_started.store(true, Relaxed);
         let p = self.clone();
         let thread = std::thread::Builder::new()
             .spawn(move || {

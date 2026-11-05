@@ -2217,6 +2217,72 @@ fn native_remote_copy_omitted_placement_uses_destination_base() {
     }
 }
 
+/// `syq cp .kube --to HOST --as foobar` onto an existing directory in the
+/// remote home: every form fails visibly and leaves the directory alone.
+#[test]
+fn native_remote_as_onto_an_existing_directory_fails_visibly() {
+    let t = Tmp::new();
+    let ssh = fake_ssh(&t);
+    let script = fs::read_to_string(&ssh)
+        .unwrap()
+        .replace("exec /bin/sh -c", "cd \"$HOME\" || exit 1\nexec /bin/sh -c");
+    executable(&ssh, script.as_bytes());
+    write(&t.path("sources/real/config"), b"config");
+    std::os::unix::fs::symlink("real", t.path("sources/.kube")).unwrap();
+    write(&t.path("sources/plain"), b"plain");
+    for engine in [false, true] {
+        for (selector, expected) in [
+            (
+                vec![".kube"],
+                "source .kube is a symlink; pass --follow-src",
+            ),
+            (
+                vec!["--src-non-dir", ".kube"],
+                "destination foobar is an existing directory; cannot replace it with non-directory source .kube",
+            ),
+            (
+                vec!["plain"],
+                "destination foobar is an existing directory; cannot replace it with non-directory source plain",
+            ),
+        ] {
+            let _ = fs::remove_dir_all(t.path("remote-home"));
+            fs::create_dir_all(t.path("remote-home/foobar")).unwrap();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command
+                .args(["cp", "--syq-path", env!("CARGO_BIN_EXE_syq"), "--no-tcp"])
+                .args(["-C", &t.s("sources")])
+                .args(&selector)
+                .args(["--to", "fake.example", "--as", "foobar"])
+                .env("XDG_CONFIG_HOME", t.path("config"))
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+                );
+            if engine {
+                command.env("SYQ_TEST_DISABLE_SMALL_COPY", "1");
+            }
+            let output = command.run().unwrap();
+            let context = format!("engine={engine} {selector:?}: {}", stderr_of(&output));
+            assert!(!output.status.success(), "{context}");
+            assert!(stderr_of(&output).contains(expected), "{context}");
+            assert!(
+                fs::symlink_metadata(t.path("remote-home/foobar"))
+                    .unwrap()
+                    .is_dir(),
+                "{context}"
+            );
+            assert_eq!(
+                fs::read_dir(t.path("remote-home/foobar")).unwrap().count(),
+                0,
+                "{context}"
+            );
+        }
+    }
+}
+
 /// Rsync's `--insecure-links` is local only and is never sent to the remote
 /// side. A remote source therefore keeps the confined default even when the
 /// operator passed the flag, and the flag still opts out locally in the same
