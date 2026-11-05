@@ -13,8 +13,8 @@ syq receiver <COMMAND>
 | Command | Purpose |
 |---|---|
 | [`receiver enroll`](#syq-receiver-enroll) | Manually enroll or refresh a server account |
-| [`receiver list`](#syq-receiver-list) | List local active and pending enrollments |
-| [`receiver revoke`](#syq-receiver-revoke) | Stop active receivers and remove their enrollment from both machines |
+| [`receiver list`](#syq-receiver-list) | List this machine's enrollments, active and pending |
+| [`receiver revoke`](#syq-receiver-revoke) | Stop an enrollment's active copies and remove it from both machines |
 
 **Help (also available on subcommands)**
 

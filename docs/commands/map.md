@@ -24,10 +24,10 @@ syq map [OPTIONS] --srcs-in DIR
 | Argument / option | Meaning |
 |---|---|
 | `--from <ENDPOINT>` | Source endpoint ([USER@]HOST[:PORT] or s3://BUCKET); omitted means local |
-| `-C, --cwd <DIR>` | Resolve relative source selectors from DIR |
-| `--root <DIR>` | Resolve source selectors beneath DIR and refuse any escape |
-| `--follow` | Follow symlinks in all directly supplied filesystem paths |
-| `--follow-src` | Follow symlinks in directly supplied source paths |
+| `-C, --cwd <DIR>` | Resolve relative source paths from DIR |
+| `--root <DIR>` | Resolve source paths inside DIR and refuse any that lead outside it |
+| `--follow` | Follow symlinks in all the paths you give |
+| `--follow-src` | Follow symlinks in the source paths you give |
 | `--src <PATH>` | Select a named source object (repeatable) |
 | `--srcs-in <DIR>` | Select a directory's contents (repeatable) |
 | `--src-non-dir <PATH>` | Select a named non-directory source object (repeatable) |
@@ -47,17 +47,17 @@ syq map [OPTIONS] --srcs-in DIR
 
 | Argument / option | Meaning |
 |---|---|
-| `--where <EXPR>` | Filter emitted mapping entries with a source expression |
+| `--where <EXPR>` | Emit only the non-directory entries that match a source expression; directories are always emitted |
 
 ## SSH and transport
 
 | Argument / option | Meaning |
 |---|---|
 | `--rsh <COMMAND>` | Remote shell command (default: ssh) |
-| `--syq-path <PATH>` | Use this remote syq executable instead of installing a helper |
-| `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |
-| `--auth-from <auto\|ssh\|@NAME\|HOST>` | How to authorize SSH access: auto, ssh (native SSH only), @NAME (a receiving machine), or HOST (an SSH provider) |
-| `--pscope <PATH>` | Use an isolated persistence domain created by `syq persist on --ephemeral` |
+| `--syq-path <PATH>` | Run the syq at PATH on the remote machine instead of the matching copy syq installs automatically |
+| `--no-bootstrap` | Run syq from the remote machine's PATH instead of the matching copy syq installs automatically |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Whose SSH access to use: this machine's own (auto or ssh), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST) |
+| `--pscope <PATH>` | Use the isolated connections and settings that `syq persist on --ephemeral` created at PATH |
 
 ## Object storage
 

@@ -145,14 +145,14 @@ pub(crate) struct Destinations {
 }
 #[derive(Subcommand, Debug)]
 enum DestinationAction {
-    /// Print registrations and whether their receiving laptop responds
+    /// List the receiving names registered here and whether each machine responds
     List,
-    /// Remove an offline destination name so another laptop can register it
+    /// Release a disconnected machine's receiving name so another machine can claim it
     Forget {
         /// Receiving name to release, without @
         name: String,
     },
-    /// Wait for a destination to respond; exit nonzero after the deadline
+    /// Wait for a receiving name's machine to respond; exit nonzero after the deadline
     Wait {
         /// Receiving name to wait for, without @
         name: String,

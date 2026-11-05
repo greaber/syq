@@ -21,10 +21,10 @@ syq rm [OPTIONS] --srcs-in DIR
 
 | Argument / option | Meaning |
 |---|---|
-| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Use approved SSH account access, or request S3 authorization from a receiving machine |
-| `--syq-path <PATH>` | Use this exact syq executable on the remote removal endpoint |
-| `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |
-| `--pscope <PATH>` | Use an isolated persistence domain created by `syq persist on --ephemeral` |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Whose SSH access to use: this machine's own (auto or ssh), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST); @NAME also authorizes S3 removal |
+| `--syq-path <PATH>` | Run the syq at PATH on the remote machine instead of the matching copy syq installs automatically |
+| `--no-bootstrap` | Run syq from the remote machine's PATH instead of the matching copy syq installs automatically |
+| `--pscope <PATH>` | Use the isolated connections and settings that `syq persist on --ephemeral` created at PATH |
 
 <a id="copy-policy-and-filtering"></a>
 
@@ -45,10 +45,10 @@ syq rm [OPTIONS] --srcs-in DIR
 | Argument / option | Meaning |
 |---|---|
 | `--on <ENDPOINT>` | Removal endpoint ([USER@]HOST[:PORT] or s3://BUCKET); omitted means local |
-| `-C, --cwd <DIR>` | Resolve relative selectors from DIR at the removal endpoint |
+| `-C, --cwd <DIR>` | Resolve relative paths from DIR on the removal endpoint |
 | `--root <DIR>` | Confine resolution and removal beneath DIR |
 | `--follow` | Like --follow-src; also follow symlinks in the --results path |
-| `--follow-src` | Follow symlinks in --cwd, --root, and selector parent directories; always unlink a final selected symlink |
+| `--follow-src` | Follow symlinks in --cwd, --root, and the parent directories of selected paths; a selected symlink itself is always removed as a link |
 | `--src <PATH>` | Select a non-directory object (repeatable) |
 | `--srcs-in <DIR>` | Recursively select a directory's contents, keeping the directory (repeatable) |
 | `--src-non-dir <PATH>` | Select a non-directory object (repeatable) |

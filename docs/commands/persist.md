@@ -11,20 +11,20 @@ syq persist [OPTIONS] <COMMAND>
 
 | Command | Purpose |
 |---|---|
-| [`persist auth-from`](#syq-persist-auth-from) | Choose default authorization for server copies and SSH sessions |
-| [`persist ssh-config`](#syq-persist-ssh-config) | Export native OpenSSH configuration for one already approved account connection |
-| [`persist receive`](#syq-persist-receive) | Configure receiving and decide incoming copy or command requests |
-| [`persist destinations`](#syq-persist-destinations) | Inspect shared receiving names; --pscope does not filter them |
-| [`persist connect`](#syq-persist-connect) | Connect with native SSH or request approved account access |
-| [`persist on`](#syq-persist-on) | Enable persistent connections for later syq commands |
-| [`persist off`](#syq-persist-off) | Disable persistence and close its live SSH control connections |
+| [`persist auth-from`](#syq-persist-auth-from) | Save the --auth-from choice that later commands use by default |
+| [`persist ssh-config`](#syq-persist-ssh-config) | Print an OpenSSH config that lets ssh, scp, or Git use an approved connection |
+| [`persist receive`](#syq-persist-receive) | Set up receiving, and approve or deny incoming copy and command requests |
+| [`persist destinations`](#syq-persist-destinations) | On a server, list or release receiving names |
+| [`persist connect`](#syq-persist-connect) | Connect to a server now and keep the connection open for later commands |
+| [`persist on`](#syq-persist-on) | Keep SSH connections open for later syq commands |
+| [`persist off`](#syq-persist-off) | Turn persistence off and close its open SSH connections, including receiving |
 | [`persist status`](#syq-persist-status) | Show connection readiness and any receiving problem |
 
 **Options (also available on subcommands)**
 
 | Argument / option | Meaning |
 |---|---|
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
+| `--pscope <PATH>` | Use the isolated connections and settings at PATH instead of the default ones |
 
 **Help (also available on subcommands)**
 
@@ -48,14 +48,14 @@ syq persist auth-from [OPTIONS] [auto|ssh|@NAME|HOST]
 
 | Argument / option | Meaning |
 |---|---|
-| `[auto\|ssh\|@NAME\|HOST]` | Authorization for later commands; omit to show saved defaults |
+| `[auto\|ssh\|@NAME\|HOST]` | Value to save, as for --auth-from; omit to show the saved choices |
 
 **Options**
 
 | Argument / option | Meaning |
 |---|---|
 | `--for <HOST>` | Apply to this exact destination hostname or SSH alias, for any login/port |
-| `--reset` | Remove the selected override so it inherits the default |
+| `--reset` | Remove the saved choice for --for HOST, or without --for, reset the default to auto |
 
 <!-- /CLI -->
 
@@ -79,7 +79,7 @@ syq persist ssh-config [OPTIONS] <HOST>
 
 | Argument / option | Meaning |
 |---|---|
-| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Select existing approval; omitted uses SYQ_AUTH_FROM, then the saved preference, then auto |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Which approved connection to export: the one from this receiving machine (@NAME) or SSH authorization provider (HOST), or with auto, the only matching one; omitted uses SYQ_AUTH_FROM, then the saved choice, then auto |
 
 <!-- /CLI -->
 
@@ -101,7 +101,7 @@ syq persist receive [OPTIONS] <COMMAND>
 | [`persist receive permissions`](#syq-persist-receive-permissions) | List or remove account permissions remembered on this machine |
 | [`persist receive deny`](#syq-persist-receive-deny) | Deny one pending request using the ID from persist receive pending |
 | [`persist receive on`](#syq-persist-receive-on) | Enable or configure a receiving profile (without --name, use the first profile) |
-| [`persist receive off`](#syq-persist-receive-off) | Disable receiving and stop its background connections; keep ordinary persistence |
+| [`persist receive off`](#syq-persist-receive-off) | Turn receiving off and close its connections; other persistent connections stay open |
 | [`persist receive remove`](#syq-persist-receive-remove) | Remove a saved receiving profile and stop its connections |
 | [`persist receive status`](#syq-persist-receive-status) | Show receiving settings and background connection state |
 | [`persist receive wait`](#syq-persist-receive-wait) | Wait for a connection with a deadline |
@@ -180,7 +180,7 @@ syq persist receive permissions [OPTIONS] <COMMAND>
 | Command | Purpose |
 |---|---|
 | [`persist receive permissions list`](#syq-persist-receive-permissions-list) | Show remembered SSH account permissions |
-| [`persist receive permissions remove`](#syq-persist-receive-permissions-remove) | Stop future authentications; already authenticated sessions may continue |
+| [`persist receive permissions remove`](#syq-persist-receive-permissions-remove) | Remove a remembered permission; sessions already logged in can continue |
 
 <!-- /CLI -->
 
@@ -243,12 +243,12 @@ syq persist receive on [OPTIONS]
 | `--all-connections` | Make this profile available through every connected SSH account |
 | `--notify <MODE>` | Show desktop prompts, or use only local pending/approve/deny commands<br><br>[possible values: desktop, off] |
 | `--name <NAME>` | Create or update this named profile; omitted means the first profile |
-| `-C, --cwd <DIR>` | Default destination directory; absolute paths and .. may select elsewhere |
-| `--auto-cwd` | Choose cwd from root, auto-approve-root, then HOME |
-| `--root <DIR>` | Confinement boundary for every download, even with approval |
-| `--no-root` | Remove the hard download boundary |
+| `-C, --cwd <DIR>` | Starting directory for downloads and commands; absolute paths and .. can still reach elsewhere |
+| `--auto-cwd` | Choose the starting directory automatically: the --root directory, else --auto-approve-root, else your home directory |
+| `--root <DIR>` | Allow downloads only inside DIR, even approved ones |
+| `--no-root` | Remove the --root restriction |
 | `--max-bytes <SIZE>` | Maximum bytes one transfer may write (default: 100G) |
-| `--max-entries <N>` | Maximum entries one transfer may touch (default: 1000000) |
+| `--max-entries <N>` | Maximum entries one transfer may change (default: 1000000) |
 | `--max-delete <N>` | Permit pruning up to N entries per transfer (default: 0) |
 
 <!-- /CLI -->
@@ -341,8 +341,8 @@ syq persist destinations [OPTIONS] <COMMAND>
 
 | Command | Purpose |
 |---|---|
-| [`persist destinations list`](#syq-persist-destinations-list) | Print registrations and whether their receiving laptop responds |
-| [`persist destinations forget`](#syq-persist-destinations-forget) | Remove an offline destination name so another laptop can register it |
+| [`persist destinations list`](#syq-persist-destinations-list) | List the receiving names registered here and whether each machine responds |
+| [`persist destinations forget`](#syq-persist-destinations-forget) | Release a disconnected machine's receiving name so another machine can claim it |
 | [`persist destinations wait`](#syq-persist-destinations-wait) | Wait for a connection with a deadline |
 
 <!-- /CLI -->
@@ -414,10 +414,10 @@ syq persist connect [OPTIONS] <HOST>
 
 | Argument / option | Meaning |
 |---|---|
-| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Authorize a reusable destination-account login through @NAME or an SSH provider |
-| `--syq-path <PATH>` | Use this remote syq executable instead of installing a matching helper |
-| `--no-bootstrap` | Use syq on the remote PATH instead of installing a matching helper |
-| `--timeout <SECONDS>` | Wait this many seconds for receiving after connecting<br><br>[default: 30] |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Whose SSH access to connect with: this machine's own (auto or ssh), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST) |
+| `--syq-path <PATH>` | Run the syq at PATH on the remote machine instead of the matching copy syq installs automatically |
+| `--no-bootstrap` | Run syq from the remote machine's PATH instead of the matching copy syq installs automatically |
+| `--timeout <SECONDS>` | After connecting, wait up to this many seconds for receiving to be ready<br><br>[default: 30] |
 
 <!-- /CLI -->
 
@@ -432,7 +432,7 @@ syq persist on [OPTIONS]
 
 | Argument / option | Meaning |
 |---|---|
-| `--ephemeral` | Create an ephemeral scope and print its path instead of changing the user setting |
+| `--ephemeral` | Create a new isolated set of connections and settings and print its path for --pscope, instead of turning persistence on for your user |
 
 <!-- /CLI -->
 
@@ -460,6 +460,6 @@ syq persist status [OPTIONS]
 
 | Argument / option | Meaning |
 |---|---|
-| `--json` | Print structured connection state |
+| `--json` | Print the status as JSON |
 
 <!-- /CLI -->

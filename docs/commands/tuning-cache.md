@@ -11,10 +11,10 @@ syq tuning-cache <COMMAND>
 
 | Command | Purpose |
 |---|---|
-| [`tuning-cache list`](#syq-tuning-cache-list) | List recent transfers |
+| [`tuning-cache list`](#syq-tuning-cache-list) | List recent transfers, newest first |
 | [`tuning-cache show`](#syq-tuning-cache-show) | Show a transfer's measurements and decisions |
 | [`tuning-cache export`](#syq-tuning-cache-export) | Export history as NDJSON; omit ID for every transfer |
-| [`tuning-cache clear`](#syq-tuning-cache-clear) | Delete recorded history and filesystem startup hints |
+| [`tuning-cache clear`](#syq-tuning-cache-clear) | Delete recorded history, so later copies choose their starting worker counts afresh |
 
 **Help (also available on subcommands)**
 

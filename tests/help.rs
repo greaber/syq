@@ -324,7 +324,7 @@ fn everyday_copy_controls_stay_visible_but_performance_overrides_do_not() {
 #[test]
 fn advanced_commands_are_discoverable_and_keep_their_full_descriptions() {
     for (path, command, description) in [
-        (vec![], "receiver", "Enroll, list, or revoke"),
+        (vec![], "receiver", "Set up, list, or revoke"),
         (vec![], "map", "Print source-to-destination mappings"),
         (
             vec!["receiver"],
@@ -334,7 +334,7 @@ fn advanced_commands_are_discoverable_and_keep_their_full_descriptions() {
         (
             vec!["persist"],
             "destinations",
-            "Inspect named return destinations",
+            "On a server: list, wait for, or release the receiving names",
         ),
         (
             vec!["persist", "receive"],

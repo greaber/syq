@@ -23,23 +23,23 @@ syq --self-update
 | Command | Purpose |
 |---|---|
 | [`cp`](cp.md) | Copy files and directories, optionally removing destination-only files |
-| [`ssh`](ssh.md) | Open an SSH shell or command with native or approved account access |
-| [`exec`](exec.md) | Run a command on a named receiving machine after local approval |
+| [`ssh`](ssh.md) | Open an SSH shell or run a command, using your own or approved SSH access |
+| [`exec`](exec.md) | From a server, run a command on a receiving machine after it approves |
 | [`rm`](rm.md) | Remove selected files and directory trees |
-| [`clean-partials`](clean-partials.md) | Delete syq partial files in directory trees |
+| [`clean-partials`](clean-partials.md) | Delete partial files that interrupted syq copies left in directory trees |
 | [`map`](map.md) | Print source-to-destination mappings as NDJSON |
 | [`rsync`](rsync.md) | Copy using rsync-compatible syntax |
-| [`persist`](persist.md) | Manage persistent connections, receiving, and return destinations |
+| [`persist`](persist.md) | Keep SSH connections open, and receive files and requests from connected servers |
 | [`completion`](completion.md) | Generate shell completion and manage cached endpoint suggestions |
 | [`tuning-cache`](tuning-cache.md) | Inspect and clear local transfer tuning history |
-| [`receiver`](receiver.md) | Manage manual receiver enrollment and recovery |
+| [`receiver`](receiver.md) | Manage restricted copying on server accounts |
 | [`help`](#syq-help) | Show help for any command or nested command |
 
 **Options**
 
 | Argument / option | Meaning |
 |---|---|
-| `--version-is <EXPR>` | Require the invoked release to match EXPR before running anything. Bare x.y.z means exact equality; operators: == != < <= > >=. Commas mean AND; \| means OR, with AND binding more tightly. Quote expressions in the shell. Development builds are unsupported. Put --version-is and --use-version before the command, in either order. |
+| `--version-is <EXPR>` | Stop with an error, before doing anything else, unless this syq release matches EXPR. Bare x.y.z means exactly that version; operators: == != < <= > >=. Commas mean AND; \| means OR, with AND binding more tightly. Quote expressions in the shell. Development builds always fail the check. Put --version-is and --use-version before the command, in either order. |
 | `--use-version <VERSION>` | Run an exact official release, downloading it if needed (before the command and other options) |
 | `--self-update` | Install the newest signed release (standalone installs); Homebrew: brew upgrade syq |
 

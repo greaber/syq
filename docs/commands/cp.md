@@ -27,8 +27,8 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 |---|---|
 | `--src-fd <FD>` | Read raw bytes from an inherited local descriptor (0 for stdin), instead of a source path |
 | `--from <ENDPOINT>` | Source endpoint ([USER@]HOST[:PORT] or s3://BUCKET); omitted means local |
-| `-C, --cwd <DIR>` | Resolve relative source selectors from DIR |
-| `--root <DIR>` | Resolve source selectors beneath DIR and refuse any escape |
+| `-C, --cwd <DIR>` | Resolve relative source paths from DIR |
+| `--root <DIR>` | Resolve source paths inside DIR and refuse any that lead outside it |
 | `--src <PATH>` | Select a named source object (repeatable) |
 | `--srcs-in <DIR>` | Select a directory's contents (repeatable) |
 | `--src-non-dir <PATH>` | Select a named non-directory source object (repeatable) |
@@ -36,7 +36,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--src-non-dirs <PATH>...` | Select several named non-directory source objects |
 | `--src-dirs <DIR>...` | Select several named source directories |
 | `--srcs <PATH>...` | Select several named source objects |
-| `--where <EXPR>` | Select non-directory entries with an expression; directories are not filtered |
+| `--where <EXPR>` | Copy only the non-directory entries that match a source expression; directories are not filtered |
 | `--ignore <PATTERN>` | Skip paths matching a gitignore-style pattern (repeatable) |
 | `--ignore-from <FILE>` | Read gitignore-style patterns from FILE (repeatable; applied in command-line order with --ignore) |
 | `[PATH]...` | Named source objects (shorthand for --src) |
@@ -48,13 +48,13 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | Argument / option | Meaning |
 |---|---|
 | `--as-fd <FD>` | Write raw bytes to an inherited local descriptor (1 for stdout), instead of a destination path |
-| `--to <ENDPOINT>` | Destination SSH endpoint, @NAME, or s3://BUCKET; placement defaults to --into |
+| `--to <ENDPOINT>` | Destination SSH endpoint, receiving name (@NAME), or s3://BUCKET; without a placement option, copy into its starting directory (--into .) |
 | `--into <DIR>` | Put selected names inside DIR, creating it if necessary |
 | `--into-new <DIR>` | Put selected names inside DIR, which must not exist |
 | `--into-existing <DIR>` | Put selected names inside an existing directory |
-| `--as <PATH>` | Map one named source exactly to PATH; never follow its final entry |
-| `--as-new <PATH>` | Map one named source exactly to PATH; its final entry must not exist and is never followed |
-| `--as-existing <PATH>` | Map one named source exactly to PATH; its final entry must exist and is never followed |
+| `--as <PATH>` | Copy one named source to exactly PATH; a symlink at PATH is not followed |
+| `--as-new <PATH>` | Like --as, but PATH must not exist |
+| `--as-existing <PATH>` | Like --as, but PATH must already exist |
 | `--mapping <FILE>` | Copy the entries of a local NDJSON mapping file (`-` reads stdin) instead of selecting sources; src paths are relative to -C and dst paths to the --into directory. Cannot be combined with --ignore or --ignore-from |
 
 <a id="copy-policy-and-filtering"></a>
@@ -74,9 +74,9 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 
 | Argument / option | Meaning |
 |---|---|
-| `--follow` | Follow symlinks in all directly supplied filesystem paths |
-| `--follow-src` | Follow symlinks in directly supplied source paths |
-| `--follow-dst` | Follow symlinks in directly supplied destination paths |
+| `--follow` | Follow symlinks in all the paths you give |
+| `--follow-src` | Follow symlinks in the source paths you give |
+| `--follow-dst` | Follow symlinks in the destination paths you give |
 | `--copy-metadata <FEATURE>` | Match selected source metadata, including on unchanged files (repeatable/comma-separated)<br><br>Possible values:<br>- mtime: Match source modification times<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files<br>- hardlinks: Preserve hard links between selected regular files<br>- acls: Preserve native Linux or macOS ACLs and permission bits<br>- xattrs: Preserve Linux or macOS extended attributes<br>- atimes: Preserve access times captured before reading<br>- crtimes: Preserve birth times; requires a macOS destination<br>- content-type: Content-Type (S3-to-S3 only)<br>- content-encoding: Content-Encoding (S3-to-S3 only)<br>- content-language: Content-Language (S3-to-S3 only)<br>- content-disposition: Content-Disposition (S3-to-S3 only)<br>- cache-control: Cache-Control (S3-to-S3 only)<br>- expires: Expires (S3-to-S3 only)<br>- website-redirect: Website redirect (S3-to-S3 only)<br>- user-metadata: User metadata, except syq-* keys (S3-to-S3 only)<br>- tags: The complete tag set (S3-to-S3 only)<br>- storage-class: Storage class (S3-to-S3 only) |
 | `--widen-dirs <MODE>` | Which directories you own may briefly get the owner permission the copy needs; each is restored afterwards<br><br>Possible values:<br>- none: Never change directory permissions<br>- rsync: Directories the copy includes, as rsync does, but not the directory it copies into<br>- all: Also the directory the copy goes into and the directories above it<br><br>[default: none] |
 | `--open-noatime` | Request reads without access-time updates; warn and continue if unavailable |
@@ -89,7 +89,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | Argument / option | Meaning |
 |---|---|
 | `--hash` | Hash existing source and destination files instead of trusting size and modification time |
-| `--hash-or-copy` | Like --hash, but compare only where the transfer strategy reuses blocks (by default, with a remote syq endpoint) and copy other files whole, even if identical |
+| `--hash-or-copy` | Like --hash, but compare only where the transfer strategy reuses blocks (by default, between different machines) and copy other files whole, even if identical |
 | `--integrity-checking <KEY=VALUE,...>` | [Payload checks](../integrity-checking.md) |
 
 <a id="ssh-and-transport"></a>
@@ -101,20 +101,20 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | Argument / option | Meaning |
 |---|---|
 | `--no-compress` | Disable transport compression |
-| `--receiver-max-entries <N>` | Refuse a restricted copy that would touch more than N destination entries |
-| `--receiver-max-bytes <SIZE>` | Refuse a restricted copy that would write more than SIZE bytes of file data |
-| `--auth-from <auto\|ssh\|@NAME\|HOST>` | How to authorize, overriding SYQ_AUTH_FROM and the saved choice: auto tries native SSH and may then ask a receiving machine, ssh uses only native SSH, and @NAME or HOST asks that receiving machine or SSH provider (@NAME also authorizes S3 copies) |
+| `--receiver-max-entries <N>` | For restricted copying between two servers (see syq receiver), refuse a copy that would change more than N entries on the destination |
+| `--receiver-max-bytes <SIZE>` | For restricted copying between two servers (see syq receiver), refuse a copy that would write more than SIZE bytes of file data |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Whose SSH access to use for servers (default: SYQ_AUTH_FROM, then the saved choice, then auto):<br>- auto: this machine's own; if a copy to or from one server can't log in that way, a receiving machine can approve just that copy<br>- ssh: only this machine's own<br>- @NAME: access approved by that receiving machine; also authorizes S3 copies<br>- HOST: access approved by that SSH authorization provider |
 | `--coordinate-at <WHERE>` | Choose which machine runs the copy<br><br>Possible values:<br>- auto: This machine, unless both endpoints are remote; then the source<br>- src: The source endpoint<br>- dst: The destination endpoint<br>- local: This machine, relaying the data through it<br><br>[default: auto] |
 | `--rsh <COMMAND>` | Remote shell command (default: ssh); when set, it controls SSH options and agent forwarding |
-| `--syq-path <PATH>` | Use this remote syq executable instead of installing a helper |
-| `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |
+| `--syq-path <PATH>` | Run the syq at PATH on the remote machine instead of the matching copy syq installs automatically |
+| `--no-bootstrap` | Run syq from the remote machine's PATH instead of the matching copy syq installs automatically |
 | `--no-tcp-encryption` | Send TCP data without encryption or authentication; use only on trusted networks |
 | `--no-tcp` | Send file data through SSH rather than separate TCP data connections |
-| `--tcp-ports <LO-HI>` | Port range remote listeners use for TCP data connections<br><br>[default: 47600-47699] |
+| `--tcp-ports <LO-HI>` | Port range that remote machines listen on for TCP data connections<br><br>[default: 47600-47699] |
 | `--tcp-congestion <ALGO>` | Use this congestion-control algorithm for TCP data sockets (Linux only) |
 | `--detach` | Return as soon as the copy starts on the server that runs it; requires --peer-auth own-credentials or --rsh |
-| `--peer-auth <MODE>` | How the server running the copy logs in to the other server; --rsh takes over this choice<br><br>Possible values:<br>- restricted: Reach the other server only through its enrolled restricted receiver; forwards no agent<br>- broker: Let it use your agent for that host and user, with full access to that account<br>- own-credentials: Forward nothing; it must have its own credentials for the other server<br>- full-agent: Forward your whole SSH agent, as ssh -A does<br><br>[default: restricted] |
-| `--pscope <PATH>` | Use an isolated persistence domain created by `syq persist on --ephemeral` |
+| `--peer-auth <MODE>` | How the server running the copy logs in to the other server; --rsh takes over this choice<br><br>Possible values:<br>- restricted: Reach the other server only through restricted copying (see syq receiver), which accepts just this copy; forwards no agent<br>- broker: Let it use your agent for that host and user, with full access to that account<br>- own-credentials: Forward nothing; it must have its own credentials for the other server<br>- full-agent: Forward your whole SSH agent, as ssh -A does<br><br>[default: restricted] |
+| `--pscope <PATH>` | Use the isolated connections and settings that `syq persist on --ephemeral` created at PATH |
 
 ## S3 connection settings
 
@@ -136,7 +136,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | Argument / option | Meaning |
 |---|---|
 | `--performance-tuning <KEY=VALUE,...>` | [Workers, request sizes, and copy methods](../tuning.md) |
-| `--transfer-strategy <STRATEGY>` | Choose whether filesystem copies reuse matching blocks of the destination file they replace (default: locality; mounted network filesystems count as local).<br><br>Possible values:<br>- whole-file: Copy selected files without comparing blocks in the final destination<br>- aligned-block: Reuse matching blocks at the same offsets in the corresponding destination file<br>- locality: Use whole-file locally and aligned-block with a remote syq endpoint |
+| `--transfer-strategy <STRATEGY>` | Choose whether filesystem copies reuse matching blocks of the destination file they replace (default: locality; mounted network filesystems count as local).<br><br>Possible values:<br>- whole-file: Copy selected files without comparing blocks in the final destination<br>- aligned-block: Reuse matching blocks at the same offsets in the corresponding destination file<br>- locality: Whole-file when source and destination are on the same machine, aligned-block when they are on different machines |
 | `--resource-limits <KEY=VALUE,...>` | [Bandwidth and concurrency ceilings](../resource-limits.md) |
 
 <a id="progress-and-results"></a>
