@@ -920,7 +920,7 @@ pub(crate) fn refresh_outdated(domain: &Domain, quiet: bool) {
         {
             continue;
         }
-        let Some(state) = status_by(&control, Instant::now() + REFRESH_ANSWER) else {
+        let Some(state) = status_by(&control, Instant::now() + refresh_answer()) else {
             continue;
         };
         if state.identity == crate::identity::build() || !busy_of(&state).idle() {
@@ -980,6 +980,17 @@ pub(crate) fn refresh_outdated(domain: &Domain, quiet: bool) {
 /// answers within a millisecond; one that does not is skipped until the
 /// next claim (`claim_switch_attempt`).
 const REFRESH_ANSWER: Duration = Duration::from_millis(50);
+fn refresh_answer() -> Duration {
+    // Tests on slow runners give stand-in services longer.
+    #[cfg(debug_assertions)]
+    if let Some(millis) = std::env::var("SYQ_TEST_REFRESH_ANSWER_MS")
+        .ok()
+        .and_then(|millis| millis.parse().ok())
+    {
+        return Duration::from_millis(millis);
+    }
+    REFRESH_ANSWER
+}
 
 /// The status of the service at `control`, if it answers by `deadline`:
 /// connecting, asking and reading the answer all end by then.

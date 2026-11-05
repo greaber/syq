@@ -3138,6 +3138,8 @@ impl Installed<'_> {
             .env("SYQ_TEST_SWITCH_CHECK_MS", "100")
             .env("SYQ_TEST_SWITCH_QUIET_MS", "500")
             .env("SYQ_TEST_SWITCH_RETRY_MS", "600000")
+            // Stand-in services on a slow runner may answer late.
+            .env("SYQ_TEST_REFRESH_ANSWER_MS", "5000")
             .env(
                 "PATH",
                 format!("{}:/usr/bin:/bin", self.ssh.parent().unwrap().display()),
@@ -3412,10 +3414,15 @@ fn other_service(
                 }
                 Err(error) => panic!("{error}"),
             };
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .unwrap();
+            // A client may have given up and left already; macOS then
+            // refuses socket options.
+            if stream.set_nonblocking(false).is_err()
+                || stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .is_err()
+            {
+                continue;
+            }
             let request = read_provider_frame(&mut stream);
             let pending = match &pending_once {
                 Some(file) if !file.exists() => serde_json::json!([]),
@@ -3809,22 +3816,23 @@ fn a_switch_does_not_turn_persistence_back_on() {
 }
 
 /// Run a no-op local copy in the fixture's scope, which looks at its stale
-/// service, and return how long it took.
+/// service with the usual short budget, and return how long it took.
 fn local_copy(t: &Tmp, installed: &Installed) -> std::time::Duration {
     fs::write(t.path("source"), b"data").unwrap();
     let started = std::time::Instant::now();
-    let copied = installed
-        .command(
-            Path::new(env!("CARGO_BIN_EXE_syq")),
-            &[
-                "cp",
-                "--pscope",
-                installed.scope.to_str().unwrap(),
-                &t.s("source"),
-                "--as",
-                &t.s("copy"),
-            ],
-        )
+    let mut command = installed.command(
+        Path::new(env!("CARGO_BIN_EXE_syq")),
+        &[
+            "cp",
+            "--pscope",
+            installed.scope.to_str().unwrap(),
+            &t.s("source"),
+            "--as",
+            &t.s("copy"),
+        ],
+    );
+    let copied = command
+        .env_remove("SYQ_TEST_REFRESH_ANSWER_MS")
         .run()
         .unwrap();
     assert_output_ok(&copied);
