@@ -793,7 +793,7 @@ impl Args {
                 crate::output::exit(0);
             }
             "--version" | "-V" => {
-                crate::output::command_println!("syq {}", env!("CARGO_PKG_VERSION"));
+                crate::output::command_println!("syq {}", crate::identity::version());
                 crate::output::exit(0);
             }
             // Installation lifecycle switches remain top-level. Internal

@@ -52,7 +52,16 @@ const CONNECTION_FAILED: u8 = 1;
 /// connection.
 const MAX_ENDING_MESSAGE: usize = 64 << 10;
 const BROKER_IO_TIMEOUT: Duration = Duration::from_secs(10);
-pub(crate) const DEFAULT_MAX_ROOTS: usize = 256;
+/// Most source selections one copy registers with an endpoint session. Every
+/// worker connection carries and holds every root, so setup time, memory and
+/// the receiver's decoding budget grow with roots times workers, and pruning
+/// compares every pair of roots. This many still fit at the
+/// `MAX_WORKER_CONNECTIONS` one receiver serves; about three times as many
+/// exhaust the decoding budget at 32 workers.
+pub(crate) const MAX_SOURCE_ROOTS: usize = 1024;
+/// Roots one session holds: the sources, plus the few directories and
+/// streams it registers besides.
+pub(crate) const DEFAULT_MAX_ROOTS: usize = MAX_SOURCE_ROOTS + 256;
 const DEFAULT_MAX_CONNECTIONS: usize = 256;
 const FD_CONTROL_LEN: usize =
     unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as libc::c_uint) as usize };

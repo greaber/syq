@@ -45,7 +45,7 @@ pub fn install() {
     })();
     match result {
         Ok(InstallOutcome::Installed) => {
-            notice(format!("installed syq {} at ~/.local/bin/syq for use on this server", env!("CARGO_PKG_VERSION")));
+            notice(format!("installed syq {} at ~/.local/bin/syq for use on this server", crate::identity::version()));
             notice("to use it on this server, ensure ~/.local/bin is on your shell PATH");
         }
         Ok(InstallOutcome::Unchanged) => {}

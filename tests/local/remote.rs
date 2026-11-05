@@ -2178,6 +2178,30 @@ fn live_group_members(group: u32) -> Vec<String> {
 }
 
 #[test]
+fn remote_to_remote_refuses_more_sources_than_its_coordinator_command_holds() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    // On the coordinator's command line each 100-byte path takes about 140.
+    let sources: Vec<String> = (0..1024)
+        .map(|i| format!("/{}/{i:04}", "x".repeat(94)))
+        .collect();
+    let out = remote_to_remote_copy(&t, &rsh, &sources).run().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("this copy between two servers names 1024 sources"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("more than the 128 KiB a server accepts"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--srcs-in"), "{stderr}");
+    // Refused before anything ran on either server.
+    assert!(!t.path("rsh.log").exists(), "{stderr}");
+}
+
+#[test]
 fn remote_to_remote_coordinator_stops_when_its_requester_ends() {
     for (signal, mapping) in [
         (libc::SIGINT, false),

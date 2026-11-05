@@ -2016,3 +2016,27 @@ fn a_closed_stdout_stops_a_streaming_command() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert!(output.stderr.is_empty(), "{}", stderr_of(&output));
 }
+
+#[test]
+fn version_reports_the_build_identity() {
+    // A development build must not claim to be the release it was built
+    // from; `--version` and the results stream show what `--build-identity`
+    // does, without its leading `v`.
+    let identity = binary_identity("--build-identity");
+    let version = identity.strip_prefix('v').expect("identity starts with v");
+    assert_eq!(binary_identity("--version"), format!("syq {version}"));
+    assert_eq!(binary_identity("-V"), format!("syq {version}"));
+
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"data");
+    let output = syq_cp_in(
+        &t.path(""),
+        &["src", "--into", "dst", "--results", "run.ndjson", "-q"],
+        None,
+    );
+    assert_output_ok(&output);
+    let content = String::from_utf8(read(&t.path("run.ndjson"))).unwrap();
+    let run: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert_eq!(run["type"], "run");
+    assert_eq!(run["syq_version"], version);
+}

@@ -1948,6 +1948,9 @@ pub fn run(mut args: Args) -> Result<i32> {
     let dry_run = args.dry_run;
     let prune = args.delete;
     let in_place_update = args.in_place_update;
+    // A caller that lends this copy its stream, as a stream mapping does for
+    // its pathname phase, records a fatal failure there itself.
+    let records_failure = args.results_override.is_none();
     let outcome = handoff.and_then(|()| run_transfer(args, Arc::clone(&progress)));
     if let Some(history) = progress.tuning_history.get() {
         history.complete(matches!(&outcome, Ok(0)), serde_json::json!({
@@ -1963,10 +1966,20 @@ pub fn run(mut args: Args) -> Result<i32> {
         // including failures in deferred metadata and deletion finalization.
         progress.stop();
         progress.finish(false);
-        // The error text reaches stderr via main; the stream still gets its
-        // terminal record so a consumer never mistakes a handled fatal for a
-        // crash (only a real crash leaves the terminal record missing).
+        // The error text reaches stderr via main; the stream gets it as a
+        // counted error record, then its terminal record, so a consumer
+        // never mistakes a handled fatal for a crash (only a real crash
+        // leaves the terminal record missing) and can say why it failed.
         if let Some(results) = progress.results_writer() {
+            if let (Err(error), true) = (&outcome, records_failure) {
+                let os_kind = os_kind_of(error);
+                progress.errors.fetch_add(1, Relaxed);
+                results.emit_error_classified(
+                    &format!("syq: {error:#}"),
+                    os_kind.map(|_| "io"),
+                    os_kind,
+                );
+            }
             results.emit_result(&crate::results::ResultRecord {
                 status: "failed",
                 exit_code: 1,
@@ -5196,6 +5209,25 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             );
         }
     }
+    if !args.quiet && !aborted && !opts.dry_run {
+        let earlier = progress
+            .earlier_partials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        if earlier > 0 {
+            progress.eprintln(&earlier_partials_notice(
+                earlier,
+                &dst_ep,
+                args.restricted_grant.is_some(),
+                &if dst_is_dir {
+                    dst_root.clone()
+                } else {
+                    parent_path(&dst_root)
+                },
+            ));
+        }
+    }
     print_timings(&args, &progress);
     print_benchmark_observations(&opts);
     if args.stats && !args.quiet && !aborted {
@@ -5536,7 +5568,8 @@ fn check_operator_directory(
 
 /// With `access`, owned directories the check must enter may briefly gain
 /// search permission; the value says whether the selected directory itself
-/// belongs to the copy.
+/// belongs to the copy. `pruned_sources` is the number of named sources when
+/// the copy prunes.
 fn check_operator_directory_ancestry(
     conn: &mut dyn Conn,
     checks: Vec<DirectoryAncestryCheck>,
@@ -5827,6 +5860,40 @@ fn ancestor_prefixes(path: &[u8]) -> impl Iterator<Item = &[u8]> {
     path.iter()
         .enumerate()
         .filter_map(|(index, byte)| (*byte == b'/').then_some(&path[..index]))
+}
+
+/// Tell the user that partial files an earlier copy left beside `files`
+/// copied files remain, and how to remove them from `directory` at the
+/// destination. A command-restricted receiver does not remove files, so
+/// there the command is only named.
+fn earlier_partials_notice(
+    files: usize,
+    destination: &Endpoint,
+    restricted: bool,
+    directory: &[u8],
+) -> String {
+    let directory = shell_words::quote(&display(directory)).into_owned();
+    let command = match destination {
+        Endpoint::Local { .. } => format!(" with: syq clean-partials {directory}"),
+        Endpoint::Remote(spec) if spec.local_process => {
+            format!(" with: syq clean-partials {directory}")
+        }
+        Endpoint::Remote(spec) if !restricted => {
+            format!(
+                " with: syq clean-partials --on {} {directory}",
+                spec.label()
+            )
+        }
+        Endpoint::Remote(_) => " with syq clean-partials".into(),
+    };
+    let (files, partials, them) = if files == 1 {
+        ("1 file".to_owned(), "a partial file", "it")
+    } else {
+        (format!("{files} files"), "partial files", "them")
+    };
+    format!(
+        "syq: {files} had {partials} from an earlier copy, left in place in case another copy is writing {them}; once none is, remove leftover partials{command}"
+    )
 }
 
 fn parent_path(path: &[u8]) -> PathBytes {

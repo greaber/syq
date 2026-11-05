@@ -332,7 +332,7 @@ pub(crate) fn root() -> Command {
         .override_usage("syq [--version-is EXPR] [--use-version VERSION] <COMMAND> [OPTIONS]\n       syq --self-update")
         .before_help("Examples:\n  syq cp photos --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq map photos --as archive/photos")
         .arg(Arg::new("version").short('V').long("version").action(ArgAction::Version).help("Print version"))
-        .version(env!("CARGO_PKG_VERSION"))
+        .version(crate::identity::version())
         .arg(Arg::new("version_is").long("version-is").value_name("EXPR")
             .help("Require the invoked release to match EXPR (before the command and other options)")
             .long_help("Require the invoked release to match EXPR before running anything or selecting --use-version. Bare x.y.z means exact equality; operators: == != < <= > >=. Commas mean AND; | means OR, with AND binding more tightly. Quote expressions in the shell. Development builds are unsupported. Put --version-is and --use-version before the command and other options, in either order."))
