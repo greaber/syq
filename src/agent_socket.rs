@@ -71,21 +71,28 @@ pub(crate) fn inspect(socket: &Path, timeout: Duration) -> Agent {
     count.map_or(Agent::Unreadable, Agent::Identities)
 }
 
-/// Inside tmux, replace an `SSH_AUTH_SOCK` where nothing answers with the
+/// Inside tmux, replace an `SSH_AUTH_SOCK` whose socket is gone with the
 /// tmux session's value when an agent answers there, for this process and
 /// the programs it starts, as a new shell in that session would have it.
-/// Nothing changes outside tmux, or when the shell's socket answers.
+/// Nothing changes outside tmux, or while the shell's socket exists.
+///
+/// sshd removes a forwarded agent's socket when its login ends, so a stale
+/// socket is one that no longer exists. Checking only that keeps every
+/// command in tmux from connecting to the agent, which for a forwarded agent
+/// opens a channel back to the laptop. A socket that exists where nothing
+/// answers, as after an agent was killed, is reported when a login fails.
 ///
 /// This changes the process environment, so call it before any thread
 /// starts.
 pub(crate) fn repair_from_tmux() {
+    use std::os::unix::fs::FileTypeExt;
     if std::env::var_os("TMUX").is_none() {
         return;
     }
     let Some(current) = std::env::var_os(VARIABLE).filter(|value| !value.is_empty()) else {
         return;
     };
-    if answers(Path::new(&current)) {
+    if std::fs::metadata(&current).is_ok_and(|metadata| metadata.file_type().is_socket()) {
         return;
     }
     let Some(session) = tmux_session_socket() else {
@@ -96,7 +103,7 @@ pub(crate) fn repair_from_tmux() {
     }
     if crate::output::debug() {
         crate::output::diagnostic!(
-            "syq: no SSH agent answers at {}; using tmux's {}",
+            "syq: the SSH agent socket {} is gone; using tmux's {}",
             Path::new(&current).display(),
             session.display()
         );

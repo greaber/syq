@@ -280,10 +280,12 @@ If hostA has no SSH credentials of its own, asking your laptop is simply how
 the copy gets authorized, and syq asks without a warning, as agent forwarding
 would. If hostA has credentials that did not work, such as keys hostB does not
 accept or an `SSH_AUTH_SOCK` where no agent answers, syq still asks your
-laptop, but first prints one line saying what went wrong and how to fix it. Inside tmux, a
-shell keeps the `SSH_AUTH_SOCK` it started with, which stops working after you
-reattach from a new SSH login; syq then uses the tmux session's current one,
-so your agent keeps working for syq.
+laptop, but first prints one line saying what went wrong and how to fix it.
+
+Inside tmux, a shell keeps the `SSH_AUTH_SOCK` it started with, which stops
+working after you reattach from a new SSH login. Syq then uses the tmux
+session's current one, so your agent keeps working for syq; see
+[Environment](environment.md#other-variables).
 
 To choose authorization for every command in a shell or a script, such as one
 a coding agent runs, set `SYQ_AUTH_FROM` to any value `--auth-from` takes, for

@@ -53,11 +53,11 @@ Diagnostic formats can change between versions. For scripts, use
 `TMPDIR`, and `SSH_AUTH_SOCK` also apply.
 
 Inside tmux, a shell keeps the `SSH_AUTH_SOCK` it started with, which stops
-working when you reattach from a new SSH login. When no agent answers at that
-socket, syq asks tmux for the session's current `SSH_AUTH_SOCK` and, if an
-agent answers there, uses it for the programs it starts, such as `ssh`, as a
-new shell in that session would. To fix the shell itself, run
-`eval "$(tmux show-environment -s SSH_AUTH_SOCK)"`.
+working when you reattach from a new SSH login: that login's agent socket is
+gone. When the socket no longer exists, syq asks tmux for the session's
+current `SSH_AUTH_SOCK` and, if an agent answers there, uses it for the
+programs it starts, such as `ssh`, as a new shell in that session would. To
+fix the shell itself, run `eval "$(tmux show-environment -s SSH_AUTH_SOCK)"`.
 
 ## Local state
 
