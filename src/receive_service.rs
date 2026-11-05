@@ -182,7 +182,7 @@ enum Action {
     },
     /// Enable or configure a receiving profile (without --name, use the first profile)
     On(Configure),
-    /// Disable receiving and stop its background connections; keep ordinary persistence
+    /// Turn receiving off and close its connections; other persistent connections stay open
     Off {
         /// Stop only this profile; without --name, stop all profiles
         #[arg(long)]
@@ -222,7 +222,7 @@ enum PermissionAction {
         #[arg(long)]
         json: bool,
     },
-    /// Stop future authentications; already authenticated sessions may continue
+    /// Remove a remembered permission; sessions already logged in can continue
     Remove {
         /// Permission ID shown by persist receive permissions list
         id: String,
@@ -249,22 +249,22 @@ struct Configure {
     /// Create or update this named profile; omitted means the first profile
     #[arg(long)]
     name: Option<String>,
-    /// Default destination directory; absolute paths and .. may select elsewhere
+    /// Starting directory for downloads and commands; absolute paths and .. can still reach elsewhere
     #[arg(short = 'C', long, value_name = "DIR", conflicts_with = "auto_cwd")]
     cwd: Option<PathBuf>,
-    /// Choose cwd from root, auto-approve-root, then HOME
+    /// Choose the starting directory automatically: the --root directory, else --auto-approve-root, else your home directory
     #[arg(long)]
     auto_cwd: bool,
-    /// Confinement boundary for every download, even with approval
+    /// Allow downloads only inside DIR, even approved ones
     #[arg(long, value_name = "DIR", conflicts_with = "no_root")]
     root: Option<PathBuf>,
-    /// Remove the hard download boundary
+    /// Remove the --root restriction
     #[arg(long)]
     no_root: bool,
     /// Maximum bytes one transfer may write (default: 100G)
     #[arg(long, value_name = "SIZE")]
     max_bytes: Option<String>,
-    /// Maximum entries one transfer may touch (default: 1000000)
+    /// Maximum entries one transfer may change (default: 1000000)
     #[arg(long, value_name = "N")]
     max_entries: Option<u64>,
     /// Permit pruning up to N entries per transfer (default: 0)

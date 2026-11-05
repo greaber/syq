@@ -26,8 +26,8 @@ syq exec [OPTIONS] --on <@NAME> -- <PROGRAM>...
 
 | Argument / option | Meaning |
 |---|---|
-| `--on <@NAME>` | Receiving name; requires a live return connection (never falls back to SSH) |
-| `-C, --cwd <DIR>` | Working directory on that machine, relative to its receiving directory<br><br>[default: .] |
+| `--on <@NAME>` | Receiving name of the machine to run on; it must be connected to this server now, and syq never uses SSH instead |
+| `-C, --cwd <DIR>` | Working directory on that machine, relative to its receiving profile's starting directory<br><br>[default: .] |
 
 ## Help and version
 

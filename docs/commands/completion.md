@@ -10,9 +10,9 @@ syq completion <COMMAND>
 
 | Command | Purpose |
 |---|---|
-| [`completion bash`](#syq-completion-bash) | Print the Bash completion adapter |
-| [`completion zsh`](#syq-completion-zsh) | Print the Zsh completion adapter |
-| [`completion fish`](#syq-completion-fish) | Print the fish completion adapter |
+| [`completion bash`](#syq-completion-bash) | Print the Bash completion script |
+| [`completion zsh`](#syq-completion-zsh) | Print the Zsh completion script |
+| [`completion fish`](#syq-completion-fish) | Print the fish completion script |
 | [`completion cache`](#syq-completion-cache) | Inspect or clear cached endpoint suggestions |
 
 **Help (also available on subcommands)**
@@ -61,7 +61,7 @@ syq completion cache <COMMAND>
 | Command | Purpose |
 |---|---|
 | [`completion cache list`](#syq-completion-cache-list) | List learned endpoint suggestions, most recently used first |
-| [`completion cache forget`](#syq-completion-cache-forget) | Forget one exact native endpoint spelling |
+| [`completion cache forget`](#syq-completion-cache-forget) | Forget one SSH endpoint, spelled exactly as listed |
 | [`completion cache clear`](#syq-completion-cache-clear) | Remove all learned endpoint suggestions |
 
 <!-- /CLI -->

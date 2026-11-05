@@ -6,7 +6,7 @@ use std::str::FromStr;
 pub(crate) const RESOURCE_HELP: &str = "Set ceilings with comma-separated KEY=VALUE pairs; syq still tunes automatically below them. Keys:\n\nbandwidth=RATE: total transfer rate; plain numbers are KiB/s, K/M/G use powers of 1024, and 0 means no limit. SSH and TCP copies count compressed bytes.\nworkers=N: filesystem copy workers, 1..65536.\ns3-requests=N: simultaneous S3 data requests, 1..65536.\ns3-objects=N: S3 objects in progress, 1..65536.\ns3-parts-per-object=N: simultaneous parts or ranges per S3 object, 1..1024.\n\nA count cannot also be fixed with --performance-tuning. Limits are not saved.";
 /// rsync copies never use S3.
 pub(crate) const RSYNC_RESOURCE_HELP: &str = "Set ceilings with comma-separated KEY=VALUE pairs; syq still tunes automatically below them. Keys:\n\nbandwidth=RATE: total transfer rate; plain numbers are KiB/s, K/M/G use powers of 1024, and 0 means no limit. SSH and TCP copies count compressed bytes.\nworkers=N: filesystem copy workers, 1..65536.\n\nA count cannot also be fixed with --performance-tuning. Limits are not saved.";
-pub(crate) const INTEGRITY_HELP: &str = "Add a payload check with transfer=blake3, sha256, md5, or xxh3-128 (default transfer=off). To check a complete result, use expected_hash in a mapping.";
+pub(crate) const INTEGRITY_HELP: &str = "Check data as it is copied, using transfer=blake3, sha256, md5, or xxh3-128 (default transfer=off). To check whole finished files, use expected_hash in a mapping.";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ResourceLimits {

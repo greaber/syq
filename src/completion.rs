@@ -44,11 +44,11 @@ struct CompletionCommand {
 
 #[derive(Subcommand, Debug)]
 enum CompletionAction {
-    /// Print the Bash completion adapter
+    /// Print the Bash completion script
     Bash,
-    /// Print the Zsh completion adapter
+    /// Print the Zsh completion script
     Zsh,
-    /// Print the fish completion adapter
+    /// Print the fish completion script
     Fish,
     /// Inspect or clear disposable local endpoint suggestions
     Cache {
@@ -81,7 +81,7 @@ enum CompletionAction {
 enum CacheAction {
     /// List learned endpoint suggestions, most recently used first
     List,
-    /// Forget one exact native endpoint spelling
+    /// Forget one SSH endpoint, spelled exactly as listed
     Forget {
         /// Endpoint to forget: [USER@]HOST[:PORT], e.g. alice@nas:2222
         endpoint: String,

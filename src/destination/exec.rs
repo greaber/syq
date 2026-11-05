@@ -11,13 +11,13 @@ const MAX_ARG_BYTES: usize = 16 * 1024;
 #[derive(Parser)]
 #[command(
     name = "syq exec",
-    about = "Run a command on a named receiving machine after local approval"
+    about = "From a server, run a command on a receiving machine, such as your laptop, after it approves"
 )]
 struct ExecCommand {
-    /// Receiving name; requires a live return connection (never falls back to SSH)
+    /// Receiving name of the machine to run on; it must be connected to this server now, and syq never uses SSH instead
     #[arg(long, value_name = "@NAME")]
     on: String,
-    /// Working directory on that machine, relative to its receiving directory
+    /// Working directory on that machine, relative to its receiving profile's starting directory
     #[arg(long, short = 'C', default_value = ".", value_name = "DIR")]
     cwd: OsString,
     /// Program and literal arguments; use sh -c explicitly for shell syntax
