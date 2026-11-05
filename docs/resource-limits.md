@@ -8,70 +8,37 @@ Supply comma-separated `KEY=VALUE` pairs:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `bandwidth` | `0` (unlimited) | Aggregate byte rate across the copy's workers; accounting depends on the transport |
+| `bandwidth` | `0` (unlimited) | Aggregate byte rate across the copy's workers; what is counted depends on the route |
 | `workers` | Automatic | Ceiling of 1–65536 filesystem copy-worker slots |
 | `s3-requests` | Automatic | Ceiling of 1–65536 simultaneous S3 data requests across objects; excludes metadata requests and idle sockets |
 | `s3-objects` | Automatic | Ceiling of 1–65536 S3 objects in progress, including preparation and finalization |
 | `s3-parts-per-object` | Automatic | Ceiling of 1–1024 simultaneous parts or ranges per S3 object |
 
+Limits also apply when a server coordinates the copy, and are not saved.
+
+<a id="where-the-limit-applies"></a>
+
+## Bandwidth
+
 ```sh
 syq cp data --to server --into backup --resource-limits bandwidth=10M
 ```
 
-For ordinary SSH and TCP copies, this limits outgoing bytes to 10 MiB/s
-across all workers, including when workers use both transports. It counts
-compressed bytes, so compressible files can copy at a higher logical rate.
-The count includes syq's framing and, for TCP, its encryption records; for
-SSH it covers the bytes passed to OpenSSH, not OpenSSH's own encryption
-overhead. Connection setup, separate control traffic, and IP/TCP headers are
-not counted, but file data that a small copy sends over its control connection
-is. Small bursts remain possible because the operating system buffers network
-writes.
+For ordinary SSH and TCP copies, this limits the bytes syq sends to 10 MiB/s
+across all workers. It counts compressed bytes, so compressible files can copy
+at a higher rate. A relay between two servers applies the rate to each leg
+separately. Local, S3 and descriptor copies, and copies a receiving machine
+approves, count file data before compression.
 
-Remote-to-remote relays apply the rate to each network leg separately: a
-10 MiB/s cap permits up to 10 MiB/s inbound and 10 MiB/s outbound at the relay. Local,
-S3 and descriptor copies, and copies a receiving machine approves, count
-logical file-data bytes before compression.
+Short bursts remain possible because of buffering. Where the limit counts file
+data, [`bw-pacing`](tuning.md#transfer-controls) chooses how
+requests are spaced. Uploads to S3 can burst by up to one part, and copies
+between buckets are not paced, since their data does not pass through this
+machine. A capped local copy uses normal copying instead of filesystem
+cloning.
 
-## Concurrency ceilings
-
-```sh
-syq cp data --to server --into backup --resource-limits workers=4,bandwidth=10M
-```
-
-Syq can adjust the filesystem copy-worker count up to four. By contrast,
-`--performance-tuning workers=4` fixes four worker slots and may start fewer
-workers when there is less work. Unused slots can remain idle in either case.
-Worker counts do not include directory scanning, metadata processing, or
-control connections, and do not cap total threads, sockets, CPU use, or
-memory.
-
-Each concurrency key conflicts with the same key in `--performance-tuning`,
-even when the values match. Controls for different quantities can combine:
-for example, a fixed request size with a worker ceiling. Unknown keys,
-duplicate keys, zero counts, and out-of-range values are rejected.
-
-A ceiling does not force syq to use that many slots. Syq adjusts the count of
-filesystem copy workers from measured throughput, up to 256: the receiving
-side serves all of a copy's workers in one process, which takes at most 256
-worker connections at once. Automatic filesystem copies also limit workers
-using the endpoints' available open-file budgets and reduce concurrency when
-worker setup exhausts local resources. Syq reports these reductions; raising an endpoint's operating-system
-limit can allow more concurrency. Fixed worker settings still report failures
-when their requested resources are unavailable.
-
-Copies can also continue with less parallel work when threads or file handles
-are scarce; persistent failures remain errors. Syq does not reserve memory or
-disk space, or guarantee success under every resource limit.
-
-[Restricted receiver limits](remote-reference.md#limits-and-unsupported-options)
-still apply. S3 ceilings constrain the route's normal automatic range without
-raising it. They are nested: object and per-object part counts also share the
-aggregate request ceiling. A fixed setting for one count still operates within
-ceilings on the other counts.
-
-Use `workers` only for filesystem copies and the S3 keys only for S3 copies.
-Limits also apply when a server coordinates the copy, and are not saved.
+In `syq rsync`, `--bwlimit RATE` selects the same rate limit. Do not combine it
+with `--resource-limits bandwidth=RATE`.
 
 ## Bandwidth units
 
@@ -84,27 +51,27 @@ Rates accept decimals and case-insensitive suffixes:
 | `KB`, `MB`, `GB`, `TB`, `PB` | Successive powers of 1,000 bytes per second |
 | `B` | Bytes per second |
 
-A final `+1` or `-1` adjusts the scaled value by one byte before rounding.
-Rates are rounded to the nearest KiB/s. Zero disables the cap; nonzero values
-below 512 bytes/s are rejected. For example, `1024` and `1M` both select 1 MiB/s.
+For example, `1024` and `1M` both select 1 MiB/s. Rates are rounded to the
+nearest KiB/s. Zero disables the cap; nonzero values below 512 bytes/s are
+rejected.
 
-## Where the limit applies
+## Concurrency ceilings
 
-For filesystem copies, workers share one aggregate limit. Buffering and
-streaming can still produce short bursts. Where the limit counts file data
-rather than transport bytes,
-[`bw-pacing`](tuning.md#average-rate-and-burst-patterns) chooses how requests
-are spaced. A capped copy uses normal copying instead of local filesystem
-cloning.
+```sh
+syq cp data --to server --into backup --resource-limits workers=4,bandwidth=10M
+```
 
-For copies between local files and S3, the limit applies as data is scheduled
-for transfer, so uploads can burst by up to one part. Server-side S3 copies do
-not pass object bodies through this machine and are not paced by this setting.
+Syq can adjust the filesystem copy-worker count up to four. By contrast,
+`--performance-tuning workers=4` fixes four worker slots. Worker counts do not
+include directory scanning or control connections, and do not cap total
+threads, sockets, CPU use, or memory. Syq uses fewer workers, and says so,
+when an endpoint's open-file limit or other resources run short; raising that
+limit can allow more.
 
-A worker ceiling also limits the starting connection count. Measurements from
-a copy with a ceiling still inform later starting counts, but the ceiling alone
-does not lower a [remembered count](tuning.md#remembered-connection-counts).
-Copies with a bandwidth limit remember counts separately for each rate.
-
-In `syq rsync`, `--bwlimit RATE` selects the same rate limit. Do not combine it
-with `--resource-limits bandwidth=RATE`.
+Use `workers` only for filesystem copies and the S3 keys only for S3 copies.
+S3 ceilings are nested: object and per-object part counts also share the
+request ceiling. Each concurrency key conflicts with the same key in
+`--performance-tuning`, even when the values match, but controls for different
+quantities can combine. Unknown keys, duplicate keys, zero counts, and
+out-of-range values are rejected. [Restricted receiver limits](remote-reference.md#limits-and-unsupported-options)
+still apply.

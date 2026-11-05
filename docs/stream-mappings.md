@@ -1,7 +1,7 @@
 # Stream-mapping protocol
 
 A program can supply or consume several byte streams in one `syq cp` process.
-Entries share transfer connections and resource limits. This is the subprocess
+This is the subprocess
 interface used by [Python callback mappings](https://greaber.github.io/syq/python-streams.html#callback-mappings).
 Ordinary shell pipelines use [`--src-fd` or `--as-fd`](commands/cp.md#file-descriptors).
 
@@ -36,12 +36,10 @@ exact byte count; a mismatch fails the entry before publication. `kind` can be
 omitted or `file`. `expected_hash` checks the transferred bytes. Explicit
 `metadata` applies to a named destination without requiring `--copy-metadata`.
 
-Syq reads and validates the whole manifest before copying. This catches malformed
-entries, duplicate destinations, and conflicts with declared file kinds. As with
-pathname mappings, actual source kinds are checked during execution. Ordinary
-pathname entries run first, followed by stream entries; mixed batches therefore
-have a separate endpoint setup for each phase. Already successful entries are
-not rolled back when another entry fails.
+Syq validates the whole manifest before copying, rejecting malformed entries,
+duplicate destinations, and conflicting declared kinds. Pathname entries run
+before stream entries. Successful entries are not rolled back when another
+entry fails.
 
 ## Control framing and version
 
@@ -115,17 +113,12 @@ may terminate before all entries have results. Application-level failures must
 also fail the caller even if it has already consumed a terminal record.
 
 Placement, preview, existence policies, compression, reporting, transfer tuning,
-and resource limits apply. Stream entries share limits across endpoint sessions;
-`--stream-concurrency` limits active entries separately from network workers.
+and resource limits apply. `--stream-concurrency` limits active entries
+separately from network workers.
 
-Streams run on the invoking machine, so these entries cannot use a remote
-coordinator or `--detach`: those could not inherit the caller's live stream.
-They also cannot copy to or from a [receiving machine](receive.md) (`@NAME`),
-whose approvals cover pathnames. `--in-place` is unavailable because syq
-publishes an entry only after its producer succeeds. Pruning and tree
-filters require a source tree; select entries in the calling program. Source
-metadata policies require actual source attributes; generated streams have none.
-Content comparison and size filters are unavailable in a stream-mapping batch;
-use a known expected hash or select promised sizes in the caller. These
-restrictions also apply to pathname entries in a mixed batch; use separate calls
-when their options differ.
+Stream entries cannot use a remote coordinator, `--detach`, a [receiving
+machine](receive.md) (`@NAME`), `--in-place`, pruning, tree filters, source
+metadata policies, content comparison, or size filters. Use a known expected
+hash instead of content comparison, and select entries and sizes in the calling
+program. These restrictions also apply to pathname entries in a mixed batch;
+use separate calls when their options differ.
