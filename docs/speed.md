@@ -102,7 +102,11 @@ A second copy into the same destination may just measure skipping existing files
 
 SSH authenticates remote copies. When reachable, encrypted TCP carries file
 data on a port in `47600–47699`; otherwise copies use SSH on the same route.
-See [Make TCP reachable](server-tuning.md#make-tcp-reachable) for firewall settings.
+Before opening data connections, syq checks that TCP gets through, waiting a
+few times the round trip it measured over SSH and never more than a second.
+When TCP does not get through, the copy says so in one line. If TCP never works with a server,
+`--no-tcp` skips the check. See
+[Make TCP reachable](server-tuning.md#make-tcp-reachable) for firewall settings.
 To [Run the copy from a server](remote-to-remote.md#run-the-copy-from-a-server)
 with your laptop’s approval, direct encrypted TCP must be reachable.
 

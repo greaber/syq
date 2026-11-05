@@ -1318,6 +1318,77 @@ fn ordinary_tcp_setup_failure_still_falls_back_with_congestion_notice() {
     );
 }
 
+/// When no advertised data address accepts a TCP connection, the copy says
+/// once, plainly, that file data goes over SSH and how to skip trying TCP.
+#[test]
+fn unreachable_tcp_falls_back_to_ssh_and_says_so_once() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    // Large enough for data workers, which small copies do without.
+    let data: Vec<u8> = (0..8 << 20).map(|offset| (offset % 251) as u8).collect();
+    write(&t.path("src"), &data);
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&rsh)
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args(["--tcp-ports", EPHEMERAL_TCP_PORTS])
+        .args(["--performance-tuning", "workers=2"])
+        .arg(t.path("src"))
+        .args(["--to", "diagnostic.invalid", "--as"])
+        .arg(t.path("dst"))
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        // The receiver advertises only this documentation address, and the
+        // name it was reached by does not resolve.
+        .env("FAKE_SSH_CONNECTION", "192.0.2.2 40000 192.0.2.1 22")
+        .env("SYQ_TEST_NO_INTERFACE_ADDRESSES", "1")
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .run()
+        .expect("run syq with no reachable TCP data address");
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), data);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let notices: Vec<_> = stderr
+        .lines()
+        .filter(|line| line.contains("over SSH instead"))
+        .collect();
+    assert_eq!(notices.len(), 1, "{stderr}");
+    assert!(
+        notices[0].starts_with("syq: diagnostic.invalid: ")
+            && notices[0].contains(
+                "sending file data over SSH instead, which can be slower. If TCP never works with this host, --no-tcp skips"
+            ),
+        "{stderr}"
+    );
+
+    // -q keeps it quiet.
+    let quiet = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "-q", "--rsh"])
+        .arg(&rsh)
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args(["--tcp-ports", EPHEMERAL_TCP_PORTS])
+        .arg(t.path("src"))
+        .args(["--to", "diagnostic.invalid", "--as"])
+        .arg(t.path("dst-quiet"))
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("FAKE_SSH_CONNECTION", "192.0.2.2 40000 192.0.2.1 22")
+        .env("SYQ_TEST_NO_INTERFACE_ADDRESSES", "1")
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .run()
+        .expect("run quiet syq with no reachable TCP data address");
+    assert_output_ok(&quiet);
+    assert_eq!(read(&t.path("dst-quiet")), data);
+    assert!(
+        !String::from_utf8_lossy(&quiet.stderr).contains("over SSH"),
+        "{}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn dropped_write_connection_is_reopened_and_uncertain_range_is_retried() {

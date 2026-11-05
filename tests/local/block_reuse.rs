@@ -614,7 +614,7 @@ fn a_file_of_which_more_differs_than_a_patch_carries_streams_its_patch() {
         let sent = (32 << 20) + (64 << 10);
         assert_eq!(stats_bytes(&out, "bytes transferred"), sent, "{route}");
         assert_eq!(
-            stats_bytes(&out, "bytes unchanged"),
+            stats_bytes(&out, "bytes unchanged or reused"),
             (64 << 20) - sent,
             "{route}"
         );
