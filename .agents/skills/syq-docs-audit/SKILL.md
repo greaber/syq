@@ -15,16 +15,25 @@ inspect documentation changes since the previous release and read their
 surrounding sections. Reuse an audit recorded for the same content; review
 subsequent changes rather than repeating it mechanically.
 
-For each section, identify what the reader is trying to do. Keep instructions,
-examples, meaningful tradeoffs, and limitations they need to choose or use the
-feature. Put detailed option interactions and machine-output contracts in the
-owning reference; link security consequences to the relevant security section.
-Delete algorithm narration, patch histories, defensive explanations of ordinary
-behavior, repeated material, and unsupported tuning advice. Moving every excess
-paragraph into reference is not a substitute for editing it. Shorten by removing
-unnecessary ideas, not by stripping sentences into terse fragments. Read the
-result as connected prose: explain how an instruction relates to the reader's
-task instead of stacking isolated facts or command names.
+For each section, identify what the reader is trying to do. Guides stay lean
+and do not overexplain: keep the instructions, examples, meaningful tradeoffs,
+and limitations readers need to choose or use the feature, and link to the
+reference for the rest. Reference pages describe semantics: what an option
+does and how options interact, observable behavior and its conditions,
+contracts such as machine output, limits a user will hit, and consequences;
+they may be long. Link
+security consequences to the relevant security section. No page, reference
+included, explains how syq implements a behavior (algorithms, internal
+ordering, batching, buffer sizes, scheduling), why it was designed that way,
+or the performance trade-offs of internal choices; readers who want that can
+read the code. Keep a performance fact only when it changes what a user should
+choose, stated as a consequence. Also delete patch histories, defensive
+explanations of ordinary behavior, repeated material, and unsupported tuning
+advice. Moving every excess paragraph into reference is not a substitute for
+editing it, and only semantics belong there. Shorten by removing unnecessary
+ideas, not by stripping sentences into terse fragments. Read the result as
+connected prose: explain how an instruction relates to the reader's task
+instead of stacking isolated facts or command names.
 
 Revise the existing explanation when a feature changes. Do not turn each bug fix
 or edge case into another paragraph. Prefer a brief introduction with a link over
