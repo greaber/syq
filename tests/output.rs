@@ -355,3 +355,42 @@ fn a_copy_stopped_by_an_error_ends_with_the_failure_after_its_progress() {
         assert_eq!(record["errors"], 1, "{result}");
     }
 }
+
+#[test]
+fn a_copy_refused_before_it_starts_shows_only_the_error() {
+    let directory = crate::test_support::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    fs::create_dir(root.join("real")).unwrap();
+    std::os::unix::fs::symlink("real", root.join("link")).unwrap();
+    for (source, error) in [
+        ("link", "syq: source link is a symlink; "),
+        (
+            "missing",
+            "syq: register source roots: resolve source selection missing",
+        ),
+    ] {
+        let results = format!("{source}.json");
+        let output = command(&root)
+            .args([
+                "cp",
+                source,
+                "--into",
+                "out",
+                "--progress",
+                "--results",
+                &results,
+            ])
+            .spawn_guarded()
+            .and_then(|child| child.wait_with_output())
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{source}: {output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        // No progress frame with zero counts stands between the user and the error.
+        assert!(stderr.starts_with(error), "{source}: {stderr:?}");
+        assert_eq!(stderr.lines().count(), 1, "{source}: {stderr:?}");
+        assert!(!stderr.contains('%'), "{source}: {stderr:?}");
+        let record = terminal(&root.join(&results));
+        assert_eq!(record["status"], "failed", "{source}");
+        assert!(!root.join("out").exists(), "{source}");
+    }
+}
