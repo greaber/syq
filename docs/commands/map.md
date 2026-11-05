@@ -73,7 +73,7 @@ syq map [OPTIONS] --srcs-in DIR
 
 | Argument / option | Meaning |
 |---|---|
-| `--as <PATH>` | Emit the single selected root at PATH, relative to the future destination container; PATH may be nested |
+| `--as <PATH>` | Emit the selected object at PATH, relative to the directory it is later copied into; PATH may be nested |
 
 ## Help and version
 

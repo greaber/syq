@@ -131,8 +131,7 @@ saved authorization choices; see
 [persistence in scripts](https://greaber.github.io/syq/persistence-reference.html#isolated-script-scopes).
 
 Typed SSH-to-SSH copies use an enrolled receiver, approved account access to
-both endpoints, or `coordinate_at="local"`. Selecting an authorization provider
-requests account connections when needed. Use `run` for detached commands and
+both endpoints, or `coordinate_at="local"`. Use `run` for detached commands and
 human output options.
 
 `IgnoreFrom(path)` is a frozen dataclass holding a rule-file path (`str`,

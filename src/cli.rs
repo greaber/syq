@@ -93,7 +93,7 @@ pub enum SourceSelection {
 pub enum IfExists {
     /// Reject detected content differences; trusts matching size and mtime unless --hash is set.
     ErrorIfDifferent,
-    /// Report an error for every existing destination leaf.
+    /// Report an error for every existing destination file.
     Error,
     /// Leave existing entries and their metadata alone.
     Keep,
@@ -109,7 +109,7 @@ pub enum IfExists {
 pub enum InPlace {
     /// Only files the copy creates; an existing file is still replaced through a staging file
     New,
-    /// Also existing files that syq can safely update where they are, writing only what changed; others are replaced. Anyone who has such a file open can read its new contents, and an interruption leaves it partly updated
+    /// Also existing files that syq can update where they are, writing only what changed; others are replaced. Anyone who has such a file open can read its new contents, and an interruption leaves it partly updated
     Update,
 }
 
@@ -1518,7 +1518,7 @@ struct NativeRemoteArgs {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum NativeCopyMetadata {
-    /// Match source modification times, including on unchanged files
+    /// Match source modification times
     #[value(alias = "times")]
     Mtime,
     /// Preserve permission bits
@@ -1537,25 +1537,25 @@ enum NativeCopyMetadata {
     Atimes,
     /// Preserve birth times; requires a macOS destination
     Crtimes,
-    /// Match Content-Type on S3-to-S3 copies
+    /// Content-Type (S3-to-S3 only)
     ContentType,
-    /// Match Content-Encoding on S3-to-S3 copies
+    /// Content-Encoding (S3-to-S3 only)
     ContentEncoding,
-    /// Match Content-Language on S3-to-S3 copies
+    /// Content-Language (S3-to-S3 only)
     ContentLanguage,
-    /// Match Content-Disposition on S3-to-S3 copies
+    /// Content-Disposition (S3-to-S3 only)
     ContentDisposition,
-    /// Match Cache-Control on S3-to-S3 copies
+    /// Cache-Control (S3-to-S3 only)
     CacheControl,
-    /// Match Expires on S3-to-S3 copies
+    /// Expires (S3-to-S3 only)
     Expires,
-    /// Match the website redirect on S3-to-S3 copies
+    /// Website redirect (S3-to-S3 only)
     WebsiteRedirect,
-    /// Match application user metadata on S3-to-S3 copies (excluding syq-* keys)
+    /// User metadata, except syq-* keys (S3-to-S3 only)
     UserMetadata,
-    /// Match the complete tag set on S3-to-S3 copies
+    /// The complete tag set (S3-to-S3 only)
     Tags,
-    /// Use the source storage class on S3-to-S3 copies
+    /// Storage class (S3-to-S3 only)
     StorageClass,
 }
 
@@ -1750,7 +1750,7 @@ struct NativeMapCommand {
     s3: crate::s3::Flags,
     #[command(flatten)]
     source: NativeSourceArgs,
-    /// Emit the single selected root at PATH, relative to the future destination container; PATH may be nested
+    /// Emit the selected object at PATH, relative to the directory it is later copied into; PATH may be nested
     #[arg(long, value_name = "PATH")]
     r#as: Option<OsString>,
 }

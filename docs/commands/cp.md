@@ -63,9 +63,9 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 
 | Argument / option | Meaning |
 |---|---|
-| `--if-exists <POLICY>` | How to handle existing destination files<br><br>Possible values:<br>- error-if-different: Reject detected content differences; trusts matching size and mtime unless --hash is set<br>- error: Report an error for every existing destination leaf<br>- keep: Leave existing entries and their metadata alone<br>- update: Update contents when they differ and apply requested metadata<br>- update-if-older: Keep newer destinations; otherwise update differing contents<br><br>[default: update] |
+| `--if-exists <POLICY>` | How to handle existing destination files<br><br>Possible values:<br>- error-if-different: Reject detected content differences; trusts matching size and mtime unless --hash is set<br>- error: Report an error for every existing destination file<br>- keep: Leave existing entries and their metadata alone<br>- update: Update contents when they differ and apply requested metadata<br>- update-if-older: Keep newer destinations; otherwise update differing contents<br><br>[default: update] |
 | `--copy-if <EXPR>` | Update only entries satisfying a source/destination expression |
-| `--in-place <MODE>` | Write files directly at their final names, with no staging file; interruption can leave them incomplete<br><br>Possible values:<br>- new: Only files the copy creates; an existing file is still replaced through a staging file<br>- update: Also existing files that syq can safely update where they are, writing only what changed; others are replaced. Anyone who has such a file open can read its new contents, and an interruption leaves it partly updated |
+| `--in-place <MODE>` | Write files directly at their final names, with no staging file; interruption can leave them incomplete<br><br>Possible values:<br>- new: Only files the copy creates; an existing file is still replaced through a staging file<br>- update: Also existing files that syq can update where they are, writing only what changed; others are replaced. Anyone who has such a file open can read its new contents, and an interruption leaves it partly updated |
 | `--prune` | After copying, remove destination entries the source does not have, within the copied directories; ignored paths are kept |
 | `--prune-before` | Like --prune, but remove the extra entries before copying to free space; a later copy failure does not restore them |
 | `--max-delete <N>` | With --prune or --prune-before, refuse all removals if more than N are planned |
@@ -77,7 +77,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--follow` | Follow symlinks in all directly supplied filesystem paths |
 | `--follow-src` | Follow symlinks in directly supplied source paths |
 | `--follow-dst` | Follow symlinks in directly supplied destination paths |
-| `--copy-metadata <FEATURE>` | Match selected source metadata, including on unchanged files (repeatable/comma-separated)<br><br>Possible values:<br>- mtime: Match source modification times, including on unchanged files<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files<br>- hardlinks: Preserve hard links between selected regular files<br>- acls: Preserve native Linux or macOS ACLs and permission bits<br>- xattrs: Preserve Linux or macOS extended attributes<br>- atimes: Preserve access times captured before reading<br>- crtimes: Preserve birth times; requires a macOS destination<br>- content-type: Match Content-Type on S3-to-S3 copies<br>- content-encoding: Match Content-Encoding on S3-to-S3 copies<br>- content-language: Match Content-Language on S3-to-S3 copies<br>- content-disposition: Match Content-Disposition on S3-to-S3 copies<br>- cache-control: Match Cache-Control on S3-to-S3 copies<br>- expires: Match Expires on S3-to-S3 copies<br>- website-redirect: Match the website redirect on S3-to-S3 copies<br>- user-metadata: Match application user metadata on S3-to-S3 copies (excluding syq-* keys)<br>- tags: Match the complete tag set on S3-to-S3 copies<br>- storage-class: Use the source storage class on S3-to-S3 copies |
+| `--copy-metadata <FEATURE>` | Match selected source metadata, including on unchanged files (repeatable/comma-separated)<br><br>Possible values:<br>- mtime: Match source modification times<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files<br>- hardlinks: Preserve hard links between selected regular files<br>- acls: Preserve native Linux or macOS ACLs and permission bits<br>- xattrs: Preserve Linux or macOS extended attributes<br>- atimes: Preserve access times captured before reading<br>- crtimes: Preserve birth times; requires a macOS destination<br>- content-type: Content-Type (S3-to-S3 only)<br>- content-encoding: Content-Encoding (S3-to-S3 only)<br>- content-language: Content-Language (S3-to-S3 only)<br>- content-disposition: Content-Disposition (S3-to-S3 only)<br>- cache-control: Cache-Control (S3-to-S3 only)<br>- expires: Expires (S3-to-S3 only)<br>- website-redirect: Website redirect (S3-to-S3 only)<br>- user-metadata: User metadata, except syq-* keys (S3-to-S3 only)<br>- tags: The complete tag set (S3-to-S3 only)<br>- storage-class: Storage class (S3-to-S3 only) |
 | `--widen-dirs <MODE>` | Which directories you own may briefly get the owner permission the copy needs; each is restored afterwards<br><br>Possible values:<br>- none: Never change directory permissions<br>- rsync: Directories the copy includes, as rsync does, but not the directory it copies into<br>- all: Also the directory the copy goes into and the directories above it<br><br>[default: none] |
 | `--open-noatime` | Request reads without access-time updates; warn and continue if unavailable |
 | `--sparse` | Turn written zero ranges into sparse holes |
@@ -216,7 +216,9 @@ retrying.
 ## Metadata details
 
 Without `--copy-metadata=permissions`, setuid, setgid, and sticky bits are not
-copied. Ownership is copied as numeric user and group IDs.
+copied. Ownership is copied as numeric user and group IDs. On macOS,
+`--widen-dirs` can widen an existing destination directory only if it is
+readable.
 
 ## File descriptors
 
