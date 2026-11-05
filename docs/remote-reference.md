@@ -7,15 +7,12 @@ source) and hostB (the destination). To set one up, start with
 
 ## SSH configurations
 
-Your laptop's SSH configuration decides how to reach hostB. HostA then connects
-with its own SSH configuration, looked up under the address your laptop's
-configuration gives hostB rather than the name you typed, and checks hostB's
-host key as described in
+To change how hostA connects to hostB, for example to require a known host
+key, edit hostA's SSH configuration for the address hostA is given. Your
+laptop's SSH configuration decides hostB's login, address, and port, and hostA
+looks up its own configuration under that address, not the name you typed.
+HostA checks hostB's host key as described in
 [how hostA checks hostB's key](security.md#how-hosta-checks-hostbs-key).
-
-`--peer-auth broker` needs your laptop to trust both servers through plain
-host keys in known_hosts. It does not work with host certificates alone,
-`KnownHostsCommand`, or `RevokedHostKeys`.
 
 ## Enrollment
 
@@ -34,11 +31,12 @@ It also installs syq under `~/.local/lib/syq` and keeps state in
 `~/.local/state/syq/enrollments/ID`. Manage both with `syq receiver` commands
 rather than deleting files.
 
-Copies cannot write the account's `~/.ssh` or syq's own programs and state,
-such as `~/.local/lib/syq`, `~/.local/libexec`, `~/.config/syq`, and
-enrollment and receiving state. A copy that fills, prunes, or replaces a
-directory holding one of these, such as your home directory, is refused; copy
-into a subdirectory instead, or copy named files or directories into it.
+Copies cannot write the account's `~/.ssh` or syq's own programs and state, such
+as `~/.local/lib/syq`, `~/.local/libexec`, `~/.config/syq`, and enrollment and
+receiving state. A copy that puts a directory's contents into, prunes, or
+replaces a directory holding one of these, such as your home directory, is
+refused; copy into a subdirectory instead, or copy named files or directories
+into it.
 
 ### Which key signs
 
@@ -62,15 +60,19 @@ copies.
 
 ### Changing keys and updating syq
 
-If you start logging in with a different key, the next copy logs in again and
-trusts the new key; `syq receiver list` shows the key each enrollment trusts.
+When the key syq recorded can no longer sign, for example because you removed
+it from your agent after switching keys, the next copy logs in again and
+trusts your current key. While the old key can still sign, syq keeps using it;
+run `syq receiver enroll HOST` to switch to your current login key now.
+`syq receiver list` shows the key each enrollment trusts.
 After you change syq builds, the next copy logs in once to update the
 receiver.
 
 Only `syq receiver revoke ID`, or deleting syq's line from `authorized_keys`,
 ends an enrollment. Removing or revoking your login key, certificate, or
 certificate authority on the server does not stop copies your key signs, and
-neither do options such as `from=` or `expiry-time=` on your key's line.
+neither do options such as `from=` or `expiry-time=` on your key's line, or a
+certificate's critical options, such as `source-address`.
 
 ## Limits and unsupported options
 
@@ -79,12 +81,14 @@ file data by default; change these for one copy with
 `--receiver-max-entries N` and `--receiver-max-bytes SIZE`. Entries are the
 changes hostB makes: files written, directories, links and special files
 created, metadata changes, and deletions. The copy must start within 24 hours
-of authorization and finish within seven days.
+of authorization and finish within seven days of it.
 
 Restricted copies cannot use `--no-tcp-encryption`, `--detach`, or
 `--performance-tuning workers=N` above 128, and `syq rm` cannot go through the
-receiver; use a normal SSH login for those. With `--into`, `--follow-dst` follows a destination symlink only to a
-directory inside the destination's parent directory, and `--widen-dirs all`
+receiver; use a normal SSH login for those.
+
+With `--into`, `--follow-dst` follows a destination symlink only to a
+directory inside the destination's parent directory. `--widen-dirs all`
 widens nothing above that parent.
 
 <a id="signed-results"></a>
@@ -112,9 +116,11 @@ mode. Each gives the server running the copy (hostA unless you set
 | `--peer-auth full-agent` | Your whole SSH agent, as with `ssh -A` |
 | `--rsh COMMAND` | Whatever your supplied SSH command permits |
 
-`broker` needs OpenSSH 8.9 or newer on all three machines. A copy run by the
-destination needs one of these modes; for example, to make hostB pull from
-hostA with its own credentials:
+`broker` needs OpenSSH 8.9 or newer on all three machines, and your laptop must
+trust both servers through plain host keys in known_hosts; it does not work with
+host certificates alone, `KnownHostsCommand`, or `RevokedHostKeys`. A copy run
+by the destination needs one of these modes; for example, to make hostB pull
+from hostA with its own credentials:
 
 ```sh
 syq cp --coordinate-at dst --peer-auth own-credentials --from hostA data --to hostB --into /archive
@@ -134,8 +140,9 @@ With the default `--auth-from auto`, a `syq cp` between the machine you run it
 on and one SSH server first tries that machine's own SSH access. If SSH rejects
 the login, cannot verify the host key, cannot resolve the name, or is refused,
 syq asks the first available receiving machine, in alphabetical order of
-name, to approve just this copy. Otherwise, as after a timeout or with no
-receiving machine available, syq reports the SSH error. A refusal or failure
+name, to approve just this copy. After a timeout, a temporary DNS failure, or
+any other SSH error, or with no receiving machine available, syq reports the
+SSH error. A refusal or failure
 on the receiving machine ends the copy.
 
 Per-copy approval does not work with a root login on the destination,

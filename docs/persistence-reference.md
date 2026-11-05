@@ -96,7 +96,8 @@ available. An agent that requires confirmation or a touch asks for each one.
 
 An [SSH authorization provider](receive.md#use-an-ssh-authorization-provider)
 needs the same syq build as the machines that use it. The first receiving
-profile in its default domain must be enabled. Its SSH server must allow local
+profile in its default domain (the one `receive status` lists first) must be
+enabled. Its SSH server must allow local
 forwarding (`AllowTcpForwarding` and `AllowStreamLocalForwarding` set to
 `local` or `yes`), and the login key's `authorized_keys` entry must not
 disable it with `restrict` or `no-port-forwarding`.
@@ -141,14 +142,9 @@ On the server, `syq cp results --to @project` and
 `receive on --name NAME` creates or updates a profile; options you omit keep
 their saved values. Without `--name`, it updates the first profile that
 `receive status` lists. It connects to the servers you give with
-`--connection` and waits until receiving is ready on them.
-
-```sh
-syq persist receive status
-syq persist receive off --name project
-syq persist receive on --name project
-syq persist receive remove project
-```
+`--connection` and waits until receiving is ready on them. If one connection
+fails, the settings stay saved and the others keep running, but the command
+exits unsuccessfully.
 
 Changing a profile's access settings, stopping it, or removing it cancels that
 profile's running copies, commands, and pending approvals; changing only
@@ -190,10 +186,10 @@ the server, then run `syq persist connect server` on the new laptop.
 ### Back up the receiving identity
 
 Your receiving names are tied to the key in `~/.syq-receiver-identity/`, which
-all profiles, domains, and syq versions share. Keep it in private backups; if you lose it, you have to `forget` your names on each
-server. Another machine with a copy of it has the same identity, but only one
-machine can hold a name at a time, so give machines that receive at the same
-time different profile names.
+all profiles, domains, and syq versions share. Keep it in private backups; if
+you lose it, you have to `forget` your names on each server. Another machine
+with a copy of it has the same identity, but only one machine can hold a name at
+a time, so give machines that receive at the same time different profile names.
 
 ## Directories
 
@@ -204,7 +200,7 @@ independent settings:
 |---|---|---|
 | `--cwd DIR` | Starting directory for relative paths | `--auto-cwd` |
 | `--root DIR` | Hard boundary for downloads, even with approval | `--no-root` |
-| `--auto-approve-root DIR` | Downloads confined here skip approval, except with some options | `--no-auto-approve-root` |
+| `--auto-approve-root DIR` | Downloads confined here skip approval, except with `--widen-dirs all` | `--no-auto-approve-root` |
 
 Each must be an existing directory, and neither root can be `/`. Without
 `--cwd`, downloads start in the hard root if set, otherwise the automatic
@@ -216,7 +212,9 @@ automatic approval outside its root, and replacing that root directory itself
 asks, or is refused when it is also the hard root. Neither root restricts
 approved commands or copies you approve between servers.
 
-## Copy limits
+<a id="copy-limits"></a>
+
+## Copy limits and restrictions
 
 Each copy to a receiving name may write up to 100 GiB and one million entries
 by default. Entries are the changes it makes, such as files written,
@@ -225,17 +223,16 @@ directories created, metadata changes, and deletions. Change the limits with
 only lower them. They apply per copy, so repeated copies can still fill the
 disk.
 
-Pruning is off until you set a positive `--max-delete`. A pruning copy that
-plans more deletions than your `--max-delete` or `--max-entries`, or its own
-`--max-delete`, deletes nothing and exits 25, and so does its dry run, so you
-can check first.
+A pruning copy is refused until you set a positive `--max-delete`. After that, a
+pruning copy that plans more deletions than your `--max-delete` or
+`--max-entries`, or its own `--max-delete`, deletes nothing and exits 25, and so
+does its dry run, so you can check first.
 
 Copies to a receiving name cannot preserve hard links, ACLs, extended
 attributes, or access or birth times, and cannot use `--open-noatime` or
 `--sparse`; the other `--copy-metadata` options work. They are refused while
 syq runs as root on the receiving machine, and they never follow a destination
-symlink, even with `--follow-dst`; name the link's target instead. `--no-tcp` sends file data over SSH, and `--tcp-ports` sets
-the server's port range for TCP.
+symlink, even with `--follow-dst`; name the link's target instead.
 
 ## Connection lifetime and waits
 

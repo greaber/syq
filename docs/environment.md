@@ -28,7 +28,7 @@ other arguments.
 | `SYQ_AUTH_FROM` | Set `--auth-from` for a shell or script, as in `SYQ_AUTH_FROM=@laptop ./agent-task.sh`; see [Authorization defaults](persistence-reference.md#authorization-defaults) |
 | `SSL_CERT_FILE`, `SSL_CERT_DIR` | Replace the system CA roots for HTTPS; see [HTTPS certificates](security.md#https-certificates) |
 | `SYQ_NO_UPDATE_CHECK`, `DO_NOT_TRACK` | Disable update reminders; see [Updates](install.md#updates) |
-| `SYQ_TUNING_CACHE` | Base path for tuning history; empty turns history off. See [Remembered connection counts](tuning.md#remembered-connection-counts) |
+| `SYQ_TUNING_CACHE` | Base path for tuning history; empty turns history off, even when `SYQ_TUNING_HISTORY` is set. See [Remembered connection counts](tuning.md#remembered-connection-counts) |
 | `SYQ_TUNING_HISTORY` | Tuning history file to use instead; empty turns history off. See [Tuning history](tuning.md#inspect-tuning-history) |
 | `SYQ_TUNING_HISTORY_SIZE` | Size to keep tuning history to; default and minimum `10M` |
 | `SYQ_DEBUG` | Add internal diagnostics to stderr |

@@ -44,30 +44,23 @@ In particular:
 
 ### Which symlinks are followed?
 
-Syq's own commands follow a symlink only in a path you supply, and only when
-you ask; links found inside a directory are never followed. (`syq rsync`
-follows rsync's rules instead; see below.)
+<a id="relationship-to-rsync-350"></a>
+
+Syq's own commands follow a symlink only in a path you supply, and only when you
+ask; links found inside a directory are never followed. (`syq rsync` instead
+follows the rule from
+[rsync 3.5.0's security design](https://github.com/RsyncProject/rsync/blob/v3.5.0/SECURITY.md#symlink-race-safe-path-resolution):
+it follows a link in a supplied path that root or the running user owns, or any
+link with `--insecure-links`, which applies to local paths only.)
 
 | Where the symlink appears | Treatment |
 |---|---|
 | In a source path you supply | Followed only with `--follow-src`. Without it, a link you name as the source is copied as a link, and a link elsewhere in the path, even a system one such as macOS's `/tmp`, stops the copy |
-| In a destination path you supply | Followed only with `--follow-dst`; without it, a link in the path stops the copy. `--as PATH` never follows its final entry |
+| In a destination path you supply | Followed only with `--follow-dst`; without it, a link in the path stops the copy. `--as PATH` replaces a link at its final entry instead of following it |
 | Inside a source directory being copied | Copied as a link; its target is not read |
 | Inside a destination directory | Not followed. A copied file can replace the link, but a copied directory cannot use it as a directory |
 
 `--follow` enables both. See [Symlinks](reference.md#symlinks) for examples.
-
-### Relationship to rsync 3.5.0
-
-Syq uses the same approach as
-[rsync 3.5.0's security design](https://github.com/RsyncProject/rsync/blob/v3.5.0/SECURITY.md#symlink-race-safe-path-resolution):
-keep directories open and resolve later operations relative to them. They
-differ in when a symlink in a path you supply may be followed:
-
-| Command | When a symlink in a supplied path may be followed |
-|---|---|
-| Rsync 3.5.0 or `syq rsync` | The link belongs to root or the process's effective user, or `--insecure-links` is set (local paths only in `syq rsync`) |
-| Other syq commands | You ask with the follow options above |
 
 <a id="limits-to-keep-in-mind"></a>
 <a id="privileged-copies-and-hard-links"></a>
@@ -85,17 +78,19 @@ who has it open, keeps the old contents. `--in-place=update`
 (`syq rsync --inplace`) instead writes into the existing file, so anyone who
 has it open sees the new contents; syq does that only when it gives no one
 access the copy would not, and replaces the file otherwise (see
-[In-place writes](reference.md#in-place-writes)). An `--as-fd` output is
-written to whatever file the descriptor refers to, without that check.
+[In-place writes](reference.md#in-place-writes)).
 
 Syq changes an existing file's metadata in place only when that cannot affect
 another name or grant privileges, and otherwise replaces the file (see
 [How syq changes existing files](reference.md#how-syq-changes-existing-files-and-directories)).
-So a hard link planted in the destination never takes the copy's metadata, and root never
-gives a file another user planted there another owner, group, or privileges. The
-exception is access times copied with `--copy-metadata=atimes`, which are set in
-place on all of a file's names. Narrowing permissions in place does not cut off
-someone who already has the file or directory open.
+So a hard link planted in the destination never takes the copy's metadata, and
+root never gives a file another user planted there another owner, group, or
+privileges. The exception is access times copied with `--copy-metadata=atimes`,
+which are set in place on all of a file's names. Narrowing permissions in place
+does not cut off someone who already has the file or directory open.
+
+An `--as-fd` output is written, and given any copied metadata, through
+whatever file the descriptor refers to, without these checks.
 
 **Permissions supplied by the source.** Copied permissions are only as
 trustworthy as the source. `--copy-metadata=permissions` can make a file
@@ -121,9 +116,8 @@ but a concurrent writer's changes can be lost. If they matter, copy into a
 destination other processes cannot modify.
 
 **Named pipes.** Swapping an input file for a named pipe just before syq opens
-it can wake the pipe's writer and discard its data; on macOS, swapping one pipe
-for another can go unnoticed. Keep pipes used by sensitive producers in
-directories untrusted users cannot modify.
+it can discard data the pipe's writer sends. Keep pipes used by sensitive
+producers in directories untrusted users cannot modify.
 
 <a id="code-and-transport-integrity"></a>
 <a id="encryption-and-authentication"></a>
@@ -144,22 +138,22 @@ with the release key built into your installed syq, so a download server
 cannot substitute code. This relies on the release signing key, your installed
 syq, and the SSH accounts involved staying trustworthy.
 
-Syq downloads official executables, published as GitHub release assets and
-served through `dl.syq.christmas`, for self-updates, `--use-version`, and
-helpers on SSH servers, and checks each against the size and SHA-256 hash the
-signed manifest lists. Source builds also carry the release key for
-`--use-version`. When an SSH server downloads its own helper, your machine
-checks the manifest and the archive hash the server reports before allowing
-installation, and uploads a verified helper over SSH instead if the download
-cannot be verified.
+Syq downloads official executables, served through `dl.syq.christmas`, for
+self-updates, `--use-version`, and helpers on SSH servers, and checks each
+against the size and SHA-256 hash the signed manifest lists. Source builds also
+carry the release key for `--use-version`. When an SSH server downloads its own
+helper, your machine checks the manifest and the archive hash the server reports
+before allowing installation, and uploads a verified helper over SSH instead if
+the download cannot be verified.
 
-Syq verifies a release once, when it stores it in `~/.local/lib/syq`. Later
-runs on your machine start it without hashing it again, but refuse it if its
-files or directories there are not yours or their permission bits let others
-write them. Anyone who can write the directories above the store can replace
-it, just as anyone who can write `~/.local/bin` can replace syq, so keep them
-writable only by you. On SSH servers, syq starts the stored helper without
-these checks, so keep `~/.local/lib/syq` there writable only by you too.
+A release you select with `--use-version` is verified once, when syq stores it
+in `~/.local/lib/syq`. Later runs on your machine start it without hashing it
+again, but refuse it if its files or directories there are not yours or their
+permission bits let others write them. Anyone who can write the directories
+above the store can replace it, just as anyone who can write `~/.local/bin` can
+replace syq, so keep them writable only by you. On SSH servers, syq starts the
+stored helper without these checks, so keep `~/.local/lib/syq` there writable
+only by you too.
 
 Your first installation establishes this trust. The standalone installer
 checks the archive against a size and SHA-256 hash embedded in the script, but
@@ -177,17 +171,18 @@ system trust store up to date; minimal Linux installations may need the
 
 To use a private CA or a restricted trust store, set `SSL_CERT_FILE` to a PEM
 bundle or `SSL_CERT_DIR` to a colon-separated list of directories of PEM
-certificates. Either one replaces the system roots, and syq loads both when both
-are set. Even an empty `SSL_CERT_FILE`, or a missing file or directory, does not
-fall back to the system roots. Unset both to restore system trust, and restart
-running syq processes to load changes. These settings do not affect SSH host-key
-checks or release signature checks.
+certificates. Setting `SSL_CERT_FILE`, even to an empty value, or a non-empty
+`SSL_CERT_DIR` replaces the system roots, and syq loads both when both are set.
+A missing or empty file or directory does not fall back to the system roots.
+Unset both to restore system trust, and restart running syq processes to load
+changes. These settings do not affect SSH host-key checks or release signature
+checks.
 
 ## Copies between servers
 
 When your laptop starts a copy from hostA to hostB, syq's default mode gives
 hostA permission for that one copy and nothing more: no private key, no access
-to your SSH agent, and no login to hostB. A compromised hostA can still misuse
+to your SSH agent, and no shell on hostB. A compromised hostA can still misuse
 that copy; see [A compromised source server](#a-compromised-source-server).
 
 ### Destination permissions
@@ -204,9 +199,9 @@ The protection has four parts:
    itself: anyone who holds it, including a server that ran an earlier copy,
    still needs a copy you newly signed. Such a server can, however, keep the
    receiver's connections busy so that new copies fail, until you revoke the
-   enrollment and enroll again. Your laptop stores the entry key unencrypted, so
-   authorize it nowhere but the receiver; anywhere else, hostA would gain that
-   access too.
+   enrollment and enroll again. Don't add the entry key to any other
+   `authorized_keys` file: hostA holds it, so it would gain that access too.
+   Your laptop stores it unencrypted.
 3. **A signature on each copy.** Your laptop signs the copy's command, exactly
    as you ran it, with an expiry time, using the key you log in to hostB with.
    The receiver checks the signature, requiring the touch and PIN your login
@@ -220,13 +215,13 @@ The protection has four parts:
    did not cut them short.
 
 An enrollment covers the whole account. Each signed command names its own
-destination, which can be anywhere the account can write except the account's
-SSH configuration and syq's own programs and state (see
-[Enrollment](remote-reference.md#enrollment)), and the receiver does not follow
-symlinks beneath it. Because a copy can write a file that runs code as the
-account, such as a shell startup file, a signed copy is as strong as a login.
-That is acceptable because only your login key can sign one, and you choose
-each destination.
+destination, which can be anywhere the account can write except its SSH
+configuration and syq's own programs and state (see
+[Enrollment](remote-reference.md#enrollment)). The receiver does not follow
+symlinks below the destination. Because a copy can write a file that runs code
+as the account, such as a shell startup file, a signed copy is as strong as a
+login. That is acceptable because only your login key can sign one, and you
+choose each destination.
 
 An enrollment outlives removing or revoking your login key on hostB; end it with
 `syq receiver revoke`. See
@@ -259,12 +254,13 @@ they could not use the entry key or the signed copy against the real hostB. For
 a copy started on your laptop, your laptop would detect that from hostB's
 reports (step 4).
 
-To refuse a host neither machine has seen, set `StrictHostKeyChecking yes` on
-hostA for the name it connects with, and on your laptop too for copies a
-server asks it to approve, and trust hostB's key on hostA or your laptop. For
-a copy a server started, that name is the one in the server's command; for one
-started on your laptop, it is the address your laptop's SSH configuration
-gives hostB.
+To refuse a host neither machine has seen, set `StrictHostKeyChecking yes` in
+hostA's SSH configuration, and add hostB's key to your laptop's known_hosts,
+which syq passes to hostA. HostA looks hostB up under the address your laptop's
+SSH configuration gives it for a copy started on your laptop, and under the
+name in the server's command for a copy a server started. For copies a server
+asks your laptop to approve, also set `StrictHostKeyChecking yes` on your
+laptop.
 
 ### A compromised source server
 
@@ -372,17 +368,17 @@ command shown, and syq enforces them on every filesystem operation. Within
 those limits, the server can supply false contents, inspect destination
 entries during planning, and use disk space.
 
-Copies start in your home directory and are not confined to it;
+By default, copies start in your home directory and are not confined to it;
 `syq persist receive on --root DIRECTORY` confines them. Automatic approval
 (`--auto-approve-root`) trusts the allowed server accounts to overwrite files
-inside its root without asking, though some options still ask. Choose an
-inbox whose contents are not automatically executed or loaded as trusted
-configuration.
+inside its root without asking; a copy with `--widen-dirs all`, or one that
+replaces the root directory itself, still asks. Choose an inbox whose contents
+are not automatically executed or loaded as trusted configuration.
 
-Another client cannot claim your receiving name, because reconnecting under it
-requires your receiver's private key, though the server account itself can
-change its stored name assignments. That key stays on your machine and grants
-no SSH login.
+Another client cannot claim your receiving name: reconnecting under it needs
+your receiver's private key, which stays on your machine and grants no SSH
+login. The server account itself can still change its stored name
+assignments.
 
 <a id="authorizing-copies-to-another-server"></a>
 
