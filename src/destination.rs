@@ -1202,11 +1202,13 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     };
     let (registration, reply) = match ask(&registration) {
         Ok((_, reply)) => (registration, reply),
-        Err(error) => {
-            // The receiving machine may have switched its connection to
-            // another syq build since this command chose it, as after an
-            // update, while the command read its input. Nothing has been
-            // copied yet: ask the new connection once, if this build can.
+        // The receiving machine may have switched its connection to another
+        // syq build since this command chose it, as after an update, while
+        // the command read its input: the connection it chose is gone or
+        // refuses requests. Nothing has been copied yet: ask the new
+        // connection once, if this build can. A decision of the old one,
+        // such as a denial, stands.
+        Err(error) if switched_away(&error) => {
             let Ok(current) = load_registration(&name) else {
                 return Err(error);
             };
@@ -1221,6 +1223,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
             let (_, reply) = ask(&current)?;
             (current, reply)
         }
+        Err(error) => return Err(error),
     };
     let Reply::Approved(approved) = reply else {
         bail!("unexpected named destination response");
@@ -1236,6 +1239,19 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         })?)
     ));
     Ok(())
+}
+
+/// What a receiving connection that stopped for a switch to another syq
+/// build answers requests in its last moments.
+const SWITCHING: &str = "receiving is switching to another syq version; retry in a moment";
+
+/// Whether a request failed because the receiving connection it went to
+/// is gone, or is going for a switch, rather than because it answered.
+fn switched_away(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+        || format!("{error:#}").contains(SWITCHING)
 }
 
 pub(crate) fn connect(grant: &str, control: bool) -> Result<UnixStream> {
@@ -1871,12 +1887,7 @@ pub(crate) fn serve_background(
             let writer = stream.try_clone();
             let Some(_handling) = activity.begin() else {
                 if let Ok(mut writer) = writer {
-                    let _ = ssh_auth::reply_error(
-                        &mut writer,
-                        &anyhow::anyhow!(
-                            "receiving is switching to another syq version; retry in a moment"
-                        ),
-                    );
+                    let _ = ssh_auth::reply_error(&mut writer, &anyhow::anyhow!(SWITCHING));
                 }
                 return;
             };

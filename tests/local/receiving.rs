@@ -3663,6 +3663,54 @@ fn ssh_switches_services_in_its_own_domain() {
     );
 }
 
+/// A switch to a new build never turns persistence back on: with it off,
+/// as after `syq persist off`, `persist connect --when-idle` does nothing.
+#[test]
+fn a_switch_does_not_turn_persistence_back_on() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    let _persistence = PersistenceOff(&t);
+    let ssh = fake_ssh(&t);
+    let connect = || {
+        persistence_command(
+            &t,
+            &[
+                "connect",
+                "test-server",
+                "--auth-from",
+                "ssh",
+                "--when-idle",
+            ],
+        )
+        .env("HOME", t.path(""))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+        )
+        .run()
+        .unwrap()
+    };
+    let enabled = || {
+        let status = persistence_command(&t, &["status", "--json"])
+            .run()
+            .unwrap();
+        assert_output_ok(&status);
+        serde_json::from_slice::<serde_json::Value>(&status.stdout).unwrap()["enabled"].clone()
+    };
+    // Never turned on, and turned off.
+    for off in [false, true] {
+        if off {
+            assert_output_ok(&persistence_command(&t, &["off"]).run().unwrap());
+        }
+        let switched = connect();
+        assert_output_ok(&switched);
+        assert!(switched.stdout.is_empty(), "{switched:?}");
+        assert_eq!(enabled(), false);
+        assert!(!t.path("rsh.log").exists(), "it logged in");
+    }
+}
+
 /// A service that an older syq left running cannot follow an update by
 /// itself. Any syq command run here replaces it with this build once it is
 /// idle, in the background, and says so; the service's settings stay.

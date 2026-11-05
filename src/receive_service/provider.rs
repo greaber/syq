@@ -1909,6 +1909,113 @@ mod tests {
         assert!(error.to_string().contains("already running"), "{error:#}");
     }
 
+    /// A provider of build `build` with process `pid`, answering status,
+    /// stop, and stop if idle, which it agrees to unless `busy`. Once it
+    /// stops, it gives up its socket and lock, then runs `then`. Returns the
+    /// requests it received.
+    fn stand_in_provider(
+        domain: &Domain,
+        build: &'static str,
+        pid: u32,
+        busy: usize,
+        then: impl FnOnce() + Send + 'static,
+    ) -> std::thread::JoinHandle<Vec<&'static str>> {
+        let lock = acquire_lock(domain, true).unwrap().unwrap();
+        let path = domain.runtime_path().join(SOCKET_FILE);
+        let listener = UnixListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "provider kept running: {seen:?}");
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let _: Hello = crate::destination::read_message(&mut stream).unwrap();
+                crate::destination::write_message(
+                    &mut stream,
+                    &HelloReply {
+                        version: PROTOCOL,
+                        build: build.into(),
+                    },
+                )
+                .unwrap();
+                let stopping = match crate::destination::read_message(&mut stream).unwrap() {
+                    Control::Status => {
+                        seen.push("status");
+                        false
+                    }
+                    Control::Stop => {
+                        seen.push("stop");
+                        true
+                    }
+                    Control::StopIfIdle => {
+                        seen.push("stop if idle");
+                        busy == 0
+                    }
+                    Control::Refresh | Control::Decide(_) => panic!("unexpected request"),
+                };
+                let reply = Snapshot {
+                    build: build.into(),
+                    pid,
+                    profiles: Vec::new(),
+                    decision_error: None,
+                    busy: Some(busy),
+                    started_from: None,
+                    switch: None,
+                    stopping,
+                };
+                crate::destination::write_framed(
+                    &mut stream,
+                    &reply,
+                    MAX_STATUS,
+                    "provider status",
+                )
+                .unwrap();
+                if stopping {
+                    // Like a provider, remove the socket before the lock.
+                    fs::remove_file(&path).unwrap();
+                    drop(lock);
+                    then();
+                    return seen;
+                }
+            }
+        })
+    }
+
+    /// Once a provider agreed to stop, another may start before the switch
+    /// sees the lock free. That one is never sent a stop: the switch waits
+    /// only for the provider that agreed, then looks at the next one, which
+    /// is busy and keeps running.
+    #[test]
+    fn a_provider_that_takes_over_after_one_agreed_to_stop_is_not_stopped() {
+        let (_directory, domain, _) = fixture();
+        let successor = Arc::new(Mutex::new(None));
+        let (started, next) = (successor.clone(), domain.clone());
+        // The process that agreed lives on after it gives up the lock, as
+        // this test's own does; the next one is another.
+        let first = stand_in_provider(&domain, "v0.0.1+first", std::process::id(), 0, move || {
+            *started.lock().unwrap() =
+                Some(stand_in_provider(&next, "v0.0.1+next", 2222, 1, || {}));
+        });
+        switch_when_idle(&domain).unwrap();
+        assert_eq!(first.join().unwrap(), ["status", "stop if idle"]);
+        let next = successor.lock().unwrap().take().unwrap();
+        assert!(is_running(&domain).unwrap());
+        query(&domain, Control::Stop).unwrap();
+        let seen = next.join().unwrap();
+        assert!(!seen[..seen.len() - 1].contains(&"stop"), "{seen:?}");
+        assert_eq!(seen.last(), Some(&"stop"));
+    }
+
     /// A provider from an older build: it answers status and stop, and rejects
     /// a refresh by closing the connection, as one that cannot parse newer
     /// settings does. Returns the requests it received.
