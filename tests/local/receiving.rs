@@ -3079,6 +3079,16 @@ fn a_receiving_service_switches_to_a_new_build_at_its_path_once_idle() {
     );
 
     let switched = t.path("switched.log");
+    // The provider follows the same file and switches as soon as it can;
+    // only the receiving service's switch connects to test-server.
+    let connects = || {
+        fs::read_to_string(&switched)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with("persist connect "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
     installed.update("v99.0.0-switch-test", &switched);
     wait_for(
         "the service to wait",
@@ -3105,24 +3115,20 @@ fn a_receiving_service_switches_to_a_new_build_at_its_path_once_idle() {
     std::thread::sleep(std::time::Duration::from_secs(1));
     let state = status();
     assert_eq!(state["busy"]["requests"], 1, "{state}");
-    assert!(
-        !switched.exists(),
-        "{:?}: {state}",
-        fs::read_to_string(&switched)
-    );
+    assert!(connects().is_empty(), "{:?}: {state}", connects());
 
     // Once the request ends and a quiet while passes, it runs the new
     // build's connect, for this server and scope, without prompts.
     drop(request);
     wait_for("the switch", std::time::Duration::from_secs(20), || {
-        switched.exists()
+        !connects().is_empty()
     });
     assert_eq!(
-        fs::read_to_string(&switched).unwrap(),
-        format!(
-            "persist connect test-server --auth-from ssh --when-idle --pscope {}\n",
+        connects(),
+        [format!(
+            "persist connect test-server --auth-from ssh --when-idle --pscope {}",
             installed.scope.display()
-        )
+        )]
     );
     // The new build stops it once idle.
     let answer =
