@@ -12,8 +12,7 @@ Each line is a JSON record. **Require a final `result` record before trusting
 completion.** EOF without one means the outcome is unknown, even if no error
 record appeared.
 
-This page describes stream semantics. The
-[JSON Schema](https://github.com/greaber/syq/blob/master/schemas/automation.schema.json)
+The [JSON Schema](https://github.com/greaber/syq/blob/master/schemas/automation.schema.json)
 lists precise field shapes;
 [example streams](https://github.com/greaber/syq/tree/master/tests/fixtures/automation)
 show complete runs. For mapping manifests, see [Mapping format](commands/map.md#mapping-format).
@@ -22,22 +21,21 @@ show complete runs. For mapping manifests, see [Mapping format](commands/map.md#
 
 `--results FILE` creates a fresh regular file and refuses an existing one.
 Use a new name for each run and keep it outside trees being copied or removed.
-`--results-fd N` uses an already opened writable descriptor above 2:
+`--results-fd N` uses an already opened writable descriptor above 2, for pipes
+and other non-regular sinks:
 
 ```sh
 syq cp project --into backup --results-fd 3 3>copy.ndjson
 ```
 
-Use a descriptor for pipes or other non-regular sinks. Named results paths
-follow the normal native symlink rules; `--follow` permits traversal.
-Human stdout and stderr are not part of this contract.
+Named results paths follow the normal native symlink rules; `--follow` permits
+traversal. Human stdout and stderr are not part of this contract.
 
 Results are written on the invoking machine, including for remote removal
-and for copies between two servers. When one of the servers coordinates the
-copy, its records come back over your SSH connection as it works. Through a
-command-restricted receiver, the records of each change on the destination,
-including the ones it refused or that failed there, come from the receiver
-itself, and failures reading the source come from the coordinating server; see
+and for copies between two servers. Through a command-restricted receiver, the
+records of each change on the destination, including the ones it refused or
+that failed there, come from the receiver itself, and failures reading the
+source come from the coordinating server; see
 [Results from the destination](remote-reference.md#results-from-the-destination).
 
 `clean-partials` uses the removal records described below. Results cannot
@@ -49,10 +47,10 @@ immediately. If writing the stream fails, syq warns where possible and stops
 writing it. Filesystem work can continue, leaving an incomplete stream.
 
 Argument errors exit 2 without a stream. Failure to open the results sink
-exits 1 without a stream. Once opened, completed runs and fatal setup failures
-emit a terminal record if the sink remains writable; a fatal failure first
-emits an `error` record with its message, counted in `errors`. Crashes and
-interruptions can leave the terminal record missing.
+exits 1 without a stream. Once the sink is open, completed runs and fatal
+setup failures emit a terminal record if the sink remains writable; a fatal
+failure first emits an `error` record with its message, counted in `errors`.
+Crashes and interruptions can leave the terminal record missing.
 
 ## Consumer rules
 
@@ -67,8 +65,8 @@ interruptions can leave the terminal record missing.
   `encoding` values.
 - Treat human `message` text as display only; parse structured fields.
 
-`--results` includes progress samples as well as final outcomes, so a live
-progress display can read the same stream.
+The stream includes progress samples as well as final outcomes, so a live
+progress display can read it too.
 
 ## Exit codes
 
@@ -112,10 +110,6 @@ credentials, headers, ports, and raw command arguments.
 Copy runs also carry `prune` and `mapping`. Removal has one source endpoint
 regardless of selector count and omits those copy fields.
 
-For S3 downloads using `--if-exists=keep`, unchanged-file totals
-include skipped symlinks selected through a prefix, but exclude symlinks named
-directly or through a mapping.
-
 ### `progress`
 
 Sampled telemetry, approximately once per second, for displays rather than
@@ -132,13 +126,12 @@ for mapping entries, kind and bytes where applicable, plus a `reason`:
 `destination_missing`, `type_differs`, `content_differs`, `metadata_differs`,
 or `destination_only`.
 
-For filesystem copies of regular files, `content_differs` means sizes or compared
-hashes differ;
-`metadata_differs` also covers copies selected by the metadata quick check.
-A `transfer_file` trace omits `bytes` when only metadata would change in
-place. A file whose metadata syq would change by replacing it (see
-[Copy metadata](reference.md#copy-metadata)) has `metadata_differs` with its
-`bytes`, and counts as transferred.
+For filesystem copies of regular files, `content_differs` means sizes or
+compared hashes differ, and `metadata_differs` also covers files selected by
+the size-and-time check. A `transfer_file` trace omits `bytes` when only
+metadata would change in place. A file whose metadata syq would change by
+replacing it (see [Copy metadata](reference.md#copy-metadata)) has
+`metadata_differs` with its `bytes`, and counts as transferred.
 
 A trace cannot be matched by identity to a later live operation: the filesystem
 may change between runs.
@@ -161,9 +154,9 @@ An outcome for a completed copy change or a failed mapping entry.
 | `class`, `os_kind`, `message` | Error details where available |
 
 A file whose data failed its [payload check](integrity-checking.md#payload-checks)
-on the way has `class: "integrity"` and the message
-`data corrupted in transit; rerun the command to retry`, whichever receiver
-reports it, and `retryable: "yes"` in a record that has that field.
+on the way has `class: "integrity"`, the message
+`data corrupted in transit; rerun the command to retry`, and, where the record
+has the field, `retryable: "yes"`.
 
 A command-restricted receiver's own records have no `src`, `attempts`, or
 `retryable`, and a deletion has no `kind`; a file it did not finish is
@@ -177,8 +170,8 @@ is non-retryable. Do not construct a retry source from its destination name.
 ### `stream_ready`
 
 A producer may start supplying payload. Uploads without a skip policy emit this
-before destination setup finishes, allowing several writers to connect concurrently.
-With `--if-exists=keep` or metadata preservation requested, source selection and destination checks come first.
+before destination setup finishes. With `--if-exists=keep` or metadata
+preservation requested, source selection and destination checks come first.
 Skipped copies and dry runs finish without this record. Setup, transfer, or
 publication can still fail; require the terminal result for completion.
 
@@ -191,14 +184,14 @@ are source/destination operands, with a source basename appended for `--into`;
 the run's endpoints identify where they belong. An FD is a handle for this
 invocation, not a reusable source or retry identity.
 
-`disposition` is `succeeded`, `failed`, `skipped`, or `planned`; `dry_run` identifies a
-preview. `bytes` counts transferred bytes, including partial work on failure,
-or planned bytes in a dry run. It is absent for a preview of unknown-length
-input. A failed upload may have transferred bytes without publishing them.
-Skipped copies consume no payload, report zero bytes, and count as one excluded
-file. The normal terminal `result` still establishes completion. Its optional
-`bytes_total_known` field is false when the source length is unknown; preview
-byte totals then count only known bytes, rather than asserting an empty input.
+`disposition` is `succeeded`, `failed`, `skipped`, or `planned`; `dry_run`
+identifies a preview. `bytes` counts transferred bytes, including partial work
+on failure, or planned bytes in a dry run, and is absent for a preview of
+unknown-length input. A failed upload may have transferred bytes without
+publishing them. Skipped copies consume no payload, report zero bytes, and
+count as one excluded file. The terminal `result` still establishes
+completion; its optional `bytes_total_known` field is false when the source
+length is unknown, and preview byte totals then count only known bytes.
 
 Stream mappings use version 5 and emit one `stream_result` for each
 callback entry, with an additional zero-based `entry` index. Each endpoint is
@@ -212,11 +205,6 @@ the [stream-mapping protocol](stream-mappings.md#entry-lifecycle) starts each
 entry instead.
 
 ### Removal records
-
-For S3 version removal, `removal_trace` and `removal_result` include optional
-`s3_version_id` (string) and `s3_delete_marker` (boolean) fields. Each record and
-entry count refers to one version or delete marker. Ordinary S3 removal omits
-these fields.
 
 | Type | Meaning |
 |---|---|
@@ -239,17 +227,16 @@ success. Failures include error details and retryability where available,
 and also produce a counted `error` record. Dry-run inspection failures can
 produce failed removal results, but never successful removal results.
 
+For S3 version removal, `removal_trace` and `removal_result` include optional
+`s3_version_id` (string) and `s3_delete_marker` (boolean) fields. Each record and
+entry count refers to one version or delete marker. Ordinary S3 removal omits
+these fields.
+
 ### `error`
 
 One per counted error. `message` is display text; `class` and `os_kind` are
 provided where known. Classes are `io`, `transport`, `conflict`, `integrity`,
 `safety_limit`, `usage`, and `internal`.
-
-An error with `diagnostic_for`, a destination path, is not counted in
-`errors`. It explains why a command-restricted receiver reported that path as
-failed: for example, the source file could not be read after the receiver had
-started writing it, so the receiver lists the file as not finished. The
-receiver's own records count the failure.
 
 OS kinds are `not_found`, `permission_denied`, `already_exists`,
 `invalid_input`, `no_space`, `quota_exceeded`, `read_only`, and `other`.
@@ -257,6 +244,11 @@ They preserve OS error meaning across hosts without requiring matching errno
 numbers. A command-restricted receiver's refusals use
 `class: "safety_limit"` and name the refused path, or the receiver when the
 refused request named none.
+
+An error with `diagnostic_for`, a destination path, is not counted in
+`errors`. It explains why a command-restricted receiver reported that path as
+failed, for example because the source file could not be read after the
+receiver had started writing it. The receiver's own records count the failure.
 
 ### `result`
 
@@ -275,29 +267,19 @@ carry the same object, with measurements advancing while that work runs:
 | `finalization_ms` | Work after file workers finish: remaining hardlinks, pruning, and directory metadata |
 | `helper_install_ms` | Installing matching helpers and remote syq commands, including the installation's platform probe |
 
-Setup and planning count the time spent in those activities, counting concurrent
-work of the same kind once. The `timing:` line under a copy's summary shows
-setup only until file work begins, so connections added while copying do not
-count there; `setup_ms` keeps them. Transfer is one span across workers,
-including gaps. Total also includes coordinator bookkeeping between measured
-activities.
-These measurements can overlap; they are not numbers to add together. For example,
-copying can begin while planning continues. Installation on two hosts also counts
-once where it overlaps.
+These measurements overlap, so do not add them together: copying can begin
+while planning continues, for example. Setup and planning count concurrent
+work of the same kind once; transfer is one span across workers, including
+gaps. The `timing:` line under a copy's summary shows setup only until file
+work begins, while `setup_ms` also counts connections added during copying.
 
-Filesystem copy coordinators report all six fields, including zero for work that
-was not needed or took less than a millisecond. S3 copies also report `transfer_ms` once file work starts. Other engines
-and removal report `total_ms` and omit unavailable measurements. Total starts
-with the executing coordinator's run clock, before SSH authorization selection
-for a filesystem copy, and continues across a local helper handoff;
-it is not the entire process lifetime. Use an external timer to include process
-startup, input handling, and shutdown.
-
-The filesystem progress bar and summary use `transfer_ms` for elapsed time.
-While copying, progress estimates the recent transfer rate; once file work
-finishes, it reports the average over the completed transfer, as the summary
-does. Initial setup and finalization do not dilute the transfer rate.
-A copy with no selected file work reports zero transfer time.
+Filesystem copies report all six fields, including zero for work that was not
+needed or took less than a millisecond, and zero transfer time when no file
+work was selected. S3 copies also report `transfer_ms` once file work starts.
+Other engines and removal report `total_ms` and omit unavailable
+measurements. For a filesystem copy, `total_ms` starts before SSH
+authorization is chosen, but it is not the entire process lifetime; use an
+external timer to include process startup, input handling, and shutdown.
 
 Copy totals include transferred/unchanged files, excluded entries, created directories,
 symlinks and specials, transferred/unchanged bytes, and on pruning runs
@@ -306,20 +288,23 @@ symlinks and specials, transferred/unchanged bytes, and on pruning runs
 data it did not need to copy because the destination already had it: the whole
 size of each unchanged file, plus the parts of transferred files it reused, such
 as matching blocks or a partial file left by an interrupted copy. So
-`bytes_unchanged` can be nonzero while `files_unchanged` is zero. The summary
-line shows the reused part with the transferred files. With
-`--in-place=update`, `replaced_not_in_place` counts the existing files syq
-replaced instead of updating them in place, by reason: `other_names`,
-`untrusted_filesystem`, `owner`, `privileges`, `wider_permissions` and
-`not_writable`, each present only when nonzero (see
-[In-place writes](reference.md#in-place-writes)). In a dry run these counts
-are estimates. A fatal
-failure reports what finished before it stopped. Dry-run totals describe
-planned work, not committed changes.
+`bytes_unchanged` can be nonzero while `files_unchanged` is zero.
+
+With `--in-place=update`, `replaced_not_in_place` counts the existing files syq
+replaced instead of updating them in place, by reason: `not_regular`,
+`other_names`, `untrusted_filesystem`, `owner`, `privileges`,
+`wider_permissions` and `not_writable`, each present only when nonzero (see
+[In-place writes](reference.md#in-place-writes)). In a dry run these counts are
+estimates.
+
+A fatal failure reports what finished before it stopped. Dry-run totals
+describe planned work, not committed changes.
 
 `files_excluded` includes ignore-rule skips on filesystem and S3 routes, in
-both live copies and dry runs.
-An ignored directory counts once; its unscanned descendants are not counted.
+both live copies and dry runs. An ignored directory counts once; its unscanned
+descendants are not counted. For S3 downloads using `--if-exists=keep`,
+unchanged-file totals include skipped symlinks selected through a prefix, but
+exclude symlinks named directly or through a mapping.
 
 Through a command-restricted receiver, the totals of what changed (files and
 bytes transferred, directories, symlinks and specials created, and deletions
@@ -331,8 +316,6 @@ missing selectors, planned/removed/already-absent entries, and failed entries.
 Live removal leaves `entries_planned` zero. Dry removal leaves
 `entries_removed` and `entries_already_absent` zero, but inspection failures
 may increase `entries_failed`.
-
-The human summary uses the same terminal totals.
 
 ## Performance measurements
 
@@ -359,26 +342,25 @@ such as `ProxyCommand`, the directory it ran in as `ssh_options_directory`;
 receiving does not apply to it, so its `receiving_enabled` is `null`.
 
 With receiving enabled for an endpoint, `ready` means its allowed receiving
-profiles are online; SSH can reconnect on its next use. If receiving preferences
-cannot be read, SSH entries are still listed, `receiving_error` explains the
-failure, and each entry's
-`receiving_enabled` is `null`.
+profiles are online; SSH can reconnect on its next use. If receiving
+preferences cannot be read, SSH entries are still listed, `receiving_error`
+explains the failure, and each entry's `receiving_enabled` is `null`.
 
 Approved account connections appear separately in `authorized_ssh`. Each entry
 has `authorizer`, `requested`, `endpoint`, `control`, and `connected` fields.
 The two endpoint objects contain `user`, `host`, and `port`; `requested` is the
 original selection and `endpoint` is the resolved account and address. A return
 authorizer is its name as a string; an ordinary SSH provider is an object with
-an `ssh` field containing the provider endpoint. `authorized_ssh_errors` contains
-diagnostics for account records that could not be read. Valid entries are still printed, but the command exits
-nonzero when this array is nonempty.
+an `ssh` field containing the provider endpoint. `authorized_ssh_errors`
+contains diagnostics for account records that could not be read. Valid entries
+are still printed, but the command exits nonzero when this array is nonempty.
 
 `persist receive status --json` reports profile settings in `profiles` and the
 first selected profile in `settings`. Each profile includes `cwd`,
-`cwd_explicit`, `root`, `auto_approve_root`, and `servers`. `servers` remains the
-JSON name for the endpoint restriction configured with `--connection`; an empty
-list means all connections in that domain. A null automatic approval root means
-every download asks. `connections` lists the profiles allowed on each endpoint.
+`cwd_explicit`, `root`, `auto_approve_root`, and `servers`. `servers` holds the
+endpoint restriction configured with `--connection`; an empty list means all
+connections in that domain. A null automatic approval root means every
+download asks. `connections` lists the profiles allowed on each endpoint.
 The `provider` object reports the local SSH authorization service, or is null
 when it is not running. Its `profiles` contain `settings`, `sessions`, and
 `pending` requests; `decision_error` reports a failed local approval action.
@@ -426,13 +408,11 @@ connection. See [account permissions](persistence-reference.md#account-permissio
 
 ## Retry failed mapping entries
 
-Add `--results r.ndjson` to record outcomes in a fresh file outside the copy
-trees.
-
 Failed mapping entries contain `src`, `dst`, and `kind`, so they can form a
-retry manifest. Preserve `expected_hash` and `metadata` too when present. First require a terminal `result` with `success` or `partial`:
-a missing terminal or an early stop means some entries may have no results.
-In those cases, rerun the original copy instead.
+retry manifest; preserve `expected_hash` and `metadata` too when present. First
+require a terminal `result` with `success` or `partial`: a missing terminal or
+an early stop means some entries may have no results, so rerun the original
+copy instead.
 
 ```bash
 set -o pipefail
@@ -455,9 +435,8 @@ jq -cs 'if any(.[]; .schema != "syq.automation" or .schema_version != 4)
 
 The filter skips non-retryable entries, including failed implicit parent
 creation without a source path. It does not guarantee that retrying will
-succeed; fix the underlying error first. Unchanged and excluded files appear
-only in summary totals, not as individual results.
+succeed; fix the underlying error first.
 
 For command-restricted copies between servers, the operation records come from
 the receiver and carry no source paths; retry the original mapping instead of
-applying the `operation_result` filter above.
+applying the filter above.
