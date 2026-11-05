@@ -1478,7 +1478,7 @@ struct NativeRemoteArgs {
     #[arg(long, value_name = "auto|ssh|@NAME|HOST", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
     /// Choose the endpoint that runs the coordinator
-    #[arg(long, value_enum, default_value_t = CoordinateAt::Auto, help_heading = REMOTE_TO_REMOTE_HEADING)]
+    #[arg(long, value_enum, value_name = "WHERE", default_value_t = CoordinateAt::Auto, help_heading = REMOTE_TO_REMOTE_HEADING)]
     coordinate_at: CoordinateAt,
     /// Remote shell command (default: ssh); when set, it controls SSH options and agent forwarding. An ssh command still uses persistent connections unless its options set up connection sharing
     #[arg(long = "rsh", value_name = "COMMAND")]

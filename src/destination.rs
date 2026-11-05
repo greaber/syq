@@ -148,11 +148,16 @@ enum DestinationAction {
     /// Print registrations and whether their receiving laptop responds
     List,
     /// Remove an offline destination name so another laptop can register it
-    Forget { name: String },
+    Forget {
+        /// Receiving name to release, without @
+        name: String,
+    },
     /// Wait for a destination to respond; exit nonzero after the deadline
     Wait {
+        /// Receiving name to wait for, without @
         name: String,
-        #[arg(long, default_value_t = 30)]
+        /// Give up after this many seconds
+        #[arg(long, value_name = "SECONDS", default_value_t = 30)]
         timeout: u64,
     },
 }

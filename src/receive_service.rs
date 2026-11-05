@@ -152,16 +152,19 @@ pub(crate) struct ReceiveCommand {
 enum Action {
     /// Show incoming copy and command requests awaiting approval on this machine
     Pending {
+        /// Print the requests as JSON
         #[arg(long)]
         json: bool,
         /// Wait for an incoming request, with a deadline
         #[arg(long)]
         wait: bool,
-        #[arg(long, default_value_t = 30)]
+        /// With --wait, give up after this many seconds
+        #[arg(long, value_name = "SECONDS", default_value_t = 30)]
         timeout: u64,
     },
     /// Allow one pending request using the ID from persist receive pending
     Approve {
+        /// Request ID shown by persist receive pending
         id: String,
         /// Remember this SSH account permission for future receiving connections or provider logins
         #[arg(long)]
@@ -173,7 +176,10 @@ enum Action {
         action: PermissionAction,
     },
     /// Deny one pending request using the ID from persist receive pending
-    Deny { id: String },
+    Deny {
+        /// Request ID shown by persist receive pending
+        id: String,
+    },
     /// Enable or configure a receiving profile (without --name, use the first profile)
     On(Configure),
     /// Disable receiving and stop its background connections; keep ordinary persistence
@@ -183,21 +189,28 @@ enum Action {
         name: Option<String>,
     },
     /// Remove a saved receiving profile and stop its connections
-    Remove { name: String },
+    Remove {
+        /// Profile to remove
+        name: String,
+    },
     /// Show receiving settings and background connection state
     Status {
+        /// Print the settings and state as JSON
         #[arg(long)]
         json: bool,
+        /// Show only this profile
         #[arg(long)]
         name: Option<String>,
     },
     /// Wait until the receiving connection through HOST is ready
     Wait {
+        /// SSH server whose receiving connection to wait for
         host: String,
         /// Wait for this profile; otherwise wait for every enabled profile
         #[arg(long)]
         name: Option<String>,
-        #[arg(long, default_value_t = 30)]
+        /// Give up after this many seconds
+        #[arg(long, value_name = "SECONDS", default_value_t = 30)]
         timeout: u64,
     },
 }
@@ -205,17 +218,21 @@ enum Action {
 enum PermissionAction {
     /// Show remembered SSH account permissions
     List {
+        /// Print the permissions as JSON
         #[arg(long)]
         json: bool,
     },
     /// Stop future authentications; already authenticated sessions may continue
-    Remove { id: String },
+    Remove {
+        /// Permission ID shown by persist receive permissions list
+        id: String,
+    },
 }
 
 #[derive(Args, Default, Debug)]
 struct Configure {
     /// Automatically approve downloads confined to this directory
-    #[arg(long, conflicts_with = "no_auto_approve_root")]
+    #[arg(long, value_name = "DIR", conflicts_with = "no_auto_approve_root")]
     auto_approve_root: Option<PathBuf>,
     /// Require approval for every download again
     #[arg(long)]
@@ -227,31 +244,31 @@ struct Configure {
     #[arg(long)]
     all_connections: bool,
     /// Show desktop prompts, or use only local pending/approve/deny commands
-    #[arg(long = "notify", value_enum)]
+    #[arg(long = "notify", value_enum, value_name = "MODE")]
     notifications: Option<crate::receive_approval::Notifications>,
     /// Create or update this named profile; omitted means the first profile
     #[arg(long)]
     name: Option<String>,
     /// Default destination directory; absolute paths and .. may select elsewhere
-    #[arg(short = 'C', long, conflicts_with = "auto_cwd")]
+    #[arg(short = 'C', long, value_name = "DIR", conflicts_with = "auto_cwd")]
     cwd: Option<PathBuf>,
     /// Choose cwd from root, auto-approve-root, then HOME
     #[arg(long)]
     auto_cwd: bool,
     /// Confinement boundary for every download, even with approval
-    #[arg(long, conflicts_with = "no_root")]
+    #[arg(long, value_name = "DIR", conflicts_with = "no_root")]
     root: Option<PathBuf>,
     /// Remove the hard download boundary
     #[arg(long)]
     no_root: bool,
-    /// Maximum bytes one transfer may reserve/write (default: 100G)
-    #[arg(long)]
+    /// Maximum bytes one transfer may write (default: 100G)
+    #[arg(long, value_name = "SIZE")]
     max_bytes: Option<String>,
     /// Maximum entries one transfer may touch (default: 1000000)
-    #[arg(long)]
+    #[arg(long, value_name = "N")]
     max_entries: Option<u64>,
     /// Permit pruning up to N entries per transfer (default: 0)
-    #[arg(long)]
+    #[arg(long, value_name = "N")]
     max_delete: Option<u64>,
 }
 

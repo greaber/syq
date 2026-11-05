@@ -110,7 +110,7 @@ syq persist receive [OPTIONS] <COMMAND>
 
 ## syq persist receive pending
 
-`--json` prints structured requests. `--wait` waits for a request, up to `--timeout` seconds (default 30). Use the returned request ID with `approve` or `deny`.
+Use a returned request ID with `approve` or `deny`.
 
 <!-- CLI: persist receive pending -->
 ```text
@@ -121,15 +121,14 @@ syq persist receive pending [OPTIONS]
 
 | Argument / option | Meaning |
 |---|---|
-| `--json` | See the command description above. |
+| `--json` | Print the requests as JSON |
 | `--wait` | Wait for an incoming request, with a deadline |
-| `--timeout <TIMEOUT>` | [default: 30] |
+| `--timeout <SECONDS>` | With --wait, give up after this many seconds<br><br>[default: 30] |
 
 <!-- /CLI -->
 
 ## syq persist receive approve
 
-`ID` is a pending request ID from `persist receive pending` on this machine.
 Copy and command approvals apply once. SSH account requests grant
 [session access](../persistence-reference.md#account-permissions); add `--remember`
 to permit future account authentications too.
@@ -143,7 +142,7 @@ syq persist receive approve [OPTIONS] <ID>
 
 | Argument / option | Meaning |
 |---|---|
-| `<ID>` | See the command description above. |
+| `<ID>` | Request ID shown by persist receive pending |
 
 **Options**
 
@@ -155,8 +154,6 @@ syq persist receive approve [OPTIONS] <ID>
 
 ## syq persist receive deny
 
-`ID` is a pending request ID from `persist receive pending` on this machine.
-
 <!-- CLI: persist receive deny -->
 ```text
 syq persist receive deny [OPTIONS] <ID>
@@ -166,7 +163,7 @@ syq persist receive deny [OPTIONS] <ID>
 
 | Argument / option | Meaning |
 |---|---|
-| `<ID>` | See the command description above. |
+| `<ID>` | Request ID shown by persist receive pending |
 
 <!-- /CLI -->
 
@@ -203,14 +200,11 @@ syq persist receive permissions list [OPTIONS]
 
 | Argument / option | Meaning |
 |---|---|
-| `--json` | See the command description above. |
+| `--json` | Print the permissions as JSON |
 
 <!-- /CLI -->
 
 ## syq persist receive permissions remove
-
-Remove the listed permission ID. Future login requests ask again; already
-authenticated connections may continue.
 
 <!-- CLI: persist receive permissions remove -->
 ```text
@@ -221,7 +215,7 @@ syq persist receive permissions remove [OPTIONS] <ID>
 
 | Argument / option | Meaning |
 |---|---|
-| `<ID>` | See the command description above. |
+| `<ID>` | Permission ID shown by persist receive permissions list |
 
 <!-- /CLI -->
 
@@ -243,19 +237,19 @@ syq persist receive on [OPTIONS]
 
 | Argument / option | Meaning |
 |---|---|
-| `--auto-approve-root <AUTO_APPROVE_ROOT>` | Automatically approve downloads confined to this directory |
+| `--auto-approve-root <DIR>` | Automatically approve downloads confined to this directory |
 | `--no-auto-approve-root` | Require approval for every download again |
 | `--connection <ENDPOINT>` | Replace the allowed connection list and connect these endpoints now (repeat for several) |
 | `--all-connections` | Make this profile available through every connected SSH account |
-| `--notify <NOTIFICATIONS>` | Show desktop prompts, or use only local pending/approve/deny commands<br><br>[possible values: desktop, off] |
+| `--notify <MODE>` | Show desktop prompts, or use only local pending/approve/deny commands<br><br>[possible values: desktop, off] |
 | `--name <NAME>` | Create or update this named profile; omitted means the first profile |
-| `-C, --cwd <CWD>` | Default destination directory; absolute paths and .. may select elsewhere |
+| `-C, --cwd <DIR>` | Default destination directory; absolute paths and .. may select elsewhere |
 | `--auto-cwd` | Choose cwd from root, auto-approve-root, then HOME |
-| `--root <ROOT>` | Confinement boundary for every download, even with approval |
+| `--root <DIR>` | Confinement boundary for every download, even with approval |
 | `--no-root` | Remove the hard download boundary |
-| `--max-bytes <MAX_BYTES>` | Maximum bytes one transfer may reserve/write (default: 100G) |
-| `--max-entries <MAX_ENTRIES>` | Maximum entries one transfer may touch (default: 1000000) |
-| `--max-delete <MAX_DELETE>` | Permit pruning up to N entries per transfer (default: 0) |
+| `--max-bytes <SIZE>` | Maximum bytes one transfer may write (default: 100G) |
+| `--max-entries <N>` | Maximum entries one transfer may touch (default: 1000000) |
+| `--max-delete <N>` | Permit pruning up to N entries per transfer (default: 0) |
 
 <!-- /CLI -->
 
@@ -278,7 +272,8 @@ syq persist receive off [OPTIONS]
 
 ## syq persist receive remove
 
-`NAME` identifies the saved profile to remove. Its connections and requests stop. The last profile can be disabled but cannot be removed; server-side name assignments remain until explicitly forgotten.
+The last profile can be disabled but not removed. Names it registered on
+servers remain until you [forget them](#syq-persist-destinations-forget).
 
 <!-- CLI: persist receive remove -->
 ```text
@@ -289,13 +284,11 @@ syq persist receive remove [OPTIONS] <NAME>
 
 | Argument / option | Meaning |
 |---|---|
-| `<NAME>` | See the command description above. |
+| `<NAME>` | Profile to remove |
 
 <!-- /CLI -->
 
 ## syq persist receive status
-
-Show all profiles, or select one with `--name`. Use `--json` for structured output.
 
 <!-- CLI: persist receive status -->
 ```text
@@ -306,14 +299,14 @@ syq persist receive status [OPTIONS]
 
 | Argument / option | Meaning |
 |---|---|
-| `--json` | See the command description above. |
-| `--name <NAME>` | See the command description above. |
+| `--json` | Print the settings and state as JSON |
+| `--name <NAME>` | Show only this profile |
 
 <!-- /CLI -->
 
 ## syq persist receive wait
 
-`HOST` is the SSH server endpoint. Wait for the selected profile, or every enabled profile when `--name` is omitted. `--timeout` is in seconds; failure or timeout exits nonzero. This command does not start a connection.
+Failure or timeout exits nonzero. This command does not start a connection.
 
 <!-- CLI: persist receive wait -->
 ```text
@@ -324,14 +317,14 @@ syq persist receive wait [OPTIONS] <HOST>
 
 | Argument / option | Meaning |
 |---|---|
-| `<HOST>` | See the command description above. |
+| `<HOST>` | SSH server whose receiving connection to wait for |
 
 **Options**
 
 | Argument / option | Meaning |
 |---|---|
 | `--name <NAME>` | Wait for this profile; otherwise wait for every enabled profile |
-| `--timeout <TIMEOUT>` | [default: 30] |
+| `--timeout <SECONDS>` | Give up after this many seconds<br><br>[default: 30] |
 
 <!-- /CLI -->
 
@@ -365,7 +358,8 @@ syq persist destinations list [OPTIONS]
 
 ## syq persist destinations forget
 
-`NAME` is an offline receiving name to release before replacing its machine. Forgetting a live connection is refused.
+Use this before replacing the laptop that registered a name. Forgetting a name
+whose laptop is still connected is refused.
 
 <!-- CLI: persist destinations forget -->
 ```text
@@ -376,13 +370,11 @@ syq persist destinations forget [OPTIONS] <NAME>
 
 | Argument / option | Meaning |
 |---|---|
-| `<NAME>` | See the command description above. |
+| `<NAME>` | Receiving name to release, without @ |
 
 <!-- /CLI -->
 
 ## syq persist destinations wait
-
-`NAME` is a receiving name without `@`. Wait up to `--timeout` seconds for it to respond; timeout exits nonzero.
 
 <!-- CLI: persist destinations wait -->
 ```text
@@ -393,13 +385,13 @@ syq persist destinations wait [OPTIONS] <NAME>
 
 | Argument / option | Meaning |
 |---|---|
-| `<NAME>` | See the command description above. |
+| `<NAME>` | Receiving name to wait for, without @ |
 
 **Options**
 
 | Argument / option | Meaning |
 |---|---|
-| `--timeout <TIMEOUT>` | [default: 30] |
+| `--timeout <SECONDS>` | Give up after this many seconds<br><br>[default: 30] |
 
 <!-- /CLI -->
 
@@ -425,7 +417,7 @@ syq persist connect [OPTIONS] <HOST>
 | `--auth-from <auto\|ssh\|@NAME\|HOST>` | Authorize a reusable destination-account login through @NAME or an SSH provider |
 | `--syq-path <PATH>` | Use this remote syq executable instead of installing a matching helper |
 | `--no-bootstrap` | Use syq on the remote PATH instead of installing a matching helper |
-| `--timeout <TIMEOUT>` | Wait this many seconds for receiving after SSH/helper setup<br><br>[default: 30] |
+| `--timeout <SECONDS>` | Wait this many seconds for receiving after connecting<br><br>[default: 30] |
 
 <!-- /CLI -->
 

@@ -104,7 +104,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--receiver-max-entries <N>` | Command-restricted receiver ceiling: refuse to touch more than N destination entries |
 | `--receiver-max-bytes <SIZE>` | Command-restricted receiver ceiling: refuse to write more than SIZE bytes of file data in total |
 | `--auth-from <auto\|ssh\|@NAME\|HOST>` | How to authorize, overriding SYQ_AUTH_FROM and the saved choice: auto tries native SSH and may then ask a receiving machine, ssh uses only native SSH, and @NAME or HOST asks that receiving machine or SSH provider (@NAME also authorizes S3 copies) |
-| `--coordinate-at <COORDINATE_AT>` | Choose the endpoint that runs the coordinator<br><br>Possible values:<br>- auto: Run locally unless both endpoints are remote, then run at the source<br>- src: Run the coordinator at the source endpoint<br>- dst: Run the coordinator at the destination endpoint<br>- local: Keep the coordinator on the invoking machine and relay the data there<br><br>[default: auto] |
+| `--coordinate-at <WHERE>` | Choose the endpoint that runs the coordinator<br><br>Possible values:<br>- auto: Run locally unless both endpoints are remote, then run at the source<br>- src: Run the coordinator at the source endpoint<br>- dst: Run the coordinator at the destination endpoint<br>- local: Keep the coordinator on the invoking machine and relay the data there<br><br>[default: auto] |
 | `--rsh <COMMAND>` | Remote shell command (default: ssh); when set, it controls SSH options and agent forwarding. An ssh command still uses persistent connections unless its options set up connection sharing |
 | `--syq-path <PATH>` | Use this remote syq executable instead of installing a helper |
 | `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |

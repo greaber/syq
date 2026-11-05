@@ -65,8 +65,8 @@ enum PersistAction {
         /// Use syq on the remote PATH instead of installing a matching helper
         #[arg(long)]
         no_bootstrap: bool,
-        /// Wait this many seconds for receiving after SSH/helper setup
-        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        /// Wait this many seconds for receiving after connecting
+        #[arg(long, value_name = "SECONDS", default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: u64,
     },
     /// Enable persistent connections for later syq commands

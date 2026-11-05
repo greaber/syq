@@ -39,7 +39,7 @@ syq tuning-cache list [OPTIONS]
 
 | Argument / option | Meaning |
 |---|---|
-| `--limit <limit>` | [default: 50] |
+| `--limit <N>` | Show at most N transfers<br><br>[default: 50] |
 
 <!-- /CLI -->
 
@@ -50,14 +50,14 @@ stdout to a file and open it in a browser for an interactive timeline.
 
 <!-- CLI: tuning-cache show -->
 ```text
-syq tuning-cache show [OPTIONS] <id>
+syq tuning-cache show [OPTIONS] <ID>
 ```
 
 **Arguments**
 
 | Argument / option | Meaning |
 |---|---|
-| `<id>` | See the command description above. |
+| `<ID>` | Transfer ID shown by tuning-cache list |
 
 **Options**
 
@@ -69,19 +69,18 @@ syq tuning-cache show [OPTIONS] <id>
 
 ## syq tuning-cache export
 
-Export one transfer, or all retained transfers when the ID is omitted, as
-NDJSON. Each transfer record is followed by its event records.
+Each transfer record is followed by its event records.
 
 <!-- CLI: tuning-cache export -->
 ```text
-syq tuning-cache export [id]
+syq tuning-cache export [ID]
 ```
 
 **Arguments**
 
 | Argument / option | Meaning |
 |---|---|
-| `[id]` | See the command description above. |
+| `[ID]` | Transfer ID shown by tuning-cache list; omit to export every transfer |
 
 <!-- /CLI -->
 
