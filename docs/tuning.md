@@ -18,12 +18,10 @@ syq cp large-file --to server --as /scratch/benchmark-copy -v \
   --performance-tuning workers=1,copy-path=ranges,request-size=1M,pipeline-depth=8
 ```
 
-<a id="average-rate-and-burst-patterns"></a>
-
 | Key | Default | Accepted values |
 |---|---|---|
 | `workers` | Automatic | 1 through 65536 filesystem workers, fewer when there is less work |
-| `comparison-block-size` | 4 MiB; 64 KiB for replaced files up to 64 MiB | 64 KiB through 64 MiB; filesystem copies only |
+| `comparison-block-size` | 4 MiB; 64 KiB for replaced files up to 64 MiB | 64 KiB through 64 MiB; filesystem copies only. Comparison can use up to 64 MiB of memory per worker |
 | `request-size` | Automatic, normally up to 4 MiB; at most 2 MiB for streaming | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
 | `copy-path` | `auto` | `auto`, `ranges`, `streaming`, `auto-streaming`; see below |
@@ -32,16 +30,21 @@ syq cp large-file --to server --as /scratch/benchmark-copy -v \
 | `split-min-size` | 32 MiB | 1 byte through 1 GiB: the smallest part of a file an idle worker can take over from another |
 | `bw-pacing` | `125ms` | An integer interval from `1ms` through `10s`, or `average`; see below |
 
+<a id="streaming-and-request-windows"></a>
+
 `copy-path=auto` takes shortcuts where they apply, such as local clones and
 small-file batches, and streams long remote ranges. `ranges` copies every file
 in range requests without those shortcuts. The experimental `streaming`
 streams every range without shortcuts, and `auto-streaming` keeps the
 shortcuts and streams all other ranges.
 
+<a id="average-rate-and-burst-patterns"></a>
+
 `bw-pacing` needs a nonzero `--resource-limits bandwidth=RATE` and applies to
 local, descriptor, and receiver-approved copies; other SSH and TCP copies
-ignore it. An interval sends smaller requests that far apart, while `average`
-waits for each request's byte budget, so data arrives in bursts.
+ignore it, and S3 copies reject it. An interval sends smaller requests that far
+apart, while `average` waits for each request's byte budget, so data can arrive
+in bursts.
 
 Sizes accept `K`, `M`, and `G`, using powers of 1024. Setting a request, block,
 pipeline, split, or batch value also stops syq from adjusting it during the
@@ -73,6 +76,8 @@ when needed to stay within S3's limit of 10,000 parts per upload. For retries,
 see [`--s3-retries`](object-storage.md#retries).
 
 <a id="s3-streams"></a>
+
+For S3 streams, see [Descriptor copies](object-storage.md#descriptor-copies).
 
 ## Deletion
 
@@ -129,18 +134,9 @@ script.
 ### Compare block reuse with full replacement
 
 To measure what [block reuse](reference.md#choose-a-transfer-strategy) costs
-and saves, compare the two strategies without copy shortcuts, keeping worker
-counts, request sizes, and cache preparation identical:
-
-```sh
-syq cp --srcs-in source --into destination \
-  --performance-tuning copy-path=ranges --transfer-strategy aligned-block
-syq cp --srcs-in source --into destination \
-  --performance-tuning copy-path=ranges --transfer-strategy whole-file
-```
-
-Block reuse saves network traffic, but the destination still writes a complete
-new file unless its filesystem supports reflinks.
+and saves, run the same copy with `--transfer-strategy aligned-block` and with
+`whole-file`, adding `--performance-tuning copy-path=ranges` to both so that
+copy shortcuts don't hide the difference.
 
 ### Scattered edits in existing files
 
@@ -154,8 +150,6 @@ syq cp --srcs-in source --to host --into destination \
 
 Set `request-size` too, since it otherwise follows the comparison block size.
 In `syq rsync`, `-B` / `--block-size` sets the comparison block size.
-
-<a id="streaming-and-request-windows"></a>
 
 ### Batch size and splitting
 

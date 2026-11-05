@@ -6,8 +6,9 @@ see [Diagnose a slow copy](speed.md#diagnose-a-slow-copy).
 
 ## Read the summary
 
-This summary, shortened to one of two workers, comes from comparing two local
-directories with `--hash`:
+At the end of a copy, `--stats` prints a summary like this one, from
+`syq cp --stats --hash` between two local directories (shortened to one of two
+workers):
 
 ```text
 Observed worker time: source request 77%, destination ack 20%, awaiting work 1%, destination send 1% (0.122884s observed; 2 workers; parking excluded: 0.000s; wait states, not proven causes)
@@ -40,11 +41,14 @@ A large share tells you which side to look at, not why it was slow:
 `source_response` can mean slow storage or CPU at the source, a slow network,
 or a slow destination. A large `awaiting_work` share means workers ran out of
 work; if scanning was still running (`scan_done` false in progress records),
-it isn't finding files fast enough. A local source has no process of its
-own, so its file work counts as `source_request` and `source_response`, as in
-the example. On SSH and TCP copies, waits for a
-[bandwidth limit](resource-limits.md#bandwidth) count as `destination_send` or
-`source_response` rather than `pacing`.
+it isn't finding files fast enough.
+
+A local source has no process of its own, so its file work counts as
+`source_request` and `source_response`, as in the example. Waits for a
+[bandwidth limit](resource-limits.md#bandwidth) count as `pacing`, except on
+SSH and TCP copies other than receiver-approved ones: there they count as
+`destination_send` when sending to a server and `source_response` when pulling
+from one.
 
 ### Endpoint operations
 
@@ -64,41 +68,42 @@ to three parts:
 | `prefetch` | `prefetch_advice` | Asking Linux to read ahead; its bytes were requested, not read |
 
 Percentages are shares of each part's own time, so don't compare them across
-parts or with worker time. A `filesystem` part that was busy for most of the
-elapsed time points to that side's storage or hashing. A `server` that mostly
-waits for requests was idle, but that alone doesn't show a network limit.
+parts or with worker time. The seconds in parentheses are how long that part
+was busy; compare them with the copy's elapsed time. A `filesystem` part that
+was busy for most of it points to that side's storage or hashing. A `server`
+that mostly waits for requests was idle, but that alone doesn't show a network
+limit.
 
 ### Process CPU
 
 The last lines give the CPU time of the coordinator (the syq process running
 the copy), of the `local receiver` that writes a local destination, and of each
-remote process. CPU time divided by elapsed time is the number of cores in use;
-if that is near the machine's core count, compare with `--no-compress`.
+remote process. CPU time divided by elapsed time is the number of cores in use.
+On a remote copy, if that is near the machine's core count, compare with
+`--no-compress`.
 
-The `tcp` lines in the `--stats` totals combine all TCP data connections.
-Retransmissions point to packet loss; see
-[Test congestion control](server-tuning.md#test-congestion-control).
-Window-limited time shows whether the receiver or the sender's socket buffer
-held data back.
+### TCP statistics
+
+`--stats` also prints `tcp …` lines with the copy's totals, combining all TCP
+data connections; for data sent over SSH they say `unavailable`.
+Retransmissions point to packet loss; see [Test congestion
+control](server-tuning.md#test-congestion-control). Window-limited time shows
+whether the receiver or the sender's socket buffer held data back.
 
 ## Activity fields
 
 To follow the measurements during a copy, also write
-[automation results](automation.md#progress): with `--stats`, each `progress`
-record carries an `activity` object (`ProgressEvent.activity` in Python),
-except in S3 copies. Fields starting with `cumulative_` cover the copy so far;
-the others cover the time since the previous sample. Expect gaps: a remote
-process can stop reporting while the copy continues.
+[automation results](automation.md#progress). With `--stats`, `progress`
+records from filesystem copies carry an `activity` object
+(`ProgressEvent.activity` in Python); S3 and descriptor copies have none. Treat
+it as optional: a remote process can stop reporting while the copy continues.
 
-| Field | Meaning |
-|---|---|
-| `sample_duration_ms` | Time since the previous sample |
-| `workers` | Worker counts and time shares |
-| `endpoints` | One entry for each worker's source or destination |
-| `processes` | One entry for each syq process |
-| `summary` | The summary `--stats` prints, for the copy so far; idle parts are left out |
+Besides `sample_duration_ms` (time since the previous progress record) and
+`summary` (the text `--stats` prints, without idle parts), `activity` has the
+objects below. Fields starting with `cumulative_` cover the copy so far; the
+others cover the time since the previous progress record.
 
-### Workers
+### `workers`
 
 | Field | Meaning |
 |---|---|
@@ -109,7 +114,9 @@ process can stop reporting while the copy continues.
 | `fractions`, `cumulative_fractions` | Each [state](#worker-time)'s share of worker time; empty when there was no activity |
 | `parked_ns`, `cumulative_parked_ns` | Paused worker time |
 
-### Endpoints
+### `endpoints`
+
+One entry for each worker's source or destination:
 
 | Field | Meaning |
 |---|---|
@@ -120,14 +127,22 @@ process can stop reporting while the copy continues.
 | `actors`, `cumulative_actors` | One entry for each [part](#endpoint-operations); `actors` is empty when no new report has arrived |
 | `tcp`, `tcp_delta`, `peer_tcp`, `peer_tcp_delta` | [TCP counters](#tcp-counters) |
 
-Each part has a `role` (`filesystem`, `server`, or `prefetch`), the operation
-in progress at the report as `state_at_sample` (or `inactive`), its time in
-operations as `observed_ns`, each operation's share of that time in
-`fractions`, and the bytes of completed operations in `bytes`. `helper_cpu` is
-the Linux `prefetch` thread's CPU time, already counted in its process, and
-null for other parts.
+#### Parts
 
-### Processes
+Each entry in `actors` and `cumulative_actors`:
+
+| Field | Meaning |
+|---|---|
+| `role` | `filesystem`, `server`, or `prefetch` |
+| `state_at_sample` | The operation in progress at the report, or `inactive` |
+| `observed_ns` | Time spent in its operations |
+| `fractions` | Each operation's share of `observed_ns` |
+| `bytes` | Bytes of completed operations, by operation |
+| `helper_cpu` | The Linux `prefetch` thread's CPU time, already counted in its process; null for other parts |
+
+### `processes`
+
+One entry for each syq process, even when it serves several connections:
 
 | Field | Meaning |
 |---|---|
@@ -136,14 +151,12 @@ null for other parts.
 | `sample_age_ms`, `sample_duration_ms` | As for endpoints |
 | `cpu`, `cumulative_cpu` | `user_ns` and `system_ns`; `cpu` is null for another process's first report or when no newer one has arrived |
 
-Each process appears once, even when it serves several connections.
-
 ### TCP counters
 
 For a TCP data connection, `tcp` and `peer_tcp` hold the kernel's counters,
 such as round-trip time and retransmissions, for the coordinator's end and the
 other end; `tcp_delta` and `peer_tcp_delta` hold their changes since the
-previous sample. The
+previous progress record. The
 [schema](https://github.com/greaber/syq/blob/master/schemas/automation.schema.json)
 lists them. Other connections report null, as does a counter the system doesn't
 provide; zero is a measurement.

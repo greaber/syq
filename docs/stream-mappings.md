@@ -49,17 +49,17 @@ Every frame contains:
 2. A four-byte unsigned big-endian JSON length, from 1 to 65,536.
 3. That many bytes of UTF-8 JSON holding one object.
 
-Reject truncated
-ancillary data and close every descriptor of a rejected frame. Received
-descriptors belong to you: mark them close-on-exec promptly, with
-`MSG_CMSG_CLOEXEC` on Linux, and on macOS don't start subprocesses while
-receiving them.
+Reject truncated ancillary data and close every descriptor of a rejected
+frame. Received descriptors belong to you: mark them close-on-exec promptly,
+with `MSG_CMSG_CLOEXEC` on Linux. On macOS, don't start subprocesses between
+receiving a descriptor and marking it close-on-exec.
 
 Syq first sends `{"type":"hello","version":1}` without descriptors, and the
 client replies `{"version":1}` the same way. Reject an unsupported version
-before producing bytes. Ignore unknown optional JSON fields, but reject
-unknown message types and unexpected descriptors. A failed handshake can end
-without an `end` message, so still check the process exit and results.
+before producing bytes. Syq changes the version for any incompatible change.
+Ignore unknown optional JSON fields, but reject unknown message types and
+unexpected descriptors. A failed handshake can end without an `end` message, so
+still check the process exit and results.
 
 ## Entry lifecycle
 
@@ -71,8 +71,9 @@ without an `end` message, so still check the process exit and results.
 | `{"type":"transferred","entry":N,"error":"..."}` | none | Transfer failed |
 | `{"type":"end"}` | none | No further control messages |
 
-A skipped or dry-run entry gets no `start`. Handle each descriptor
-independently; their numbers are unrelated to manifest indexes.
+Each direction of an entry gets at most one `start`; a skipped or dry-run entry
+gets none. Handle each descriptor independently; their numbers are unrelated to
+manifest indexes.
 
 A producer writes its payload and closes that descriptor. Only after its work
 has succeeded does it write the single byte `C` to the completion descriptor

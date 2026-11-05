@@ -14,7 +14,7 @@ See [`syq rsync`](commands/rsync.md) for all accepted options.
 | `--ignore-existing` | Keeps an existing non-directory even where the source would create a directory |
 | Type changes | Refuses replacement between a directory and any non-directory, even when the directory is empty |
 | `--update` | Checks mtimes only for regular files; replacements between non-directory types still occur |
-| Read-only destination directories | Briefly adds owner access, as rsync does, but then restores each directory's exact mode; `--syq-widen-dirs` changes this ([details](reference.md#copy-metadata)) |
+| Read-only destination directories | Briefly adds owner access, as rsync does, but then restores each directory's exact mode; `--syq-widen-dirs` changes this ([details](commands/rsync.md#copy-policy-and-filtering)) |
 | Resume | Keeps syq partial files a later copy can resume from; cannot reuse rsync partials |
 | Existing files | Often replaced where rsync changes them in place; see [below](#existing-files) |
 | Delta transfer | Reuses matching blocks only at the same offsets in the destination file. Local copies default to whole-file and remote copies to block reuse; `-W` / `--whole-file` disables reuse and `--no-W` enables it |
@@ -48,11 +48,11 @@ match can be rewritten. `-c` wins when both are given.
 ### Other options
 
 `--numeric-ids` and `--partial` are accepted and change nothing: syq always
-uses numeric IDs and keeps [partial files to resume
-from](reference.md#resume-an-interrupted-copy). `-P` shows progress.
-Compression is on by default, so `-z` adds nothing. `-B` / `--block-size` sets
-syq's comparison and reuse block size, within the range in the [tuning
-table](tuning.md#transfer-controls).
+uses numeric IDs and keeps
+[partial files to resume from](reference.md#resume-an-interrupted-copy). `-P`
+shows progress. Compression is on by default, so `-z` adds nothing. `-B` /
+`--block-size` sets syq's comparison and reuse block size, within the range in
+the [tuning table](tuning.md#transfer-controls).
 
 `-H` preserves hardlinks between selected regular files. On Linux and macOS,
 `-A` preserves ACLs and `-X` extended attributes. `-S` turns written zero

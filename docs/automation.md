@@ -16,6 +16,8 @@ The [JSON Schema](https://github.com/greaber/syq/blob/master/schemas/automation.
 gives exact field shapes, and the
 [example streams](https://github.com/greaber/syq/tree/master/tests/fixtures/automation)
 show complete runs. For mapping manifests, see [Mapping format](commands/map.md#mapping-format).
+The last sections describe the JSON that the `syq persist` status,
+pending-request, and permission commands print.
 
 <a id="the-channel"></a>
 
@@ -33,11 +35,12 @@ Syq follows a symlink in the `--results` path only with `--follow`. Human
 stdout and stderr are not part of this contract.
 
 Results are written on the machine where you run syq, also for remote removal
-and for copies between two servers. A command-restricted receiver reports its
-own changes; see
-[Results from the destination](remote-reference.md#results-from-the-destination).
-`clean-partials` writes [removal records](#removal-records). `--results` can't
-be combined with `--detach`.
+and for copies between two servers. In a
+[restricted copy between servers](remote-reference.md#results-from-the-destination),
+the destination runs a restricted receiver, which reports its own changes,
+including the ones it refused or failed. `clean-partials` writes
+[removal records](#removal-records). `--results` can't be combined with
+`--detach`.
 
 If writing the stream fails, syq warns and stops writing it, but the copy or
 removal can continue. Once the stream is open, a completed run or a fatal
@@ -96,10 +99,10 @@ arguments. Removal has one source endpoint however many selectors it has.
 
 About once a second, for progress displays rather than accounting: bytes,
 files, exclusions, scan state, `timings`, and optional `rate_bytes_per_second`
-and `eta_ms` estimates. With `--stats`, it also carries
-[performance measurements](performance-measurements.md) in `activity`.
-Removal reports zero bytes and zero unchanged and excluded counts. A copy that
-finishes transferring always emits a final progress record.
+and `eta_ms` estimates. With `--stats`, a filesystem copy's progress records
+also carry [performance measurements](performance-measurements.md) in
+`activity`. Removal reports zero bytes and zero unchanged and excluded counts.
+A copy that finishes transferring always emits a final progress record.
 
 ### `trace`
 
@@ -136,7 +139,7 @@ A file that failed its [payload check](integrity-checking.md#payload-checks)
 has `class: "integrity"` and, where the record has the field,
 `retryable: "yes"`.
 
-A command-restricted receiver's own records have no `src`, `attempts`, or
+A restricted receiver's own records have no `src`, `attempts`, or
 `retryable`, and a deletion has no `kind`. A file it didn't finish is `failed`,
 and a change it refused is `failed` with `class: "safety_limit"`.
 
@@ -146,7 +149,8 @@ create implicitly can lack `src` and is not retryable.
 
 ### `stream_ready`
 
-Tells the program supplying a descriptor copy's data that it can start
+Tells the program supplying a
+[descriptor copy's](commands/cp.md#file-descriptors) data that it can start
 writing. Skipped copies and dry runs never emit it. The copy can still fail
 afterwards, so wait for the terminal result.
 
@@ -170,9 +174,12 @@ Stream mappings use schema version 5 and emit one `stream_result` for each
 callback entry, with a zero-based `entry` index. Each endpoint is
 `{"path": <tagged path>}` or `{"entry": N, "callback": true}`, and failed
 entries include `message`. These records can't become a pathname retry
-manifest. These runs don't emit `stream_ready`: the
-[stream-mapping protocol](stream-mappings.md#entry-lifecycle) starts each entry
-instead.
+manifest; the
+[Python callback reference](https://greaber.github.io/syq/python-streams.html#callback-mappings)
+describes publication and application retries. Pathname entries in the same
+mapping still emit their usual records. These runs don't emit `stream_ready`:
+the [stream-mapping protocol](stream-mappings.md#entry-lifecycle) starts each
+entry instead.
 
 ### Removal records
 
@@ -208,7 +215,7 @@ given where known. Classes are `io`, `transport`, `conflict`, `integrity`,
 `permission_denied`, `already_exists`, `invalid_input`, `no_space`,
 `quota_exceeded`, `read_only`, and `other`.
 
-A command-restricted receiver's refusals use `class: "safety_limit"` and name
+A restricted receiver's refusals use `class: "safety_limit"` and name
 the refused path, or the receiver when the request named none. An error with
 `diagnostic_for`, a destination path, is not counted in `errors`: it explains
 why the receiver reported that path as failed.
@@ -223,7 +230,7 @@ object, advancing as the work runs:
 
 | Field | What it measures |
 |---|---|
-| `total_ms` | The whole measured run, including helper installation |
+| `total_ms` | The whole measured run, including helper installation but not process startup and shutdown; use an external timer for those |
 | `setup_ms` | Preparing endpoints and connections and choosing the data transport, excluding helper installation. Connections added while files are copying also count, so it can approach `total_ms` |
 | `planning_ms` | Finding source entries, inspecting destinations, and deciding what to copy, including directories created meanwhile |
 | `transfer_ms` | From the first file operation to the last, including reads, hashing, writes, per-file metadata, waits, and retries |
@@ -234,8 +241,7 @@ The measurements overlap, so don't add them up: copying can start while
 planning continues, for example. Filesystem copies report all six fields, with
 zero for work that wasn't needed or took under a millisecond. S3 copies report
 `transfer_ms` once file work starts. Other copies and removal report
-`total_ms` and omit the rest. `total_ms` doesn't cover the whole process; use
-an external timer to include startup and shutdown.
+`total_ms` and omit the rest.
 
 Copy totals count transferred, unchanged, and excluded files, created
 directories, symlinks and specials, and transferred and unchanged bytes;
@@ -257,7 +263,7 @@ A fatal failure reports what finished before it stopped. Dry-run totals
 describe planned work, not committed changes. `files_excluded` counts
 ignore-rule skips; an ignored directory counts once, without its contents.
 
-Through a command-restricted receiver, the totals of what changed come from
+Through a restricted receiver, the totals of what changed come from
 the receiver, and `errors` counts the error records in the stream.
 
 Removal terminals have `mode: "rm"` and totals for selectors, resolved and
@@ -373,5 +379,5 @@ jq -cs 'if any(.[]; .schema != "syq.automation" or .schema_version != 4)
 ```
 
 The filter skips non-retryable entries; fix the underlying errors before
-retrying. Records from a command-restricted receiver carry no source paths, so
+retrying. Records from a restricted receiver carry no source paths, so
 retry the original mapping instead.

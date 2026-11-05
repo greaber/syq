@@ -1,14 +1,15 @@
 # Integrity checking
 
-How syq decides which files to copy, and how to check what it copied.
+This page explains how syq decides which files to copy and how you can check
+what it copied.
 
 ## Comparison
 
 By default, syq skips files whose size and modification time match. `syq cp`
 compares timestamps at the precision the destination keeps, so a destination
 that truncates fractions of a second still matches. `syq rsync` compares whole
-seconds, as rsync does. On FAT, which keeps times in two-second steps, times
-less than two seconds apart match
+seconds, as rsync does. When the destination is on FAT, which keeps times in
+two-second steps, times less than two seconds apart match
 ([exceptions](reference.md#check-file-contents)). A larger difference counts as
 a change, even when the source is older.
 
@@ -28,9 +29,11 @@ only its metadata is updated. `--hash-or-copy` (rsync `-I`) also stops trusting
 size and timestamp, but can rewrite files that already match; see
 [Check file contents](reference.md#check-file-contents).
 
-Syq stores a hash with each object it uploads. When sizes match but timestamps
-differ, or with `--hash`, it compares the local file with that hash instead of
-copying; `--hash` reads an object that has no stored BLAKE3 hash.
+Syq stores a hash with each object it uploads. In copies between local files
+and S3, when sizes match but timestamps differ, syq compares the local file
+with that hash, if the object has one, instead of copying it. With `--hash`, it
+compares every file whose size matches, reading any object that has no stored
+BLAKE3 hash.
 
 ## Payload checks
 
@@ -93,11 +96,11 @@ machine-readable output, add [`--results`](automation.md); for two servers, see
 
 A copy reads files over time, so if another program changes them meanwhile, the
 result can mix data from different moments. For a consistent copy, use a
-filesystem snapshot or stop the writer. Syq rechecks each source's size and
-modification time before replacing a destination file, and retries or keeps the
-old file if they changed, but that doesn't catch every change. Both
-`--in-place` modes let readers see incomplete files, also after an interrupted
-copy.
+filesystem snapshot or stop the writer. Filesystem copies recheck each source's
+size and modification time before replacing the destination, and retry or keep
+the previous destination if they changed, but that doesn't catch every change.
+Both `--in-place` modes let readers see incomplete files, also after an
+interrupted copy.
 
 If another program writes to a destination file while syq replaces it, its
 writes can end up in the new file, except on Linux ext2/3/4, XFS, Btrfs, ZFS,
