@@ -636,6 +636,6 @@ pub(super) fn revoke_for_account(
         remove_revoked_state(&state)?;
     }
     drop(directory);
-    println!("revoked {}", request.id);
+    crate::output::command_println!("revoked {}", request.id);
     Ok(())
 }

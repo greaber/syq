@@ -453,10 +453,15 @@ pub(crate) fn show_topic(topics: &[std::ffi::OsString]) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("unknown help topic {topic:?}"))?
             .bin_name(format!("{parent} {topic}"));
     }
-    if full {
-        command.print_long_help()?;
+    let printed = if full {
+        command.print_long_help()
     } else {
-        command.print_help()?;
+        command.print_help()
+    };
+    // As other command output: quiet for a closed stdout, and otherwise
+    // reported once, failing the command when it exits.
+    if let Err(error) = printed {
+        crate::output::command_stdout_failed(&error);
     }
     Ok(())
 }

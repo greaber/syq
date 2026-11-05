@@ -3161,7 +3161,16 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             } else {
                 let ended = failed_schedule.clone();
                 std::thread::Builder::new().spawn(move || {
-                    let result = work();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                        .unwrap_or_else(|panic| {
+                            // The worker may hold files its peers would
+                            // wait for forever: stop the copy at once.
+                            ended.abort();
+                            Err(anyhow::anyhow!(
+                                "internal error: a transfer worker panicked: {}",
+                                panic_message(panic.as_ref())
+                            ))
+                        });
                     // A worker that leaves because the copy ended releases the
                     // join from waiting on peers that are still connecting.
                     ended.end_unneeded_worker_setups();
@@ -4983,7 +4992,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     progress.error(&format!("syq: worker: {e:#}"));
                     sched.abort();
                 }
-                Err(_) => progress.error("syq: worker thread panicked"),
+                Err(_) => {
+                    progress.error("syq: worker thread panicked");
+                    sched.abort();
+                }
             }
         }
     }
@@ -5246,6 +5258,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         dst_ctl.detach();
     }
     Ok(exit_code)
+}
+
+/// The message a panic was raised with, when it has one.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
 }
 
 /// A finished connection need not wait for its helper to exit, except where

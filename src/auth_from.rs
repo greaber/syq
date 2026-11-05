@@ -392,7 +392,7 @@ pub(crate) fn run(domain: &Domain, command: PreferenceCommand) -> Result<i32> {
         load(domain)?
     };
     if let Some(host) = &command.host {
-        crate::output::human_stdout!(
+        crate::output::command_human_stdout!(
             "{host}: {}{}",
             spelling(&config.selected(host)?),
             if config.hosts.contains_key(host) {
@@ -402,9 +402,12 @@ pub(crate) fn run(domain: &Domain, command: PreferenceCommand) -> Result<i32> {
             }
         );
     } else {
-        crate::output::human_stdout!("default: {}", config.default.as_deref().unwrap_or("auto"));
+        crate::output::command_human_stdout!(
+            "default: {}",
+            config.default.as_deref().unwrap_or("auto")
+        );
         for (host, value) in &config.hosts {
-            crate::output::human_stdout!("{host}: {value}");
+            crate::output::command_human_stdout!("{host}: {value}");
         }
     }
     Ok(0)

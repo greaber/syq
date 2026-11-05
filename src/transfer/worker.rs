@@ -155,6 +155,13 @@ impl Worker {
                 return Ok(());
             }
             Item::File(idx) => {
+                // Tests make a worker fail unexpectedly while it holds a file.
+                #[cfg(debug_assertions)]
+                if std::env::var_os("SYQ_TEST_WORKER_PANIC")
+                    .is_some_and(|name| name.as_encoded_bytes() == self.job(idx).dst.as_slice())
+                {
+                    panic!("injected worker panic");
+                }
                 let progress = self.progress.clone();
                 let _copying = progress.copying_interval();
                 if self.compare_candidate(idx) {

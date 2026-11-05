@@ -124,13 +124,16 @@ pub fn self_update() -> Result<()> {
             release.version
         ),
         std::cmp::Ordering::Equal => {
-            println!("syq {} is already the newest release", release.version);
+            crate::output::command_println!(
+                "syq {} is already the newest release",
+                release.version
+            );
             return Ok(());
         }
         std::cmp::Ordering::Greater => {}
     }
     install_release(&release, &receipt_path, &mut receipt)?;
-    println!("updated syq to {}", release.version);
+    crate::output::command_println!("updated syq to {}", release.version);
     Ok(())
 }
 

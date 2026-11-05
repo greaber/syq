@@ -119,6 +119,14 @@ pub(crate) fn write_stdout(args: Arguments<'_>) -> io::Result<()> {
     writeln!(out, "{args}").and_then(|()| out.flush())
 }
 
+/// Set once stdout's reader has gone away, as `head` does after its lines:
+/// a command's later output to stdout is dropped without trying.
+static STDOUT_CLOSED: AtomicBool = AtomicBool::new(false);
+/// Set once a command's output could not be written for another reason, as
+/// to a full disk: the failure has been reported, later output is dropped,
+/// and `exit` fails the command.
+static STDOUT_FAILED: AtomicBool = AtomicBool::new(false);
+
 pub(crate) fn warn_stdout(error: &io::Error) {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Relaxed) {
@@ -126,6 +134,134 @@ pub(crate) fn warn_stdout(error: &io::Error) {
             "syq: warning: could not write human output to stdout: {error}"
         ));
     }
+}
+
+fn command_stdout_lost() -> bool {
+    STDOUT_CLOSED.load(Relaxed) || STDOUT_FAILED.load(Relaxed)
+}
+
+/// Print a command's own output as written, such as `--version`, a listing
+/// or JSON. As coreutils do, a closed stdout ends the output quietly, as
+/// when piped into `head`: the reader has what it wanted. Any other write
+/// failure, as to a full disk, is reported once and fails the command when
+/// it exits (`exit`), so truncated output never looks complete. A copy's
+/// human output (`human_stdout!`) instead only warns.
+pub(crate) fn emit_command_stdout(args: Arguments<'_>) {
+    if command_stdout_lost() {
+        return;
+    }
+    let mut out = io::stdout().lock();
+    if let Err(error) = out.write_fmt(args).and_then(|()| out.flush()) {
+        command_stdout_failed(&error);
+    }
+}
+
+/// A command's own human output, escaped and placed as `human_stdout!`
+/// does, with failures handled as `emit_command_stdout` handles them.
+pub(crate) fn emit_command_human_stdout(args: Arguments<'_>) {
+    if command_stdout_lost() {
+        return;
+    }
+    if let Err(error) = write_stdout(format_args!("{}", safe_message(args))) {
+        command_stdout_failed(&error);
+    }
+}
+
+pub(crate) fn command_stdout_failed(error: &io::Error) {
+    if error.kind() == io::ErrorKind::BrokenPipe {
+        STDOUT_CLOSED.store(true, Relaxed);
+    } else if !STDOUT_FAILED.swap(true, Relaxed) {
+        emit_diagnostic(format_args!("syq: cannot write to stdout: {error}"));
+    }
+}
+
+/// End the process with `code`. A command whose output could not all be
+/// written, except to a closed stdout, fails with 1 instead of succeeding.
+pub(crate) fn exit(code: i32) -> ! {
+    let code = if code == 0 && STDOUT_FAILED.load(Relaxed) {
+        1
+    } else {
+        code
+    };
+    std::process::exit(code)
+}
+
+/// Print a command-line error, help or version from clap, and exit as
+/// `Error::exit` does, except that help or a version that could not be
+/// written to stdout fails as other command output does.
+pub(crate) fn exit_with(error: impl std::borrow::Borrow<clap::Error>) -> ! {
+    let error = error.borrow();
+    let printed = error.print();
+    if !error.use_stderr() {
+        if let Err(failure) = printed {
+            command_stdout_failed(&failure);
+        }
+    }
+    exit(error.exit_code())
+}
+
+/// Stdout for a command that writes its output as a stream. A failure ends
+/// the stream: the first is reported as `emit_command_stdout` reports it,
+/// and it and every later write return an error, so the command stops
+/// through its usual `?` instead of doing work nobody will read; then
+/// `exit_on_error` ends it quietly for a closed stdout. Dropping it flushes
+/// what it holds.
+pub(crate) fn command_stdout() -> CommandStdout {
+    CommandStdout(io::stdout().lock())
+}
+
+pub(crate) struct CommandStdout(io::StdoutLock<'static>);
+
+/// Set once a command's stdout stream has returned an error: the command's
+/// own failure that follows is that end, already handled. Serializers such
+/// as serde_json replace the error they were given, so the error itself
+/// cannot carry this.
+static STREAM_ENDED: AtomicBool = AtomicBool::new(false);
+
+fn stream_ended(error: io::Error) -> io::Error {
+    STREAM_ENDED.store(true, Relaxed);
+    error
+}
+
+impl Write for CommandStdout {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if command_stdout_lost() {
+            return Err(stream_ended(io::ErrorKind::BrokenPipe.into()));
+        }
+        self.0.write(buffer).map_err(|error| {
+            command_stdout_failed(&error);
+            stream_ended(error)
+        })
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if command_stdout_lost() {
+            return Err(stream_ended(io::ErrorKind::BrokenPipe.into()));
+        }
+        self.0.flush().map_err(|error| {
+            command_stdout_failed(&error);
+            stream_ended(error)
+        })
+    }
+}
+
+impl Drop for CommandStdout {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
+/// End a command that failed with `error`. When its stdout stream ended the
+/// command, that end has been handled: a closed stdout exits quietly with 0,
+/// as for a reader that stopped early, and another failure, reported when
+/// it happened, exits 1. Otherwise print `context: error` and exit with
+/// `code`.
+pub(crate) fn exit_on_error(error: &anyhow::Error, code: i32, context: &str) -> ! {
+    if STREAM_ENDED.load(Relaxed) {
+        exit(i32::from(STDOUT_FAILED.load(Relaxed)));
+    }
+    emit_diagnostic(format_args!("{context}: {error:#}"));
+    exit(code)
 }
 
 /// Pass another process's human output through to ours. After a write
@@ -156,6 +292,23 @@ pub(crate) fn pass_through(
         }
     }
 }
+
+macro_rules! command_print {
+    ($($arg:tt)*) => { $crate::output::emit_command_stdout(format_args!($($arg)*)) };
+}
+pub(crate) use command_print;
+
+macro_rules! command_human_stdout {
+    ($($arg:tt)*) => { $crate::output::emit_command_human_stdout(format_args!($($arg)*)) };
+}
+pub(crate) use command_human_stdout;
+
+macro_rules! command_println {
+    ($($arg:tt)*) => {
+        $crate::output::emit_command_stdout(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+pub(crate) use command_println;
 
 macro_rules! diagnostic {
     ($($arg:tt)*) => { $crate::output::emit_diagnostic(format_args!($($arg)*)) };

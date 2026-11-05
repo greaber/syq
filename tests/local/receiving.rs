@@ -2466,13 +2466,45 @@ fn connecting_again_replaces_a_receiving_connection_from_another_build() {
 /// stays enabled.
 #[test]
 fn a_server_refusing_remote_forwarding_is_not_redialed() {
+    refused_receiving_is_not_redialed(
+        "Error: remote port forwarding failed for listen path /tmp/syq-return-test.sock",
+        "refuses remote forwarding",
+        "then run syq persist connect test-server",
+    );
+}
+
+/// A server that rejects this machine's SSH login, as after its key was
+/// removed there, is tried again only after 30 seconds and then less and
+/// less often, rather than every half minute: it may only be an agent still
+/// locked after sleep. The status says why meanwhile.
+#[test]
+fn a_server_rejecting_the_login_is_redialed_less_often() {
+    for ssh_error in [
+        "syq@test-server: Permission denied (publickey).",
+        "Host key verification failed.",
+    ] {
+        refused_receiving_is_not_redialed(
+            ssh_error,
+            "cannot log in to test-server",
+            " s, or run syq persist connect test-server to try now",
+        );
+    }
+}
+
+/// Other commands that connect to the server try a rejected login again too,
+/// but no sooner than a while after the last attempt, so commands that come
+/// every few seconds, such as completion, do not log in again each time; and
+/// they wake the waiting connection rather than start it over, so its waits
+/// keep growing. `persist connect` tries again at once whenever it runs.
+#[cfg(debug_assertions)]
+#[test]
+fn commands_retry_a_rejected_login_no_more_than_once_a_while() {
     let t = Tmp::new();
     fs::create_dir(t.runtime()).unwrap();
     fs::create_dir(t.path("root")).unwrap();
     fs::create_dir(t.path("home")).unwrap();
+    write(&t.path("file"), b"copied");
     let ssh = fake_ssh(&t);
-    // The receiving connection asks for its return socket with -R, which
-    // this server refuses the way OpenSSH reports it.
     executable(
         &t.path("refusing-bin/ssh"),
         format!(
@@ -2480,7 +2512,219 @@ fn a_server_refusing_remote_forwarding_is_not_redialed() {
              for argument in \"$@\"; do\n\
              \x20   if [ \"$argument\" = -R ]; then\n\
              \x20       echo dialed >> \"$FAKE_FORWARD_LOG\"\n\
-             \x20       echo 'Error: remote port forwarding failed for listen path /tmp/syq-return-test.sock' >&2\n\
+             \x20       echo 'syq@test-server: Permission denied (publickey).' >&2\n\
+             \x20       exit 255\n\
+             \x20   fi\n\
+             done\n\
+             exec {} \"$@\"\n",
+            ssh.display()
+        )
+        .as_bytes(),
+    );
+    let scope = ephemeral_scope(&t);
+    let _off = ScopeOff(&t, scope.clone());
+    let environment = |command: &mut Command| {
+        command
+            .env("HOME", t.path("home"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("FAKE_FORWARD_LOG", t.path("forward.log"))
+            .env("SYQ_TEST_COMMAND_RETRY_MS", "8000")
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", t.path("refusing-bin").display()),
+            );
+    };
+    let run = |args: &[&str]| {
+        let mut command = persistence_command(&t, args);
+        command.args(["--pscope", scope.to_str().unwrap()]);
+        environment(&mut command);
+        command.run().unwrap()
+    };
+    assert_output_ok(&run(&[
+        "receive",
+        "on",
+        "--notify",
+        "off",
+        "--root",
+        &t.s("root"),
+        "--all-connections",
+    ]));
+    let connect = || {
+        let output = run(&[
+            "connect",
+            "test-server",
+            "--timeout",
+            "20",
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+        ]);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            stderr_of(&output).contains("cannot log in to test-server"),
+            "{output:?}"
+        );
+    };
+    // A copy to the server, which connects through the same persistence.
+    let copy = |name: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(["cp", &t.s("file"), "--to", "test-server", "--as"])
+            .arg(t.s(name))
+            .args(["--pscope", scope.to_str().unwrap()])
+            .args(["--syq-path", env!("CARGO_BIN_EXE_syq"), "-q"]);
+        environment(&mut command);
+        assert_output_ok(&command.run().unwrap());
+        assert_eq!(read(&t.path(name)), b"copied");
+    };
+    let dials = || fs::read(t.path("forward.log")).unwrap().len() / b"dialed\n".len();
+    let retry_in = || {
+        let status = run(&["receive", "status", "--json"]);
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        let error = status["connections"][0]["connection"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        // None while an attempt is under way, before it has failed again.
+        error
+            .split_once("trying again in ")
+            .and_then(|(_, rest)| rest.split_once(" s,"))
+            .and_then(|(seconds, _)| seconds.parse::<u64>().ok())
+    };
+    connect();
+    assert_eq!(dials(), 1);
+    // Soon after, a copy neither logs in for receiving again nor waits.
+    copy("first");
+    assert_eq!(dials(), 1);
+    // persist connect tries again at once, starting over.
+    connect();
+    assert_eq!(dials(), 2);
+    assert!(retry_in().is_some_and(|seconds| seconds <= 30));
+    // Once the interval has passed, a copy wakes the connection, which
+    // tries at once and then waits longer than it did before.
+    std::thread::sleep(std::time::Duration::from_secs(9));
+    copy("second");
+    wait_for(
+        "the woken retry",
+        std::time::Duration::from_secs(20),
+        || dials() == 3,
+    );
+    wait_for(
+        "the longer wait",
+        std::time::Duration::from_secs(20),
+        || retry_in().is_some_and(|seconds| seconds > 40),
+    );
+}
+
+/// It does try again by itself, as an agent unlocked after sleep needs.
+#[cfg(debug_assertions)]
+#[test]
+fn a_rejected_receiving_login_is_retried_by_itself() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    fs::create_dir(t.path("root")).unwrap();
+    fs::create_dir(t.path("home")).unwrap();
+    let ssh = fake_ssh(&t);
+    executable(
+        &t.path("refusing-bin/ssh"),
+        format!(
+            "#!/bin/sh\n\
+             for argument in \"$@\"; do\n\
+             \x20   if [ \"$argument\" = -R ]; then\n\
+             \x20       echo dialed >> \"$FAKE_FORWARD_LOG\"\n\
+             \x20       echo 'syq@test-server: Permission denied (publickey).' >&2\n\
+             \x20       exit 255\n\
+             \x20   fi\n\
+             done\n\
+             exec {} \"$@\"\n",
+            ssh.display()
+        )
+        .as_bytes(),
+    );
+    let scope = ephemeral_scope(&t);
+    let _off = ScopeOff(&t, scope.clone());
+    let run = |args: &[&str]| {
+        persistence_command(&t, args)
+            .args(["--pscope", scope.to_str().unwrap()])
+            .env("HOME", t.path("home"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("FAKE_FORWARD_LOG", t.path("forward.log"))
+            .env("SYQ_TEST_LOGIN_RETRY_MS", "1000")
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", t.path("refusing-bin").display()),
+            )
+            .run()
+            .unwrap()
+    };
+    assert_output_ok(&run(&[
+        "receive",
+        "on",
+        "--notify",
+        "off",
+        "--root",
+        &t.s("root"),
+        "--all-connections",
+    ]));
+    let connect = run(&[
+        "connect",
+        "test-server",
+        "--timeout",
+        "20",
+        "--syq-path",
+        env!("CARGO_BIN_EXE_syq"),
+    ]);
+    assert!(!connect.status.success(), "{connect:?}");
+    // Dialed at once, after 1 s, then after 2 s more.
+    wait_for(
+        "three dials of the rejected login",
+        std::time::Duration::from_secs(20),
+        || fs::read(t.path("forward.log")).is_ok_and(|log| log.len() >= b"dialed\n".len() * 3),
+    );
+    // Between attempts the status says why; during one it is connecting.
+    wait_for(
+        "the rejected login's status",
+        std::time::Duration::from_secs(20),
+        || {
+            let status = run(&["receive", "status", "--json"]);
+            let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+            let connection = &status["connections"][0]["connection"];
+            connection["phase"] == "failed"
+                && connection["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("cannot log in to test-server"))
+        },
+    );
+}
+
+/// Turn receiving on for a fake `test-server` whose receiving connection
+/// fails with `ssh_error`, and check that it is dialed once and then fails
+/// with a status containing `reason` and `detail`, not dialed again by
+/// itself within a few seconds, and dialed again at once by `persist
+/// connect`.
+fn refused_receiving_is_not_redialed(ssh_error: &str, reason: &str, detail: &str) {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    fs::create_dir(t.path("root")).unwrap();
+    fs::create_dir(t.path("home")).unwrap();
+    let ssh = fake_ssh(&t);
+    // The receiving connection asks for its return socket with -R; this
+    // server fails it the way OpenSSH reports it.
+    executable(
+        &t.path("refusing-bin/ssh"),
+        format!(
+            "#!/bin/sh\n\
+             for argument in \"$@\"; do\n\
+             \x20   if [ \"$argument\" = -R ]; then\n\
+             \x20       echo dialed >> \"$FAKE_FORWARD_LOG\"\n\
+             \x20       echo '{ssh_error}' >&2\n\
              \x20       exit 255\n\
              \x20   fi\n\
              done\n\
@@ -2516,35 +2760,33 @@ fn a_server_refusing_remote_forwarding_is_not_redialed() {
         &t.s("root"),
         "--all-connections",
     ]));
-    let started = std::time::Instant::now();
-    let connect = run(&[
-        "connect",
-        "test-server",
-        "--timeout",
-        "20",
-        "--syq-path",
-        env!("CARGO_BIN_EXE_syq"),
-    ]);
-    assert!(!connect.status.success(), "{connect:?}");
-    let stderr = stderr_of(&connect);
-    assert!(stderr.contains("refuses remote forwarding"), "{stderr}");
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(15),
-        "connect waited for its whole timeout: {stderr}"
-    );
-    // A redial would come one second after the refusal, then two more.
-    std::thread::sleep(std::time::Duration::from_secs(4));
-    assert_eq!(read(&t.path("forward.log")), b"dialed\n");
-    let status = run(&["receive", "status", "--json"]);
-    assert_output_ok(&status);
-    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
-    let connection = &status["connections"][0]["connection"];
-    assert_eq!(connection["phase"], "failed", "{status}");
-    assert!(
-        connection["error"]
-            .as_str()
-            .unwrap()
-            .contains("refuses remote forwarding"),
-        "{status}"
-    );
+    for dials in [b"dialed\n".as_slice(), b"dialed\ndialed\n"] {
+        let started = std::time::Instant::now();
+        let connect = run(&[
+            "connect",
+            "test-server",
+            "--timeout",
+            "20",
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+        ]);
+        assert!(!connect.status.success(), "{connect:?}");
+        let stderr = stderr_of(&connect);
+        assert!(stderr.contains(reason), "{stderr}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "connect waited for its whole timeout: {stderr}"
+        );
+        // A redial on the reconnecting schedule would come one second
+        // after the refusal, then two more.
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        assert_eq!(read(&t.path("forward.log")), dials, "{ssh_error}");
+        let status = run(&["receive", "status", "--json"]);
+        assert_output_ok(&status);
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        let connection = &status["connections"][0]["connection"];
+        assert_eq!(connection["phase"], "failed", "{status}");
+        let error = connection["error"].as_str().unwrap();
+        assert!(error.contains(reason) && error.contains(detail), "{status}");
+    }
 }

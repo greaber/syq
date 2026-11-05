@@ -81,7 +81,7 @@ impl Settings {
         self.enabled && (self.servers.is_empty() || self.servers.iter().any(|s| s == endpoint))
     }
     fn print_paths(&self) {
-        crate::output::human_stdout!(
+        crate::output::command_human_stdout!(
             "cwd: {} ({})",
             self.cwd.display(),
             if self.cwd_explicit {
@@ -91,15 +91,19 @@ impl Settings {
             }
         );
         if let Some(root) = &self.root {
-            crate::output::human_stdout!("root: {}", root.display());
+            crate::output::command_human_stdout!("root: {}", root.display());
         }
         match &self.auto_approve_root {
-            Some(root) => crate::output::human_stdout!("auto-approve-root: {}", root.display()),
+            Some(root) => {
+                crate::output::command_human_stdout!("auto-approve-root: {}", root.display())
+            }
             None => {
-                crate::output::human_stdout!("auto-approve-root: none (ask for every download)")
+                crate::output::command_human_stdout!(
+                    "auto-approve-root: none (ask for every download)"
+                )
             }
         }
-        crate::output::human_stdout!(
+        crate::output::command_human_stdout!(
             "connections: {}",
             if self.servers.is_empty() {
                 "all".into()
@@ -521,6 +525,13 @@ pub(crate) struct ConnectionState {
     pub phase: String,
     pub error: Option<String>,
     pub ssh_pid: Option<u32>,
+    /// When the connection last started to log in.
+    #[serde(skip)]
+    pub attempted: Option<Instant>,
+    /// When a failed connection tries again by itself, and the rest of the
+    /// status's sentence about it. `shown` renders the time left.
+    #[serde(skip)]
+    pub retry: Option<(Instant, String)>,
 }
 impl Default for ConnectionState {
     fn default() -> Self {
@@ -528,7 +539,22 @@ impl Default for ConnectionState {
             phase: "starting".into(),
             error: None,
             ssh_pid: None,
+            attempted: None,
+            retry: None,
         }
+    }
+}
+impl ConnectionState {
+    /// The state as a status shows it, with the time left before a retry.
+    fn shown(&self) -> Self {
+        let mut shown = self.clone();
+        if let (Some(error), Some((at, rest))) = (&shown.error, &self.retry) {
+            shown.error = Some(format!(
+                "{error}; trying again in {}{rest}",
+                crate::destination::retry_wait(at.saturating_duration_since(Instant::now()))
+            ));
+        }
+        shown
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -563,6 +589,22 @@ struct LocalRequest {
     decision: Option<Decision>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     retry: bool,
+    /// Restart failed connections now, whenever they last tried, as
+    /// `persist connect` asks. Only a service of the same build receives it
+    /// (`ensure_inner`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    restart: bool,
+}
+
+/// What a request asks the service to do with its failed connections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Retry {
+    No,
+    /// A command connected to the server: try again if a while has passed
+    /// since the last attempt.
+    IfDue,
+    /// `persist connect`: start a failed connection over at once.
+    Now,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -581,13 +623,13 @@ fn status(control: &Path, stop: bool) -> Result<Status> {
     query(control, stop, None)
 }
 fn query(control: &Path, stop: bool, decision: Option<Decision>) -> Result<Status> {
-    query_retry(control, stop, decision, false)
+    query_retry(control, stop, decision, Retry::No)
 }
 fn query_retry(
     control: &Path,
     stop: bool,
     decision: Option<Decision>,
-    retry: bool,
+    retry: Retry,
 ) -> Result<Status> {
     let mut socket = UnixStream::connect(suffixed(control, SOCKET))?;
     socket.set_read_timeout(Some(Duration::from_secs(1)))?;
@@ -598,7 +640,8 @@ fn query_retry(
             version: VERSION,
             stop,
             decision,
-            retry,
+            retry: retry == Retry::IfDue,
+            restart: retry == Retry::Now,
         },
     )?;
     let result: Status = read_status(&mut socket)?;
@@ -628,7 +671,7 @@ fn unanswered(error: &anyhow::Error) -> bool {
 }
 /// Query the service holding this control's lock, waiting up to `timeout` for
 /// it to answer while it starts or stops. None once no service holds the lock.
-fn running_status(control: &Path, retry: bool, timeout: Duration) -> Result<Option<Status>> {
+fn running_status(control: &Path, retry: Retry, timeout: Duration) -> Result<Option<Status>> {
     let deadline = Instant::now() + timeout;
     while is_running(control) {
         match query_retry(control, false, None, retry) {
@@ -715,7 +758,7 @@ fn read_spec(control: &Path) -> Result<ServiceSpec> {
 /// Called after a successful ordinary persistent SSH control connection. A
 /// failed return setup is visible but does not invalidate that ordinary copy.
 pub(crate) fn ensure(domain: &Domain, control: &Path, remote: &crate::conn::RemoteSpec) {
-    if let Err(error) = ensure_inner(domain, control, remote) {
+    if let Err(error) = ensure_inner(domain, control, remote, Retry::IfDue) {
         crate::output::diagnostic!(
             "syq: background receiving through {}: {error:#}",
             remote.label()
@@ -729,7 +772,7 @@ pub(crate) fn ensure_ready(
     remote: &crate::conn::RemoteSpec,
     timeout: Duration,
 ) -> Result<Option<Vec<String>>> {
-    if !ensure_inner(domain, control, remote)? {
+    if !ensure_inner(domain, control, remote, Retry::Now)? {
         return Ok(None);
     }
     let deadline = Instant::now() + timeout;
@@ -805,7 +848,15 @@ pub(crate) fn profile_names(domain: &Domain) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn ensure_inner(domain: &Domain, control: &Path, remote: &crate::conn::RemoteSpec) -> Result<bool> {
+/// `retry` is what to do with a failed connection to this server: what a
+/// command connecting to it asks (`Retry::IfDue`), or `persist connect`
+/// (`Retry::Now`).
+fn ensure_inner(
+    domain: &Domain,
+    control: &Path,
+    remote: &crate::conn::RemoteSpec,
+    retry: Retry,
+) -> Result<bool> {
     let scope = control.parent().context("persistence scope missing")?;
     crate::persistence::validate_scope(scope)?;
     anyhow::ensure!(
@@ -825,10 +876,10 @@ fn ensure_inner(domain: &Domain, control: &Path, remote: &crate::conn::RemoteSpe
         .iter()
         .any(|p| p.allows_server(&remote.label()));
     if allowed {
-        if let Some(state) = running_status(control, false, ANSWER_TIMEOUT)? {
+        if let Some(state) = running_status(control, Retry::No, ANSWER_TIMEOUT)? {
             if state.identity != crate::identity::build() {
                 stop_inner(control, false)?;
-            } else if running_status(control, true, ANSWER_TIMEOUT)?.is_some() {
+            } else if running_status(control, retry, ANSWER_TIMEOUT)?.is_some() {
                 return Ok(true);
             }
         }
@@ -945,11 +996,14 @@ impl Drop for SocketCleanup {
 }
 struct Worker {
     stop: Arc<AtomicBool>,
+    /// Dropped to wake the thread from its waits as soon as it is stopped.
+    wake: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<Result<()>>>,
 }
 impl Drop for Worker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        drop(self.wake.take());
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -959,7 +1013,7 @@ struct ProfileWorker {
     config: Settings,
     state: Arc<Mutex<ConnectionState>>,
     approvals: Arc<crate::receive_approval::Queue>,
-    _worker: Worker,
+    worker: Worker,
 }
 impl ProfileWorker {
     fn new(domain: &Domain, config: Settings, spec: ServiceSpec) -> Self {
@@ -967,6 +1021,7 @@ impl ProfileWorker {
         let approvals = Arc::new(crate::receive_approval::Queue::new(domain.clone()));
         approvals.set_notifications(config.notifications);
         let stop = Arc::new(AtomicBool::new(false));
+        let (wake, woken) = std::sync::mpsc::channel();
         let (thread_state, thread_approvals, thread_stop, thread_config) = (
             state.clone(),
             approvals.clone(),
@@ -984,16 +1039,17 @@ impl ProfileWorker {
                     thread_config,
                     spec,
                     thread_stop,
+                    woken,
                     thread_state.clone(),
                     thread_approvals,
                 )
             };
             if let Err(error) = &result {
-                *thread_state.lock().unwrap() = ConnectionState {
-                    phase: "failed".into(),
-                    error: Some(format!("{error:#}")),
-                    ssh_pid: None,
-                };
+                let mut state = thread_state.lock().unwrap();
+                state.phase = "failed".into();
+                state.error = Some(format!("{error:#}"));
+                state.ssh_pid = None;
+                state.retry = None;
             }
             result
         });
@@ -1001,8 +1057,9 @@ impl ProfileWorker {
             config,
             state,
             approvals,
-            _worker: Worker {
+            worker: Worker {
                 stop,
+                wake: Some(wake),
                 thread: Some(thread),
             },
         }
@@ -1010,7 +1067,7 @@ impl ProfileWorker {
     fn snapshot(&self) -> ProfileStatus {
         ProfileStatus {
             settings: self.config.clone(),
-            connection: self.state.lock().unwrap().clone(),
+            connection: self.state.lock().unwrap().shown(),
             pending: self.approvals.snapshots(),
         }
     }
@@ -1020,7 +1077,7 @@ fn reconcile(
     workers: &mut Vec<ProfileWorker>,
     config: &Preferences,
     spec: &ServiceSpec,
-    retry: bool,
+    retry: Retry,
 ) {
     workers.retain_mut(|worker| {
         let Some(profile) = config.profiles.iter().find(|profile| {
@@ -1030,7 +1087,46 @@ fn reconcile(
         };
         worker.approvals.set_notifications(profile.notifications);
         worker.config = profile.clone();
-        !(retry && worker.state.lock().unwrap().phase == "failed")
+        let mut state = worker.state.lock().unwrap();
+        if state.phase != "failed" {
+            return true;
+        }
+        match retry {
+            Retry::No => true,
+            // Start over, with the first short wait.
+            Retry::Now => false,
+            // A command connected: try again at once, but no sooner than a
+            // while after the last attempt, since commands such as
+            // completion may come every few seconds and each retry of a
+            // rejected login is another failed login on the server. A
+            // connection still waiting to retry is woken, keeping its
+            // growing waits; one that stopped is started over.
+            Retry::IfDue => {
+                let due = state.attempted.is_none_or(|attempted| {
+                    attempted.elapsed() >= crate::destination::command_retry_interval()
+                });
+                if !due {
+                    return true;
+                }
+                let running = worker
+                    .worker
+                    .thread
+                    .as_ref()
+                    .is_some_and(|thread| !thread.is_finished());
+                if running
+                    && worker
+                        .worker
+                        .wake
+                        .as_ref()
+                        .is_some_and(|wake| wake.send(()).is_ok())
+                {
+                    // Under way: later commands wait for this attempt.
+                    state.attempted = Some(Instant::now());
+                    return true;
+                }
+                false
+            }
+        }
     });
     for profile in config
         .profiles
@@ -1057,6 +1153,7 @@ fn aggregate(profiles: &[ProfileStatus]) -> (String, ConnectionState) {
             phase: "disabled".into(),
             error: None,
             ssh_pid: None,
+            ..Default::default()
         });
     (name, connection)
 }
@@ -1080,7 +1177,7 @@ fn apply_preferences(domain: &Domain, config: &Preferences) -> Result<()> {
             stop_inner(&control, false)?;
             continue;
         }
-        if running_status(&control, false, ANSWER_TIMEOUT)?
+        if running_status(&control, Retry::No, ANSWER_TIMEOUT)?
             .is_some_and(|state| state.identity != crate::identity::build())
         {
             stop_inner(&control, false)?;
@@ -1211,7 +1308,7 @@ fn run(domain: &Domain, control: &Path) -> Result<()> {
             }
             if last_check.elapsed() >= Duration::from_millis(200) {
                 config = preferences(domain)?;
-                reconcile(domain, &mut workers, &config, &spec, false);
+                reconcile(domain, &mut workers, &config, &spec, Retry::No);
                 last_check = Instant::now();
             }
             match listener.accept() {
@@ -1223,8 +1320,15 @@ fn run(domain: &Domain, control: &Path) -> Result<()> {
                             if request.stop {
                                 shutdown.store(true, Ordering::Release);
                             }
-                            if request.retry {
-                                reconcile(domain, &mut workers, &config, &spec, true);
+                            let retry = if request.restart {
+                                Retry::Now
+                            } else if request.retry {
+                                Retry::IfDue
+                            } else {
+                                Retry::No
+                            };
+                            if retry != Retry::No {
+                                reconcile(domain, &mut workers, &config, &spec, retry);
                             }
                             let decision_error = request.decision.and_then(|decision| {
                                 workers
@@ -1296,6 +1400,7 @@ fn statuses(domain: &Domain) -> Result<Vec<Status>> {
                         phase: "inactive".into(),
                         error: None,
                         ssh_pid: None,
+                        ..Default::default()
                     },
                 })
             })
@@ -1421,7 +1526,7 @@ fn configure(domain: &Domain, options: Configure) -> Result<()> {
             failures.join("; ")
         );
     }
-    crate::output::human_stdout!("Receiving is on: {}", config.name);
+    crate::output::command_human_stdout!("Receiving is on: {}", config.name);
     config.print_paths();
     Ok(())
 }
@@ -1446,15 +1551,15 @@ fn pending(domain: &Domain, json: bool, wait: bool, timeout: u64) -> Result<()> 
         }
         if !wait || !requests.is_empty() {
             if json {
-                println!("{}", serde_json::to_string(&requests)?);
+                crate::output::command_println!("{}", serde_json::to_string(&requests)?);
             } else if requests.is_empty() {
-                crate::output::human_stdout!("No requests awaiting approval");
+                crate::output::command_human_stdout!("No requests awaiting approval");
             } else {
                 // Dim arguments naming files the server reads and this machine
                 // cannot check.
                 let terminal = std::io::IsTerminal::is_terminal(&std::io::stdout());
                 for request in requests {
-                    crate::output::human_stdout!(
+                    crate::output::command_human_stdout!(
                         "{}\n{}\nNotification: {}\n",
                         request.id,
                         request.description(domain, |word| if terminal {
@@ -1501,7 +1606,7 @@ fn decide(domain: &Domain, id: &str, allow: bool, remember: bool) -> Result<()> 
             if let Some(error) = response.decision_error {
                 bail!("{error}");
             }
-            crate::output::human_stdout!(
+            crate::output::command_human_stdout!(
                 "{} {id}",
                 if remember {
                     "Approved and remembered"
@@ -1534,7 +1639,7 @@ fn decide(domain: &Domain, id: &str, allow: bool, remember: bool) -> Result<()> 
                     remember,
                 },
             )?;
-            crate::output::human_stdout!(
+            crate::output::command_human_stdout!(
                 "{} {id}",
                 if remember {
                     "Approved and remembered"
@@ -1658,12 +1763,12 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                             .map(serde_json::to_value)
                             .collect::<std::result::Result<Vec<_>, _>>()?,
                     );
-                    println!("{}", serde_json::to_string(&rows)?);
+                    crate::output::command_println!("{}", serde_json::to_string(&rows)?);
                 } else if permissions.is_empty() && provider_permissions.is_empty() {
-                    crate::output::human_stdout!("No remembered account permissions");
+                    crate::output::command_human_stdout!("No remembered account permissions");
                 } else {
                     for item in permissions {
-                        crate::output::human_stdout!(
+                        crate::output::command_human_stdout!(
                             "{}  {} -> {} (receiving profile @{})",
                             item.id,
                             permission_account_label(&item.permission.source),
@@ -1672,7 +1777,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                         );
                     }
                     for item in provider_permissions {
-                        crate::output::human_stdout!(
+                        crate::output::command_human_stdout!(
                             "{}  {} -> {} (provider profile {})",
                             item.id,
                             item.permission.provider.label(),
@@ -1693,7 +1798,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                     // Keep the original store's ID validation and not-found diagnostic.
                     crate::receive_approval::accounts::remove(domain, &id)?;
                 }
-                crate::output::human_stdout!("Removed {id}; future authentications require approval. Already authenticated sessions may continue.");
+                crate::output::command_human_stdout!("Removed {id}; future authentications require approval. Already authenticated sessions may continue.");
             }
         },
         Action::Off { name } => {
@@ -1709,7 +1814,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
             }
             save_settings(domain, &config)?;
             apply_preferences(domain, &config)?;
-            crate::output::human_stdout!(
+            crate::output::command_human_stdout!(
                 "Selected receiving profiles are off; ordinary SSH persistence is unchanged"
             );
         }
@@ -1725,7 +1830,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
             config.profiles.remove(index);
             save_settings(domain, &config)?;
             apply_preferences(domain, &config)?;
-            crate::output::human_stdout!("Removed receiving profile {name}");
+            crate::output::command_human_stdout!("Removed receiving profile {name}");
         }
         Action::Status { json, name } => {
             let config = preferences(domain)?;
@@ -1760,7 +1865,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                 .filter(|p| name.as_ref().is_none_or(|n| n == &p.name))
                 .collect();
             if json {
-                println!(
+                crate::output::command_println!(
                     "{}",
                     serde_json::to_string(
                         &serde_json::json!({ "settings": selected[0], "profiles": selected, "connections": connections, "provider": local_provider })
@@ -1768,7 +1873,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                 );
             } else {
                 for config in selected {
-                    crate::output::human_stdout!(
+                    crate::output::command_human_stdout!(
                         "Receiving is {}: {}",
                         if config.enabled { "on" } else { "off" },
                         config.name
@@ -1777,7 +1882,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                 }
                 if let Some(provider) = local_provider {
                     for profile in provider.profiles {
-                        crate::output::human_stdout!(
+                        crate::output::command_human_stdout!(
                             "  local SSH provider {}: {} sessions ({} pending)",
                             profile.settings.name,
                             profile.sessions,
@@ -1787,7 +1892,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                 }
                 for state in connections {
                     if state.profiles.is_empty() {
-                        crate::output::human_stdout!(
+                        crate::output::command_human_stdout!(
                             "  {}: {}{}",
                             state.endpoint,
                             state.connection.phase,
@@ -1804,7 +1909,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                         .iter()
                         .filter(|p| name.as_ref().is_none_or(|n| n == &p.settings.name))
                     {
-                        crate::output::human_stdout!(
+                        crate::output::command_human_stdout!(
                             "  {} @{}: {} ({} pending){}",
                             state.endpoint,
                             profile.settings.name,
@@ -1985,10 +2090,12 @@ mod tests {
                 phase: "online".into(),
                 error: None,
                 ssh_pid: Some(42),
+                ..Default::default()
             })),
             approvals: approvals.clone(),
-            _worker: Worker {
+            worker: Worker {
                 stop: stop.clone(),
+                wake: None,
                 thread: None,
             },
         }];
@@ -2009,7 +2116,7 @@ mod tests {
             version: PREFERENCES_VERSION,
             profiles: vec![settings],
         };
-        reconcile(&Domain::default(), &mut workers, &config, &spec, false);
+        reconcile(&Domain::default(), &mut workers, &config, &spec, Retry::No);
         assert_eq!(workers.len(), 1);
         assert!(Arc::ptr_eq(&workers[0].approvals, &approvals));
         assert!(!stop.load(Ordering::Acquire));
@@ -2025,7 +2132,7 @@ mod tests {
 
         // Access changes still remove the old worker, including its authority.
         config.profiles[0].servers = vec!["other".into()];
-        reconcile(&Domain::default(), &mut workers, &config, &spec, false);
+        reconcile(&Domain::default(), &mut workers, &config, &spec, Retry::No);
         assert!(workers.is_empty());
         assert!(stop.load(Ordering::Acquire));
     }
@@ -2205,6 +2312,7 @@ mod tests {
                         phase: "failed".into(),
                         error: Some("e".repeat(8192)),
                         ssh_pid: None,
+                        ..Default::default()
                     },
                 }
             })
@@ -2318,6 +2426,7 @@ mod tests {
                 stop,
                 decision: None,
                 retry: false,
+                restart: false,
             };
             assert_eq!(serde_json::to_string(&request).unwrap(), old);
             let decoded: LocalRequest = serde_json::from_str(old).unwrap();
@@ -2356,7 +2465,7 @@ mod tests {
                 }
             };
             let request = read_control_request(&mut client).unwrap();
-            assert!(!request.stop && !request.retry);
+            assert!(!request.stop && !request.retry && !request.restart);
             let state = Status {
                 version: VERSION,
                 identity: crate::identity::build().into(),
@@ -2371,7 +2480,7 @@ mod tests {
             };
             write_status(&mut client, &state).unwrap();
         });
-        let state = running_status(&control, false, ANSWER_TIMEOUT).unwrap();
+        let state = running_status(&control, Retry::No, ANSWER_TIMEOUT).unwrap();
         service.join().unwrap();
         assert_eq!(state.unwrap().pid, 4242);
     }
@@ -2380,7 +2489,7 @@ mod tests {
     fn a_locked_service_that_never_answers_fails_with_its_socket() {
         let (_root, control, _lock) = locked_control();
         let started = Instant::now();
-        let error = running_status(&control, false, Duration::from_millis(200)).unwrap_err();
+        let error = running_status(&control, Retry::No, Duration::from_millis(200)).unwrap_err();
         let elapsed = started.elapsed();
         assert!(
             elapsed >= Duration::from_millis(200) && elapsed < Duration::from_secs(5),
@@ -2404,7 +2513,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             drop(lock);
         });
-        assert!(running_status(&control, false, Duration::from_secs(10))
+        assert!(running_status(&control, Retry::No, Duration::from_secs(10))
             .unwrap()
             .is_none());
         stopped.join().unwrap();

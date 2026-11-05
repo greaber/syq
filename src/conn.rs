@@ -25,6 +25,7 @@ mod local;
 mod replies;
 mod reverse_tcp;
 mod ssh_auth;
+pub(crate) use ssh_auth::login_rejection;
 mod ssh_multiplexer;
 mod tcp_socket;
 pub(crate) use replies::Replies;
