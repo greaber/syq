@@ -913,13 +913,36 @@ pub(crate) fn protect_keeper_inheritance(command: &mut Command) -> Result<()> {
     Ok(())
 }
 
-/// What the keeper sends the command that started it: that it asked for
-/// approval, then its result. `Ok` and `Err` match how `Result` serializes.
+/// What the keeper sends the command that started it: that it waits for a
+/// person's approval, then its result. `Ok` and `Err` match how `Result`
+/// serializes. `earlier` says that another command asked for this account
+/// first.
 #[derive(Serialize, Deserialize)]
 enum KeeperMessage {
-    Asking { who: String, what: String },
+    Waiting {
+        who: String,
+        what: String,
+        earlier: bool,
+    },
     Ok(String),
     Err(String),
+}
+
+/// How long an approval request may go unanswered before the command says
+/// it waits: a remembered or session approval answers sooner, without a
+/// person.
+const UNANSWERED: Duration = Duration::from_secs(1);
+
+/// Tell the command that started this keeper that it waits for approval.
+fn report_waiting(request: &SessionRequest, earlier: bool) -> Result<()> {
+    super::super::write_message(
+        &mut std::io::stdout().lock(),
+        &KeeperMessage::Waiting {
+            who: request.provider.label(),
+            what: format!("SSH access to {}", request.destination.host),
+            earlier,
+        },
+    )
 }
 
 fn start(domain: &Domain, request: SessionRequest, plan: resolution::Plan) -> Result<()> {
@@ -958,7 +981,7 @@ fn start(domain: &Domain, request: SessionRequest, plan: resolution::Plan) -> Re
     let (sender, receiver) = std::sync::mpsc::sync_channel(2);
     let reader = std::thread::spawn(move || loop {
         let message: Result<KeeperMessage> = super::super::read_message(&mut parent);
-        let last = !matches!(message, Ok(KeeperMessage::Asking { .. }));
+        let last = !matches!(message, Ok(KeeperMessage::Waiting { .. }));
         if sender.send(message).is_err() || last {
             break;
         }
@@ -968,8 +991,12 @@ fn start(domain: &Domain, request: SessionRequest, plan: resolution::Plan) -> Re
     let mut said = false;
     let result = loop {
         match receiver.recv_timeout(POLL) {
-            Ok(Ok(KeeperMessage::Asking { who, what })) => {
-                super::super::notices::waiting(&who, &what);
+            Ok(Ok(KeeperMessage::Waiting { who, what, earlier })) => {
+                if earlier {
+                    super::super::notices::waiting_for_earlier(&who, &what);
+                } else {
+                    super::super::notices::waiting(&who, &what);
+                }
                 said = true;
                 continue;
             }
@@ -1070,7 +1097,9 @@ fn keeper(startup: Startup) -> Result<()> {
         bail!("SSH authority lock must be an owner-only file");
     }
     let signals = foreground::Signals::new()?;
-    let deadline = Instant::now() + Duration::from_secs(330);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(330);
+    let mut reported = false;
     loop {
         if !startup_open(&domain, &startup)? || signals.received.load(Ordering::Acquire) != 0 {
             bail!("SSH account setup cancelled while waiting for another request");
@@ -1093,6 +1122,11 @@ fn keeper(startup: Startup) -> Result<()> {
         if Instant::now() >= deadline {
             bail!("another SSH account request did not become ready within 330 seconds");
         }
+        // Another command asked for this account and has no answer yet.
+        if !reported && started.elapsed() >= UNANSWERED {
+            report_waiting(&request, true)?;
+            reported = true;
+        }
         signals.wait(POLL)?;
     }
     let approval_request = request.clone();
@@ -1101,21 +1135,16 @@ fn keeper(startup: Startup) -> Result<()> {
     let selected = selected.clone();
     let approval_local = local.clone();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    // When the request went to the provider.
+    let asked = std::sync::Arc::new(std::sync::OnceLock::new());
+    let asked_in_thread = asked.clone();
     // The keeper is a dedicated child process. If setup is cancelled, it exits
     // and closes the pending return request even while approval is blocked.
     std::thread::Builder::new()
         .name("syq-ssh-approve".into())
         .spawn(move || {
-            // The keeper's stderr goes nowhere; the foreground says it waits.
             let asking = || {
-                let _ = super::super::write_message(
-                    // Locked for the whole frame, so the keeper's result cannot split it.
-                    &mut std::io::stdout().lock(),
-                    &KeeperMessage::Asking {
-                        who: approval_request.provider.label(),
-                        what: format!("SSH access to {}", approval_request.destination.host),
-                    },
-                );
+                let _ = asked_in_thread.set(Instant::now());
             };
             let _ = sender.send(super::super::ssh_auth::authorize_expected(
                 &approval_domain,
@@ -1128,6 +1157,7 @@ fn keeper(startup: Startup) -> Result<()> {
             ));
         })?;
     let approval_deadline = Instant::now() + Duration::from_secs(330);
+    let mut reported_request = false;
     let session = loop {
         if signals.received.load(Ordering::Acquire) != 0 || !startup_open(&domain, &startup)? {
             bail!("persistent SSH setup cancelled before approval");
@@ -1141,6 +1171,15 @@ fn keeper(startup: Startup) -> Result<()> {
         }
         if Instant::now() >= approval_deadline {
             bail!("persistent SSH authorization exceeded its deadline");
+        }
+        // The keeper's stderr goes nowhere; the command says it waits.
+        if !reported_request
+            && asked
+                .get()
+                .is_some_and(|at: &Instant| at.elapsed() >= UNANSWERED)
+        {
+            report_waiting(&request, false)?;
+            reported_request = true;
         }
     };
     let options = session.options();

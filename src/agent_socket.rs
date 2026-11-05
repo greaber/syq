@@ -14,7 +14,8 @@ pub(crate) const VARIABLE: &str = "SSH_AUTH_SOCK";
 
 /// Connect to the agent at `socket` without waiting: a Unix stream connect
 /// completes at once or fails, and a full listen queue (EAGAIN on Linux)
-/// still means an agent is there.
+/// still means an agent is there. The stream stays nonblocking; `wait`
+/// paces its I/O.
 fn connect(socket: &Path) -> io::Result<Option<UnixStream>> {
     use socket2::{Domain, SockAddr, Socket, Type};
     let stream = Socket::new(Domain::UNIX, Type::STREAM, None)?;
@@ -24,7 +25,6 @@ fn connect(socket: &Path) -> io::Result<Option<UnixStream>> {
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
         Err(error) => return Err(error),
     }
-    stream.set_nonblocking(false)?;
     let descriptor: std::os::fd::OwnedFd = stream.into();
     Ok(Some(descriptor.into()))
 }
@@ -80,30 +80,49 @@ pub(crate) fn inspect(socket: &Path, deadline: Instant) -> Agent {
     }
 }
 
-fn remaining(deadline: Instant) -> io::Result<Duration> {
-    let left = deadline.saturating_duration_since(Instant::now());
-    if left.is_zero() {
-        return Err(io::ErrorKind::TimedOut.into());
+/// Wait until `stream` is ready for `events` or `deadline` passes. Polling
+/// leaves socket options alone: macOS refuses to set a timeout on a socket
+/// whose peer has already closed, as an agent may once it has answered.
+fn wait(stream: &UnixStream, events: libc::c_short, deadline: Instant) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        let milliseconds = left.as_millis().clamp(1, libc::c_int::MAX as u128) as libc::c_int;
+        // SAFETY: one valid pollfd for the duration of the call.
+        match unsafe { libc::poll(&mut descriptor, 1, milliseconds) } {
+            0 => {}
+            count if count > 0 => return Ok(()),
+            _ => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
     }
-    Ok(left)
-}
-
-fn timed_out(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
-    )
 }
 
 /// Write all of `bytes` before `deadline`, however the peer paces reads.
 fn write_by(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
     use std::io::Write;
     while !bytes.is_empty() {
-        stream.set_write_timeout(Some(remaining(deadline)?))?;
+        wait(stream, libc::POLLOUT, deadline)?;
         match stream.write(bytes) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(count) => bytes = &bytes[count..],
-            Err(error) if timed_out(&error) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
             Err(error) => return Err(error),
         }
     }
@@ -114,11 +133,15 @@ fn write_by(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> io:
 fn read_by(stream: &mut UnixStream, mut buffer: &mut [u8], deadline: Instant) -> io::Result<()> {
     use std::io::Read;
     while !buffer.is_empty() {
-        stream.set_read_timeout(Some(remaining(deadline)?))?;
+        wait(stream, libc::POLLIN, deadline)?;
         match stream.read(buffer) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(count) => buffer = &mut buffer[count..],
-            Err(error) if timed_out(&error) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
             Err(error) => return Err(error),
         }
     }
@@ -162,7 +185,7 @@ pub(crate) fn repair_from_tmux() {
             session.display()
         );
     }
-    // SAFETY: main calls this before starting any threads.
+    // SAFETY: callers run this before the process starts any threads.
     unsafe { std::env::set_var(VARIABLE, session) };
 }
 

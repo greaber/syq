@@ -166,7 +166,9 @@ fn max_files_per_process() -> Option<libc::rlim_t> {
 }
 
 /// Whether a parsed copy, removal or listing names an SSH endpoint, so that
-/// it can start ssh. Receiving names and object storage use no SSH login.
+/// it can start ssh: among its locations, its rsync-style paths, or a
+/// descriptor copy's one location. Receiving names and object storage use no
+/// SSH login.
 fn reaches_ssh(args: &cli::Args) -> bool {
     if args.s3.is_some() {
         return false;
@@ -179,9 +181,54 @@ fn reaches_ssh(args: &cli::Args) -> bool {
     };
     args.locations.iter().any(ssh)
         || args
+            .descriptor_copy
+            .as_ref()
+            .and_then(|plan| plan.location.as_ref())
+            .is_some_and(ssh)
+        || args
             .paths
             .iter()
             .any(|path| cli::Location::parse(path).is_ok_and(|location| ssh(&location)))
+}
+
+/// Whether `syq ssh`, `syq persist` or `syq receiver` can start ssh, now or
+/// through a background service it starts. Help, listings and local
+/// settings cannot, and need not ask tmux about the agent socket.
+fn may_start_ssh(argv: &[std::ffi::OsString]) -> bool {
+    let words: Vec<&str> = argv
+        .iter()
+        .skip(1)
+        .map(|word| word.to_str().unwrap_or(""))
+        .take_while(|word| *word != "--")
+        .collect();
+    let Some((command, rest)) = words.split_first() else {
+        return false;
+    };
+    if rest
+        .iter()
+        .any(|word| matches!(*word, "-h" | "--help" | "--help-all"))
+    {
+        return false;
+    }
+    // The actions, skipping options and the value of --pscope.
+    let mut actions = Vec::new();
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        if *word == "--pscope" {
+            words.next();
+        } else if !word.starts_with('-') {
+            actions.push(*word);
+        }
+    }
+    match *command {
+        "ssh" => true,
+        "receiver" => matches!(actions.first(), Some(&("enroll" | "revoke"))),
+        "persist" => matches!(
+            actions.as_slice(),
+            ["connect", ..] | ["on", ..] | ["receive", "on", ..]
+        ),
+        _ => false,
+    }
 }
 
 fn main() {
@@ -321,12 +368,10 @@ fn run() {
         crate::output::exit_on_error(&error, 2, "syq");
     }
     destination::handoff::record_command_line(&argv);
-    // Commands that can start ssh, before they start it or any thread. The
-    // copy commands check their endpoints after parsing, below.
-    if matches!(
-        argv.get(1).and_then(|arg| arg.to_str()),
-        Some("ssh" | "exec" | "persist" | "receiver")
-    ) {
+    // Before these commands start ssh, or any thread. The copy commands
+    // check their endpoints after parsing, below, and completion before it
+    // lists a remote directory.
+    if may_start_ssh(&argv) {
         agent_socket::repair_from_tmux();
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("ssh") {
@@ -476,6 +521,44 @@ fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_commands_that_can_start_ssh_ask_tmux_about_the_agent() {
+        let starts = |words: &str| {
+            let argv: Vec<std::ffi::OsString> = std::iter::once("syq")
+                .chain(words.split(' '))
+                .map(Into::into)
+                .collect();
+            super::may_start_ssh(&argv)
+        };
+        for words in [
+            "ssh backup",
+            "ssh -t backup -- --help",
+            "persist connect backup",
+            "persist --pscope /tmp/scope connect backup",
+            "persist on",
+            "persist receive on --connection server",
+            "receiver revoke backup",
+            "receiver enroll backup",
+        ] {
+            assert!(starts(words), "{words}");
+        }
+        for words in [
+            "ssh --help",
+            "persist auth-from --for backup",
+            "persist --pscope connect status",
+            "persist receive status",
+            "persist receive pending",
+            "persist status",
+            "persist connect --help",
+            "receiver list",
+            "receiver help revoke",
+            "exec --on @laptop -- true",
+            "completion bash",
+        ] {
+            assert!(!starts(words), "{words}");
+        }
+    }
+
     #[test]
     fn raise_nofile_reaches_its_target() {
         let target = super::nofile_raise_target();

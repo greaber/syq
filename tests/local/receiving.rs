@@ -1765,6 +1765,9 @@ struct HeldLaptop {
     requests: std::sync::mpsc::Receiver<serde_json::Value>,
     release: std::sync::mpsc::Sender<()>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether requests wait for the test, as for a person, or are refused
+    /// at once, as a remembered decision would answer.
+    holding: std::sync::Arc<std::sync::atomic::AtomicBool>,
     responder: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -1790,6 +1793,7 @@ impl HeldLaptop {
             requests: std::sync::mpsc::channel().1,
             release: std::sync::mpsc::channel().0,
             stop: Default::default(),
+            holding: std::sync::Arc::new(true.into()),
             responder: None,
         };
         let identity = String::from_utf8(
@@ -1819,6 +1823,7 @@ impl HeldLaptop {
         let (request_sender, requests) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel::<()>();
         let stop = laptop.stop.clone();
+        let holding = laptop.holding.clone();
         // What the laptop's SSH configuration says about backup, for
         // account access.
         let key = ssh_key::PrivateKey::new(
@@ -1859,10 +1864,13 @@ impl HeldLaptop {
                     vec![serde_json::json!("Ready"), resolved.clone()]
                 } else {
                     // A copy, or account access: what a person approves.
+                    let hold = holding.load(std::sync::atomic::Ordering::Relaxed);
                     request_sender.send(envelope).unwrap();
-                    released
-                        .recv_timeout(Duration::from_secs(60))
-                        .expect("the test releases each held request");
+                    if hold {
+                        released
+                            .recv_timeout(Duration::from_secs(60))
+                            .expect("the test releases each held request");
+                    }
                     vec![serde_json::json!({"Error": "denied by fixture"})]
                 };
                 for response in responses {
@@ -1901,21 +1909,8 @@ impl HeldLaptop {
         &self,
         command: &mut Command,
     ) -> (std::process::ExitStatus, String, Vec<serde_json::Value>) {
-        use std::io::BufRead;
         use std::time::{Duration, Instant};
-        let mut child = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .start()
-            .unwrap();
-        let stderr = child.stderr.take().unwrap();
-        let (line_sender, lines) = std::sync::mpsc::channel::<String>();
-        let reader = std::thread::spawn(move || {
-            for line in std::io::BufReader::new(stderr).lines() {
-                let _ = line_sender.send(line.unwrap());
-            }
-        });
+        let (mut child, lines, reader) = Self::start(command);
         let mut seen = Vec::new();
         let mut requests = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -1926,6 +1921,10 @@ impl HeldLaptop {
             assert!(Instant::now() < deadline, "syq did not finish: {seen:?}");
             seen.extend(lines.try_iter());
             if let Ok(request) = self.requests.recv_timeout(Duration::from_millis(10)) {
+                if !self.holding.load(std::sync::atomic::Ordering::Relaxed) {
+                    requests.push(request);
+                    continue;
+                }
                 let waiting = Instant::now() + Duration::from_secs(10);
                 while !seen
                     .iter()
@@ -1946,6 +1945,44 @@ impl HeldLaptop {
         reader.join().unwrap();
         seen.extend(lines.try_iter());
         (status, seen.join("\n"), requests)
+    }
+
+    /// Start `command` without a terminal, passing its stderr lines on.
+    fn start(
+        command: &mut Command,
+    ) -> (
+        std::process::Child,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::BufRead;
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let (line_sender, lines) = std::sync::mpsc::channel::<String>();
+        let reader = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stderr).lines() {
+                let _ = line_sender.send(line.unwrap());
+            }
+        });
+        (child, lines, reader)
+    }
+
+    /// Wait up to ten seconds for a line containing `text`, keeping the
+    /// lines read on the way in `seen`.
+    fn expect_line(lines: &std::sync::mpsc::Receiver<String>, seen: &mut Vec<String>, text: &str) {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !seen.iter().any(|line| line.contains(text)) {
+            assert!(Instant::now() < deadline, "no line with {text:?}: {seen:?}");
+            if let Ok(line) = lines.recv_timeout(Duration::from_millis(10)) {
+                seen.push(line);
+            }
+        }
     }
 }
 
@@ -2033,10 +2070,11 @@ fn automatic_fallback_explains_failed_credentials_and_says_at_once_that_it_waits
 }
 
 #[test]
-fn account_access_says_at_once_that_it_waits_for_the_laptop() {
+fn account_access_says_when_it_waits_for_the_laptop() {
     let laptop = HeldLaptop::new();
     // The keeper that asks for account access has no stderr of its own; the
-    // command says that it waits as soon as the request goes out.
+    // command says that it waits once the request has gone a second without
+    // an answer.
     for command in [
         laptop.command(&["cp", "source", "--to", "backup", "--auth-from", "@laptop"]),
         {
@@ -2059,6 +2097,64 @@ fn account_access_says_at_once_that_it_waits_for_the_laptop() {
         assert!(!stderr.contains("still setting up"), "{stderr}");
         assert!(!laptop.t.path("ssh-used").exists(), "{stderr}");
     }
+
+    // A decision the laptop remembered answers at once: nobody is asked,
+    // so the command does not say it waits.
+    laptop
+        .holding
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let (status, stderr, requests) = laptop.run(&mut laptop.command(&[
+        "cp",
+        "source",
+        "--to",
+        "backup",
+        "--auth-from",
+        "@laptop",
+    ]));
+    assert!(!status.success());
+    assert_eq!(requests.len(), 1, "{stderr}");
+    assert!(stderr.contains("denied by fixture"), "{stderr}");
+    assert!(!stderr.contains("waiting up to"), "{stderr}");
+    laptop
+        .holding
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    // A second command for the same account waits for the first one's
+    // request, and says so.
+    let account = ["cp", "source", "--to", "backup", "--auth-from", "@laptop"];
+    let (mut first, first_lines, first_reader) = HeldLaptop::start(&mut laptop.command(&account));
+    let request = laptop
+        .requests
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap();
+    assert!(request["message"].get("LocalSsh").is_some());
+    let (mut second, second_lines, second_reader) =
+        HeldLaptop::start(&mut laptop.command(&account));
+    let mut seen = Vec::new();
+    HeldLaptop::expect_line(
+        &second_lines,
+        &mut seen,
+        "syq: waiting up to 5 minutes for @laptop to approve SSH access to backup, which another command already asked for",
+    );
+    // The first request is refused; the second command then asks itself.
+    laptop.release.send(()).unwrap();
+    assert!(!first.wait().unwrap().success());
+    first_reader.join().unwrap();
+    let mut first_seen: Vec<_> = first_lines.try_iter().collect();
+    HeldLaptop::expect_line(&first_lines, &mut first_seen, "denied by fixture");
+    let request = laptop
+        .requests
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap();
+    assert!(request["message"].get("LocalSsh").is_some());
+    HeldLaptop::expect_line(
+        &second_lines,
+        &mut seen,
+        "syq: waiting up to 5 minutes for @laptop to approve SSH access to backup;",
+    );
+    laptop.release.send(()).unwrap();
+    assert!(!second.wait().unwrap().success());
+    second_reader.join().unwrap();
 }
 
 #[test]
