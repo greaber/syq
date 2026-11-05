@@ -2,9 +2,10 @@
 """Check relative Markdown links and heading anchors in the user-facing docs.
 
 Covers README.md and docs/**/*.md. A relative link must point at an existing
-file, its #fragment must match a heading in the target, and a link from the
-packaged documentation must stay inside the crate package (README.md,
-LICENSE, docs/, src/, tests/) so the published crate has no dangling links.
+file, its #fragment must match a heading or an `<a id>` anchor in the target,
+and a link from the packaged documentation must stay inside the crate package
+(README.md, LICENSE, docs/, src/, tests/) so the published crate has no
+dangling links.
 """
 import pathlib
 import re
@@ -19,7 +20,7 @@ FENCE = re.compile(r"```.*?```", re.S)
 
 
 def anchors(text):
-    out = set()
+    out = set(re.findall(r'<a id="([^"]+)"></a>', FENCE.sub("", text)))
     for line in text.splitlines():
         m = re.match(r"^(#{1,6})\s+(.*)$", line)
         if not m:
