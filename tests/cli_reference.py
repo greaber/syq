@@ -20,15 +20,18 @@ GROUP_LINKS = {
     "--integrity-checking": "[Payload checks](../integrity-checking.md)",
 }
 
-# Preserve published cp fragments when help groups are reorganized.
-CP_HEADING_ALIASES = {
-    "Sources and filtering": ("sources-and-selection",),
-    "Destination and mapping": ("destination-placement",),
-    "Updates and deletion": ("copy-policy-and-filtering",),
-    "Verification": ("integrity-checking",),
-    "Connections and remote execution": ("ssh-and-transport", "remote-to-remote-transfers"),
-    "Performance and resource limits": ("performance-tuning", "resource-limits"),
-    "Preview, progress, and results": ("progress-and-results", "preview-and-output"),
+# Preserve published fragments when help groups are reorganized.
+HEADING_ALIASES = {
+    ("cp",): {
+        "Sources and filtering": ("sources-and-selection",),
+        "Destination and mapping": ("destination-placement",),
+        "Updates and deletion": ("copy-policy-and-filtering",),
+        "Verification": ("integrity-checking",),
+        "Connections and remote execution": ("ssh-and-transport", "remote-to-remote-transfers"),
+        "Performance and resource limits": ("performance-tuning", "resource-limits"),
+        "Preview, progress, and results": ("progress-and-results", "preview-and-output"),
+    },
+    ("rm",): {"Object storage": ("copy-policy-and-filtering",)},
 }
 
 
@@ -100,8 +103,18 @@ def anchor(command):
     return "syq-" + "-".join(command)
 
 
+def family_rows(family, commands):
+    """Rows of a command family that every nested command repeats."""
+    nested = [parsed for name, parsed in commands.items()
+              if len(name) > 1 and name[0] == family[0]]
+    return {heading: [row for row in rows
+                      if all(any(h == heading and row in r for h, r in parsed[1]) for parsed in nested)]
+            for heading, rows in commands[family][1]} if nested else {}
+
+
 def render(command, parsed, commands):
     usage, groups, children = parsed
+    shared = family_rows(command[:1], commands) if command else {}
     out = ["```text", *usage, "```", ""]
     if children:
         out += ["| Command | Purpose |", "|---|---|"]
@@ -115,15 +128,16 @@ def render(command, parsed, commands):
     for heading, rows in groups:
         if not rows:
             continue
-        # The family's table covers identical help flags on nested commands.
-        if len(command) > 1 and heading == "Help and version" and (heading, rows) in commands[(command[0],)][1]:
-            continue
-        if len(command) == 1 and children and heading == "Help and version":
-            heading = "Help (also available on subcommands)"
+        # The family's table covers options that every nested command repeats.
+        if len(command) > 1:
+            rows = [row for row in rows if row not in shared.get(heading, ())]
+            if not rows:
+                continue
+        elif children and rows == shared.get(heading):
+            heading = ("Help" if heading == "Help and version" else heading) + " (also available on subcommands)"
         title = f"## {heading}" if len(command) == 1 and not children and not command[0].startswith("--") else f"**{heading}**"
-        if command == ("cp",):
-            for legacy in CP_HEADING_ALIASES.get(heading, ()):
-                out += [f'<a id="{legacy}"></a>', ""]
+        for legacy in HEADING_ALIASES.get(command, {}).get(heading, ()):
+            out += [f'<a id="{legacy}"></a>', ""]
         out += [title, "", "| Argument / option | Meaning |", "|---|---|"]
         for signature, description in rows:
             body = prose(description)

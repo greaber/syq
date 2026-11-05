@@ -221,9 +221,6 @@ struct Configure {
     #[arg(long)]
     no_auto_approve_root: bool,
     /// Replace the allowed connection list and connect these endpoints now (repeat for several)
-    ///
-    /// Only endpoints supplied in this invocation are connected. Omitting this
-    /// option keeps the saved restriction without dialing dormant endpoints.
     #[arg(long, value_name = "ENDPOINT", conflicts_with = "all_connections")]
     connection: Vec<String>,
     /// Make this profile available through every connected SSH account

@@ -47,72 +47,64 @@ syq ssh [OPTIONS] <HOST> [-- [COMMAND]...]
 ## Account access requires approval
 
 The first laptop-authorized login asks permission for the source account to use
-**the destination account**, including arbitrary commands and file access. The
-shown command describes the requester's intent; it is not a restriction on that
-permission. Copy roots and byte limits do not apply.
-
-Commands and copies reuse the approved SSH connection. See
+**the destination account**, including running any command and reading or
+changing its files. The command shown describes what the requester intends; it
+does not restrict the permission, and copy roots and byte limits do not apply.
+Later commands and copies reuse the approved connection. See
 [account permission controls](../persistence-reference.md#account-permissions)
-for approval lifetimes, remembered permissions, and revocation limits.
+for how long approvals last and how to revoke them, and
+[SSH account access](../security.md#ssh-account-access) for the trust boundary.
 
-The laptop's ordinary SSH agent is not forwarded. Syq limits its authentication
-requests to the approved destination host keys and login account. The requesting
-SSH client and destination SSH server need OpenSSH 8.9 or newer. Both servers
-must have exact plain host keys trusted by the laptop; host-certificate-only
-trust is unsupported. The laptop's key must be loaded in its local agent.
-The requesting server's `IdentityFile` and `IdentitiesOnly` settings select
-which keys to offer; a public-key file on that server can select the matching
-private key in the laptop's agent. A local `CertificateFile` can pair a user
-certificate with that agent key. Laptop private-key paths are not imported.
-Syq supplies the restricted agent in place of the server's `IdentityAgent`.
+This needs:
 
-The provider looks up trusted host keys using the alias you typed, or your
-local `HostKeyAlias` when set. It uses its own SSH configuration for that trust
-lookup. This lets the same alias use a private address between servers and a
-public address on the laptop, provided both routes reach the trusted host. A
-port written explicitly in the target also applies to the trust lookup unless
-you set `HostKeyAlias`.
+- OpenSSH 8.9 or newer for the requesting server's SSH client and the
+  destination's SSH server.
+- Exact plain host keys for both servers, trusted by the laptop; trust through
+  host certificates alone is not supported.
+- The laptop's key loaded in its SSH agent. The requesting server's
+  `IdentityFile` and `IdentitiesOnly` settings choose which keys to offer: an
+  `IdentityFile` naming a public key there selects the matching key in the
+  laptop's agent, and a `CertificateFile` can pair a user certificate with it.
 
-Configured `ProxyJump` hosts receive separate account approvals and reusable
-connections. A custom `ProxyCommand` runs on the requesting server and uses
-its own authentication; it does not receive the laptop's agent.
+The laptop looks up the host key under the alias you typed, or your
+`HostKeyAlias`, using its own SSH configuration. The same alias can therefore
+use a private address between servers and a public one on the laptop, as long
+as both reach the same trusted host. `ProxyJump` hosts need their own
+approvals, and a custom `ProxyCommand` uses the requesting server's own
+authentication.
 
-Stopping receiving prevents new laptop-authorized logins. Syq also cleans up
-its owned connections, but already authenticated sessions and commands are not
-guaranteed to end. See [SSH account access](../security.md#ssh-account-access).
+Stopping receiving prevents new laptop-authorized logins, but sessions and
+commands that already authenticated are not guaranteed to end.
 
 ## Commands and terminals
 
-Without a command, OpenSSH opens a shell and uses its normal terminal selection.
-Use `-t` to request a terminal for a command or `-T` to disable terminal
-allocation. OpenSSH handles input, output, resizing, and terminal restoration.
-Syq returns the remote exit status. Its own connection, authorization, and
-setup failures return 255; invalid arguments use the argument parser's status.
+Without a command, OpenSSH opens a shell with its usual terminal handling. Use
+`-t` to request a terminal for a command or `-T` to disable one. Syq returns the
+remote exit status, or 255 for its own connection, authorization, and setup
+failures.
 
 Put `--` before a remote command. As with `ssh`, the destination's shell
-interprets the command arguments joined with spaces. Preserve quoting needed
-by that shell:
+interprets the arguments joined with spaces, so keep the quoting that shell
+needs:
 
 ```sh
 syq ssh --auth-from @laptop hostB -- "printf '%s\n' 'two words'"
 ```
 
 This differs from [`syq exec --on @laptop`](exec.md), which runs a program on
-your laptop with literal arguments and closed stdin.
-
-`syq ssh` accepts the options listed above; it has no port-forwarding flags.
-Shell completion suggests authorization choices without contacting a destination
-or requesting approval.
+your laptop with literal arguments and closed stdin. `syq ssh` has no
+port-forwarding options.
 
 ## Authorization selection
 
-Omitting `--auth-from` uses your [saved choice](../persistence-reference.md#authorization-defaults),
+Without `--auth-from`, syq uses your [saved choice](../persistence-reference.md#authorization-defaults),
 or `auto` when none is saved. For `syq ssh`, `auto` and `ssh` both run native
 SSH once, with your ordinary SSH configuration and syq's persistent connections
-when they are enabled; an existing approved account connection is not used.
-A failed login or command is never retried through a receiving machine.
-Use `--auth-from @NAME` or save that preference to ask your laptop directly.
-An ordinary SSH endpoint, such as `--auth-from alice@provider:2222`, instead
-opens a connection to an [SSH authorization provider](../receive.md#use-an-ssh-authorization-provider).
-With either provider, syq opens or reuses an approved account connection.
-You do not need to run `persist connect` first.
+when they are enabled. They do not use an approved account connection, and a
+failed login or command is never retried through a receiving machine.
+
+To ask your laptop directly, use `--auth-from @NAME` or save it as your choice.
+An ordinary SSH endpoint, such as `--auth-from alice@provider:2222`, uses an
+[SSH authorization provider](../receive.md#use-an-ssh-authorization-provider)
+instead. Either way, syq opens or reuses an approved account connection; you do
+not need to run `persist connect` first.

@@ -16,21 +16,20 @@ Add `--on server` to clean a remote tree. For results output, see
 
 ## Which files are removed
 
-`clean-partials` removes regular files named `.FILENAME.syq-tmp.RANDOM`, with
-16 random characters at the end. The filename portion may be shortened or
-omitted. It also removes the `.syq-s3-HASH.partial` files that
-[S3 downloads](../object-storage.md) leave beside the files they download,
-where `HASH` is 64 hexadecimal digits; removing one means a later download of
-that file starts over. It does not follow symlinks, and it does not remove old
-partial-name formats or the `.syq-stream-*` files that a killed
-[descriptor copy](cp.md#completion-and-failures) can leave. A regular file
-deliberately named like a partial is also selected, so preview before deleting.
+`clean-partials` removes syq partial files, named `.FILENAME.syq-tmp.RANDOM`,
+and the `.syq-s3-HASH.partial` files that [S3 downloads](../object-storage.md)
+leave beside the files they download; removing one of those means a later
+download of that file starts over. It does not follow symlinks, and it does not
+remove partial files left by older syq versions or the `.syq-stream-*` files
+that a killed [descriptor copy](cp.md#completion-and-failures) can leave. A
+regular file deliberately named like a partial is also selected, so preview
+before deleting.
 
 Interrupted replacements, replacements that race with another program, and
-macOS clones can leave `.syq-swap-...` entries containing displaced files or
+macOS clones can leave `.syq-swap-...` entries holding displaced files or
 temporary clone data. Neither this command nor pruning removes them. Stop
 copies using the destination, inspect these entries, and recover anything you
-need before removing them manually.
+need before removing them yourself.
 
 <!-- CLI: clean-partials -->
 ```text

@@ -39,7 +39,7 @@ syq --self-update
 
 | Argument / option | Meaning |
 |---|---|
-| `--version-is <EXPR>` | Require the invoked release to match EXPR before running anything or selecting --use-version. Bare x.y.z means exact equality; operators: == != < <= > >=. Commas mean AND; \| means OR, with AND binding more tightly. Quote expressions in the shell. Development builds are unsupported. Put --version-is and --use-version before the command and other options, in either order. |
+| `--version-is <EXPR>` | Require the invoked release to match EXPR before running anything. Bare x.y.z means exact equality; operators: == != < <= > >=. Commas mean AND; \| means OR, with AND binding more tightly. Quote expressions in the shell. Development builds are unsupported. Put --version-is and --use-version before the command, in either order. |
 | `--use-version <VERSION>` | Run an exact official release, downloading it if needed (before the command and other options) |
 | `--self-update` | Install the newest signed release (standalone installs); Homebrew: brew upgrade syq |
 
@@ -90,12 +90,11 @@ root help. A trailing `--help` or `-h` selects common help.
 
 ## Build identity
 
-`syq --build-identity` prints the executable’s build identity. A release's
-identity is its version tag, such as `v0.7.1`. Any build from source, including
-`cargo install syq` and a Python package that pip builds from its source
-archive, adds the revision it was built from, such as
-`v0.7.1+dev.0123456789ab`, and its `--version` and results stream report that
-version too, as `0.7.1+dev.0123456789ab`. A build that
+`syq --build-identity` prints the executable’s build identity. A release
+prints its version tag, such as `v0.7.1`. A build from source, including
+`cargo install syq` and a Python package built from its source archive, adds
+the revision it was built from, such as `v0.7.1+dev.0123456789ab`, and reports
+the version `0.7.1+dev.0123456789ab` in `--version` and results. A build that
 [uses official helpers](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md#choose-official-helpers)
 keeps the release's identity. See
 [development builds](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md#another-platform-with-your-own-helpers).

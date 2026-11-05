@@ -26,7 +26,9 @@ syq rm [OPTIONS] --srcs-in DIR
 | `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |
 | `--pscope <PATH>` | Use an isolated persistence domain created by `syq persist on --ephemeral` |
 
-## Copy policy and filtering
+<a id="copy-policy-and-filtering"></a>
+
+## Object storage
 
 | Argument / option | Meaning |
 |---|---|
@@ -92,11 +94,10 @@ syq rm [OPTIONS] --srcs-in DIR
 ## Selection rules
 
 Named paths, `--src`, and `--src-non-dir` require non-directories. Use
-`--src-dir` to require a directory and remove it recursively, or `--srcs-in`
-to remove its contents while keeping the directory. These directory selectors
-reject a final symlink even when following is enabled. All selections are
-checked before deletion begins. Filters are not supported.
+`--src-dir` to remove a directory recursively, or `--srcs-in` to remove its
+contents and keep the directory; both reject a final symlink even when
+following is enabled. Syq checks every selection before deleting anything.
+Filters are not supported.
 
-A concurrent rename can leave a selected directory at its new name even when
-removal succeeds. Avoid concurrent renames if all selected directories must
-be removed.
+If another program renames a selected directory during removal, the directory
+can survive under its new name even though removal succeeds.

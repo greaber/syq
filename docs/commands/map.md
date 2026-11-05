@@ -53,7 +53,7 @@ syq map [OPTIONS] --srcs-in DIR
 
 | Argument / option | Meaning |
 |---|---|
-| `--rsh <COMMAND>` | Remote shell command (default: ssh). An ssh command keeps shared and persistent connections unless its options configure connection sharing; -v shares them only within the run |
+| `--rsh <COMMAND>` | Remote shell command (default: ssh). An ssh command still uses persistent connections unless its options set up connection sharing |
 | `--syq-path <PATH>` | Use this remote syq executable instead of installing a helper |
 | `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |
 | `--auth-from <auto\|ssh\|@NAME\|HOST>` | Use an approved SSH account connection, or native SSH authentication |
@@ -87,38 +87,8 @@ syq map [OPTIONS] --srcs-in DIR
 
 ## Mapping format
 
-`cp --mapping` reads one JSON object per line. `map` emits this format from
-local, SSH, or S3 sources; other programs can generate it too. By default it
-emits only `src` and `dst`. Request optional fields explicitly, for example
-`--include kind,size,mtime`. Repeat `--include` or separate fields with commas.
-
-`kind` adds a type check when the mapping is copied. Size and timestamps are
-information for your filters; they do not change copying. Filesystem sources
-emit size and modification time for regular files. S3 size is the object body
-size; `mtime` is the filesystem time stored by syq, omitted if unavailable.
-`s3_last_modified` is S3's object modification time, available only for S3
-sources. Both timestamps use Unix seconds and can be requested independently.
-`--where` selects entries with the same [expressions](../expressions.md) as
-`cp`. As in `cp`, it does not filter directories: directory records are always
-emitted.
-Fields used by a condition need not be included in the output. For example,
-`--where 'src.kind = "file" and src.size > 1MiB'` emits the matching file records
-and every directory record.
-
-S3 object time comes from listing; requesting `kind` or `mtime` also reads
-object metadata. Generating mappings never downloads object bodies.
-
-For example, generate from an S3 prefix and copy selected entries later:
-
-```sh
-syq map --from s3://photos --srcs-in originals --include s3_last_modified > photos.ndjson
-syq cp --from s3://photos -C originals --mapping photos.ndjson --into restored
-```
-
-An S3 prefix without its own directory marker produces child entries only.
-Keys that cannot be represented as mapping paths, such as `a//b`, cause an
-error. Source scan or listing failures return a nonzero status; stdout may
-already contain entries. See [checking the producer](../mappings.md#check-the-producer-before-copying).
+`cp --mapping` reads one JSON object per line. `syq map` writes this format
+from local, SSH, or S3 sources, and other programs can generate it too.
 
 | Field | Meaning |
 |---|---|
@@ -130,61 +100,78 @@ already contain entries. See [checking the producer](../mappings.md#check-the-pr
 | `expected_hash` | Optional whole-file expectation: `{"algorithm":"md5","value":"900150983cd24fb0d6963f7d28e17f72"}` |
 
 Paths use `encoding: "utf-8"`, or `"base64"` with standard base64 of raw
-filename bytes. Absolute or empty paths, and any `.` or `..` component, are
-refused. Unknown fields are refused too.
+filename bytes. Absolute or empty paths, `.` and `..` components, and unknown
+fields are refused.
+
+Each entry copies one object. **A directory entry is not recursive**, so
+`syq map` emits a directory's descendants as separate entries. A missing source
+or a wrong `kind` fails that entry while the others continue.
+
+By default `map` emits only `src` and `dst`; request other fields with
+`--include`, for example `--include kind,size,mtime`. `kind` adds a type check
+when the mapping is copied. Sizes and timestamps are information for your own
+filters and do not change copying. Both timestamps are Unix seconds: `mtime` is
+the file's modification time, which for S3 is the time syq stored and is
+omitted when there is none, and `s3_last_modified` is S3's own object time.
+Requesting `kind` or `mtime` from S3 reads object metadata; `map` never
+downloads object bodies.
+
+`--where` selects entries with the same [expressions](../expressions.md) as
+`cp`, and as in `cp` it does not filter directories. A condition can use fields
+you did not include: `--where 'src.kind = "file" and src.size > 1MiB'` emits the
+matching files and every directory.
+
+For example, generate a mapping from an S3 prefix and copy selected entries later:
+
+```sh
+syq map --from s3://photos --srcs-in originals --include s3_last_modified > photos.ndjson
+syq cp --from s3://photos -C originals --mapping photos.ndjson --into restored
+```
+
+If scanning or listing fails, `map` exits nonzero, though stdout may already
+contain entries. See [checking the producer](../mappings.md#check-the-producer-before-copying).
 
 `expected_hash` checks a regular file's complete contents, including reused
-bytes. A mismatch fails the entry. See [expected hashes](../integrity-checking.md#expected-hashes)
-for algorithms and behavior with in-place writes.
+bytes, and a mismatch fails the entry. See
+[expected hashes](../integrity-checking.md#expected-hashes) for the algorithms.
 
 To set destination attributes without changing the source, add a `metadata`
-object, for example `"metadata": {"mode": 416, "mtime": 1700000000}`. This sets
-permissions to `0640` and the modification time to the given Unix second.
-Optional fields are `mode` (permission bits, 0–4095), numeric `uid` and `gid`,
+object, for example `"metadata": {"mode": 416, "mtime": 1700000000}`, which sets
+permissions to `0640` and the modification time to the given Unix second. The
+optional fields are `mode` (permission bits, 0–4095), numeric `uid` and `gid`,
 `mtime` (Unix seconds), and `mtime_nsec` (0–999999999, requires `mtime`).
-A supplied `mtime` defaults to zero fractional seconds. Omitted attributes
-follow normal copy behavior; the top-level `mtime` remains informational.
+Omitted attributes follow normal copy behavior, and the top-level `mtime`
+remains informational.
 
-Explicit attributes apply without `--copy-metadata`. Ownership requests fail if the
-filesystem refuses them; symlinks cannot have a requested `mode`.
-S3 uploads store the attributes in syq object metadata; downloads apply them
-to the filesystem. S3-to-S3 copies keep other object metadata and stay server-side.
-Restricted receivers apply them too, checking each against the mapping signed
-with the copy. Selection rules such as `--if-exists=keep` still take precedence. Supplied
-timestamps disable the size/time shortcut for those entries. Use `--hash` to
-compare contents when repeating a copy with a fixed destination timestamp.
-Older binaries that do not support `metadata` or `s3_last_modified` reject those
-fields. Upgrade the consumer or remove unsupported informational fields before
-copying.
-
-Each entry copies one object. **A directory entry is not recursive.**
-`syq map` emits its descendants as separate entries. A missing source or
-wrong `kind` fails that entry while independent entries continue.
+Explicit attributes apply without `--copy-metadata`; S3 uploads store them in
+syq's object metadata, and downloads apply them. Ownership requests fail if the
+filesystem refuses them, and symlinks cannot have a requested `mode`. Selection rules such as
+`--if-exists=keep` still take precedence. A supplied timestamp turns off the
+size-and-time comparison for that entry, so use `--hash` when you repeat such a
+copy.
 
 ## Mapping restrictions
 
 Use `--mapping` instead of source selectors, with `--into`, `--into-new`, or
-`--into-existing`. It cannot combine with `--as`, `--prune`, `--prune-before`,
-`--ignore`, `--ignore-from`, or `--detach`. To skip paths, leave their entries
-out of the manifest.
-Use the same source base for `map` and `cp`. `--root` confines source selection.
-Follow options apply to supplied paths, never to links traversed by a manifest
-entry. `map` refuses non-UTF-8 names; hand-written manifests may use base64.
+`--into-existing`. It cannot be combined with `--as`, `--prune`,
+`--prune-before`, `--ignore`, `--ignore-from`, or `--detach`; to skip paths,
+leave their entries out of the manifest. Use the same source base for `map` and
+`cp`. Follow options apply to the paths you supply, never to links inside a
+manifest entry. `map` refuses non-UTF-8 names; hand-written manifests may use
+base64.
 
-The whole manifest is validated before copying. Malformed input, duplicate
-destination names, and declared file/ancestor conflicts refuse the run. The
-destination container may already have been created. Memory use grows with
-manifest size. Conflicts discovered while copying fail the affected entries.
+Syq validates the whole manifest before copying: malformed input, duplicate
+destination names, and file/ancestor conflicts refuse the run, although the
+destination container may already have been created. Memory use grows with the
+size of the manifest.
 
 For restricted copies between servers, mapped destinations and their parent
-directories count against the receiver's entry limit. These copies also limit
-each manifest line to 1 MiB and each destination path to 4096 bytes, with no
-separate limit on the whole manifest. Missing parent directories are created;
-a file or symlink blocking a parent must be moved or removed before retrying.
+directories count against the receiver's entry limit, each manifest line is
+limited to 1 MiB, and each destination path to 4096 bytes.
 
-`kind: "special"` checks the source type; add `--copy-metadata=specials` to copy those
-entries. Use `--mapping -` for a pipeline; a named FIFO manifest requires Linux
-with procfs.
+`kind: "special"` checks the source type; add `--copy-metadata=specials` to
+copy those entries. Use `--mapping -` for a pipeline; a named pipe as the
+manifest requires Linux with procfs.
 
 ## Filter a mapping
 

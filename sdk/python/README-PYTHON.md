@@ -18,9 +18,8 @@ on Linux and macOS:
 python -m pip install syq
 ```
 
-Prebuilt wheels include the matching syq executable, so no Rust compiler or
-separate syq installation is needed. The `syq` command is also available in
-the Python environment.
+Prebuilt wheels include the matching syq executable, which is also available
+as the `syq` command in the Python environment.
 
 <a id="try-a-copy"></a>
 
@@ -68,9 +67,6 @@ as a live call, with counters describing the planned changes:
 preview = syq.cp("data", into="backup", dry_run=True)
 print(preview.files_transferred, preview.bytes_transferred)
 ```
-
-Remove `dry_run=True` to apply the changes. syq checks the filesystem again
-when that call runs.
 
 ## Mirror a directory
 
@@ -126,11 +122,10 @@ except syq.SyqOperationError as error:
     print(error.stderr.decode(errors="replace"))
 ```
 
-Use `check=False` to receive unsuccessful results without that exception.
-Invalid arguments, installation failures, and incomplete or invalid results
-still raise exceptions. Catch `syq.SyqError` to handle any SDK-defined exception,
-or catch a specific subclass as above. Completed filesystem changes are not
-rolled back.
+Use `check=False` to receive unsuccessful results without that exception;
+invalid arguments, installation failures, and invalid results still raise.
+Catch `syq.SyqError` to handle any SDK-defined exception. Completed filesystem
+changes are not rolled back.
 
 ## Watch events and save results
 
@@ -167,15 +162,13 @@ with syq.map(srcs_in="photos") as mapping:
     result = syq.cp(mapping=renamed, into="published")
 ```
 
-This places the contents of `photos` under `published/archive`. The
-transformed mapping remembers where its sources are and how to connect, so the
-copy reads them from the same place. Pass `from_="server"` or
-`from_="s3://bucket"` to `map` to list remote sources. Entries contain only
-source and destination paths unless you request more with `include`, such as
-`include=["kind", "size", "mtime"]`.
-Return `None` from the transform to skip an entry. The entire transform must
-finish successfully before copying starts; a failed transform leaves the
-destination untouched. See
+This places the contents of `photos` under `published/archive`. The mapping
+remembers where its sources are, so the copy reads them from the same place;
+pass `from_="server"` or `from_="s3://bucket"` to `map` to list remote sources.
+Entries contain only source and destination paths unless you request more with
+`include`, such as `include=["kind", "size", "mtime"]`. Return `None` from the
+transform to skip an entry. The whole transform finishes before copying starts,
+so a failed transform leaves the destination untouched. See
 [Rename and reorganize](https://greaber.github.io/syq/mappings.html) for mapping rules.
 
 For a complete program built on mappings, see
@@ -204,15 +197,13 @@ with syq.open_reader("dataset.tar", from_="s3://backups") as source:
 ```
 
 The writer commits when its `with` block exits successfully; an exception
-aborts it. The reader checks transfer success when its `with` block exits,
-reading any bytes your code left unread. To cancel instead, call `abort()`.
-If you extract or publish files from a stream, wait for both decoding and the
-reader context to finish successfully before making those files available.
+aborts it. The reader checks transfer success when its `with` block exits, or
+call `abort()` to cancel. If you extract files from a stream, make them
+available only after both decoding and the reader context finish successfully.
 See [Byte streams](https://greaber.github.io/syq/python-streams.html#byte-streams)
 for wrappers, explicit completion, and async behavior.
 
-For several generated files, put producers in a mapping. syq starts them as
-transfer capacity becomes available and reuses its connections:
+For several generated files, put producers in a mapping and copy them in one call:
 
 ```python
 from functools import partial
@@ -226,9 +217,8 @@ syq.cp(mapping=[syq.MappingEntry(syq.StreamSource(partial(pack, name)), f"{name}
        to="s3://backups", into="dataset", stream_concurrency=2)
 ```
 
-A `StreamDestination(consumer)` receives downloaded bytes in the same way.
-Archive formats belong to your callback.
-See [Callback mappings](https://greaber.github.io/syq/python-streams.html#callback-mappings)
+A `StreamDestination(consumer)` receives downloaded bytes in the same way. See
+[Callback mappings](https://greaber.github.io/syq/python-streams.html#callback-mappings)
 for completion, retries, and async callbacks.
 
 ## Use asyncio
@@ -268,9 +258,9 @@ client = syq.Client(process_cwd="/srv/jobs", timeout=3600)
 result = client.cp("data", into="backup")
 ```
 
-`process_cwd` sets the local subprocess directory; typed `cwd` sets the source
-base, which may be on a remote host. Omit `timeout` on a call to use the client
-default; pass `timeout=None` to disable it for that call:
+`process_cwd` sets the local working directory, while `cwd` sets the source
+base, which may be on a remote host. A call uses the client's timeout unless
+it passes its own; `timeout=None` disables it for that call:
 
 ```python
 result = client.cp("data", into="backup", timeout=None)
@@ -311,8 +301,8 @@ result = syq.run(
 print(result.stdout.decode())
 ```
 
-This captures output and raises on a nonzero exit. The receiving machine asks
-for approval before running the command. See
+It raises on a nonzero exit, and the receiving machine asks for approval
+before running the command. See
 [Run commands on your receiving machine](https://greaber.github.io/syq/receive.html#run-commands-on-your-laptop).
 
 ## Building from source

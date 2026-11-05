@@ -27,8 +27,8 @@ syq tuning-cache <COMMAND>
 
 ## syq tuning-cache list
 
-List recent transfers, newest first. The worker column contains saved counts
-from older records; new transfers show `?`.
+List recent transfers, newest first. The worker column shows `?` for
+transfers that did not record a count.
 
 <!-- CLI: tuning-cache list -->
 ```text
@@ -87,10 +87,9 @@ syq tuning-cache export [id]
 
 ## syq tuning-cache clear
 
-Delete recorded history and the filesystem startup hints learned from it, so
-later copies choose their starting worker counts afresh. Older syq versions
-kept connection counts in `~/.cache/syq/tuning.json`; current versions do not
-use that file, so `clear` leaves it alone and you can delete it yourself.
+Delete recorded history and the startup hints learned from it, so later
+copies choose their starting worker counts afresh. `clear` leaves alone
+`~/.cache/syq/tuning.json`, which older versions used; you can delete it.
 
 <!-- CLI: tuning-cache clear -->
 ```text

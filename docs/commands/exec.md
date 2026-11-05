@@ -40,10 +40,10 @@ syq exec [OPTIONS] --on <@NAME> -- <PROGRAM>...
 
 ## Approve each command locally
 
-Every command requires approval on the receiving machine, even if copies are
+Every command needs approval on the receiving machine, even when copies are
 approved automatically. Review the program, arguments, requesting server, and
-working directory. If the desktop prompt is missing or truncated, inspect and
-answer the request from a local terminal:
+working directory. If the desktop prompt is missing or truncated, answer the
+request from a local terminal:
 
 ```sh
 syq persist receive pending
@@ -59,38 +59,36 @@ trust boundary.
 ## Arguments and working directories
 
 Put `--` before the program. Everything after it is passed as a literal
-argument, including strings starting with `--`. There is no implicit shell
-expansion on the receiving machine. To use shell syntax, request a shell:
+argument, including strings starting with `--`, and no shell runs on the
+receiving machine. To use shell syntax, run a shell:
 
 ```sh
 syq exec --on @laptop --cwd work/project -- sh -c 'cargo build && ./target/debug/demo'
 ```
 
 `--cwd DIR` (or `-C DIR`) is relative to the receiving profile's starting
-directory, which `persist receive status` shows. Its default is that directory.
-Absolute paths and `..` can select elsewhere. The directory must exist. Syq does not expand `~`
-on the receiving machine; use a relative path or an absolute path instead.
+directory, which `persist receive status` shows, and defaults to it. Absolute
+paths and `..` can select elsewhere, but `~` is not expanded. The directory
+must exist.
 
-The command inherits the receiving service's local environment, including
-`PATH` and its desktop session. It does not inherit the server's environment.
-Restart receiving from a terminal in the desired desktop session when those
-values change. Stdin is closed and there is no interactive terminal.
+The command inherits the receiving service's environment, including `PATH` and
+its desktop session, not the server's. To change them, restart receiving from a
+terminal in the session you want. Stdin is closed and there is no terminal.
 
 ## Output, completion and cancellation
 
 Stdout and stderr stream back to your terminal, and syq returns the command's
-exit code, or `128 + signal` if it was killed by a signal. Setup and connection
-failures return nonzero; losing the exit status is an error. Commands are not
-retried automatically, and completed file changes are not rolled back.
+exit code, or `128 + signal` if a signal killed it. Commands are not retried,
+and completed file changes are not rolled back.
 
 Interrupting the request, stopping or changing receiving, or losing the
-connection forcibly stops the command's process group. Cleanup handlers do not
-run. Remaining children in that group are also stopped when the foreground
-program exits. Detached processes and applications launched through macOS
-`open` can survive this cleanup. Commands do not emit copy automation records.
+connection kills the command's process group without running its cleanup
+handlers. Processes left in that group are also stopped when the program exits,
+but detached processes and applications started through macOS `open` can
+survive. Commands do not write copy result records.
 
 ## Execution details
 
-Requests allow up to 256 arguments (16 KiB total) and a 4096-byte working-directory
-path. Each server connection permits one pending approval and eight active
-commands.
+A request allows up to 256 arguments (16 KiB in total) and a 4096-byte working
+directory path. Each server connection allows one pending approval and eight
+running commands.
