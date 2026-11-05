@@ -93,9 +93,10 @@ through them. Revoke them with the older version before upgrading, or delete
 them by hand:
 
 - On the server, delete each line in `~/.ssh/authorized_keys` whose command
-  runs `~/.local/libexec/syq-receiver` (keep those that run syq from
-  `~/.local/lib/syq`), then the directory `~/.local/share/syq/restricted` and
-  the file `~/.local/libexec/syq-receiver`.
+  runs `~/.local/libexec/syq-receiver`, written with your home directory's
+  full path (keep those that run syq from `~/.local/lib/syq`). Then delete the
+  directory `~/.local/share/syq/restricted` and the file
+  `~/.local/libexec/syq-receiver`.
 - On your machine, delete the directory `~/.local/state/syq/restricted`.
 
 ## Limits and unsupported options
@@ -195,9 +196,9 @@ machine's own SSH access, with SSH's usual prompts and timeouts, even when an
 approved account connection exists. If SSH rejects the credentials, can't
 verify the host key, can't resolve the name, or is refused, syq asks your live
 receiving machines, in alphabetical order, to approve just this copy; each
-uses its own SSH configuration and trusted host keys. After a timeout or
-another SSH error, or with no receiving machine available, syq reports the SSH
-error. Copies with options a receiving machine can't authorize (below) use only
+uses its own SSH configuration and trusted host keys. After a timeout, a
+temporary DNS failure, or another SSH error, or with no receiving machine
+available, syq reports the SSH error. Copies with options a receiving machine can't authorize (below) use only
 this machine's access. Once approval is requested, a refusal or failure ends
 the attempt.
 

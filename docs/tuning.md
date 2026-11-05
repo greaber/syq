@@ -85,8 +85,9 @@ setting also applies to S3 pruning. Filesystem pruning tunes its own workers.
 
 ## Remembered connection counts
 
-Syq remembers useful starting worker counts from successful filesystem copies
-of the same kind and keeps adjusting as the next copy runs.
+Syq remembers useful worker counts from successful filesystem copies, starts
+later copies of the same kind from them, and keeps adjusting as each copy
+runs.
 
 `--performance-tuning workers=N` bypasses the remembered count, and
 `--resource-limits workers=N` caps it. Set `SYQ_TUNING_CACHE` to an empty value

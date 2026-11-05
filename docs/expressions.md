@@ -34,7 +34,8 @@ usual comparison still skips unchanged files.
 none of their contents are selected, and `map --where` always emits their
 records. Metadata used by the expression is added to `map` records only when
 requested with `--include`. For a directory, a false `--copy-if` result skips
-only its own metadata, not its contents.
+only its own metadata, not its contents. On S3, `--where` never filters
+directory-marker objects, but `--copy-if` can skip them.
 
 Use [ignore rules](reference.md#ignoring-paths) to stop traversal of a subtree.
 An expression cannot re-include an ignored path. With `--prune`, excluded
@@ -125,11 +126,11 @@ need a string escape, as in the JPEG example above.
 
 Types must agree: compare a size with `10B`, not `10` or `"10B"`. Subtracting
 timestamps yields a duration, and adding a duration to a timestamp shifts it.
-Arithmetic and bitwise operators bind more tightly than comparisons, and `not`,
-`and`, and `or` bind in that order; use parentheses to group conditions
-otherwise. `and` and `or` evaluate left to right and stop as soon as the
-result is known, so put an availability check before a condition that needs
-the value.
+Arithmetic and bitwise operators bind more tightly than comparisons, which
+bind more tightly than `not`, then `and`, then `or`; use parentheses to group
+conditions otherwise. `and` and `or` evaluate left to right and stop as soon as the
+result is known, and `if` and `coalesce` evaluate only the needed branch, so
+put an availability check before a condition that needs the value.
 
 Expressions cannot execute commands, read arbitrary files, or query other
 entries. For collection-wide selection or external data, generate a

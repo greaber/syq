@@ -22,7 +22,7 @@ Syq uses your AWS credentials and detects AWS bucket regions automatically.
 | `--s3-endpoint URL` | Use an S3-compatible service; also accepts `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL` |
 | `--s3-region REGION` | Set the signing region explicitly |
 | `--s3-header 'NAME: VALUE'` | Add a provider header to every request; repeatable |
-| `--s3-write-header 'NAME: VALUE'` | Add a header only to requests that create or replace objects, such as storage class or server-side encryption settings; repeatable, and overrides `--s3-header`. Pass customer-provided key headers (`x-amz-server-side-encryption-customer-*`) with `--s3-header`, since reads need them too |
+| `--s3-write-header 'NAME: VALUE'` | Add a header only to requests that create or replace objects, such as storage class or server-side encryption settings; repeatable, and overrides an `--s3-header` of the same name. Pass customer-provided key headers (`x-amz-server-side-encryption-customer-*`) with `--s3-header`, since reads need them too |
 | `--s3-retries N` | Retry each request up to N times (0–100, default 10) after a dropped connection, a timeout, a server error or throttling; 0 disables retries |
 
 See [S3 copies](tuning.md#s3-copies) for concurrency and part sizes.
@@ -115,8 +115,10 @@ at the destination, and selecting `user-metadata` or `tags` also removes
 destination-only keys. These selections need S3 on both sides.
 
 Updating metadata other than tags rewrites the object within S3: it gets a new
-Last-Modified time, a new version in a versioned bucket, and loses its ACLs,
-Object Lock settings, and custom KMS encryption contexts. Updating tags needs
+Last-Modified time and a new version in a versioned bucket. It keeps its
+storage class and encryption settings unless `--s3-header` or
+`--s3-write-header` overrides them, but loses its ACLs, Object Lock settings,
+and custom KMS encryption contexts. Updating tags needs
 permission to read and write them, and a provider without tag support may drop
 tags from new copies.
 

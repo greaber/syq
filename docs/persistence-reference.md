@@ -56,10 +56,12 @@ to `auto` and keeps host choices. Omit the value to show saved choices, or add
 `SYQ_AUTH_FROM` overrides them. Choices are saved in `auth-from.json` in the
 selected domain.
 
-Saved choices and `SYQ_AUTH_FROM` apply to `syq ssh` and the SSH endpoints of
-`cp`, `rsync`, `rm`, `map`, and `clean-partials`, whether or not persistence is
-on. A copy with `--coordinate-at local` selects access separately for each
-endpoint. Custom `--rsh` routes, copies to receiving names, and object storage
+Saved choices and `SYQ_AUTH_FROM` apply to every command that takes
+`--auth-from`, whether or not persistence is on: `syq ssh`, `persist connect`,
+`persist ssh-config`, and the SSH endpoints of `cp`, `rsync`, `rm`, `map`, and
+`clean-partials`. So with `@laptop` saved, `syq persist connect hostB` opens an
+approved account connection rather than an ordinary persistent one. A copy
+with `--coordinate-at local` selects access separately for each endpoint. Custom `--rsh` routes, copies to receiving names, and object storage
 keep their own authentication; S3 storage authorization needs an explicit
 `--auth-from @NAME`.
 
@@ -143,11 +145,12 @@ syq persist receive permissions list
 syq persist receive permissions remove PERMISSION_ID
 ```
 
-`--remember` is accepted only for account-access requests. To end access, run
-`syq persist off` on the requesting server to close its connections, and
-`syq persist receive off` on the laptop to end session permissions and stop
-further authorization. Add `--pscope PATH` on either machine for an isolated
-domain. Remembered permissions belong to the laptop's selected domain: a new
+`--remember` is accepted only for account-access requests. To stop further
+access, run `syq persist off` on the requesting server to close its
+connections, and `syq persist receive off` on the laptop to end session
+permissions and stop further authorization; see
+[SSH account access](security.md#ssh-account-access) for what this does not
+undo. Add `--pscope PATH` on either machine for an isolated domain. Remembered permissions belong to the laptop's selected domain: a new
 domain on the laptop starts without them, and a new domain on the server does
 not revoke what that server account was already granted.
 

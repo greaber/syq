@@ -7,6 +7,9 @@ syq ssh user@hostB
 syq ssh --auth-from @laptop hostB -- hostname
 ```
 
+<a id="account-access-requires-approval"></a>
+<a id="authorization-selection"></a>
+
 Without `--auth-from`, syq uses your
 [saved choice](../persistence-reference.md#authorization-defaults); `auto` and
 `ssh` both run native SSH. `--auth-from @laptop` uses
@@ -45,9 +48,6 @@ syq ssh [OPTIONS] <HOST> [-- [COMMAND]...]
 | `--help-all` | Show all options and details |
 
 <!-- /CLI -->
-
-<a id="account-access-requires-approval"></a>
-<a id="authorization-selection"></a>
 
 ## Commands and terminals
 

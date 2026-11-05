@@ -32,8 +32,10 @@ the copy finishes; the copy stops if it ends.
   SSH agent, or a key file without a passphrase. Password and multi-factor
   logins cannot authorize these copies.
 - OpenSSH 7.2 or newer on hostB, with a writable `~/.ssh/authorized_keys`.
-- SSH connectivity from hostA to hostB. Copies are faster when hostA can also
-  reach a TCP data port on hostB; see [Make TCP reachable](server-tuning.md#make-tcp-reachable).
+- Direct SSH connectivity from hostA to hostB; a `ProxyJump` or
+  `ProxyCommand` in hostA's configuration is not used. Copies are faster when
+  hostA can also reach a TCP data port on hostB; see
+  [Make TCP reachable](server-tuning.md#make-tcp-reachable).
 - An existing parent directory for the destination.
 - A hostB login other than root.
 

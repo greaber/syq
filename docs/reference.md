@@ -545,7 +545,10 @@ on macOS anything but APFS and HFS+. There every metadata-only change rewrites
 the file, and `--in-place=update` replaces files instead of updating them.
 
 A directory receives its copied permissions and ACLs after its contents, so
-an interrupted copy can leave a new directory open only to its owner.
+an interrupted copy can leave a new directory open only to its owner. With
+`--copy-metadata=permissions`, an existing directory that allows more than its
+source is narrowed before anything is created in it, though someone who
+already has it open can keep listing the names syq creates.
 
 When a directory you own lacks the write or search permission a change needs,
 `--widen-dirs` (`--syq-widen-dirs` for `syq rsync`) decides whether syq

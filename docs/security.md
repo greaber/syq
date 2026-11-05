@@ -79,15 +79,21 @@ when syq has more permissions than the people who can modify that directory.
 **Existing files and their other names.** Syq writes new contents only into
 files the copy creates, and replaces an existing file by renaming a new one
 over its name, so another name for the old file, or someone who has it open,
-keeps the old contents. The exceptions are an `--as-fd` output, and
-`--in-place=update` (`syq rsync --inplace`), which updates a file in place
+keeps the old contents. An `--as-fd` output and `--in-place=update`
+(`syq rsync --inplace`) are exceptions: they write into an existing file, so
+anyone who has it open can read the new contents. Syq updates a file in place
 only where that gives no one access the copy would not (see
-[In-place writes](reference.md#in-place-writes)). Metadata follows the same
-rule (see [How syq changes existing files](reference.md#how-syq-changes-existing-files-and-directories)):
-a hard link planted in the destination never takes the copy's metadata, and
-root never gives a file another user planted there another owner, group, or
-privileges. Access times copied with `--copy-metadata=atimes` are the
-exception: they are set in place, on all of a file's names.
+[In-place writes](reference.md#in-place-writes)).
+
+Syq changes an existing file's metadata in place only when that can't affect
+another name or grant privileges, and otherwise replaces the file (see
+[How syq changes existing files](reference.md#how-syq-changes-existing-files-and-directories)).
+So a hard link planted in the destination never takes the copy's metadata,
+and root never gives a file another user planted there another owner, group,
+or privileges. Access times copied with `--copy-metadata=atimes` are the
+exception: they are set in place, on all of a file's names. Narrowing
+permissions in place does not cut off someone who already has the file or
+directory open.
 
 **Permissions supplied by the source.** Path protection does not decide
 whether copied permissions are appropriate. For example,
@@ -98,9 +104,11 @@ grant other users access or privileges. Enable these options only when you
 trust the source's ownership and permission settings.
 
 **Partial files.** Syq writes partial files, and files `--in-place=new`
-creates, only through files it created itself, and resumes from an old partial
-file only when it is a regular file owned by its user with no other names. A
-symlink or hard link planted where a partial file should be is left unchanged.
+creates, only through files it created or opened itself, and resumes from an
+old partial file only when it is a regular file owned by its user with no
+other names. A symlink or hard link planted where a partial file should be is
+left unchanged. A file swapped in during the copy gets none of the copy's data
+or metadata; syq reports it as failed and does not publish it.
 
 **Concurrent replacement of directory entries.** Checking an entry and
 removing it are separate operations. Someone able to rename files in that
@@ -245,7 +253,8 @@ would. See [Other authentication modes](remote-reference.md#other-authentication
 HostA checks hostB's host key with its own SSH configuration, as its own `ssh`
 would. It also accepts the keys and host certificate authorities that your
 laptop's known_hosts lists for hostB, and refuses keys your laptop marks
-revoked.
+revoked. Trusting hostB only through a host certificate authority counts as
+not knowing it when the key comes without a certificate.
 
 When neither machine knows hostB, nobody can answer a prompt, so hostA's
 default `StrictHostKeyChecking ask` works like `accept-new`: hostA accepts the
@@ -278,6 +287,8 @@ HostA can:
 - Omit a source file and, if pruning is authorized, cause its destination copy
   to be deleted.
 - Inspect destination entries for copy planning and consume the allowed space.
+- Ignore `--where` and `--copy-if`; hostB enforces only the destination, the
+  write and deletion permissions, and the limits.
 - Stop the transfer or withhold hostB's reports, which fails the copy.
 
 HostA cannot:
@@ -293,9 +304,10 @@ HostA cannot:
   shell.
 - Forge, alter, or cut short hostB's reports of its changes.
 
-On some filesystems, such as NFS, FAT, and rclone mounts, a copy that may only
-create new files can still replace a file that another program creates at the
-same name during the copy.
+On some filesystems, such as NFS, FAT and exFAT on macOS, and rclone mounts, a
+copy that may only create new files can still replace a file that another
+program creates at the same name during the copy, and hostA controls how long
+the copy takes.
 
 HostB's account and receiver remain trusted to enforce the signed copy and
 report accurately. HostB's reports describe their work; they cannot prove that

@@ -209,7 +209,6 @@ the approved connection:
 
 ```sh
 syq persist auth-from @laptop
-syq cp report --to hostB --as report
 syq persist ssh-config hostB > hostB.ssh
 scp -F hostB.ssh report hostB:report
 ```
