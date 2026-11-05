@@ -4,6 +4,7 @@ Port 22
 ListenAddress 0.0.0.0
 AddressFamily inet
 HostKey /run/sshd/ssh_host_ed25519_key
+HostKey /run/sshd/ssh_host_ecdsa_key
 PidFile /run/sshd/sshd.pid
 
 PermitRootLogin no

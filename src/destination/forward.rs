@@ -174,9 +174,11 @@ pub(super) struct Issued {
     entry_key: EntryKeyText,
     /// The account the enrollment is for.
     login: String,
-    /// The destination's host keys this machine trusts.
+    /// What this machine's known_hosts files say about the destination.
     known_hosts: String,
-    host_key_algorithms: String,
+    /// What they leave out of its configuration, without its value, for a
+    /// notice.
+    known_hosts_left_out: Option<String>,
     /// The destination as the directive's rules name it.
     destination: Vec<u8>,
     /// This machine's deletion limit for the copy.
@@ -241,23 +243,29 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
             "syq: remote copy approved; connecting to the destination's restricted receiver"
         );
     }
-    // This machine reaches the receiver at the address its own SSH
-    // configuration gives the target, as the account the approving machine
-    // enrolled, trusting only the host keys that machine trusts.
-    let address = ssh_target(&target, Instant::now() + SETUP_TIMEOUT, &|| false)?;
-    let port = address.port;
+    // This machine reaches the receiver as its own SSH configuration reaches
+    // the target its command named, as the account the approving machine
+    // enrolled, and checks its host key as its own `ssh` would, also
+    // accepting what the approving machine knows.
+    let endpoint = target_endpoint(&target)?;
     super::apply_deletion_limit(args, Some(issued.max_delete));
     let destination = args.locations.last_mut().unwrap();
     destination.path = issued.destination;
-    destination.host = Some(address.hostname);
+    destination.host = Some(endpoint.host);
     destination.user = Some(issued.login);
-    destination.port = Some(port);
+    destination.port = endpoint.port;
     args.auth_from = crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name));
     args.restricted_grant = Some(issued.directive);
-    args.rsh = Some(crate::remote_to_remote::receiver_rsh(
-        port,
-        &issued.host_key_algorithms,
-    ));
+    args.rsh = Some(crate::remote_to_remote::receiver_rsh(endpoint.port));
+    if let Some(left_out) = issued.known_hosts_left_out.filter(|_| !args.quiet) {
+        crate::output::diagnostic!(
+            "syq: checking the destination's host key without some of what the approving machine knows about it: {}",
+            left_out
+                .chars()
+                .filter(|character| !character.is_control())
+                .collect::<String>()
+        );
+    }
     let keys = crate::remote_to_remote::prepare_receiver_ssh_with(
         args,
         &issued.known_hosts,
@@ -267,37 +275,18 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
     Ok(())
 }
 
-/// What this machine's SSH configuration gives `target`.
-struct SshTarget {
-    user: String,
-    hostname: String,
-    port: u16,
-}
-
-fn ssh_target(target: &str, deadline: Instant, cancelled: &dyn Fn() -> bool) -> Result<SshTarget> {
+/// The login this machine's SSH configuration gives `target`.
+fn ssh_login(target: &str, deadline: Instant, cancelled: &dyn Fn() -> bool) -> Result<String> {
     let output = read_ssh_configuration(
         target_spec(target)?.ssh_hostname_command(),
         deadline,
         cancelled,
     )?;
-    let value = |name: &str| {
-        output
-            .lines()
-            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
-            .map(|value| value.trim().to_owned())
-            .with_context(|| {
-                format!("the SSH configuration for {target:?} did not report its {name}")
-            })
-    };
-    let hostname = value("hostname")?;
-    validate_data_hostname(&hostname)?;
-    Ok(SshTarget {
-        user: value("user")?,
-        port: value("port")?.parse().with_context(|| {
-            format!("the SSH configuration for {target:?} reported an invalid port")
-        })?,
-        hostname,
-    })
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("user ")?.trim().to_owned().into())
+        .filter(|user: &String| !user.is_empty())
+        .with_context(|| format!("the SSH configuration for {target:?} did not report its user"))
 }
 
 pub(super) struct Slot<'a>(pub(super) &'a AtomicUsize);
@@ -390,7 +379,7 @@ impl Receiver {
                 || requester_closed(&socket)
         };
         // Reading this machine's SSH configuration contacts no server.
-        let login = ssh_target(&target, Instant::now() + SETUP_TIMEOUT, &cancelled)?.user;
+        let login = ssh_login(&target, Instant::now() + SETUP_TIMEOUT, &cancelled)?;
         let enrollment =
             crate::restricted::local_enrollment_state(&endpoint.host, endpoint.port, &login)?;
         let account = format!("{login}@{}", endpoint.host);
@@ -421,9 +410,9 @@ impl Receiver {
         anyhow::ensure!(!cancelled(), "remote copy disconnected before setup");
         // This lock only serializes decisions, not enrollment.
         drop(request_lock);
-        // The destination's host keys this machine trusts, which the server
-        // checks; the same lookup gives the login enrollment uses.
-        let policy = crate::agent_broker::resolve_host_policy_at_bounded(
+        // The login enrollment uses, and what this machine knows about the
+        // destination's key, which the server adds to what it knows.
+        let policy = crate::agent_broker::resolve_known_policy_at_bounded(
             "ssh",
             endpoint.user.as_deref(),
             &endpoint.host,
@@ -467,8 +456,9 @@ impl Receiver {
             directive: prepared.directive,
             entry_key: prepared.entry_key,
             login: policy.login_user.clone(),
-            known_hosts: policy.known_hosts(crate::remote_to_remote::RECEIVER_HOST_ALIAS)?,
-            host_key_algorithms: policy.host_key_algorithms(),
+            known_hosts: policy.known_hosts_for_others()?,
+            // The configured value stays here: it can hold commands and paths.
+            known_hosts_left_out: policy.left_out_kind().map(str::to_owned),
             destination: prepared.destination,
             max_delete,
         };
@@ -1215,6 +1205,7 @@ pub(super) fn target_spec(target: &str) -> Result<crate::conn::RemoteSpec> {
         diagnostics: Default::default(),
         primed_control: Default::default(),
         forwarded: None,
+        receiver_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     })
 }

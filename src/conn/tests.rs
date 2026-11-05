@@ -905,6 +905,7 @@ fn connecting_socket_congestion_rejection_is_attributed_to_coordinator() {
         diagnostics: Default::default(),
         primed_control: Default::default(),
         forwarded: None,
+        receiver_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
     let info = TcpInfo {
@@ -1816,6 +1817,7 @@ fn ssh_inherits_host_key_policy() {
         diagnostics: Default::default(),
         primed_control: Default::default(),
         forwarded: None,
+        receiver_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
     let command = spec.ssh_command(SshConnection::Independent, false);
@@ -1881,6 +1883,7 @@ fn worker_tcp_fallback_survives_broken_stderr() {
         diagnostics: Default::default(),
         primed_control: Default::default(),
         forwarded: None,
+        receiver_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
     let endpoint = Endpoint::Remote(spec.clone());
@@ -1920,6 +1923,7 @@ fn ssh_workers_reuse_the_private_control_socket_only_when_enabled() {
         diagnostics: Default::default(),
         primed_control: Default::default(),
         forwarded: None,
+        receiver_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
     let args = |connection| {
@@ -2113,6 +2117,7 @@ fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
         diagnostics: Default::default(),
         primed_control: Default::default(),
         forwarded: None,
+        receiver_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
     let args = |connection| {
@@ -2241,6 +2246,7 @@ fn persistent_control_path_is_one_byte_exact_openssh_argument() {
         diagnostics: Default::default(),
         primed_control: Default::default(),
         forwarded: None,
+        receiver_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
 
@@ -2669,6 +2675,7 @@ fn only_sessions_within_a_run_use_the_handshake_platform() {
         diagnostics: Default::default(),
         primed_control: Default::default(),
         forwarded: None,
+        receiver_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
     let server = ["--server".to_string()];

@@ -120,8 +120,12 @@ fn setup_and_destination_connections_apply_only_the_selected_agent_policy() {
         ambient: "/tmp/ambient-agent".into(),
         broker: "/tmp/syq-agent".into(),
     };
-    let hardened =
-        constrained_destination_rsh(2222, "ssh-ed25519", DestinationAuthentication::Broker);
+    let hardened = constrained_destination_rsh(
+        Some(2222),
+        DestinationAuthentication::Broker {
+            host_key_algorithms: "ssh-ed25519",
+        },
+    );
     assert_eq!(
         destination_rsh(None, false, Some(&constrained), Some(&hardened)),
         Some(hardened.clone())
@@ -141,6 +145,8 @@ fn setup_and_destination_connections_apply_only_the_selected_agent_policy() {
         "LogLevel=ERROR",
         "ConnectTimeout=10",
         "HostKeyAlgorithms=ssh-ed25519",
+        "StrictHostKeyChecking=no",
+        "UserKnownHostsFile=/dev/null",
         "2222",
     ] {
         assert!(hardened_words.iter().any(|word| word == required));
@@ -912,32 +918,336 @@ fn requester_loss_counts_only_input_that_ends_after_the_marker() {
     }
 }
 
+/// `ssh -G` output for a destination, as this machine's own configuration
+/// resolves it under the receiver command.
+const RECEIVER_CONFIG: &str = "user backup\n\
+    hostname backup.example.net\n\
+    port 2222\n\
+    stricthostkeychecking ask\n\
+    userknownhostsfile /home/u/.ssh/known_hosts /home/u/.ssh/known_hosts2\n\
+    globalknownhostsfile /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2\n\
+    pubkeyacceptedalgorithms ssh-ed25519,rsa-sha2-512\n\
+    sessiontype default\n\
+    stdinnull no\n\
+    forkafterauthentication no\n\
+    securitykeyprovider internal\n\
+    tunnel false\n\
+    proxyusefdpass no\n";
+
+/// A stand-in `ssh` in `directory` that prints `output` for `-G`.
+fn stand_in_ssh(directory: &std::path::Path, output: &str) -> std::path::PathBuf {
+    let path = directory.join("ssh");
+    crate::test_support::write_executable(
+        &path,
+        format!("#!/bin/sh\nprintf '%s' '{output}'\n"),
+        0o700,
+    );
+    path
+}
+
 #[test]
-fn receiver_ssh_uses_the_entry_key_alone_and_pinned_host_keys() {
+fn the_coordinator_adds_only_what_its_own_configuration_needs() {
+    let connection = ReceiverConnection::parse(RECEIVER_CONFIG).unwrap();
+    // SSH looks the destination up under its address and port.
+    assert_eq!(connection.lookup, "[backup.example.net]:2222");
+    // Nobody can answer `ask` here: accept a new host, as accept-new does.
+    // Everything else stays as configured, and the approving machine's
+    // knowledge joins through a command, beside the configured files.
+    assert_eq!(connection.hostname, "backup.example.net");
+    assert_eq!(connection.accepted_algorithms, "PubkeyAcceptedAlgorithms");
+    assert_eq!(
+        connection.arguments(Some(std::path::Path::new("/tmp/approving"))),
+        [
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "KnownHostsCommand=/usr/bin/env cat /tmp/approving",
+        ]
+    );
+    for configured in ["yes", "true", "no", "false", "accept-new"] {
+        let connection = ReceiverConnection::parse(&RECEIVER_CONFIG.replace(
+            "stricthostkeychecking ask",
+            &format!("stricthostkeychecking {configured}"),
+        ))
+        .unwrap();
+        assert!(
+            !connection
+                .additions
+                .iter()
+                .any(|option| option.starts_with("StrictHostKeyChecking")),
+            "{configured}"
+        );
+    }
+    // Session options the configuration sets are overridden, and only those.
+    let session = ReceiverConnection::parse(
+        &(RECEIVER_CONFIG
+            .replace("sessiontype default", "sessiontype none")
+            .replace("stdinnull no", "stdinnull yes")
+            .replace("forkafterauthentication no", "forkafterauthentication yes")
+            .replace(
+                "securitykeyprovider internal",
+                "securitykeyprovider /usr/lib/sk.so",
+            )
+            .replace("tunnel false", "tunnel point-to-point")
+            .replace("proxyusefdpass no", "proxyusefdpass yes")
+            + "remotecommand echo hi\n"),
+    )
+    .unwrap();
+    for option in [
+        "RemoteCommand=none",
+        "SessionType=default",
+        "StdinNull=no",
+        "ForkAfterAuthentication=no",
+        "SecurityKeyProvider=internal",
+        "Tunnel=no",
+        "ProxyUseFdpass=no",
+    ] {
+        assert!(session.additions.contains(&option.to_owned()), "{option}");
+    }
+    // An older ssh that reports none of them gets none of them.
+    let old = ReceiverConnection::parse("hostname backup\nport 22\n").unwrap();
+    assert!(old.additions.is_empty());
+    assert_eq!(old.lookup, "backup");
+    // A configured alias is the name.
+    let aliased =
+        ReceiverConnection::parse(&format!("{RECEIVER_CONFIG}hostkeyalias backup-alias\n"))
+            .unwrap();
+    assert_eq!(aliased.lookup, "backup-alias");
+    // Without the approving machine's file, nothing is added.
+    assert_eq!(
+        connection.arguments(None),
+        ["-o", "StrictHostKeyChecking=accept-new"]
+    );
+    // An older ssh names the accepted algorithms its own way.
+    let older =
+        ReceiverConnection::parse("hostname backup\nport 22\npubkeyacceptedkeytypes ssh-ed25519\n")
+            .unwrap();
+    assert_eq!(older.accepted_algorithms, "PubkeyAcceptedKeyTypes");
+    assert!(ReceiverConnection::parse("port 22\n").is_err());
+}
+
+/// The approving machine's entries join through a KnownHostsCommand, which
+/// leaves the configured files as they are. Where the configuration has a
+/// command of its own, or this ssh has none, they become one more global
+/// file only when the configured value has no whitespace: `ssh -G` prints a
+/// list and one quoted name with spaces the same way.
+#[test]
+fn the_approving_machines_entries_join_without_guessing_file_lists() {
+    let approving = Some(std::path::Path::new("/tmp/approving"));
+    let joined = |config: &str| {
+        let connection = ReceiverConnection::parse(config).unwrap();
+        (
+            connection.approving_keys(),
+            connection
+                .arguments(approving)
+                .into_iter()
+                .filter(|argument| {
+                    argument.starts_with("KnownHostsCommand")
+                        || argument.starts_with("GlobalKnownHostsFile")
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(
+        joined(RECEIVER_CONFIG),
+        (
+            ApprovingKeys::Command,
+            vec!["KnownHostsCommand=/usr/bin/env cat /tmp/approving".to_owned()]
+        )
+    );
+    // The configuration's own command stays.
+    let own = format!("{RECEIVER_CONFIG}knownhostscommand /usr/local/bin/hosts %H\n");
+    assert_eq!(joined(&own), (ApprovingKeys::Omitted, Vec::new()));
+    // ssh names the command's output by its own label, and a file by its
+    // name; an omission says why.
+    let label = |config: &str| ReceiverConnection::parse(config).unwrap().approving_label();
+    assert_eq!(label(RECEIVER_CONFIG), "KnownHostsCommand-");
+    assert_eq!(label(&own), APPROVING_KNOWN_HOSTS);
+    assert!(ReceiverConnection::parse(&own)
+        .unwrap()
+        .omission_cause()
+        .starts_with("this machine's configuration has a KnownHostsCommand of its own, "));
+    let single = own.replace(
+        "globalknownhostsfile /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2",
+        "globalknownhostsfile /etc/ssh/ssh_known_hosts",
+    );
+    assert_eq!(
+        joined(&single),
+        (
+            ApprovingKeys::GlobalFile,
+            vec!["GlobalKnownHostsFile=/etc/ssh/ssh_known_hosts /tmp/approving".to_owned()]
+        )
+    );
+    let none = own.replace(
+        "globalknownhostsfile /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2",
+        "globalknownhostsfile none",
+    );
+    assert_eq!(
+        joined(&none),
+        (
+            ApprovingKeys::GlobalFile,
+            vec!["GlobalKnownHostsFile=/tmp/approving".to_owned()]
+        )
+    );
+    // An ssh older than 8.5 has no KnownHostsCommand.
+    let older = RECEIVER_CONFIG.replace(
+        "pubkeyacceptedalgorithms ssh-ed25519,rsa-sha2-512",
+        "pubkeyacceptedkeytypes ssh-ed25519,rsa-sha2-512",
+    );
+    assert_eq!(joined(&older), (ApprovingKeys::Omitted, Vec::new()));
+    assert!(ReceiverConnection::parse(&older)
+        .unwrap()
+        .omission_cause()
+        .starts_with("this machine's ssh is older than OpenSSH 8.5, "));
+    assert_eq!(
+        joined(&older.replace(
+            "globalknownhostsfile /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2",
+            "globalknownhostsfile /etc/ssh/ssh_known_hosts",
+        ))
+        .0,
+        ApprovingKeys::GlobalFile
+    );
+}
+
+/// With real OpenSSH: under the receiver command and what syq adds, a
+/// configuration that would weaken the entry key's session keeps none of
+/// that, while its host-key checking stands as configured.
+#[test]
+fn the_entry_key_session_keeps_its_hardening_under_this_machines_configuration() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let config = temporary.path().join("config");
+    std::fs::write(
+        &config,
+        "Host backup\n  HostName backup.example.net\n  Port 2222\n  User someone\n  \
+         IdentityAgent /tmp/agent\n  ForwardAgent yes\n  ForwardX11 yes\n  \
+         ControlMaster auto\n  ControlPath ~/.ssh/cm-%C\n  ProxyJump bastion\n  \
+         LocalForward 1234 localhost:22\n  RemoteForward 1235 localhost:22\n  \
+         RemoteCommand echo hi\n  RequestTTY yes\n  PKCS11Provider /usr/lib/p11.so\n  \
+         SecurityKeyProvider /usr/lib/sk.so\n  PermitLocalCommand yes\n  \
+         LocalCommand touch /tmp/x\n  Tunnel yes\n  SessionType none\n  StdinNull yes\n  \
+         ForkAfterAuthentication yes\n  ProxyUseFdpass yes\n  BatchMode no\n  \
+         IdentitiesOnly no\n  PubkeyAuthentication no\n  PasswordAuthentication yes\n  \
+         StrictHostKeyChecking ask\n  UserKnownHostsFile none\n  \
+         CASignatureAlgorithms ssh-ed25519\n  KnownHostsCommand /bin/true %H %K\n  \
+         PubkeyAcceptedAlgorithms ssh-ed25519-cert-v01@openssh.com,ssh-ed25519\n  \
+         HostbasedAuthentication yes\n  KbdInteractiveAuthentication yes\n",
+    )
+    .unwrap();
+    let mut command = shell_words::split(&receiver_rsh(None)).unwrap();
+    command.splice(1..1, ["-F".to_owned(), config.display().to_string()]);
+    let resolved = |command: &[String]| {
+        let output = Command::new(&command[0])
+            .args(&command[1..])
+            .args(["-G", "-l", "backup", "backup"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let connection = ReceiverConnection::parse(&resolved(&command)).unwrap();
+    command.extend(connection.arguments(Some(std::path::Path::new("/tmp/approving"))));
+    command.extend([
+        "-o".to_owned(),
+        format!("{}=ssh-ed25519", connection.accepted_algorithms),
+    ]);
+    let effective = resolved(&command);
+    let has = |line: &str| effective.lines().any(|candidate| candidate == line);
+    for line in [
+        "user backup",
+        "identityagent none",
+        "identitiesonly yes",
+        "forwardagent no",
+        "forwardx11 no",
+        "controlmaster false",
+        "requesttty false",
+        "securitykeyprovider internal",
+        "permitlocalcommand no",
+        "tunnel false",
+        "sessiontype default",
+        "stdinnull no",
+        "forkafterauthentication no",
+        "proxyusefdpass no",
+        "batchmode yes",
+        "pubkeyauthentication true",
+        "preferredauthentications publickey",
+        // Only the entry key's own algorithm: no certificate is offered.
+        "pubkeyacceptedalgorithms ssh-ed25519",
+        "hostbasedauthentication no",
+        "kbdinteractiveauthentication no",
+        "passwordauthentication no",
+        "clearallforwardings yes",
+        // Host-key checking as configured, `ask` accepting a new key.
+        "stricthostkeychecking accept-new",
+        "userknownhostsfile none",
+        "casignaturealgorithms ssh-ed25519",
+        // The configuration's own command stays, and its default global
+        // list could be one quoted name: the approving machine's entries
+        // are left out rather than guessed at.
+        "knownhostscommand /bin/true %H %K",
+    ] {
+        assert!(has(line), "{line}\n{effective}");
+    }
+    // OpenSSH leaves these settings out when they are off.
+    for name in [
+        "controlpath ",
+        "proxyjump ",
+        "proxycommand ",
+        "localforward ",
+        "remoteforward ",
+        "remotecommand ",
+        "pkcs11provider ",
+    ] {
+        assert!(
+            !effective.lines().any(|line| line.starts_with(name)),
+            "{name}\n{effective}"
+        );
+    }
+    // The entry key comes first; HostKeyAlgorithms stays unset, so OpenSSH
+    // still prefers the key types it already knows for the destination.
+    assert_eq!(
+        effective
+            .lines()
+            .find(|line| line.starts_with("identityfile ")),
+        Some("identityfile none")
+    );
+    assert!(!command
+        .iter()
+        .any(|argument| argument.starts_with("HostKeyAlgorithms")));
+}
+
+#[test]
+fn receiver_ssh_uses_the_entry_key_first_and_checks_host_keys_as_this_machine_does() {
     use clap::Parser;
     use std::os::unix::fs::PermissionsExt as _;
     let mut args = Args::parse_from(["syq", "src", "dst"]);
     args.restricted_grant = Some("signed-grant".into());
-    let template =
-        constrained_destination_rsh(2222, "ssh-ed25519", DestinationAuthentication::Receiver);
+    args.locations = vec![Location::parse("backup:/archive").unwrap()];
+    let stand_in = crate::test_support::tempdir().unwrap();
+    let ssh = stand_in_ssh(stand_in.path(), RECEIVER_CONFIG);
+    let mut words = shell_words::split(&receiver_rsh(Some(2222))).unwrap();
+    words[0] = ssh.display().to_string();
+    let template = shell_words::join(&words);
     args.rsh = Some(template.clone());
     let host =
         ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ed25519)
             .unwrap();
-    let known_hosts = format!(
-        "{RECEIVER_HOST_ALIAS} {}\n",
-        host.public_key().to_openssh().unwrap()
-    );
+    let authority =
+        ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ed25519)
+            .unwrap();
+    let host_key = host.public_key().to_openssh().unwrap();
+    let authority_key = authority.public_key().to_openssh().unwrap();
+    // What the approving machine knows: a key and a host certificate
+    // authority, under its own name for the destination.
+    let known_hosts =
+        format!("backup-alias {host_key}\n@cert-authority backup-alias {authority_key}\n");
     let entry =
         ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ed25519)
             .unwrap();
     let entry_key = entry.to_openssh(ssh_key::LineEnding::LF).unwrap();
     let guard = prepare_receiver_ssh_with(&mut args, &known_hosts, entry_key.as_bytes()).unwrap();
     let command = parse_rsh(&args.rsh).unwrap();
-    // The whole hardening set: no user configuration, agent, control
-    // socket, forwarding, proxy or local command, the entry key as the only
-    // identity, and only the pinned host keys.
-    assert_eq!(&command[..3], ["ssh", "-F", "/dev/null"]);
+    // This machine's own configuration, under the entry-key hardening.
+    assert!(!command.contains(&"-F".to_owned()));
     for flag in ["-a", "-x", "-k", "-T"] {
         assert!(command.contains(&flag.to_owned()), "{flag}");
     }
@@ -952,46 +1262,122 @@ fn receiver_ssh_uses_the_entry_key_alone_and_pinned_host_keys() {
         "ControlMaster=no",
         "ControlPath=none",
         "ClearAllForwardings=yes",
+        "ForwardAgent=no",
+        "ForwardX11=no",
         "PermitLocalCommand=no",
         "ProxyJump=none",
         "ProxyCommand=none",
-        "StrictHostKeyChecking=yes",
-        "GlobalKnownHostsFile=/dev/null",
-        "UpdateHostKeys=no",
-        "HostKeyAlias=syq-enrolled-receiver",
+        "HostbasedAuthentication=no",
+        "KbdInteractiveAuthentication=no",
+        "PasswordAuthentication=no",
+        "StrictHostKeyChecking=accept-new",
+        // The entry key's own algorithm only: no certificate first.
+        "PubkeyAcceptedAlgorithms=ssh-ed25519",
     ] {
         assert!(command.contains(&option.to_owned()), "{option}");
+    }
+    for unset in ["UserKnownHostsFile=", "HostKeyAlias=", "HostKeyAlgorithms="] {
+        assert!(
+            !command.iter().any(|argument| argument.starts_with(unset)),
+            "{unset}"
+        );
     }
     assert!(!command.contains(&"PubkeyAuthentication=host-bound".into()));
     assert!(!command
         .iter()
         .any(|argument| argument == "IdentityFile=none"));
-    let known = guard.path().join("known_hosts");
+    let approving = guard.path().join(APPROVING_KNOWN_HOSTS);
     let key = guard.path().join("entry-key");
-    assert!(command.contains(&format!("UserKnownHostsFile={}", known.display())));
+    assert!(command.contains(&format!(
+        "KnownHostsCommand=/usr/bin/env cat {}",
+        approving.display()
+    )));
+    assert!(!command
+        .iter()
+        .any(|argument| argument.starts_with("GlobalKnownHostsFile")));
     assert!(command.contains(&format!("IdentityFile={}", key.display())));
-    assert_eq!(std::fs::read_to_string(&known).unwrap(), known_hosts);
+    // Written under the name this machine's own configuration uses.
+    assert_eq!(
+        std::fs::read_to_string(&approving).unwrap(),
+        format!(
+            "[backup.example.net]:2222 {host_key}\n@cert-authority [backup.example.net]:2222 {authority_key}\n"
+        )
+    );
     assert_eq!(std::fs::read_to_string(&key).unwrap(), entry_key.as_str());
     assert_eq!(
         std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
         0o600
     );
+    // The copy's TCP data goes to the host this inspection resolved, and a
+    // refused key names the approving machine's own name for the host.
+    let (dialed, receiver) = args.receiver_host.take().unwrap();
+    assert_eq!(dialed, "backup");
+    assert_eq!(receiver.hostname, "backup.example.net");
+    assert_eq!(
+        receiver.approving,
+        Some(("KnownHostsCommand-", "backup-alias".to_owned()))
+    );
     drop(guard);
-    assert!(!known.exists() && !key.exists());
+    assert!(!approving.exists() && !key.exists());
 
+    // With a KnownHostsCommand of its own and a global value that could be
+    // one quoted name, the configuration stays as it is, without the
+    // approving machine's entries.
+    let configured = crate::test_support::tempdir().unwrap();
+    let ssh = stand_in_ssh(
+        configured.path(),
+        &format!("{RECEIVER_CONFIG}knownhostscommand /usr/local/bin/hosts %H\n"),
+    );
+    let mut words = shell_words::split(&receiver_rsh(Some(2222))).unwrap();
+    words[0] = ssh.display().to_string();
+    args.rsh = Some(shell_words::join(&words));
+    let guard = prepare_receiver_ssh_with(&mut args, &known_hosts, entry_key.as_bytes()).unwrap();
+    let command = parse_rsh(&args.rsh).unwrap();
+    assert!(!command.iter().any(|argument| {
+        argument.starts_with("GlobalKnownHostsFile") || argument.starts_with("KnownHostsCommand")
+    }));
+    assert_eq!(args.receiver_host.take().unwrap().1.approving, None);
+    drop(guard);
+
+    // An approving machine that knows nothing adds nothing.
+    args.rsh = Some(template.clone());
+    let guard = prepare_receiver_ssh_with(&mut args, "", entry_key.as_bytes()).unwrap();
+    assert!(!guard.path().join(APPROVING_KNOWN_HOSTS).exists());
+    let command = parse_rsh(&args.rsh).unwrap();
+    assert!(!command.iter().any(|argument| {
+        argument.starts_with("GlobalKnownHostsFile") || argument.starts_with("KnownHostsCommand")
+    }));
+    drop(guard);
     args.rsh = Some(template.clone());
     assert!(
         prepare_receiver_ssh_with(&mut args, "@cert-authority * bad", entry_key.as_bytes())
             .is_err()
     );
+    // A name that cannot be shown as it is gives way to the host dialed.
+    args.rsh = Some(template.clone());
+    let guard = prepare_receiver_ssh_with(
+        &mut args,
+        &format!("backup\u{1b}[2J {host_key}\n"),
+        entry_key.as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        args.receiver_host.take().unwrap().1.approving,
+        Some(("KnownHostsCommand-", "backup".to_owned()))
+    );
+    drop(guard);
+    // A command that already checks host keys its own way is refused.
+    args.rsh = Some(format!("{template} -o StrictHostKeyChecking=no"));
+    assert!(prepare_receiver_ssh_with(&mut args, &known_hosts, entry_key.as_bytes()).is_err());
     // A command that would also use an agent never gets the key.
     args.rsh = Some(template.replace("IdentityAgent=none", "IdentityAgent=SSH_AUTH_SOCK"));
     assert!(prepare_receiver_ssh_with(&mut args, &known_hosts, entry_key.as_bytes()).is_err());
     // The broker's command uses an agent, so it never gets the key.
     args.rsh = Some(constrained_destination_rsh(
-        2222,
-        "ssh-ed25519",
-        DestinationAuthentication::Broker,
+        Some(2222),
+        DestinationAuthentication::Broker {
+            host_key_algorithms: "ssh-ed25519",
+        },
     ));
     assert!(prepare_receiver_ssh_with(&mut args, &known_hosts, entry_key.as_bytes()).is_err());
 }
@@ -1016,14 +1402,16 @@ fn the_coordinator_connection_forwards_nothing_when_it_gets_an_entry_key() {
 fn an_interrupted_coordinator_removes_its_entry_key() {
     use clap::Parser;
     const CHILD: &str = "SYQ_TEST_ENTRY_KEY_CHILD";
+    const STAND_IN: &str = "SYQ_TEST_ENTRY_KEY_SSH";
     if let Some(report) = std::env::var_os(CHILD) {
         let mut args = Args::parse_from(["syq", "src", "dst"]);
         args.restricted_grant = Some("signed-grant".into());
-        args.rsh = Some(constrained_destination_rsh(
-            2222,
-            "ssh-ed25519",
-            DestinationAuthentication::Receiver,
-        ));
+        args.locations = vec![Location::parse("backup:/archive").unwrap()];
+        // A stand-in `ssh`, so the developer's own configuration plays no
+        // part.
+        let mut words = shell_words::split(&receiver_rsh(Some(2222))).unwrap();
+        words[0] = std::env::var(STAND_IN).unwrap();
+        args.rsh = Some(shell_words::join(&words));
         let host = ssh_key::PrivateKey::random(
             &mut ssh_key::rand_core::OsRng,
             ssh_key::Algorithm::Ed25519,
@@ -1038,10 +1426,7 @@ fn an_interrupted_coordinator_removes_its_entry_key() {
         .unwrap();
         let directory = prepare_receiver_ssh_with(
             &mut args,
-            &format!(
-                "{RECEIVER_HOST_ALIAS} {}\n",
-                host.public_key().to_openssh().unwrap()
-            ),
+            &format!("backup {}\n", host.public_key().to_openssh().unwrap()),
             entry.as_bytes(),
         )
         .unwrap();
@@ -1053,6 +1438,7 @@ fn an_interrupted_coordinator_removes_its_entry_key() {
     }
     let temporary = crate::test_support::tempdir().unwrap();
     let report = temporary.path().join("directory");
+    let ssh = stand_in_ssh(temporary.path(), RECEIVER_CONFIG);
     let status = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -1060,6 +1446,7 @@ fn an_interrupted_coordinator_removes_its_entry_key() {
             "--nocapture",
         ])
         .env(CHILD, &report)
+        .env(STAND_IN, &ssh)
         .stdin(Stdio::null())
         .status_guarded()
         .unwrap();
@@ -1114,6 +1501,12 @@ fn the_coordinator_reads_the_entry_key_and_directive_from_its_input() {
             .to_openssh(ssh_key::LineEnding::LF)
             .unwrap();
     let directive = b"SYQDIR1\0 the copy's directive";
+    let stand_in = crate::test_support::tempdir().unwrap();
+    crate::test_support::write_executable(
+        &stand_in.path().join("ssh"),
+        format!("#!/bin/sh\nprintf '%s' '{RECEIVER_CONFIG}'\n"),
+        0o700,
+    );
     if std::env::var_os(CHILD).is_some() {
         let host = ssh_key::PrivateKey::random(
             &mut ssh_key::rand_core::OsRng,
@@ -1130,14 +1523,13 @@ fn the_coordinator_reads_the_entry_key_and_directive_from_its_input() {
         );
         args.directive_stdin = Some(directive.len());
         args.receiver_known_hosts = Some(format!(
-            "{RECEIVER_HOST_ALIAS} {}\n",
+            "backup {}\n",
             host.public_key().to_openssh().unwrap()
         ));
-        args.rsh = Some(constrained_destination_rsh(
-            2222,
-            "ssh-ed25519",
-            DestinationAuthentication::Receiver,
-        ));
+        args.rsh = Some(receiver_rsh(Some(2222)));
+        // The coordinator reads its own SSH configuration for the receiver,
+        // here from the stand-in `ssh` the parent put first on PATH.
+        args.locations = vec![Location::parse("backup:/archive").unwrap()];
         let _directory = prepare_receiver_ssh(&mut args).unwrap().unwrap();
         assert_eq!(
             args.restricted_grant.as_deref(),
@@ -1160,6 +1552,14 @@ fn the_coordinator_reads_the_entry_key_and_directive_from_its_input() {
         ])
         .env(CHILD, "1")
         .env("SYQ_TEST_ENTRY_KEY_LENGTH", entry.len().to_string())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                stand_in.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

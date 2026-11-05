@@ -19,7 +19,11 @@ fn host_policy(user: &str, name: &str, key: KeyData) -> HostPolicy {
         login_user: user.into(),
         connection_host: name.into(),
         port: 22,
-        host_keys: vec![key],
+        host_keys: vec![key.clone()],
+        listed_keys: vec![key],
+        authorities: Vec::new(),
+        revoked: Vec::new(),
+        unsupported: None,
         known_hosts_name: name.into(),
         host_key_algorithms: vec![algorithm],
         required_rsa_size: 1024,
@@ -194,12 +198,63 @@ fn ambiguous_or_relative_known_hosts_filenames_fail_closed() {
         let output = format!(
                 "user backup\nhostname vault.internal\nport 22\nuserknownhostsfile {value}\nglobalknownhostsfile none\nhostkeyalgorithms ssh-ed25519\n"
             );
-        let error = parse_ssh_config(output.as_bytes()).unwrap_err();
+        // Exact-key uses refuse it; reading what the files hold does not.
+        let config = parse_ssh_config(output.as_bytes()).unwrap();
+        let reason = config.unsupported.unwrap().broker_error();
         assert!(
-            error.to_string().contains("known_hosts"),
-            "unexpected error for {value:?}: {error:#}"
+            reason.contains("known_hosts"),
+            "unexpected reason for {value:?}: {reason}"
         );
     }
+}
+
+/// What this machine tells a server about a host: a configured value with
+/// whitespace could be one quoted name or several, so it is left out,
+/// judged by the keys actually selected.
+#[test]
+fn known_hosts_values_with_whitespace_are_left_out() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let key = |name: &str| {
+        let key = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let line = format!("vault {}\n", key.public_key().to_openssh().unwrap());
+        std::fs::write(temporary.path().join(name), line).unwrap();
+        key.public_key().key_data().clone()
+    };
+    key("known hosts");
+    let known = key("known");
+    key("other");
+    let selected = |value: &str| {
+        let mut files = Vec::new();
+        let mut unsupported = None;
+        append_known_hosts_files(&mut files, value, None, true, &mut unsupported);
+        // Exact-key uses refuse such a value.
+        assert!(unsupported.is_some(), "{value}");
+        let (keys, _) =
+            read_known_host_keys(&OsString::from("ssh-keygen"), "vault", &files).unwrap();
+        keys
+    };
+    let directory = temporary.path().display();
+    // `"…/known hosts"`, one quoted name, and an unquoted list of existing
+    // files look the same: neither is read, so `…/known` never is.
+    assert!(selected(&format!("{directory}/known hosts")).is_empty());
+    assert!(selected(&format!("{directory}/known {directory}/other")).is_empty());
+    // One name without whitespace is read.
+    let mut files = Vec::new();
+    let mut unsupported = None;
+    append_known_hosts_files(
+        &mut files,
+        &format!("{directory}/known"),
+        None,
+        true,
+        &mut unsupported,
+    );
+    assert!(unsupported.is_none());
+    let (keys, _) = read_known_host_keys(&OsString::from("ssh-keygen"), "vault", &files).unwrap();
+    assert_eq!(keys, [known]);
 }
 
 #[test]
@@ -221,7 +276,7 @@ fn configured_value_identical_to_flattened_defaults_fails_closed() {
             files: Vec::new(),
         },
     };
-    let error = parse_ssh_config_with_defaults(
+    let config = parse_ssh_config_with_defaults(
         output.as_bytes(),
         Some(&defaults),
         &KnownHostsConfigured {
@@ -229,8 +284,12 @@ fn configured_value_identical_to_flattened_defaults_fails_closed() {
             global: false,
         },
     )
-    .unwrap_err();
-    assert!(error.to_string().contains("ambiguous known_hosts"));
+    .unwrap();
+    assert!(config
+        .unsupported
+        .unwrap()
+        .broker_error()
+        .contains("ambiguous known_hosts"));
 }
 
 #[test]
@@ -301,9 +360,13 @@ fn openssh_quoted_default_collision_is_rejected_end_to_end() {
     let paths = ssh_configuration_paths(&output.stderr).unwrap();
     let configured = configured_known_hosts_directives(&paths).unwrap();
     assert!(configured.user);
-    let error =
-        parse_ssh_config_with_defaults(&output.stdout, Some(&defaults), &configured).unwrap_err();
-    assert!(error.to_string().contains("ambiguous known_hosts"));
+    let config =
+        parse_ssh_config_with_defaults(&output.stdout, Some(&defaults), &configured).unwrap();
+    assert!(config
+        .unsupported
+        .unwrap()
+        .broker_error()
+        .contains("ambiguous known_hosts"));
 }
 
 #[test]
@@ -312,7 +375,9 @@ fn unrelated_literal_known_hosts_options_preserve_real_default_lists() {
     let defaults = KnownHostsDefaults::from_openssh(&defaults_output.output).unwrap();
     let temp = crate::test_support::tempdir().unwrap();
     let config = temp.path().join("ssh_config");
-    std::fs::write(&config, b"Host unrelated.example\n  UserKnownHostsFile /tmp/private-known-hosts\n  GlobalKnownHostsFile=/dev/null\n").unwrap();
+    // A literal absolute or `~/` name has no space, so it cannot be read as
+    // the default list, wherever it is set.
+    std::fs::write(&config, b"Host unrelated.example\n  UserKnownHostsFile /tmp/private-known-hosts\n  GlobalKnownHostsFile=/dev/null\nHost work\n  UserKnownHostsFile ~/.ssh/known_hosts_work ~/.ssh/known_hosts_work2\n").unwrap();
     let output = Command::new("ssh")
         .args(["-G", "-vvv", "-F"])
         .arg(&config)
@@ -338,7 +403,8 @@ fn unrelated_literal_known_hosts_options_preserve_real_default_lists() {
     for uncertain in [
         b"UserKnownHostsFile \"/tmp/a /tmp/b\"".as_slice(),
         b"UserKnownHostsFile /tmp/a\\ /tmp/b",
-        b"UserKnownHostsFile ~/.ssh/known_hosts",
+        b"UserKnownHostsFile ~other/.ssh/known_hosts",
+        b"UserKnownHostsFile \"~/.ssh/known hosts\"",
         b"UserKnownHostsFile ${HOME}/.ssh/known_hosts",
         b"UserKnownHostsFile /tmp/%h",
     ] {
@@ -376,8 +442,18 @@ fn dynamic_and_external_revocation_host_policies_fail_closed() {
         let config = format!(
                 "user backup\nhostname vault.internal\nport 22\nuserknownhostsfile /tmp/known\nhostkeyalgorithms ssh-ed25519\nrequiredrsasize 1024\n{policy}\n"
             );
-        let error = parse_ssh_config(config.as_bytes()).unwrap_err();
-        assert!(error.to_string().contains("constrained agent forwarding"));
+        // Exact-key uses, which bind agent signatures to the host, refuse
+        // it; OpenSSH's own checking reproduces it.
+        let config = parse_ssh_config(config.as_bytes()).unwrap();
+        let unsupported = config.unsupported.unwrap();
+        assert!(unsupported
+            .broker_error()
+            .contains("constrained agent forwarding"));
+        // This machine's notice names the value; what another machine is
+        // told does not.
+        let (_, value) = policy.split_once(' ').unwrap();
+        assert!(unsupported.notice().contains(value));
+        assert!(!unsupported.kind().contains(value));
     }
 }
 
@@ -487,24 +563,24 @@ fn known_hosts_parser_keeps_plain_keys_and_tracks_ca_and_revocation() {
     );
     let mut trusted = Vec::new();
     let mut revoked = Vec::new();
-    let mut saw_ca = false;
+    let mut authorities = Vec::new();
     parse_known_host_output(
         &text,
         Path::new("known_hosts"),
         &mut trusted,
         &mut revoked,
-        &mut saw_ca,
+        &mut authorities,
     )
     .unwrap();
-    assert_eq!(trusted, [plain]);
+    assert_eq!(trusted, std::slice::from_ref(&plain));
     assert_eq!(revoked, [revoked_key]);
-    assert!(saw_ca);
+    assert_eq!(authorities, [plain]);
     assert!(parse_known_host_output(
         &format!("@unknown host {plain_text}\n"),
         Path::new("known_hosts"),
         &mut trusted,
         &mut revoked,
-        &mut saw_ca,
+        &mut authorities,
     )
     .is_err());
 }

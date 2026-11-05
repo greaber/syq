@@ -554,6 +554,13 @@ impl SshEndpoint {
         &self.target
     }
 
+    /// What `ssh -G` needs after its options to resolve this endpoint.
+    pub(crate) fn query_arguments(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        self.append_connection_args(&mut args);
+        args
+    }
+
     pub(crate) fn label(&self) -> String {
         let target = match self.target.rsplit_once('@') {
             Some((user, host)) if host.contains(':') => format!("{user}@[{host}]"),
@@ -626,17 +633,34 @@ pub enum EnrollmentRoute<'a> {
     ProxyJump { jump: &'a SshEndpoint },
 }
 
-/// What a login nobody is watching, such as the receiving service's, adds
-/// ahead of the user's configuration, for itself and for a jump syq makes:
-/// never prompt, never trust a new host key, and give up on a server that
-/// stops answering.
-const BACKGROUND_LOGIN: [&str; 5] = [
+/// A login nobody is watching, such as the receiving service's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Unattended {
+    /// The SSH configuration would ask about a host key it does not know,
+    /// which nobody can answer: accept a new one the first time, as
+    /// `accept-new` does.
+    pub login_accepts_new: bool,
+    /// The same, for the jump syq makes.
+    pub jump_accepts_new: bool,
+}
+
+/// What an unattended login adds ahead of the user's configuration, for
+/// itself and for a jump syq makes: never prompt, and give up on a server
+/// that stops answering. Host keys are checked as the configuration says.
+const BACKGROUND_LOGIN: [&str; 4] = [
     "BatchMode=yes",
-    "StrictHostKeyChecking=yes",
     "ConnectTimeout=10",
     "ServerAliveInterval=15",
     "ServerAliveCountMax=3",
 ];
+
+/// Whether `ssh -G` output says `StrictHostKeyChecking ask`, the default:
+/// someone would have to answer about a host key nobody knows.
+pub(crate) fn asks_about_new_host_keys(config: &[u8]) -> bool {
+    String::from_utf8_lossy(config)
+        .lines()
+        .any(|line| line.trim() == "stricthostkeychecking ask")
+}
 
 /// Arguments for the trusted local OpenSSH client that enrolls HostB.  A jump
 /// host receives only an opaque TCP stream; it never receives an agent socket
@@ -646,22 +670,30 @@ pub fn enrollment_ssh_args(
     route: EnrollmentRoute<'_>,
     remote_command: &EnrollmentRemoteCommand,
 ) -> Vec<String> {
-    enrollment_ssh_args_raw(target, route, remote_command.as_str(), false)
+    enrollment_ssh_args_raw(target, route, remote_command.as_str(), None)
 }
 
-/// `background`: nobody is watching this login (see `BACKGROUND_LOGIN`).
+/// `unattended`: nobody is watching this login.
 pub(crate) fn enrollment_ssh_args_raw(
     target: &SshEndpoint,
     route: EnrollmentRoute<'_>,
     remote_command: &str,
-    background: bool,
+    unattended: Option<Unattended>,
 ) -> Vec<String> {
     // SSH takes the first value of each option, and the command line's
     // before its configuration's.
-    let policy: &[&str] = if background { &BACKGROUND_LOGIN } else { &[] };
-    let mut args: Vec<String> = policy
-        .iter()
-        .flat_map(|option| ["-o".to_owned(), (*option).to_owned()])
+    let policy = |accepts_new: bool| -> Vec<&str> {
+        match unattended {
+            None => Vec::new(),
+            Some(_) => BACKGROUND_LOGIN
+                .into_iter()
+                .chain(accepts_new.then_some("StrictHostKeyChecking=accept-new"))
+                .collect(),
+        }
+    };
+    let mut args: Vec<String> = policy(unattended.is_some_and(|login| login.login_accepts_new))
+        .into_iter()
+        .flat_map(|option| ["-o".to_owned(), option.to_owned()])
         .collect();
     args.extend([
         "-a".to_owned(),
@@ -691,8 +723,8 @@ pub(crate) fn enrollment_ssh_args_raw(
             // end-to-end with HostB.
             // A login nobody is watching passes its policy on: OpenSSH gives
             // its proxy command none of its own options.
-            let policy: String = policy
-                .iter()
+            let policy: String = policy(unattended.is_some_and(|login| login.jump_accepts_new))
+                .into_iter()
                 .map(|option| format!(" -o {option}"))
                 .collect();
             args.push("-o".to_owned());
@@ -1067,12 +1099,12 @@ mod tests {
     fn a_background_login_gives_its_policy_to_the_jump_syq_makes() {
         let target = SshEndpoint::parse("backup@hostB").unwrap();
         let jump = SshEndpoint::parse("user@hostA").unwrap();
-        let proxy = |background| {
+        let proxy = |unattended| {
             let args = enrollment_ssh_args_raw(
                 &target,
                 EnrollmentRoute::ProxyJump { jump: &jump },
                 "/opt/syq/enroll",
-                background,
+                unattended,
             );
             let proxy = args
                 .iter()
@@ -1081,7 +1113,7 @@ mod tests {
                 .to_owned();
             (args, proxy)
         };
-        let (args, command) = proxy(true);
+        let (args, command) = proxy(Some(Unattended::default()));
         for option in BACKGROUND_LOGIN {
             assert!(
                 args.windows(2).any(|pair| pair == ["-o", option]),
@@ -1089,37 +1121,66 @@ mod tests {
             );
             assert!(command.contains(&format!(" -o {option} ")), "{command}");
         }
+        // Host keys are checked as the configuration says...
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("StrictHostKeyChecking")));
+        assert!(!command.contains("StrictHostKeyChecking"), "{command}");
+        // ...except that where it would ask, nobody can answer, so a new
+        // key is accepted the first time, for the login or for the jump.
+        let (args, command) = proxy(Some(Unattended {
+            login_accepts_new: true,
+            jump_accepts_new: false,
+        }));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-o", "StrictHostKeyChecking=accept-new"]));
+        assert!(!command.contains("StrictHostKeyChecking"), "{command}");
+        let (args, command) = proxy(Some(Unattended {
+            login_accepts_new: false,
+            jump_accepts_new: true,
+        }));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("StrictHostKeyChecking")));
+        assert!(
+            command.contains(" -o StrictHostKeyChecking=accept-new "),
+            "{command}"
+        );
         // A foreground login, as `--via` makes, may still ask.
-        let (args, command) = proxy(false);
+        let (args, command) = proxy(None);
         assert!(!args.iter().any(|arg| arg.starts_with("BatchMode")));
         assert!(!command.contains("BatchMode"), "{command}");
 
-        // The jump's own options win over a configuration that would trust a
-        // new host key or ask for a passphrase.
-        let (_, command) = proxy(true);
-        let temporary = crate::test_support::tempdir().unwrap();
-        let config = temporary.path().join("config");
-        std::fs::write(
-            &config,
-            "Host *\n  StrictHostKeyChecking accept-new\n  BatchMode no\n  ConnectTimeout 300\n",
-        )
-        .unwrap();
-        let words = shell_words::split(&command).unwrap();
-        let (program, options) = words.split_first().unwrap();
-        assert_eq!(program, "ssh");
-        let output = std::process::Command::new("ssh")
-            .arg("-G")
-            .arg("-F")
-            .arg(&config)
-            .args(
-                options
-                    .iter()
-                    .map(|word| word.replace("%h", "hostB").replace("%p", "22")),
-            )
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-        let effective = String::from_utf8(output.stdout).unwrap();
+        // The jump's own options win over a configuration that would ask for
+        // a passphrase or wait long, and its host-key setting is the
+        // configuration's.
+        let effective = |config_text: &str, unattended| {
+            let (_, command) = proxy(Some(unattended));
+            let temporary = crate::test_support::tempdir().unwrap();
+            let config = temporary.path().join("config");
+            std::fs::write(&config, config_text).unwrap();
+            let words = shell_words::split(&command).unwrap();
+            let (program, options) = words.split_first().unwrap();
+            assert_eq!(program, "ssh");
+            let output = std::process::Command::new("ssh")
+                .arg("-G")
+                .arg("-F")
+                .arg(&config)
+                .args(
+                    options
+                        .iter()
+                        .map(|word| word.replace("%h", "hostB").replace("%p", "22")),
+                )
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let strict = effective(
+            "Host *\n  StrictHostKeyChecking yes\n  BatchMode no\n  ConnectTimeout 300\n",
+            Unattended::default(),
+        );
         for setting in [
             "batchmode yes",
             "stricthostkeychecking true",
@@ -1128,10 +1189,31 @@ mod tests {
             "serveralivecountmax 3",
         ] {
             assert!(
-                effective.lines().any(|line| line == setting),
-                "{setting}\n{effective}"
+                strict.lines().any(|line| line == setting),
+                "{setting}\n{strict}"
             );
         }
+        let accepting = effective(
+            "Host *\n  StrictHostKeyChecking accept-new\n",
+            Unattended::default(),
+        );
+        assert!(accepting
+            .lines()
+            .any(|line| line == "stricthostkeychecking accept-new"));
+        let asking = effective(
+            "Host *\n  StrictHostKeyChecking ask\n",
+            Unattended {
+                login_accepts_new: false,
+                jump_accepts_new: true,
+            },
+        );
+        assert!(asking
+            .lines()
+            .any(|line| line == "stricthostkeychecking accept-new"));
+        assert!(asks_about_new_host_keys(
+            b"user x\nstricthostkeychecking ask\n"
+        ));
+        assert!(!asks_about_new_host_keys(b"stricthostkeychecking true\n"));
     }
 
     #[test]

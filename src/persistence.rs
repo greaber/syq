@@ -415,6 +415,7 @@ pub(crate) fn connect_domain(
         diagnostics: Default::default(),
         primed_control: Default::default(),
         forwarded: None,
+        receiver_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
     crate::output::command_human_stdout!("Connecting to {}...", remote.label());

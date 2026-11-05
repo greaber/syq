@@ -22,9 +22,10 @@ def remote(command, *, success=True):
 
 
 def copy(path, *, allow=True, success=True, extra=(), drop_laptop=False, interrupt=False,
-         source="/tmp/syq-real-ssh/return-source/subdir/chunks.bin", prefix=None, after_approval=None, auth=(), binary="syq", stdin=None, ssh_trace=None):
+         source="/tmp/syq-real-ssh/return-source/subdir/chunks.bin", prefix=None, after_approval=None, auth=(), binary="syq", stdin=None, ssh_trace=None,
+         to="destination"):
 
-    argv = [binary, "cp", "-vv", source, "--to", "destination",
+    argv = [binary, "cp", "-vv", source, "--to", to,
             *auth, "--as", path, "--performance-tuning", "workers=2", *extra]
     if ssh_trace is not None:
         argv = ["env", "SYQ_REAL_SSH_TRACE_FILE=" + ssh_trace, *argv]
@@ -39,7 +40,7 @@ def copy(path, *, allow=True, success=True, extra=(), drop_laptop=False, interru
             pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
             assert len(pending) == 1, pending
             request = pending[0]
-            assert ' on "destination" using your SSH access' in request["destination"], request
+            assert f' on "{to}" using your SSH access' in request["destination"], request
             assert "syq's receiver" in request["permission"], request
             run("syq", "persist", "receive", "approve" if allow else "deny", request["id"])
             run("syq", "persist", "receive", "approve", request["id"], success=False)
@@ -235,36 +236,61 @@ assert "a dry run does not set up restricted copying on syq@destination" in stde
 assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
 assert destination_enrollments() == []
 
-print("case: a first copy to a destination this machine does not trust is refused without enrolling", flush=True)
+print("case: a first copy to a destination this machine has not seen follows its host-key setting", flush=True)
 known_hosts = Path.home() / ".ssh/known_hosts"
 trusted = known_hosts.read_bytes()
+config = Path.home() / ".ssh/config"
+original_config = config.read_bytes() if config.exists() else None
 run("ssh-keygen", "-R", "destination", "-f", str(known_hosts))
 try:
+    # With StrictHostKeyChecking yes, this machine refuses a host it has not
+    # seen, and nothing is enrolled.
+    config.write_bytes(b"Host destination\n  StrictHostKeyChecking yes\n\n" + (original_config or b""))
+    config.chmod(0o600)
     untrusted = source_copy()
     pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
     assert len(pending) == 1 and "Also sets up restricted copying" in pending[0]["permission"], pending
     run("syq", "persist", "receive", "approve", pending[0]["id"])
     _, stderr = untrusted.communicate(timeout=90)
     assert untrusted.returncode not in (0, 124), stderr
-    assert "no exact trusted host key for destination" in stderr, stderr
+    assert "Host key verification failed" in stderr, stderr
     assert destination_enrollments() == []
+    # With `ask`, the default (the lab's configuration says `yes`), nobody can
+    # answer in the background: the key is accepted the first time and
+    # recorded, as accept-new does, and the copy sets restricted copying up.
+    config.write_bytes(b"Host destination\n  StrictHostKeyChecking ask\n\n" + (original_config or b""))
+    config.chmod(0o600)
+    first = source_copy()
+    pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
+    assert len(pending) == 1 and "Also sets up restricted copying" in pending[0]["permission"], pending
+    run("syq", "persist", "receive", "approve", pending[0]["id"])
+    _, stderr = first.communicate(timeout=90)
+    assert first.returncode == 0, stderr
+    assert subprocess.run(["ssh-keygen", "-F", "destination", "-f", str(known_hosts)],
+                          capture_output=True).returncode == 0
+    assert len(destination_enrollments()) == 1
 finally:
     known_hosts.write_bytes(trusted)
-assert "syq-enrollment:" not in remote("cat ~/.ssh/authorized_keys 2>/dev/null || true")
-remote("test ! -e /tmp/syq-real-ssh/forward/first-use")
+    if original_config is None:
+        config.unlink(missing_ok=True)
+    else:
+        config.write_bytes(original_config)
+assert remote("sha256sum /tmp/syq-real-ssh/forward/first-use").split()[0] == run(
+    "ssh", "source", "sha256sum /tmp/syq-real-ssh/return-source/subdir/chunks.bin").split()[0]
 
 # The source has its own trace filesystem. Give this copy a separate file so
 # an older source session's background activity cannot enter the assertion.
 source_trace = run("ssh", "source", "mktemp /tmp/syq-real-ssh/forward-ssh.XXXXXX").strip()
 try:
-    # The first approved copy sets up restricted copying on the destination.
     copy("/tmp/syq-real-ssh/forward/approved", extra=("--stats",), ssh_trace=source_trace)
     events = trace_events(run("ssh", "source", "cat " + shlex.quote(source_trace)))
     # RemoteSpec sets ControlMaster on every transport connection. The same
-    # process also runs ssh -G to read config; that query never connects.
+    # process also runs ssh -G to read config, for the receiver too; those
+    # queries never connect.
     attempts = [event for event in events
                 if event["phase"] == "start" and event["host"] == "destination"
-                and event["control_master"] != "unset" and event["entry_key"] == "no"]
+                and event["control_master"] != "unset" and event["entry_key"] == "no"
+                and event.get("query") != "yes"]
     assert len(attempts) == 1, ("expected one source SSH attempt", events)
     exits = [event for event in events
              if event["phase"] == "end" and event["pid"] == attempts[0]["pid"]]
@@ -614,7 +640,7 @@ def restart_receiving(environment):
         assert f"{name}={value}".encode() in environ, (name, environ)
 
 
-print("case: the retry through the server that asked never prompts for it or trusts a new key", flush=True)
+print("case: the retry through the server that asked follows the host-key setting for it and never prompts", flush=True)
 for enrollment in destination_enrollments():
     run("syq", "receiver", "revoke", enrollment)
 askpass_root = Path(tempfile.mkdtemp(prefix="syq-real-ssh-askpass-"))
@@ -627,16 +653,17 @@ jump_port = Path("/tmp/syq-real-ssh-jump-port")
 unreachable = Path("/tmp/syq-real-ssh-unreachable-direct")
 config = Path.home() / ".ssh/config"
 original = config.read_bytes() if config.exists() else None
+known_hosts = Path.home() / ".ssh/known_hosts"
 try:
     with ForwardingListener(trust=False) as listener:
         try:
-            # This machine's own configuration would trust a new key for the
-            # server, and the service could ask through askpass.
-            config.write_bytes(b"Host source\n  StrictHostKeyChecking accept-new\n\n" + (original or b""))
-            config.chmod(0o600)
-            hosts = (Path.home() / ".ssh/known_hosts").read_bytes()
             jump_port.write_text(str(listener.port))
             unreachable.touch()
+            hosts = known_hosts.read_bytes()
+            # With StrictHostKeyChecking yes for the server, the jump's new
+            # key is refused, and nothing is recorded or asked.
+            config.write_bytes(b"Host source\n  StrictHostKeyChecking yes\n\n" + (original or b""))
+            config.chmod(0o600)
             refused = source_copy()
             pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
             assert len(pending) == 1, pending
@@ -645,10 +672,25 @@ try:
             assert refused.returncode not in (0, 124), stderr
             # The hop's own reason reaches the requester.
             assert "Host key verification failed" in stderr, stderr
-            assert (Path.home() / ".ssh/known_hosts").read_bytes() == hosts
-            assert not askpass_used.exists()
+            assert known_hosts.read_bytes() == hosts
             assert destination_enrollments() == []
             assert listener.logins() == 0
+            # With `ask`, the default (the lab's configuration says `yes`),
+            # the key is accepted the first time and recorded, and the copy
+            # goes through the jump.
+            config.write_bytes(b"Host source\n  StrictHostKeyChecking ask\n\n" + (original or b""))
+            config.chmod(0o600)
+            accepted = source_copy()
+            pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
+            assert len(pending) == 1, pending
+            run("syq", "persist", "receive", "approve", pending[0]["id"])
+            _, stderr = accepted.communicate(timeout=120)
+            assert accepted.returncode == 0, stderr
+            assert subprocess.run(["ssh-keygen", "-F", f"[source]:{listener.port}", "-f", str(known_hosts)],
+                                  capture_output=True).returncode == 0
+            assert listener.logins() >= 1
+            assert len(destination_enrollments()) == 1
+            assert not askpass_used.exists()
         finally:
             unreachable.unlink(missing_ok=True)
             jump_port.unlink(missing_ok=True)
@@ -658,7 +700,6 @@ try:
                 config.write_bytes(original)
 finally:
     restart_receiving({})
-remote("test ! -e /tmp/syq-real-ssh/forward/first-use")
 
 print("case: enrolling goes through the server that asked when the runner cannot reach the destination", flush=True)
 for enrollment in destination_enrollments():
@@ -699,4 +740,271 @@ run("syq", "persist", "receive", "approve", pending[0]["id"])
 _, stderr = updating.communicate(timeout=90)
 assert updating.returncode == 0, stderr
 assert not refreshing.exists()
+def source_known_hosts():
+    return run("ssh", "source", "cat ~/.ssh/known_hosts 2>/dev/null || true")
+
+
+def restore_source_known_hosts(text):
+    run("ssh", "source", "umask 077; cat > ~/.ssh/known_hosts", stdin=text)
+
+
+def source_knows(name):
+    return subprocess.run(["ssh", "source", f"ssh-keygen -F {shlex.quote(name)} >/dev/null"],
+                          timeout=40).returncode == 0
+
+
+def with_source_config(text, action):
+    """Run `action` with `text` first in the source's SSH configuration."""
+    original = run("ssh", "source", "cat ~/.ssh/config 2>/dev/null || true")
+    run("ssh", "source", "umask 077; cat > ~/.ssh/config", stdin=text + "\n" + original)
+    try:
+        return action()
+    finally:
+        run("ssh", "source", "umask 077; cat > ~/.ssh/config", stdin=original)
+
+
+def copy_between_servers(path):
+    """Copy from the source to the destination, started here; return its status and errors."""
+    result = subprocess.run(["syq", "cp", "--from", "source", "/tmp/syq-real-ssh/return-source/subdir/chunks.bin",
+                             "--to", "destination", "--as", path, "--no-progress"],
+                            capture_output=True, text=True, timeout=90)
+    return result.returncode, result.stderr
+
+
+print("case: the server checks the destination's key with its own SSH configuration", flush=True)
+assert len(destination_enrollments()) == 1
+saved_source = source_known_hosts()
+known_hosts = Path.home() / ".ssh/known_hosts"
+saved_runner = known_hosts.read_bytes()
+try:
+    # Neither machine knows the destination: the server accepts its key the
+    # first time and records it, as accept-new does for the default `ask`.
+    run("ssh", "source", "ssh-keygen -R destination >/dev/null 2>&1 || true")
+    run("ssh-keygen", "-R", "destination", "-f", str(known_hosts))
+    assert not source_knows("destination")
+    copy("/tmp/syq-real-ssh/forward/hostkey-first-use")
+    assert source_knows("destination")
+    print("the server recorded a destination neither machine knew", flush=True)
+
+    # A key the server knows that contradicts the one presented, with
+    # nothing else known: refused, naming the server's file.
+    restore_source_known_hosts(saved_source)
+    run("ssh", "source", "ssh-keygen -R destination >/dev/null 2>&1 || true; "
+        "rm -f /tmp/syq-real-ssh-wrong-key*; ssh-keygen -q -t ed25519 -N '' -f /tmp/syq-real-ssh-wrong-key && "
+        "printf 'destination %s\\n' \"$(cut -d' ' -f1,2 /tmp/syq-real-ssh-wrong-key.pub)\" >> ~/.ssh/known_hosts")
+    changed = source_copy()
+    pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
+    assert len(pending) == 1, pending
+    run("syq", "persist", "receive", "approve", pending[0]["id"])
+    _, stderr = changed.communicate(timeout=90)
+    assert changed.returncode not in (0, 124), stderr
+    assert "Host key verification failed" in stderr, stderr
+    assert "/.ssh/known_hosts" in stderr, stderr
+    print("a key that contradicts the server's own was refused", flush=True)
+
+    # A key only the runner knows that contradicts the one presented:
+    # refused, and the copy says to fix the runner's known_hosts, since
+    # OpenSSH names the runner's entries by a label no file has.
+    run("ssh", "source", "ssh-keygen -R destination >/dev/null 2>&1 || true")
+    wrong = run("ssh", "source", "cut -d' ' -f1,2 /tmp/syq-real-ssh-wrong-key.pub").strip()
+    run("ssh-keygen", "-R", "destination", "-f", str(known_hosts))
+    with known_hosts.open("a") as hosts:
+        hosts.write(f"destination {wrong}\n")
+    changed = source_copy()
+    pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
+    assert len(pending) == 1, pending
+    run("syq", "persist", "receive", "approve", pending[0]["id"])
+    _, stderr = changed.communicate(timeout=90)
+    assert changed.returncode not in (0, 124), stderr
+    assert "Host key verification failed" in stderr, stderr
+    refusal = ("the approving machine's known_hosts lists a different key for destination; "
+               "if that key is out of date, remove it there with `ssh-keygen -R destination`")
+    assert refusal in stderr, stderr
+    assert not source_knows("destination")
+    # The same for a copy between the servers started here, which the source
+    # coordinates.
+    status, stderr = copy_between_servers("/tmp/syq-real-ssh/forward/hostkey-runner-contradicts")
+    assert status != 0, stderr
+    assert "Host key verification failed" in stderr and refusal in stderr, stderr
+    assert not source_knows("destination")
+    print("a key only the runner knows that contradicts the one presented was refused", flush=True)
+
+    # What either machine knows is accepted: the runner's key for the
+    # destination wins over the server's stale one, and over its strict
+    # setting for a host it does not know, without recording anything there.
+    known_hosts.write_bytes(saved_runner)
+    copy("/tmp/syq-real-ssh/forward/hostkey-union-stale")
+    run("ssh", "source", "ssh-keygen -R destination >/dev/null 2>&1 || true")
+    with_source_config("Host destination\n  StrictHostKeyChecking yes\n",
+                       lambda: copy("/tmp/syq-real-ssh/forward/hostkey-union-strict"))
+    assert not source_knows("destination")
+    print("the server accepted what the approving machine knows", flush=True)
+finally:
+    restore_source_known_hosts(saved_source)
+    known_hosts.write_bytes(saved_runner)
+for name in ["hostkey-first-use", "hostkey-union-stale", "hostkey-union-strict"]:
+    assert remote(f"sha256sum /tmp/syq-real-ssh/forward/{name}").split()[0] == source_hash
+
+print("case: a destination trusted only through a host certificate works on both sides", flush=True)
+# A second SSH server for the destination account, presenting a host
+# certificate that a CA the runner trusts signed.
+authority = Path(tempfile.mkdtemp(prefix="syq-real-ssh-host-ca-")) / "ca"
+run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(authority))
+server = json.loads(remote("""python3 - <<'EOF'
+import json, pathlib, socket, subprocess, tempfile
+root = pathlib.Path(tempfile.mkdtemp(prefix="syq-real-ssh-certified-"))
+subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(root / "host_key")], check=True)
+with socket.socket() as probe:
+    probe.bind(("0.0.0.0", 0))
+    port = probe.getsockname()[1]
+print(json.dumps({"root": str(root), "port": port, "key": (root / "host_key.pub").read_text()}))
+EOF"""))
+root, port = server["root"], server["port"]
+signing = Path(authority.parent) / "host_key.pub"
+signing.write_text(server["key"])
+run("ssh-keygen", "-q", "-s", str(authority), "-h", "-I", "syq-real-ssh-destination", "-n", "destination",
+    str(signing))
+certificate = signing.with_name("host_key-cert.pub").read_text()
+subprocess.run(["ssh", "destination", f"cat > {shlex.quote(root)}/host_key-cert.pub"],
+               input=certificate, text=True, check=True, timeout=40)
+remote(f"""cd {shlex.quote(root)} && printf '%s\\n' "Port {port}" "ListenAddress 0.0.0.0" "AddressFamily inet" \
+  "HostKey $PWD/host_key" "HostCertificate $PWD/host_key-cert.pub" "PidFile $PWD/sshd.pid" \
+  "AuthorizedKeysFile .ssh/authorized_keys /etc/ssh/lab_authorized_keys" "StrictModes yes" "AllowUsers syq" \
+  "AuthenticationMethods publickey" "PubkeyAuthentication yes" "PasswordAuthentication no" \
+  "KbdInteractiveAuthentication no" "UsePAM no" "UseDNS no" "PermitTTY no" "LogLevel VERBOSE" > sshd_config && \
+  /usr/sbin/sshd -f $PWD/sshd_config -E $PWD/sshd.log""")
+saved_source = source_known_hosts()
+saved_runner = known_hosts.read_bytes()
+target = f"destination:{port}"
+try:
+    def listening():
+        try:
+            with socket.create_connection(("destination", port), timeout=.5):
+                return True, "listening"
+        except OSError as error:
+            return False, str(error)
+    wait_until("the certified SSH server", listening)
+    # The runner trusts the destination at that port only through its CA;
+    # the source knows nothing about it and refuses a host it has not seen.
+    with known_hosts.open("a") as hosts:
+        hosts.write(f"@cert-authority [destination]:{port} {authority.with_suffix('.pub').read_text()}")
+    def certified_copy():
+        copy("/tmp/syq-real-ssh/forward/hostkey-certificate", to=target)
+    with_source_config(f"Host destination\n  StrictHostKeyChecking yes\n", certified_copy)
+    assert not source_knows(f"[destination]:{port}")
+    certified = [line.split("\t")[0] for line in run("syq", "receiver", "list").splitlines()
+                 if f"\tsyq@destination:{port}" in line]
+    assert len(certified) == 1, certified
+    for enrollment in certified:
+        run("syq", "receiver", "revoke", enrollment)
+finally:
+    restore_source_known_hosts(saved_source)
+    known_hosts.write_bytes(saved_runner)
+    remote(f"kill $(cat {shlex.quote(root)}/sshd.pid) 2>/dev/null; rm -rf {shlex.quote(root)}")
+assert remote("sha256sum /tmp/syq-real-ssh/forward/hostkey-certificate").split()[0] == source_hash
+print("case: a destination whose only known key is ECDSA is checked against that key", flush=True)
+# The destination also offers ed25519, which OpenSSH prefers unless it
+# already knows another type for the host: both machines know only ECDSA.
+saved_source = source_known_hosts()
+saved_runner = known_hosts.read_bytes()
+ecdsa = run("ssh-keyscan", "-T", "5", "-t", "ecdsa", "destination")
+assert ecdsa.split()[1].startswith("ecdsa-sha2-"), ecdsa
+try:
+    run("ssh-keygen", "-R", "destination", "-f", str(known_hosts))
+    with known_hosts.open("a") as hosts:
+        hosts.write(ecdsa)
+    run("ssh", "source", "ssh-keygen -R destination >/dev/null 2>&1; umask 077; cat >> ~/.ssh/known_hosts",
+        stdin=ecdsa)
+    with_source_config("Host destination\n  StrictHostKeyChecking yes\n",
+                       lambda: copy("/tmp/syq-real-ssh/forward/hostkey-ecdsa"))
+finally:
+    restore_source_known_hosts(saved_source)
+    known_hosts.write_bytes(saved_runner)
+assert remote("sha256sum /tmp/syq-real-ssh/forward/hostkey-ecdsa").split()[0] == source_hash
+print("case: a user certificate the source's SSH configuration names does not replace the entry key", flush=True)
+# The destination accepts a certificate the source's configuration offers,
+# which OpenSSH would offer before any plain key. A copy between the servers
+# started here, which the source coordinates with the entry key, must still
+# log in with it and reach the enrolled receiver.
+authority = run("ssh", "source", "rm -rf /tmp/syq-real-ssh-usercert && mkdir -m 700 /tmp/syq-real-ssh-usercert && "
+                "cd /tmp/syq-real-ssh-usercert && ssh-keygen -q -t ed25519 -N '' -f ca && "
+                "ssh-keygen -q -t ed25519 -N '' -f user && ssh-keygen -q -s ca -I user -n syq user.pub && "
+                "cat ca.pub").strip()
+authorized = remote("cat ~/.ssh/authorized_keys")
+try:
+    run("ssh", "destination", "cat >> ~/.ssh/authorized_keys", stdin=f"cert-authority {authority}\n")
+    assert subprocess.run(["ssh", "source", "ssh -o BatchMode=yes -o IdentitiesOnly=yes "
+                           "-i /tmp/syq-real-ssh-usercert/user destination true"], timeout=40).returncode == 0
+    with_source_config("Host destination\n  IdentityFile /tmp/syq-real-ssh-usercert/user\n"
+                       "  CertificateFile /tmp/syq-real-ssh-usercert/user-cert.pub\n",
+                       lambda: run("syq", "cp", "--from", "source",
+                                   "/tmp/syq-real-ssh/return-source/subdir/chunks.bin", "--to", "destination",
+                                   "--as", "/tmp/syq-real-ssh/forward/hostkey-user-certificate",
+                                   "--no-progress"))
+finally:
+    run("ssh", "destination", "umask 077; cat > ~/.ssh/authorized_keys", stdin=authorized)
+    run("ssh", "source", "rm -rf /tmp/syq-real-ssh-usercert")
+assert remote("sha256sum /tmp/syq-real-ssh/forward/hostkey-user-certificate").split()[0] == source_hash
+
+def approved_source_copy():
+    """Run `source_copy()`, approve it, and return its status and errors."""
+    process = source_copy()
+    pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
+    assert len(pending) == 1, pending
+    run("syq", "persist", "receive", "approve", pending[0]["id"])
+    _, stderr = process.communicate(timeout=90)
+    return process.returncode, stderr
+
+
+print("case: the server's own KnownHostsCommand is kept", flush=True)
+# The source knows the destination only through a KnownHostsCommand of its
+# own. The runner's entries cannot join through another command, and the
+# source's default GlobalKnownHostsFile list looks like one quoted name to
+# `ssh -G`, so they are left out, and the copy says so.
+WITHOUT = "without what the approving machine knows about it"
+saved_source = source_known_hosts()
+right = run("ssh-keyscan", "-T", "5", "destination")
+try:
+    run("ssh", "source", "ssh-keygen -R destination >/dev/null 2>&1; rm -rf /tmp/syq-real-ssh-khc && "
+        "mkdir /tmp/syq-real-ssh-khc && cat > /tmp/syq-real-ssh-khc/hosts", stdin=right)
+    status, stderr = with_source_config(
+        "Host destination\n  StrictHostKeyChecking yes\n"
+        "  KnownHostsCommand /usr/bin/env cat /tmp/syq-real-ssh-khc/hosts\n",
+        approved_source_copy)
+    assert status == 0, stderr
+    assert f"{WITHOUT}: this machine's configuration has a KnownHostsCommand of its own" in stderr, stderr
+    print("the source's own KnownHostsCommand decided", flush=True)
+    # The same, with the source's command knowing nothing: only the runner
+    # knows the destination, and its entries are left out, so the copy is
+    # refused, as the source's own ssh would refuse it.
+    status, stderr = with_source_config(
+        "Host destination\n  StrictHostKeyChecking yes\n  KnownHostsCommand /bin/true\n",
+        approved_source_copy)
+    assert status not in (0, 124), stderr
+    assert WITHOUT in stderr and "Host key verification failed" in stderr, stderr
+    print("without the runner's entries, the copy was refused and said why", flush=True)
+finally:
+    restore_source_known_hosts(saved_source)
+    run("ssh", "source", "rm -rf /tmp/syq-real-ssh-khc")
+
+print("case: the runner says what of its own host-key checking the server cannot use", flush=True)
+# The runner's own KnownHostsCommand is not run for the source; the source
+# still checks the destination with what it and the runner's files know.
+# The server is told only which setting, not its value.
+runner_config = Path.home() / ".ssh/config"
+original_config = runner_config.read_bytes()
+try:
+    runner_config.write_bytes(b"Host destination\n  KnownHostsCommand /bin/true\n\n" + original_config)
+    status, stderr = approved_source_copy()
+    between_status, between_stderr = copy_between_servers("/tmp/syq-real-ssh/forward/hostkey-runner-command")
+finally:
+    runner_config.write_bytes(original_config)
+assert status == 0, stderr
+assert ("without some of what the approving machine knows about it: "
+        "its KnownHostsCommand is not run for that") in stderr, stderr
+assert "/bin/true" not in stderr, stderr
+# A copy between the servers started here says so here, with the value.
+assert between_status == 0, between_stderr
+assert ("the source checks the destination's host key without some of what this machine knows about it: "
+        'its KnownHostsCommand "/bin/true" is not run for that') in between_stderr, between_stderr
 print("source-shell remote copy checks passed", flush=True)

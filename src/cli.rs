@@ -223,6 +223,10 @@ pub struct Args {
     /// machine approved this copy for, kept for the copy's connections.
     #[arg(skip)]
     pub(crate) receiver_keys: Option<std::sync::Arc<crate::private_broker::SignalCleanedDir>>,
+    /// The enrolled receiver's host as this copy dials it, and what
+    /// preparing its host-key checking found.
+    #[arg(skip)]
+    pub(crate) receiver_host: Option<(String, crate::conn::ReceiverHost)>,
     #[arg(skip)]
     pub(crate) auth_from_explicit: bool,
     /// Which public command produced this execution request.

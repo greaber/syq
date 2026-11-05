@@ -246,7 +246,7 @@ The protection has several parts:
    trusts. The receiver refuses to run as root.
 2. **Give hostA only the entry key.** HostA receives the entry key with each
    copy you authorize and uses it for every connection to the receiver,
-   checking hostB's host key against the keys your laptop trusts. The entry
+   checking hostB's host key as described [below](#how-hosta-checks-hostbs-key). The entry
    key can start the receiver but authorizes nothing: anyone holding it,
    including a server that ran an earlier copy, still needs a copy you newly
    signed to copy files. A connection made with the entry key has 10 seconds
@@ -312,6 +312,77 @@ Alternative authentication modes grant more authority. `--peer-auth broker`
 limits authentication to the chosen host and user but allows that account's
 full authority. `--peer-auth full-agent` exposes your SSH agent as `ssh -A`
 would. See [Other authentication modes](remote-reference.md#other-authentication-modes).
+
+### How hostA checks hostB's key
+
+HostA connects to hostB with its own SSH configuration, which checks hostB's
+host key as its own `ssh` would: its known_hosts files, host certificate
+authorities, `KnownHostsCommand`, `StrictHostKeyChecking`, and the rest of its
+host-key settings. Syq overrides on the command line what this connection
+must not do: it logs in with the entry key, with no agent, no PKCS#11 or
+other security key provider, no control socket, forwarding, proxy, tunnel,
+local or remote command, or terminal, and it never prompts. Only the entry
+key's own key type may log in, so certificates and other key types hostA's
+configuration names are never offered; if hostB refuses the entry key,
+hostA's own keys of that same type that its configuration names are offered
+after it, as with any `ssh` login. Environment variables hostA's
+configuration sends (`SendEnv`, `SetEnv`) go as far as hostB's sshd accepts
+them, and, as for hostA's other connections, `UpdateHostKeys` can record
+keys hostB announces in hostA's known_hosts.
+
+HostA also accepts the keys and host certificate authorities that your
+laptop's known_hosts lists for hostB, and refuses the keys it marks revoked.
+Syq gives them to hostA's `ssh` through a `KnownHostsCommand`, so hostA's
+own known_hosts settings stay exactly as configured. Where hostA's
+configuration sets a `KnownHostsCommand` of its own, which stays, or hostA's
+OpenSSH is older than 8.5, syq instead adds a file named
+`known-to-the-machine-that-approved-this-copy` to hostA's
+`GlobalKnownHostsFile`, but only when that setting is one word. OpenSSH
+reports a list of files and one quoted name containing spaces the same way,
+and its default setting lists two files. So on those hosts, unless
+`GlobalKnownHostsFile` names a single file, hostA checks hostB's key without
+your laptop's entries, and the copy says so. HostA still connects whenever
+its own configuration accepts hostB's key. In the same way, your laptop
+leaves out what it cannot read as its `ssh` does, such as its own
+`KnownHostsCommand`, or a known_hosts setting that contains whitespace. It
+reads OpenSSH's default list only where its configuration names known_hosts
+files nowhere, or only as plain absolute or `~/` paths. The copy says when
+your laptop left something out.
+
+A key that matches an entry on either machine is accepted, so a key your
+laptop knows works even where hostA has an old one. A key that matches
+nothing while either machine lists a plain key of the same type for hostB is
+refused, as `ssh` refuses it. When the other key is your laptop's, ssh's
+message calls it `KnownHostsCommand-HOSTNAME`, or names the file above, and
+suggests fixing hostA's files; syq adds a line saying that your laptop's
+known_hosts lists a different key, with the `ssh-keygen -R` command to run
+there if that key is out of date. A host certificate authority listed on
+either machine does not refuse a key presented without a certificate from
+it; hostA treats that key as it would treat a host it has not seen, and
+`StrictHostKeyChecking yes` refuses it. With `StrictHostKeyChecking no`,
+hostA accepts such a key, as its `ssh` would. When neither machine knows
+hostB, hostA follows its own setting, except that nobody can answer the
+question `ask`, the default, would ask. So `ask` works like `accept-new`:
+hostA accepts the key it is shown the first time and records it in its own
+known_hosts, and later connections are checked against it. Your laptop's own
+login to hostB, which sets up restricted copying, checks hostB's key with
+your laptop's SSH configuration in the same way, records a newly accepted
+key in your laptop's known_hosts, and asks you only when it runs in a
+terminal.
+
+Accepting a new key means that someone who can intercept that first
+connection could present their own key. They could not use the entry key or
+the signed copy against the real hostB, because an SSH key login cannot be
+relayed to another connection, but they would receive the copy's data and
+could report that it completed. For a copy started on your laptop, your
+laptop checks hostB's reports (step 4) and would detect that.
+
+To refuse a host neither machine has seen, set `StrictHostKeyChecking yes`
+on hostA for the name hostA connects with, and trust hostB's key there or
+on your laptop. For a copy a server started, that is the name in the
+server's command. For a copy started on your laptop, it is the address your
+laptop's SSH configuration gives hostB, not the name you typed: a `Host`
+block on hostA for that name does not apply.
 
 ### A compromised source server
 
@@ -449,8 +520,9 @@ Such a copy uses the destination account's enrollment, as described in
 [Copies between servers](#copies-between-servers), with the server that asked
 in hostA's place: your laptop shows the command, sets up or updates the
 enrollment when it needs that, signs the approved copy with your login key,
-and gives the server the entry key and the destination host keys your laptop
-trusts. The server coordinates the copy itself: it connects to the
+and gives the server the entry key and what your laptop's known_hosts lists
+for the destination, which the server accepts as well as what it knows
+itself. The server coordinates the copy itself: it connects to the
 destination's receiver, which confines the copy to the approved destination,
 refuses the protected paths, and enforces your laptop's own limits as well as
 the command's. Step 4 above does not apply: your laptop does not check what

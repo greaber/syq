@@ -309,7 +309,9 @@ fn enrollment_account(value: &str) -> Result<(String, String)> {
         Some((user, host)) => (Some(user), host),
         None => (None, endpoint.as_str()),
     };
-    let policy = crate::agent_broker::resolve_host_policy("ssh", user, host)?;
+    // Only the login: enrolling checks the host's key as the user's `ssh`
+    // does.
+    let policy = crate::agent_broker::resolve_known_policy_at("ssh", user, host, None)?;
     Ok((policy.login_user, host.to_owned()))
 }
 

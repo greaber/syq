@@ -24,8 +24,10 @@ for what this protects against.
 
 ### What you need
 
-- SSH access from your machine to both servers, with their host keys already
-  trusted. Connect with ordinary SSH once if either server is new to you.
+- SSH access from your machine to both servers. Your SSH configuration
+  checks their host keys, and asks about a server it has not seen before.
+  HostA checks hostB's key with its own SSH configuration; see
+  [how hostA checks hostB's key](security.md#how-hosta-checks-hostbs-key).
 - A login to hostB with an SSH key that can sign on your machine: a key file
   without a passphrase, or a key loaded in your SSH agent. Passphrase-protected,
   FIDO, and PKCS#11 or PIV keys must be in the agent. Password and multi-factor
