@@ -19,32 +19,20 @@ comparing syq with rsync over three rounds. It creates disposable test data,
 checks every copy, and cleans up afterward. Use `--mode pull` for downloads or
 `--mode local` to include cp.
 
-Network tests first warm up syq's connection tuning. This targets about a minute
-of copying, but setup and slow transfers can take longer. It uses up to four
-copies of datasets no larger than 1 GiB each, subject to free space. Use
-`--warmup off` for a shorter comparison.
+Network tests first spend about a minute warming up syq's connection tuning;
+use `--warmup off` for a shorter comparison. Run `bash try-benchmark.sh --help`
+for workload sizes, dependencies, and custom syq options. If trials are too
+short to measure sustained speed, choose a larger workload.
 
-Compare tools using the main table: it includes connection startup in total
-command time. Network results show average MB/s; local results show seconds,
-since filesystem cloning may avoid moving the bytes. The separate syq timing
-table helps diagnose setup costs; its copying-only rate is not comparable with
-another tool's total-time rate.
+<a id="what-the-comparison-measures"></a>
 
-Run `bash try-benchmark.sh --help` for workload sizes, dependencies, scratch
-directories, and custom syq options. If trials are too short to measure sustained
-speed, choose a larger workload.
-
-### What the comparison measures
-
-Each timed copy uses the same data and an empty destination, preserving
-permissions and modification times. Generation, helper preparation, warm-up,
-and content checks are untimed. Failed copies or content checks stop the test.
-
-Network tests disable SSH connection reuse for both tools. Syq's learned
-connection counts remain active unless you override tuning; warm-up does not
-guarantee that tuning has settled. Caches are not flushed, and copies do not
-wait for durable storage. Local cloning times therefore do not measure disk
-bandwidth.
+Compare tools using the main table, which times each whole command, including
+connection startup, into an empty destination. Network results show average
+MB/s; local results show seconds, since filesystem cloning may avoid moving the
+bytes. The separate syq timing table splits out setup time; its copying-only
+rate is not comparable with another tool's rate. Network tests disable SSH
+connection reuse for both tools. Caches are not flushed and copies do not wait
+for durable storage, so local times do not measure disk bandwidth.
 
 ## Benchmarks
 
@@ -80,13 +68,11 @@ Your results will depend on your machines and connection.</figcaption>
 syq cp -vv --stats data --to server --into /backup
 ```
 
-`-vv` shows the chosen transport and connections; `--stats` adds totals and
-available TCP statistics, worker wait fractions, endpoint operations and bytes,
-and process CPU. These wait fractions
-help locate delays; they are not proof of their cause. Add `--results run.ndjson`
-to inspect how worker waits, endpoint operations, CPU and TCP backpressure change
-over time. Remote evidence includes its age. See the
-[performance measurements](performance-measurements.md) reference for interpretation and limitations.
+`-vv` shows the chosen transport and connections; `--stats` adds totals, TCP
+statistics, where workers spent their time, and process CPU. These measurements
+help locate delays but do not prove their cause. Add `--results run.ndjson` to
+see how they change over time; see
+[performance measurements](performance-measurements.md) for how to read them.
 
 | Symptom | Try |
 |---|---|
@@ -98,67 +84,41 @@ over time. Remote evidence includes its age. See the
 Compare the same workload and direction using empty test destinations.
 A second copy into the same destination may just measure skipping existing files.
 
-## TCP data connections
-
-SSH authenticates remote copies. When reachable, encrypted TCP carries file
-data on a port in `47600–47699`; otherwise copies use SSH on the same route.
-Before opening data connections, syq checks that TCP gets through, waiting a
-few times the round trip it measured over SSH and never more than a second.
-When TCP does not get through, the copy says so in one line. If TCP never works with a server,
-`--no-tcp` skips the check. See
-[Make TCP reachable](server-tuning.md#make-tcp-reachable) for firewall settings.
-To [Run the copy from a server](remote-to-remote.md#run-the-copy-from-a-server)
-with your laptop’s approval, direct encrypted TCP must be reachable.
-
-Use `--no-tcp` to select SSH data transport or `--tcp-ports LO-HI` to choose a
-port range. On Linux, `--tcp-congestion ALGO` selects an available congestion
-control algorithm. `--no-tcp-encryption` disables data encryption and
-authentication; use it only on a trusted network. Restricted receivers refuse
-it.
-
 ## Local copies and NFS
 
 For local copies, syq uses the filesystem's copy optimizations automatically
 when it can. On filesystems that support cloning, this can avoid physically
-copying every byte. You can also copy to or from a mounted NFS directory using
-its local path.
+copying every byte, so the displayed rate can exceed disk throughput. You can
+also copy to or from a mounted NFS directory using its local path.
 
-On Linux, copies of many small files to a network filesystem, such as NFS or
-an SSHFS mount, start with more workers.
-
-Reported bytes count the file's size even when cloning avoids physical I/O,
-so the displayed rate can exceed disk throughput.
-
-## Limit bandwidth
-
-Use `--resource-limits bandwidth=RATE` to leave bandwidth for other work:
-
-```sh
-syq cp data --to server --into /backup --resource-limits bandwidth=10M
-```
-
-For ordinary SSH and TCP copies, this limits compressed transport bytes to 10 MiB/s
-across workers. Other routes count file data before compression. Buffering can
-still cause short bursts. See [Resource limits](resource-limits.md) for accounting
-details, units, and supported routes.
-
+<a id="tcp-data-connections"></a>
+<a id="limit-bandwidth"></a>
 <a id="options-that-change-the-tradeoff"></a>
-
 <a id="compression-and-in-place-writes"></a>
-
-## Compression
-
-`--no-compress` can help when compression costs more CPU time than it saves
-in network traffic; see [Transport compression](reference.md#transport-compression).
-
+<a id="compression"></a>
 <a id="how-many-connections"></a>
 <a id="benchmark-tuning"></a>
 <a id="streaming-and-request-windows"></a>
 <a id="batch-size-and-splitting"></a>
 <a id="average-rate-and-burst-patterns"></a>
 <a id="recording-a-comparison"></a>
+<a id="investigate-tuning"></a>
 
-## Investigate tuning
+## Other options
 
-Manual connection counts and other [tuning options](tuning.md) are for
-troubleshooting and development. Normal copies should not need them.
+Remote copies send file data over encrypted TCP on a port in `47600–47699`
+when it is reachable, and otherwise fall back to SSH, except for
+[downloads your laptop approves per copy](receive.md#authorize-copies-between-servers),
+which need TCP. See [Make TCP reachable](server-tuning.md#make-tcp-reachable)
+for firewall settings. `--no-tcp` uses
+SSH without trying TCP, `--tcp-ports LO-HI` chooses another port range, and on
+Linux `--tcp-congestion ALGO` selects a congestion control algorithm.
+`--no-tcp-encryption` disables data encryption and authentication; use it only
+on a trusted network. Restricted receivers refuse it.
+
+`--resource-limits bandwidth=RATE` leaves bandwidth for other work; see
+[Resource limits](resource-limits.md). `--no-compress` can help when
+compression costs more CPU time than it saves in network traffic; see
+[Transport compression](reference.md#transport-compression). Manual connection
+counts and other [tuning options](tuning.md) are for troubleshooting; normal
+copies should not need them.

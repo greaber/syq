@@ -24,39 +24,18 @@ is available only for `cp`. Neither applies to descriptor or pipe copies.
 ## Selection and updates
 
 `--where` accepts only `src` fields. `--copy-if` accepts both `src` and `dst`:
-`dst` always names the destination chosen by the copy's placement or mapping.
-For non-directory entries, both options must pass when present. Existing policies such as
-`--if-exists=keep` also apply. Each expression option can be supplied once; combine
-conditions with `and` and `or`.
+`dst` names the destination chosen by the copy's placement or mapping. An
+entry is copied only when both options pass and existing policies such as
+`--if-exists=keep` allow it. Each option can be given once; combine conditions
+with `and` and `or`. A true expression does not force a rewrite: the copy's
+usual comparison still skips unchanged files.
 
-A true expression allows the copy to proceed through its normal comparison.
-It does not force a rewrite of an unchanged file. Use `--hash` when contents
-must be compared even if size and modification time match.
-
-`--where` does not filter directories. They are copied as in an unfiltered
-copy, with their usual metadata and any `--copy-metadata=FEATURE` controls, and they
-are created even when none of their contents are selected. For example, this
-copies JPEGs while keeping the permissions and modification times of the
-directories around them:
-
-```sh
-syq cp --srcs-in photos --into archive --copy-metadata=permissions,mtime \
-  --where 'src.extension = "jpg"'
-```
-
-`map --where` likewise always emits directory records and filters the others.
-Metadata used by the expression is added to records only when requested with
-`--include`.
-
-`--copy-if` applies to directories too: a false result suppresses their source
-metadata, without blocking their children. Existing filesystem directories then
-keep their metadata, apart from the effects of adding or removing children and
-any temporary permission change that
-[`--widen-dirs`](reference.md#copy-metadata) allows. New directories get the
-destination's defaults, including its umask or the parent's default ACL, and
-setgid inheritance. On S3, directory-marker objects are never filtered by
-`--where`; `--copy-if` can skip their copy, while keys beneath them are
-considered independently.
+`--where` does not filter directories: they are copied as usual, even when
+none of their contents are selected, and `map --where` always emits their
+records. Metadata used by the expression is added to `map` records only when
+requested with `--include`. For a directory, a false `--copy-if` result skips
+only its own metadata, not its contents. On S3, `--where` never filters
+directory-marker objects, but `--copy-if` can skip them.
 
 Use [ignore rules](reference.md#ignoring-paths) to stop traversal of a subtree.
 An expression cannot re-include an ignored path. With `--prune`, excluded
@@ -69,14 +48,9 @@ division by zero and failed metadata reads, fail the copy and prevent pruning;
 files already completed can remain.
 
 Conditions use observed metadata. They are not locks or atomic assertions
-against concurrent changes. `--copy-if` cannot combine with `--in-place`:
-an interrupted copy can leave an incomplete file whose metadata makes a
-retry skip it.
-
-In a copy through a restricted receiver, such as a
-[restricted copy between servers](remote-reference.md#enrollment), the machine
-coordinating the copy evaluates expressions and the receiver does not enforce
-them. The receiver enforces what was approved for the copy, such as its
+against concurrent changes. `--copy-if` cannot combine with `--in-place`.
+A [restricted receiver](remote-reference.md#enrollment) does not enforce
+expressions; it enforces only what was approved for the copy, such as its
 destination and limits.
 
 ## Fields
@@ -102,23 +76,18 @@ the selected entry; recursively discovered symlinks are not followed.
 
 Names and paths preserve raw filename bytes. String equality is exact and
 case-sensitive. `src.name = "*.jpg"` tests for that literal name; use `glob`
-for a pattern. Device, inode, and owner IDs have meaning within their host;
-equal numbers on separate hosts do not establish a shared identity.
+for a pattern.
 
 For an absent destination, `exists` is false, path fields still describe its
 placement, and metadata fields are `null`. S3 has no `ctime`, device, inode,
 link count, or exposed link-target field. Permissions and ownership are
-available only when the object carries syq metadata. `mtime` and `s3_last_modified` are separate facts. Use
-`coalesce(src.mtime, src.s3_last_modified)` to explicitly prefer stored time
-with a service-time fallback. Downloaded files use that fallback by default
-when restoring their modification times; see [S3 metadata](object-storage.md#filesystem-differences).
+available only when the object carries syq metadata. Use
+`coalesce(src.mtime, src.s3_last_modified)` to prefer the stored time and fall
+back to the service's time, as downloads do.
 
-S3 evaluates conditions from listing data when possible. Path, name, extension, size,
-and `s3_last_modified` conditions do not require an extra per-object metadata request. Put
-cheap conditions first: a filename test can reject an object before a later
-condition needs its stored modification time, kind, permissions, or ownership.
-Metadata requests still apply when needed for comparison, authorization, or
-other copy options.
+On S3, path, name, extension, size, and `s3_last_modified` come from the
+listing; other fields need a request for each object. Put those cheap
+conditions first, so that an object they reject needs no extra request.
 
 Use `is null`, `is not null`, or `coalesce(value, fallback)` for unavailable
 metadata. Equality treats `null` as a distinct value. Ordering, arithmetic,
@@ -156,9 +125,8 @@ src.mode & 0o111 != 0
 | `coalesce(value, fallback)` | Use the fallback only when the first value is `null` |
 
 `not in`, `not between`, `not glob`, and `not matches` negate those operations.
-Patterns and timestamp arguments must be quoted literals. Glob and regex
-patterns are compiled once. Regex backslashes need a string escape, as in the
-JPEG example above.
+Patterns and timestamp arguments must be quoted literals. Regex backslashes
+need a string escape, as in the JPEG example above.
 
 Types must agree: compare a size with `10B`, not `10` or `"10B"`. Subtracting
 timestamps yields a duration; adding or subtracting a duration shifts a
