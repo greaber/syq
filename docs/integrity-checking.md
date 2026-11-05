@@ -108,10 +108,11 @@ previous destination in place. These checks do not detect every concurrent
 change. Both `--in-place` modes let destination readers see incomplete files,
 including after an interrupted copy.
 
-On Linux ext2/3/4, XFS, Btrfs, ZFS, and tmpfs, syq keeps another program's
-writes out of a file it is replacing: that program's open for writing can wait
-briefly, or fail if it does not wait. On other filesystems, and on macOS, a
-program writing a destination file while syq updates it can leave its bytes in
-the published file. Syq keeps the previous destination when it detects a
-delayed write error, such as a full NFS export, but it does not catch every
-one, and a successful copy may not survive an immediate power loss.
+On Linux ext2/3/4, XFS, Btrfs, ZFS, and tmpfs, a program writing a file that
+syq is replacing can't leave its bytes in the published file; that program's
+open for writing can wait briefly, or fail if it does not wait. On other
+filesystems, and on macOS, a program writing a destination file while syq
+updates it can leave its bytes in the published file. Syq keeps the previous
+destination when it detects a delayed write error, such as a full NFS export,
+but it does not catch every one, and a successful copy may not survive an
+immediate power loss.
