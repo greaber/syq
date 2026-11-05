@@ -7,9 +7,9 @@ buckets. For examples, start with [Copy files](../reference.md).
 syq cp --srcs-in project --to server --into backup --dry-run -v
 ```
 
-Put the source options (`--from`, `-C`, selectors, and `--mapping`) before
-`--to` and the placement option. In scripts, `SYQ_CP_OPTIONS` adds arguments;
-see [environment variables](../environment.md).
+Put the source options (`--from`, `-C` or `--root`, `--src-fd`, selectors,
+and `--mapping`) before `--to` and the placement option. In scripts,
+`SYQ_CP_OPTIONS` adds arguments; see [environment variables](../environment.md).
 
 <!-- CLI: cp -->
 ```text
@@ -172,14 +172,16 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 ## Update policies
 
 `--if-exists` decides what happens to destination files that already exist;
-see [existing-file policies](../reference.md#choose-which-existing-files-to-update).
-When you retry a failed copy, entries the failed attempt created already exist,
-so `--into-new`, `--as-new`, and `--if-exists=error` reject the retry; see
+see [existing-file policies](../reference.md#choose-which-existing-files-to-update)
+and, before retrying a failed copy,
 [resuming a copy](../reference.md#resume-an-interrupted-copy).
 
 `--in-place` cannot be combined with `--if-exists=keep` or `update-if-older`,
-because a retry would then skip a file left incomplete. S3 destinations do not
-support it. See [In-place writes](../reference.md#in-place-writes).
+because a retry would then skip a file left incomplete. Even with `--in-place`,
+a new file that must not replace anything (`--as-new`, or a new file under
+`--if-exists=error` or `error-if-different`) is written under a temporary name
+first. S3 destinations do not support `--in-place`. See
+[In-place writes](../reference.md#in-place-writes).
 
 ## Pruning
 
@@ -190,27 +192,31 @@ aliases for one server, or shared storage, can hide the overlap. Pruning never
 removes ignored paths, partial files, or
 [recovery entries](clean-partials.md#which-files-are-removed).
 
-## Filename and type conflicts
+<a id="filename-and-type-conflicts"></a>
+
+## Filename conflicts
 
 On a case-insensitive destination, `Report.txt` and `report.txt` (or two
 Unicode spellings of one name) collide. Syq does not check for this, so one
 replaces the other or is reported as a conflict. Rename one source, or use a
-destination that can tell them apart. Syq also never replaces a directory
-with a non-directory or the reverse, even an empty one.
+destination that can tell them apart.
 
 ## Metadata details
 
-Setuid, setgid, and sticky bits are copied only with
-`--copy-metadata=permissions`. Ownership and ACL entries are copied as numeric
-IDs (UUIDs for macOS ACLs), not translated to account names, so on another host
-they apply to whichever account has that ID there.
+When you copy metadata to another machine, check how it carries over. Setuid,
+setgid, and sticky bits are copied only with `--copy-metadata=permissions`.
+Ownership and ACL entries are copied as numeric IDs (UUIDs for macOS ACLs), not
+translated to account names, so on another host they apply to whichever
+account has that ID there.
 
 ## File descriptors
 
 Use a descriptor copy to connect syq to another program without a temporary
-file. `--src-fd 0` reads standard input and `--as-fd 1` writes standard output;
+file. It streams raw bytes through an inherited file descriptor, a named pipe,
+or a process substitution. `--src-fd 0` reads standard input and `--as-fd 1`
+writes standard output;
 [Shell pipelines and file descriptors](../reference.md#shell-pipelines-and-file-descriptors)
-has examples. Process substitution and named pipes work as sources too:
+has examples. Process substitution and named pipes work as sources:
 
 ```sh
 syq cp --src <(gzip -c data) --to server --as data.gz
@@ -226,8 +232,8 @@ standard error, so descriptor 2 cannot carry a payload.
 ### Completion and failures
 
 A named destination is replaced only after the transfer succeeds, but syq
-cannot tell whether the producer succeeded: if it fails partway, syq saves what
-it wrote. Check the producer's status, for example with Bash's
+cannot tell whether the producer succeeded: if the producer fails partway, syq
+still saves the bytes it received. Check the producer's status, for example with Bash's
 `set -o pipefail`; Python
 [managed streams](https://greaber.github.io/syq/python-streams.html#byte-streams)
 do this for you. Likewise, check syq's exit status before using what it wrote
@@ -244,7 +250,8 @@ once no copy is writing there.
 
 `--if-exists=keep` skips an existing destination without reading input, so a
 shell producer can get SIGPIPE. An output descriptor always exists, so
-`--as-fd` with `keep` always skips. `--dry-run` reads no input, so it cannot
+`--as-fd` with `keep` always skips; `update-if-older` is refused, and other
+`--if-exists` values do not apply. `--dry-run` reads no input, so it cannot
 check a payload hash or a pipe's length. `--results` reports one
 [`stream_result`](../automation.md#stream_result) record.
 

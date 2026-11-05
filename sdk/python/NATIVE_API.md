@@ -35,9 +35,9 @@ and `AsyncClient(...)` accept:
 | `timeout` | Timeout for each operation, in seconds; default: none |
 
 `client.version()` and `syq.version(executable=None)` return the executable's
-version. `syq.managed_executable(cache_dir=None)` downloads the verified
-executable if needed and returns its path. See
-[Compatibility](https://greaber.github.io/syq/python-operations.html#compatibility).
+version. See
+[Compatibility](https://greaber.github.io/syq/python-operations.html#compatibility)
+for how the executable is chosen.
 
 <a id="the-native-vocabulary-is-the-python-vocabulary"></a>
 
@@ -60,7 +60,8 @@ underscore on Python keywords (`from_`, `as_`). Paths can be `str`, `bytes`, or
 | `timeout` | Seconds, or `None` for no timeout; omitted: the client's timeout |
 
 Flags default to `False` and other optional arguments to `None`, except `check`,
-which defaults to `True`, and `timeout`. Invalid combinations raise
+which defaults to `True`, and `timeout`, which defaults to the client's
+timeout. Invalid combinations raise
 `SyqInvocationError`.
 
 <a id="a-normal-copy"></a>
@@ -100,7 +101,7 @@ what they do.
 | `widen_dirs` | `"none"` (default), `"rsync"`, or `"all"`: which of your directories may briefly get the owner permission the copy needs, as `--widen-dirs` describes |
 | `open_noatime` | Read without updating access times where possible; warns otherwise |
 | `sparse` | Write zero ranges as sparse holes on filesystem destinations |
-| `in_place` | `"new"`: write new files at their final names instead of under a temporary name. `"update"`: also update existing files in place, as `--in-place=update` describes |
+| `in_place` | `"new"`: write new files at their final names instead of under a temporary name, except a new file that must not replace anything (`as_new`, or under `if_exists="error"` or `"error-if-different"`). `"update"`: also update existing files in place, as `--in-place=update` describes |
 | `no_compress` | Disable compression |
 | `transfer_strategy` | `"whole-file"`, `"aligned-block"`, or `"locality"` (default); filesystem copies only; see [transfer strategies](https://greaber.github.io/syq/reference.html#choose-a-transfer-strategy) |
 | `performance_tuning` | Overrides such as `"workers=4"` or `"s3-objects=4,s3-parts-per-object=8"`; default: automatic |
@@ -116,11 +117,11 @@ what they do.
 | `receiver_max_entries`, `receiver_max_bytes` | Limits for a restricted copy: an entry count, and a size string or byte count |
 | `on_event`, `results`, `check` | See [events and failures](https://greaber.github.io/syq/python-results.html) |
 
-To copy between two SSH servers, `cp` needs a
-[restricted receiver](https://greaber.github.io/syq/remote-to-remote.html)
-enrolled on the destination, approved account access to both servers, or
-`coordinate_at="local"`. For `--detach` and human-readable output options, use
-`run`.
+To copy between two SSH servers, `cp` uses
+[restricted copying](https://greaber.github.io/syq/remote-to-remote.html) on
+the destination, which the first copy sets up as in the CLI; approved account
+access to both servers; or `coordinate_at="local"`. For `--detach` and
+human-readable output options, use `run`.
 
 `IgnoreFrom(path)` names a rule file, so you can interleave files and patterns:
 `ignore=[syq.IgnoreFrom("rules"), "!keep.tmp"]`. The last matching rule wins.
@@ -159,14 +160,16 @@ A stream always raises on a transfer failure; it has no `check` argument.
 
 ### Writer completion
 
-Use a `with` block: the writer publishes when the block exits normally, and
-aborts if it raises, leaving the destination unchanged. Calling `close()` in the
-block does not stop publication; only `abort()` does. If you wrap the writer in
+Use a `with` block: the writer publishes when the block exits without an
+exception. An exception inside a writer's or reader's block cancels the
+transfer, leaves the destination unchanged, and propagates unchanged. Calling
+`close()` in the block does not stop publication; only `abort()` does. If you wrap the writer in
 `io.BufferedWriter` or `io.TextIOWrapper`, close the wrapper before the writer
 commits, so its buffered data is written.
 
 Without a `with` block, finish with `commit()` or `abort()`; after `close()`
-alone, the transfer stays pending. `commit()` publishes at once, so a later
+alone, the transfer stays pending, and an uncommitted writer is aborted only
+when it is garbage-collected, which can block. `commit()` publishes at once, so a later
 error in your program cannot undo it. If a timeout or lost connection
 interrupts it, `commit()` raises without knowing whether the file was
 published.
@@ -197,10 +200,7 @@ After completion, `stream.result` holds a `CpResult`, or `None` if syq never
 reported one, as after a forced kill.
 
 `read(size)` can return data before a later transfer error, so treat the data
-as complete only when the reader finishes. An exception inside either `with`
-block cancels the transfer and propagates unchanged. An uncommitted writer is
-aborted when it is garbage-collected, which can block; a `with` block avoids
-that.
+as complete only when the reader's block exits without an exception.
 
 `timeout` covers the stream's whole life, including time blocked in reads and
 writes, and raises `subprocess.TimeoutExpired` unless the transfer already
@@ -223,7 +223,8 @@ async with client.open_reader("generated.bin", from_="server") as source:
 ```
 
 An async stream starts when its block is entered, and cancellation stops the
-transfer. Its `read`, `write`, `close`, `abort`, and `commit` are coroutines.
+transfer. Their `read` or `write`, `close`, `abort`, and (on writers) `commit`
+methods are coroutines.
 <!-- ANCHOR_END: streams -->
 
 <!-- ANCHOR: removal -->
@@ -379,7 +380,9 @@ the indices of the failed entries.
 
 ### Hash and HashAlgorithm
 
-`Hash(algorithm, value)` is the expected hash of a whole regular file.
+To require known contents for a mapped file, give its entry an
+`expected_hash`. `Hash(algorithm, value)` is the expected hash of a whole
+regular file.
 `algorithm` is a `HashAlgorithm` or its string: `"blake3"`, `"sha256"`, `"md5"`,
 or `"xxh3-128"`. `value` is hexadecimal: 64 digits for BLAKE3 and SHA-256, 32 for MD5 and
 XXH3-128.
@@ -856,13 +859,13 @@ By default the SDK runs the syq installed with its wheel, without searching
 
 ### Managed executable
 
-`Client(cache_dir=DIR)` instead downloads the matching syq into `DIR` on first
-use, verifies it against the release manifest in the package, and checks it
-again before every use.
-`syq.managed_executable()` downloads ahead of time and returns the path;
-without `cache_dir`, it uses `$XDG_CACHE_HOME/syq/sdk/python/v<version>/` when
-`XDG_CACHE_HOME` is absolute, and `~/.cache/syq/sdk/python/v<version>/`
-otherwise.
+`Client(cache_dir=DIR)` instead downloads the matching syq on first use into
+`DIR/syq/sdk/python/v<version>/<target>/`, where `<target>` names the platform,
+such as `linux-x86_64`. It verifies the download against the release manifest
+in the package and checks it again before every use.
+`syq.managed_executable(cache_dir=None)` downloads ahead of time and returns the
+executable's path. Without `cache_dir`, `DIR` is `$XDG_CACHE_HOME` when that is
+an absolute path, and `~/.cache` otherwise.
 
 ### Custom executable
 

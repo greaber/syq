@@ -189,10 +189,10 @@ with syq.open_reader("dataset.tar", from_="s3://backups") as source:
         consume(chunk)
 ```
 
-A writer publishes its file only when its `with` block exits normally. A
-reader checks that the transfer succeeded when its block exits, so if you
-extract files from a stream, use them only after both decoding and the reader's
-block finish. See
+A writer publishes its file only when its `with` block exits without an
+exception. A reader checks that the transfer succeeded when its block exits, so
+if you extract files from a stream, use them only after both decoding and the
+reader's block finish successfully. See
 [Byte streams](https://greaber.github.io/syq/python-streams.html#byte-streams).
 
 To generate several files in one copy, put producers in a mapping:

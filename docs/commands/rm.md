@@ -8,7 +8,9 @@ Remove local files, files on an SSH server, or S3 objects. See
 syq rm --src-dir old-output --dry-run -v
 ```
 
-For scripts, see [Removal records](../automation.md#removal-records).
+In scripts, `SYQ_RM_OPTIONS` adds arguments (see
+[environment variables](../environment.md)), and
+[Removal records](../automation.md#removal-records) describes `--results`.
 
 <!-- CLI: rm -->
 ```text

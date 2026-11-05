@@ -215,9 +215,11 @@ syq persist receive permissions remove [OPTIONS] <ID>
 ## syq persist receive on
 
 Settings you leave out keep their saved values. A new profile asks for
-approval with desktop prompts, writes into your home directory, and accepts
-requests through every connection; `--root` and `--connection` restrict it.
-Changing access settings cancels the profile's active requests. See
+approval with desktop prompts, starts relative paths in your home directory
+without confining copies to it, and accepts requests through every connection.
+Use `--root` to confine copies to one directory and `--connection` to limit
+which servers can use the profile. Changing access settings cancels the
+profile's active requests. See
 [profile settings](../persistence-reference.md#names-and-profiles) and
 [copy limits](../persistence-reference.md#copy-limits).
 

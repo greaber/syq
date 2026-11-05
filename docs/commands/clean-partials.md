@@ -10,7 +10,8 @@ syq clean-partials --dry-run -v backup
 syq clean-partials backup
 ```
 
-Add `--on server` to clean a directory on an SSH server.
+Add `--on server` to clean a directory on an SSH server. For `--results`
+output, see [Removal records](../automation.md#removal-records).
 
 ## Which files are removed
 
@@ -21,10 +22,10 @@ the `.syq-stream-*` files of killed
 [descriptor copies](cp.md#completion-and-failures) alone.
 
 Neither this command nor pruning removes `.syq-swap-...` recovery entries.
-They hold files that copies moved aside while replacing them, when a copy was
-interrupted or another program wrote the same name at the same time. Once no
-copy is using the destination, recover what you need from them and delete them
-yourself.
+Each holds either a file that a copy moved aside while replacing it (after an
+interruption, or when another program wrote the same name at the same time) or
+a killed copy's own unfinished entry. Once no copy is using the destination,
+recover what you need from them and delete them yourself.
 
 <!-- CLI: clean-partials -->
 ```text
