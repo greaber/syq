@@ -78,21 +78,16 @@ configured receiving profile, which must be enabled. A local `--pscope` does
 not select a domain on the provider.
 
 The requesting machine's SSH configuration determines the destination account,
-host, port, identity selection, and route. Changing an alias affects the next
-command whether or not a connection already exists, while existing sessions
-keep their original destination. `persist status --json` lists these
+host, port, identity selection, and route. `persist status --json` lists these
 connections in [`authorized_ssh`](automation.md#connection-status).
 
 Later commands that select the same provider reuse the approved connection,
 including copies, SSH data with `--no-tcp`, `rsync`, `rm`, `map`,
 `clean-partials`, and descriptor copies; for copies between two other servers,
-see [Approved account copies](remote-reference.md#approved-account-copies).
-The prompt grants the account's authority, not permission for only the
-displayed operation. When the connection closes, the next command can log in
-again under the current session or remembered permission; a failure after a
-command starts ends it without a retry. Remote path completion reuses a
-matching connection, but never contacts the provider, requests approval, or
-opens a connection.
+see [Approved account copies](remote-reference.md#approved-account-copies). The
+prompt grants the account's authority, not permission for only the displayed
+operation. Remote path completion reuses a matching connection, but never
+contacts the provider, requests approval, or opens a connection.
 
 When TCP is unavailable or you use `--no-tcp`, data workers open their own SSH
 connections under the same account permission. Your authorization provider
@@ -105,13 +100,12 @@ connection for the next one. It occupies one SSH session, so with the server's
 `MaxSessions 1`, a shell or another tool sharing that connection has no session
 left.
 
-`syq persist ssh-config HOST [--auth-from auto|ssh|@NAME|HOST]` prints a standalone
-OpenSSH configuration for one existing approved login. Use it with `ssh`,
-`scp`, or `sftp` through `-F FILE`, or with Git and rsync's SSH command option.
-The endpoint must match the user, host spelling, and port used to open the
-approved connection. The command never requests approval or opens a login, and
-native-only `ssh` selection cannot export approved access. The configuration
-is a snapshot bound to the resolved host, account, and port. Once its
+`syq persist ssh-config HOST [--auth-from auto|ssh|@NAME|HOST]` prints a
+standalone OpenSSH configuration for one existing approved login. Use it with
+`ssh`, `scp`, or `sftp` through `-F FILE`, or with Git and rsync's SSH command
+option. The endpoint must match the user, host spelling, and port used to open
+the approved connection. The command never requests approval or opens a login,
+and native-only `ssh` selection cannot export approved access. Once its
 connection closes, it fails without trying other authentication, so export it
 again after reconnecting. It contains no private key.
 
@@ -124,11 +118,9 @@ the same profile. Both accounts, resolved endpoints, and trusted host keys are
 part of the permission; changing them requires approval again. Permission is
 shared by processes running as the requesting account.
 
-With an ordinary SSH provider, **Allow** lasts for the current connection to
-that provider account. **Remember** permits later logins to the provider to
-authorize the destination through the same receiving profile. Syq does not
-verify which source machine opened that login; see
-[provider trust](security.md#ordinary-ssh-authorization-providers).
+With an ordinary SSH provider, see
+[provider trust](security.md#ordinary-ssh-authorization-providers) for what
+**Allow** and **Remember** cover.
 
 For a pending account request, use the desktop controls or decide locally:
 
@@ -142,15 +134,13 @@ syq persist receive permissions remove PERMISSION_ID
 ```
 
 `--remember` is accepted only for account-access requests. Removing a
-remembered permission makes future authentication requests ask again, but
-existing authenticated connections may continue, including new commands over
-them. To close syq's owned connections, run `syq persist off` on the requesting
-machine, with `--pscope PATH` if they belong to an explicit domain. Run
+remembered permission makes future authentication requests ask again. To close
+syq's owned connections, run `syq persist off` on the requesting machine, with
+`--pscope PATH` if they belong to an explicit domain. Run
 `syq persist receive off` on the authorizing machine to end session permission
 and prevent further authorization, selecting its domain with `--pscope` when
-needed. Neither stops remote commands or detached processes already running;
-stop those on the destination. See [account access](security.md#ssh-account-access)
-for the limits of account approval.
+needed. See [account access](security.md#ssh-account-access) for what these
+actions do not stop.
 
 Remembered permissions belong to the authorizing laptop's selected domain and
 are stored separately from receiving settings. A new domain on that laptop does
@@ -182,12 +172,9 @@ domain and applies the profile to allowed connections, active and future. It
 connects only the endpoints supplied with `--connection` in this invocation,
 and waits for receiving to become ready on them. If one fails, the settings
 stay saved and healthy connections keep running, but the command exits
-unsuccessfully. Use `persist connect HOST` to start another connection, or
-`receive wait HOST` to wait for readiness without starting it. Without
-`--name`, `receive on` updates the first saved profile, shown first by
-`receive status`. Until receiving settings are first saved, the first name you
-choose replaces the default profile named after your hostname; after that, a
-new name joins the existing profiles.
+unsuccessfully. Use `persist connect HOST` to start another connection.
+Without `--name`, `receive on` updates the first saved profile, shown first by
+`receive status`.
 
 ```sh
 syq persist receive status
@@ -207,10 +194,9 @@ finishes, until someone interrupts it on the server, or until you revoke the
 destination's enrollment with `syq receiver revoke`. `receive off` without a
 name stops all profiles; `receive on` enables the first profile, and
 `receive on --name NAME` enables another. Removing the first profile makes the
-next saved profile the default. The last profile can be disabled but cannot be
-removed. `pending`, `approve`, and `deny` work across the selected domain's
-profiles, and `pending` names the receiving profile of each request. Without
-`--name`, `receive wait` waits for every enabled profile on that server.
+next saved profile the default. `pending`, `approve`, and `deny` work across
+the selected domain's profiles, and `pending` names the receiving profile of
+each request.
 
 <a id="choose-allowed-servers"></a>
 
@@ -243,8 +229,6 @@ the saved list and connects the supplied endpoints; omitting `--connection`
 keeps the restriction without connecting dormant endpoints.
 `--all-connections` clears the restriction and starts receiving on active
 connections. Changes apply to existing persistent connections too.
-`receive wait HOST` waits only for profiles allowed on HOST in the selected
-domain.
 
 ### Move a name to another machine
 
@@ -310,11 +294,9 @@ as for any copy by an ordinary account. Named copies do not follow a
 destination symlink, even with `--follow-dst`; name the directory the link
 points to instead.
 
-Each copy is limited to 100 GiB and one million entries by default. Entries
-count the changes the copy makes on the laptop: each file it writes, each
-directory, link or special file it creates, each metadata change and each
-deletion; looking at what is already there does not count, and neither does a
-change that fails. Change these ceilings with
+Each copy is limited to 100 GiB and one million entries by default, counting
+entries as [restricted copies](remote-reference.md#limits-and-unsupported-options)
+do. Change these ceilings with
 `syq persist receive on --max-bytes 20G --max-entries 100000`. Lower limits
 requested by the sender also apply. Limits are per copy, so repeated copies can
 fill the disk.
@@ -377,12 +359,11 @@ choosing a receiving name that is not already connected to that server
 account. Use the same `--pscope PATH` for its status, pending requests,
 approvals, and remembered-permission management.
 
-A domain separates syq's saved policy and owned connections; it does not
-isolate processes running as the same OS account. SSH configuration, keys,
-agents, the local account's receiving identity, and the names other receiving
-machines advertise remain shared. `persist destinations list`, `wait`, and
-`forget` use this shared registry even with `--pscope`: forgetting an offline
-name releases it for the whole account.
+A domain does not isolate processes running as the same OS account; see
+[Persistent connections](security.md#persistent-connections). Receiving names
+are shared too: `persist destinations list`, `wait`, and `forget` work across
+the account even with `--pscope`, so forgetting an offline name releases it
+for the whole account.
 
 Scoped `persist off` closes that domain's connections and receiving services,
 then removes its settings and remembered permissions; the path cannot be

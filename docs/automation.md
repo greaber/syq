@@ -65,9 +65,6 @@ Crashes and interruptions can leave the terminal record missing.
   `encoding` values.
 - Treat human `message` text as display only; parse structured fields.
 
-The stream includes progress samples as well as final outcomes, so a live
-progress display can read it too.
-
 ## Exit codes
 
 | Code | Terminal status | Meaning |
@@ -130,7 +127,9 @@ For filesystem copies of regular files, `content_differs` means sizes or
 compared hashes differ, and `metadata_differs` also covers files selected by
 the size-and-time check. A `transfer_file` trace omits `bytes` when only
 metadata would change in place. A file whose metadata syq would change by
-replacing it (see [Copy metadata](reference.md#copy-metadata)) has
+replacing it (see
+[How syq changes existing files](reference.md#how-syq-changes-existing-files-and-directories))
+has
 `metadata_differs` with its `bytes`, and counts as transferred.
 
 A trace cannot be matched by identity to a later live operation: the filesystem
@@ -154,9 +153,8 @@ An outcome for a completed copy change or a failed mapping entry.
 | `class`, `os_kind`, `message` | Error details where available |
 
 A file whose data failed its [payload check](integrity-checking.md#payload-checks)
-on the way has `class: "integrity"`, the message
-`data corrupted in transit; rerun the command to retry`, and, where the record
-has the field, `retryable: "yes"`.
+on the way has `class: "integrity"` and, where the record has the field,
+`retryable: "yes"`.
 
 A command-restricted receiver's own records have no `src`, `attempts`, or
 `retryable`, and a deletion has no `kind`; a file it did not finish is
@@ -240,8 +238,7 @@ provided where known. Classes are `io`, `transport`, `conflict`, `integrity`,
 
 OS kinds are `not_found`, `permission_denied`, `already_exists`,
 `invalid_input`, `no_space`, `quota_exceeded`, `read_only`, and `other`.
-They preserve OS error meaning across hosts without requiring matching errno
-numbers. A command-restricted receiver's refusals use
+A command-restricted receiver's refusals use
 `class: "safety_limit"` and name the refused path, or the receiver when the
 refused request named none.
 
@@ -271,7 +268,7 @@ These measurements overlap, so do not add them together: copying can begin
 while planning continues, for example. Setup and planning count concurrent
 work of the same kind once; transfer is one span across workers, including
 gaps. The `timing:` line under a copy's summary shows setup only until file
-work begins, while `setup_ms` also counts connections added during copying.
+work begins.
 
 Filesystem copies report all six fields, including zero for work that was not
 needed or took less than a millisecond, and zero transfer time when no file

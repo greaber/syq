@@ -15,11 +15,8 @@ also accepts the host keys your laptop's known_hosts lists for hostB. See
 
 The authentication broker (`--peer-auth broker`) needs your laptop to trust
 both servers through exact plain host keys in known_hosts. It does not support
-host certificates alone, `KnownHostsCommand`, or `RevokedHostKeys`, and a
-custom `UserKnownHostsFile` or `GlobalKnownHostsFile` must name one absolute
-file per directive (`UserKnownHostsFile` can also use a `~/` path). The default
-known-hosts files work. Syq reports an unsupported configuration instead of
-relaxing host verification.
+host certificates alone, `KnownHostsCommand`, or `RevokedHostKeys`. Syq
+reports an unsupported configuration instead of relaxing host verification.
 
 ## Enrollment
 
@@ -97,15 +94,9 @@ To end an enrollment, run `syq receiver revoke ID`, or remove every
 comment.
 
 After you change syq builds, the next copy logs in once to install the
-matching receiver and rewrite syq's line. An SSH connection opened before that
-refresh cannot start a new copy; copies already running finish. Releases stay
+matching receiver and rewrite syq's line. Releases stay
 in `~/.local/lib/syq` until you delete them. Delete a release's directory only
 when no syq line in `authorized_keys` names it.
-
-Enrollment installs an executable for the destination's platform. Source
-builds require compatible platforms, and `--syq-path` does not select the
-restricted receiver. See [Developing syq](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md#direct-server-to-server-copies)
-for testing source builds.
 
 If the server loses an enrollment's state, its receiver refuses every copy,
 and `syq receiver enroll` sets up a new enrollment in its place. If only the
@@ -185,10 +176,7 @@ file or the right contents. See [A compromised source server](security.md#a-comp
 | `--rsh COMMAND` | Whatever your supplied SSH command permits |
 
 `--peer-auth broker` requires OpenSSH 8.9 or newer on the invoking machine,
-the coordinating server, and the peer's SSH server. Your machine uses the
-`IdentityAgent` its configuration names for the coordinating server for the
-connection there, and the peer's for the forwarded authentication, so the two
-can use separate agents.
+the coordinating server, and the peer's SSH server.
 
 To make hostB pull from hostA using credentials already on hostB:
 
@@ -256,11 +244,8 @@ unencrypted key file). That login follows the authorizing machine's SSH
 configuration, but accepts and records a destination key it has not seen
 before, as `accept-new` does, because nobody can answer. When it cannot
 connect, it tries again through the source, whose SSH server must then allow
-TCP forwarding. The source then connects to the destination's receiver and
-sends file data directly over encrypted TCP, falling back to SSH between the
-same servers; `--no-tcp` selects SSH. The source receives no laptop
-credentials or general SSH access; see
-[Copying between servers](security.md#copying-between-servers).
+TCP forwarding. See [Copying between servers](security.md#copying-between-servers)
+for what the source receives.
 
 For per-copy downloads (`--from HOST` to this machine), approval grants read
 access to the displayed source files and directory trees. `--src-non-dir`
@@ -289,9 +274,7 @@ prepare connections in advance, use
 This route runs the copy on the source, the default coordinator, with
 `--peer-auth restricted`. It supports `--no-tcp`, helper overrides, mappings,
 and `--results`, and `--pscope` selects the approved connections and
-authorization choices of that local domain. Custom `--rsh`, detached copies,
-destination coordination, and other peer-auth modes keep their own connection
-requirements. `--coordinate-at local` can reuse approved access to each
+authorization choices of that local domain. `--coordinate-at local` can reuse approved access to each
 endpoint and relays file data through the invoking machine.
 
 The source's SSH server must permit remote Unix-socket forwarding, and OpenSSH

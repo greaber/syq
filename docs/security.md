@@ -112,9 +112,11 @@ rename a file into the place of one being written. Syq writes partial files,
 and files `--in-place=new` creates, only through files it created or opened
 itself, and reuses bytes from an old partial only when it is a regular file
 owned by its user with no other names, after checking them against the source.
-A planted file is left unchanged. A file swapped in during the copy gets none
-of its data or metadata, and syq reports that file as failed instead of
-publishing what is at its name.
+A planted file is left unchanged, and a file swapped in during the copy gets
+none of the copy's data or metadata. When that happens to a partial file, syq
+reports the file as failed and does not publish what is at its name. A new
+file written in place is reported the same way on filesystems where syq can
+tell which file a name leads to.
 
 **Concurrent replacement of directory entries.** Checking an entry and
 removing it are separate operations. Someone able to rename files in that
@@ -260,10 +262,8 @@ with `syq receiver revoke`. See
 [Changing keys](remote-reference.md#changing-keys-and-updating-syq) for what
 does and does not stop a signed copy.
 
-File data travels directly from hostA to hostB, over encrypted TCP or SSH.
-Your laptop provides authorization and verifies the result without carrying
-the file data. See [Copy between servers](remote-to-remote.md) for setup and
-revoking access.
+See [Copy between servers](remote-to-remote.md) for setup and revoking
+access.
 
 Alternative authentication modes grant more authority. `--peer-auth broker`
 limits authentication to the chosen host and user but allows that account's
@@ -274,8 +274,8 @@ would. See [Other authentication modes](remote-reference.md#other-authentication
 
 HostA connects to hostB with its own SSH configuration, which checks hostB's
 host key as its own `ssh` would, with its known_hosts files, host certificate
-authorities, and `StrictHostKeyChecking`. Syq allows this connection nothing
-else: it logs in only with the entry key, with no agent, forwarding, proxy,
+authorities, and `StrictHostKeyChecking`. Syq overrides what this connection
+must not do: it logs in with the entry key, with no agent, forwarding, proxy,
 tunnel, remote command, or terminal, and it never prompts.
 
 HostA also accepts the keys and host certificate authorities that your
@@ -285,10 +285,14 @@ your laptop knows works even where hostA has an old one; a key that matches
 nothing while either machine lists a plain key of the same type for hostB is
 refused, as `ssh` refuses it. A listed host certificate authority does not
 refuse a key presented without a certificate: hostA treats that key as it
-would a host it has not seen. Where hostA's OpenSSH is older than 8.5 or its
+would a host it has not seen.
+
+Your laptop's entries can be incomplete, for example when its configuration
+uses a `KnownHostsCommand`. Where hostA's OpenSSH is older than 8.5 or its
 configuration sets its own `KnownHostsCommand`, hostA can use your laptop's
-entries only if its `GlobalKnownHostsFile` names a single file; otherwise the
-copy says it checked without them.
+entries only if its `GlobalKnownHostsFile` names a single file. In either case
+hostA checks without the missing entries, still connecting whenever its own
+configuration accepts hostB's key, and the copy says so.
 
 When neither machine knows hostB, hostA follows its own
 `StrictHostKeyChecking` setting, except that nobody can answer the question
@@ -343,20 +347,19 @@ HostA cannot:
 - Forge, alter, or cut short hostB's reports of its changes.
 
 Some filesystems narrow the promise about existing files. A signed copy that
-permits only creating new files refuses hard links on filesystems whose link
-counts syq does not trust, such as SMB and SSHFS. On filesystems without an
-atomic no-replace rename, such as NFS, hostB places a new file without a final
-check at a name it found free while planning, so a file another program
-creates there later in the copy can be replaced; hostA decides when the copy
-looks names up and when it writes them. On FAT and exFAT on macOS and on
-rclone mounts, hostB still refuses files that already exist, but one created
-in the instant between its check and its rename can be replaced.
+permits only creating new files refuses hard links on filesystems where syq
+can't tell which file a link would name, such as SMB and SSHFS. On filesystems
+without an atomic no-replace rename, such as NFS, hostB places a new file
+without a final check at a name it found free while planning, so a file another
+program creates there later in the copy can be replaced; hostA decides when the
+copy looks names up and when it writes them. On FAT and exFAT on macOS and on
+rclone mounts, hostB still refuses files that already exist, but one created in
+the instant between its check and its rename can be replaced.
 
-The filesystem limitations above still apply. HostB's account and receiver
-remain trusted to enforce the signed copy and report accurately. HostB's reports
-describe their work; they cannot prove that hostA supplied the right files. For
-example, they can accurately report that hostB wrote false contents provided by
-hostA.
+HostB's account and receiver remain trusted to enforce the signed copy and
+report accurately. HostB's reports describe their work; they cannot prove that
+hostA supplied the right files. For example, they can accurately report that
+hostB wrote false contents provided by hostA.
 
 <a id="file-contents"></a>
 <a id="expected-contents-and-corruption-checks"></a>
@@ -522,9 +525,7 @@ Custom proxy commands use local authentication and do not receive the
 laptop's agent socket.
 
 A laptop agent key constrained with `ssh-add -h hostB` can authorize this
-login, because the agent sees a direct login to hostB. Syq approves the
-requesting source account itself; that approval does not imply an agent
-constraint describing a forwarded hop from the source to hostB.
+login.
 
 Stopping receiving ends further authorization through that connection, and
 removing a remembered permission requires new approval for future
