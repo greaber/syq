@@ -159,8 +159,10 @@ Keep the laptop connection open while you work.
 Later commands reuse the approval, including copies with `--auth-from @laptop`.
 To make your laptop the default on hostA, run `syq persist auth-from @laptop`.
 See [Account access](persistence-reference.md#account-access) for how long
-approval lasts and how to use other SSH tools through the approved connection,
-and [`syq ssh`](commands/ssh.md) for terminals and exit status.
+approval lasts,
+[Approved account connections](persistence-reference.md#approved-account-connections)
+to use `scp`, Git or other SSH tools through it, and
+[`syq ssh`](commands/ssh.md) for terminals and exit status.
 
 ## Use an SSH authorization provider
 
