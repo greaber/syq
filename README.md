@@ -18,8 +18,8 @@ Quick links to docs for common tasks:
 - [Copy directly between servers without forwarding your SSH agent](https://greaber.github.io/syq/remote-to-remote.html)
 - [Copy to, from, and between S3-compatible buckets](https://greaber.github.io/syq/object-storage.html)
 - [Rename and reorganize files during a copy](https://greaber.github.io/syq/mappings.html)
-- Script syq using structured results or the
-  [Python SDK](https://greaber.github.io/syq/python.html).
+- Script syq using [structured results](https://greaber.github.io/syq/automation.html)
+  or the [Python SDK](https://greaber.github.io/syq/python.html).
 
 ## Install
 
@@ -49,9 +49,9 @@ syq cp project --to server --into backup
 ```
 
 This creates or updates `backup/project` in your home directory on the server.
-Add `--dry-run` to preview the copy. If interrupted, rerun with `--resume` to
-reuse completed files and recoverable partials. See [Copy files](https://greaber.github.io/syq/reference.html) for more
-examples.
+Add `--dry-run` to preview the copy. If interrupted, rerun the same command;
+it reuses completed files and matching parts of interrupted ones. See
+[Copy files](https://greaber.github.io/syq/reference.html) for more examples.
 
 ## Developing syq
 

@@ -116,12 +116,13 @@ also fail the caller even if it has already consumed a terminal record.
 
 Placement, preview, existence policies, compression, reporting, transfer tuning,
 and resource limits apply. Stream entries share limits across endpoint sessions;
-`--stream-concurrency` limits archive jobs separately from network workers.
+`--stream-concurrency` limits active entries separately from network workers.
 
-Streams run on the invoking machine. Remote coordinator placement, detached
-execution, and named receiver grants are unavailable for these entries: they
-cannot inherit the caller's live stream, and named grants authorize pathnames.
-`--in-place` cannot provide publication after producer success. Pruning and tree
+Streams run on the invoking machine, so these entries cannot use a remote
+coordinator or `--detach`: those could not inherit the caller's live stream.
+They also cannot copy to or from a [receiving machine](receive.md) (`@NAME`),
+whose approvals cover pathnames. `--in-place` is unavailable because syq
+publishes an entry only after its producer succeeds. Pruning and tree
 filters require a source tree; select entries in the calling program. Source
 metadata policies require actual source attributes; generated streams have none.
 Content comparison and size filters are unavailable in a stream-mapping batch;

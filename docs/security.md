@@ -85,10 +85,12 @@ holds with `--in-place=new` too, which writes only new files at their final
 names. It does not hold for an `--as-fd` output, which syq writes into the
 descriptor it is given, or for directories, whose metadata syq changes in
 place. Nor does it hold for `--in-place=update` (`syq rsync --inplace`), which
-writes into an existing file with one name that belongs to the account syq
-runs as (run as root, one that already has the owner and group the copy
-gives it), and whose permissions are no wider than the copy's, so that
-anyone who already has that file open can read the new contents.
+writes into an existing file, so anyone who already has that file open can
+read the new contents. Syq does that only to a file with one name that
+belongs to the account syq runs as (run as root, one that already has the
+owner and group the copy gives it) and whose permissions are no wider than
+the copy's; [In-place writes](reference.md#in-place-writes) lists every
+condition.
 
 Syq changes an existing file's permissions, owner, group, modification time,
 ACLs or extended attributes in place only when the file has no other names, the
@@ -163,14 +165,6 @@ SSH or syq's direct TCP connections.
 can read or alter the traffic, including its authentication token. Use it only
 on a network you trust.
 
-Storage upload approvals include reading object contents and metadata within
-the approved destination paths, for comparisons with existing files. When
-updates are allowed, they also permit reading destination tags, updating tags on
-the current destination object, and copying an object onto itself to update
-metadata. They do not authorize tag changes on historical versions or copying a
-different destination object as the source; bucket-to-bucket copies require a
-separate approved source scope. Upload approval is not a write-only grant.
-
 ## Downloaded executables
 
 Official releases provide executables for each supported operating system and
@@ -188,10 +182,12 @@ then checks downloaded files against the signed sizes and hashes before using
 them. The verification key comes from the installed executable, not from the
 server supplying the download. Source builds also carry the official public
 key for explicit `--use-version` selections. A selected release is verified
-once, when it is stored in `~/.local/lib/syq`, and later runs start it without
-checking it again. The store trusts the directories above it: anyone who can
-write them can replace the store, just as anyone who can write `~/.local/bin`
-can replace syq, so those directories should be writable only by you.
+once, when it is stored in `~/.local/lib/syq`. Later runs normally start it
+without hashing it again, but refuse it if its files or directories in the
+store are not yours or others can write them. The store trusts the
+directories above it: anyone who can write them can replace the store, just
+as anyone who can write `~/.local/bin` can replace syq, so those directories
+should be writable only by you.
 
 This also applies when the SSH server downloads its own helper: your client
 verifies the manifest and checks the reported archive hash before authorizing
@@ -337,17 +333,16 @@ own known_hosts settings stay exactly as configured. Where hostA's
 configuration sets a `KnownHostsCommand` of its own, which stays, or hostA's
 OpenSSH is older than 8.5, syq instead adds a file named
 `known-to-the-machine-that-approved-this-copy` to hostA's
-`GlobalKnownHostsFile`, but only when that setting is one word. OpenSSH
-reports a list of files and one quoted name containing spaces the same way,
-and its default setting lists two files. So on those hosts, unless
-`GlobalKnownHostsFile` names a single file, hostA checks hostB's key without
-your laptop's entries, and the copy says so. HostA still connects whenever
-its own configuration accepts hostB's key. In the same way, your laptop
-leaves out what it cannot read as its `ssh` does, such as its own
+`GlobalKnownHostsFile`. It can do that only when that setting is a single
+file name without spaces, and OpenSSH's default lists two files. So on those
+hosts, unless `GlobalKnownHostsFile` names a single file, hostA checks hostB's
+key without your laptop's entries, and the copy says so. HostA still connects
+whenever its own configuration accepts hostB's key. In the same way, your
+laptop leaves out what it cannot read as its `ssh` does, such as its own
 `KnownHostsCommand`, or a known_hosts setting that contains whitespace. It
-reads OpenSSH's default list only where its configuration names known_hosts
-files nowhere, or only as plain absolute or `~/` paths. The copy says when
-your laptop left something out.
+reads OpenSSH's default known_hosts files only when its configuration names
+no known_hosts files, even for other hosts, or names them only as plain
+absolute or `~/` paths. The copy says when your laptop left something out.
 
 A key that matches an entry on either machine is accepted, so a key your
 laptop knows works even where hostA has an old one. A key that matches
@@ -564,6 +559,14 @@ a signature does not cover.
 Anyone with the URLs can reuse them until expiry; stopping receiving does not
 revoke them. Filesystem receiver roots, aggregate limits, and single-use
 signed copies do not apply.
+
+Upload approval is not a write-only grant. It includes reading object
+contents and metadata within the approved destination paths, for comparisons
+with existing files. When updates are allowed, it also permits reading
+destination tags, updating tags on the current destination object, and
+copying an object onto itself to update metadata. It does not authorize tag
+changes on historical versions or copying a different destination object as
+the source; bucket-to-bucket copies require a separate approved source scope.
 
 ## SSH account access
 

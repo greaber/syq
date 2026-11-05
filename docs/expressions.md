@@ -50,10 +50,11 @@ Metadata used by the expression is added to records only when requested with
 
 `--copy-if` applies to directories too: a false result suppresses their source
 metadata, without blocking their children. Existing filesystem directories then
-keep their metadata, apart from the effects of adding or removing children;
-their permissions can be temporarily reopened for copying and are restored
-afterward. New directories get the receiver's defaults, including its umask or
-the parent's default ACL, and setgid inheritance. On S3, directory-marker objects are never filtered by
+keep their metadata, apart from the effects of adding or removing children and
+any temporary permission change that
+[`--widen-dirs`](reference.md#copy-metadata) allows. New directories get the
+destination's defaults, including its umask or the parent's default ACL, and
+setgid inheritance. On S3, directory-marker objects are never filtered by
 `--where`; `--copy-if` can skip their copy, while keys beneath them are
 considered independently.
 
@@ -72,9 +73,11 @@ against concurrent changes. `--copy-if` cannot combine with `--in-place`:
 an interrupted copy can leave an incomplete file whose metadata makes a
 retry skip it.
 
-For restricted remote copies, expressions are evaluated by the coordinator
-as copy preferences. They do not add receiver-enforced restrictions to the
-signed copy, whose destination scope and permissions the receiver enforces.
+In a copy through a restricted receiver, such as a
+[restricted copy between servers](remote-reference.md#enrollment), the machine
+coordinating the copy evaluates expressions and the receiver does not enforce
+them. The receiver enforces what was approved for the copy, such as its
+destination and limits.
 
 ## Fields
 

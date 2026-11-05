@@ -72,8 +72,10 @@ syq receiver revoke ID
 Use the ID from `list`. Revocation stops active copies for that enrollment
 and removes its access; completed writes remain. If cleanup fails, retry
 `receiver revoke`. See [Enrollment](remote-reference.md#enrollment)
-for which keys can sign, key changes, updates, and enrollments made by older
-versions.
+for which keys can sign, key changes, and updates. Enrollments made by syq
+0.7.1 and earlier do not appear in `list`; see
+[Enrollments from older versions](remote-reference.md#enrollments-from-older-versions)
+to remove them.
 
 Setting up, refreshing, and revoking log in to hostB the way your SSH
 configuration routes `ssh` there, including its jump hosts and proxy

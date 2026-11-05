@@ -23,8 +23,9 @@ or lose its remote connection while the copy continues.
 Worker `fractions` divide each state's accumulated duration by `observed_ns`,
 including waits still in progress. They sum to one when activity was observed;
 an empty object means none was observed. `cumulative_fractions` uses all observed
-worker time since collection began. Both exclude tuner parking; `parked_ns` and
-`cumulative_parked_ns` report that time separately in nanoseconds. These are
+worker time since collection began. Both exclude time that connection tuning
+keeps workers parked; `parked_ns` and `cumulative_parked_ns` report that time
+separately in nanoseconds. These are
 fractions of worker time, not command elapsed time. `observed` includes retired
 workers; `active` excludes retired workers and workers `parked` by connection tuning. `awaiting_work`
 counts workers waiting for a scheduler job. Compare this with `scan_done` to

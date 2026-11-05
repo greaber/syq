@@ -211,8 +211,9 @@ syq persist receive permissions [OPTIONS] <COMMAND>
 
 ## syq persist receive permissions list
 
-Show remembered return-channel and ordinary-provider account permissions,
-including each destination's trusted name and connection route. Use `--json`
+Show remembered account permissions, both for servers connected to this
+machine and for logins through it as an SSH authorization provider, including
+each destination's trusted name and connection route. Use `--json`
 for [structured permission records](../automation.md#remembered-account-permissions).
 
 <!-- CLI: persist receive permissions list -->

@@ -71,7 +71,8 @@ must stay inside that root.
 ## Results
 
 If some entries cannot be removed, syq reports the errors and continues with
-independent entries. Completed deletions remain in effect. Use
-[automation results](automation.md) for per-path outcomes in scripts.
+independent entries. Completed deletions remain in effect. For per-path
+outcomes in scripts, add `--results FILE`; see
+[Removal records](automation.md#removal-records).
 
 See [`syq rm`](commands/rm.md) for all options.

@@ -164,7 +164,9 @@ wrong `kind` fails that entry while independent entries continue.
 ## Mapping restrictions
 
 Use `--mapping` instead of source selectors, with `--into`, `--into-new`, or
-`--into-existing`. It cannot combine with `--as`, `--prune`, or `--detach`.
+`--into-existing`. It cannot combine with `--as`, `--prune`, `--prune-before`,
+`--ignore`, `--ignore-from`, or `--detach`. To skip paths, leave their entries
+out of the manifest.
 Use the same source base for `map` and `cp`. `--root` confines source selection.
 Follow options apply to supplied paths, never to links traversed by a manifest
 entry. `map` refuses non-UTF-8 names; hand-written manifests may use base64.
@@ -175,10 +177,10 @@ destination container may already have been created. Memory use grows with
 manifest size. Conflicts discovered while copying fail the affected entries.
 
 For restricted copies between servers, mapped destinations and their parent
-directories count against the receiver's entry limit. Each line can be up to
-1 MiB, and each destination path up to 4096 bytes. There is no separate total
-manifest-size limit. Missing parent directories are created; a file or symlink
-blocking a parent must be moved or removed before retrying.
+directories count against the receiver's entry limit. These copies also limit
+each manifest line to 1 MiB and each destination path to 4096 bytes, with no
+separate limit on the whole manifest. Missing parent directories are created;
+a file or symlink blocking a parent must be moved or removed before retrying.
 
 `kind: "special"` checks the source type; add `--copy-metadata=specials` to copy those
 entries. Use `--mapping -` for a pipeline; a named FIFO manifest requires Linux

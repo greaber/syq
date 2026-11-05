@@ -17,7 +17,7 @@ never reused by a command that asked for another. A relative path to a file in
 the options, such as `-F ssh.conf`, names a different file in each directory,
 so it counts as different options there. So does an option that runs a local
 command, such as `ProxyCommand`, because the command may use files in the
-directory it runs in. Receiving and the pool of ready sessions use only
+directory it runs in. Receiving and ready syq sessions on the server use only
 connections made with your plain `ssh`. With `-v` or a debug `LogLevel`, a
 command shares its connection only while it runs, so debug output does not
 outlive it. Options that set up SSH connection sharing themselves (`-M`, `-S`,
