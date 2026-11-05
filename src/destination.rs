@@ -626,7 +626,7 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
-        bail!("destination name must contain 1–64 letters, digits, hyphens, or underscores");
+        bail!("receiving name must contain 1–64 letters, digits, hyphens, or underscores");
     }
     Ok(())
 }
@@ -708,18 +708,29 @@ fn read_existing_registration(name: &str) -> Result<Option<Registration>> {
     read_existing_registration_at(&home.join(".syq-destinations-v3"), name)
 }
 
+/// Each failure says once what to do: check permissions when the registry
+/// cannot be read, or reconnect the receiving machine, which writes a new
+/// registration, when what it holds cannot be used.
 fn read_existing_registration_at(directory: &Path, name: &str) -> Result<Option<Registration>> {
     validate_name(name)?;
+    let unreadable = |error: anyhow::Error| {
+        error.context(format!(
+            "cannot read the registration for @{name}; check the permissions of {}",
+            directory.display()
+        ))
+    };
     let metadata = match fs::symlink_metadata(directory) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(unreadable(error.into())),
     };
     if !metadata.is_dir()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.mode() & 0o777 != 0o700
     {
-        bail!("destination registry must be an owned directory with mode 0700");
+        return Err(unreadable(anyhow::anyhow!(
+            "destination registry must be an owned directory with mode 0700"
+        )));
     }
     let path = directory.join(format!("{name}.json"));
     let encoded =
@@ -734,44 +745,39 @@ fn read_existing_registration_at(directory: &Path, name: &str) -> Result<Option<
             {
                 return Ok(None)
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(unreadable(error)),
         };
-    let registration: Registration = serde_json::from_slice(&encoded)?;
+    let unusable = |problem: &str| {
+        anyhow::anyhow!(notices::reconnect(
+            &format!("the registration for @{name} {problem}"),
+            notices::here()
+        ))
+    };
+    let registration: Registration = serde_json::from_slice(&encoded)
+        .map_err(|error| unusable(&format!("is invalid ({error})")))?;
     if registration.version != REGISTRATION_VERSION {
-        bail!(notices::reconnect(
-            "unsupported destination registration",
-            notices::this_account().as_deref()
-        ));
+        return Err(unusable("comes from an unsupported syq version"));
     }
     if !Path::new(std::ffi::OsStr::from_bytes(&registration.program)).is_absolute()
         || registration.program.contains(&0)
         || registration.identity.is_empty()
     {
-        bail!(notices::reconnect(
-            "invalid destination helper registration",
-            notices::this_account().as_deref()
-        ));
+        return Err(unusable("names an invalid helper"));
     }
     Ok(Some(registration))
 }
 
 fn read_registration(name: &str) -> Result<Registration> {
-    if let Some(registration) = read_existing_registration(name).with_context(|| {
-        notices::reconnect(
-            &format!("cannot read the registration for @{name}; check its permissions"),
-            notices::this_account().as_deref(),
-        )
-    })? {
+    if let Some(registration) = read_existing_registration(name)? {
         return Ok(registration);
     }
-    let account = notices::this_account();
     if identity::owner(&registry()?, name)?.is_some() {
-        bail!(notices::offline(name, account.as_deref()));
+        bail!(notices::offline(name, notices::here()));
     }
     bail!(notices::not_connected(
         name,
         &registered_names(),
-        account.as_deref()
+        notices::here()
     ));
 }
 
@@ -793,7 +799,7 @@ fn exchange(
     {
         bail!(notices::reconnect(
             "named destination requires its matching helper",
-            notices::this_account().as_deref()
+            notices::here()
         ));
     }
     let deadline = Instant::now() + timeout;
@@ -802,7 +808,7 @@ fn exchange(
             let message = if error.kind() == std::io::ErrorKind::WouldBlock {
                 "receiving machine is busy; try again shortly".to_owned()
             } else {
-                notices::unreachable(notices::this_account().as_deref())
+                notices::unreachable(notices::here())
             };
             anyhow::Error::new(error).context(message)
         })?;

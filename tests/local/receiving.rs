@@ -1068,8 +1068,8 @@ fn unknown_receiving_names_never_reach_ssh_and_say_what_to_do() {
         &std::env::var_os("PATH").unwrap_or_default(),
     ));
     let path = std::env::join_paths(path).unwrap();
-    let run = |args: &[&str]| {
-        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let syq = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
             .args(args)
             .env("HOME", t.path(""))
             .env("XDG_CONFIG_HOME", t.path("config"))
@@ -1083,7 +1083,33 @@ fn unknown_receiving_names_never_reach_ssh_and_say_what_to_do() {
             .current_dir(t.path(""))
             .stdin(Stdio::null())
             .capture_output()
-            .unwrap();
+            .unwrap()
+    };
+    // Refused before receiving settings are saved.
+    let refused = syq(&["persist", "receive", "on", "--connection", "@master"]);
+    assert!(!refused.status.success());
+    assert!(
+        stderr_of(&refused).contains("@master is a receiving name, not an SSH server: --connection takes the SSH server this machine should connect to"),
+        "{}",
+        stderr_of(&refused)
+    );
+    assert!(!t.path("config").exists(), "receiving settings were saved");
+    // Control: the same commands with an SSH host do reach both recorders.
+    for args in [
+        &["cp", ".kube", "--from", "server"][..],
+        &["rsync", "-e", &rsh, "server:.kube", "copy/"],
+    ] {
+        let output = syq(args);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(
+            t.path("ssh-used").exists(),
+            "{args:?} did not run ssh: {}",
+            stderr_of(&output)
+        );
+        fs::remove_file(t.path("ssh-used")).unwrap();
+    }
+    let run = |args: &[&str]| {
+        let output = syq(args);
         let error = stderr_of(&output);
         assert!(!output.status.success(), "{args:?} succeeded: {error}");
         assert!(

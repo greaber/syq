@@ -375,7 +375,7 @@ fn reject_receiving_name(host: &str) -> Result<()> {
     if let Some(name) = host.strip_prefix('@') {
         bail!(crate::destination::notices::connect_takes_server(
             name,
-            crate::destination::notices::this_account().as_deref()
+            crate::destination::notices::here()
         ));
     }
     Ok(())

@@ -1133,7 +1133,7 @@ fn reject_receiving_names(command: &str, args: &Args) -> Result<()> {
             bail!(notices::unsupported(&format!("syq {command}"), name));
         }
         if index != last {
-            bail!(notices::copy_from(name, notices::this_account().as_deref()));
+            bail!(notices::copy_from(name, notices::here()));
         }
     }
     Ok(())
@@ -1155,7 +1155,7 @@ fn reject_rsync_receiving_names(paths: &[String]) -> Result<()> {
         if index > 0 && index == paths.len() - 1 {
             bail!("receiving machine @{name} cannot be used with syq rsync; to copy to it, use `syq cp SOURCE --to @{name}`, adding --into DIR or --as PATH to choose where");
         }
-        bail!(notices::copy_from(name, notices::this_account().as_deref()));
+        bail!(notices::copy_from(name, notices::here()));
     }
     Ok(())
 }
@@ -2503,9 +2503,16 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
         .map(str::to_owned);
     let s3_options = crate::s3::Options::parse(s3, s3_from.as_deref(), s3_to.as_deref(), &matches)?;
     if s3_options.is_some() {
-        if (s3_from.is_none() && copy.selection.from.is_some())
-            || (s3_to.is_none() && copy.to.is_some())
-        {
+        let other = [
+            (s3_from.is_none(), copy.selection.from.as_deref()),
+            (s3_to.is_none(), copy.to.as_deref()),
+        ]
+        .into_iter()
+        .find_map(|(other, endpoint)| endpoint.filter(|_| other));
+        if let Some(endpoint) = other {
+            if let Some(name) = endpoint.strip_prefix('@') {
+                bail!("S3 copies cannot use receiving machine @{name}; run syq on that machine to copy between it and the bucket");
+            }
             bail!("S3 copies with an SSH endpoint are not supported; run syq on the machine holding the files");
         }
         if s3_from.is_some() {

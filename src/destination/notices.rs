@@ -28,45 +28,65 @@ pub(super) fn waiting_for_earlier(who: &str, what: &str) {
     );
 }
 
-/// This account as someone at a receiving machine might know it, such as
-/// `alice@j5`. Best effort: a part that is unavailable is left out. Only
-/// error messages use it; it is looked up once, since listing several
-/// offline names builds one message for each.
-pub(crate) fn this_account() -> Option<String> {
-    static ACCOUNT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    ACCOUNT
-        .get_or_init(|| {
-            let mut buffer = [0u8; 256];
-            let host = (unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) }
-                == 0)
-                .then(|| buffer.iter().position(|byte| *byte == 0))
-                .flatten()
-                .and_then(|end| std::str::from_utf8(&buffer[..end]).ok())
-                .filter(|host| {
-                    !host.is_empty() && host.bytes().all(|byte| byte.is_ascii_graphic())
-                })?;
-            Some(match crate::restricted::current_account_name() {
-                Some(user) => format!("{user}@{host}"),
-                None => host.to_owned(),
-            })
+/// This machine's hostname and login name. Someone at a receiving machine
+/// can use them to work out which HOST reaches this server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Here {
+    pub(crate) host: String,
+    pub(crate) user: Option<String>,
+}
+
+/// This machine's hostname and login name, looked up once and only for
+/// error messages. `None` when the hostname is unavailable or unprintable;
+/// the login name alone would not help find the machine.
+pub(crate) fn here() -> Option<&'static Here> {
+    static HERE: std::sync::OnceLock<Option<Here>> = std::sync::OnceLock::new();
+    HERE.get_or_init(|| {
+        let mut buffer = [0u8; 256];
+        let host = (unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } == 0)
+            .then(|| buffer.iter().position(|byte| *byte == 0))
+            .flatten()
+            .and_then(|end| std::str::from_utf8(&buffer[..end]).ok())
+            .filter(|host| !host.is_empty() && host.bytes().all(|byte| byte.is_ascii_graphic()))?;
+        Some(Here {
+            host: host.to_owned(),
+            user: crate::restricted::current_account_name(),
         })
-        .clone()
+    })
+    .as_ref()
+}
+
+/// ` (this server's hostname is j5 and its account is alice; your laptop
+/// may use another name for it)`, or nothing when the hostname is unknown.
+/// A laptop often reaches a server through an SSH alias, so this is a hint
+/// for HOST, not a value to use.
+fn hint(machine: &str, here: Option<&Here>) -> String {
+    let Some(here) = here else {
+        return String::new();
+    };
+    let account = here
+        .user
+        .as_deref()
+        .map(|user| format!(" and its account is {user}"))
+        .unwrap_or_default();
+    format!(
+        " ({machine}'s hostname is {}{account}; your laptop may use another name for it)",
+        here.host
+    )
 }
 
 /// What the person at `machine` runs to connect it to this server account.
-fn connect_instruction(machine: &str, account: Option<&str>) -> String {
+fn connect_instruction(machine: &str, here: Option<&Here>) -> String {
     format!(
         "run `syq persist connect HOST` on {machine} (for example your laptop), where HOST is how it reaches this server{}",
-        account
-            .map(|account| format!(" (this server account is {account})"))
-            .unwrap_or_default()
+        hint("this server", here)
     )
 }
 
 /// No receiving machine is registered as `@name`; `registered` lists the
 /// names that are. A mistyped or guessed name is the usual cause, so a
 /// registered name comes first, before how to connect another machine.
-pub(super) fn not_connected(name: &str, registered: &[String], account: Option<&str>) -> String {
+pub(super) fn not_connected(name: &str, registered: &[String], here: Option<&Here>) -> String {
     let mut message =
         format!("no receiving machine named @{name} is connected to this server account");
     match registered {
@@ -88,61 +108,57 @@ pub(super) fn not_connected(name: &str, registered: &[String], account: Option<&
     }
     message.push_str(&format!(
         "\nTo connect a receiving machine, {}. If receiving was never set up there, run `syq persist receive on --connection HOST` there instead.",
-        connect_instruction("it", account)
+        connect_instruction("it", here)
     ));
     message
 }
 
 /// `@name` is registered here, but its connection is gone.
-pub(super) fn offline(name: &str, account: Option<&str>) -> String {
+pub(super) fn offline(name: &str, here: Option<&Here>) -> String {
     format!(
-        "receiving machine @{name} is registered on this server account but not connected; it may have restarted or lost its connection.\nTo reconnect it, {}. Then retry, or release the name with `syq persist destinations forget {name}`.",
-        connect_instruction("that machine", account)
+        "receiving machine @{name} is registered on this server account but not connected; it may have restarted or lost its connection.\nTo reconnect it, {}. Then retry, or release the name on this server with `syq persist destinations forget {name}`.",
+        connect_instruction("that machine", here)
     )
 }
 
 /// The registered connection did not answer.
-pub(super) fn unreachable(account: Option<&str>) -> String {
+pub(super) fn unreachable(here: Option<&Here>) -> String {
     format!(
         "could not reach the receiving machine; it may be busy, or its connection may have ended, for example because it restarted. Try again, or {}",
-        connect_instruction("that machine", account)
+        connect_instruction("that machine", here)
     )
 }
 
 /// The registration cannot be used as it is; a new connection replaces it.
-pub(super) fn reconnect(problem: &str, account: Option<&str>) -> String {
+pub(super) fn reconnect(problem: &str, here: Option<&Here>) -> String {
     format!(
         "{problem}; to reconnect, {}",
-        connect_instruction("the receiving machine", account)
+        connect_instruction("the receiving machine", here)
     )
 }
 
 /// The syq on `@name` is too old for `what`.
-pub(super) fn outdated(name: &str, what: &str, account: Option<&str>) -> String {
+pub(super) fn outdated(name: &str, what: &str, here: Option<&Here>) -> String {
     format!(
         "the syq connected as @{name} does not support {what}; update syq on that machine, then {}",
-        connect_instruction("it", account)
+        connect_instruction("it", here)
     )
 }
 
 /// `syq persist connect @name`: the command runs on the receiving machine
 /// and names the SSH server it connects to.
-pub(crate) fn connect_takes_server(name: &str, account: Option<&str>) -> String {
+pub(crate) fn connect_takes_server(name: &str, here: Option<&Here>) -> String {
     format!(
         "@{name} is a receiving name, not an SSH server: run `syq persist connect HOST` on the receiving machine itself (for example your laptop), where HOST is the SSH server it should connect to{}",
-        account
-            .map(|account| format!(" (this machine is {account})"))
-            .unwrap_or_default()
+        hint("this machine", here)
     )
 }
 
 /// A copy from `@name`, which receiving machines do not serve.
-pub(crate) fn copy_from(name: &str, account: Option<&str>) -> String {
+pub(crate) fn copy_from(name: &str, here: Option<&Here>) -> String {
     format!(
         "cannot copy from receiving machine @{name}: receiving machines accept copies sent to them (`syq cp PATH --to @{name}`) and commands (`syq exec --on @{name} -- COMMAND`).\nTo copy files from that machine to this server, run `syq cp PATH --to HOST` on it, where HOST is how it reaches this server{}.",
-        account
-            .map(|account| format!(" (this server account is {account})"))
-            .unwrap_or_default()
+        hint("this server", here)
     )
 }
 
@@ -306,27 +322,34 @@ mod tests {
     /// an agent on the server knows to ask the person at the laptop.
     #[test]
     fn receiving_name_errors_say_where_to_run_what() {
-        let account = Some("alice@j5");
-        let connect = "run `syq persist connect HOST` on it (for example your laptop), where HOST is how it reaches this server (this server account is alice@j5)";
-        let none = not_connected("master", &[], account);
+        let j5 = Here {
+            host: "j5".into(),
+            user: Some("alice".into()),
+        };
+        let here = Some(&j5);
+        let server = "(this server's hostname is j5 and its account is alice; your laptop may use another name for it)";
+        let connect = format!("run `syq persist connect HOST` on it (for example your laptop), where HOST is how it reaches this server {server}");
+        let none = not_connected("master", &[], here);
         assert!(
             none.starts_with(
                 "no receiving machine named @master is connected to this server account.\n"
             ),
             "{none}"
         );
-        assert!(none.contains(connect), "{none}");
+        assert!(none.contains(&connect), "{none}");
         assert!(
-            none.contains("run `syq persist receive on --connection HOST` there instead"),
+            none.ends_with(
+                ". If receiving was never set up there, run `syq persist receive on --connection HOST` there instead."
+            ),
             "{none}"
         );
-        let one = not_connected("master", &["laptop".into()], account);
+        let one = not_connected("master", &["laptop".into()], here);
         assert!(
             one.starts_with("no receiving machine named @master is connected to this server account; did you mean @laptop?\n"),
             "{one}"
         );
         let names: Vec<String> = (0..10).map(|n| format!("m{n}")).collect();
-        let many = not_connected("master", &names, account);
+        let many = not_connected("master", &names, here);
         assert!(
             many.contains(
                 ". Names registered here: @m0, @m1, @m2, @m3, @m4, @m5, @m6, @m7, and 2 more.\n"
@@ -337,32 +360,39 @@ mod tests {
         for message in [&none, &one, &many] {
             assert!(!message.contains("restarted"), "{message}");
         }
-        let offline = offline("laptop", account);
-        assert!(
-            offline.starts_with("receiving machine @laptop is registered on this server account but not connected; it may have restarted or lost its connection.\nTo reconnect it, run `syq persist connect HOST` on that machine (for example your laptop), where HOST is how it reaches this server (this server account is alice@j5)."),
-            "{offline}"
-        );
-        assert!(
-            offline.ends_with("release the name with `syq persist destinations forget laptop`."),
-            "{offline}"
-        );
-        assert!(unreachable(account).contains("run `syq persist connect HOST` on that machine (for example your laptop), where HOST is how it reaches this server (this server account is alice@j5)"));
         assert_eq!(
-            connect_takes_server("master", account),
-            "@master is a receiving name, not an SSH server: run `syq persist connect HOST` on the receiving machine itself (for example your laptop), where HOST is the SSH server it should connect to (this machine is alice@j5)"
+            offline("laptop", here),
+            format!("receiving machine @laptop is registered on this server account but not connected; it may have restarted or lost its connection.\nTo reconnect it, run `syq persist connect HOST` on that machine (for example your laptop), where HOST is how it reaches this server {server}. Then retry, or release the name on this server with `syq persist destinations forget laptop`.")
         );
-        assert!(copy_from("master", account).ends_with("run `syq cp PATH --to HOST` on it, where HOST is how it reaches this server (this server account is alice@j5)."));
-        assert!(outdated("laptop", "syq ssh", account).contains(
-            "update syq on that machine, then run `syq persist connect HOST` on it (for example your laptop)"
+        assert!(unreachable(here).ends_with(&format!("run `syq persist connect HOST` on that machine (for example your laptop), where HOST is how it reaches this server {server}")));
+        assert_eq!(
+            connect_takes_server("master", here),
+            "@master is a receiving name, not an SSH server: run `syq persist connect HOST` on the receiving machine itself (for example your laptop), where HOST is the SSH server it should connect to (this machine's hostname is j5 and its account is alice; your laptop may use another name for it)"
+        );
+        assert!(copy_from("master", here).ends_with(&format!(
+            "run `syq cp PATH --to HOST` on it, where HOST is how it reaches this server {server}."
+        )));
+        assert!(outdated("laptop", "syq ssh", here)
+            .ends_with(&format!("update syq on that machine, then {connect}")));
+        assert!(reconnect("the registration for @laptop is invalid", here).ends_with(
+            &format!("is invalid; to reconnect, run `syq persist connect HOST` on the receiving machine (for example your laptop), where HOST is how it reaches this server {server}")
         ));
-        // Without a known account, the hint is simply left out.
+        // Without a login name the hostname still helps; without a
+        // hostname the hint is left out.
+        let nameless = Here {
+            host: "j5".into(),
+            user: None,
+        };
+        assert!(not_connected("master", &[], Some(&nameless)).contains(
+            "reaches this server (this server's hostname is j5; your laptop may use another name for it). If"
+        ));
         assert!(not_connected("master", &[], None).contains(
             "where HOST is how it reaches this server. If receiving was never set up there"
         ));
-        let here = this_account().expect("this test host has a hostname");
+        let local = super::here().expect("this test host has a hostname");
         assert!(
-            !here.is_empty() && here.bytes().all(|byte| byte.is_ascii_graphic()),
-            "{here:?}"
+            !local.host.is_empty() && local.host.bytes().all(|byte| byte.is_ascii_graphic()),
+            "{local:?}"
         );
     }
 

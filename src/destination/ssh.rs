@@ -95,6 +95,9 @@ fn parse_command(argv: &[OsString]) -> Result<(Invocation, Option<AuthFrom>, Opt
     }
     let destination = crate::cli::parse_native_endpoint(Some(&parsed.destination))?
         .context("SSH destination is missing")?;
+    if let Some(name) = destination.host.strip_prefix('@') {
+        bail!("@{name} is a receiving name, not an SSH server; to run a command on that machine, use `syq exec --on @{name} -- COMMAND`");
+    }
     validate_endpoint(&destination)?;
     if parsed.command.iter().any(|arg| arg.as_bytes().contains(&0)) {
         bail!("SSH command arguments must not contain NUL");
@@ -214,7 +217,7 @@ pub(crate) fn validate_host_key_alias(alias: &str) -> Result<()> {
 
 pub(crate) fn validate_endpoint(endpoint: &NativeEndpoint) -> Result<()> {
     if let Some(name) = endpoint.host.strip_prefix('@') {
-        bail!("@{name} is a receiving name, not an SSH server; to run a command on that machine, use `syq exec --on @{name} -- COMMAND`");
+        bail!("@{name} is a receiving name, not an SSH server");
     }
     if endpoint.host.is_empty()
         || endpoint.host.starts_with('-')
