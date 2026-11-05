@@ -1,16 +1,15 @@
 # syq cp
 
-Copy files, directories, and symlinks locally, over SSH, or with S3. See [Copy files](../reference.md) for examples and
-[remote](../remote-reference.md) and [S3](../object-storage.md) copy details.
+Copy files, directories, and symlinks between local paths, SSH servers, and S3
+buckets. For examples, start with [Copy files](../reference.md).
 
 ```sh
 syq cp --srcs-in project --to server --into backup --dry-run -v
 ```
 
-Put source selectors and `--mapping` before `--to` or a placement option.
-For scripting, `SYQ_CP_OPTIONS` supplies extra arguments and `SYQ_AUTH_FROM`
-chooses authorization; see [environment variables](../environment.md)
-and [results](../automation.md).
+Put the source options (`--from`, `-C` or `--root`, `--src-fd`, selectors,
+and `--mapping`) before `--to` and the placement option. In scripts,
+`SYQ_CP_OPTIONS` adds arguments; see [environment variables](../environment.md).
 
 <!-- CLI: cp -->
 ```text
@@ -172,90 +171,77 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 
 ## Update policies
 
-`--if-exists` chooses what happens to existing destination files; see
-[existing-file policies](../reference.md#choose-which-existing-files-to-update)
-for each value. A retry after a failure is subject to the same placement and
-policy, so a `-new` placement or `--if-exists=error` can reject entries the
-failed attempt created; see
+`--if-exists` decides what happens to destination files that already exist;
+see [existing-file policies](../reference.md#choose-which-existing-files-to-update)
+and, before retrying a failed copy,
 [resuming a copy](../reference.md#resume-an-interrupted-copy).
 
-`--in-place` cannot be combined with `--if-exists=keep` or `update-if-older`:
-an interrupted copy could leave an incomplete file that a retry would then skip.
-With `--in-place`, a file that must be new (an `--as-new` file, or a new file
-under `--if-exists=error` or `error-if-different`) is still written under a
-temporary name, so an interruption never leaves an incomplete file there. S3
-destinations do not support `--in-place`. See
-[In-place writes](../reference.md#in-place-writes) for which existing files
-`--in-place=update` writes into.
+`--in-place` cannot be combined with `--if-exists=keep` or `update-if-older`,
+because a retry would then skip a file left incomplete. Even with `--in-place`,
+a new file that must not replace anything (`--as-new`, or a new file under
+`--if-exists=error` or `error-if-different`) is written under a temporary name
+first. S3 destinations do not support `--in-place`. See
+[In-place writes](../reference.md#in-place-writes).
 
 ## Pruning
 
-Pruning keeps ignored paths, syq partial files, and
-[recovery entries](clean-partials.md#which-files-are-removed). An interruption
-during deletion can leave some extras already removed.
-
-Keep the source outside the destination. Syq detects overlap for local paths
-and for remote paths with the same host name, user, and port, but different SSH
-aliases or shared storage can hide it. Wait for other copies into the
-destination to finish before pruning, so their new files are not deleted as
-extras.
+Before pruning, keep the source outside the destination and let other copies
+into it finish; otherwise pruning can delete files you want. Syq refuses to
+prune a destination that it can see contains the source, but different SSH
+aliases for one server, or shared storage, can hide the overlap. Pruning never
+removes ignored paths, partial files, or
+[recovery entries](clean-partials.md#which-files-are-removed).
 
 ## Filename and type conflicts
 
-A case-insensitive destination cannot store both `Report.txt` and `report.txt`,
-and the same goes for different Unicode spellings that the destination treats
-as one name. Syq does not check for this before copying: the later file can
-replace the earlier one or, under a protective `--if-exists` policy, be
-reported as a conflict. Rename the source entries or use a destination that can
-tell them apart.
+On a case-insensitive destination, `Report.txt` and `report.txt` (or two
+Unicode spellings of one name) collide. Syq does not check for this, so one
+replaces the other or is reported as a conflict. Rename one source, or use a
+destination that can tell them apart.
 
-Syq refuses to replace a directory with a non-directory or the reverse, even an
-empty directory. Move or remove the conflicting destination entry before
-retrying.
+Syq never replaces a directory with a non-directory or the reverse, even an
+empty one; move or remove the conflicting entry first.
 
 ## Metadata details
 
-Without `--copy-metadata=permissions`, setuid, setgid, and sticky bits are not
-copied. Ownership is copied as numeric user and group IDs. On macOS,
-`--widen-dirs` can widen an existing destination directory only if it is
-readable.
+When you copy metadata to another machine, check how it carries over. Setuid,
+setgid, and sticky bits are copied only with `--copy-metadata=permissions`.
+Ownership and ACL entries are copied as numeric IDs (UUIDs for macOS ACLs), not
+translated to account names, so on another host they apply to whichever
+account has that ID there.
 
 ## File descriptors
 
-`--src-fd 0` reads stdin and `--as-fd 1` writes stdout, so you can connect
-local, SSH, or S3 copies to other programs; see
-[Shell pipelines and file descriptors](../reference.md#shell-pipelines-and-file-descriptors).
-Bash process substitution also works as an ordinary source:
+Use a descriptor copy to connect syq to another program without a temporary
+file. It streams raw bytes through an inherited file descriptor, a named pipe,
+or a process substitution. `--src-fd 0` reads standard input and `--as-fd 1`
+writes standard output;
+[Shell pipelines and file descriptors](../reference.md#shell-pipelines-and-file-descriptors)
+has examples. Process substitution and named pipes work as sources:
 
 ```sh
 syq cp --src <(gzip -c data) --to server --as data.gz
+syq cp incoming.fifo --into saved
 ```
 
-Each stream copy takes one source. Stdin and process substitution have no
-filename, so use `--as` to name the destination, or `--as-fd` to write to a
-descriptor. A named pipe can use `--into`: `syq cp incoming.fifo --into saved`
-waits for a writer, then saves its bytes as the regular file
-`saved/incoming.fifo`. A symlink to a pipe requires `--follow-src`. Directory
-copies never read pipes; `--copy-metadata=specials` copies the pipe itself.
-
-Other inherited descriptors work too, except 2, which is reserved for
-diagnostics. Syq advances the descriptor's offset and respects append mode; it
-does not truncate it. A literal `-` is a filename.
+Each descriptor copy takes one source, and input without a filename needs `--as`
+or `--as-fd`. The second example waits for a writer and saves its bytes as the
+regular file `saved/incoming.fifo`. Syq reads or writes from a descriptor's
+current position and never truncates it. Progress and `-v` output go to
+standard error, so descriptor 2 cannot carry a payload.
 
 ### Completion and failures
 
-A named destination is replaced only after the transfer succeeds. End of input
-does not tell syq whether the producer succeeded, so a failed producer can still
-leave a saved file. Use Bash's `set -o pipefail` or check a process
-substitution's status separately; in Python,
+A named destination is replaced only after the transfer succeeds, but syq cannot
+tell whether the producer succeeded: if the producer fails partway, syq still
+saves the bytes it received. Check the producer's status, for example with
+Bash's `set -o pipefail`; Python
 [managed streams](https://greaber.github.io/syq/python-streams.html#byte-streams)
-commit only after your producer succeeds.
+do this for you. Likewise, check syq's exit status before using what it wrote
+to an output descriptor, which can be incomplete after a failure.
 
-An output descriptor may contain incomplete data after a failure, so check
-syq's exit status before using it. A consumer that closes early makes syq fail.
-A killed copy can leave a `.syq-stream-*` temporary file beside the
-destination, which `syq clean-partials` does not remove; delete it once no copy
-is writing there.
+A killed copy can leave a `.syq-stream-*` file beside the destination; delete it
+once no copy is writing there.
 
 <a id="options-and-file-behavior"></a>
 
@@ -263,42 +249,28 @@ is writing there.
 
 ### Skips and previews
 
-Progress, `--stats`, and `-v` go to stderr, leaving stdout for the payload.
-
-`--if-exists=keep` skips a destination that already exists without reading
-input or opening a named pipe, so a shell producer can receive SIGPIPE; in
-Python, check the writer's `skipped` property first. An output descriptor
-always exists, so `--if-exists=keep --as-fd N` always skips.
-
-`--dry-run` checks source and destination placement without reading input or
-changing the destination; it cannot check a payload hash or predict the length
-of a pipe. `--results` and `--results-fd` report
-[`stream_result`](../automation.md#stream_result) records, and must use a
-different descriptor from the payload.
+`--if-exists=keep` skips an existing destination without reading input, so a
+shell producer can get SIGPIPE. An output descriptor always exists, so
+`--as-fd` with `keep` always skips; `update-if-older` is refused, and other
+`--if-exists` values do not apply. `--dry-run` reads no input, so it cannot
+check a payload hash or a pipe's length. `--results` reports one
+[`stream_result`](../automation.md#stream_result) record.
 
 ### Transport and limits
 
-Filesystem streams accept only the `workers`, `request-size`, `pipeline-depth`,
-and `bw-pacing` performance-tuning keys. For S3 streams, see [Descriptor copies](../object-storage.md#descriptor-copies).
-
-Streams cannot go to receiving names, and an interrupted stream starts over.
-Options for file trees, such as `--hash`, `--in-place`, `--prune`, `--where`,
-`--ignore`, `--transfer-strategy`, and `--detach`, are refused. `--root` cannot
-be combined with `--src-fd`.
-
-`--if-exists` does not apply to output descriptors, except that `keep` always
-skips and `update-if-older` is refused.
+Descriptor copies refuse options for file trees, such as `--hash`, `--prune`,
+`--where`, and `--detach`, and cannot use a receiving name (`@NAME`). An
+interrupted one starts over. Filesystem descriptor copies accept only the
+`workers`, `request-size`, `pipeline-depth`, and `bw-pacing`
+[tuning keys](../tuning.md); for S3, see
+[Descriptor copies](../object-storage.md#descriptor-copies).
 
 <a id="descriptor-offsets-and-metadata"></a>
 
 ### Descriptor metadata
 
-Output descriptors get the timestamps of ordinary writes. Add
-`--copy-metadata=mtime` to set the source modification time instead, which
-changes the whole destination file's timestamp even after a partial write;
-`--copy-metadata=permissions,ownership` copies those attributes.
-
-Pipes, sockets, and devices have no metadata to copy, so they reject
-`--copy-metadata` and `--if-exists=update-if-older`, and their new named
-destinations get mode `0666` limited by the umask or the directory's default
-ACL. Named remote sources must be regular files.
+A file written through `--as-fd` gets ordinary write timestamps unless you add
+`--copy-metadata=mtime`, which sets the time of the whole file.
+`--copy-metadata=permissions,ownership` copies those attributes too. A pipe,
+socket, or device source has no metadata; a new named destination for one gets
+mode `0666`, limited by the umask.

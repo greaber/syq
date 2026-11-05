@@ -1,8 +1,9 @@
 # syq persist
 
-Manage reusable SSH connections and receiving profiles. Start with
-[Use your laptop from a server](../receive.md) for setup, or see
-[Persistence details](../persistence-reference.md) for profiles and limits.
+Keep SSH connections open between commands, and let servers send copies and
+requests to your laptop. Start with
+[Use your laptop from a server](../receive.md);
+[Persistence details](../persistence-reference.md) covers profiles and limits.
 
 <!-- CLI: persist -->
 ```text
@@ -85,10 +86,6 @@ syq persist ssh-config [OPTIONS] <HOST>
 
 ## syq persist receive
 
-Configure receiving and approve its requests. See the
-[three uses of receiving](../receive.md) for file copies to your
-machine, commands on it, and authorizing copies between servers.
-
 <!-- CLI: persist receive -->
 ```text
 syq persist receive [OPTIONS] <COMMAND>
@@ -129,9 +126,9 @@ syq persist receive pending [OPTIONS]
 
 ## syq persist receive approve
 
-Copy and command approvals apply once. SSH account requests grant
-[session access](../persistence-reference.md#account-permissions); add `--remember`
-to permit future account authentications too.
+Approving a copy or command allows that one request. Approving an SSH account
+request grants [session access](../persistence-reference.md#account-permissions);
+add `--remember` to allow later logins too.
 
 <!-- CLI: persist receive approve -->
 ```text
@@ -186,9 +183,7 @@ syq persist receive permissions [OPTIONS] <COMMAND>
 
 ## syq persist receive permissions list
 
-Show remembered account permissions, including those for logins through this
-machine as an SSH authorization provider. Use `--json` for
-[structured permission records](../automation.md#remembered-account-permissions).
+`--json` prints [structured records](../automation.md#remembered-account-permissions).
 
 <!-- CLI: persist receive permissions list -->
 ```text
@@ -220,12 +215,13 @@ syq persist receive permissions remove [OPTIONS] <ID>
 
 ## syq persist receive on
 
-Omitted settings keep their saved values. A new profile asks for approval with
-desktop prompts and uses your home directory; set `--root` to confine copies to
-a directory. Without `--connection`, a new profile applies to all existing and
-future connections, and an existing profile keeps its allowed list. Changing
-access settings cancels the profile's active requests.
-See [profile settings](../persistence-reference.md#names-and-profiles) and
+Settings you leave out keep their saved values. A new profile asks for
+approval with desktop prompts, starts relative paths in your home directory
+without confining copies to it, and accepts requests through every connection.
+Use `--root` to confine copies to one directory and `--connection` to limit
+which servers can use the profile. Changing access settings cancels the
+profile's active requests. See
+[profile settings](../persistence-reference.md#names-and-profiles) and
 [copy limits](../persistence-reference.md#copy-limits).
 
 <!-- CLI: persist receive on -->
@@ -255,7 +251,8 @@ syq persist receive on [OPTIONS]
 
 ## syq persist receive off
 
-Disable the named profile, or all profiles when `--name` is omitted. This stops incoming requests while leaving forward SSH persistence available.
+Turn off the named profile, or every profile without `--name`. Your
+persistent SSH connections keep working.
 
 <!-- CLI: persist receive off -->
 ```text
@@ -306,7 +303,7 @@ syq persist receive status [OPTIONS]
 
 ## syq persist receive wait
 
-Failure or timeout exits nonzero. This command does not start a connection.
+Exits nonzero on failure or timeout. It does not start a connection.
 
 <!-- CLI: persist receive wait -->
 ```text
@@ -330,9 +327,9 @@ syq persist receive wait [OPTIONS] <HOST>
 
 ## syq persist destinations
 
-Receiving names are shared by this OS account across persistence domains.
-`--pscope` does not filter this registry; forgetting an offline name releases it
-for every domain.
+Run these on a server. Receiving names belong to the whole OS account, so
+`--pscope` does not filter them, and forgetting one releases it in every
+persistence domain.
 
 <!-- CLI: persist destinations -->
 ```text
@@ -358,8 +355,8 @@ syq persist destinations list [OPTIONS]
 
 ## syq persist destinations forget
 
-Use this before replacing the laptop that registered a name. Forgetting a name
-whose laptop is still connected is refused.
+Run this before you replace the laptop that registered a name, so the new
+one can claim it.
 
 <!-- CLI: persist destinations forget -->
 ```text
@@ -447,9 +444,8 @@ syq persist off [OPTIONS]
 
 ## syq persist status
 
-Show connections without starting them. `--json` prints the
-[connection-status contract](../automation.md#connection-status), including
-[approved account connections](../persistence-reference.md#approved-account-connections).
+Show connections without starting them. `--json` prints
+[machine-readable status](../automation.md#connection-status).
 
 <!-- CLI: persist status -->
 ```text

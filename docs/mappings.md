@@ -37,8 +37,8 @@ syq map photo.jpg --as albums/cover.jpg
 `--from s3://BUCKET` for S3. It emits `src` and `dst` by default; request
 additional fields with `--include`, for example `--include kind,size,mtime`.
 Use the same source directory when making the copy: a list produced with
-`--srcs-in photos` needs `-C photos` on `cp`. Each listed directory includes
-separate entries for its contents.
+`--srcs-in photos` needs `-C photos` on `cp`. Each entry copies one object, so
+a directory's contents have entries of their own.
 
 ## Group photos by modification month
 
