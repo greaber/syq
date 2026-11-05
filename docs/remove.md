@@ -6,22 +6,21 @@ Remove a file or symlink:
 syq rm old-file
 ```
 
-Named paths, `--src`, and `--srcs` refuse directories. Select a tree explicitly
-to remove it recursively:
+Paths you name, and `--src` and `--srcs`, refuse directories. To remove a
+directory and everything in it, use `--src-dir`:
 
 ```sh
 syq rm --src-dir old-output
 ```
 
-Remove a directory's contents recursively, leaving the directory itself:
+To remove everything inside a directory but keep the directory itself:
 
 ```sh
 syq rm --srcs-in cache
 ```
 
-Add `--dry-run -v` to preview what would be removed first.
-A missing path is not an error. Filesystem removal is permanent; completed
-deletions cannot be rolled back.
+Add `--dry-run -v` to preview what would be removed. A missing path is not an
+error. Removing files is permanent; completed deletions can't be undone.
 
 ## On another machine
 
@@ -29,8 +28,9 @@ deletions cannot be rolled back.
 syq rm --on server --src-dir /scratch/old-output
 ```
 
-Keep the connection open until removal finishes. A dry run can still install syq
-on the server; see [Automatic installation on SSH servers](install.md#automatic-installation-on-ssh-servers).
+Removal on a server stops if the command stops, so let it finish. A dry run
+can still install syq on the server; see
+[Automatic installation on SSH servers](install.md#automatic-installation-on-ssh-servers).
 
 For object storage, use `--on s3://BUCKET`:
 
@@ -38,9 +38,9 @@ For object storage, use `--on s3://BUCKET`:
 syq rm --on s3://backups --src-dir old-backup --dry-run -v
 ```
 
-Ordinary removal respects bucket
-versioning; explicit version deletion is available with `--s3-all-versions` or
-`--s3-version-id`. See [Versions and deletion](object-storage.md#versions-and-deletion).
+In a versioned bucket, removal keeps older versions unless you add
+`--s3-all-versions` or `--s3-version-id`; see
+[Versions and deletion](object-storage.md#versions-and-deletion).
 
 ## Limit the selection
 
@@ -70,8 +70,8 @@ must stay inside that root.
 
 ## Results
 
-If some entries cannot be removed, syq reports the errors and continues with
-independent entries. Completed deletions remain in effect. For per-path
+If some entries can't be removed, syq reports the errors and continues with
+the rest. Completed deletions stay in effect. For per-path
 outcomes in scripts, add `--results FILE`; see
 [Removal records](automation.md#removal-records).
 

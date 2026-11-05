@@ -1,8 +1,8 @@
 # syq tuning-cache
 
-Inspect the measurements and decisions recorded by filesystem transfers.
-See [tuning history](../tuning.md#inspect-tuning-history) for privacy,
-retention, and startup behavior.
+Inspect how past filesystem copies chose their worker counts.
+[Tuning history](../tuning.md#inspect-tuning-history) explains what is
+recorded.
 
 <!-- CLI: tuning-cache -->
 ```text
@@ -27,8 +27,8 @@ syq tuning-cache <COMMAND>
 
 ## syq tuning-cache list
 
-List recent transfers, newest first. The worker column shows `?` for new
-transfers; only older records have a count.
+List recent transfers, newest first. The `WORKERS` column shows `?` for
+transfers recorded by this version; use `show` to see their worker counts.
 
 <!-- CLI: tuning-cache list -->
 ```text
@@ -69,7 +69,7 @@ syq tuning-cache show [OPTIONS] <ID>
 
 ## syq tuning-cache export
 
-Each transfer record is followed by its event records.
+Print transfers as NDJSON, each followed by its events.
 
 <!-- CLI: tuning-cache export -->
 ```text
@@ -86,9 +86,7 @@ syq tuning-cache export [ID]
 
 ## syq tuning-cache clear
 
-Delete recorded history and the startup hints learned from it, so later
-copies choose their starting worker counts afresh. `clear` leaves alone
-`~/.cache/syq/tuning.json`, which older versions used; you can delete it.
+Delete the history and the starting worker counts learned from it.
 
 <!-- CLI: tuning-cache clear -->
 ```text

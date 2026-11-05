@@ -1,9 +1,7 @@
 # Command reference
 
-Look up commands and options below. For copy examples, start with
-[Copy files](../reference.md).
-
-The advanced option groups have separate references:
+Look up commands and options here. For copy examples, start with
+[Copy files](../reference.md). Three option groups have their own pages:
 
 - [Performance tuning](../tuning.md): workers, request sizes, and copy methods.
 - [Resource limits](../resource-limits.md): bandwidth and concurrency ceilings.
@@ -84,13 +82,11 @@ syq --self-update
 syq help [COMMAND...] [--help-all]
 ```
 
-Show common help for a command or nested command, such as `syq help persist
-receive on`. Add `--help-all` for its complete help. With no command, show the
-root help. A trailing `--help` or `-h` selects common help.
+`syq help persist receive on` shows the common help for that command, as
+`syq persist receive on --help` does. Add `--help-all` for every option.
 
 ## Build identity
 
-`syq --build-identity` prints a release's version tag, such as `v0.7.1`, or for
-a build from source that tag plus its revision, such as
-`v0.7.1+dev.0123456789ab`. See
+`syq --build-identity` prints the release tag, such as `v0.7.1`. A build from
+source adds its revision, as in `v0.7.1+dev.0123456789ab`; see
 [development builds](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md#another-platform-with-your-own-helpers).
