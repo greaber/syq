@@ -294,9 +294,13 @@ pub fn run(local_receiver: bool) -> Result<()> {
     let descriptor_session = DescriptorSessionSlot::default();
     descriptor_session
         .serve_handed_connections(handed_connection_handler(descriptor_session.clone()));
+    let client_gone = std::sync::atomic::AtomicBool::new(false);
     let result = serve(
         io::Cursor::new(prefix).chain(io::stdin()),
-        io::stdout().lock(),
+        ClientOutput {
+            inner: io::stdout().lock(),
+            gone: &client_gone,
+        },
         true,
         None,
         None,
@@ -316,7 +320,64 @@ pub fn run(local_receiver: bool) -> Result<()> {
     );
     descriptor_session.close();
     crate::process::termination::wait_if_terminating();
-    result
+    match result {
+        Err(error)
+            if client_gone.load(Relaxed)
+                && error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|error| error.kind() == ErrorKind::BrokenPipe)
+                }) =>
+        {
+            Err(error.context(ClientGone))
+        }
+        result => result,
+    }
+}
+
+/// The client closed the control connection before reading every reply,
+/// as a copy does once one endpoint refuses it. The client reports its own
+/// outcome, so the server has nothing to add.
+#[derive(Debug)]
+pub(crate) struct ClientGone;
+
+impl std::fmt::Display for ClientGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the client stopped reading replies")
+    }
+}
+
+/// The control connection's output, noting when the client stops reading it.
+struct ClientOutput<'a, W> {
+    inner: W,
+    gone: &'a std::sync::atomic::AtomicBool,
+}
+
+impl<W: Write> ClientOutput<'_, W> {
+    fn note<T>(&self, result: io::Result<T>) -> io::Result<T> {
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() == ErrorKind::BrokenPipe)
+        {
+            self.gone.store(true, Relaxed);
+        }
+        result
+    }
+}
+
+impl<W: Write> Write for ClientOutput<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let result = self.inner.write(bytes);
+        self.note(result)
+    }
+    fn write_vectored(&mut self, buffers: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        let result = self.inner.write_vectored(buffers);
+        self.note(result)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        let result = self.inner.flush();
+        self.note(result)
+    }
 }
 
 /// Records every byte read through it.
