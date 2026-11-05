@@ -147,11 +147,7 @@ pub(super) fn select(
             // Do not repeat the failed SSH attempt when no receiver responds.
             return Err(error);
         };
-        crate::output::diagnostic!(
-            "syq: {}; trying authorization through @{}",
-            error.root_cause(),
-            found.0
-        );
+        super::notices::asking(&error, &spec, &found.0, &format!("this copy to {target}"));
         found
     };
     Ok(Some(handoff::Selection::new(
@@ -221,7 +217,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
         ignore: args.ignore_lines.clone(),
         mapping: crate::directive::mapping_authorization(args)?,
     };
-    crate::output::diagnostic!("syq: requesting permission from @{name} to copy to {target:?}; approve on that machine with its desktop prompt or syq persist receive pending");
+    super::notices::waiting(&format!("@{name}"), &format!("this copy to {target}"));
     let (stream, reply) = exchange(
         &registration,
         Message::Forward {

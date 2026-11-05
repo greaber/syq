@@ -22,6 +22,19 @@ other arguments. Repeating an option follows the same rules as repeating it
 on the command line. Syq removes these three variables before launching SSH,
 helpers, or other programs; the rest of the environment is passed through.
 
+## Choose authorization through the environment
+
+`SYQ_AUTH_FROM` chooses authorization for SSH endpoints in every command that
+takes `--auth-from`: `auto`, `ssh`, `@NAME`, or an SSH provider host, as
+`--auth-from` does. It wins over [saved choices](persistence-reference.md#authorization-defaults),
+and `--auth-from` on the command line (`--syq-auth-from` for `syq rsync`) wins
+over it. Like saved choices, it does not apply to local copies or object
+storage. An empty value counts as unset.
+
+```sh
+SYQ_AUTH_FROM=@laptop ./agent-task.sh
+```
+
 ## Other variables
 
 | Variable | Purpose |
@@ -38,6 +51,15 @@ helpers, or other programs; the rest of the environment is passed through.
 Diagnostic formats can change between versions. For scripts, use
 [automation results](automation.md). Usual system variables such as `HOME`,
 `TMPDIR`, and `SSH_AUTH_SOCK` also apply.
+
+Inside tmux, a shell keeps the `SSH_AUTH_SOCK` it started with, which stops
+working when you reattach from a new SSH login: that login's agent socket is
+gone. When a command that can use SSH finds that the socket no longer
+exists, syq asks tmux for the session's current `SSH_AUTH_SOCK` and, if an
+agent you own answers there, uses it for the programs it starts, such as
+`ssh`, as a new shell in that session would. A path that exists, such as
+`/dev/null` to turn the agent off, is left alone. To fix the shell itself, run
+`eval "$(tmux show-environment -s SSH_AUTH_SOCK)"`.
 
 ## Local state
 

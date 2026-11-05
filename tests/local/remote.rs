@@ -382,6 +382,178 @@ fn native_rejects_unknown_relay_option() {
     );
 }
 
+#[test]
+fn a_dead_agent_socket_inside_tmux_is_replaced_by_the_session_socket() {
+    use std::os::unix::net::UnixListener;
+    let t = Tmp::new();
+    write(&t.path("source"), b"payload");
+    // ssh records the agent socket it was given, then fails in a way no
+    // copy retries; tmux reports the session's socket.
+    executable(
+        &t.path("bin/ssh"),
+        b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_8.9p1 >&2; exit 0; fi\nprintf '%s\\n' \"${SSH_AUTH_SOCK-unset}\" > \"$HOME/ssh-agent\"\necho 'fixture: no ssh here' >&2\nexit 127\n",
+    );
+    executable(
+        &t.path("bin/tmux"),
+        b"#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/tmux-used\"\n[ \"$*\" = 'show-environment SSH_AUTH_SOCK' ] || exit 1\nprintf '%s\\n' \"$SYQ_TEST_TMUX_VALUE\"\n",
+    );
+    let mut paths = vec![t.path("bin")];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let paths = std::env::join_paths(paths).unwrap();
+    let sockets = test_support::short_tempdir().unwrap();
+    let live = sockets.path().join("live");
+    let _agent = UnixListener::bind(&live).unwrap();
+    let dead = sockets.path().join("dead");
+    let gone = sockets.path().join("gone");
+    let session = |socket: &Path| format!("SSH_AUTH_SOCK={}", socket.display());
+    let run = |tmux: Option<&str>, shell: &Path, session: &str| {
+        let _ = fs::remove_file(t.path("tmux-used"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(["cp", "source", "--to", "backup", "--auth-from", "ssh"])
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("PATH", &paths)
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .env("SSH_AUTH_SOCK", shell)
+            .env("SYQ_TEST_TMUX_VALUE", session)
+            .env_remove("SYQ_AUTH_FROM")
+            .current_dir(t.path(""));
+        match tmux {
+            Some(tmux) => command.env("TMUX", tmux),
+            None => command.env_remove("TMUX"),
+        };
+        let out = command.run().unwrap();
+        assert!(!out.status.success(), "{}", stderr_of(&out));
+        let used = fs::read_to_string(t.path("ssh-agent")).unwrap();
+        (PathBuf::from(used.trim_end()), t.path("tmux-used").exists())
+    };
+    let tmux_value = "/tmp/tmux-fixture/default,1234,0";
+    let tmux = Some(tmux_value);
+
+    // The shell's socket is gone, as after reattaching from a new login:
+    // ssh gets the session's socket, where an agent answers.
+    assert_eq!(run(tmux, &dead, &session(&live)), (live.clone(), true));
+    // An answering shell socket stays, without asking tmux.
+    assert_eq!(run(tmux, &live, &session(&gone)), (live.clone(), false));
+    // Nothing answers at the session's socket either, or the session has
+    // none: nothing changes.
+    for value in [session(&gone), "-SSH_AUTH_SOCK".into()] {
+        assert_eq!(run(tmux, &dead, &value), (dead.clone(), true), "{value}");
+    }
+    // Outside tmux nothing changes, and tmux is not asked.
+    assert_eq!(run(None, &dead, &session(&live)), (dead.clone(), false));
+    // A path that exists turns the agent off on purpose.
+    let off = Path::new("/dev/null");
+    assert_eq!(run(tmux, off, &session(&live)), (off.to_path_buf(), false));
+
+    // Completing a remote path repairs the socket for its listing's ssh;
+    // commands that cannot start ssh do not ask tmux.
+    let in_tmux = |args: &[&str]| {
+        let _ = fs::remove_file(t.path("tmux-used"));
+        let _ = fs::remove_file(t.path("ssh-agent"));
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("PATH", &paths)
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .env("SSH_AUTH_SOCK", &dead)
+            .env("SYQ_TEST_TMUX_VALUE", session(&live))
+            .env("TMUX", tmux_value)
+            .env_remove("SYQ_AUTH_FROM")
+            .env_remove("SYQ_COMPLETION_DEBUG")
+            .current_dir(t.path(""))
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        let used = fs::read_to_string(t.path("ssh-agent")).ok();
+        (
+            used.map(|used| PathBuf::from(used.trim_end())),
+            t.path("tmux-used").exists(),
+        )
+    };
+    let complete = |words: &[&str]| {
+        let index = (words.len() - 1).to_string();
+        let mut args = vec!["completion", "__complete", "bash", &index, "--"];
+        args.extend_from_slice(words);
+        in_tmux(&args)
+    };
+    assert_eq!(
+        complete(&["syq", "cp", "--from", "backup", "data/"]),
+        (Some(live.clone()), true)
+    );
+    assert_eq!(complete(&["syq", "cp", "sou"]), (None, false));
+    assert_eq!(in_tmux(&["completion", "bash"]), (None, false));
+    assert_eq!(in_tmux(&["cp", "source", "--as", "copy"]), (None, false));
+    // A copy from a descriptor names its SSH endpoint apart from the other
+    // copy locations, and a pipe source is such a copy.
+    let in_tmux_failing = |args: &[&str]| {
+        let _ = fs::remove_file(t.path("ssh-agent"));
+        let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("PATH", &paths)
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .env("SSH_AUTH_SOCK", &dead)
+            .env("SYQ_TEST_TMUX_VALUE", session(&live))
+            .env("TMUX", tmux_value)
+            .env_remove("SYQ_AUTH_FROM")
+            .current_dir(t.path(""))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+        drop(child.stdin.take());
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(!child.wait().unwrap().success(), "{stderr}");
+        PathBuf::from(fs::read_to_string(t.path("ssh-agent")).unwrap().trim_end())
+    };
+    for args in [
+        &[
+            "cp",
+            "--src-fd",
+            "0",
+            "--to",
+            "backup",
+            "--as",
+            "copy",
+            "--auth-from",
+            "ssh",
+        ][..],
+        &[
+            "cp",
+            "--from",
+            "backup",
+            "data",
+            "--as-fd",
+            "1",
+            "--auth-from",
+            "ssh",
+        ],
+        &[
+            "cp",
+            "/dev/stdin",
+            "--to",
+            "backup",
+            "--as",
+            "copy",
+            "--auth-from",
+            "ssh",
+        ],
+    ] {
+        assert_eq!(in_tmux_failing(args), live, "{args:?}");
+    }
+}
+
 fn add_remote_tool(t: &Tmp, name: &str) {
     let destination = t.path(&format!("remote-bin/{name}"));
     if destination.exists() {

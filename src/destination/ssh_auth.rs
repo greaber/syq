@@ -478,6 +478,8 @@ pub(crate) fn resolve(
     })
 }
 
+/// `asking` runs when the request for account access goes to the provider,
+/// which then may wait for a person to approve it.
 pub(crate) fn authorize_expected(
     domain: &Domain,
     request: &ssh::SessionRequest,
@@ -485,6 +487,7 @@ pub(crate) fn authorize_expected(
     provider_binding: &str,
     expected: &ResolvedPolicy,
     local: &ssh::local_config::LocalPlan,
+    asking: &dyn Fn(),
 ) -> Result<Session> {
     authorize_expected_inner(
         domain,
@@ -493,7 +496,7 @@ pub(crate) fn authorize_expected(
         provider_binding,
         expected,
         local,
-        false,
+        Some(asking),
     )
 }
 
@@ -512,10 +515,11 @@ pub(crate) fn authorize_worker_expected(
         provider_binding,
         expected,
         local,
-        true,
+        None,
     )
 }
 
+/// Without `asking`, only an existing account approval is used.
 fn authorize_expected_inner(
     domain: &Domain,
     request: &ssh::SessionRequest,
@@ -523,8 +527,9 @@ fn authorize_expected_inner(
     provider_binding: &str,
     expected: &ResolvedPolicy,
     local: &ssh::local_config::LocalPlan,
-    existing_account_only: bool,
+    asking: Option<&dyn Fn()>,
 ) -> Result<Session> {
+    let existing_account_only = asking.is_none();
     let target = LocalTarget::from_plan(local)?;
     anyhow::ensure!(
         target.requested == request.destination,
@@ -545,11 +550,8 @@ fn authorize_expected_inner(
         expected: expected.clone(),
         existing_account_only,
     };
-    if !existing_account_only {
-        crate::output::diagnostic!(
-            "syq: requesting SSH account access from {}; approve on that machine",
-            request.provider.label()
-        );
+    if let Some(asking) = asking {
+        asking();
     }
     let (mut stream, reply) = match &request.provider {
         Provider::Return(name) => {

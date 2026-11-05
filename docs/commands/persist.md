@@ -80,7 +80,7 @@ syq persist ssh-config [OPTIONS] <HOST>
 
 | Argument / option | Meaning |
 |---|---|
-| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Select existing approval; omitted uses the saved preference, then auto |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Select existing approval; omitted uses SYQ_AUTH_FROM, then the saved preference, then auto |
 | `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
 
 <!-- /CLI -->

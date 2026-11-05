@@ -135,7 +135,7 @@ try:
     print(result.stderr, end="", flush=True)
     assert result.returncode != 0, result
     assert "timed out" in result.stderr.lower(), result
-    assert "requesting permission" not in result.stderr, result
+    assert "waiting up to" not in result.stderr, result
     print("SSH timeout returned after", round(time.monotonic() - started, 2), "seconds", flush=True)
 finally:
     if original is None:

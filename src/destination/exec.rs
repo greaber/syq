@@ -94,7 +94,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     );
     handoff::maybe_exec(&selection)?;
     let registration = selection.registration;
-    crate::output::diagnostic!("syq: requesting command permission from @{name}; approve on that machine with its desktop prompt or syq persist receive pending");
+    super::notices::waiting(&format!("@{name}"), "this command");
     let (stream, reply) = exchange(
         &registration,
         Message::Exec(request),
