@@ -18,7 +18,7 @@ syq persist [OPTIONS] <COMMAND>
 | [`persist destinations`](#syq-persist-destinations) | On a server, list or release receiving names |
 | [`persist connect`](#syq-persist-connect) | Connect to a server now and keep the connection open for later commands |
 | [`persist on`](#syq-persist-on) | Keep SSH connections open for later syq commands |
-| [`persist off`](#syq-persist-off) | Turn persistence off and close its open SSH connections, including receiving; with |
+| [`persist off`](#syq-persist-off) | Turn persistence off and close its open SSH connections, including receiving; for an |
 | [`persist status`](#syq-persist-status) | Show connection readiness and any receiving problem |
 
 **Options (also available on subcommands)**

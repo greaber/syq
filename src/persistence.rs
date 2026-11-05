@@ -74,7 +74,7 @@ enum PersistAction {
         #[arg(long, conflicts_with = "pscope")]
         ephemeral: bool,
     },
-    /// Turn persistence off and close its open SSH connections, including receiving; with --pscope, also delete that scope with its settings and remembered permissions
+    /// Turn persistence off and close its open SSH connections, including receiving; for an isolated set from persist on --ephemeral, also delete its settings and remembered permissions
     Off {},
     /// Show connection readiness and any receiving problem
     Status {
