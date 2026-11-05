@@ -65,7 +65,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 |---|---|
 | `--if-exists <POLICY>` | How to handle existing destination files; directories remain containers<br><br>Possible values:<br>- error-if-different: Reject detected content differences; trusts matching size and mtime unless --hash is set<br>- error: Report an error for every existing destination leaf<br>- keep: Leave existing entries and their metadata alone<br>- update: Update contents when they differ and apply requested metadata<br>- update-if-older: Keep newer destinations; otherwise update differing contents<br><br>[default: update] |
 | `--copy-if <EXPR>` | Update only entries satisfying a source/destination expression |
-| `--in-place <MODE>` | Write files directly at their final names, with no staging file; interruption can leave them incomplete<br><br>Possible values:<br>- new: Only files the copy creates; an existing file is still replaced through a staging file<br>- update: Also existing files syq can vouch for, writing only what changed; others are replaced. Anyone who has such a file open can read its new contents, and an interruption leaves it partly updated |
+| `--in-place <MODE>` | Write files directly at their final names, with no staging file; interruption can leave them incomplete<br><br>Possible values:<br>- new: Only files the copy creates; an existing file is still replaced through a staging file<br>- update: Also existing files that syq can safely update where they are, writing only what changed; others are replaced. Anyone who has such a file open can read its new contents, and an interruption leaves it partly updated |
 | `--prune` | After copying, remove destination entries the source does not have, within the copied directories; ignored paths are kept |
 | `--prune-before` | Like --prune, but remove the extra entries before copying to free space; a later copy failure does not restore them |
 | `--max-delete <N>` | With --prune or --prune-before, refuse all removals if more than N are planned |
@@ -136,7 +136,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | Argument / option | Meaning |
 |---|---|
 | `--performance-tuning <KEY=VALUE,...>` | [Workers, request sizes, and copy methods](../tuning.md) |
-| `--transfer-strategy <STRATEGY>` | Choose whether filesystem copies reuse matching blocks of the destination file they replace. The default, locality, reuses them only when a syq endpoint is remote; mounted network filesystems count as local.<br><br>Possible values:<br>- whole-file: Copy selected files without comparing blocks in the final destination<br>- aligned-block: Reuse matching blocks at the same offsets in the corresponding destination file<br>- locality: Use whole-file locally and aligned-block with a remote syq endpoint |
+| `--transfer-strategy <STRATEGY>` | Choose whether filesystem copies reuse matching blocks of the destination file they replace. Mounted network filesystems count as local.<br><br>Possible values:<br>- whole-file: Copy selected files without comparing blocks in the final destination<br>- aligned-block: Reuse matching blocks at the same offsets in the corresponding destination file<br>- locality: Use whole-file locally and aligned-block with a remote syq endpoint |
 | `--resource-limits <KEY=VALUE,...>` | [Bandwidth and concurrency ceilings](../resource-limits.md) |
 
 <a id="progress-and-results"></a>
@@ -149,7 +149,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 |---|---|
 | `--results <FILE>` | Write the machine-readable NDJSON result stream to FILE (created fresh; an existing file is refused) |
 | `--results-fd <FD>` | Write the result stream to an inherited file descriptor the caller opened (e.g. `--results-fd 3 3>run.ndjson`); must be above 2 |
-| `-n, --dry-run` | Preview without changing copy/removal data; remote setup may still install the helper or syq; requested results files are still written |
+| `-n, --dry-run` | Preview without changing files; remote setup may still install syq, and requested results files are still written |
 | `-v, --verbose...` | List files with -v; explain helpers and transport with -vv |
 | `-q, --quiet` | Suppress non-error messages |
 | `--progress` | Show progress even when stderr is not a terminal |

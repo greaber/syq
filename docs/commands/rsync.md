@@ -66,7 +66,7 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 |---|---|
 | `-v, --verbose...` | List files with -v; explain helpers and transport with -vv |
 | `-q, --quiet` | Suppress non-error messages |
-| `-n, --dry-run` | Resolve mappings and transport, then estimate transfers, exclusions, and deletions; leave source and destination data unchanged (remote setup may still install the helper or syq) |
+| `-n, --dry-run` | Show what would be transferred, skipped, and deleted without changing source or destination files (remote setup may still install syq) |
 
 ## SSH and transport
 

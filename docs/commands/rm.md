@@ -62,7 +62,7 @@ syq rm [OPTIONS] --srcs-in DIR
 
 | Argument / option | Meaning |
 |---|---|
-| `-n, --dry-run` | Preview without changing copy/removal data; remote setup may still install the helper or syq; requested results files are still written |
+| `-n, --dry-run` | Preview without changing files; remote setup may still install syq, and requested results files are still written |
 | `-v, --verbose...` | List removed paths |
 | `-q, --quiet` | Suppress non-error messages |
 

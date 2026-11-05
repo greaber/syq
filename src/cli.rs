@@ -62,7 +62,7 @@ impl TransferStrategy {
     }
 }
 
-const TRANSFER_STRATEGY_HELP: &str = "Choose whether filesystem copies reuse matching blocks of the destination file they replace. The default, locality, reuses them only when a syq endpoint is remote; mounted network filesystems count as local.";
+const TRANSFER_STRATEGY_HELP: &str = "Choose whether filesystem copies reuse matching blocks of the destination file they replace. Mounted network filesystems count as local.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Existence {
@@ -109,7 +109,7 @@ pub enum IfExists {
 pub enum InPlace {
     /// Only files the copy creates; an existing file is still replaced through a staging file
     New,
-    /// Also existing files syq can vouch for, writing only what changed; others are replaced. Anyone who has such a file open can read its new contents, and an interruption leaves it partly updated
+    /// Also existing files that syq can safely update where they are, writing only what changed; others are replaced. Anyone who has such a file open can read its new contents, and an interruption leaves it partly updated
     Update,
 }
 
@@ -399,8 +399,8 @@ pub struct Args {
     /// Disable transport compression
     #[arg(long, overrides_with = "compress")]
     pub no_compress: bool,
-    /// Resolve mappings and transport, then estimate transfers, exclusions, and deletions;
-    /// leave source and destination data unchanged (remote setup may still install the helper or syq)
+    /// Show what would be transferred, skipped, and deleted without changing source or
+    /// destination files (remote setup may still install syq)
     #[arg(short = 'n', long)]
     pub dry_run: bool,
     /// No-op accepted for rsync compatibility (sizes are always human-readable)
@@ -1317,7 +1317,7 @@ struct NativeRmSelectionArgs {
 
 #[derive(clap::Args, Debug)]
 struct NativeOperationalArgs {
-    /// Preview without changing copy/removal data; remote setup may still install the helper or syq; requested results files are still written
+    /// Preview without changing files; remote setup may still install syq, and requested results files are still written
     #[arg(short = 'n', long)]
     dry_run: bool,
     /// Increase verbosity
