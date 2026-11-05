@@ -30,7 +30,10 @@ separate task, so read only the one you need:
 
 ## Set up receiving
 
-With syq installed on both machines, run this on your laptop:
+With syq installed on both machines, and the server's SSH server allowing
+remote forwarding (see
+[Setup and recovery](persistence-reference.md#setup-and-recovery)), run this
+on your laptop:
 
 ```sh
 syq persist receive on --connection server
@@ -42,13 +45,12 @@ receiving name: your laptop's short hostname, unless you choose another with
 and make requests from any shell on the server, including an existing tmux
 session.
 
-The server's SSH server must allow remote forwarding; see
-[Setup and recovery](persistence-reference.md#setup-and-recovery). Receiving
-doesn't survive a reboot, and logging in with `ssh server` doesn't restart it;
-run `syq persist connect server` on your laptop. To allow several servers,
-repeat `--connection`; a new list replaces the saved one. See
-[Names and profiles](persistence-reference.md#names-and-profiles) to use
-separate names and settings for different projects.
+After your laptop restarts, run `syq persist connect server` again; logging
+in with `ssh server` doesn't restart receiving.
+
+To allow several servers, repeat `--connection`; a new list replaces the saved
+one. See [Names and profiles](persistence-reference.md#names-and-profiles) to
+use separate names and settings for different projects.
 
 <a id="approving-copies"></a>
 <a id="names-and-paths"></a>

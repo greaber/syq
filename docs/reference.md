@@ -231,8 +231,9 @@ syq cp --prune --srcs-in build --into backup
 
 To free space first, use `--prune-before`. It removes extras after syq has
 listed the source but before copying. If the copy then fails, the extras stay
-deleted. `--max-delete` applies as with `--prune`. See [Pruning](commands/cp.md#pruning) for restrictions and files kept
-for recovery.
+deleted. `--max-delete` applies as with `--prune`. See
+[Pruning](commands/cp.md#pruning) for restrictions and files kept for
+recovery.
 
 ## Select files by metadata
 
@@ -390,9 +391,9 @@ syq cp --copy-metadata=permissions,ownership project --into backup
 | `--copy-metadata=hardlinks` | `-H` (regular files) |
 | `--copy-metadata=acls` | `-A` (native ACLs; implies permissions) |
 | `--copy-metadata=xattrs` | `-X` (extended attributes) |
-| `--copy-metadata=atimes` | `-U` (access times; Linux 5.8 or later) |
+| `--copy-metadata=atimes` | `-U` (access times; on Linux, kernel 5.8 or later) |
 | `--copy-metadata=crtimes` | `-N` (birth times; macOS destination) |
-| `--open-noatime` | `--open-noatime` (reading doesn't update source access times); `-UU` selects it with `-U` |
+| `--open-noatime` | `--open-noatime` (reading doesn't update source access times); rsync's `-UU` selects both this and `-U` |
 
 Setting ownership needs suitable privileges on the destination. Hard links,
 ACLs, xattrs, access times and birth times are not part of `syq rsync -a`, and

@@ -107,7 +107,8 @@ syq completion fish | source
 ```
 
 Completion suggests options, hosts, and paths, including remote paths over
-your usual SSH login. Open a new shell after adding the setup line. See [`syq completion`](commands/completion.md) for all options.
+your usual SSH login. Open a new shell after adding the setup line. See
+[`syq completion`](commands/completion.md) for all options.
 
 ## Keep connections open
 
