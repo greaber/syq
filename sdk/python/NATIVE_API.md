@@ -562,7 +562,7 @@ unsuccessful copy. Read attributes directly, for example
 | `specials_created` | `int` | Special filesystem objects created |
 | `bytes_transferred` | `int` | File-content bytes transferred, not compressed network traffic |
 | `bytes_total_known` | `bool \| None` | For descriptor copies, whether the source length is known; otherwise absent (`None`) |
-| `bytes_unchanged` | `int` | Bytes in unchanged files |
+| `bytes_unchanged` | `int` | Bytes not copied because the destination already had them: unchanged files and data reused inside transferred files |
 | `deletions_planned` | `int` or `None` | Entries selected for pruning |
 | `deletions_completed` | `int` or `None` | Entries pruned |
 | `deletions_blocked` | `int` or `None` | Pruning deletions blocked by a safety limit |

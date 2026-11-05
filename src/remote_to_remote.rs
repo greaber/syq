@@ -554,6 +554,9 @@ fn print_summary(terminal: &serde_json::Value) {
                         .collect()
                 }),
         },
+        // The coordinator's results do not separate data reused inside
+        // transferred files from unchanged files.
+        None,
         elapsed_ms as f64 / 1000.0,
         &deletions,
     );

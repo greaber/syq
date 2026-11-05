@@ -955,9 +955,16 @@ exec /bin/sh -c "$1""#,
         );
         assert_eq!(final_progress["timings"], terminal["timings"]);
         let stdout = String::from_utf8_lossy(&output.stdout);
+        // The timing line shows setup until file work began: the initial
+        // connection, without installation or anything after it.
+        let shown = stdout
+            .split_once("timing: setup ")
+            .and_then(|(_, rest)| rest.split_once('s'))
+            .and_then(|(seconds, _)| seconds.parse::<f64>().ok())
+            .unwrap_or_else(|| panic!("no timing line: {stdout}"));
         assert!(
-            stdout.contains(&format!("timing: setup {:.3}s", setup as f64 / 1000.0)),
-            "{stdout}"
+            shown >= 0.9 && shown <= setup as f64 / 1000.0,
+            "{stdout}{terminal}"
         );
         let duration = format!("{}:{:02}", transfer / 60_000, transfer / 1000 % 60);
         assert!(stdout.contains(&format!(", {duration} at ")), "{stdout}");

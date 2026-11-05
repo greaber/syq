@@ -1929,3 +1929,87 @@ fn a_rejected_login_waits_longer_each_time_up_to_ten_minutes() {
         ["0 s", "1 s", "30 s", "119 s", "2 min", "3 min"]
     );
 }
+
+/// An approved source reached without SSH has no fallback when TCP fails,
+/// so its route probes wait the most rather than a few round trips.
+#[test]
+fn an_approved_source_without_ssh_waits_the_full_probe_time() {
+    let directory = crate::test_support::tempdir().unwrap();
+    let mut args = args(directory.path(), "target");
+    args.locations[0].host = Some("source".into());
+    args.locations.last_mut().unwrap().host = None;
+    let (control, _peer) = UnixStream::pair().unwrap();
+    args.return_source = Some(ReturnConnection::source(control, "source".into()).unwrap());
+    let crate::conn::Endpoint::Remote(source) =
+        crate::transfer::endpoint(&args.locations[0], &args).unwrap()
+    else {
+        panic!("source must remain remote");
+    };
+    let fast = Some(Duration::from_millis(1));
+    assert_eq!(
+        source.route_probe_wait(fast),
+        crate::conn::TCP_PROBE_CEILING
+    );
+    let ordinary = crate::conn::RemoteSpec::local_receiver(true);
+    assert_eq!(
+        ordinary.route_probe_wait(fast),
+        crate::conn::TCP_PROBE_FLOOR
+    );
+}
+
+/// When the receiving machine's probe of a named route reaches none of the
+/// coordinator's addresses, it answers with no route rather than an error,
+/// so the coordinator says the copy falls back as it does on any route. It
+/// waits only as long as the coordinator asks.
+#[test]
+fn a_named_route_probe_that_reaches_nothing_answers_with_no_route() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
+    let (command, request, _) = requested(Path::new("source"), &["--no-compress"]);
+    let approved = approve(&registration, command, request);
+    let mut spec = crate::conn::RemoteSpec::local_receiver(true);
+    spec.restricted_grant = Some(route(registration, approved.token));
+    let _control = spec.connect_with(false, false).unwrap();
+    // Opening the control channel measured the round trip that bounds the
+    // receiving machine's probes, rather than leaving them the full second.
+    assert!(spec.diagnostics().route_round_trip.is_some());
+    // On Linux a listener whose accept queue is full drops new connections
+    // without answering; elsewhere a closed port refuses them.
+    #[cfg(target_os = "linux")]
+    let (port, _held) = {
+        use socket2::{Domain, Socket, Type};
+        let listener = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        listener
+            .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .unwrap();
+        listener.listen(0).unwrap();
+        let address = listener.local_addr().unwrap().as_socket().unwrap();
+        let queued =
+            std::net::TcpStream::connect_timeout(&address, Duration::from_secs(10)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        (address.port(), Some((listener, queued)))
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (port, _held) = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        (listener.local_addr().unwrap().port(), None::<()>)
+    };
+    let started = Instant::now();
+    let candidates = tcp::probe(
+        spec.restricted_grant.as_deref().unwrap(),
+        port,
+        (0, 0),
+        vec![("127.0.0.1".into(), 0)],
+        None,
+        crate::conn::TCP_PROBE_FLOOR,
+    )
+    .unwrap();
+    let elapsed = started.elapsed();
+    receiver.revoke_all();
+    assert!(
+        candidates.iter().all(|candidate| !candidate.selected),
+        "{candidates:?}"
+    );
+    assert!(elapsed < Duration::from_millis(800), "{elapsed:?}");
+}

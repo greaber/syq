@@ -3182,8 +3182,10 @@ impl Worker {
 
     pub(super) fn complete_file(&self, job: WorkerJob, matched: bool) -> Result<()> {
         if matched {
+            // Every byte of a matched file was counted as unchanged.
             self.progress.files_total.fetch_sub(1, Relaxed);
             self.progress.files_unchanged.fetch_add(1, Relaxed);
+            self.progress.add_unchanged_file_bytes(job.entry.size);
         } else {
             self.progress.add_files(1);
             self.note_replaced(&job);
@@ -3349,6 +3351,7 @@ impl Worker {
             self.progress
                 .bytes_unchanged
                 .fetch_add(job.entry.size, Relaxed);
+            self.progress.add_unchanged_file_bytes(job.entry.size);
             let destination = job
                 .dst_entry
                 .as_ref()

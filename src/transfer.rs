@@ -1497,6 +1497,7 @@ fn attempt_small_copy(
         ) {
             progress.files_unchanged.fetch_add(1, Relaxed);
             progress.bytes_unchanged.fetch_add(entry.size, Relaxed);
+            progress.add_unchanged_file_bytes(entry.size);
             let listing = kept_small_file_listing(&result);
             if let Some(error) = result.error {
                 let error = endpoint_error(error);
@@ -1630,7 +1631,7 @@ fn attempt_small_copy(
     };
     let elapsed = progress.display_elapsed().as_secs_f64();
     if !args.quiet && !args.suppress_summary {
-        print_transfer_summary(&terminal, elapsed, "");
+        print_transfer_summary(&terminal, Some(progress.bytes_reused()), elapsed, "");
     }
     print_timings(args, progress);
     if let Some(benchmark) = &opts.benchmark {
@@ -1682,10 +1683,13 @@ fn print_timings(args: &Args, progress: &Progress) {
             .filter(|ms| *ms > 0)
             .map(|ms| format!(" · helper install {:.3}s", ms as f64 / 1000.0))
             .unwrap_or_default();
+        // Setup here is the wait before file work began. Connections the
+        // tuner adds while copying belong to the transfer.
         crate::output::human_stdout!(
             "  timing: setup {:.3}s · planning {:.3}s · transfer {:.3}s · finalization {:.3}s · total {:.3}s{}",
-            seconds(t.setup_ms), seconds(t.planning_ms), seconds(t.transfer_ms),
-            seconds(t.finalization_ms), t.total_ms as f64 / 1000.0, install
+            seconds(Some(progress.setup_before_transfer_ms())), seconds(t.planning_ms),
+            seconds(t.transfer_ms), seconds(t.finalization_ms), t.total_ms as f64 / 1000.0,
+            install
         );
     }
 }
@@ -1712,7 +1716,9 @@ fn print_statistics(opts: &Opts, progress: &Progress, connections: &str, tcp_sta
                 "files to transfer",
                 "files unchanged",
                 "bytes transferred",
-                "bytes unchanged",
+                // Like `bytes_unchanged`, also data reused inside
+                // transferred files.
+                "bytes unchanged or reused",
                 progress.bytes_done.load(Relaxed),
             )
         };
@@ -1759,19 +1765,47 @@ pub(crate) fn in_place_refusal_summary(
     })
 }
 
+/// The transferred and unchanged parts of the summary line. `bytes_unchanged`
+/// also counts data reused inside transferred files; that part is shown with
+/// them, so "unchanged" covers only files left alone. `reused` is None when
+/// only the results are known; with no unchanged files, all of it was reused.
+fn transfer_summary_counts(terminal: &crate::results::ResultRecord, reused: Option<u64>) -> String {
+    let reused = reused.or((terminal.files_unchanged == 0).then_some(terminal.bytes_unchanged));
+    let Some(reused) = reused.map(|reused| reused.min(terminal.bytes_unchanged)) else {
+        return format!(
+            "transferred {} files ({}), {} unchanged or reused ({} files unchanged)",
+            commas(terminal.files_transferred),
+            human(terminal.bytes_transferred),
+            human(terminal.bytes_unchanged),
+            commas(terminal.files_unchanged),
+        );
+    };
+    let reused_note = if reused > 0 {
+        format!(", plus {} reused", human(reused))
+    } else {
+        String::new()
+    };
+    format!(
+        "transferred {} files ({}{reused_note}), {} unchanged ({} files)",
+        commas(terminal.files_transferred),
+        human(terminal.bytes_transferred),
+        human(terminal.bytes_unchanged - reused),
+        commas(terminal.files_unchanged),
+    )
+}
+
 /// The one summary line a completed copy prints, rendered from the same
-/// record the results stream settles with.
+/// record the results stream settles with, and the data reused inside
+/// transferred files when this process counted it.
 pub(crate) fn print_transfer_summary(
     terminal: &crate::results::ResultRecord,
+    reused: Option<u64>,
     elapsed: f64,
     deletions: &str,
 ) {
     crate::output::human_stdout!(
-        "syq: transferred {} files ({}), {} unchanged ({} files), {} dirs created{}{}{}",
-        commas(terminal.files_transferred),
-        human(terminal.bytes_transferred),
-        human(terminal.bytes_unchanged),
-        commas(terminal.files_unchanged),
+        "syq: {}, {} dirs created{}{}{}",
+        transfer_summary_counts(terminal, reused),
         commas(terminal.directories_created),
         deletions,
         format_args!(
@@ -1848,7 +1882,22 @@ fn handle_tcp_setup_error(
     if !args.quiet || debug() {
         let congestion_note =
             crate::conn::tcp_congestion_fallback_note(args.tcp_congestion.as_deref());
-        if args.verbose >= 2 || debug() {
+        if let Some(route) = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::conn::NoTcpRoute>())
+        {
+            if first_tcp_fallback_notice(&spec.label()) {
+                crate::output::diagnostic!(
+                    "syq: {}{congestion_note}",
+                    no_tcp_route_notice(
+                        &spec.label(),
+                        route,
+                        interface_option(args, "--no-tcp", "--syq-no-tcp"),
+                        args.dry_run
+                    )
+                );
+            }
+        } else if args.verbose >= 2 || debug() {
             crate::output::diagnostic!(
                 "syq: {}: data over ssh (TCP ports {}-{} not reachable: {error:#}{congestion_note})",
                 spec.label(),
@@ -1860,6 +1909,41 @@ fn handle_tcp_setup_error(
         }
     }
     Ok(())
+}
+
+/// Whether this process has not yet said that data to `label` falls back to
+/// SSH because TCP did not get through. A copy says so once per host.
+fn first_tcp_fallback_notice(label: &str) -> bool {
+    static SHOWN: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    SHOWN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(label.to_owned())
+}
+
+/// Say plainly that file data goes over SSH because no data address accepted
+/// a TCP connection, and how to skip trying when TCP never works there.
+fn no_tcp_route_notice(
+    label: &str,
+    route: &crate::conn::NoTcpRoute,
+    no_tcp: &str,
+    dry_run: bool,
+) -> String {
+    let sending = if dry_run {
+        "a copy would send file data over SSH instead"
+    } else {
+        "sending file data over SSH instead"
+    };
+    match route.unanswered_after {
+        Some(wait) => format!(
+            "{label}: no answer over TCP within {:.2}s; {sending}, which can be slower. If TCP never works with this host, {no_tcp} skips the wait",
+            wait.as_secs_f64()
+        ),
+        None => format!(
+            "{label}: TCP connections did not get through; {sending}, which can be slower. If TCP never works with this host, {no_tcp} skips trying it"
+        ),
+    }
 }
 
 fn announce_detached_ready() -> Result<()> {
@@ -5197,6 +5281,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         } else {
             print_transfer_summary(
                 &terminal,
+                Some(progress.bytes_reused()),
                 elapsed,
                 &deletion_summary(
                     delete_plan,

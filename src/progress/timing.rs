@@ -108,6 +108,15 @@ impl Clock {
         let _ = self.end.set(Instant::now());
     }
 
+    /// Setup that elapsed before file work began at `transfer_start`, or
+    /// before the end without file work. Data connections opened while files
+    /// were already copying are left out; `setup_ms` keeps them.
+    pub fn setup_before(&self, start: Instant, transfer_start: Option<Instant>) -> Duration {
+        let end = self.end.get().copied().unwrap_or_else(Instant::now);
+        let until = transfer_start.map_or(end, |transfer_start| transfer_start.min(end));
+        duration(&self.setup.spans(start, until))
+    }
+
     pub fn snapshot(&self, start: Instant, transfer: Option<Duration>) -> Timings {
         let end = self.end.get().copied().unwrap_or_else(Instant::now);
         let mut timings = Timings {
@@ -183,6 +192,33 @@ mod tests {
         assert_eq!(measured.transfer_ms, Some(20_000));
         assert_eq!(measured.finalization_ms, Some(2_000));
         assert_eq!(clock.snapshot(origin, None).total_ms, 50_000);
+    }
+
+    #[test]
+    fn setup_before_file_work_leaves_out_connections_added_while_copying() {
+        let origin = Instant::now() - Duration::from_secs(60);
+        let at = |n| origin + Duration::from_secs(n);
+        let clock = Clock::default();
+        // Control connection and first workers, then file work at 6, then
+        // workers the tuner added while copying.
+        for span in [
+            (at(0), at(4)),
+            (at(3), at(7)),
+            (at(10), at(12)),
+            (at(20), at(29)),
+        ] {
+            clock.setup.record(span);
+        }
+        clock.end.set(at(30)).unwrap();
+        assert_eq!(
+            clock.setup_before(origin, Some(at(6))),
+            Duration::from_secs(6)
+        );
+        // The results keep every connection's setup.
+        let measured = clock.snapshot(origin, Some(Duration::from_secs(24)));
+        assert_eq!(measured.setup_ms, Some(18_000));
+        // Without file work, setup runs to the end.
+        assert_eq!(clock.setup_before(origin, None), Duration::from_secs(18));
     }
 
     #[test]

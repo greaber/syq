@@ -1219,6 +1219,7 @@ impl Worker {
         self.progress.bytes_total.fetch_sub(job.entry.size, Relaxed);
         self.progress.files_total.fetch_sub(1, Relaxed);
         self.progress.files_unchanged.fetch_add(1, Relaxed);
+        self.progress.add_unchanged_file_bytes(job.entry.size);
         Ok(())
     }
 }

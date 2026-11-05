@@ -755,14 +755,20 @@ fn read_spec(control: &Path) -> Result<ServiceSpec> {
     Ok(spec)
 }
 
-/// Called after a successful ordinary persistent SSH control connection. A
+/// Called after a successful ordinary persistent SSH control connection to
+/// start receiving through this endpoint when enabled and not running. A
 /// failed return setup is visible but does not invalidate that ordinary copy.
-pub(crate) fn ensure(domain: &Domain, control: &Path, remote: &crate::conn::RemoteSpec) {
-    if let Err(error) = ensure_inner(domain, control, remote, Retry::IfDue) {
-        crate::output::diagnostic!(
-            "syq: background receiving through {}: {error:#}",
-            remote.label()
-        );
+/// Returns whether this call started a service process.
+pub(crate) fn ensure(domain: &Domain, control: &Path, remote: &crate::conn::RemoteSpec) -> bool {
+    match ensure_inner(domain, control, remote, Retry::IfDue) {
+        Ok(receiving) => receiving == Receiving::Started,
+        Err(error) => {
+            crate::output::diagnostic!(
+                "syq: background receiving through {}: {error:#}",
+                remote.label()
+            );
+            false
+        }
     }
 }
 /// Return readiness for one owned endpoint; do not restart a healthy service.
@@ -772,7 +778,7 @@ pub(crate) fn ensure_ready(
     remote: &crate::conn::RemoteSpec,
     timeout: Duration,
 ) -> Result<Option<Vec<String>>> {
-    if !ensure_inner(domain, control, remote, Retry::Now)? {
+    if ensure_inner(domain, control, remote, Retry::Now)? == Receiving::Off {
         return Ok(None);
     }
     let deadline = Instant::now() + timeout;
@@ -848,6 +854,15 @@ pub(crate) fn profile_names(domain: &Domain) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Whether receiving through an endpoint is on, and whether starting it
+/// took a new service process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Receiving {
+    Off,
+    Running,
+    Started,
+}
+
 /// `retry` is what to do with a failed connection to this server: what a
 /// command connecting to it asks (`Retry::IfDue`), or `persist connect`
 /// (`Retry::Now`).
@@ -856,7 +871,7 @@ fn ensure_inner(
     control: &Path,
     remote: &crate::conn::RemoteSpec,
     retry: Retry,
-) -> Result<bool> {
+) -> Result<Receiving> {
     let scope = control.parent().context("persistence scope missing")?;
     crate::persistence::validate_scope(scope)?;
     anyhow::ensure!(
@@ -864,7 +879,7 @@ fn ensure_inner(
         "receiving control belongs to a different persistence domain"
     );
     if !domain.enabled()? {
-        return Ok(false);
+        return Ok(Receiving::Off);
     }
     if scope.join(CLOSING).exists() {
         bail!("persistence scope is closing");
@@ -880,7 +895,7 @@ fn ensure_inner(
             if state.identity != crate::identity::build() {
                 stop_inner(control, false)?;
             } else if running_status(control, retry, ANSWER_TIMEOUT)?.is_some() {
-                return Ok(true);
+                return Ok(Receiving::Running);
             }
         }
     }
@@ -900,10 +915,10 @@ fn ensure_inner(
     // a later preference change can start receiving without another connect.
     atomic_json(&suffixed(control, RECORD), &spec)?;
     if !allowed {
-        return Ok(false);
+        return Ok(Receiving::Off);
     }
     spawn(control)?;
-    Ok(true)
+    Ok(Receiving::Started)
 }
 /// A service process this call started. Its reaper drops the sender once the
 /// process has exited, which it does at once if another service owns the lock.
