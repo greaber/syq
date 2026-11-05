@@ -386,6 +386,21 @@ fn broker_with_max_delete(
     Registration,
     mpsc::Receiver<Prompt>,
 ) {
+    broker_with_limits(root, approval, max_delete, 1000)
+}
+
+/// The same, permitting up to `max_entries` changes per copy.
+fn broker_with_limits(
+    root: &Path,
+    approval: Approval,
+    max_delete: u64,
+    max_entries: u64,
+) -> (
+    PrivateBroker,
+    Arc<Receiver>,
+    Registration,
+    mpsc::Receiver<Prompt>,
+) {
     let (prompts, requests) = mpsc::sync_channel(1);
     let receiver = Arc::new(Receiver {
         tcp_peer: crate::conn::RemoteSpec::local_receiver(false),
@@ -404,7 +419,7 @@ fn broker_with_max_delete(
         root: Some(root.into()),
         secret: random_token().unwrap(),
         max_bytes: 10_000_000,
-        max_entries: 1000,
+        max_entries,
         max_delete,
         approval,
         prompts,
@@ -906,6 +921,112 @@ fn named_copy_with_transport(tcp: bool) {
         fs::read_link(root.join("source/link")).unwrap(),
         Path::new("hello")
     );
+}
+
+/// As many named sources as any copy takes, with names long enough that
+/// their request is several times the size of an ordinary message.
+#[test]
+fn named_copy_takes_1024_sources_with_long_names() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    fs::create_dir(&root).unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap().join("sources");
+    let names: Vec<String> = (0..1024)
+        .map(|i| format!("{i:04}-{}", "n".repeat(95)))
+        .collect();
+    let mut command = vec![b"cp".to_vec()];
+    for name in &names {
+        fs::create_dir_all(base.join(name)).unwrap();
+        command.push(b"--src".to_vec());
+        command.push(base.join(name).into_os_string().into_vec());
+    }
+    for arg in [
+        "--to",
+        "@laptop",
+        "--into",
+        ".",
+        "--tcp-ports",
+        "0-0",
+        "--resource-limits",
+        "workers=2",
+    ] {
+        command.push(arg.as_bytes().to_vec());
+    }
+    let mut args = crate::approval_command::parse(&command).unwrap();
+    let (request, _) = request(&args);
+    let message = serde_json::to_vec(&request).unwrap();
+    assert!(message.len() > 2 * MAX_MESSAGE, "{}", message.len());
+    let (_broker, _receiver, registration, _) =
+        broker_with_limits(&root, Approval::Always, 0, 10_000);
+    let approved = approve(&registration, command, request);
+    args.locations.last_mut().unwrap().host = Some("server".into());
+    args.locations.last_mut().unwrap().path = approved.destination.clone();
+    args.restricted_grant = Some(route(registration, approved.token.clone()));
+    assert_eq!(crate::transfer::run(args).unwrap(), 0);
+    for name in &names {
+        assert!(root.join(name).is_dir(), "{name}");
+    }
+}
+
+/// Before a message is authenticated, its sender decides its size. Only a
+/// few messages larger than an ordinary one are read at once; another is
+/// refused as busy, and an ordinary one is still read.
+#[test]
+fn only_a_few_large_messages_are_read_at_once() {
+    let large = (MAX_MESSAGE as u32 + 1).to_be_bytes();
+    let mut held = Vec::new();
+    for _ in 0..LARGE_MESSAGE_READS {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.write_all(&large).unwrap();
+        let reader = std::thread::spawn(move || read_message::<String>(&mut server).is_ok());
+        held.push((client, reader));
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while LARGE_READS.load(Ordering::Acquire) < LARGE_MESSAGE_READS {
+        assert!(Instant::now() < deadline, "readers never started");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let message = |text: String| {
+        let mut bytes = Vec::new();
+        write_message(&mut bytes, &text).unwrap();
+        bytes
+    };
+    let big = message("x".repeat(MAX_MESSAGE));
+    let error = read_message::<String>(&mut &big[..]).unwrap_err();
+    assert!(format!("{error:#}").contains("busy"), "{error:#}");
+    assert_eq!(
+        read_message::<String>(&mut &message("small".into())[..]).unwrap(),
+        "small"
+    );
+    // A reader that ends gives its place to the next large message.
+    let (client, reader) = held.pop().unwrap();
+    drop(client);
+    assert!(!reader.join().unwrap());
+    assert_eq!(
+        read_message::<String>(&mut &big[..]).unwrap().len(),
+        MAX_MESSAGE
+    );
+    for (client, reader) in held {
+        drop(client);
+        assert!(!reader.join().unwrap());
+    }
+    assert_eq!(LARGE_READS.load(Ordering::Acquire), 0);
+}
+
+/// A large message may take longer to arrive than an ordinary one.
+#[test]
+fn a_large_message_may_arrive_after_the_ordinary_deadline() {
+    let mut bytes = Vec::new();
+    write_message(&mut bytes, &"x".repeat(MAX_MESSAGE)).unwrap();
+    let (mut client, mut server) = UnixStream::pair().unwrap();
+    let reader = std::thread::spawn(move || {
+        read_socket_request::<String>(&mut server, Duration::from_millis(100))
+            .map(|text| text.len())
+    });
+    client.write_all(&bytes[..4]).unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    client.write_all(&bytes[4..]).unwrap();
+    assert_eq!(reader.join().unwrap().unwrap(), MAX_MESSAGE);
 }
 
 /// The receiving machine never runs as root, so a laptop download accepts

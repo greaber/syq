@@ -116,6 +116,95 @@ fn resume_from_partial() {
 
 #[cfg(debug_assertions)]
 #[test]
+fn retry_names_the_earlier_partials_it_leaves() {
+    let t = Tmp::new();
+    let data = prng(6 * 1024 * 1024 + 7, 9);
+    write(&t.path("src/big.bin"), &data);
+    fs::create_dir_all(t.path("dst")).unwrap();
+    let src = t.s("src/big.bin");
+    let dst = t.s("dst/");
+    let args = [
+        "--block-size",
+        "1M",
+        "--resource-limits",
+        "bandwidth=1G",
+        &src,
+        &dst,
+    ];
+    let partial = interrupted_partial(&args, &t.path("dst"));
+    {
+        let f = File::create(&partial).unwrap();
+        (&f).write_all(&data[..data.len() / 2]).unwrap();
+        f.set_len(data.len() as u64).unwrap();
+    }
+    let out = compat_command()
+        .args(args)
+        .arg("--no-progress")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst/big.bin")), data);
+    // The earlier copy's partial stays for other copies, so the retry says
+    // so and how to remove it.
+    assert!(partial.exists());
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("1 file had a partial file from an earlier copy"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("syq clean-partials {}", t.s("dst"))),
+        "{stderr}"
+    );
+
+    // Quiet runs stay quiet.
+    let quiet = compat_command()
+        .args(["-q", "-I"])
+        .args(args)
+        .run()
+        .unwrap();
+    assert_output_ok(&quiet);
+    assert!(!stderr_of(&quiet).contains("clean-partials"), "{quiet:?}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_file_prepared_again_after_a_dropped_connection_finds_no_earlier_partial() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    t.expose_remote_syq();
+    let data = prng(2 * 1024 * 1024 + 7, 11);
+    write(&t.path("src"), &data);
+    let remote = format!("fake:{}", t.s("dst"));
+    let marker = t.path("drop-prepare-once");
+    // The receiver creates this copy's partial, then the connection drops
+    // before its reply. Prepared again over a new connection, the file finds
+    // that partial, which is this copy's own.
+    let out = remote_syq_command(
+        &t,
+        &rsh,
+        &[
+            "-a",
+            "--syq-no-bootstrap",
+            "--block-size=64K",
+            &t.s("src"),
+            &remote,
+        ],
+    )
+    .env("SYQ_TEST_DROP_AFTER_REQUEST", "prepare")
+    .env("SYQ_TEST_DROP_MARKER", &marker)
+    .run()
+    .unwrap();
+    assert_output_ok(&out);
+    assert!(marker.exists());
+    assert_eq!(read(&t.path("dst")), data);
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("connection dropped; reopening"), "{stderr}");
+    assert!(!stderr.contains("from an earlier copy"), "{stderr}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
 fn checksum_toggle_accepts_prior_partial_candidates() {
     let t = Tmp::new();
     let data = prng(6 * 1024 * 1024, 43);

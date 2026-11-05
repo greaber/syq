@@ -1578,3 +1578,15 @@ fn the_coordinator_reads_the_entry_key_and_directive_from_its_input() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn a_coordinator_command_fits_in_one_linux_argument() {
+    assert!(ensure_coordinator_command_fits(128 * 1024 - 1, 1).is_ok());
+    let error = ensure_coordinator_command_fits(128 * 1024, 900).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("names 900 sources, which make its coordinator's command line 128 KiB"),
+        "{error:#}"
+    );
+}

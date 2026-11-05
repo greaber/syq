@@ -2,8 +2,7 @@
 //! by `syq --server` for remote endpoints, so both sides behave identically.
 
 use crate::descriptor_broker::{
-    acquire_descriptor, DescriptorSessionSlot, DescriptorTicket, RegisteredRootId,
-    DEFAULT_MAX_ROOTS,
+    acquire_descriptor, DescriptorSessionSlot, DescriptorTicket, RegisteredRootId, MAX_SOURCE_ROOTS,
 };
 use crate::proto::*;
 use crate::rooted::{
@@ -137,6 +136,16 @@ pub(crate) fn destination_fraction_matches(source: u32, destination: u32) -> boo
         fraction /= 10;
     }
     source / precision == destination / precision
+}
+
+/// What to do instead of naming too many sources in one copy.
+pub(crate) const FEWER_SOURCES: &str = "select their parent directory with --srcs-in and narrow it with --ignore or --where, or split the copy";
+
+/// Why a copy naming more sources than one endpoint session accepts fails.
+fn too_many_sources(count: usize) -> String {
+    format!(
+        "this copy names {count} sources, more than the {MAX_SOURCE_ROOTS} one copy accepts; {FEWER_SOURCES}"
+    )
 }
 
 pub const PARTIAL_MARKER: &str = ".syq-tmp.";
@@ -1290,11 +1299,8 @@ impl FsOps {
         checks: &[DirectoryAncestryCheck],
         access: Option<bool>,
     ) -> Result<Vec<Vec<DirectoryRelation>>> {
-        if checks.len() > DEFAULT_MAX_ROOTS {
-            bail!(
-                "destination ancestry source count ({}) exceeds the endpoint-session limit ({DEFAULT_MAX_ROOTS})",
-                checks.len()
-            );
+        if checks.len() > MAX_SOURCE_ROOTS {
+            bail!(too_many_sources(checks.len()));
         }
         let registered_selection;
         let selection = if let Some(selection) = &self.operator_selection {
@@ -2102,11 +2108,8 @@ impl FsOps {
         if selections.is_empty() {
             bail!("source registration requires at least one selection");
         }
-        if selections.len() > DEFAULT_MAX_ROOTS {
-            bail!(
-                "source root count ({}) exceeds the endpoint-session limit ({DEFAULT_MAX_ROOTS})",
-                selections.len()
-            );
+        if selections.len() > MAX_SOURCE_ROOTS {
+            bail!(too_many_sources(selections.len()));
         }
         base.validate()?;
         require_source_descriptor_capacity(selections.len(), shared_workers, independent_workers)?;
@@ -2322,11 +2325,8 @@ impl FsOps {
         if sources.is_empty() {
             bail!("source worker requires at least one registered root");
         }
-        if sources.len() > DEFAULT_MAX_ROOTS {
-            bail!(
-                "source worker root count ({}) exceeds the endpoint-session limit ({DEFAULT_MAX_ROOTS})",
-                sources.len()
-            );
+        if sources.len() > MAX_SOURCE_ROOTS {
+            bail!(too_many_sources(sources.len()));
         }
         let mut roots = HashMap::with_capacity(sources.len());
         let endpoint_ticket = &sources[0].ticket;

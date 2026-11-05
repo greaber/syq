@@ -521,6 +521,12 @@ mod tests {
             ],
         )
         .unwrap();
+        // OpenSSH before 9.x prints no `host` line in `ssh -G`, so check the
+        // alias as the destination argument instead.
+        assert_eq!(
+            command.get_args().last(),
+            Some(std::ffi::OsStr::new("configured-alias"))
+        );
         let output = command.output().unwrap();
         assert!(
             output.status.success(),
@@ -529,7 +535,6 @@ mod tests {
         );
         let resolved = String::from_utf8(output.stdout).unwrap();
         for line in [
-            "host configured-alias",
             "hostname 192.0.2.8",
             "user approved-user",
             "port 2200",

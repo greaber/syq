@@ -339,6 +339,27 @@ fn commands_a_receiver_cannot_enforce_yield_no_rules() {
     }
 }
 
+#[test]
+fn an_approval_lists_as_many_sources_as_a_copy_takes_with_their_destination() {
+    let home = Path::new(HOME);
+    let names: Vec<String> = (0..1025).map(|i| format!("data-{i:04}")).collect();
+    let command = |count: usize| {
+        let mut args = vec!["cp", "--from", "host-a"];
+        args.extend(names[..count].iter().map(String::as_str));
+        args.extend(["--to", "host-b", "--into", "backup"]);
+        directive(&args)
+    };
+    let (grant, _) = destination_rules(&command(1024), home).unwrap();
+    assert_eq!(grant.copy.mutation_scopes.len(), 1025);
+    let error = destination_rules(&command(1025), home).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("this copy names 1025 sources, more than the 1024 its approval can list"),
+        "{message}"
+    );
+    assert!(message.contains("--srcs-in"), "{message}");
+}
+
 /// The rules a checker derives depend on the signed command alone, not on
 /// its environment, its working directory, its locale or options from its
 /// environment.

@@ -2113,3 +2113,105 @@ fn delete_many_roots_keeps_claims_in_their_own_scope() {
         }
     }
 }
+
+#[test]
+fn copy_accepts_hundreds_of_source_selectors() {
+    // A shell glob over a large directory easily names more than the 256
+    // sources one endpoint session used to accept. Mix directories with
+    // files, which the session registers through their parents.
+    let t = Tmp::new();
+    let mut names = Vec::new();
+    for i in 0..200 {
+        let name = format!("dir-{i:03}");
+        write(&t.path(&format!("src/{name}/file")), name.as_bytes());
+        names.push(name);
+    }
+    for i in 0..120 {
+        let name = format!("file-{i:03}");
+        write(&t.path(&format!("src/{name}")), name.as_bytes());
+        names.push(name);
+    }
+    let base = t.s("src");
+    let destination = t.s("dst");
+    let mut args = vec!["cp", "--cwd", base.as_str()];
+    args.extend(names.iter().map(String::as_str));
+    args.extend(["--into", destination.as_str()]);
+    let output = native_syq(&args);
+    assert_output_ok(&output);
+    for i in 0..200 {
+        let name = format!("dir-{i:03}");
+        assert_eq!(read(&t.path(&format!("dst/{name}/file"))), name.as_bytes());
+    }
+    for i in 0..120 {
+        let name = format!("file-{i:03}");
+        assert_eq!(read(&t.path(&format!("dst/{name}"))), name.as_bytes());
+    }
+}
+
+#[test]
+fn too_many_source_selectors_fail_with_advice_in_the_results() {
+    let t = Tmp::new();
+    let names: Vec<String> = (0..1025).map(|i| format!("dir-{i:04}")).collect();
+    for name in &names {
+        fs::create_dir_all(t.path(&format!("src/{name}"))).unwrap();
+    }
+    let base = t.s("src");
+    let destination = t.s("dst");
+    let results = t.s("run.ndjson");
+    let mut args = vec!["cp", "--cwd", base.as_str()];
+    args.extend(names.iter().map(String::as_str));
+    args.extend([
+        "--into",
+        destination.as_str(),
+        "--results",
+        results.as_str(),
+    ]);
+    let output = native_syq(&args);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let advice = "this copy names 1025 sources, more than the 1024 one copy accepts";
+    assert!(stderr_of(&output).contains(advice), "{output:?}");
+    assert!(stderr_of(&output).contains("--srcs-in"), "{output:?}");
+    let records: Vec<serde_json::Value> = String::from_utf8(read(&t.path("run.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let errors: Vec<_> = records
+        .iter()
+        .filter(|record| record["type"] == "error")
+        .collect();
+    assert_eq!(errors.len(), 1, "{records:?}");
+    assert!(errors[0]["message"].as_str().unwrap().contains(advice));
+    let last = records.last().unwrap();
+    assert_eq!(
+        (&last["status"], &last["errors"]),
+        (&"failed".into(), &1.into())
+    );
+    assert!(!t.path("dst").exists());
+}
+
+#[test]
+fn prune_with_too_many_long_source_names_fails_with_advice() {
+    // Pruning checks every named source against every other in one request,
+    // whose size grows with the square of their number and with their names.
+    let t = Tmp::new();
+    let names: Vec<String> = (0..320)
+        .map(|i| format!("dir-{i:03}-{}", "x".repeat(92)))
+        .collect();
+    for name in &names {
+        fs::create_dir_all(t.path(&format!("src/{name}"))).unwrap();
+    }
+    let base = t.s("src");
+    let destination = t.s("dst");
+    let mut args = vec!["cp", "--prune", "--cwd", base.as_str()];
+    args.extend(names.iter().map(String::as_str));
+    args.extend(["--into", destination.as_str()]);
+    let output = native_syq(&args);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("this copy names 320 sources, more than --prune can check at once"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--srcs-in"), "{stderr}");
+}

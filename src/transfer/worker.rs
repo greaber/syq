@@ -1907,23 +1907,36 @@ impl Worker {
         // The receiver creates an in-place file in its final mode and a
         // sidecar in its staged mode, the final bits, unless a group change
         // or an ACL keeps either private until finalize.
-        let reply = change_ok(
-            self.dst.call(Request::Prepare {
-                path: job.dst.clone(),
-                size: job.entry.size,
-                inplace: job.inplace,
-                copy_id: self.copy_id(),
-                mode: self.create_mode(job),
-                flags: self.publication_flags(job),
-                acl: crate::fsops::has_acl(job.entry.inode_metadata.as_deref()),
-                scanned: job.scanned,
-                attempt: job.attempt,
-                create_if_missing,
-                group: self.publication_group(job),
-                update: self.in_place_update(job),
-            })?,
-            "prepare",
-        );
+        let sent = self.dst.call(Request::Prepare {
+            path: job.dst.clone(),
+            size: job.entry.size,
+            inplace: job.inplace,
+            copy_id: self.copy_id(),
+            mode: self.create_mode(job),
+            flags: self.publication_flags(job),
+            acl: crate::fsops::has_acl(job.entry.inode_metadata.as_deref()),
+            scanned: job.scanned,
+            attempt: job.attempt,
+            create_if_missing,
+            group: self.publication_group(job),
+            update: self.in_place_update(job),
+        });
+        // Only a file's first preparation tells an earlier copy's partials
+        // from this copy's own: one repeated after a dropped connection or a
+        // source change can find the partial this copy made. A first
+        // preparation whose reply was lost counts as finding none.
+        let first = self.sched.jobs.lock().unwrap().first_preparation(idx);
+        if first
+            && job.attempt == 0
+            && matches!(&sent, Ok(Response::Prepared(prepared)) if prepared.has_candidates)
+        {
+            self.progress
+                .earlier_partials
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(idx);
+        }
+        let reply = change_ok(sent?, "prepare");
         // A restricted receiver now holds the file unfinished, unless the
         // preparation only looked and found nothing of it, as the receiver
         // judges.
