@@ -130,7 +130,7 @@ with tempfile.TemporaryDirectory(prefix="syq-profiles-") as directory:
     processes.append(mapped)
     request = pending(1)[0]
     assert request["warnings"] == [
-        "can use its mapping file to make the files it lists readable by others, "
+        "can use its mapping file to make the files it lists readable or writable by others, "
         "create programs that run as you, or give them to any group you belong to"], request
     receive("deny", request["id"])
     finish(mapped, success=False)

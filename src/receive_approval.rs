@@ -179,7 +179,10 @@ pub(crate) enum Details {
         preserve_permissions: bool,
         /// What the server could do with the requested options or its
         /// mapping file that a copy of plain files cannot, each completing
-        /// "The server ...". Absent from requests stored by earlier releases.
+        /// "The server ...". Absent when there is nothing to warn about,
+        /// unless the copy preserves permissions: then an empty list tells
+        /// this request from one stored by an earlier release, which had no
+        /// list and shows the permissions warning.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         warnings: Option<Vec<String>>,
     },
@@ -573,7 +576,7 @@ fn copy_notes(request: &crate::destination::CopyRequest, remote: bool) -> Vec<St
 }
 
 const PERMISSIONS_WARNING: &str =
-    "can make files readable by others or create programs that run as you";
+    "can make files readable or writable by others or create programs that run as you";
 
 /// The warning for `--in-place=update`, shown first.
 const UPDATE_IN_PLACE_WARNING: &str = "can write new contents into your existing files in place, where anyone who already has one open can read them, and an interruption leaves a file partly updated";
@@ -591,8 +594,8 @@ fn mapping_warning(request: &crate::destination::CopyRequest) -> Option<&'static
     request.constraints.mapping.as_ref()?;
     let options = &request.copy.options;
     match (options.preserve_permissions, options.preserve_group) {
-        (false, false) => Some("can use its mapping file to make the files it lists readable by others, create programs that run as you, or give them to any group you belong to"),
-        (false, true) => Some("can use its mapping file to make the files it lists readable by others or create programs that run as you"),
+        (false, false) => Some("can use its mapping file to make the files it lists readable or writable by others, create programs that run as you, or give them to any group you belong to"),
+        (false, true) => Some("can use its mapping file to make the files it lists readable or writable by others or create programs that run as you"),
         (true, false) => Some("can use its mapping file to give the files it lists to any group you belong to"),
         (true, true) => None,
     }
@@ -1728,7 +1731,7 @@ mod tests {
         request.copy.policy.publication = crate::delegation::PublicationPolicy::InPlaceNew;
         let warnings = [
             "can delete up to 4 files or folders anywhere in the destination",
-            "can make files readable by others or create programs that run as you",
+            "can make files readable or writable by others or create programs that run as you",
             "can give files to any group you belong to",
             "can give other users access to files",
             "can set extended attributes, which some programs act on",
@@ -1825,7 +1828,7 @@ mod tests {
         warnings
     }
 
-    const MAPPING_WARNING: &str = "can use its mapping file to make the files it lists readable by others, create programs that run as you, or give them to any group you belong to";
+    const MAPPING_WARNING: &str = "can use its mapping file to make the files it lists readable or writable by others, create programs that run as you, or give them to any group you belong to";
 
     /// A server's mapping file can set the permissions, set-ID bits
     /// included, and the group of the files it lists without the matching
@@ -1875,7 +1878,7 @@ mod tests {
             warnings(&request),
             [
                 "can give files to any group you belong to",
-                "can use its mapping file to make the files it lists readable by others or create programs that run as you",
+                "can use its mapping file to make the files it lists readable or writable by others or create programs that run as you",
             ]
         );
         // A preview changes nothing.

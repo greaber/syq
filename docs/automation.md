@@ -330,8 +330,7 @@ depend on the request:
 `warnings` lists what a copy lets the server do beyond copying plain files, as
 display text that completes "The server …", for example
 `can delete up to 3 files or folders anywhere in the destination`. It is absent
-when there is nothing to warn about, except that a dry run with
-`--copy-metadata=permissions` has an empty list.
+or empty when there is nothing to warn about.
 
 `account` contains `profile`, `source`, and `destination`. Each account
 identity has an `endpoint`, trusted SHA256 fingerprints in `host_keys`, and an
