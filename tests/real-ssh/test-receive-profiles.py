@@ -116,6 +116,25 @@ with tempfile.TemporaryDirectory(prefix="syq-profiles-") as directory:
     finish(escaped, success=False)
     assert not (root / "escape").exists()
 
+    print("case: a server's mapping file warns of what it can set", flush=True)
+    # The server reads the mapping; only its digest reaches the laptop.
+    mapping = "/tmp/syq-real-ssh-receive-mapping.ndjson"
+    entry = json.dumps({"src": {"encoding": "utf-8", "value": "message.txt"},
+                        "dst": {"encoding": "utf-8", "value": "message.txt"},
+                        "metadata": {"mode": 0o4755}}) + "\n"
+    run("ssh", "source", shlex.join(["python3", "-c", f"open({mapping!r}, 'w').write({entry!r})"]))
+    mapped = subprocess.Popen(["ssh", "source", shlex.join([
+        "syq", "cp", "-C", "/tmp/syq-real-ssh/return-source", "--mapping", mapping,
+        "--to", "@laptop", "--into", "mapped"])],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    processes.append(mapped)
+    request = pending(1)[0]
+    assert request["warnings"] == [
+        "can use its mapping file to make the files it lists readable by others, "
+        "create programs that run as you, or give them to any group you belong to"], request
+    receive("deny", request["id"])
+    finish(mapped, success=False)
+
     print("case: scoped automatic downloads and server restrictions", flush=True)
     inbox = root / "inbox"
     inbox.mkdir()

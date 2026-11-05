@@ -5,8 +5,8 @@
 //! derives the rules from it with the same parser and the same functions
 //! below, so what a receiver enforces is what the command says. Facts the
 //! command cannot state travel beside it: the ignore rules and the mapping it
-//! read from files, which only narrow a copy, and the key that encrypts the
-//! destination's results for the copy's initiator.
+//! read from files, and the key that encrypts the destination's results for
+//! the copy's initiator.
 //!
 //! The encoding is canonical postcard behind a fixed header. A receiver
 //! decodes it, encodes it again and requires the same bytes, so there is one
@@ -93,8 +93,9 @@ pub(crate) enum Role {
     Destination,
 }
 
-/// What the command read from files, which a receiver cannot read. Both only
-/// narrow the copy.
+/// What the command read from files, which a receiver cannot read. Ignore
+/// rules only narrow the copy. A mapping limits it to the entries it lists,
+/// and can also set their permissions and group (`mapping::Metadata`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Inputs {
     /// The ordered ignore rules, from `--ignore` and `--ignore-from`.

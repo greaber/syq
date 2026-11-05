@@ -177,9 +177,9 @@ pub(crate) enum Details {
         max_entries: u64,
         max_delete: u64,
         preserve_permissions: bool,
-        /// What the server could do with the requested options that a copy
-        /// of plain files cannot, each completing "The server ...". Absent
-        /// from requests stored by earlier releases.
+        /// What the server could do with the requested options or its
+        /// mapping file that a copy of plain files cannot, each completing
+        /// "The server ...". Absent from requests stored by earlier releases.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         warnings: Option<Vec<String>>,
     },
@@ -578,8 +578,29 @@ const PERMISSIONS_WARNING: &str =
 /// The warning for `--in-place=update`, shown first.
 const UPDATE_IN_PLACE_WARNING: &str = "can write new contents into your existing files in place, where anyone who already has one open can read them, and an interruption leaves a file partly updated";
 
-/// One short line for each requested option that lets the server do more
-/// than copy plain files, each completing "The server ...".
+/// What the server's mapping file can do that the copy's own options do not
+/// already allow. A mapping entry can set the permissions, set-user-ID and
+/// set-group-ID bits included, and the group of the entry it lists without
+/// the matching copy option, and the receiver applies them
+/// (`RestrictedAuthority::mapped_grants`). This machine has only the
+/// mapping's size and digest when it approves, never its contents, so any
+/// mapping warns. Owners and modification times add nothing: approved
+/// copies are never written as root, and every copy that can carry a mapping
+/// already sets modification times from the source, which the server supplies.
+fn mapping_warning(request: &crate::destination::CopyRequest) -> Option<&'static str> {
+    request.constraints.mapping.as_ref()?;
+    let options = &request.copy.options;
+    match (options.preserve_permissions, options.preserve_group) {
+        (false, false) => Some("can use its mapping file to make the files it lists readable by others, create programs that run as you, or give them to any group you belong to"),
+        (false, true) => Some("can use its mapping file to make the files it lists readable by others or create programs that run as you"),
+        (true, false) => Some("can use its mapping file to give the files it lists to any group you belong to"),
+        (true, true) => None,
+    }
+}
+
+/// One short line for each requested option, or the server's mapping file,
+/// that lets the server do more than copy plain files, each completing
+/// "The server ...".
 fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
     let options = &request.copy.options;
     let extra = &request.constraints.extra_options;
@@ -603,6 +624,7 @@ fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
         options
             .preserve_group
             .then(|| "can give files to any group you belong to".to_owned()),
+        mapping_warning(request).map(str::to_owned),
         extra
             .acls
             .then(|| "can give other users access to files".to_owned()),
@@ -1779,6 +1801,192 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// The warnings a copy request shows, checked to read the same in the
+    /// desktop prompt, `persist receive pending`, and its JSON.
+    fn shown_warnings(summary: &Summary) -> Vec<String> {
+        let details = summary.description(&crate::persistence::Domain::default(), str::to_owned);
+        let warnings: Vec<String> = details
+            .lines()
+            .filter_map(|line| line.strip_prefix("The server "))
+            .map(|line| line.strip_suffix('.').unwrap().to_owned())
+            .collect();
+        let desktop = summary.desktop_description(false);
+        for warning in &warnings {
+            assert_eq!(desktop.matches(warning.as_str()).count(), 1, "{desktop}");
+        }
+        let json = serde_json::to_value(summary).unwrap();
+        if warnings.is_empty() {
+            assert!(json.get("warnings").is_none(), "{json}");
+        } else {
+            assert_eq!(json["warnings"], serde_json::json!(warnings), "{json}");
+        }
+        warnings
+    }
+
+    const MAPPING_WARNING: &str = "can use its mapping file to make the files it lists readable by others, create programs that run as you, or give them to any group you belong to";
+
+    /// A server's mapping file can set the permissions, set-ID bits
+    /// included, and the group of the files it lists without the matching
+    /// copy options. This machine sees only the mapping's digest, so any
+    /// mapping warns, of what the copy's options do not already allow.
+    #[test]
+    fn copy_approvals_warn_of_what_the_servers_mapping_can_set() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap().join("data");
+        let mut request = copy_request(&path);
+        let warnings = |request: &crate::destination::CopyRequest| {
+            shown_warnings(&Summary::new(&requester(), &[], "~", request, TIMEOUT, None).unwrap())
+        };
+        let none: [&str; 0] = [];
+        assert_eq!(warnings(&request), none);
+        let entry = r#"{"src":{"encoding":"utf-8","value":"tool"},"dst":{"encoding":"utf-8","value":"tool"}"#;
+        for contents in [
+            format!("{entry}}}\n"),
+            format!("{entry},\"metadata\":{{\"mode\":{}}}}}\n", 0o4755),
+        ] {
+            request.constraints.mapping = Some(crate::mapping::Authorization::from_contents(
+                contents.as_bytes(),
+            ));
+            assert_eq!(warnings(&request), [MAPPING_WARNING]);
+        }
+        // What the options already allow is said once, without the mapping.
+        request.copy.options.preserve_permissions = true;
+        request.copy.options.receiver_managed_modes = false;
+        assert_eq!(
+            warnings(&request),
+            [
+                PERMISSIONS_WARNING,
+                "can use its mapping file to give the files it lists to any group you belong to",
+            ]
+        );
+        request.copy.options.preserve_group = true;
+        assert_eq!(
+            warnings(&request),
+            [
+                PERMISSIONS_WARNING,
+                "can give files to any group you belong to"
+            ]
+        );
+        request.copy.options.preserve_permissions = false;
+        request.copy.options.receiver_managed_modes = true;
+        assert_eq!(
+            warnings(&request),
+            [
+                "can give files to any group you belong to",
+                "can use its mapping file to make the files it lists readable by others or create programs that run as you",
+            ]
+        );
+        // A preview changes nothing.
+        request.copy.options.dry_run = true;
+        assert_eq!(warnings(&request), none);
+    }
+
+    /// Both routes a server's `cp --mapping` takes to an approval here: to
+    /// this machine, and to another server this machine signs for. The server
+    /// reads the mapping, here one that makes a set-user-ID program, and only
+    /// its size and digest arrive with the command.
+    #[test]
+    fn server_mapping_copies_warn_on_both_approval_routes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let temp = crate::test_support::tempdir().unwrap();
+        let mapping = temp.path().join("mapping.ndjson");
+        std::fs::write(
+            &mapping,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "src": {"encoding": "utf-8", "value": "tool"},
+                    "dst": {"encoding": "utf-8", "value": "bin/tool"},
+                    "metadata": {"mode": 0o4755},
+                })
+            ),
+        )
+        .unwrap();
+        let mapping = mapping.to_str().unwrap();
+        let command = |destination: &str| -> Vec<Vec<u8>> {
+            [
+                "cp",
+                "--mapping",
+                mapping,
+                "--to",
+                destination,
+                "--into",
+                "runs",
+            ]
+            .iter()
+            .map(|arg| arg.as_bytes().to_vec())
+            .collect()
+        };
+
+        // To this machine: the request the server builds, which this
+        // machine accepts for its command.
+        let to_laptop = command("@laptop");
+        let argv: Vec<OsString> = to_laptop
+            .iter()
+            .map(|arg| OsString::from_vec(arg.clone()))
+            .collect();
+        let mut args = crate::cli::Args::parse_args(&argv).unwrap();
+        args.normalize();
+        crate::persistence::mark_explicit_scope(&mut args).unwrap();
+        args.read_copy_inputs().unwrap();
+        args.mapping_contents = Some(std::sync::Arc::new(
+            std::sync::Arc::unwrap_or_clone(crate::mapping::load(&args).unwrap()).input,
+        ));
+        let request = crate::restricted::named_request(
+            &args,
+            crate::delegation::GrantConstraints::default().receipt_policy,
+        )
+        .unwrap();
+        crate::approval_command::check_copy(&to_laptop, &request, "laptop").unwrap();
+        let summary = Summary::new(&requester(), &to_laptop, "~", &request, TIMEOUT, None).unwrap();
+        assert_eq!(shown_warnings(&summary), [MAPPING_WARNING]);
+
+        // To another server: the rules that server's receiver will derive,
+        // as the approval previews them.
+        let to_server = command("host-b");
+        let preview = crate::directive::issue(
+            crate::directive::Binding {
+                enrollment: crate::enrollment::EnrollmentId::random(),
+                generation: 1,
+                account: "preview".into(),
+                role: crate::directive::Role::Destination,
+            },
+            to_server.clone(),
+            "~".into(),
+            (
+                crate::directive::Inputs {
+                    ignore: Vec::new(),
+                    mapping: request.constraints.mapping.clone(),
+                },
+                None,
+            ),
+            [1; 32],
+        )
+        .unwrap();
+        let (rules, constraints) =
+            crate::directive::destination_rules(&preview, std::path::Path::new("/home/backup"))
+                .unwrap();
+        let forwarded = crate::destination::CopyRequest {
+            destination: b"runs".to_vec(),
+            copy: rules.copy,
+            constraints,
+        };
+        let summary = Summary::new(
+            &requester(),
+            &to_server,
+            "~",
+            &forwarded,
+            TIMEOUT,
+            Some(Remote {
+                target: "host-b",
+                enrollment: crate::restricted::EnrollmentState::Ready,
+            }),
+        )
+        .unwrap();
+        assert_eq!(shown_warnings(&summary), [MAPPING_WARNING]);
     }
 
     #[test]
