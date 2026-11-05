@@ -535,3 +535,22 @@ fn long_commands_are_shortened_in_desktop_prompts() {
     assert!(short.ends_with("… (full command in syq persist receive pending)"));
     assert!(render(&shown, None, str::to_owned, str::to_owned).ends_with("--to @laptop"));
 }
+
+#[test]
+fn a_command_too_long_for_an_approval_is_refused_with_advice() {
+    let mut command = vec![b"cp".to_vec()];
+    // 1,023 arguments of 255 bytes and their terminators, with "cp", fit.
+    command.extend((0..1023).map(|i| format!("{i:0255}").into_bytes()));
+    let room = MAX_COMMAND_BYTES - command_bytes(&command);
+    command.push(vec![b'x'; room - 1]);
+    assert!(ensure_command_fits(&command, 1024).is_ok());
+    command.last_mut().unwrap().push(b'x');
+    let error = ensure_command_fits(&command, 1024).unwrap_err();
+    assert!(
+        error.to_string().contains(
+            "this copy names 1024 sources, which make its command 257 KiB, more than the 256 KiB its approval can carry"
+        ),
+        "{error:#}"
+    );
+    assert!(error.to_string().contains("--srcs-in"), "{error:#}");
+}

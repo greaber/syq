@@ -5628,9 +5628,12 @@ fn source_initialization_rejects_mismatched_bad_and_excess_roots_atomically() {
     assert!(worker.initialize_sources(&roots).is_err());
     assert!(worker.source_roots.is_empty());
 
-    let excess = vec![roots[0].clone(); DEFAULT_MAX_ROOTS + 1];
+    let excess = vec![roots[0].clone(); MAX_SOURCE_ROOTS + 1];
     let error = worker.initialize_sources(&excess).unwrap_err();
-    assert!(error.to_string().contains("root count"));
+    assert!(
+        error.to_string().contains("sources, more than"),
+        "{error:#}"
+    );
     assert!(worker.source_roots.is_empty());
 }
 

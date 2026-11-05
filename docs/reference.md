@@ -378,7 +378,10 @@ within one machine that copies files whole does not: rerunning it copies those
 files whole again, so their partial files are removed.
 
 Partial files may remain after a successful retry, as can temporary files
-left by a copy that was killed. To remove them:
+left by a copy that was killed. A copy reads the partial files an earlier copy
+left, but does not remove them, since another copy may still be writing one;
+when it finds some, it says how many files had them and how to remove them.
+To remove them:
 
 ```sh
 syq clean-partials --dry-run -v backup
@@ -793,6 +796,25 @@ relative destination paths start.
 Use `--root DIR` instead of `-C DIR` when selections must stay inside that
 directory. Sources must then be relative: `../private` is refused, and even
 with `--follow-src`, symlinks cannot lead outside the root. `-C` permits both.
+
+One copy accepts up to 1,024 named sources, such as the names a shell glob
+expands to. Some copies take fewer:
+
+- A copy a [receiving machine](receive.md) approves carries its whole
+  command in that approval, and the command can be at most 256 KiB. So 1,024
+  named sources fit when the arguments naming them average up to about 250
+  characters.
+- A [copy between two servers](remote-to-remote.md), including a
+  [restricted copy](remote-reference.md#enrollment), passes its named sources
+  to the server that runs it on a command line, unless it runs with
+  `--coordinate-at local`. The command line holds 128 KiB, and each path takes
+  about a third more room there than its length. So 1,024 sources
+  fit when their paths average up to about 90 characters, and 500 when they
+  average up to about 190.
+
+For more, select their parent directory with `--srcs-in` and leave out what
+you don't want with `--ignore` or `--where`, or split the copy. Each named
+source adds to the copy's setup time.
 
 ## Shell pipelines and file descriptors
 

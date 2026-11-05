@@ -696,6 +696,18 @@ fn native_cp_results_fatal_failure_emits_terminal_record() {
     assert_eq!(last["type"], "result");
     assert_eq!(last["status"], "failed");
     assert_eq!(last["exit_code"], 1);
+    // The failure itself is in the stream, counted, before the terminal.
+    let errors: Vec<_> = lines
+        .iter()
+        .filter(|record| record["type"] == "error")
+        .collect();
+    assert_eq!(errors.len(), 1, "{lines:?}");
+    let message = errors[0]["message"].as_str().unwrap();
+    assert!(message.contains("absent"), "{message}");
+    assert_eq!(errors[0]["os_kind"], "not_found");
+    assert_eq!(last["errors"], 1);
+    let stderr = stderr_of(&out);
+    assert_eq!(stderr.matches("absent").count(), 1, "{stderr}");
 }
 
 #[test]

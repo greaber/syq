@@ -1139,10 +1139,20 @@ fn apply_preferences(domain: &Domain, config: &Preferences) -> Result<()> {
     Ok(())
 }
 
+/// The largest control request: a version, flags and one approval decision.
+const MAX_CONTROL_REQUEST: usize = 16 * 1024;
+
+/// Read one control request. The service's loop reads them inline, so each
+/// has 200 ms and a small size, never what a large copy request may take.
 fn read_control_request(client: &mut UnixStream) -> Result<LocalRequest> {
     client.set_nonblocking(false)?;
     client.set_write_timeout(Some(Duration::from_millis(200)))?;
-    crate::destination::read_socket_message(client, Duration::from_millis(200))
+    crate::destination::read_socket_framed(
+        client,
+        Duration::from_millis(200),
+        MAX_CONTROL_REQUEST,
+        "receiving control request",
+    )
 }
 
 fn run(domain: &Domain, control: &Path) -> Result<()> {
@@ -1881,6 +1891,27 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The service reads control requests inline, so one that claims to be
+    /// large, even as large as a copy request may be, is refused at its
+    /// header instead of holding the loop while the rest arrives.
+    #[test]
+    fn an_oversized_control_request_is_refused_at_once() {
+        use std::io::Write as _;
+        for length in [MAX_CONTROL_REQUEST + 1, 4 << 20] {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            client.write_all(&(length as u32).to_be_bytes()).unwrap();
+            let started = Instant::now();
+            let Err(error) = read_control_request(&mut server) else {
+                panic!("an oversized control request of {length} bytes was accepted");
+            };
+            assert!(started.elapsed() < Duration::from_millis(150), "{length}");
+            assert!(
+                format!("{error:#}").contains("invalid receiving control request size"),
+                "{error:#}"
+            );
+        }
+    }
 
     #[test]
     fn removed_connection_flags_report_migration_without_accepting_aliases() {

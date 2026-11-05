@@ -324,6 +324,20 @@ report actual access or decision blockers instead of bypassing them.
 - State the SHA even when nothing changed — "unchanged at `ab12cd3`" is
   the fact the reader needs to route the next step.
 
+## Starting reviews
+
+The implementing or coordinating agent starts reviews and follows them itself
+with `scripts/agent-coordination.py review` (see
+[`scripts/agent-coordination.md`](scripts/agent-coordination.md)). Do not ask
+the user to start reviewers or pass reports between agents; the tool already
+carries reports and later rounds. The default reviewer, Claude Opus 5.5 at
+`xhigh` effort without approval prompts, suits most PRs. For security,
+protocol, authorization or data-integrity changes, and for large PRs, also add
+`--additional-reviewer --reviewer codex` with GPT-6 Astra (the default) or
+GPT-6.1 Sol (`--model gpt-6.1-sol`): a second model occasionally finds
+important issues Opus misses. Lower effort is fine for small or test-only
+changes.
+
 ## Acting on review feedback
 
 Assess every finding and observation on its merits. "Pre-existing", "out of

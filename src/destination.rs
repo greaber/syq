@@ -20,7 +20,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     mpsc, Arc, Mutex,
 };
 use std::time::{Duration, Instant};
@@ -46,7 +46,23 @@ pub(crate) mod tcp;
 const DISCOVERY_VERSION: u16 = 2;
 const VERSION: u16 = 2;
 const REGISTRATION_VERSION: u16 = 3;
+/// The size of an ordinary message, and the most a few small values
+/// carried beside messages may take.
 const MAX_MESSAGE: usize = 256 * 1024;
+/// The largest message: a copy request whose command is as long as a
+/// receiving machine accepts (`approval_command::MAX_COMMAND_BYTES`), which
+/// JSON spells with up to four characters a byte, once in the command and
+/// twice in the request derived from it.
+const MAX_REQUEST_MESSAGE: usize = 4 * 1024 * 1024;
+/// How many messages larger than an ordinary one this process reads at
+/// once. A message is read before its sender is authenticated, so this keeps
+/// what unauthenticated senders can make it hold near what ordinary
+/// messages allow.
+const LARGE_MESSAGE_READS: usize = 4;
+static LARGE_READS: AtomicUsize = AtomicUsize::new(0);
+/// How long a message larger than an ordinary one may take to arrive: a
+/// few megabytes take a slow link longer than an ordinary message's deadline.
+pub(crate) const LARGE_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a registering server waits for the receiving laptop's handshake.
@@ -299,10 +315,50 @@ struct Route {
 }
 
 pub(crate) fn write_message(writer: &mut impl Write, message: &impl Serialize) -> Result<()> {
-    write_framed(writer, message, MAX_MESSAGE, "named destination message")
+    write_framed(
+        writer,
+        message,
+        MAX_REQUEST_MESSAGE,
+        "named destination message",
+    )
 }
 pub(crate) fn read_message<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
-    read_framed(reader, MAX_MESSAGE, "named destination message")
+    read_message_extending(reader, |_| ())
+}
+/// As `read_message`, calling `large` before reading a message larger than
+/// an ordinary one, to give it until `LARGE_MESSAGE_TIMEOUT`.
+pub(crate) fn read_message_extending<R: Read, T: DeserializeOwned>(
+    reader: &mut R,
+    large: impl FnOnce(&mut R),
+) -> Result<T> {
+    let length = read_frame_length(reader, MAX_REQUEST_MESSAGE, "named destination message")?;
+    if length <= MAX_MESSAGE {
+        return read_frame_body(reader, length);
+    }
+    large(reader);
+    let Some(_read) = LargeRead::start() else {
+        // Read the rest without keeping it, so that the sender sees why.
+        std::io::copy(&mut reader.take(length as u64), &mut std::io::sink())?;
+        bail!("busy reading {LARGE_MESSAGE_READS} other large requests; retry");
+    };
+    read_frame_body(reader, length)
+}
+/// One of the `LARGE_MESSAGE_READS` reads of a large message.
+struct LargeRead;
+impl LargeRead {
+    fn start() -> Option<Self> {
+        LARGE_READS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reads| {
+                (reads < LARGE_MESSAGE_READS).then_some(reads + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+impl Drop for LargeRead {
+    fn drop(&mut self) {
+        LARGE_READS.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 /// One JSON value behind a four-byte big-endian length. `what` names the
 /// message in size errors.
@@ -326,12 +382,19 @@ pub(crate) fn read_framed<T: DeserializeOwned>(
     limit: usize,
     what: &str,
 ) -> Result<T> {
+    let length = read_frame_length(reader, limit, what)?;
+    read_frame_body(reader, length)
+}
+fn read_frame_length(reader: &mut impl Read, limit: usize, what: &str) -> Result<usize> {
     let mut length = [0; 4];
     reader.read_exact(&mut length)?;
     let length = u32::from_be_bytes(length) as usize;
     if length == 0 || length > limit {
         bail!("invalid {what} size");
     }
+    Ok(length)
+}
+fn read_frame_body<T: DeserializeOwned>(reader: &mut impl Read, length: usize) -> Result<T> {
     let mut bytes = vec![0; length];
     reader.read_exact(&mut bytes)?;
     Ok(serde_json::from_slice(&bytes)?)
@@ -454,10 +517,39 @@ pub(crate) fn read_socket_message<T: DeserializeOwned>(
     socket: &mut UnixStream,
     timeout: Duration,
 ) -> Result<T> {
-    read_message(&mut DeadlineSocket {
-        socket,
-        deadline: Instant::now() + timeout,
-    })
+    read_socket_framed(socket, timeout, MAX_MESSAGE, "named destination message")
+}
+/// As `read_socket_message`, for a message of at most `limit` bytes.
+pub(crate) fn read_socket_framed<T: DeserializeOwned>(
+    socket: &mut UnixStream,
+    timeout: Duration,
+    limit: usize,
+    what: &str,
+) -> Result<T> {
+    read_framed(
+        &mut DeadlineSocket {
+            socket,
+            deadline: Instant::now() + timeout,
+        },
+        limit,
+        what,
+    )
+}
+/// As `read_socket_message`, for a request that may be as large as a
+/// message can be: one larger than an ordinary message takes one of the
+/// `LARGE_MESSAGE_READS`, and has until `LARGE_MESSAGE_TIMEOUT` to arrive.
+pub(crate) fn read_socket_request<T: DeserializeOwned>(
+    socket: &mut UnixStream,
+    timeout: Duration,
+) -> Result<T> {
+    let started = Instant::now();
+    read_message_extending(
+        &mut DeadlineSocket {
+            socket,
+            deadline: started + timeout,
+        },
+        |reader| reader.deadline = reader.deadline.max(started + LARGE_MESSAGE_TIMEOUT),
+    )
 }
 
 fn connect_socket(
@@ -827,7 +919,7 @@ fn constrain(
     max_delete: u64,
     dry_run_prunes: bool,
 ) -> Result<CopyRequest> {
-    if request.copy.mutation_scopes.len() > 1024 {
+    if request.copy.mutation_scopes.len() > crate::delegation::MAX_MUTATION_SCOPES {
         bail!("too many copy scopes");
     }
     request.copy.destination = rebase(&request.copy.destination, destination)?;
@@ -1048,6 +1140,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     let handoff::Selection {
         name, registration, ..
     } = selection;
+    let command = crate::approval_command::copy_command(args)?;
     let request = crate::restricted::named_request(
         args,
         crate::destination_results::ReceiptPolicy::unused()?,
@@ -1056,7 +1149,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     let (_, reply) = exchange(
         &registration,
         Message::Request {
-            command: crate::approval_command::current()?,
+            command,
             cwd: crate::approval_command::current_directory(),
             request: Box::new(request),
         },
@@ -1206,7 +1299,7 @@ impl Receiver {
 
     fn handle(&self, mut stream: TrackedStream) -> Result<()> {
         let envelope: Envelope =
-            read_socket_message(&mut stream.try_clone()?, Duration::from_secs(10))?;
+            read_socket_request(&mut stream.try_clone()?, Duration::from_secs(10))?;
         let version = if matches!(envelope.message, Message::Ping | Message::Identify { .. }) {
             DISCOVERY_VERSION
         } else {

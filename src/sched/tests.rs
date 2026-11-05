@@ -1443,3 +1443,15 @@ fn a_requeued_probe_never_lets_the_copy_look_finished() {
     };
     assert_eq!(taken, idx);
 }
+
+#[test]
+fn only_a_jobs_first_preparation_is_first() {
+    let mut jobs = Jobs::default();
+    for idx in [0, 63, 64, 1000] {
+        assert!(jobs.first_preparation(idx), "{idx}");
+        assert!(!jobs.first_preparation(idx), "{idx}");
+    }
+    assert!(jobs.first_preparation(1));
+    // One bit per job up to the highest prepared.
+    assert_eq!(jobs.prepared.len(), 1000 / 64 + 1);
+}

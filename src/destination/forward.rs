@@ -173,6 +173,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
         ..
     } = selection;
     let target = target.context("remote authorization target missing")?;
+    let command = crate::approval_command::copy_command(args)?;
     let request = crate::restricted::named_request(
         args,
         crate::destination_results::ReceiptPolicy::unused()?,
@@ -182,7 +183,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
         &registration,
         Message::Forward {
             target,
-            command: crate::approval_command::current()?,
+            command,
             cwd: crate::approval_command::current_directory(),
             request: Box::new(request),
         },
@@ -806,11 +807,15 @@ fn receive() -> Result<i32> {
     let mut input = unsafe { File::from_raw_fd(fd) };
     let setup = (|| {
         crate::restricted::refuse_privileged_approved_receiver()?;
-        let request: HelperRequest = read_message(&mut DeadlineIo {
-            inner: &mut input,
-            deadline: Instant::now() + Duration::from_secs(10),
-            cancelled: None,
-        })?;
+        let started = Instant::now();
+        let request: HelperRequest = read_message_extending(
+            &mut DeadlineIo {
+                inner: &mut input,
+                deadline: started + Duration::from_secs(10),
+                cancelled: None,
+            },
+            |input| input.deadline = started + super::LARGE_MESSAGE_TIMEOUT,
+        )?;
         if request.version != HELPER_VERSION || request.identity != crate::identity::build() {
             bail!("return helper build mismatch");
         }
