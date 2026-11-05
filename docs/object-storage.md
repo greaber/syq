@@ -177,13 +177,11 @@ markers, or `--s3-version-id ID` for one version. Deleting a marker can reveal
 an older version. Preview version deletions with `--dry-run -v`. When deleting
 an exact directory-marker version, keep the trailing `/` in its key.
 
-Tigris's batch delete ignores version IDs, so for endpoints at
-`t3.storage.dev` or under `tigris.dev`, syq deletes versions one at a time,
-which can take longer for large histories. Syq does not recognize Tigris
-behind a custom proxy hostname: permanent version deletion there can leave
-versions intact and add delete markers that hide current objects, and syq
-reports failure. Use a Tigris endpoint for permanent version deletion. To undo
-an unintended deletion, find the markers the failed attempt created in your
-provider's version listing and remove them with `--s3-version-id` through a
-Tigris endpoint, or rerun the original `--s3-all-versions` command there if you
-meant to purge all versions.
+Permanent version deletion on Tigris needs a Tigris endpoint (`t3.storage.dev`
+or under `tigris.dev`) and can take longer for large histories. Syq does not
+recognize Tigris behind a custom proxy hostname: permanent version deletion
+there can leave versions intact and add delete markers that hide current
+objects, and syq reports failure. To undo an unintended deletion, find the
+markers the failed attempt created in your provider's version listing and
+remove them with `--s3-version-id` through a Tigris endpoint, or rerun the
+original `--s3-all-versions` command there if you meant to purge all versions.

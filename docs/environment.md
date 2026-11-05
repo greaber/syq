@@ -42,7 +42,7 @@ SYQ_AUTH_FROM=@laptop ./agent-task.sh
 | `SYQ_NO_UPDATE_CHECK`, `DO_NOT_TRACK` | Disable update reminders; see [Updates](install.md#updates) |
 | `SYQ_TUNING_CACHE` | Base path for tuning history; an empty value turns history off, even when `SYQ_TUNING_HISTORY` is set. See [Remembered connection counts](tuning.md#remembered-connection-counts) |
 | `SYQ_TUNING_HISTORY` | Tuning history file to use instead; empty disables history. See [Tuning history](tuning.md#inspect-tuning-history) |
-| `SYQ_TUNING_HISTORY_SIZE` | History retention target, default `10M` |
+| `SYQ_TUNING_HISTORY_SIZE` | History retention target, default and minimum `10M` |
 | `SYQ_DEBUG` | Add internal diagnostics to stderr |
 | `SYQ_S3_DIAGNOSTICS=1` | Add S3 request diagnostics to stderr |
 | `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR` | Relocate cache, preference, and runtime files, but not [stored releases](#stored-releases-and-helpers); relative values are ignored |

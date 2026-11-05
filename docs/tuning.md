@@ -33,7 +33,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 | `batch-files` | Up to 2048 | 1 through 4096 files per worker batch |
 | `batch-bytes` | 16 MiB | 512 bytes through 64 MiB per worker batch |
 | `split-min-size` | 32 MiB | 1 byte through 1 GiB: the smallest part of a file an idle worker can take over from another |
-| `bw-pacing` | `125ms` | How a nonzero `--resource-limits bandwidth=RATE` paces file data in local, descriptor, and receiver-approved copies: an integer interval from `1ms` through `10s` sends smaller requests at that spacing, and `average` waits for each request's byte budget, which can arrive in bursts. Ordinary SSH and TCP copies ignore it; S3 copies reject it |
+| `bw-pacing` | `125ms` | Requires a nonzero `--resource-limits bandwidth=RATE`. Chooses how local, descriptor, and receiver-approved copies pace file data: an integer interval from `1ms` through `10s` sends smaller requests at that spacing, and `average` waits for each request's byte budget, so data can arrive in bursts. Ordinary SSH and TCP copies ignore it; S3 copies reject it |
 
 Sizes accept `K`, `M`, and `G`, using powers of 1024. Unknown keys, repeated
 keys, and out-of-range values fail the command. Explicit request, block,
@@ -146,8 +146,9 @@ syq cp --srcs-in source --into destination \
   --performance-tuning copy-path=ranges --transfer-strategy whole-file
 ```
 
-Comparison can use up to 64 MiB of destination buffers per worker, so more
-workers use more memory.
+Block reuse saves network traffic, but the destination still writes a complete
+new file unless its filesystem supports reflinks. Comparison can use up to
+64 MiB of destination buffers per worker, so more workers use more memory.
 
 ### Scattered edits in existing files
 
@@ -164,7 +165,9 @@ Both endpoints still read the full file to compare it. In `syq rsync`,
 `-B` / `--block-size` selects the comparison block size; do not combine it
 with `comparison-block-size`.
 
-### Streaming and request windows
+<a id="streaming-and-request-windows"></a>
+
+### Pipeline depth
 
 To compare pipeline depths, hold the worker count and request size fixed:
 

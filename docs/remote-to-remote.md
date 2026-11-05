@@ -68,9 +68,8 @@ changes, and updates. Enrollments made by syq 0.7.1 and earlier do not appear
 in `list`; see [Enrollments from older versions](remote-reference.md#enrollments-from-older-versions)
 to remove them.
 
-Setting up and revoking log in to hostB the way your SSH configuration routes
-`ssh` there. If that cannot connect, a copy started on your machine tries
-again through hostA; for `enroll` or `revoke`, add `--via hostA`.
+If your machine cannot reach hostB, a copy tries again through hostA; for
+`enroll` or `revoke`, add `--via hostA`.
 
 <a id="start-a-copy-from-the-source-server"></a>
 

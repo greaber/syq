@@ -44,7 +44,8 @@ see [deletion rules](reference.md#mirror-a-directory).
 see [timestamp matching](integrity-checking.md#comparison). Use `-c` to compare
 contents when size and timestamp match. `-I` (`--ignore-times`) compares only
 the files block reuse would compare, by default every file in a remote copy,
-and copies the rest whole, so files that already match may be rewritten.
+and copies the rest whole, so files that already match may be rewritten. `-c`
+takes precedence when both are given.
 
 Syq uses numeric IDs and keeps partial files a later copy can resume from (see
 [Resume an interrupted copy](reference.md#resume-an-interrupted-copy)), so
