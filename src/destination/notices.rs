@@ -1,5 +1,11 @@
 //! What a command says when it waits for a receiving machine's approval,
-//! and why `auto` asks one after this machine's own SSH login failed.
+//! why `auto` asks one after this machine's own SSH login failed, and what
+//! to do when a receiving name cannot be used.
+//!
+//! The person reading a receiving-name error is usually on the server, often
+//! an agent working for someone whose laptop is the receiving machine. The
+//! fix runs on that laptop and names this server, so each message says which
+//! machine runs what, and names this server account as a hint for HOST.
 use super::*;
 use crate::agent_socket::Agent;
 use crate::conn::SshLoginFailure;
@@ -20,6 +26,131 @@ pub(super) fn waiting_for_earlier(who: &str, what: &str) {
         "syq: waiting up to {} minutes for another command to finish setting up {what}; if it still needs approval, approve it on {who} in the desktop prompt or with `syq persist receive pending`",
         REQUEST_TIMEOUT.as_secs() / 60
     );
+}
+
+/// This account as someone at a receiving machine might know it, such as
+/// `alice@j5`. Best effort: a part that is unavailable is left out. Only
+/// error messages use it; it is looked up once, since listing several
+/// offline names builds one message for each.
+pub(crate) fn this_account() -> Option<String> {
+    static ACCOUNT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ACCOUNT
+        .get_or_init(|| {
+            let mut buffer = [0u8; 256];
+            let host = (unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) }
+                == 0)
+                .then(|| buffer.iter().position(|byte| *byte == 0))
+                .flatten()
+                .and_then(|end| std::str::from_utf8(&buffer[..end]).ok())
+                .filter(|host| {
+                    !host.is_empty() && host.bytes().all(|byte| byte.is_ascii_graphic())
+                })?;
+            Some(match crate::restricted::current_account_name() {
+                Some(user) => format!("{user}@{host}"),
+                None => host.to_owned(),
+            })
+        })
+        .clone()
+}
+
+/// What the person at `machine` runs to connect it to this server account.
+fn connect_instruction(machine: &str, account: Option<&str>) -> String {
+    format!(
+        "run `syq persist connect HOST` on {machine} (for example your laptop), where HOST is how it reaches this server{}",
+        account
+            .map(|account| format!(" (this server account is {account})"))
+            .unwrap_or_default()
+    )
+}
+
+/// No receiving machine is registered as `@name`; `registered` lists the
+/// names that are. A mistyped or guessed name is the usual cause, so a
+/// registered name comes first, before how to connect another machine.
+pub(super) fn not_connected(name: &str, registered: &[String], account: Option<&str>) -> String {
+    let mut message =
+        format!("no receiving machine named @{name} is connected to this server account");
+    match registered {
+        [] => message.push('.'),
+        [only] => message.push_str(&format!("; did you mean @{only}?")),
+        _ => {
+            let shown = registered
+                .iter()
+                .take(8)
+                .map(|name| format!("@{name}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more = match registered.len() {
+                0..=8 => String::new(),
+                count => format!(", and {} more", count - 8),
+            };
+            message.push_str(&format!(". Names registered here: {shown}{more}."));
+        }
+    }
+    message.push_str(&format!(
+        "\nTo connect a receiving machine, {}. If receiving was never set up there, run `syq persist receive on --connection HOST` there instead.",
+        connect_instruction("it", account)
+    ));
+    message
+}
+
+/// `@name` is registered here, but its connection is gone.
+pub(super) fn offline(name: &str, account: Option<&str>) -> String {
+    format!(
+        "receiving machine @{name} is registered on this server account but not connected; it may have restarted or lost its connection.\nTo reconnect it, {}. Then retry, or release the name with `syq persist destinations forget {name}`.",
+        connect_instruction("that machine", account)
+    )
+}
+
+/// The registered connection did not answer.
+pub(super) fn unreachable(account: Option<&str>) -> String {
+    format!(
+        "could not reach the receiving machine; it may be busy, or its connection may have ended, for example because it restarted. Try again, or {}",
+        connect_instruction("that machine", account)
+    )
+}
+
+/// The registration cannot be used as it is; a new connection replaces it.
+pub(super) fn reconnect(problem: &str, account: Option<&str>) -> String {
+    format!(
+        "{problem}; to reconnect, {}",
+        connect_instruction("the receiving machine", account)
+    )
+}
+
+/// The syq on `@name` is too old for `what`.
+pub(super) fn outdated(name: &str, what: &str, account: Option<&str>) -> String {
+    format!(
+        "the syq connected as @{name} does not support {what}; update syq on that machine, then {}",
+        connect_instruction("it", account)
+    )
+}
+
+/// `syq persist connect @name`: the command runs on the receiving machine
+/// and names the SSH server it connects to.
+pub(crate) fn connect_takes_server(name: &str, account: Option<&str>) -> String {
+    format!(
+        "@{name} is a receiving name, not an SSH server: run `syq persist connect HOST` on the receiving machine itself (for example your laptop), where HOST is the SSH server it should connect to{}",
+        account
+            .map(|account| format!(" (this machine is {account})"))
+            .unwrap_or_default()
+    )
+}
+
+/// A copy from `@name`, which receiving machines do not serve.
+pub(crate) fn copy_from(name: &str, account: Option<&str>) -> String {
+    format!(
+        "cannot copy from receiving machine @{name}: receiving machines accept copies sent to them (`syq cp PATH --to @{name}`) and commands (`syq exec --on @{name} -- COMMAND`).\nTo copy files from that machine to this server, run `syq cp PATH --to HOST` on it, where HOST is how it reaches this server{}.",
+        account
+            .map(|account| format!(" (this server account is {account})"))
+            .unwrap_or_default()
+    )
+}
+
+/// `command` given `@name`, which only copies and commands can use.
+pub(crate) fn unsupported(command: &str, name: &str) -> String {
+    format!(
+        "receiving machine @{name} cannot be used with {command}; receiving machines accept copies sent with `syq cp PATH --to @{name}` and commands run with `syq exec --on @{name} -- COMMAND`"
+    )
 }
 
 /// After this machine's own SSH login to `spec` failed with `error`, say in
@@ -170,6 +301,70 @@ fn classify(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each message says which machine runs the fix and what it names, so
+    /// an agent on the server knows to ask the person at the laptop.
+    #[test]
+    fn receiving_name_errors_say_where_to_run_what() {
+        let account = Some("alice@j5");
+        let connect = "run `syq persist connect HOST` on it (for example your laptop), where HOST is how it reaches this server (this server account is alice@j5)";
+        let none = not_connected("master", &[], account);
+        assert!(
+            none.starts_with(
+                "no receiving machine named @master is connected to this server account.\n"
+            ),
+            "{none}"
+        );
+        assert!(none.contains(connect), "{none}");
+        assert!(
+            none.contains("run `syq persist receive on --connection HOST` there instead"),
+            "{none}"
+        );
+        let one = not_connected("master", &["selaptop".into()], account);
+        assert!(
+            one.starts_with("no receiving machine named @master is connected to this server account; did you mean @selaptop?\n"),
+            "{one}"
+        );
+        let names: Vec<String> = (0..10).map(|n| format!("m{n}")).collect();
+        let many = not_connected("master", &names, account);
+        assert!(
+            many.contains(
+                ". Names registered here: @m0, @m1, @m2, @m3, @m4, @m5, @m6, @m7, and 2 more.\n"
+            ),
+            "{many}"
+        );
+        assert!(!many.contains("did you mean"), "{many}");
+        for message in [&none, &one, &many] {
+            assert!(!message.contains("restarted"), "{message}");
+        }
+        let offline = offline("selaptop", account);
+        assert!(
+            offline.starts_with("receiving machine @selaptop is registered on this server account but not connected; it may have restarted or lost its connection.\nTo reconnect it, run `syq persist connect HOST` on that machine (for example your laptop), where HOST is how it reaches this server (this server account is alice@j5)."),
+            "{offline}"
+        );
+        assert!(
+            offline.ends_with("release the name with `syq persist destinations forget selaptop`."),
+            "{offline}"
+        );
+        assert!(unreachable(account).contains("run `syq persist connect HOST` on that machine (for example your laptop), where HOST is how it reaches this server (this server account is alice@j5)"));
+        assert_eq!(
+            connect_takes_server("master", account),
+            "@master is a receiving name, not an SSH server: run `syq persist connect HOST` on the receiving machine itself (for example your laptop), where HOST is the SSH server it should connect to (this machine is alice@j5)"
+        );
+        assert!(copy_from("master", account).ends_with("run `syq cp PATH --to HOST` on it, where HOST is how it reaches this server (this server account is alice@j5)."));
+        assert!(outdated("selaptop", "syq ssh", account).contains(
+            "update syq on that machine, then run `syq persist connect HOST` on it (for example your laptop)"
+        ));
+        // Without a known account, the hint is simply left out.
+        assert!(not_connected("master", &[], None).contains(
+            "where HOST is how it reaches this server. If receiving was never set up there"
+        ));
+        let here = this_account().expect("this test host has a hostname");
+        assert!(
+            !here.is_empty() && here.bytes().all(|byte| byte.is_ascii_graphic()),
+            "{here:?}"
+        );
+    }
 
     #[test]
     fn credentials_are_absent_only_without_agent_keys_and_key_files() {

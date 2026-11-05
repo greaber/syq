@@ -31,7 +31,7 @@ use crate::private_broker::{PrivateBroker, PrivateBrokerConfig, TrackedStream};
 pub(crate) mod account_copy;
 pub(crate) mod exec;
 mod forward;
-mod notices;
+pub(crate) mod notices;
 pub(crate) use forward::{DeadlineIo, HandshakeInput};
 pub(crate) mod handoff;
 mod identity;
@@ -738,39 +738,41 @@ fn read_existing_registration_at(directory: &Path, name: &str) -> Result<Option<
         };
     let registration: Registration = serde_json::from_slice(&encoded)?;
     if registration.version != REGISTRATION_VERSION {
-        bail!("unsupported destination registration; reconnect from the receiving machine");
+        bail!(notices::reconnect(
+            "unsupported destination registration",
+            notices::this_account().as_deref()
+        ));
     }
     if !Path::new(std::ffi::OsStr::from_bytes(&registration.program)).is_absolute()
         || registration.program.contains(&0)
         || registration.identity.is_empty()
     {
-        bail!("invalid destination helper registration; reconnect from the receiving machine");
+        bail!(notices::reconnect(
+            "invalid destination helper registration",
+            notices::this_account().as_deref()
+        ));
     }
     Ok(Some(registration))
 }
 
 fn read_registration(name: &str) -> Result<Registration> {
-    if let Some(registration) = read_existing_registration(name)
-        .with_context(|| format!("cannot read the registration for @{name}; check its permissions or reconnect from the receiving machine"))?
-    {
+    if let Some(registration) = read_existing_registration(name).with_context(|| {
+        notices::reconnect(
+            &format!("cannot read the registration for @{name}; check its permissions"),
+            notices::this_account().as_deref(),
+        )
+    })? {
         return Ok(registration);
     }
+    let account = notices::this_account();
     if identity::owner(&registry()?, name)?.is_some() {
-        bail!("receiving machine @{name} is offline; reconnect its original receiver with `syq persist connect SERVER`, or release the name on this server with `syq persist destinations forget {name}`");
+        bail!(notices::offline(name, account.as_deref()));
     }
-    let names = registered_names();
-    let advice = if names.is_empty() {
-        "On the receiving machine, run `syq persist connect SERVER`, using the SSH endpoint for this server account.".to_owned()
-    } else {
-        let shown = names
-            .iter()
-            .take(8)
-            .map(|name| format!("@{name}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("Registered names: {shown}{}. Use one of these names, or connect another receiving machine with `syq persist connect SERVER`.", if names.len() > 8 { ", ..." } else { "" })
-    };
-    bail!("no receiving machine named @{name} is registered for this account.\n{advice}\nRun `syq persist destinations list` to see names and connection status.");
+    bail!(notices::not_connected(
+        name,
+        &registered_names(),
+        account.as_deref()
+    ));
 }
 
 fn load_registration(name: &str) -> Result<Registration> {
@@ -789,19 +791,21 @@ fn exchange(
     if !matches!(message, Message::Ping | Message::Identify { .. })
         && registration.identity != crate::identity::build()
     {
-        bail!(
-            "named destination requires its matching helper; reconnect from the receiving machine"
-        );
+        bail!(notices::reconnect(
+            "named destination requires its matching helper",
+            notices::this_account().as_deref()
+        ));
     }
     let deadline = Instant::now() + timeout;
-    let mut stream = connect_socket(&registration.socket, deadline, stream_timeout).map_err(|error| {
-        let message = if error.kind() == std::io::ErrorKind::WouldBlock {
-            "receiving machine is busy; try again shortly"
-        } else {
-            "could not connect to receiving machine; it may be busy or its connection may have ended; try again, or run `syq persist connect SERVER` on the receiving machine to connect to this server account"
-        };
-        anyhow::Error::new(error).context(message)
-    })?;
+    let mut stream =
+        connect_socket(&registration.socket, deadline, stream_timeout).map_err(|error| {
+            let message = if error.kind() == std::io::ErrorKind::WouldBlock {
+                "receiving machine is busy; try again shortly".to_owned()
+            } else {
+                notices::unreachable(notices::this_account().as_deref())
+            };
+            anyhow::Error::new(error).context(message)
+        })?;
     // The initial exchange has its own absolute deadline. stream_timeout
     // controls later I/O without changing socket options after a peer reply.
     let mut io = DeadlineSocket {

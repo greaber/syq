@@ -777,7 +777,7 @@ impl Args {
             }
             bail!("command name is not valid UTF-8");
         };
-        match command {
+        let args = match command {
             "rsync" => Self::parse_rsync(&argv[1..]),
             "cp" => parse_native(&argv[1..], Interface::NativeCp),
             "rm" => parse_native(&argv[1..], Interface::NativeRm),
@@ -805,7 +805,9 @@ impl Args {
             _ => bail!(
                 "unrecognized command or option {command:?}; run `syq --help` for commands and standalone options such as `--self-update`"
             ),
-        }
+        }?;
+        reject_receiving_names(command, &args)?;
+        Ok(args)
     }
 
     fn parse_rsync(argv: &[OsString]) -> Result<Args> {
@@ -825,6 +827,7 @@ impl Args {
         let mut args = Args::from_arg_matches(&matches)?;
         // rsync updates existing files in place.
         args.in_place_update = args.inplace;
+        reject_rsync_receiving_names(&args.paths)?;
         reject_remote_to_remote(&args)?;
         finish_parse(args, &matches)
     }
@@ -1114,6 +1117,47 @@ pub(crate) fn rsync_operator_symlink_policy(insecure_links: bool) -> OperatorSym
     } else {
         OperatorSymlinkPolicy::TrustedOwner
     }
+}
+
+/// A leading `@NAME` is a receiving name, never an SSH login with an empty
+/// user name. Only a native copy's destination can use one; refuse every
+/// other position here, before anything can hand it to ssh.
+fn reject_receiving_names(command: &str, args: &Args) -> Result<()> {
+    use crate::destination::notices;
+    let last = args.locations.len().saturating_sub(1);
+    for (index, location) in args.locations.iter().enumerate() {
+        let Some(name) = location.host.as_deref().and_then(|h| h.strip_prefix('@')) else {
+            continue;
+        };
+        if args.interface != Interface::NativeCp {
+            bail!(notices::unsupported(&format!("syq {command}"), name));
+        }
+        if index != last {
+            bail!(notices::copy_from(name, notices::this_account().as_deref()));
+        }
+    }
+    Ok(())
+}
+
+/// `syq rsync` never uses receiving machines. Explain an `@NAME:PATH`
+/// operand instead of reading it as an SSH login with an empty user name.
+fn reject_rsync_receiving_names(paths: &[String]) -> Result<()> {
+    use crate::destination::notices;
+    for (index, path) in paths.iter().enumerate() {
+        let Some(name) = path
+            .strip_prefix('@')
+            .and_then(|operand| operand.split_once(':'))
+            .map(|(name, _)| name)
+            .filter(|name| crate::destination::validate_name(name).is_ok())
+        else {
+            continue;
+        };
+        if index > 0 && index == paths.len() - 1 {
+            bail!("receiving machine @{name} cannot be used with syq rsync; to copy to it, use `syq cp SOURCE --to @{name}`, adding --into DIR or --as PATH to choose where");
+        }
+        bail!(notices::copy_from(name, notices::this_account().as_deref()));
+    }
+    Ok(())
 }
 
 fn reject_remote_to_remote(args: &Args) -> Result<()> {
@@ -3709,6 +3753,7 @@ impl Location {
             bail!("rsync daemon syntax ({s}) is not supported");
         }
         let (user, host) = match hostpart.rsplit_once('@') {
+            Some(("", _)) => bail!("empty user in {s:?}"),
             Some((u, h)) => (Some(u.to_string()), h),
             None => (None, hostpart),
         };

@@ -115,7 +115,10 @@ fn digest(registration: &Registration) -> Result<String> {
 impl Guard {
     fn validate(&self) -> Result<()> {
         if self.identity != crate::identity::build() {
-            bail!("registered return helper has a different build; reconnect from the receiving machine to refresh it");
+            bail!(super::notices::reconnect(
+                "registered return helper has a different build",
+                super::notices::this_account().as_deref()
+            ));
         }
         let registration = load_registration(&self.name)?;
         if self.registration != digest(&registration)? {
@@ -242,14 +245,22 @@ pub(super) fn maybe_exec(selection: &Selection) -> Result<()> {
             .capture_output()
             .is_ok_and(|output| output.status.success());
         if !supported {
-            bail!("the registered helper for @{} does not support source authorization; update syq on the receiving machine and reconnect with syq persist connect SERVER", selection.name);
+            bail!(super::notices::outdated(
+                &selection.name,
+                "source authorization",
+                super::notices::this_account().as_deref()
+            ));
         }
     }
     if selection.kind == Kind::Account {
         anyhow::ensure!(!ACCOUNT_PREFLIGHT_DONE.load(std::sync::atomic::Ordering::Acquire),
             "receiving connection changed after account preflight; retry the command to use its matching helper");
         if !supports_requester_ssh_policy(program) {
-            bail!("the registered helper for @{} does not support requester-selected SSH configuration; update syq on the receiving machine and reconnect with syq persist connect SERVER", selection.name);
+            bail!(super::notices::outdated(
+                &selection.name,
+                "requester-selected SSH configuration",
+                super::notices::this_account().as_deref()
+            ));
         }
     }
     if matches!(selection.kind, Kind::Ssh | Kind::SshPersistent) {
@@ -261,7 +272,11 @@ pub(super) fn maybe_exec(selection: &Selection) -> Result<()> {
             .capture_output()
             .is_ok_and(|output| output.status.success());
         if !supported {
-            bail!("the registered helper for @{} does not support syq ssh; update syq on the receiving machine and reconnect with syq persist connect SERVER", selection.name);
+            bail!(super::notices::outdated(
+                &selection.name,
+                "syq ssh",
+                super::notices::this_account().as_deref()
+            ));
         }
     }
     let guard = serde_json::to_string(&selection.guard()?)?;
@@ -275,10 +290,16 @@ pub(super) fn maybe_exec(selection: &Selection) -> Result<()> {
         .arg(guard)
         .args(argv.iter().skip(1))
         .exec();
-    Err(error).with_context(|| format!(
-        "start matching return helper {} for @{}; reconnect from the receiving machine to refresh it",
-        Path::new(program).display(), selection.name
-    ))
+    Err(error).with_context(|| {
+        super::notices::reconnect(
+            &format!(
+                "start matching return helper {} for @{}",
+                Path::new(program).display(),
+                selection.name
+            ),
+            super::notices::this_account().as_deref(),
+        )
+    })
 }
 
 pub(crate) fn copy(

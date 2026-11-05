@@ -213,6 +213,9 @@ pub(crate) fn validate_host_key_alias(alias: &str) -> Result<()> {
 }
 
 pub(crate) fn validate_endpoint(endpoint: &NativeEndpoint) -> Result<()> {
+    if let Some(name) = endpoint.host.strip_prefix('@') {
+        bail!("@{name} is a receiving name, not an SSH server; to run a command on that machine, use `syq exec --on @{name} -- COMMAND`");
+    }
     if endpoint.host.is_empty()
         || endpoint.host.starts_with('-')
         || !endpoint
