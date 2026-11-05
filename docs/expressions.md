@@ -18,41 +18,36 @@ syq cp --srcs-in photos --into archive --ignore-from .gitignore \
   --where 'src.name matches "(?i)\\.jpe?g$" and src.mtime >= now - 7d'
 ```
 
-`--where` works with local, SSH, and S3 sources in both commands. `--copy-if`
-is available only for `cp`. Neither applies to descriptor or pipe copies.
+`--where` works with local, SSH, and S3 sources. `--copy-if` is only for
+`cp`, and can't be combined with `--in-place`. Neither applies to descriptor
+or pipe copies.
 
 ## Selection and updates
 
-`--where` accepts only `src` fields. `--copy-if` accepts both `src` and `dst`:
-`dst` names the destination chosen by the copy's placement or mapping. An
-entry is copied only when both options pass and existing policies such as
-`--if-exists=keep` allow it. Each option can be given once; combine conditions
-with `and` and `or`. A true expression does not force a rewrite: the copy's
-usual comparison still skips unchanged files.
+Use `--where` to choose files by their own metadata, and `--copy-if` to
+compare each file with what is already at its destination. `--where` sees
+only `src` fields; `--copy-if` also sees `dst`, the destination that placement
+or a mapping chooses. An entry is copied only when both expressions are true
+and the `--if-exists` policy allows it, and unchanged files are still skipped.
+Each option can be given once; combine conditions with `and` and `or`.
 
-`--where` does not filter directories: they are copied as usual, even when
-none of their contents are selected, and `map --where` always emits their
-records. Metadata used by the expression is added to `map` records only when
-requested with `--include`. For a directory, a false `--copy-if` result skips
-only its own metadata, not its contents. On S3, `--where` never filters
-directory-marker objects, but `--copy-if` can skip them.
+`--where` doesn't filter directories: they are copied even when none of their
+contents are selected. A false `--copy-if` skips only a directory's own
+metadata, not its contents. To skip a whole subtree without reading it, use
+[ignore rules](reference.md#ignoring-paths) instead; an expression can't
+re-include an ignored path.
 
-Use [ignore rules](reference.md#ignoring-paths) to stop traversal of a subtree.
-An expression cannot re-include an ignored path. With `--prune`, excluded
-source entries still protect their destination counterparts. Destination-only
-entries remain eligible for pruning even when an expression selects no files.
-
-`--dry-run` uses the same expressions. Invalid syntax, unknown fields, and
-incompatible types fail before copying starts. Evaluation errors, including
-division by zero and failed metadata reads, fail the copy and prevent pruning;
-files already completed can remain.
-
-`--copy-if` cannot combine with `--in-place`.
+With `--prune`, a source entry an expression excludes still protects its
+destination counterpart, and destination entries with no source are still
+pruned. An error during evaluation, such as division by zero or a failed
+metadata read, fails the copy and prevents pruning; files already copied
+stay. Mistakes in syntax, field names and types are reported before copying
+starts.
 
 ## Fields
 
-Prefix every field with `src.` or `dst.`. All filesystem metadata describes
-the selected entry; recursively discovered symlinks are not followed.
+Prefix every field with `src.` or `dst.`. Metadata describes the entry
+itself: a symlink found inside a directory is not followed.
 
 | Field | Type and meaning |
 |---|---|
@@ -61,7 +56,7 @@ the selected entry; recursively discovered symlinks are not followed.
 | `extension` | Text after the last dot in `name`, without the dot; empty for extensionless names and a leading dot alone |
 | `exists` | Whether the entry exists; always true for a scanned source |
 | `kind` | `"file"`, `"dir"`, `"symlink"`, `"fifo"`, `"socket"`, `"char"`, `"block"`, or `"other"` |
-| `size` | Entry size in bytes; regular-file length. Sizes of other filesystem entry types are platform-dependent. |
+| `size` | Size in bytes; for anything but a regular file, the value depends on the platform |
 | `mtime` | Filesystem modification timestamp, stored in syq object metadata on S3; `null` when unavailable |
 | `s3_last_modified` | S3 service modification timestamp; `null` on filesystem endpoints |
 | `ctime` | Filesystem status-change timestamp, not creation time |
@@ -82,13 +77,12 @@ available only when the object carries syq metadata. Use
 back to the service's time, as downloads do.
 
 On S3, path, name, extension, size, and `s3_last_modified` come from the
-listing; other fields need a request for each object. Put those cheap
-conditions first, so that an object they reject needs no extra request.
+listing, and other fields need a request for each object, so put conditions
+on the listed fields first.
 
 Use `is null`, `is not null`, or `coalesce(value, fallback)` for unavailable
-metadata. Equality treats `null` as a distinct value. Ordering, arithmetic,
-and pattern matching on `null` fail. Metadata read errors are reported as
-errors, never converted to `null`.
+metadata. Equality treats `null` as a distinct value, but ordering,
+arithmetic, and pattern matching on `null` are errors.
 
 ```text
 src.uid is not null and src.uid = 1000
@@ -106,7 +100,7 @@ src.mode & 0o111 != 0
 | `1B`, `2KiB`, `1.5MiB`, `3GiB`, `1TiB` | Byte quantities with binary units |
 | `1kB`, `2MB`, `3GB`, `1TB` | Byte quantities with decimal units (`KB` also accepted) |
 | `1ns`, `2us`, `3ms`, `4s`, `5m`, `6h`, `7d`, `2w` | Durations; a day is 24 hours and a week is seven days |
-| `now` | One fixed timestamp for this coordinator invocation |
+| `now` | The time the command started, the same for every entry |
 | `timestamp("2026-09-01T00:00:00Z")` | RFC 3339 timestamp with an explicit timezone |
 | `"text"`, `'text'` | Strings; escapes are `\\`, `\"`, `\'`, `\n`, `\r`, `\t`, and `\xNN` for a byte |
 | `=`, `==`, `!=`, `<>`, `<`, `<=`, `>`, `>=` | Exact equality, inequality, and ordering |
@@ -125,13 +119,13 @@ Patterns and timestamp arguments must be quoted literals. Regex backslashes
 need a string escape, as in the JPEG example above.
 
 Types must agree: compare a size with `10B`, not `10` or `"10B"`. Subtracting
-timestamps yields a duration, and adding a duration to a timestamp shifts it.
-Arithmetic and bitwise operators bind more tightly than comparisons, which
-bind more tightly than `not`, then `and`, then `or`; use parentheses to group
-conditions otherwise. `and` and `or` evaluate left to right and stop as soon as the
-result is known, and `if` and `coalesce` evaluate only the needed branch, so
-put an availability check before a condition that needs the value.
+timestamps gives a duration, and adding a duration to a timestamp shifts it.
+Arithmetic and bitwise operators bind most tightly, then comparisons, then
+`not`, then `and`, then `or`; use parentheses to group conditions otherwise.
+`and` and `or` evaluate left to right and stop once the result is known, and
+`if` and `coalesce` evaluate only the branch they need, so put an availability
+check first.
 
-Expressions cannot execute commands, read arbitrary files, or query other
-entries. For collection-wide selection or external data, generate a
-[mapping](mappings.md) with a program.
+Expressions can't run commands, read other files, or look at other entries.
+To select using external data, generate a [mapping](mappings.md) with a
+program.
