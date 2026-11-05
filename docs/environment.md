@@ -50,7 +50,6 @@ shell itself, run `eval "$(tmux show-environment -s SSH_AUTH_SOCK)"`.
 |---|---|
 | `~/.cache/syq/tuning.history-v1.sqlite` | Tuning timelines and filesystem startup hints |
 | `~/.cache/syq/completion-endpoints.json` | Hosts offered by completion |
-| `~/.cache/syq/tuning.json`, `~/.cache/syq/helpers/` | Left by older versions; safe to delete unless you still run those releases |
 | `~/.config/syq/persistence.json`, `receive.json` | Persistence setting and receiving profiles |
 | `~/.config/syq/install.json`, `last-update-check` | Install receipt and update-check timing |
 | `~/.local/lib/syq/` | [Stored releases and helpers](#stored-releases-and-helpers) |

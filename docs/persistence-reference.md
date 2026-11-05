@@ -95,8 +95,7 @@ export it again after reconnecting.
 ### SSH authorization providers
 
 An [SSH authorization provider](receive.md#use-an-ssh-authorization-provider)
-needs the same syq build as the machines that use it, so run
-`syq persist receive on` there again after updating syq. The first receiving
+needs the same syq build as the machines that use it. The first receiving
 profile in its default domain must be enabled. Its SSH server must allow local
 forwarding (`AllowTcpForwarding` and `AllowStreamLocalForwarding` set to
 `local` or `yes`), and the login key's `authorized_keys` entry must not
@@ -191,8 +190,7 @@ the server, then run `syq persist connect server` on the new laptop.
 ### Back up the receiving identity
 
 Your receiving names are tied to the key in `~/.syq-receiver-identity/`, which
-all profiles, domains, and syq versions share. Keep it across upgrades and in
-private backups; if you lose it, you have to `forget` your names on each
+all profiles, domains, and syq versions share. Keep it in private backups; if you lose it, you have to `forget` your names on each
 server. Another machine with a copy of it has the same identity, but only one
 machine can hold a name at a time, so give machines that receive at the same
 time different profile names.
@@ -280,6 +278,8 @@ same account from each other (see
 [Persistent connections](security.md#persistent-connections)), and all domains
 share receiving names.
 
+<a id="updating-connections"></a>
+
 ## Setup and recovery
 
 If approval prompts do not appear, start receiving from a terminal in your
@@ -299,30 +299,3 @@ to `remote` or `yes`. When a server refuses forwarding, receiving through it
 stops; after a rejected login or changed host key, it retries with waits of up
 to 10 minutes. `syq persist status` shows the reason, and
 `syq persist connect server` retries at once.
-
-If a command on the server reports a missing helper or an option it does not
-recognize, update syq on both machines and reconnect from your laptop.
-
-## Updating connections
-
-After upgrading syq on both machines, run `syq persist connect server` on the
-receiving machine for each server you use, adding `--pscope PATH` for a scoped
-domain. The new version replaces the receiving service the older one left
-running and keeps your settings. If receiving was disabled, enable it first
-with `syq persist receive on`, or enable and connect together with
-`syq persist receive on --connection server`. You do not need
-`syq persist off` before upgrading; for a scoped domain it would also delete
-that domain's settings and remembered permissions.
-
-Requests that were waiting for approval do not carry over: run them again on
-the server and approve the new requests. Session permissions (**Allow**) end
-with the old receiving connection, so the next account access asks again
-unless you chose **Remember**.
-
-Manage receiving with the new version afterwards. An older binary may refuse
-settings that a newer one wrote, does not manage scoped domains a newer version
-created, and does not enforce receiving-name assignments, so use updated syq
-commands on the server and stop older receiving services before switching
-versions. Saved names, directories, and limits carry over. Settings using the
-former `--approve always` now require approval; choose `--auto-approve-root`
-explicitly to enable unattended downloads.

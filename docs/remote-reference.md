@@ -58,6 +58,8 @@ copies.
   [account access](persistence-reference.md#account-access) with
   `--auth-from @NAME` instead.
 
+<a id="enrollments-from-older-versions"></a>
+
 ### Changing keys and updating syq
 
 If you start logging in with a different key, the next copy logs in again and
@@ -69,20 +71,6 @@ Only `syq receiver revoke ID`, or deleting syq's line from `authorized_keys`,
 ends an enrollment. Removing or revoking your login key, certificate, or
 certificate authority on the server does not stop copies your key signs, and
 neither do options such as `from=` or `expiry-time=` on your key's line.
-
-### Enrollments from older versions
-
-Syq 0.7.1 and earlier made one enrollment per destination directory. Newer
-versions do not use, list, or revoke them, but an older syq can keep copying
-through them until you remove them. Revoke them with the older version before
-upgrading, or delete them by hand:
-
-- On the server, delete each line in `~/.ssh/authorized_keys` whose command
-  runs `~/.local/libexec/syq-receiver`, written with your home directory's
-  full path (keep those that run syq from `~/.local/lib/syq`). Then delete the
-  directory `~/.local/share/syq/restricted` and the file
-  `~/.local/libexec/syq-receiver`.
-- On your machine, delete the directory `~/.local/state/syq/restricted`.
 
 ## Limits and unsupported options
 
