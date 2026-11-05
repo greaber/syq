@@ -807,20 +807,60 @@ struct SourceMapping<'a> {
     sub: &'a [u8],
 }
 
-/// Check a selected root against its selector. A symlink named as a plain
+/// Whether a selected root is a symlink named as a plain source. Such a
 /// source is refused rather than copied as a link: people who name a link
 /// usually mean what it points to. `--src-non-dir` selects the link itself.
+pub(crate) fn refuses_named_symlink(selection: SourceSelection, kind: Kind) -> bool {
+    selection == SourceSelection::NamedNoFollow && kind == Kind::Symlink
+}
+
+/// The error for named sources that are symlinks, listing them all. `sources`
+/// counts every named source: several suggest a shell glob, for which
+/// `--srcs-in` is the usual alternative.
+pub(crate) fn named_symlink_sources_error(links: &[&[u8]], sources: usize) -> anyhow::Error {
+    const SHOWN: usize = 10;
+    let mut names: Vec<String> = links
+        .iter()
+        .take(SHOWN)
+        .map(|link| shell_word(link))
+        .collect();
+    if links.len() > SHOWN {
+        names.push(format!("{} more", links.len() - SHOWN));
+    }
+    let mut message = match names.as_slice() {
+        [name] => format!(
+            "source {name} is a symlink; pass --follow-src to copy what it points to, or --src-non-dir {name} to copy the link itself"
+        ),
+        [first @ .., last] => format!(
+            "sources {} and {last} are symlinks; pass --follow-src to copy what they point to, or name each with --src-non-dir to copy the links themselves",
+            first.join(", ")
+        ),
+        [] => unreachable!("a named symlink error names at least one source"),
+    };
+    if sources > 1 {
+        message.push_str(
+            "; for a glob, --srcs-in DIR copies the directory's contents and keeps links as links",
+        );
+    }
+    anyhow::anyhow!(message)
+}
+
+/// `path` as a word a user can paste into a shell.
+fn shell_word(path: &[u8]) -> String {
+    match std::str::from_utf8(path) {
+        Ok(text) if !text.chars().any(char::is_control) => shell_words::quote(text).into_owned(),
+        _ => crate::approval_command::display_arg(path),
+    }
+}
+
+/// Check a selected root against its selector.
 pub(crate) fn validate_native_source_type(
     path: &[u8],
     selection: SourceSelection,
     kind: Kind,
 ) -> Result<()> {
     match selection {
-        SourceSelection::NamedNoFollow if kind == Kind::Symlink => bail!(
-            "source {} is a symlink; pass --follow-src to copy what it points to, or --src-non-dir {} to copy the link itself",
-            display(path),
-            display(path)
-        ),
+        _ if refuses_named_symlink(selection, kind) => Err(named_symlink_sources_error(&[path], 1)),
         SourceSelection::Contents | SourceSelection::Directory if kind == Kind::Symlink => bail!(
             "selector {} is a symlink; pass --follow-src (or --follow) to resolve source symlinks",
             display(path)
@@ -3689,6 +3729,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         // Native selectors are structural: validate every selected root before
         // a missing --into target can be created. The registered selection is
         // authoritative here, so its operator path is not resolved again.
+        // Named symlinks are reported together, as a glob can name several.
+        let mut links = Vec::new();
         for (source_index, source) in srcs.iter().enumerate() {
             match stat_one_registered(
                 &mut *src_ctl,
@@ -3696,11 +3738,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 &source_roots.get().expect("source roots registered")[source_index].selection,
                 source.follows_root(args.follows_native_source_paths()),
             )? {
+                Some(entry) if refuses_named_symlink(source.selection, entry.kind) => {
+                    links.push(source.path.as_slice())
+                }
                 Some(entry) => {
                     validate_native_source_type(&source.path, source.selection, entry.kind)?
                 }
                 None => bail!("source {} does not exist", display(&source.path)),
             }
+        }
+        if !links.is_empty() {
+            return Err(named_symlink_sources_error(&links, srcs.len()));
         }
     }
     hold_after_target_precondition_for_test(&args)?;

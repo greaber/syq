@@ -264,6 +264,10 @@ pub(super) fn upload_plan(args: &Args) -> Result<UploadPlan> {
     }
     let mut out = Vec::new();
     let mut claims = BTreeMap::new();
+    // Named sources that are symlinks, reported together once every
+    // selector has been resolved; nothing is uploaded before then.
+    let mut links = Vec::new();
+    let named_sources = selectors.len();
     for (path, destination, selection, declared_kind, expected_hash, metadata) in selectors {
         let resolved = crate::fsops::resolve(&path);
         let pinned = if resolved.is_absolute() {
@@ -322,11 +326,19 @@ pub(super) fn upload_plan(args: &Args) -> Result<UploadPlan> {
             _ => bail!("source cannot be selected for S3 upload"),
         };
         if source.kind() == ObjectKind::Symlink {
+            if crate::transfer::refuses_named_symlink(selection, crate::proto::Kind::Symlink) {
+                links.push(source.label.clone());
+                continue;
+            }
             crate::transfer::validate_native_source_type(
                 &source.label,
                 selection,
                 crate::proto::Kind::Symlink,
             )?;
+        }
+        if !links.is_empty() {
+            // The copy fails anyway: only look for further named links.
+            continue;
         }
         if (selection == SourceSelection::File && source.kind() == ObjectKind::Dir)
             || (matches!(
@@ -455,6 +467,13 @@ pub(super) fn upload_plan(args: &Args) -> Result<UploadPlan> {
             }
             out.push(source);
         }
+    }
+    if !links.is_empty() {
+        let links: Vec<&[u8]> = links.iter().map(Vec::as_slice).collect();
+        return Err(crate::transfer::named_symlink_sources_error(
+            &links,
+            named_sources,
+        ));
     }
     Ok(UploadPlan {
         sources: out,

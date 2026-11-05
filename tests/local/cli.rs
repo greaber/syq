@@ -2126,10 +2126,18 @@ fn a_closed_stdout_stops_a_streaming_command() {
     for index in 0..3000 {
         fs::write(t.path(&format!("src/big/file-{index:05}")), b"").unwrap();
     }
+    // A later selector that fails only once map walks it: map checks every
+    // selector before writing, so a missing one would fail before any output.
+    fs::create_dir_all(t.path("src/later/unreadable")).unwrap();
+    fs::set_permissions(
+        t.path("src/later/unreadable"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
     let (reader, writer) = std::io::pipe().unwrap();
     drop(reader);
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args(["map", "--cwd", &t.s("src"), "big", "absent"])
+        .args(["map", "--cwd", &t.s("src"), "big", "later"])
         .stdin(Stdio::null())
         .stdout(writer)
         .stderr(Stdio::piped())
@@ -2137,6 +2145,11 @@ fn a_closed_stdout_stops_a_streaming_command() {
         .unwrap()
         .wait_with_output()
         .unwrap();
+    fs::set_permissions(
+        t.path("src/later/unreadable"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert!(output.stderr.is_empty(), "{}", stderr_of(&output));
 }

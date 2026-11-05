@@ -219,6 +219,26 @@ pub fn write_local(options: &Options, out: &mut impl Write) -> Result<()> {
         fields: &options.include,
         policy,
     };
+    // Check every selector before writing anything: a mapping cut short by a
+    // later selector's error still reads as complete to `syq cp --mapping -`
+    // when the shell ignores the producer's status. Each selection is pinned
+    // again to emit it, so many selectors do not hold descriptors open.
+    let mut links = Vec::new();
+    for location in &options.sources {
+        let selection = pin_selection(&base, location, follow_src, symlink_policy)?;
+        let (_, root) = selected_root(&selection)?;
+        if crate::transfer::refuses_named_symlink(location.selection, root.kind) {
+            links.push(location.path.as_slice());
+        } else {
+            check_selected_root(location, root.kind)?;
+        }
+    }
+    if !links.is_empty() {
+        return Err(crate::transfer::named_symlink_sources_error(
+            &links,
+            options.sources.len(),
+        ));
+    }
     for (location, destination) in options.sources.iter().zip(destinations) {
         let selection = pin_selection(&base, location, follow_src, symlink_policy)?;
         hold_map_selection_for_test()?;
@@ -394,13 +414,9 @@ fn emitted_source(location: &Source, resolved_relative: Option<&[u8]>) -> Result
     Ok(resolved_relative.to_vec())
 }
 
-fn emit_selection(
-    location: &Source,
-    selection: MapSelection,
-    destination_prefix: &[u8],
-    out: &mut Emitter<'_, impl Write>,
-) -> Result<()> {
-    let contents = location.selection == SourceSelection::Contents;
+/// The selected root's metadata and entry, checked against the pinned
+/// identity.
+fn selected_root(selection: &MapSelection) -> Result<(crate::rooted::RootMetadata, Entry)> {
     let scan_relative = RelativePath::new(&selection.relative)?;
     let metadata = selection.root.metadata(&scan_relative)?;
     if let Some(expected) = selection.expected_leaf.as_ref() {
@@ -416,16 +432,30 @@ fn emit_selection(
     if let Some(expected) = selection.expected_leaf.as_ref() {
         require_source_leaf_identity(expected, selection.root.metadata(&scan_relative)?)?;
     }
-    if contents {
-        if root_entry.kind != Kind::Dir {
+    Ok((metadata, root_entry))
+}
+
+/// Check a selected root's type against its selector.
+fn check_selected_root(location: &Source, kind: Kind) -> Result<()> {
+    if location.selection == SourceSelection::Contents {
+        if kind != Kind::Dir {
             bail!("--srcs-in {} is not a directory", display(&location.path));
         }
-    } else {
-        crate::transfer::validate_native_source_type(
-            &location.path,
-            location.selection,
-            root_entry.kind,
-        )?;
+        return Ok(());
+    }
+    crate::transfer::validate_native_source_type(&location.path, location.selection, kind)
+}
+
+fn emit_selection(
+    location: &Source,
+    selection: MapSelection,
+    destination_prefix: &[u8],
+    out: &mut Emitter<'_, impl Write>,
+) -> Result<()> {
+    let contents = location.selection == SourceSelection::Contents;
+    let (metadata, root_entry) = selected_root(&selection)?;
+    check_selected_root(location, root_entry.kind)?;
+    if !contents {
         emit(
             out,
             &selection.emitted_source,

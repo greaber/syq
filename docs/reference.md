@@ -469,7 +469,9 @@ default.
 
 Syq copies the symlinks inside a directory as links. A symlink you name as a
 source stops the copy: pass `--follow-src` to copy what it points to, or name
-it with `--src-non-dir` to copy the link itself. A symlink elsewhere in a path
+it with `--src-non-dir` to copy the link itself. If a shell glob such as
+`project/*` names links, `--srcs-in project` copies the directory's contents
+instead and keeps its links as links. A symlink elsewhere in a path
 you supply also stops the copy unless you pass `--follow-src` for source paths
 or `--follow-dst` for destination paths. `--follow` does both, and also
 follows paths given to options such as `--ignore-from`.

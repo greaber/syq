@@ -277,6 +277,79 @@ fn native_copy_refuses_a_named_symlink_unless_followed_or_selected_as_a_link() {
 }
 
 #[test]
+fn native_named_symlinks_are_refused_together_and_map_writes_nothing() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("proj/a"), b"a");
+    fs::create_dir(t.path("proj/real")).unwrap();
+    symlink("real", t.path("proj/current")).unwrap();
+    symlink("a", t.path("proj/flink")).unwrap();
+    symlink("real", t.path("proj/my link")).unwrap();
+    let proj = t.s("proj");
+    // What a shell glob such as proj/* would pass.
+    let glob = ["a", "current", "flink", "my link", "real"];
+
+    // One error lists every named link, quoted for the shell, and nothing is copied.
+    let mut args = vec!["cp", "-C", &proj];
+    args.extend(glob);
+    let into = t.s("out");
+    args.extend(["--into", &into]);
+    let refused = native_syq(&args);
+    assert!(!refused.status.success());
+    let stderr = stderr_of(&refused);
+    assert!(
+        stderr.contains("sources current, flink and 'my link' are symlinks")
+            && stderr.contains("--follow-src")
+            && stderr.contains("--src-non-dir")
+            && stderr.contains("--srcs-in DIR"),
+        "{stderr}"
+    );
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(!t.path("out").exists());
+
+    // A single named link gets a suggestion that can be pasted as is.
+    let single = native_syq(&["cp", "-C", &proj, "my link", "--into", &into]);
+    assert!(!single.status.success());
+    assert!(
+        stderr_of(&single).contains("or --src-non-dir 'my link' to copy the link itself"),
+        "{}",
+        stderr_of(&single)
+    );
+    assert!(!stderr_of(&single).contains("--srcs-in"));
+
+    // syq map checks every selector before writing any entry, so a pipeline
+    // into `syq cp --mapping -` never gets a partial mapping.
+    for (selectors, expected) in [
+        (vec!["a", "current"], "--src-non-dir current"),
+        (vec!["a", "missing"], "missing"),
+    ] {
+        let mapped = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["map", "-C", &proj])
+            .args(&selectors)
+            .run()
+            .expect("run syq map");
+        assert!(!mapped.status.success(), "{selectors:?}");
+        assert!(
+            mapped.stdout.is_empty(),
+            "{selectors:?}: {:?}",
+            mapped.stdout
+        );
+        assert!(
+            stderr_of(&mapped).contains(expected),
+            "{selectors:?}: {}",
+            stderr_of(&mapped)
+        );
+    }
+    let mapped = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["map", "-C", &proj, "current", "flink"])
+        .run()
+        .expect("run syq map");
+    assert!(stderr_of(&mapped).contains("sources current and flink are symlinks"));
+    assert!(mapped.stdout.is_empty());
+}
+
+#[test]
 fn native_cp_with_prune_checks_all_typed_sources_before_mutation() {
     let t = Tmp::new();
     write(&t.path("src/good"), b"new");
