@@ -201,8 +201,9 @@ with a non-directory or the reverse, even an empty one.
 ## Metadata details
 
 Setuid, setgid, and sticky bits are copied only with
-`--copy-metadata=permissions`, and ownership is copied as numeric IDs, not
-account names.
+`--copy-metadata=permissions`. Ownership and ACL entries are copied as numeric
+IDs (UUIDs for macOS ACLs), not translated to account names, so on another host
+they apply to whichever account has that ID there.
 
 ## File descriptors
 
