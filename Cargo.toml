@@ -125,3 +125,5 @@ opt-level = 3
 [lints.clippy]
 # Receiver modules opt into the subprocess restrictions in clippy.toml.
 disallowed_methods = "allow"
+# Product code opts into the stderr macro restriction; tests may print.
+disallowed_macros = "allow"

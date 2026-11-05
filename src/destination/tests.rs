@@ -1575,7 +1575,7 @@ fn named_workers_refuse_mutations_before_transport_shutdown() {
             spec.finish_tcp_setup(pending).unwrap();
         }
         let mut worker = crate::conn::Endpoint::Remote(spec.clone())
-            .connect_with_copy_capabilities(false, None, Vec::new(), false)
+            .connect_with_copy_capabilities(false, None, Vec::new(), false, None)
             .unwrap();
         assert_eq!(worker.transport_stats().is_some(), tcp);
         let (finished, observed) = mpsc::channel();
@@ -1660,7 +1660,7 @@ fn named_tcp_workers_obey_limits_and_revocation() {
         drop(intruder);
         let endpoint = crate::conn::Endpoint::Remote(spec.clone());
         let mut worker = endpoint
-            .connect_with_copy_capabilities(false, None, Vec::new(), false)
+            .connect_with_copy_capabilities(false, None, Vec::new(), false, None)
             .unwrap();
         assert!(
             worker.transport_stats().is_some(),
@@ -1746,7 +1746,7 @@ fn named_tcp_connect_failure_uses_approved_ssh_worker() {
     }
     let endpoint = crate::conn::Endpoint::Remote(spec.clone());
     let mut worker = endpoint
-        .connect_with_copy_capabilities(false, None, Vec::new(), false)
+        .connect_with_copy_capabilities(false, None, Vec::new(), false, None)
         .unwrap();
     assert_eq!(spec.data_transport(), crate::conn::DataTransport::Ssh);
     assert!(worker.transport_stats().is_none());
@@ -1785,7 +1785,7 @@ fn named_tcp_workers_connect_concurrently() {
             std::thread::spawn(move || {
                 start.wait();
                 let mut worker = endpoint
-                    .connect_with_copy_capabilities(false, None, Vec::new(), false)
+                    .connect_with_copy_capabilities(false, None, Vec::new(), false, None)
                     .unwrap();
                 assert!(
                     worker.transport_stats().is_some(),
@@ -1832,7 +1832,7 @@ fn named_tcp_idle_and_partial_arrivals_do_not_block_worker() {
     partial.write_all(&[0; 16]).unwrap();
     let endpoint = crate::conn::Endpoint::Remote(spec);
     let mut worker = endpoint
-        .connect_with_copy_capabilities(false, None, Vec::new(), false)
+        .connect_with_copy_capabilities(false, None, Vec::new(), false, None)
         .unwrap();
     assert!(
         worker.transport_stats().is_some(),
@@ -1900,4 +1900,32 @@ fn named_requests_never_sign_following_the_destination() {
         let (_, request, _) = requested(Path::new("source"), &[follow]);
         assert!(!request.constraints.extra_options.follow_dst, "{follow}");
     }
+}
+
+#[test]
+fn a_rejected_login_waits_longer_each_time_up_to_ten_minutes() {
+    let mut wait = super::LOGIN_RETRY_FIRST;
+    let mut shown = Vec::new();
+    for _ in 0..7 {
+        shown.push(super::retry_wait(wait));
+        wait = super::next_login_retry(wait);
+    }
+    assert_eq!(
+        shown,
+        ["30 s", "60 s", "2 min", "4 min", "8 min", "10 min", "10 min"]
+    );
+    // Times left are rounded up to whole seconds, then to the nearest
+    // minute from two minutes on.
+    let wait = |millis| super::retry_wait(std::time::Duration::from_millis(millis));
+    assert_eq!(
+        [
+            wait(0),
+            wait(1),
+            wait(29_001),
+            wait(119_000),
+            wait(149_000),
+            wait(151_000)
+        ],
+        ["0 s", "1 s", "30 s", "119 s", "2 min", "3 min"]
+    );
 }

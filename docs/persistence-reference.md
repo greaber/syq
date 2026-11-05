@@ -473,8 +473,18 @@ with you.
 
 For automatic reconnection to work, your SSH key or agent must be available and
 the server's host key must already be trusted. The background service cannot
-ask for a password. The server must allow remote Unix socket forwarding;
-OpenSSH 9.2 also requires permission for remote TCP forwarding.
+ask for a password. The server must allow remote Unix socket forwarding, and
+OpenSSH 7.8 and later also require permission for remote TCP forwarding:
+`AllowStreamLocalForwarding` and `AllowTcpForwarding` must both allow `remote`
+or `yes`. When a server refuses it, receiving through that server stops
+instead of reconnecting, and `syq persist status` shows it as failed with the
+reason. When a server rejects your login or presents a host key that does not
+match, receiving tries again after 30 seconds, then waits twice as long each
+time, up to 10 minutes; meanwhile `syq persist status` shows it as failed with
+the reason and when it tries next. In both cases run
+`syq persist connect server` to try again at once. Other commands that connect
+to that server try again too, but at most once every 30 seconds, and without
+shortening the waits that follow.
 
 The server command uses the matching helper installed by the receiving
 connection. If that helper is missing or does not recognize an option, update

@@ -753,8 +753,21 @@ pub(super) fn open_operator_start(absolute: bool) -> Result<File> {
 }
 
 pub(crate) fn open_operator_directory_at(parent: &File, component: &[u8]) -> Result<File> {
+    #[cfg(debug_assertions)]
+    OPERATOR_DIRECTORY_LOOKUPS.set(OPERATOR_DIRECTORY_LOOKUPS.get() + 1);
     let component = operator_component_cstring(component)?;
     open_operator_directory_fd(parent.as_raw_fd(), &component)
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static OPERATOR_DIRECTORY_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many directories this thread has opened by name beneath another.
+#[cfg(debug_assertions)]
+pub(crate) fn operator_directory_lookups_for_test() -> u64 {
+    OPERATOR_DIRECTORY_LOOKUPS.get()
 }
 
 pub(super) fn open_operator_directory_fd(parent: RawFd, component: &CString) -> Result<File> {

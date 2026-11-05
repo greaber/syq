@@ -1298,7 +1298,8 @@ fn attempt_small_copy(
             drop(planning.take());
             let setup = progress.clock.setup.begin();
             // Read through the engine's source-worker path.
-            let Ok(mut reader) = src_ep.connect_with_sources(args.compress, roots.to_vec(), true)
+            let Ok(mut reader) =
+                src_ep.connect_with_sources(args.compress, roots.to_vec(), true, None)
             else {
                 return Ok(SmallCopy::Reconnect);
             };
@@ -2804,6 +2805,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     };
     let opts = Arc::new(opts);
     let sched = Arc::new(Sched::new(block, opts.tuning.split_min_size(block)));
+    sched.watch_worker_setups();
 
     // Workers connect on their own threads once the control connections are
     // up: everything waits on those, so they must never compete with worker
@@ -2938,8 +2940,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     // the remaining independent connections finish logging in.
                     // TCP and custom remote shells keep their existing policy.
                     let reuse_control = reuse_startup_ssh(id, autotune);
+                    let setups = Some(sched.worker_setups());
                     let conns = src_ep
-                        .connect_with_sources(compress, initial_sources.clone(), reuse_control)
+                        .connect_with_sources(
+                            compress,
+                            initial_sources.clone(),
+                            reuse_control,
+                            setups,
+                        )
                         .and_then(|src| {
                             let copy_sources =
                                 if opts.copy_policy(bwlimit.is_some()).allows_receiver_copy() {
@@ -2954,6 +2962,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                     initial_destination.clone(),
                                     copy_sources,
                                     reuse_control,
+                                    setups,
                                 )?,
                             ))
                         });
@@ -3033,7 +3042,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                     1 << (failures - 1)
                                 );
                             }
-                            std::thread::sleep(std::time::Duration::from_secs(1 << (failures - 1)));
+                            // Stops early when the copy ends; the loop then returns.
+                            let _ = sched
+                                .worker_setups()
+                                .sleep(std::time::Duration::from_secs(1 << (failures - 1)));
                             continue;
                         }
                     };
@@ -3131,7 +3143,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                     1 << (failures - 1)
                                 );
                             }
-                            std::thread::sleep(std::time::Duration::from_secs(1 << (failures - 1)));
+                            let _ = sched
+                                .worker_setups()
+                                .sleep(std::time::Duration::from_secs(1 << (failures - 1)));
                         }
                         Err(error) => {
                             gate.mark_failed(id);
@@ -3143,7 +3157,23 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             let spawned = if refused {
                 Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
             } else {
-                std::thread::Builder::new().spawn(work)
+                let ended = failed_schedule.clone();
+                std::thread::Builder::new().spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                        .unwrap_or_else(|panic| {
+                            // The worker may hold files its peers would
+                            // wait for forever: stop the copy at once.
+                            ended.abort();
+                            Err(anyhow::anyhow!(
+                                "internal error: a transfer worker panicked: {}",
+                                panic_message(panic.as_ref())
+                            ))
+                        });
+                    // A worker that leaves because the copy ended releases the
+                    // join from waiting on peers that are still connecting.
+                    ended.end_unneeded_worker_setups();
+                    result
+                })
             };
             match spawned {
                 Ok(thread) => workers.lock().unwrap().push(thread),
@@ -3874,24 +3904,31 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 .unwrap_or_default()
                 .to_vec()
         };
-        let prune_suffixes: Vec<_> = if may_prune {
-            srcs.iter()
+        // Recursion checks include the destination container, but prune
+        // overlap checks apply only to copied directory roots. The receiver
+        // compares every selected source with every such root, so one
+        // source's prune cannot remove another selected source.
+        let mut prune_suffixes = Vec::new();
+        if may_prune {
+            let mut distinct = std::collections::HashSet::new();
+            for (candidate, _) in srcs
+                .iter()
                 .zip(roots)
                 .filter(|(_, root)| root.selection.relative().is_empty())
-                .map(|(candidate, _)| {
-                    if candidate.copies_contents()
-                        || args.files_from.is_some()
-                        || args.placement == Placement::As
-                    {
-                        primary_suffix.clone()
-                    } else {
-                        join(&primary_suffix, &candidate.basename())
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+            {
+                let suffix = if candidate.copies_contents()
+                    || args.files_from.is_some()
+                    || args.placement == Placement::As
+                {
+                    primary_suffix.clone()
+                } else {
+                    join(&primary_suffix, &candidate.basename())
+                };
+                if distinct.insert(suffix.clone()) {
+                    prune_suffixes.push(suffix);
+                }
+            }
+        }
         for (source_index, (source, root)) in srcs.iter().zip(roots).enumerate() {
             // Registration represents every selected directory as an empty
             // path beneath that directory descriptor. Exact files and
@@ -3908,20 +3945,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     suffixes.push(basename);
                 }
             }
-            // Recursion checks include the destination container, but prune
-            // overlap checks apply only to copied directory roots. Compare
-            // every selected source with every such root: one source's prune
-            // must not remove another selected source.
-            for suffix in &prune_suffixes {
-                if !suffixes.contains(suffix) {
-                    suffixes.push(suffix.clone());
-                }
-            }
-            let checked_for_prune = suffixes
-                .iter()
-                .map(|suffix| prune_suffixes.contains(suffix))
-                .collect::<Vec<_>>();
-            source_checks.push((source_index, checked_for_prune));
+            source_checks.push((source_index, suffixes.len()));
             ancestry_checks.push(DirectoryAncestryCheck {
                 source_root: root.ticket.clone(),
                 source_is_directory,
@@ -3941,9 +3965,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             match check_operator_directory_ancestry(
                 &mut *dst_ctl,
                 ancestry_checks,
+                prune_suffixes,
                 opts.may_widen_directory_permissions()
                     .then_some(selection_in_copy),
-                may_prune.then_some(srcs.len()),
             ) {
                 // A preview never widens a directory to check this. It writes
                 // nothing, so it goes on to report what it cannot inspect,
@@ -3956,7 +3980,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     prune_overlap_unsearchable = true;
                     source_checks
                         .iter()
-                        .map(|(_, checked)| vec![DirectoryRelation::Separate; checked.len()])
+                        .map(|&(_, suffixes)| SourceDirectoryRelations {
+                            relations: vec![DirectoryRelation::Separate; suffixes],
+                            shared: DirectoryRelation::Separate,
+                        })
                         .collect()
                 }
                 result => result?,
@@ -3969,18 +3996,24 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 source_checks.len()
             );
         }
-        for ((source_index, checked_for_prune), relations) in
-            source_checks.into_iter().zip(relations)
-        {
-            if relations.len() != checked_for_prune.len() {
+        for ((source_index, suffixes), relations) in source_checks.into_iter().zip(relations) {
+            if relations.relations.len() != suffixes {
                 bail!(
                     "destination returned {} ancestry results for {} effective paths",
-                    relations.len(),
-                    checked_for_prune.len()
+                    relations.relations.len(),
+                    suffixes
                 );
             }
             let source = &srcs[source_index];
-            for (relation, checks_prune) in relations.into_iter().zip(checked_for_prune) {
+            // The source's own effective paths check recursion; its relation
+            // to the copied directory roots together decides whether pruning
+            // could remove it.
+            let relations = relations
+                .relations
+                .into_iter()
+                .map(|relation| (relation, false))
+                .chain([(relations.shared, true)]);
+            for (relation, checks_prune) in relations {
                 match relation {
                     DirectoryRelation::Separate => {}
                     DirectoryRelation::SourceUnsearchable => {
@@ -4957,7 +4990,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     progress.error(&format!("syq: worker: {e:#}"));
                     sched.abort();
                 }
-                Err(_) => progress.error("syq: worker thread panicked"),
+                Err(_) => {
+                    progress.error("syq: worker thread panicked");
+                    sched.abort();
+                }
             }
         }
     }
@@ -5220,6 +5256,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         dst_ctl.detach();
     }
     Ok(exit_code)
+}
+
+/// The message a panic was raised with, when it has one.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
 }
 
 /// A finished connection need not wait for its helper to exit, except where
@@ -5526,27 +5571,21 @@ fn check_operator_directory(
 fn check_operator_directory_ancestry(
     conn: &mut dyn Conn,
     checks: Vec<DirectoryAncestryCheck>,
+    shared_suffixes: Vec<PathBytes>,
     access: Option<bool>,
-    pruned_sources: Option<usize>,
-) -> Result<Vec<Vec<DirectoryRelation>>> {
+) -> Result<Vec<SourceDirectoryRelations>> {
     let request = match access {
         Some(selection_in_copy) => Request::CheckOperatorDirectoryAncestryWithAccess {
             checks,
+            shared_suffixes,
             selection_in_copy,
         },
-        None => Request::CheckOperatorDirectoryAncestry { checks },
+        None => Request::CheckOperatorDirectoryAncestry {
+            checks,
+            shared_suffixes,
+        },
     };
-    // Pruning checks every source against every copied directory, so the
-    // request grows with the square of the sources' number.
-    let too_many = pruned_sources.filter(|_| crate::proto::exceeds_message_limit(&request));
-    let reply = conn.call(request).map_err(|error| match too_many {
-        Some(count) => error.context(format!(
-            "this copy names {count} sources, more than --prune can check at once; {}",
-            crate::fsops::FEWER_SOURCES
-        )),
-        None => error,
-    })?;
-    match ok(reply, "destination ancestry")? {
+    match ok(conn.call(request)?, "destination ancestry")? {
         Response::DirectoryRelations(relations) => Ok(relations),
         other => bail!("unexpected response {other:?}"),
     }

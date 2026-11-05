@@ -104,7 +104,8 @@ using TCP when reachable or SSH otherwise. `--no-tcp` selects SSH directly.
 Keep the copy and laptop receiving connection open until it finishes.
 
 HostB's SSH server must allow remote Unix-socket forwarding for the copy's
-control connection. This does not forward an SSH agent. SSH data workers need
+control connection, and OpenSSH 7.8 and later also require remote TCP
+forwarding to be allowed. This does not forward an SSH agent. SSH data workers need
 writable `~/.ssh/authorized_keys` on hostC for a temporary restricted key.
 See [Approved account copies](remote-reference.md#approved-account-copies)
 for option support.

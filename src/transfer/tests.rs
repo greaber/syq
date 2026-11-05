@@ -492,6 +492,44 @@ fn pipeline_worker(
 }
 
 #[test]
+fn roots_inside_matches_comparing_every_root() {
+    let mut roots: Vec<(PathBytes, ())> = [
+        "dst",
+        "dst/a",
+        "dst/a",
+        "dst/a-b",
+        "dst/a/b",
+        "dst/a/b/c",
+        "dst/ab",
+        "dst2",
+        "/",
+        "/x",
+    ]
+    .into_iter()
+    .map(|path| (path.as_bytes().to_vec(), ()))
+    .collect();
+    roots.sort();
+    for root in [
+        "dst",
+        "dst/",
+        "dst/a",
+        "dst/a/",
+        "dst/a/b/c",
+        "missing",
+        "/",
+        "",
+    ] {
+        let root = root.as_bytes();
+        let compared: Vec<_> = roots
+            .iter()
+            .filter(|(path, _)| path != root && path_is_inside(path, root))
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert_eq!(roots_inside(&roots, root), compared, "{root:?}");
+    }
+}
+
+#[test]
 fn prune_index_preserves_root_boundaries() {
     let seen: std::collections::HashMap<_, _> = [
         "dst",

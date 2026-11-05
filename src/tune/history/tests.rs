@@ -493,6 +493,7 @@ fn tcp_preflight_preserves_evidence_without_storing_addresses() {
                 source: DataAddressSource::RemoteInterface,
                 reachable: Some(true),
                 selected: true,
+                same_as_ssh_target: false,
             },
             TcpCandidate {
                 address: "example.invalid".into(),
@@ -500,6 +501,7 @@ fn tcp_preflight_preserves_evidence_without_storing_addresses() {
                 source: DataAddressSource::SshTarget,
                 reachable: Some(false),
                 selected: false,
+                same_as_ssh_target: false,
             },
             TcpCandidate {
                 address: "2001:db8::10".into(),
@@ -507,6 +509,7 @@ fn tcp_preflight_preserves_evidence_without_storing_addresses() {
                 source: DataAddressSource::RemoteInterface,
                 reachable: None,
                 selected: false,
+                same_as_ssh_target: false,
             },
         ],
     };

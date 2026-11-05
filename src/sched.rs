@@ -628,6 +628,7 @@ pub struct Sched {
     /// Files a command-restricted receiver is writing and has not
     /// published: it lists each as failed if the copy ends without it.
     receiver_holds: Mutex<HashSet<usize>>,
+    worker_setups: Arc<crate::conn::WorkerSetups>,
 }
 
 impl Sched {
@@ -660,6 +661,30 @@ impl Sched {
             block,
             min_split: min_split.max(2 * block),
             receiver_holds: Mutex::new(HashSet::new()),
+            worker_setups: Default::default(),
+        }
+    }
+
+    /// Worker connections being set up for this copy.
+    pub fn worker_setups(&self) -> &Arc<crate::conn::WorkerSetups> {
+        &self.worker_setups
+    }
+
+    /// Let the worker setups ask this scheduler whether the copy has ended.
+    pub fn watch_worker_setups(self: &Arc<Self>) {
+        let sched = Arc::downgrade(self);
+        self.worker_setups.set_ended(move || {
+            sched
+                .upgrade()
+                .is_none_or(|sched| sched.is_aborted() || sched.finished())
+        });
+    }
+
+    /// Once the copy has finished or failed, a worker connection still being
+    /// set up can never be used. End those setups rather than wait for them.
+    pub fn end_unneeded_worker_setups(&self) {
+        if self.is_aborted() || self.finished() {
+            self.worker_setups.cancel();
         }
     }
 
@@ -788,6 +813,17 @@ impl Sched {
         self.cv.notify_one();
     }
 
+    /// End the probe of file `idx` and queue it again, in one step: between
+    /// the two the copy would look finished, and workers that woke then
+    /// would leave and end the setups of connections it still needs.
+    pub fn requeue_probed(&self, idx: usize) {
+        let size = self.jobs.lock().unwrap()[idx].entry.size;
+        let mut g = self.inner.lock().unwrap();
+        g.probing -= 1;
+        g.files.push((size, Reverse(FileOrder::new(idx))));
+        self.cv.notify_all();
+    }
+
     /// Release validated jobs while the planner finishes preparing later
     /// batches. An empty queue is still a wait, not EOF, until scan_done.
     pub fn release_preflighted_work(&self) {
@@ -806,12 +842,14 @@ impl Sched {
         self.inner.lock().unwrap().scan_done = true;
         self.cv.notify_all();
         self.tune_cv.notify_one();
+        self.end_unneeded_worker_setups();
     }
 
     pub fn abort(&self) {
         self.inner.lock().unwrap().abort = true;
         self.cv.notify_all();
         self.tune_cv.notify_one();
+        self.worker_setups.cancel();
     }
 
     pub fn is_aborted(&self) -> bool {

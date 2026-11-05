@@ -872,6 +872,16 @@ pub struct DirectoryAncestryCheck {
     pub suffixes: Vec<PathBytes>,
 }
 
+/// One source's relations: one for each of its check's `suffixes`, and one
+/// for all of the request's `shared_suffixes` together. `shared` is the
+/// relation of the first shared suffix that is `Same`, `Descendant` or
+/// `Ancestor`; otherwise `SourceUnsearchable` if any is, else `Separate`.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct SourceDirectoryRelations {
+    pub relations: Vec<DirectoryRelation>,
+    pub shared: DirectoryRelation,
+}
+
 /// Relationship of one effective destination directory to its source root.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DirectoryRelation {
@@ -1003,9 +1013,12 @@ pub enum WireRequest<Data> {
     },
     /// Compare candidate directories beneath the retained operator selection
     /// with exact source-directory descriptors. This is a control-only safety
-    /// query and never reopens either operator pathname.
+    /// query and never reopens either operator pathname. Every check's source
+    /// is also compared with each of `shared_suffixes`, which the receiver
+    /// resolves once for all of them.
     CheckOperatorDirectoryAncestry {
         checks: Vec<DirectoryAncestryCheck>,
+        shared_suffixes: Vec<PathBytes>,
     },
     /// Resolve every operator source selection, then atomically register its
     /// opened directory or parent descriptor. Only a control connection may
@@ -1430,6 +1443,7 @@ pub enum WireRequest<Data> {
     /// mode. The receiver restores modes before returning DirectoryRelations.
     CheckOperatorDirectoryAncestryWithAccess {
         checks: Vec<DirectoryAncestryCheck>,
+        shared_suffixes: Vec<PathBytes>,
         selection_in_copy: bool,
     },
     /// Select an operator directory and require kernel-checked search access:
@@ -1697,7 +1711,7 @@ pub enum Response {
     /// Absolute operator spelling plus device/inode of the securely opened
     /// directory, or None when an allowed missing suffix was reached.
     DirectorySelection(Option<DirectoryAnchor>),
-    DirectoryRelations(Vec<Vec<DirectoryRelation>>),
+    DirectoryRelations(Vec<SourceDirectoryRelations>),
     DestinationRegistered(DescriptorTicket),
     SourceRootsRegistered(Vec<RegisteredSourceRoot>),
     DestinationFilesystemInfo(DestinationFilesystemInfo),
@@ -2332,11 +2346,6 @@ impl<W: Write> postcard::ser_flavors::Flavor for MessageOutput<'_, W> {
         }
         Ok(())
     }
-}
-
-/// Whether `msg` is too large for a `FrameWriter` to send.
-pub(crate) fn exceeds_message_limit<T: Serialize + SizeHint>(msg: &T) -> bool {
-    postcard::experimental::serialized_size(msg).is_ok_and(|size| size >= msg.frame_limit())
 }
 
 pub struct FrameWriter<W: Write> {

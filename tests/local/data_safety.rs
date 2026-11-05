@@ -448,6 +448,50 @@ fn prune_named_directory_cannot_remove_another_selected_source() {
     assert!(!t.path("b/photos/file").exists());
 }
 
+/// Every selected source is compared with every directory the copy may
+/// prune, but the destination looks up each directory once, not once for
+/// each pair: the lookups grow with the number of sources, not its square.
+#[cfg(debug_assertions)]
+#[test]
+fn prune_overlap_checks_grow_linearly_with_sources() {
+    let lookups = |count: usize| {
+        let t = Tmp::new();
+        let mut args = vec!["cp".to_string(), "--prune".to_string()];
+        for index in 0..count {
+            let source = format!("src/d{index:03}");
+            write(&t.path(&format!("{source}/file")), b"contents");
+            args.push(t.s(&source));
+        }
+        args.extend(["--into".to_string(), t.s("dst"), "-q".to_string()]);
+        let log = t.path("lookups");
+        // The second copy finds every directory it may prune, so both sides
+        // of each comparison are walked.
+        for _ in 0..2 {
+            let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+                .args(&args)
+                .env("SYQ_TEST_ANCESTRY_LOOKUPS_LOG", &log)
+                .run()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        }
+        let lookups: Vec<u64> = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| line.parse().unwrap())
+            .collect();
+        assert_eq!(lookups.len(), 2, "{lookups:?}");
+        lookups.iter().sum::<u64>()
+    };
+    let (few, many) = (lookups(8), lookups(64));
+    assert!(few > 0);
+    // Eight times the sources: linear lookups grow about eightfold, while
+    // walking every pair takes about 58 times as many.
+    assert!(
+        many < 16 * few,
+        "{few} directory lookups for 8 sources, {many} for 64"
+    );
+}
+
 #[test]
 fn prune_preserves_replacement_recovery_entries_and_their_contents() {
     let t = Tmp::new();

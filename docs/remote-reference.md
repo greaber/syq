@@ -340,7 +340,8 @@ coordination, and other peer-auth modes keep their separate
 connection requirements. `--coordinate-at local` can reuse approved access to
 each endpoint and explicitly relays file data through the invoking machine.
 
-The source's SSH server must permit remote Unix-socket forwarding. A TCP copy
+The source's SSH server must permit remote Unix-socket forwarding, and OpenSSH
+7.8 and later also require it to permit remote TCP forwarding. A TCP copy
 needs one free SSH session on each connection; SSH worker setup needs a second
 free session on the destination's connection. Prepared helpers stay ready for
 completion when sessions are available. If SSH refuses startup, syq releases

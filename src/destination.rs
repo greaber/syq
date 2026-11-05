@@ -71,6 +71,60 @@ const PREFIX: &str = "named-v2:";
 const REQUEST_ROOT: &[u8] = b"/SYQ-RECEIVE";
 const RECONNECT_PENDING: i32 = 75;
 
+/// The first wait before a receiving connection whose login was rejected
+/// tries again, and the longest, which later waits double up to.
+const LOGIN_RETRY_FIRST: Duration = Duration::from_secs(30);
+const LOGIN_RETRY_MAX: Duration = Duration::from_secs(600);
+
+fn login_retry_first() -> Duration {
+    // Tests shorten the first wait to see a retry happen by itself.
+    #[cfg(debug_assertions)]
+    if let Some(millis) = std::env::var("SYQ_TEST_LOGIN_RETRY_MS")
+        .ok()
+        .and_then(|millis| millis.parse().ok())
+    {
+        return Duration::from_millis(millis);
+    }
+    LOGIN_RETRY_FIRST
+}
+
+/// How long after a failed receiving connection's last attempt a command
+/// connecting to its server may restart it.
+pub(crate) fn command_retry_interval() -> Duration {
+    // Tests shorten it to see a command restart the connection.
+    #[cfg(debug_assertions)]
+    if let Some(millis) = std::env::var("SYQ_TEST_COMMAND_RETRY_MS")
+        .ok()
+        .and_then(|millis| millis.parse().ok())
+    {
+        return Duration::from_millis(millis);
+    }
+    LOGIN_RETRY_FIRST
+}
+
+fn next_login_retry(wait: Duration) -> Duration {
+    (wait * 2).min(LOGIN_RETRY_MAX)
+}
+
+/// A wait as a status shows it: whole seconds, rounded up, below two
+/// minutes, otherwise the nearest whole minute.
+pub(crate) fn retry_wait(wait: Duration) -> String {
+    let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+    if seconds < 120 {
+        format!("{seconds} s")
+    } else {
+        format!("{} min", (seconds + 30) / 60)
+    }
+}
+
+/// Whether ssh's error output says the server refused a remote forwarding,
+/// as OpenSSH reports it under `ExitOnForwardFailure`.
+fn refuses_remote_forwarding(ssh_error: &str) -> bool {
+    ssh_error
+        .lines()
+        .any(|line| line.contains("remote port forwarding failed for listen"))
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 enum Approval {
@@ -1588,6 +1642,8 @@ pub(crate) fn serve_background(
     config: crate::receive_service::Settings,
     spec: crate::receive_service::ServiceSpec,
     stop: Arc<AtomicBool>,
+    // Disconnected when `stop` is set, which ends its waits at once.
+    woken: mpsc::Receiver<()>,
     state: Arc<Mutex<crate::receive_service::ConnectionState>>,
     approvals: Arc<crate::receive_approval::Queue>,
 ) -> Result<()> {
@@ -1658,6 +1714,7 @@ pub(crate) fn serve_background(
     )?;
     let result = (|| {
         let mut delay = Duration::from_secs(1);
+        let mut login_delay = login_retry_first();
         while !stop.load(Ordering::Acquire) {
             let socket = format!("/tmp/syq-return-{}.sock", random_token()?);
             let args = [
@@ -1709,11 +1766,14 @@ pub(crate) fn serve_background(
                     .spawn_guarded()
                     .context("start receiving SSH connection")?,
             );
-            *state.lock().unwrap() = crate::receive_service::ConnectionState {
-                phase: "connecting".into(),
-                error: None,
-                ssh_pid: Some(child.0.id()),
-            };
+            {
+                let mut state = state.lock().unwrap();
+                state.phase = "connecting".into();
+                state.error = None;
+                state.ssh_pid = Some(child.0.id());
+                state.attempted = Some(Instant::now());
+                state.retry = None;
+            }
             let (ready, readiness) = mpsc::sync_channel(1);
             let mut stdout = child.0.stdout.take().unwrap();
             let reader = std::thread::spawn(move || {
@@ -1744,7 +1804,7 @@ pub(crate) fn serve_background(
                 if !online && connected.elapsed() >= Duration::from_secs(30) {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                let _ = woken.recv_timeout(Duration::from_millis(50));
             }
             let exit = child.0.try_wait()?;
             drop(child);
@@ -1768,19 +1828,65 @@ pub(crate) fn serve_background(
             {
                 bail!("server rejected return connection: {error}; run syq persist connect {} on the receiving machine to retry", shell_words::quote(&spec.endpoint.label()));
             }
-            *state.lock().unwrap() = crate::receive_service::ConnectionState {
-                phase: "reconnecting".into(),
-                error: Some(error),
-                ssh_pid: None,
+            // Dialing again cannot help a server whose configuration refuses
+            // the return socket; each attempt would only log in once more. A
+            // later command connecting to the server retries.
+            if !online && refuses_remote_forwarding(&error) {
+                bail!(
+                    "{} refuses remote forwarding, which receiving needs ({error}); allow remote Unix socket forwarding in its SSH server (OpenSSH 7.8 and later also need remote TCP forwarding allowed), then run syq persist connect {} on the receiving machine",
+                    spec.endpoint.label(),
+                    shell_words::quote(&spec.endpoint.label())
+                );
+            }
+            if online {
+                login_delay = login_retry_first();
+            }
+            // A rejected login, as after a key was removed, or a host key
+            // that does not match is tried again less and less often: it may
+            // only be an agent still locked after sleep. The status says why
+            // meanwhile. `persist connect` starts the connection over, and
+            // another command connecting to the server wakes this wait once
+            // a while has passed since the last attempt
+            // (`command_retry_interval`), keeping the waits growing.
+            let login = (!online)
+                .then(|| crate::conn::login_rejection(&error))
+                .flatten();
+            let wait = match login {
+                Some(advice) => {
+                    let wait = login_delay;
+                    login_delay = next_login_retry(login_delay);
+                    let mut state = state.lock().unwrap();
+                    state.phase = "failed".into();
+                    state.error = Some(format!(
+                        "cannot log in to {} ({error}): {advice}",
+                        spec.endpoint.label()
+                    ));
+                    state.ssh_pid = None;
+                    state.retry = Some((
+                        Instant::now() + wait,
+                        format!(
+                            ", or run syq persist connect {} to try now",
+                            shell_words::quote(&spec.endpoint.label())
+                        ),
+                    ));
+                    wait
+                }
+                None => {
+                    let mut state = state.lock().unwrap();
+                    state.phase = "reconnecting".into();
+                    state.error = Some(error);
+                    state.ssh_pid = None;
+                    state.retry = None;
+                    if online && connected.elapsed() >= Duration::from_secs(60) {
+                        delay = Duration::from_secs(1);
+                    }
+                    delay
+                }
             };
-            if online && connected.elapsed() >= Duration::from_secs(60) {
-                delay = Duration::from_secs(1);
+            let _ = woken.recv_timeout(wait);
+            if login.is_none() {
+                delay = (delay * 2).min(Duration::from_secs(30));
             }
-            let until = Instant::now() + delay;
-            while !stop.load(Ordering::Acquire) && Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            delay = (delay * 2).min(Duration::from_secs(30));
         }
         Ok(())
     })();
@@ -1969,7 +2075,7 @@ fn destinations(action: DestinationAction) -> Result<i32> {
             names.sort();
             names.dedup();
             for name in names {
-                println!(
+                crate::output::command_println!(
                     "@{name}\t{}",
                     if available(&name, Duration::from_secs(1)).is_ok() {
                         "online"
@@ -1995,7 +2101,7 @@ fn destinations(action: DestinationAction) -> Result<i32> {
                 bail!("destination @{name} is still registered; stop its receiver first");
             }
             identity::forget(&directory, &name)?;
-            println!("syq: forgot offline destination @{name}");
+            crate::output::command_println!("syq: forgot offline destination @{name}");
             Ok(0)
         }
         DestinationAction::Wait { name, timeout } => {

@@ -343,6 +343,54 @@ fn double_verbose_dry_run_reports_ipv6_arrival_address_as_reachable() {
 }
 
 #[test]
+fn double_verbose_names_the_host_an_advertised_address_belongs_to() {
+    // The server advertises the address ssh arrived on, which is also where
+    // the host's name leads: -vv shows that address once, under the name.
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"named");
+    let remote = format!("localhost:{}", t.s("dst"));
+
+    let out = compat_command()
+        .arg("-e")
+        .arg(&rsh)
+        .arg("--rsync-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--syq-tcp-ports", EPHEMERAL_TCP_PORTS])
+        .args(["--dry-run", "-vv", "-a"])
+        .arg(t.s("src"))
+        .arg(&remote)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("FAKE_SSH_CONNECTION", "127.0.0.1 40000 127.0.0.1 22")
+        .env("SYQ_TEST_NO_INTERFACE_ADDRESSES", "1")
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .run()
+        .expect("run double-verbose dry-run");
+
+    assert_output_ok(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let line = stderr
+        .lines()
+        .find(|line| line.contains("TCP 127.0.0.1:"))
+        .unwrap_or_else(|| panic!("{stderr}"));
+    assert!(
+        line.contains(" (localhost): reachable, link speed unknown, selected by preflight"),
+        "{stderr}"
+    );
+    // Where localhost leads only to that address, its own line would say
+    // the same thing again.
+    use std::net::ToSocketAddrs as _;
+    let only_ipv4 = ("localhost", 0)
+        .to_socket_addrs()
+        .unwrap()
+        .all(|address| address.ip() == std::net::Ipv4Addr::LOCALHOST);
+    assert_eq!(stderr.contains("TCP localhost:"), !only_ipv4, "{stderr}");
+}
+
+#[test]
 fn single_verbose_keeps_file_listing_semantics() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);

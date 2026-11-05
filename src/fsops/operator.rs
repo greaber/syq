@@ -289,21 +289,18 @@ impl OperatorDirectorySelection {
     }
 
     /// Compare an effective directory beneath this retained operator
-    /// selection with an exact opened source directory. Existing components
-    /// are opened without following symlinks. Once a missing or non-directory
-    /// component is reached, the remaining virtual suffix is interpreted
-    /// component by component so `.` and `..` retain kernel path semantics.
+    /// selection with an exact opened source directory.
     #[cfg(test)]
     pub(super) fn relation_to_source(
         &self,
         source: &File,
         suffix: &[u8],
     ) -> Result<DirectoryRelation> {
-        self.relation_to_source_with_access(
-            source,
-            suffix,
-            &mut TemporaryDirectorySearchAccess::default(),
-        )
+        let mut access = TemporaryDirectorySearchAccess::default();
+        let mut ancestry = DirectoryAncestry::new(self, &mut access);
+        let mut source = AncestrySource::new(source.try_clone()?, true)?;
+        let destination = ancestry.resolve(suffix)?;
+        ancestry.relation(&mut source, destination)
     }
 
     /// Whether the copy may widen the selected directory itself: not when it
@@ -315,13 +312,234 @@ impl OperatorDirectorySelection {
         let metadata = self.directory.metadata()?;
         Ok(Some((metadata.dev(), metadata.ino())))
     }
+}
 
-    pub(super) fn relation_to_source_with_access(
-        &self,
-        source: &File,
-        suffix: &[u8],
-        access: &mut TemporaryDirectorySearchAccess,
-    ) -> Result<DirectoryRelation> {
+/// Device and inode of an open directory.
+type Identity = (u64, u64);
+
+fn identity(metadata: &fs::Metadata) -> Identity {
+    (metadata.dev(), metadata.ino())
+}
+
+/// Compares exact source directories with effective destination directories
+/// beneath one retained operator selection. Each destination spelling is
+/// walked once, and each source's ancestors at most once, however many pairs
+/// are compared; the identities those walks gather decide every relation. The
+/// source descriptors stay open for the whole query, so device/inode reuse
+/// cannot turn a comparison into pathname authority.
+pub(super) struct DirectoryAncestry<'a> {
+    selection: &'a OperatorDirectorySelection,
+    access: &'a mut TemporaryDirectorySearchAccess,
+    destinations: Vec<EffectiveDirectory>,
+    by_suffix: HashMap<PathBytes, usize>,
+}
+
+/// The walk from the selection through one suffix, then up to the root.
+struct EffectiveDirectory {
+    /// Every component exists as a directory. Otherwise the copy would create
+    /// the rest beneath the directory the walk reached.
+    exists: bool,
+    /// The directory the walk reached, then each parent up to the root, as
+    /// far as the walk got.
+    chain: Vec<Identity>,
+    /// The walk up reached the root. Otherwise it failed with `error`.
+    finished: bool,
+    error: Option<anyhow::Error>,
+}
+
+impl EffectiveDirectory {
+    /// The relation of a source on this chain: an existing destination is the
+    /// source itself, and anything else lies beneath it.
+    fn relation_to(&self, source: Identity) -> Option<DirectoryRelation> {
+        let position = self.chain.iter().position(|&found| found == source)?;
+        Some(if position == 0 && self.exists {
+            DirectoryRelation::Same
+        } else {
+            DirectoryRelation::Descendant
+        })
+    }
+
+    fn failure(&mut self) -> anyhow::Error {
+        self.error
+            .take()
+            .unwrap_or_else(|| anyhow!("walk effective destination ancestry failed"))
+    }
+}
+
+/// An exact source directory; an exact file or symlink is represented by its
+/// parent.
+struct AncestrySource {
+    directory: File,
+    identity: Identity,
+    is_directory: bool,
+    ancestors: Option<SourceAncestors>,
+}
+
+/// A source's ancestors, from its parent up, as far as the walk got.
+struct SourceAncestors {
+    identities: Vec<Identity>,
+    end: AncestorsEnd,
+}
+
+enum AncestorsEnd {
+    Root,
+    Unsearchable,
+    Failed(Option<anyhow::Error>),
+}
+
+impl AncestrySource {
+    fn new(directory: File, is_directory: bool) -> Result<Self> {
+        let metadata = directory
+            .metadata()
+            .context("inspect source directory capability")?;
+        if !metadata.is_dir() {
+            bail!("destination ancestry source capability is not a directory");
+        }
+        Ok(Self {
+            directory,
+            identity: identity(&metadata),
+            is_directory,
+            ancestors: None,
+        })
+    }
+
+    /// Walked once, on first need. Source permissions are never changed.
+    fn ancestors(&mut self) -> &mut SourceAncestors {
+        let (directory, identity) = (&self.directory, self.identity);
+        self.ancestors.get_or_insert_with(|| {
+            let (identities, error) =
+                ancestors_from(open_operator_directory_at(directory, b".."), identity);
+            let end = match error {
+                None => AncestorsEnd::Root,
+                Some(error) if error_is_kind(&error, io::ErrorKind::PermissionDenied) => {
+                    AncestorsEnd::Unsearchable
+                }
+                Some(error) => AncestorsEnd::Failed(Some(error)),
+            };
+            SourceAncestors { identities, end }
+        })
+    }
+
+    /// How a destination not on the source's ancestry relates to it once the
+    /// walk up from the source has passed every ancestor it could reach.
+    fn beyond_ancestors(&mut self) -> Result<DirectoryRelation> {
+        match &mut self.ancestors().end {
+            AncestorsEnd::Root => Ok(DirectoryRelation::Separate),
+            AncestorsEnd::Unsearchable => Ok(DirectoryRelation::SourceUnsearchable),
+            AncestorsEnd::Failed(error) => Err(error
+                .take()
+                .unwrap_or_else(|| anyhow!("walk source directory ancestry failed"))),
+        }
+    }
+
+    /// An exact file's parent that is the destination puts the file in it,
+    /// and a destination beneath that parent cannot contain the file.
+    fn as_seen(&self, relation: DirectoryRelation) -> DirectoryRelation {
+        match relation {
+            _ if self.is_directory => relation,
+            DirectoryRelation::Same => DirectoryRelation::Ancestor,
+            DirectoryRelation::Descendant => DirectoryRelation::Separate,
+            other => other,
+        }
+    }
+}
+
+/// Identities from `parent`, the opened parent of the directory `child`, up to
+/// the root, and the error that stopped the walk below the root.
+fn ancestors_from(
+    mut parent: Result<File>,
+    mut child: Identity,
+) -> (Vec<Identity>, Option<anyhow::Error>) {
+    let mut identities = Vec::new();
+    loop {
+        let step = parent
+            .context("walk effective destination ancestry")
+            .and_then(|parent| {
+                let metadata = parent
+                    .metadata()
+                    .context("inspect effective destination parent")?;
+                Ok((parent, identity(&metadata)))
+            });
+        match step {
+            Err(error) => return (identities, Some(error)),
+            Ok((_, found)) if found == child => return (identities, None),
+            Ok((directory, found)) => {
+                identities.push(found);
+                child = found;
+                parent = open_operator_directory_at(&directory, b"..");
+            }
+        }
+    }
+}
+
+impl<'a> DirectoryAncestry<'a> {
+    pub(super) fn new(
+        selection: &'a OperatorDirectorySelection,
+        access: &'a mut TemporaryDirectorySearchAccess,
+    ) -> Self {
+        Self {
+            selection,
+            access,
+            destinations: Vec::new(),
+            by_suffix: HashMap::new(),
+        }
+    }
+
+    /// One check's relations: to each of its own suffixes, then to the shared
+    /// suffixes together, which is that of the first shared suffix it is
+    /// `Same`, `Descendant` or `Ancestor` to; otherwise `SourceUnsearchable`
+    /// if it is to any, else `Separate`. Each suffix is walked once for all
+    /// checks, and each source's ancestors at most once.
+    pub(super) fn check(
+        &mut self,
+        source: File,
+        is_directory: bool,
+        suffixes: &[PathBytes],
+        shared: &[PathBytes],
+    ) -> Result<SourceDirectoryRelations> {
+        if suffixes.is_empty() && shared.is_empty() {
+            return Ok(SourceDirectoryRelations {
+                relations: Vec::new(),
+                shared: DirectoryRelation::Separate,
+            });
+        }
+        let mut source = AncestrySource::new(source, is_directory)?;
+        let relations = suffixes
+            .iter()
+            .map(|suffix| {
+                let destination = self.resolve(suffix)?;
+                self.relation(&mut source, destination)
+            })
+            .collect::<Result<_>>()?;
+        let mut combined = DirectoryRelation::Separate;
+        for suffix in shared {
+            let destination = self.resolve(suffix)?;
+            match self.relation(&mut source, destination)? {
+                DirectoryRelation::Separate => {}
+                DirectoryRelation::SourceUnsearchable => {
+                    combined = DirectoryRelation::SourceUnsearchable;
+                }
+                refusing => {
+                    combined = refusing;
+                    break;
+                }
+            }
+        }
+        Ok(SourceDirectoryRelations {
+            relations,
+            shared: combined,
+        })
+    }
+
+    /// The destination `suffix` names, walked on first use. Existing
+    /// components are opened without following symlinks. Once a missing or
+    /// non-directory component is reached, the remaining virtual suffix is
+    /// interpreted component by component so `.` and `..` retain kernel path
+    /// semantics.
+    fn resolve(&mut self, suffix: &[u8]) -> Result<usize> {
+        if let Some(&destination) = self.by_suffix.get(suffix) {
+            return Ok(destination);
+        }
         if suffix.starts_with(b"/") {
             bail!("destination ancestry suffix must be relative");
         }
@@ -329,18 +547,12 @@ impl OperatorDirectorySelection {
             bail!("destination ancestry suffix contains NUL");
         }
 
-        let source_metadata = source
-            .metadata()
-            .context("inspect source directory capability")?;
-        if !source_metadata.is_dir() {
-            bail!("destination ancestry source capability is not a directory");
-        }
-
         let mut directory = self
+            .selection
             .directory
             .try_clone()
             .context("duplicate retained destination directory")?;
-        let mut components = self.missing.clone();
+        let mut components = self.selection.missing.clone();
         components.extend(
             suffix
                 .split(|byte| *byte == b'/')
@@ -371,7 +583,7 @@ impl OperatorDirectorySelection {
             let opened = if left_selection {
                 open_operator_directory_at(&directory, &component)
             } else {
-                access.open(&directory, &component)
+                self.access.open(&directory, &component)
             };
             match opened {
                 Ok(child) => directory = child,
@@ -391,79 +603,49 @@ impl OperatorDirectorySelection {
             }
         }
 
-        let destination_metadata = directory.metadata()?;
-        let mut no_access = TemporaryDirectorySearchAccess::default();
-        let relation = opened_directory_relation(
-            directory,
-            source_metadata.dev(),
-            source_metadata.ino(),
-            !virtual_components.is_empty(),
-            if left_selection {
-                &mut no_access
-            } else {
-                access
-            },
-        )?;
-        if relation == DirectoryRelation::Separate && virtual_components.is_empty() {
-            // Source permissions are never changed.
-            match opened_directory_relation(
-                source.try_clone()?,
-                destination_metadata.dev(),
-                destination_metadata.ino(),
-                false,
-                &mut TemporaryDirectorySearchAccess::default(),
-            ) {
-                Ok(DirectoryRelation::Descendant) => return Ok(DirectoryRelation::Ancestor),
-                Ok(_) => {}
-                Err(error) if error_is_kind(&error, io::ErrorKind::PermissionDenied) => {
-                    return Ok(DirectoryRelation::SourceUnsearchable);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(relation)
-    }
-}
-
-/// Walk parents from an already-open destination directory. The source
-/// descriptor stays open for the whole query, so device/inode reuse cannot
-/// turn the comparison into pathname authority.
-pub(super) fn opened_directory_relation(
-    mut directory: File,
-    source_dev: u64,
-    source_ino: u64,
-    virtual_descendant: bool,
-    access: &mut TemporaryDirectorySearchAccess,
-) -> Result<DirectoryRelation> {
-    let mut below_candidate = virtual_descendant;
-    let mut reached_directory = true;
-    loop {
-        let metadata = directory
-            .metadata()
-            .context("inspect effective destination directory")?;
-        if (metadata.dev(), metadata.ino()) == (source_dev, source_ino) {
-            return Ok(if below_candidate {
-                DirectoryRelation::Descendant
-            } else {
-                DirectoryRelation::Same
-            });
-        }
+        let reached = identity(&directory.metadata()?);
         // The reached directory may need search access. Its ancestors lie
         // above the copy and are never widened by this check.
-        let parent = if std::mem::take(&mut reached_directory) {
-            access.open(&directory, b"..")
-        } else {
+        let parent = if left_selection {
             open_operator_directory_at(&directory, b"..")
-        }
-        .context("walk effective destination ancestry")?;
-        let parent_metadata = parent
-            .metadata()
-            .context("inspect effective destination parent")?;
-        if (parent_metadata.dev(), parent_metadata.ino()) == (metadata.dev(), metadata.ino()) {
-            return Ok(DirectoryRelation::Separate);
-        }
-        directory = parent;
-        below_candidate = true;
+        } else {
+            self.access.open(&directory, b"..")
+        };
+        let (ancestors, error) = ancestors_from(parent, reached);
+        let mut chain = Vec::with_capacity(ancestors.len() + 1);
+        chain.push(reached);
+        chain.extend(ancestors);
+        self.destinations.push(EffectiveDirectory {
+            exists: virtual_components.is_empty(),
+            chain,
+            finished: error.is_none(),
+            error,
+        });
+        let destination = self.destinations.len() - 1;
+        self.by_suffix.insert(suffix.to_vec(), destination);
+        Ok(destination)
+    }
+
+    /// The relation of `source` to one destination, as walking up from the
+    /// destination, and then from the source when it exists, finds it.
+    fn relation(
+        &mut self,
+        source: &mut AncestrySource,
+        destination: usize,
+    ) -> Result<DirectoryRelation> {
+        let directory = &mut self.destinations[destination];
+        let relation = if let Some(relation) = directory.relation_to(source.identity) {
+            relation
+        } else if !directory.finished {
+            return Err(directory.failure());
+        } else if !directory.exists {
+            DirectoryRelation::Separate
+        } else if source.ancestors().identities.contains(&directory.chain[0]) {
+            DirectoryRelation::Ancestor
+        } else {
+            source.beyond_ancestors()?
+        };
+        Ok(source.as_seen(relation))
     }
 }
 
@@ -672,4 +854,128 @@ fn appeared_after_precondition() -> anyhow::Error {
         "destination directory appeared after the new-path precondition",
     )
     .into()
+}
+
+/// Master's per-pair ancestry check before the shared walk replaced it
+/// (b77f661a, `relation_to_source_with_access` and
+/// `opened_directory_relation`), without temporary search access. Tests
+/// compare the shared walk with it: it walks the destination down and up and
+/// the source up for each pair on its own.
+#[cfg(test)]
+pub(super) fn pairwise_relation_for_test(
+    selection: &OperatorDirectorySelection,
+    source: &File,
+    source_is_directory: bool,
+    suffix: &[u8],
+) -> Result<DirectoryRelation> {
+    if suffix.starts_with(b"/") {
+        bail!("destination ancestry suffix must be relative");
+    }
+    if suffix.contains(&0) {
+        bail!("destination ancestry suffix contains NUL");
+    }
+    let source_metadata = source
+        .metadata()
+        .context("inspect source directory capability")?;
+    if !source_metadata.is_dir() {
+        bail!("destination ancestry source capability is not a directory");
+    }
+    let mut directory = selection
+        .directory
+        .try_clone()
+        .context("duplicate retained destination directory")?;
+    let mut components = selection.missing.clone();
+    components.extend(
+        suffix
+            .split(|byte| *byte == b'/')
+            .filter(|component| !component.is_empty())
+            .map(<[u8]>::to_vec),
+    );
+    let mut virtual_components: Vec<Vec<u8>> = Vec::new();
+    while let Some(component) = components.pop_front() {
+        if component == b"." {
+            continue;
+        }
+        if component == b".." {
+            if virtual_components.pop().is_none() {
+                directory = open_operator_directory_at(&directory, b"..")
+                    .context("open retained destination parent")?;
+            }
+            continue;
+        }
+        if !virtual_components.is_empty() {
+            virtual_components.push(component);
+            continue;
+        }
+        match open_operator_directory_at(&directory, &component) {
+            Ok(child) => directory = child,
+            Err(error) if absent_or_nondirectory(&error) => virtual_components.push(component),
+            Err(error) => return Err(error),
+        }
+    }
+    let destination_metadata = directory.metadata()?;
+    let mut relation = pairwise_opened_relation(
+        directory,
+        source_metadata.dev(),
+        source_metadata.ino(),
+        !virtual_components.is_empty(),
+    )?;
+    if relation == DirectoryRelation::Separate && virtual_components.is_empty() {
+        match pairwise_opened_relation(
+            source.try_clone()?,
+            destination_metadata.dev(),
+            destination_metadata.ino(),
+            false,
+        ) {
+            Ok(DirectoryRelation::Descendant) => relation = DirectoryRelation::Ancestor,
+            Ok(_) => {}
+            Err(error) if error_is_kind(&error, io::ErrorKind::PermissionDenied) => {
+                relation = DirectoryRelation::SourceUnsearchable;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    // An exact file is represented by its parent, as master's
+    // `check_operator_directory_ancestry` mapped it.
+    Ok(if source_is_directory {
+        relation
+    } else {
+        match relation {
+            DirectoryRelation::Same => DirectoryRelation::Ancestor,
+            DirectoryRelation::Descendant => DirectoryRelation::Separate,
+            other => other,
+        }
+    })
+}
+
+#[cfg(test)]
+fn pairwise_opened_relation(
+    mut directory: File,
+    source_dev: u64,
+    source_ino: u64,
+    virtual_descendant: bool,
+) -> Result<DirectoryRelation> {
+    let mut below_candidate = virtual_descendant;
+    loop {
+        let metadata = directory
+            .metadata()
+            .context("inspect effective destination directory")?;
+        if (metadata.dev(), metadata.ino()) == (source_dev, source_ino) {
+            return Ok(if below_candidate {
+                DirectoryRelation::Descendant
+            } else {
+                DirectoryRelation::Same
+            });
+        }
+        let parent = open_operator_directory_at(&directory, b"..")
+            .context("walk effective destination ancestry")?;
+        let parent_metadata = parent
+            .metadata()
+            .context("inspect effective destination parent")?;
+        if (parent_metadata.dev(), parent_metadata.ino()) == (metadata.dev(), metadata.ino()) {
+            return Ok(DirectoryRelation::Separate);
+        }
+        directory = parent;
+        below_candidate = true;
+    }
 }
