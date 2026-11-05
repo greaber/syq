@@ -264,7 +264,12 @@ fn run() {
         }
         fsops::reserve_startup_descriptors();
         if let Err(error) = server::run_checker(enrollment, generation) {
-            crate::output::exit_on_error(&error, 1, "syq restricted receiver");
+            let code = if crate::restricted::is_sessions_full(&error) {
+                crate::restricted::SESSIONS_FULL_EXIT
+            } else {
+                1
+            };
+            crate::output::exit_on_error(&error, code, "syq restricted receiver");
         }
         return;
     }

@@ -125,10 +125,33 @@ impl UnverifiedSlot {
                 }
             }
         }
-        bail!(
+        Err(SessionsFull(format!(
             "{slots} other connections are starting copies on this enrollment; try again shortly, or replace its entry key with `syq receiver revoke` and enroll again if this persists"
-        )
+        ))
+        .into())
     }
+}
+
+/// Every slot for unverified sessions was taken, so the session was refused.
+/// The receiver exits with [`SESSIONS_FULL_EXIT`], and a coordinator that
+/// sees it reports this error, which it retries soon: the slots free as
+/// soon as other connections finish starting.
+#[derive(Debug)]
+pub(crate) struct SessionsFull(pub(crate) String);
+
+impl fmt::Display for SessionsFull {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SessionsFull {}
+
+/// The exit status of a session refused for [`SessionsFull`].
+pub(crate) const SESSIONS_FULL_EXIT: i32 = 73;
+
+pub(crate) fn is_sessions_full(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<SessionsFull>())
 }
 
 /// What a session the forced command started may go on to do.
@@ -364,7 +387,7 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
                 .expect("account required");
             let (login, host) = enrollment_account(account)?;
             let via = via()?;
-            let (metadata, _, _) = enroll(&host, None, &login, via.as_ref(), true, None)?;
+            let (metadata, _, _) = enroll(&host, None, &login, (via.as_ref(), false), true, None)?;
             crate::output::command_println!(
                 "enrolled {} for {}",
                 metadata.id,
@@ -402,17 +425,17 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
             };
             let target = endpoint(&target_login, &host, port)?;
             let encoded = serde_json::to_vec(&request)?;
-            let direct = run_management_over_route(
+            let configured = run_management_over_route(
                 &target,
-                EnrollmentRoute::Direct,
+                EnrollmentRoute::Configured,
                 id,
                 ManagementAction::Revoke,
                 &encoded,
             );
-            match (direct, via.as_ref()) {
+            match (configured, via.as_ref()) {
                 (Ok(_), _) => {}
-                (Err(direct_error), Some(via))
-                    if is_enrollment_transport_failure(&direct_error) =>
+                (Err(configured_error), Some(via))
+                    if is_enrollment_transport_failure(&configured_error) =>
                 {
                     run_management_over_route(
                         &target,
@@ -421,7 +444,9 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
                         ManagementAction::Revoke,
                         &encoded,
                     )
-                    .with_context(|| format!("direct revocation also failed: {direct_error:#}"))?;
+                    .with_context(|| {
+                        format!("revoking along your SSH configuration's route also failed: {configured_error:#}")
+                    })?;
                 }
                 (Err(error), _) => return Err(error),
             }

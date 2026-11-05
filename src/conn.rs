@@ -979,6 +979,16 @@ impl RemoteConn {
                         }
                         return anyhow!("{}: remote syq exited ({status})", self.label);
                     }
+                    // An enrolled receiver whose slots for starting
+                    // sessions are all taken refuses before its preamble;
+                    // that is no version skew, and trying again soon works.
+                    if status.code() == Some(crate::restricted::SESSIONS_FULL_EXIT) {
+                        return crate::restricted::SessionsFull(format!(
+                            "{}: the receiver refused the connection while other connections were starting ({status})",
+                            self.label
+                        ))
+                        .into();
+                    }
                     // For other early exits, a preamble failure is the
                     // actionable version-skew diagnosis; the exit status is
                     // commonly just the old helper rejecting unknown bytes.

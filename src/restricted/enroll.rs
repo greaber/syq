@@ -133,6 +133,39 @@ pub(super) fn enrollment_ssh_error(
     })
 }
 
+/// What SSH itself said when it failed (`ssh_failed`: exit status 255, or
+/// no output from the remote command): the last lines of its trace that are
+/// not debug output, such as "Permission denied (publickey)." or a host name
+/// it could not resolve. Logging to a file, SSH writes these only there.
+/// When SSH worked and the remote command failed, those lines are only its
+/// progress, so there is none.
+pub(super) fn ssh_reason(trace: &str, ssh_failed: bool) -> Option<String> {
+    if !ssh_failed {
+        return None;
+    }
+    let lines: Vec<&str> = trace
+        .lines()
+        .filter(|line| {
+            !line.trim().is_empty()
+                && !line.starts_with("debug")
+                // An indented line continues a debug line, such as the
+                // open channels listed when the session closes.
+                && !line.starts_with(char::is_whitespace)
+                // The progress SSH reports at this log level.
+                && !line.starts_with("Authenticated to ")
+                && !line.starts_with("Transferred: ")
+                && !line.starts_with("Bytes per second: ")
+        })
+        .map(str::trim)
+        .collect();
+    let reason = lines[lines.len().saturating_sub(3)..]
+        .iter()
+        .map(|line| line.chars().take(300).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("; ");
+    (!reason.is_empty()).then_some(reason)
+}
+
 pub(super) fn is_enrollment_transport_failure(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
@@ -147,7 +180,8 @@ pub(super) fn run_ssh(
     remote_command: &str,
     input: &[u8],
 ) -> Result<Vec<u8>> {
-    let args = enrollment::enrollment_ssh_args_raw(target, route, remote_command);
+    // Only `syq receiver revoke` manages an enrollment, in the foreground.
+    let args = enrollment::enrollment_ssh_args_raw(target, route, remote_command, false);
     let mut command = Command::new("ssh");
     command
         .args(args)
@@ -400,10 +434,13 @@ pub(super) fn endpoint(login: &str, host: &str, port: Option<u16>) -> Result<Ssh
 pub(super) fn configured_agent(
     target: &SshEndpoint,
     route: EnrollmentRoute<'_>,
+    background: bool,
 ) -> Result<Option<PathBuf>> {
     let output = Command::new("ssh")
         .arg("-G")
-        .args(enrollment::enrollment_ssh_args_raw(target, route, ""))
+        .args(enrollment::enrollment_ssh_args_raw(
+            target, route, "", background,
+        ))
         .capture_output()
         .context("inspect the SSH configuration for the enrollment's login")?;
     if !output.status.success() {
@@ -439,12 +476,13 @@ pub(super) type DestinationCheck<'a> = Option<&'a dyn Fn(&Path, &[PathBuf]) -> R
 /// The enrollment for `login@host:port`, set up when there is none, and
 /// refreshed when it runs another build or `refresh` asks to find the
 /// login key again. Returns the login key's signer when this logged in to
-/// the server.
+/// the server. With `batch`, SSH neither prompts nor accepts a host key the
+/// user has not trusted.
 pub(super) fn enroll(
     host: &str,
     port: Option<u16>,
     login: &str,
-    jump: Option<&SshEndpoint>,
+    (jump, batch): (Option<&SshEndpoint>, bool),
     refresh: bool,
     check: DestinationCheck<'_>,
 ) -> Result<(LocalEnrollment, PathBuf, Option<LoginSigner>)> {
@@ -497,7 +535,7 @@ pub(super) fn enroll(
     }
     let lost = (plan.refresh, plan.id, plan.directory.clone());
     let (metadata, directory, signer) =
-        match run_session(&target, jump, (host, port, login), plan, check)? {
+        match run_session(&target, (jump, batch), (host, port, login), plan, check)? {
             (Session::Installed(installed), directory) => {
                 let (metadata, signer) = *installed;
                 (metadata, directory, signer)
@@ -523,7 +561,7 @@ pub(super) fn enroll(
                     });
                 match run_session(
                     &target,
-                    jump,
+                    (jump, batch),
                     (host, port, login),
                     replacement_plan(&base, pending, replaced)?,
                     check,
@@ -580,7 +618,7 @@ fn new_plan(base: &Path, replaces: Option<ReplacedEnrollment>) -> Plan {
 /// through `jump`.
 fn run_session(
     target: &SshEndpoint,
-    jump: Option<&SshEndpoint>,
+    (jump, batch): (Option<&SshEndpoint>, bool),
     account: (&str, Option<u16>, &str),
     plan: Plan,
     check: DestinationCheck<'_>,
@@ -591,19 +629,27 @@ fn run_session(
         "remains pending for a safe retry"
     };
     let id = plan.id;
-    let direct = install_over_route(target, EnrollmentRoute::Direct, account, &plan, check);
-    let session = match (direct, jump) {
+    // The user's own login first, along the route the SSH configuration
+    // gives; then through `jump` when that cannot connect.
+    let configured = install_over_route(
+        target,
+        EnrollmentRoute::Configured,
+        account,
+        (&plan, batch),
+        check,
+    );
+    let session = match (configured, jump) {
         (Ok(session), _) => session,
-        (Err(direct_error), Some(jump)) if is_enrollment_transport_failure(&direct_error) => {
+        (Err(configured_error), Some(jump)) if is_enrollment_transport_failure(&configured_error) => {
             install_over_route(
                 target,
                 EnrollmentRoute::ProxyJump { jump },
                 account,
-                &plan,
+                (&plan, batch),
                 check,
             )
             .with_context(|| {
-                format!("enrollment {id} {retry_state}; direct enrollment also failed: {direct_error:#}")
+                format!("enrollment {id} {retry_state}; enrolling along your SSH configuration's route also failed: {configured_error:#}")
             })?
         }
         (Err(error), _) => {
@@ -621,28 +667,45 @@ fn install_over_route(
     target: &SshEndpoint,
     route: EnrollmentRoute<'_>,
     (host, port, login): (&str, Option<u16>, &str),
-    plan: &Plan,
+    (plan, batch): (&Plan, bool),
     check: DestinationCheck<'_>,
 ) -> Result<Session> {
-    let agent = configured_agent(target, route.clone())?;
+    let agent = configured_agent(target, route.clone(), batch)?;
     let temporary = crate::private_broker::private_temp_dir("syq-enroll-")?;
     let trace_path = temporary.path().join("ssh.log");
     let stage = stage_name(plan.id)?;
     let remote = in_sh(&install_remote_command(&stage));
     let mut command = Command::new("ssh");
+    // The trace goes to the file alone. With -v, OpenSSH would also start a
+    // configured jump with -v, which writes its own trace to stderr.
     command
-        .args(["-vvv", "-o", "FingerprintHash=sha256", "-E"])
-        .arg(&trace_path)
+        .args([
+            "-o",
+            "LogLevel=DEBUG3",
+            "-o",
+            "FingerprintHash=sha256",
+            "-E",
+        ])
+        .arg(&trace_path);
+    command
         .args(enrollment::enrollment_ssh_args_raw(
             target,
             route.clone(),
             &remote,
+            batch,
         ))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    let mut group = crate::process_group::ProcessGroup::spawn(&mut command)
-        .map_err(|error| enrollment_ssh_error(target, true, error))?;
+    // Without a terminal, the login stays in this process's group: the
+    // receiving service ends its setup child with that whole group, at its
+    // deadline or when the requester goes, and the login with it.
+    let mut group = if batch {
+        crate::process_group::ProcessGroup::spawn_in_this_group(&mut command)
+    } else {
+        crate::process_group::ProcessGroup::spawn(&mut command)
+    }
+    .map_err(|error| enrollment_ssh_error(target, true, error))?;
     let foreground = group
         .foreground()
         .context("give enrollment SSH access to the terminal")?;
@@ -701,10 +764,17 @@ fn install_over_route(
             } else {
                 group.wait()?
             };
+            let ssh_failed = !greeted || status.code() == Some(255);
+            let reason = fs::read_to_string(&trace_path)
+                .ok()
+                .and_then(|trace| ssh_reason(&trace, ssh_failed));
             return Err(enrollment_ssh_error(
                 target,
                 status.code() == Some(255),
-                error,
+                match reason {
+                    Some(reason) => format!("{error:#} ({reason})"),
+                    None => format!("{error:#}"),
+                },
             ));
         }
     };
@@ -813,8 +883,13 @@ fn install_over_route(
     }
     let status = group.wait()?;
     if !status.success() {
+        let reason = fs::read_to_string(&trace_path)
+            .ok()
+            .and_then(|trace| ssh_reason(&trace, status.code() == Some(255)))
+            .map(|reason| format!(": {reason}"))
+            .unwrap_or_default();
         bail!(
-            "installation over SSH failed ({status}); retry, or run `syq receiver revoke {}`",
+            "installation over SSH failed ({status}){reason}; retry, or run `syq receiver revoke {}`",
             plan.id
         );
     }

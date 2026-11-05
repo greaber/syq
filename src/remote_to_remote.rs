@@ -724,6 +724,16 @@ enum DestinationAuthentication {
     Receiver,
 }
 
+/// The SSH command for an enrolled receiver at `port`: the entry key alone,
+/// and only the pinned host keys, which `prepare_receiver_ssh_with` fills in.
+pub(crate) fn receiver_rsh(port: u16, host_key_algorithms: &str) -> String {
+    constrained_destination_rsh(
+        port,
+        host_key_algorithms,
+        DestinationAuthentication::Receiver,
+    )
+}
+
 /// The SSH command a coordinator uses to reach the destination. With the
 /// broker it authenticates through the forwarded, filtered agent. With an
 /// enrollment it uses the entry key alone, whose file replaces the
@@ -788,6 +798,11 @@ fn constrained_destination_rsh(
         // handshake in bounded time instead of waiting for the TCP timeout.
         "-o".to_owned(),
         "ConnectTimeout=10".to_owned(),
+        // And notice a destination that stops answering during the copy.
+        "-o".to_owned(),
+        "ServerAliveInterval=15".to_owned(),
+        "-o".to_owned(),
+        "ServerAliveCountMax=3".to_owned(),
         "-o".to_owned(),
         format!("HostKeyAlgorithms={host_key_algorithms}"),
         "-p".to_owned(),
@@ -809,7 +824,7 @@ pub(crate) const ENTRY_KEY_STDIN: &str = "SYQ_INTERNAL_NATIVE_ENTRY_KEY";
 /// Set with the entry key: this many bytes of the copy's signed directive
 /// follow it on the coordinator's input.
 pub(crate) const DIRECTIVE_STDIN: &str = "SYQ_INTERNAL_NATIVE_DIRECTIVE";
-const RECEIVER_HOST_ALIAS: &str = "syq-enrolled-receiver";
+pub(crate) const RECEIVER_HOST_ALIAS: &str = "syq-enrolled-receiver";
 /// The identity of the coordinator's SSH command to the receiver until the
 /// coordinator puts its copy of the entry key there. An SSH command that
 /// keeps it has no identity, and fails.
@@ -908,7 +923,7 @@ fn read_input(label: &str, length: usize, maximum: usize) -> Result<zeroize::Zer
     Ok(bytes)
 }
 
-fn prepare_receiver_ssh_with(
+pub(crate) fn prepare_receiver_ssh_with(
     args: &mut Args,
     known_hosts: &str,
     entry_key: &[u8],
@@ -1234,16 +1249,30 @@ fn run_remote(
         // form instead of silently keeping only the constrained broker.
         let prepared = (!coordinator_at_dst && args.peer_auth != PeerAuth::Broker)
             .then(|| {
-                crate::restricted::prepare_transfer(
-                    args,
-                    crate::approval_command::copy_command(args)?,
-                    srcs,
-                    dst,
-                    &coordinator_policy.login_user,
-                    &peer_policy.login_user,
-                    peer_policy.agent_socket(),
-                    !args.dry_run,
-                )
+                crate::directive::validate_restricted_args(args)?;
+                crate::restricted::prepare_transfer(crate::restricted::Issue {
+                    command: crate::approval_command::copy_command(args)?,
+                    cwd: crate::approval_command::current_directory(),
+                    inputs: crate::directive::Inputs {
+                        ignore: args.ignore_lines.clone(),
+                        mapping: crate::directive::mapping_authorization(args)?,
+                    },
+                    caps: None,
+                    host: dst.host.as_deref().context("destination host missing")?,
+                    port: dst.port,
+                    login: &peer_policy.login_user,
+                    // Enrolling can go through the source when the
+                    // destination cannot be reached along this machine's
+                    // SSH configuration's route.
+                    jump: Some(crate::enrollment::SshEndpoint::from_parts(
+                        &coordinator_policy.login_user,
+                        srcs[0].host.as_deref().context("source host missing")?,
+                        srcs[0].port,
+                    )?),
+                    agent: peer_policy.agent_socket(),
+                    allow_enrollment: !args.dry_run,
+                    batch: false,
+                })
             })
             .transpose()
             .context(

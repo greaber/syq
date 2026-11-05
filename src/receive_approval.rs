@@ -92,6 +92,14 @@ impl std::fmt::Display for Requester {
     }
 }
 
+/// The other server a copy approved here goes to, and what approving it
+/// sets up there first.
+#[derive(Clone, Copy)]
+pub(crate) struct Remote<'a> {
+    pub target: &'a str,
+    pub enrollment: crate::restricted::EnrollmentState,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Summary {
     pub id: String,
@@ -208,7 +216,7 @@ impl Summary {
         cwd: &str,
         request: &crate::destination::CopyRequest,
         lifetime: Duration,
-        remote: Option<&str>,
+        remote: Option<Remote<'_>>,
     ) -> Result<Self> {
         let mut id = [0; 16];
         getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("approval ID: {e}"))?;
@@ -228,17 +236,30 @@ impl Summary {
         // own destination is a placeholder until that server resolves it.
         let (destination, permission) = match remote {
             None => (
-                format!("{:?}", std::ffi::OsStr::from_bytes(&request.copy.destination)),
+                format!(
+                    "{:?}",
+                    std::ffi::OsStr::from_bytes(&request.copy.destination)
+                ),
                 permission.to_owned(),
             ),
             // Automatic approval of writes to this machine does not authorize
             // use of its SSH credentials on another host; say what that use is.
-            Some(target) => (
+            Some(Remote { target, enrollment }) => (
                 format!(
                     "{:?} on {target:?} using your SSH access",
                     std::ffi::OsStr::from_bytes(&request.destination)
                 ),
-                format!("{permission}. Uses this machine's SSH access to {target:?} and installs the syq helper there if needed"),
+                match enrollment {
+                    crate::restricted::EnrollmentState::Missing => format!(
+                        "{permission}. Also sets up restricted copying on {target:?}: adds a key to its ~/.ssh/authorized_keys that can only start syq's receiver for copies you approve, and installs syq {} in ~/.local/lib/syq. Remove it with `syq receiver revoke`",
+                        crate::identity::build()
+                    ),
+                    crate::restricted::EnrollmentState::Outdated => format!(
+                        "{permission}. Also updates restricted copying on {target:?}: installs syq {} in ~/.local/lib/syq and rewrites syq's line in its ~/.ssh/authorized_keys, whose key can only start syq's receiver for copies you approve",
+                        crate::identity::build()
+                    ),
+                    crate::restricted::EnrollmentState::Ready => format!("{permission}. Signs this copy with your SSH login key for {target:?}; the server keeps a key that can only start syq's receiver there"),
+                },
             ),
         };
         // Sources stay as the command wrote them, relative to `cwd` on the
@@ -258,7 +279,7 @@ impl Summary {
         let prunes = parsed.as_ref().is_some_and(|args| args.delete);
         let target = match remote {
             None => local_path(&request.copy.destination),
-            Some(target) => crate::approval_command::display_arg(
+            Some(Remote { target, .. }) => crate::approval_command::display_arg(
                 &[target.as_bytes(), b":", request.destination.as_slice()].concat(),
             ),
         };
@@ -879,13 +900,13 @@ impl Queue {
         from: &Requester,
         command: &[Vec<u8>],
         cwd: &str,
-        target: &str,
+        remote: Remote<'_>,
         request: &crate::destination::CopyRequest,
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
         self.wait(
-            Summary::new(from, command, cwd, request, TIMEOUT, Some(target))?,
+            Summary::new(from, command, cwd, request, TIMEOUT, Some(remote))?,
             notifications,
             TIMEOUT,
             cancelled,
@@ -1831,7 +1852,10 @@ mod tests {
             "~/rt-bench",
             &forwarded,
             TIMEOUT,
-            Some("backup"),
+            Some(Remote {
+                target: "backup",
+                enrollment: crate::restricted::EnrollmentState::Ready,
+            }),
         )
         .unwrap();
         assert!(remote.desktop_description(false).starts_with(&format!(
@@ -1844,7 +1868,41 @@ mod tests {
             "{details}"
         );
         assert!(!details.contains("SYQ-RECEIVE"), "{details}");
-        assert!(details.contains("May create and overwrite matching entries. Uses this machine's SSH access to \"backup\" and installs the syq helper there if needed\n"));
+        assert!(details.contains("May create and overwrite matching entries. Signs this copy with your SSH login key for \"backup\"; the server keeps a key that can only start syq's receiver there\n"));
+        let first = Summary::new(
+            &requester(),
+            &command,
+            "~/rt-bench",
+            &forwarded,
+            TIMEOUT,
+            Some(Remote {
+                target: "backup",
+                enrollment: crate::restricted::EnrollmentState::Missing,
+            }),
+        )
+        .unwrap()
+        .details_description(str::to_owned);
+        assert!(
+            first.contains("Also sets up restricted copying on \"backup\": adds a key to its ~/.ssh/authorized_keys that can only start syq's receiver for copies you approve"),
+            "{first}"
+        );
+        let outdated = Summary::new(
+            &requester(),
+            &command,
+            "~/rt-bench",
+            &forwarded,
+            TIMEOUT,
+            Some(Remote {
+                target: "backup",
+                enrollment: crate::restricted::EnrollmentState::Outdated,
+            }),
+        )
+        .unwrap()
+        .details_description(str::to_owned);
+        assert!(
+            outdated.contains(&format!("Also updates restricted copying on \"backup\": installs syq {} in ~/.local/lib/syq and rewrites syq's line in its ~/.ssh/authorized_keys", crate::identity::build())),
+            "{outdated}"
+        );
 
         // The server's directory is remote text: no line breaks or markup of
         // its own reach the prompt, and it never enters the title.
@@ -2162,7 +2220,10 @@ mod tests {
             "~",
             &request,
             TIMEOUT,
-            Some("backup"),
+            Some(Remote {
+                target: "backup",
+                enrollment: crate::restricted::EnrollmentState::Ready,
+            }),
         )
         .unwrap();
         assert!(sync

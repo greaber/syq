@@ -5,6 +5,8 @@ use std::process::{Child, Command, ExitStatus};
 pub(crate) struct ProcessGroup {
     pub child: Child,
     status: Option<ExitStatus>,
+    /// Whether the child leads its own group, which ending it kills.
+    leader: bool,
 }
 impl ProcessGroup {
     pub fn spawn(command: &mut Command) -> std::io::Result<Self> {
@@ -12,12 +14,35 @@ impl ProcessGroup {
         Ok(Self {
             child: command.process_group(0).spawn_guarded()?,
             status: None,
+            leader: true,
         })
+    }
+    /// A child that stays in this process's group, for a process whose own
+    /// owner ends that group with everything in it, such as the receiving
+    /// service's setup child. It cannot take the terminal.
+    pub fn spawn_in_this_group(command: &mut Command) -> std::io::Result<Self> {
+        Ok(Self {
+            child: command.spawn_guarded()?,
+            status: None,
+            leader: false,
+        })
+    }
+    /// The target of a signal to the child: its group when it leads one.
+    fn target(&self) -> libc::pid_t {
+        let pid = self.child.id() as libc::pid_t;
+        if self.leader {
+            -pid
+        } else {
+            pid
+        }
     }
     /// Let an interactive SSH child read the controlling terminal until its
     /// authentication finishes. The parent regains it before asking for a PIN.
     pub fn foreground(&self) -> std::io::Result<Option<ForegroundTerminal>> {
         use std::os::fd::AsRawFd;
+        if !self.leader {
+            return Ok(None);
+        }
         let terminal = match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -49,7 +74,7 @@ impl ProcessGroup {
         }
         // Nobody else may reap this child. Keeping its PID reserved prevents
         // cleanup from killing an unrelated group after PID reuse.
-        unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
+        unsafe { libc::kill(self.target(), libc::SIGKILL) };
         let status = self.child.wait()?;
         self.status = Some(status);
         Ok(status)
@@ -61,8 +86,8 @@ impl ProcessGroup {
             return Ok(status);
         }
         unsafe {
-            libc::kill(-(self.child.id() as i32), libc::SIGTERM);
-            libc::kill(-(self.child.id() as i32), libc::SIGCONT);
+            libc::kill(self.target(), libc::SIGTERM);
+            libc::kill(self.target(), libc::SIGCONT);
         }
         // The shell may exit before its children finish their TERM handlers.
         // poll() closes the entire group when that leader exits, so do not call
@@ -190,6 +215,20 @@ mod tests {
         output.read_exact(&mut ready).unwrap();
         assert_eq!(&ready, b"ready\n");
         child
+    }
+
+    #[test]
+    fn a_child_in_this_group_stays_in_it_and_is_killed_alone() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let mut child = ProcessGroup::spawn_in_this_group(&mut command).unwrap();
+        let pid = child.child.id() as libc::pid_t;
+        assert_eq!(unsafe { libc::getpgid(pid) }, unsafe { libc::getpgrp() });
+        assert!(child.foreground().unwrap().is_none());
+        let started = Instant::now();
+        let status = child.close().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

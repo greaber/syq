@@ -381,7 +381,7 @@ pub(crate) fn receiver() -> Command {
         Arg::new("via")
             .long("via")
             .value_name("ENDPOINT")
-            .help("Retry through this SSH jump host if the direct management connection fails")
+            .help("Retry through this SSH jump host if the connection along your SSH configuration's route fails")
     };
     configure(
         Command::new("syq receiver")

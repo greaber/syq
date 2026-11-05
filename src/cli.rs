@@ -219,10 +219,10 @@ pub struct Args {
     /// Local source work overlapped with the automatic authorization SSH attempt.
     #[arg(skip)]
     pub(crate) prepared_source: Option<std::sync::Arc<crate::transfer::PreparedSource>>,
-    /// The approved control channel of a copy to another server that a
-    /// receiving machine authorized and connects.
+    /// The entry key and host keys of the enrolled receiver a receiving
+    /// machine approved this copy for, kept for the copy's connections.
     #[arg(skip)]
-    pub(crate) return_destination: Option<std::sync::Arc<crate::destination::ReturnConnection>>,
+    pub(crate) receiver_keys: Option<std::sync::Arc<crate::private_broker::SignalCleanedDir>>,
     #[arg(skip)]
     pub(crate) auth_from_explicit: bool,
     /// Which public command produced this execution request.

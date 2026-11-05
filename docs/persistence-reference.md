@@ -254,9 +254,12 @@ syq persist receive wait server --name laptop --timeout 30
 ```
 
 Changing a profile's access settings, stopping it, or removing it cancels only
-that profile's copies, commands, and pending approvals. Changing `--notify` or
-repeating `receive on` with unchanged settings preserves them. Other profiles
-keep working. `receive off`
+that profile's copies, commands, and pending approvals. A copy it approved from
+a server to another server is the exception: once approved, that copy no longer
+needs this machine, and runs until it finishes, until someone interrupts it on
+the server, or until you revoke the destination's enrollment with
+`syq receiver revoke`. Changing `--notify` or repeating `receive on` with
+unchanged settings preserves them. Other profiles keep working. `receive off`
 without a name stops all profiles; `receive on` enables the first profile, and
 `receive on --name NAME` enables another. Removing the first profile makes the
 next saved profile the default. The last profile can be disabled but cannot be

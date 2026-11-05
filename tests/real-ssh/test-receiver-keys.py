@@ -8,7 +8,9 @@ sign are refused before anything is installed. A new login key replaces only
 the trusted signer, a connection started before a refresh cannot start a new
 copy, and a copy running through a refresh finishes. Connections that have
 not shown a signed copy yet are refused once 32 are starting, which one copy
-never reaches, and revoking works while they keep arriving.
+never reaches; a copy's workers refused that way start again without the
+wait of a failed worker, and revoking works while refused connections keep
+arriving.
 """
 import json
 import os
@@ -24,6 +26,8 @@ PROVIDER = '/usr/local/lib/syq-test-sk.so'
 SOURCE_FILE = '/tmp/syq-real-ssh-key-source'
 STATE = Path.home() / '.local/state/syq/enrollments'
 REFUSED = b'other connections are starting copies on this enrollment'
+SESSIONS_FULL_EXIT = 73
+HOLD = '/tmp/syq-real-ssh-hold-restricted-workers'
 # The receiver's sessions on the destination: every session the entry key
 # starts runs it.
 RECEIVER_SESSIONS = '''
@@ -517,34 +521,100 @@ def session_slots(parent):
 
     directory, record = enrollment()
     receivers = 'python3 -c ' + shlex.quote(RECEIVER_SESSIONS + 'print(len(sessions))')
-    wait_for('the copy\'s sessions to end', lambda: (
-        int(remote_text(receivers)) == 0, remote_text(receivers).strip()))
-    holders = []
-    threads = []
-    stop = threading.Event()
-    arrivals = []
+
+    def count():
+        return int(remote_text(receivers))
+
+    wait_for('the copy\'s sessions to end', lambda: (count() == 0, count()))
+    # The receiver's sessions before the latest holders started.
+    baseline = [0]
+
+    def hold_slots():
+        # Sessions that send nothing hold their slots for 10 seconds. Start
+        # them a few at a time, within sshd's MaxStartups.
+        baseline[0] = count()
+        holders = []
+        try:
+            for _ in range(4):
+                holders += [subprocess.Popen(entry_ssh(directory), stdin=subprocess.PIPE,
+                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                             start_new_session=True)
+                            for _ in range(8)]
+                wait_for('sessions to take slots', lambda: (
+                    count() >= baseline[0] + len(holders), count()), seconds=8)
+        except BaseException:
+            release(holders)
+            raise
+        return holders
+
+    def release(holders):
+        # The lab's ssh is a wrapper around the client: end them both, and
+        # so the session, before the receiver's deadline would.
+        for holder in holders:
+            try:
+                os.killpg(holder.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            holder.wait()
+        wait_for('released sessions to end', lambda: (count() <= baseline[0], count()), seconds=8)
+
+    holders = hold_slots()
     try:
-        # Sessions that send nothing hold their slots for 10 seconds.
-        # Start them a few at a time, within sshd's MaxStartups.
-        for _ in range(4):
-            holders += [subprocess.Popen(entry_ssh(directory), stdin=subprocess.PIPE,
-                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        for _ in range(8)]
-            wait_for('sessions to take slots', lambda: (
-                int(remote_text(receivers)) >= len(holders), remote_text(receivers).strip()), seconds=8)
         started = time.monotonic()
         refused = attempt(*entry_ssh(directory), input=b'')
-        assert refused.returncode and REFUSED in refused.stderr, refused.stderr
+        assert refused.returncode == SESSIONS_FULL_EXIT and REFUSED in refused.stderr, refused
         assert time.monotonic() - started < 5, time.monotonic() - started
         blocked = copy(f'{parent}/slots-full', check=False)
         assert blocked.returncode and REFUSED in blocked.stderr, blocked.stderr
-        print('with every slot held, sessions and copies were refused at once', flush=True)
+    finally:
+        release(holders)
+    print('with every slot held, sessions and copies were refused at once', flush=True)
 
-        # Revoking removes the enrollment's state while sessions keep
-        # arriving and being refused.
-        def arrive():
-            while not stop.is_set():
-                arrivals.append(attempt(*entry_ssh(directory), input=b'').returncode)
+    # A running copy whose workers find the slots taken starts them again
+    # as soon as the slots free, not after the wait of a failed worker.
+    run('ssh', 'source', f'rm -f {HOLD}.control {HOLD}.waiting && touch {HOLD}')
+    with tempfile.TemporaryFile() as output:
+        process = subprocess.Popen(
+            ['syq', 'cp', '--from', 'source', files, '--to', 'destination',
+             '--as', f'{parent}/slots-overlap', '--no-tcp', '--no-progress',
+             '--performance-tuning', 'workers=4'],
+            stdout=output, stderr=output, start_new_session=True)
+        holders = []
+        try:
+            waiting = 'test -e ' + shlex.quote(f'{HOLD}.waiting') + ' && echo yes || echo no'
+            wait_for('the copy\'s workers to start', lambda: (
+                attempt('ssh', 'source', waiting).stdout.strip() == b'yes', process.poll()))
+            holders = hold_slots()
+            run('ssh', 'source', f'rm -f {HOLD}')
+            time.sleep(1)
+            release(holders)
+            assert process.wait(timeout=90) == 0
+        except BaseException:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            raise
+        finally:
+            release(holders)
+            run('ssh', 'source', f'rm -f {HOLD} {HOLD}.control {HOLD}.waiting')
+            output.seek(0)
+            log = output.read().decode(errors='replace')
+    assert REFUSED.decode() in log, log
+    assert 'connection setup failed' not in log, log
+    assert remote_text(f'ls {parent}/slots-overlap | wc -l').strip() == '2000'
+    print('workers refused while other sessions held the slots started again at once', flush=True)
+
+    # Revoking removes the enrollment's state while sessions keep arriving
+    # and being refused.
+    stop = threading.Event()
+    arrivals = []
+    threads = []
+
+    def arrive():
+        while not stop.is_set():
+            arrivals.append(attempt(*entry_ssh(directory), input=b'').returncode)
+
+    holders = hold_slots()
+    try:
         threads += [threading.Thread(target=arrive) for _ in range(4)]
         for thread in threads:
             thread.start()
@@ -553,9 +623,7 @@ def session_slots(parent):
         assert revoked.returncode == 0, revoked.stderr
     finally:
         stop.set()
-        for holder in holders:
-            holder.kill()
-            holder.wait()
+        release(holders)
         for thread in threads:
             thread.join()
     assert arrivals and all(arrivals), arrivals

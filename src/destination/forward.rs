@@ -1,5 +1,7 @@
-//! One approved control stream through the receiving machine; data goes to the
-//! destination's restricted TCP or SSH workers. There is no remote signing interface.
+//! Copies from a server to another server that the receiving machine
+//! approves: it signs a directive for the destination's enrolled receiver,
+//! and the server connects to that receiver directly. The per-copy receiver
+//! that a copy between two other servers still uses lives here too.
 pub(super) mod ssh;
 use super::*;
 use std::fs::File;
@@ -110,11 +112,6 @@ pub(super) fn select(
         Err(_) if explicit.is_none() => return Ok(None),
         Err(error) => return Err(error),
     };
-    if explicit.is_none() && args.locations.last().unwrap().path.starts_with(b"~//") {
-        // Ordinary SSH interprets ~// as absolute. Do not change the copy's
-        // destination just because a return authorizer became available.
-        return Ok(None);
-    }
     let (name, registration) = if let Some(name) = explicit {
         let registration = load_registration(&name)?;
         (name, registration)
@@ -165,6 +162,46 @@ pub(super) fn select(
     )))
 }
 
+/// What the receiving machine returns for a server's copy to another
+/// server: the directive it signed for the destination's enrolled receiver,
+/// and how to reach that receiver.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Issued {
+    /// The signed directive, base64url-encoded.
+    directive: String,
+    /// The enrollment's entry key, which only starts its receiver.
+    entry_key: EntryKeyText,
+    /// The account the enrollment is for.
+    login: String,
+    /// The destination's host keys this machine trusts.
+    known_hosts: String,
+    host_key_algorithms: String,
+    /// The destination as the directive's rules name it.
+    destination: Vec<u8>,
+    /// This machine's deletion limit for the copy.
+    max_delete: u64,
+}
+
+/// An entry key in OpenSSH form, wiped when dropped.
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+struct EntryKeyText(String);
+
+impl Drop for EntryKeyText {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+impl std::fmt::Debug for Issued {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Issued")
+            .field("login", &self.login)
+            .finish_non_exhaustive()
+    }
+}
+
 pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection) -> Result<()> {
     let handoff::Selection {
         name,
@@ -173,38 +210,94 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
         ..
     } = selection;
     let target = target.context("remote authorization target missing")?;
+    // Refused with advice before anything is asked when an approval cannot
+    // carry the command.
     let command = crate::approval_command::copy_command(args)?;
-    let request = crate::restricted::named_request(
-        args,
-        crate::destination_results::ReceiptPolicy::unused()?,
-    )?;
+    // The rules come from the command; only what it read from files, which
+    // only narrows the copy, travels beside it.
+    let inputs = crate::directive::Inputs {
+        ignore: args.ignore_lines.clone(),
+        mapping: crate::directive::mapping_authorization(args)?,
+    };
     crate::output::diagnostic!("syq: requesting permission from @{name} to copy to {target:?}; approve on that machine with its desktop prompt or syq persist receive pending");
     let (stream, reply) = exchange(
         &registration,
         Message::Forward {
-            target,
+            target: target.clone(),
             command,
             cwd: crate::approval_command::current_directory(),
-            request: Box::new(request),
+            inputs,
         },
         REQUEST_TIMEOUT + SETUP_TIMEOUT + Duration::from_secs(10),
         None,
     )?;
-    if args.verbose > 0 {
-        crate::output::diagnostic!("syq: remote copy approved; opening its control connection");
-    }
-    let Reply::Approved(approved) = reply else {
+    // The copy needs nothing more from the receiving machine.
+    drop(stream);
+    let Reply::Directive(issued) = reply else {
         bail!("unexpected remote copy approval response");
     };
-    super::apply_deletion_limit(args, &approved);
-    args.locations.last_mut().unwrap().path = approved.destination.clone();
+    if args.verbose > 0 {
+        crate::output::diagnostic!(
+            "syq: remote copy approved; connecting to the destination's restricted receiver"
+        );
+    }
+    // This machine reaches the receiver at the address its own SSH
+    // configuration gives the target, as the account the approving machine
+    // enrolled, trusting only the host keys that machine trusts.
+    let address = ssh_target(&target, Instant::now() + SETUP_TIMEOUT, &|| false)?;
+    let port = address.port;
+    super::apply_deletion_limit(args, Some(issued.max_delete));
+    let destination = args.locations.last_mut().unwrap();
+    destination.path = issued.destination;
+    destination.host = Some(address.hostname);
+    destination.user = Some(issued.login);
+    destination.port = Some(port);
     args.auth_from = crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name));
-    // The actual authority never leaves the destination helper. This internal
-    // marker selects its restricted executor and per-copy worker admission.
-    args.restricted_grant = Some(super::RETURN_GRANT.into());
-    let ssh = ssh::Client::new(registration, approved.token.clone());
-    args.return_destination = Some(ReturnConnection::new(stream, Some(ssh)));
+    args.restricted_grant = Some(issued.directive);
+    args.rsh = Some(crate::remote_to_remote::receiver_rsh(
+        port,
+        &issued.host_key_algorithms,
+    ));
+    let keys = crate::remote_to_remote::prepare_receiver_ssh_with(
+        args,
+        &issued.known_hosts,
+        issued.entry_key.0.as_bytes(),
+    )?;
+    args.receiver_keys = Some(Arc::new(keys));
     Ok(())
+}
+
+/// What this machine's SSH configuration gives `target`.
+struct SshTarget {
+    user: String,
+    hostname: String,
+    port: u16,
+}
+
+fn ssh_target(target: &str, deadline: Instant, cancelled: &dyn Fn() -> bool) -> Result<SshTarget> {
+    let output = read_ssh_configuration(
+        target_spec(target)?.ssh_hostname_command(),
+        deadline,
+        cancelled,
+    )?;
+    let value = |name: &str| {
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+            .map(|value| value.trim().to_owned())
+            .with_context(|| {
+                format!("the SSH configuration for {target:?} did not report its {name}")
+            })
+    };
+    let hostname = value("hostname")?;
+    validate_data_hostname(&hostname)?;
+    Ok(SshTarget {
+        user: value("user")?,
+        port: value("port")?.parse().with_context(|| {
+            format!("the SSH configuration for {target:?} reported an invalid port")
+        })?,
+        hostname,
+    })
 }
 
 pub(super) struct Slot<'a>(pub(super) &'a AtomicUsize);
@@ -215,40 +308,72 @@ impl Drop for Slot<'_> {
 }
 
 impl Receiver {
+    /// Approve a server's copy to another server: show the command, then,
+    /// over this machine's own SSH, set up or refresh the destination
+    /// account's enrollment and sign a directive for its receiver. The
+    /// server connects to that receiver itself; this machine is not part of
+    /// the copy after it replies.
     pub(super) fn forward(
         &self,
         target: String,
         command: Vec<Vec<u8>>,
         cwd: String,
-        request: CopyRequest,
+        inputs: crate::directive::Inputs,
         mut stream: TrackedStream,
     ) -> Result<()> {
+        // The server waits this long for the reply, from when it asked: the
+        // decision, then the setup. Cancellation ends the setup sooner when
+        // the server goes.
+        let budget = Instant::now() + REQUEST_TIMEOUT + SETUP_TIMEOUT;
         let request_lock = self.request_lock.try_lock().map_err(|_| {
             anyhow::anyhow!("another transfer is awaiting approval; retry after it is decided")
         })?;
-        target_endpoint(&target)?;
+        let endpoint = target_endpoint(&target)?;
         crate::approval_command::check_authorizer(&command, &self.name)?;
-        crate::approval_command::check_copy(&command, &request, None, Some(&target))?;
-        if request.copy.destination != REQUEST_ROOT
-            || request.destination.len() > 4096
-            || request.destination.contains(&0)
-        {
-            bail!("invalid remote copy destination");
-        }
-        let request = constrain(
-            request,
-            Path::new(std::ffi::OsStr::from_bytes(REQUEST_ROOT)),
-            self.max_bytes,
-            self.max_entries,
-            self.max_delete,
-            crate::approval_command::dry_run_prunes(&command)?,
+        let args = crate::approval_command::parse(&command)?;
+        anyhow::ensure!(
+            eligible_target(&args)? == target,
+            "the requesting command copies to a different server"
+        );
+        let caps = crate::directive::Caps {
+            max_bytes: self.max_bytes,
+            max_entries: self.max_entries,
+            max_delete: self.max_delete,
+        };
+        // The rules the receiver will derive, before the server's home is
+        // known: the prompt names the destination as the command does.
+        let preview = crate::directive::issue(
+            crate::directive::Binding {
+                enrollment: crate::enrollment::EnrollmentId::random(),
+                generation: 1,
+                account: "preview".into(),
+                role: crate::directive::Role::Destination,
+            },
+            command.clone(),
+            cwd.clone(),
+            (inputs.clone(), Some(caps)),
+            // Unused: the preview has no results.
+            [1; 32],
         )?;
-        let max_delete = super::deletion_ceiling(&request, self.max_delete);
-        crate::delegation::validate_rules(&request.copy, &mut request.constraints.clone())?;
+        let (rules, constraints) = crate::directive::destination_rules(
+            &preview,
+            Path::new(std::ffi::OsStr::from_bytes(REQUEST_ROOT)),
+        )?;
+        let max_delete = caps.deletion_ceiling(&rules.copy);
+        let request = CopyRequest {
+            destination: args
+                .locations
+                .last()
+                .context("copy destination missing")?
+                .path
+                .clone(),
+            copy: rules.copy,
+            constraints,
+        };
         let count = self.forward_count.fetch_add(1, Ordering::AcqRel);
         let _slot = Slot(&self.forward_count);
         if count >= 8 {
-            bail!("too many active remote copies; wait for one to finish");
+            bail!("too many copies to other servers are waiting for approval or setup here; retry after one is decided");
         }
         let (generation, _channel) = {
             // Serialize registration with revocation, including reconnects.
@@ -262,53 +387,238 @@ impl Receiver {
         let cancelled = || {
             self.stop.load(Ordering::Acquire)
                 || self.generation.load(Ordering::Acquire) != generation
+                || requester_closed(&socket)
         };
-        let setup_cancelled = || cancelled() || requester_closed(&socket);
-        // Automatic approval of writes to this machine does not authorize use
-        // of its SSH credentials on another host.
+        // Reading this machine's SSH configuration contacts no server.
+        let login = ssh_target(&target, Instant::now() + SETUP_TIMEOUT, &cancelled)?.user;
+        let enrollment =
+            crate::restricted::local_enrollment_state(&endpoint.host, endpoint.port, &login)?;
+        let account = format!("{login}@{}", endpoint.host);
+        match enrollment {
+            _ if !args.dry_run => {}
+            crate::restricted::EnrollmentState::Ready => {}
+            crate::restricted::EnrollmentState::Missing => bail!(
+                "a dry run does not set up restricted copying on {account}; the first real copy does, or run `syq receiver enroll {account}` on the receiving machine"
+            ),
+            crate::restricted::EnrollmentState::Outdated => bail!(
+                "a dry run does not update syq on {account} for this machine's build; the next real copy does, or run `syq receiver enroll {account}` on the receiving machine"
+            ),
+        }
+        // Automatic approval of writes to this machine does not authorize
+        // use of its SSH credentials on another host.
         self.approvals.request_remote(
             &self.requester,
             &command,
             &cwd,
-            &target,
+            crate::receive_approval::Remote {
+                target: &target,
+                enrollment,
+            },
             &request,
             self.notifications,
-            setup_cancelled,
+            cancelled,
         )?;
-        if setup_cancelled() {
-            bail!("remote copy disconnected before setup");
-        }
-        // This lock only serializes decisions, not SSH setup or active copies.
+        anyhow::ensure!(!cancelled(), "remote copy disconnected before setup");
+        // This lock only serializes decisions, not enrollment.
         drop(request_lock);
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(target.as_bytes());
-        let (mut child, reply) = ForwardChild::connect(
-            &encoded,
-            &HelperRequest {
-                version: HELPER_VERSION,
-                identity: crate::identity::build().into(),
-                request,
-            },
-            "--return-receiver",
+        // The destination's host keys this machine trusts, which the server
+        // checks; the same lookup gives the login enrollment uses.
+        let policy = crate::agent_broker::resolve_host_policy_at_bounded(
+            "ssh",
+            endpoint.user.as_deref(),
+            &endpoint.host,
+            endpoint.port,
             Instant::now() + SETUP_TIMEOUT,
-            &setup_cancelled,
+            &cancelled,
         )?;
-        let Reply::Approved(mut approved) = reply else {
-            bail!("invalid destination setup response");
+        anyhow::ensure!(
+            policy.login_user == login,
+            "the SSH configuration for {target:?} changed during approval"
+        );
+        let mut setup = crate::process::self_command()?;
+        setup.arg("--return-prepare");
+        let prepared = prepare_in_child(
+            setup,
+            &Prepare {
+                command,
+                cwd,
+                inputs,
+                caps,
+                host: endpoint.host.clone(),
+                port: endpoint.port,
+                login: policy.login_user.clone(),
+                via: (
+                    self.server_user.clone(),
+                    self.tcp_peer.host.clone(),
+                    self.tcp_peer.port,
+                ),
+                agent: policy.agent_socket().map(Path::to_path_buf),
+                allow_enrollment: !args.dry_run,
+            },
+            // Setting restricted copying up can upload syq, which takes a
+            // while on a slow link: give it what is left of the server's
+            // wait, not only the time after the decision.
+            budget,
+            &cancelled,
+        )
+        .with_context(|| format!("approve the copy to {target:?}"))?;
+        anyhow::ensure!(!cancelled(), "remote copy disconnected before setup");
+        let issued = Issued {
+            directive: prepared.directive,
+            entry_key: prepared.entry_key,
+            login: policy.login_user.clone(),
+            known_hosts: policy.known_hosts(crate::remote_to_remote::RECEIVER_HOST_ALIAS)?,
+            host_key_algorithms: policy.host_key_algorithms(),
+            destination: prepared.destination,
+            max_delete,
         };
-        let session =
-            ssh::SessionGuard::insert(self, target.clone(), approved.token.clone(), generation)?;
-        approved.token = session.token();
-        approved.max_delete = Some(max_delete);
-        let result = (|| {
-            let input = child.child.stdin.take().unwrap();
-            let output = child.child.stdout.take().unwrap();
-            socket.set_read_timeout(None)?;
-            socket.set_write_timeout(None)?;
-            write_message(&mut stream, &Reply::Approved(approved))?;
-            relay(socket.try_clone()?, input, output, cancelled, &mut child)
-        })();
-        result.with_context(|| format!("copy via this machine to {target:?}: {}", child.errors()))
+        write_message(&mut stream, &Reply::Directive(Box::new(issued)))
     }
+}
+
+/// What the receiving service's setup child needs to set up or refresh the
+/// destination's enrollment and sign an approved upload's directive.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Prepare {
+    command: Vec<Vec<u8>>,
+    cwd: String,
+    inputs: crate::directive::Inputs,
+    caps: crate::directive::Caps,
+    host: String,
+    port: Option<u16>,
+    login: String,
+    /// The server that asked, as this machine's receiving connection logs
+    /// in to it: its user, if named, host and port.
+    via: (Option<String>, String, Option<u16>),
+    agent: Option<PathBuf>,
+    allow_enrollment: bool,
+}
+
+impl Prepare {
+    fn issue(&self) -> Result<crate::restricted::Issue<'_>> {
+        let (user, host, port) = &self.via;
+        Ok(crate::restricted::Issue {
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
+            inputs: self.inputs.clone(),
+            caps: Some(self.caps),
+            host: &self.host,
+            port: self.port,
+            login: &self.login,
+            // The copy needs the server that asked to reach the
+            // destination's SSH port, so enrolling can go through it when
+            // this machine cannot reach the destination along its own SSH
+            // configuration's route, as a copy started on this machine goes
+            // through its source.
+            jump: Some(crate::enrollment::SshEndpoint::from_host(
+                user.as_deref(),
+                host,
+                *port,
+            )?),
+            agent: self.agent.as_deref(),
+            allow_enrollment: self.allow_enrollment,
+            // No terminal: never prompt, and never trust a new host key.
+            batch: true,
+        })
+    }
+}
+
+/// The setup child's answer.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+enum Prepared {
+    Signed(Signed),
+    Refused(String),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Signed {
+    directive: String,
+    entry_key: EntryKeyText,
+    destination: Vec<u8>,
+}
+
+/// Set up the enrollment and sign the directive in the setup child
+/// `command`, until `deadline` or until `cancelled`. Then the child ends
+/// with everything in its process group, its SSH login included, which
+/// releases the enrollment lock and any wait for the SSH agent with it.
+fn prepare_in_child(
+    command: Command,
+    request: &Prepare,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Signed> {
+    let mut child = ForwardChild::spawn_command(command)?;
+    let reply = (|| -> Result<Prepared> {
+        let mut input = child.child.stdin.take().context("setup input missing")?;
+        write_message(
+            &mut DeadlineIo {
+                inner: &mut input,
+                deadline,
+                cancelled: Some(cancelled),
+            },
+            request,
+        )?;
+        drop(input);
+        read_message(&mut DeadlineIo {
+            inner: child.child.stdout.as_mut().unwrap(),
+            deadline,
+            cancelled: Some(cancelled),
+        })
+    })();
+    let status = child.close();
+    // The setup's own SSH writes its errors, and the remote installer's,
+    // here; its login's reasons are already in the reply.
+    let wrote = !child.errors.lock().unwrap().is_empty();
+    let output = if wrote {
+        format!("; its output: {}", child.errors())
+    } else {
+        String::new()
+    };
+    match reply {
+        Ok(Prepared::Signed(signed)) => Ok(signed),
+        Ok(Prepared::Refused(error)) => Err(anyhow::anyhow!("{error}{output}")),
+        Err(error) if Instant::now() >= deadline => {
+            let account = format!("{}@{}", request.login, request.host);
+            Err(error).with_context(|| {
+                format!(
+                    "the copy's setup did not finish while the server waited{output}. If it was setting up or updating restricted copying on {account}, run `syq receiver enroll {account}` on this machine, which has no time limit, then try the copy again"
+                )
+            })
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("the copy's setup stopped ({status:?}): {}", child.errors())),
+    }
+}
+
+/// The receiving service's setup child (`--return-prepare`): set up or
+/// refresh the destination's enrollment and sign the directive. Its parent
+/// ends it, with its process group, at the setup deadline or when the
+/// requester goes.
+fn prepare_setup() -> Result<i32> {
+    let request: Prepare = read_message(&mut std::io::stdin().lock())?;
+    let reply = match request
+        .issue()
+        .and_then(crate::restricted::prepare_transfer)
+    {
+        Ok(prepared) => Prepared::Signed(Signed {
+            directive: prepared.directive,
+            entry_key: EntryKeyText(
+                prepared
+                    .entry_key
+                    .to_openssh(ssh_key::LineEnding::LF)?
+                    .to_string(),
+            ),
+            destination: prepared.destination,
+        }),
+        Err(error) => Prepared::Refused(format!("{error:#}")),
+    };
+    let mut output = std::io::stdout().lock();
+    write_message(&mut output, &reply)?;
+    output.flush()?;
+    Ok(0)
 }
 
 /// Kill before reaping, including bootstrap/ProxyCommand descendants. Capture
@@ -367,7 +677,7 @@ impl ForwardChild {
                     | Reply::Identity(_)
                     | Reply::TcpProbed(_)
                     | Reply::TcpCongestionRejected(_)
-                    | Reply::ForwardSsh(_),
+                    | Reply::Directive(_),
                 ) => {
                     bail!("invalid destination setup response")
                 }
@@ -922,6 +1232,23 @@ fn read_source_hostname(
     deadline: Instant,
     cancelled: &impl Fn() -> bool,
 ) -> Result<String> {
+    let text = read_ssh_configuration(command, deadline, cancelled)?;
+    let hostname = text
+        .lines()
+        .find_map(|line| line.strip_prefix("hostname "))
+        .context("source SSH configuration did not report its hostname")?
+        .trim()
+        .to_owned();
+    validate_data_hostname(&hostname)?;
+    Ok(hostname)
+}
+
+/// What `ssh -G` prints for a target, within the setup's deadline.
+fn read_ssh_configuration(
+    command: Command,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<String> {
     // Reuse helper process-group ownership, bounded stderr capture, and the
     // setup's absolute deadline. A local Match exec must not outlive revocation.
     let mut child = ForwardChild::spawn_command(command)?;
@@ -936,28 +1263,20 @@ fn read_source_hostname(
     .read_to_end(&mut output)?;
     anyhow::ensure!(
         output.len() <= MAX_MESSAGE,
-        "source SSH configuration output is too large"
+        "SSH configuration output is too large"
     );
-    let status = child.wait_for_exit(deadline, cancelled)?;
+    let status = child.wait_for_exit(deadline, &cancelled)?;
     anyhow::ensure!(
         status.success(),
-        "resolve source SSH hostname: {}",
+        "resolve the SSH configuration: {}",
         child.errors()
     );
-    let text = std::str::from_utf8(&output).context("source SSH configuration is not UTF-8")?;
-    let hostname = text
-        .lines()
-        .find_map(|line| line.strip_prefix("hostname "))
-        .context("source SSH configuration did not report its hostname")?
-        .trim()
-        .to_owned();
-    validate_data_hostname(&hostname)?;
-    Ok(hostname)
+    String::from_utf8(output).context("SSH configuration is not UTF-8")
 }
 
 pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
     match argv.get(1).and_then(|v| v.to_str())? {
-        "--return-receiver" | "--peer-receiver" if argv.len() == 2 => Some(receive()),
+        "--peer-receiver" if argv.len() == 2 => Some(receive()),
         "--return-ssh-setup" if argv.len() == 2 => Some(ssh::setup()),
         "--return-ssh-worker" if argv.len() == 3 => Some(
             argv[2]
@@ -965,32 +1284,24 @@ pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
                 .context("invalid copy worker admission")
                 .and_then(ssh::worker),
         ),
-        "--return-ssh-connect" if argv.len() == 3 => Some(
+        "--return-source-probe" if argv.len() == 2 => Some(Ok(0)),
+        "--return-prepare" if argv.len() == 2 => Some(prepare_setup()),
+        "--return-source" if argv.len() == 2 => Some(super::pull::receive()),
+        "--return-connect" | "--return-connect-install" if argv.len() == 4 => Some(
             argv[2]
                 .to_str()
                 .context("invalid return target")
-                .and_then(|target| connect(target, false, "--return-ssh-setup")),
+                .and_then(|target| {
+                    connect(
+                        target,
+                        argv[1] == "--return-connect-install",
+                        match argv.get(3).and_then(|arg| arg.to_str()) {
+                            Some("--return-source") => "--return-source",
+                            _ => bail!("invalid return helper operation"),
+                        },
+                    )
+                }),
         ),
-        "--return-source-probe" if argv.len() == 2 => Some(Ok(0)),
-        "--return-source" if argv.len() == 2 => Some(super::pull::receive()),
-        "--return-connect" | "--return-connect-install" if argv.len() == 3 || argv.len() == 4 => {
-            Some(
-                argv[2]
-                    .to_str()
-                    .context("invalid return target")
-                    .and_then(|target| {
-                        connect(
-                            target,
-                            argv[1] == "--return-connect-install",
-                            match argv.get(3).and_then(|arg| arg.to_str()) {
-                                None | Some("--return-receiver") => "--return-receiver",
-                                Some("--return-source") => "--return-source",
-                                _ => bail!("invalid return helper operation"),
-                            },
-                        )
-                    }),
-            )
-        }
         _ => None,
     }
 }
@@ -998,7 +1309,141 @@ pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::destination::tests::{args, broker, request};
+    use crate::destination::tests::{args, broker};
+
+    fn prepare_request() -> Prepare {
+        Prepare {
+            command: vec![b"cp".to_vec()],
+            cwd: "~".into(),
+            inputs: Default::default(),
+            caps: crate::directive::Caps {
+                max_bytes: 1,
+                max_entries: 1,
+                max_delete: 0,
+            },
+            host: "backup".into(),
+            port: None,
+            login: "alice".into(),
+            via: (None, "server".into(), None),
+            agent: None,
+            allow_enrollment: true,
+        }
+    }
+
+    /// Whether `pid` has ended: gone, or a zombie its new parent has not
+    /// reaped yet.
+    fn ended(pid: libc::pid_t) -> bool {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .is_ok_and(|output| output.stdout.trim_ascii().starts_with(b"Z"))
+    }
+
+    #[test]
+    fn the_setup_child_ends_with_its_group_at_the_deadline_or_when_the_requester_goes() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        for requester_goes in [false, true] {
+            // A child whose own login waits on a server that stopped
+            // answering, as enrollment's SSH does in the child's group.
+            let pid_file = temporary.path().join(format!("login-{requester_goes}"));
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                &format!(
+                    "sleep 60 & echo $! > {}; wait",
+                    shell_words::quote(pid_file.to_str().unwrap())
+                ),
+            ]);
+            let started = Instant::now();
+            let deadline = started
+                + if requester_goes {
+                    Duration::from_secs(60)
+                } else {
+                    Duration::from_millis(500)
+                };
+            let cancelled = || requester_goes && started.elapsed() >= Duration::from_millis(500);
+            let error = prepare_in_child(command, &prepare_request(), deadline, &cancelled)
+                .err()
+                .unwrap();
+            assert!(started.elapsed() < Duration::from_secs(10), "{error:#}");
+            // Running out of time says how to set up without a time limit;
+            // a requester that went needs nothing more.
+            assert_eq!(
+                format!("{error:#}")
+                    .contains("run `syq receiver enroll alice@backup` on this machine"),
+                !requester_goes,
+                "{error:#}"
+            );
+            let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let waited = Instant::now();
+            while !ended(pid) {
+                assert!(
+                    waited.elapsed() < Duration::from_secs(5),
+                    "the child's login outlived it"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_setup_keeps_what_the_child_wrote() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let reply = temporary.path().join("reply");
+        let mut frame = Vec::new();
+        write_message(
+            &mut frame,
+            &Prepared::Refused("restricted enrollment SSH to alice@backup failed".into()),
+        )
+        .unwrap();
+        std::fs::write(&reply, frame).unwrap();
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            &format!(
+                "cat > /dev/null; echo 'installer: no space left' >&2; cat {}",
+                shell_words::quote(reply.to_str().unwrap())
+            ),
+        ]);
+        let error = prepare_in_child(
+            command,
+            &prepare_request(),
+            Instant::now() + Duration::from_secs(30),
+            &|| false,
+        )
+        .err()
+        .unwrap();
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with("restricted enrollment SSH to alice@backup failed"),
+            "{message}"
+        );
+        assert!(message.contains("installer: no space left"), "{message}");
+    }
+
+    #[test]
+    fn the_setup_child_enrolls_without_prompts_and_through_the_server_that_asked() {
+        let request = prepare_request();
+        let issue = request.issue().unwrap();
+        assert!(issue.batch);
+        assert_eq!(issue.caps, Some(request.caps));
+        assert_eq!(issue.jump.unwrap().label(), "server");
+        let mut named = prepare_request();
+        named.via = (Some("alice".into()), "server".into(), Some(2222));
+        assert_eq!(
+            named.issue().unwrap().jump.unwrap().label(),
+            "alice@server:2222"
+        );
+        named.via = (None, "-oProxyCommand=evil".into(), None);
+        assert!(named.issue().is_err());
+    }
 
     #[test]
     fn source_hostname_lookup_obeys_setup_deadline_and_cancellation() {
@@ -1342,25 +1787,55 @@ mod tests {
     fn forward_validation_precedes_approval_and_outbound_ssh() {
         let root = crate::test_support::tempdir().unwrap();
         let (_broker, receiver, registration, _) = broker(root.path(), Approval::Always);
-        let command = forward_command(root.path());
-        let (valid, _) = request(&crate::approval_command::parse(&command).unwrap());
-        for case in 0..5 {
-            let mut copy = valid.clone();
-            let mut target = "backup".to_owned();
-            match case {
-                0 => target = "bad$(command)".into(),
-                1 => copy.copy.mutation_scopes[0].path = b"/outside".to_vec(),
-                2 => copy.copy.limits.max_entries = 0,
-                3 => copy.destination = b"bad\0path".to_vec(),
-                _ => copy.constraints.receipt_policy.required = false,
-            }
+        let valid = forward_command(root.path());
+        let with = |extra: &[&str]| {
+            let mut command = valid.clone();
+            command.extend(extra.iter().map(|arg| arg.as_bytes().to_vec()));
+            command
+        };
+        let inputs = crate::directive::Inputs::default();
+        let cases = [
+            // Not a plain SSH endpoint.
+            ("bad$(command)", valid.clone(), inputs.clone()),
+            // The command copies to another server than the one named.
+            ("elsewhere", valid.clone(), inputs.clone()),
+            // Options this route refuses, and rules the receiver could
+            // not derive.
+            ("backup", with(&["--rsh", "ssh"]), inputs.clone()),
+            (
+                "backup",
+                with(&["--receiver-max-entries", "0"]),
+                inputs.clone(),
+            ),
+            // What the server read from files is bounded too.
+            (
+                "backup",
+                with(&["--ignore", "*.tmp"]),
+                crate::directive::Inputs {
+                    ignore: vec!["a\0b".into()],
+                    mapping: None,
+                },
+            ),
+            (
+                "backup",
+                valid.clone(),
+                crate::directive::Inputs {
+                    ignore: Vec::new(),
+                    mapping: Some(crate::mapping::Authorization {
+                        bytes: 1,
+                        digest: [0; 32],
+                    }),
+                },
+            ),
+        ];
+        for (target, command, inputs) in cases {
             assert!(exchange(
                 &registration,
                 Message::Forward {
-                    target,
+                    target: target.into(),
                     command: command.clone(),
                     cwd: String::new(),
-                    request: Box::new(copy)
+                    inputs,
                 },
                 Duration::from_secs(2),
                 Some(Duration::from_secs(2))
@@ -1377,7 +1852,6 @@ mod tests {
             let root = crate::test_support::tempdir().unwrap();
             let (_broker, receiver, registration, _) = broker(root.path(), Approval::Always);
             let command = forward_command(root.path());
-            let (copy, _) = request(&crate::approval_command::parse(&command).unwrap());
             let task = std::thread::spawn(move || {
                 exchange(
                     &registration,
@@ -1385,7 +1859,7 @@ mod tests {
                         target: "backup".into(),
                         command,
                         cwd: "~/rt-bench".into(),
-                        request: Box::new(copy),
+                        inputs: crate::directive::Inputs::default(),
                     },
                     Duration::from_secs(3),
                     Some(Duration::from_secs(3)),
@@ -1395,6 +1869,9 @@ mod tests {
             let pending = loop {
                 if let Some(summary) = receiver.approvals.snapshots().first() {
                     break summary.clone();
+                }
+                if task.is_finished() {
+                    panic!("forward request ended: {:?}", task.join().unwrap().err());
                 }
                 assert!(
                     Instant::now() < deadline,

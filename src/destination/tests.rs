@@ -134,7 +134,7 @@ fn approved_source_uses_its_control_channel_without_a_native_ssh_pool() {
     args.locations[0].host = Some("source".into());
     args.locations.last_mut().unwrap().host = None;
     let (control, _peer) = UnixStream::pair().unwrap();
-    let approved = ReturnConnection::new(control, None);
+    let approved = ReturnConnection::source(control, "source".into()).unwrap();
     args.return_source = Some(approved.clone());
     let crate::conn::Endpoint::Remote(source) =
         crate::transfer::endpoint(&args.locations[0], &args).unwrap()
@@ -404,6 +404,7 @@ fn broker_with_limits(
     let (prompts, requests) = mpsc::sync_channel(1);
     let receiver = Arc::new(Receiver {
         tcp_peer: crate::conn::RemoteSpec::local_receiver(false),
+        server_user: None,
         name: "laptop".into(),
         identity_key: identity::generate_key().unwrap(),
         requester: crate::receive_approval::Requester {
@@ -431,7 +432,6 @@ fn broker_with_limits(
         account_source: Mutex::new(Err("test source not configured".into())),
         account_sessions: Mutex::new(HashMap::new()),
         forward_count: std::sync::atomic::AtomicUsize::new(0),
-        forward_sessions: Mutex::new(HashMap::new()),
         request_lock: Mutex::new(()),
         stop: Arc::new(AtomicBool::new(false)),
     });
@@ -1127,7 +1127,7 @@ fn named_requests_accept_in_place_new_and_prune_within_the_machines_limit() {
         approved.max_delete = machine;
         pruning.max_delete = stated;
         pruning.max_delete_from_approver = false;
-        apply_deletion_limit(&mut pruning, &approved);
+        apply_deletion_limit(&mut pruning, approved.max_delete);
         assert_eq!(
             (pruning.max_delete, pruning.max_delete_from_approver),
             (planned, from_machine),
@@ -1284,7 +1284,7 @@ fn named_copy(registration: &Registration, source: &Path, options: &[&str]) -> i
     let mut args = crate::approval_command::parse(&command).unwrap();
     let approved = approve(registration, command, request);
     // As `prepare` does with the approval.
-    apply_deletion_limit(&mut args, &approved);
+    apply_deletion_limit(&mut args, approved.max_delete);
     args.locations.last_mut().unwrap().host = Some("server".into());
     args.locations.last_mut().unwrap().path = approved.destination.clone();
     args.restricted_grant = Some(route(registration.clone(), approved.token.clone()));

@@ -268,8 +268,7 @@ pub fn start(args: &Args, mode: RunMode) -> Result<Option<Arc<ResultsWriter>>> {
     if args.stream_mapping_fd.is_some() {
         writer.schema_version = 5;
     }
-    writer.destination_reports =
-        args.relay_results && crate::destination::reports_results(&args.restricted_grant);
+    writer.destination_reports = args.relay_results && crate::destination::reports_results(args);
     let writer = Arc::new(writer);
     let run_id = {
         let mut bytes = [0u8; 16];

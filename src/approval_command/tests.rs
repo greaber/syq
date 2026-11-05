@@ -93,18 +93,18 @@ fn copy_requests_must_match_the_command_shown() {
             .collect::<Vec<_>>(),
         );
         let request = copy_request(&command);
-        check_copy(&command, &request, Some("laptop"), None).unwrap();
-        assert!(check_copy(&command, &request, Some("other"), None).is_err());
+        check_copy(&command, &request, "laptop").unwrap();
+        assert!(check_copy(&command, &request, "other").is_err());
 
         let mut changed = request.clone();
         changed.copy.limits.max_deletions += 1;
-        assert!(check_copy(&command, &changed, Some("laptop"), None).is_err());
+        assert!(check_copy(&command, &changed, "laptop").is_err());
         let mut changed = request.clone();
         changed.destination = b"elsewhere".to_vec();
-        assert!(check_copy(&command, &changed, Some("laptop"), None).is_err());
+        assert!(check_copy(&command, &changed, "laptop").is_err());
         let mut changed = request.clone();
         changed.copy.options.preserve_permissions ^= true;
-        assert!(check_copy(&command, &changed, Some("laptop"), None).is_err());
+        assert!(check_copy(&command, &changed, "laptop").is_err());
     }
 }
 
@@ -126,9 +126,9 @@ fn server_files_supply_only_their_own_contents() {
         } else {
             request.constraints.filters.ignore = vec!["*.tmp".into()];
         }
-        check_copy(&with_file, &request, Some("laptop"), None).unwrap();
+        check_copy(&with_file, &request, "laptop").unwrap();
         request.copy.policy.deletion = crate::delegation::DeletionPolicy::DeleteDestinationOnly;
-        assert!(check_copy(&with_file, &request, Some("laptop"), None).is_err());
+        assert!(check_copy(&with_file, &request, "laptop").is_err());
     }
 
     // Without a mapping file, the server cannot add a mapping.
@@ -137,9 +137,9 @@ fn server_files_supply_only_their_own_contents() {
     ]);
     let mut request = copy_request(&inline);
     assert_eq!(request.constraints.filters.ignore, ["*.log"]);
-    check_copy(&inline, &request, Some("laptop"), None).unwrap();
+    check_copy(&inline, &request, "laptop").unwrap();
     request.constraints.mapping = Some(crate::mapping::Authorization::from_contents(b"{}"));
-    assert!(check_copy(&inline, &request, Some("laptop"), None).is_err());
+    assert!(check_copy(&inline, &request, "laptop").is_err());
 }
 
 #[test]
@@ -163,15 +163,15 @@ fn ignore_rules_come_from_the_server_and_only_narrow() {
     for lines in [&[][..], &["b"], &["!a", "a"]] {
         let mut changed = request.clone();
         changed.constraints.filters.ignore = lines.iter().map(|line| line.to_string()).collect();
-        check_copy(&command, &changed, Some("laptop"), None).unwrap();
+        check_copy(&command, &changed, "laptop").unwrap();
     }
     // What the ignore rules restrict is still checked.
     let mut changed = request.clone();
     changed.copy.limits.max_deletions += 1;
-    assert!(check_copy(&command, &changed, Some("laptop"), None).is_err());
+    assert!(check_copy(&command, &changed, "laptop").is_err());
     let mut changed = request;
     changed.constraints.filters.delete_excluded = true;
-    assert!(check_copy(&command, &changed, Some("laptop"), None).is_err());
+    assert!(check_copy(&command, &changed, "laptop").is_err());
 }
 
 #[test]
@@ -188,7 +188,7 @@ fn derivation_ignores_this_machines_files() {
         policy(),
     )
     .unwrap();
-    check_copy(&copy, &request, Some("laptop"), None).unwrap();
+    check_copy(&copy, &request, "laptop").unwrap();
 
     // A source that is a pipe on the server becomes a stream upload there.
     let upload = command(&[
@@ -215,16 +215,6 @@ fn derivation_ignores_this_machines_files() {
     let mut changed = stream.clone();
     changed.scopes[0].key = "other".into();
     assert!(check_storage(&upload, &changed, "laptop").is_err());
-}
-
-#[test]
-fn forwarded_copies_name_their_ssh_destination() {
-    let command = command(&[
-        "cp", "--src", "results", "--to", "backup", "--into", "/archive",
-    ]);
-    let request = copy_request(&command);
-    check_copy(&command, &request, None, Some("backup")).unwrap();
-    assert!(check_copy(&command, &request, None, Some("other")).is_err());
 }
 
 #[test]
@@ -493,7 +483,7 @@ fn server_side_preparation_matches_derivation_for_many_copy_options() {
     ];
     for case in cases {
         let command = command(&[&["cp"][..], case].concat());
-        check_copy(&command, &copy_request(&command), Some("laptop"), None)
+        check_copy(&command, &copy_request(&command), "laptop")
             .unwrap_or_else(|e| panic!("{case:?}: {e:#}"));
     }
 }

@@ -1,5 +1,5 @@
 use super::*;
-use crate::cli::{Existence, Placement};
+use crate::cli::{Existence, Location, Placement};
 use crate::delegation::{CopyLimits, CopyOptions, CopyPolicy, PublicationPolicy};
 use crate::directive::{
     copy_operation, filter_destination_roots, normalize_absolute, validate_restricted_args,
@@ -17,7 +17,7 @@ fn enrollment_upload_selects_and_verifies_the_remote_platform() {
     if let Ok(case) = std::env::var("SYQ_ENROLLMENT_TEST_CHILD") {
         let result = run_management_over_route(
             &endpoint("receiver", "fixture", None).unwrap(),
-            EnrollmentRoute::Direct,
+            EnrollmentRoute::Configured,
             EnrollmentId::test_v4(1),
             ManagementAction::Revoke,
             b"{}",
@@ -2322,14 +2322,63 @@ fn a_session_reads_exactly_one_bounded_first_frame() {
 }
 
 #[test]
+fn a_failed_login_reports_what_ssh_said_in_its_trace() {
+    let trace = "debug1: Reading configuration data /etc/ssh/ssh_config\n\
+                 debug3: resolve_host: lookup backup:22\n\
+                 ssh: Could not resolve hostname backup: Name or service not known\n";
+    assert_eq!(
+        ssh_reason(trace, true).unwrap(),
+        "ssh: Could not resolve hostname backup: Name or service not known"
+    );
+    let refused = "debug1: Authentications that can continue: publickey\n\
+                   debug1: No more authentication methods to try.\n\
+                   syq@backup: Permission denied (publickey).\n";
+    assert_eq!(
+        ssh_reason(refused, true).unwrap(),
+        "syq@backup: Permission denied (publickey)."
+    );
+    assert!(ssh_reason("debug1: only debug output\n", true).is_none());
+    let long = format!("{}\n", "x".repeat(1000));
+    assert_eq!(ssh_reason(&long, true).unwrap().len(), 300);
+
+    // After the login, what SSH writes without a prefix is its progress, and
+    // the open channels it lists, indented, when the session closes. When
+    // the remote command failed, SSH said nothing about it...
+    let worked = "debug1: Server accepts key: /home/syq/.ssh/id_ed25519 ED25519 SHA256:x\n\
+                  Authenticated to backup ([192.0.2.7]:22) using \"publickey\".\n\
+                  debug1: client_input_channel_req: channel 0 rtype exit-status reply 0\n\
+                  debug3: channel 0: status: The following connections are open:\n  \
+                  #0 client-session (t4 [session] r0 i3/0 o3/0 e[write]/0 fd -1/-1/7 sock -1 cc -1 io 0x00/0x00)\n\
+                  \n\
+                  Transferred: sent 41500000, received 2000 bytes, in 3.1 seconds\n\
+                  Bytes per second: sent 13387096.8, received 645.2\n\
+                  debug1: Exit status 1\n";
+    assert!(ssh_reason(worked, false).is_none());
+    assert!(ssh_reason(worked, true).is_none());
+    // ...and when the connection broke after it, SSH says why on its
+    // stderr, not in the trace: the trace gives no reason.
+    let dropped = "Authenticated to backup ([192.0.2.7]:22) using \"publickey\".\n\
+                   debug3: channel 0: status: The following connections are open:\n  \
+                   #0 client-session (t4 [session] r0 i0/0 o0/0 e[write]/0 fd 4/5/6 sock -1 cc -1 io 0x01/0x00)\n\
+                   \n\
+                   Transferred: sent 4100, received 2000 bytes, in 3.1 seconds\n\
+                   Bytes per second: sent 1322.6, received 645.2\n";
+    assert!(ssh_reason(dropped, true).is_none());
+}
+
+#[test]
 fn unverified_sessions_beyond_the_slots_are_refused_at_once() {
     let temporary = crate::test_support::tempdir().unwrap();
     let state = temporary.path().join("state");
     fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
     let first = UnverifiedSlot::take(&state, 2).unwrap();
     let second = UnverifiedSlot::take(&state, 2).unwrap();
-    let error = UnverifiedSlot::take(&state, 2).err().unwrap().to_string();
-    assert!(error.contains("2 other connections"), "{error}");
+    let error = UnverifiedSlot::take(&state, 2).err().unwrap();
+    assert!(is_sessions_full(&error), "{error:#}");
+    assert!(
+        error.to_string().contains("2 other connections"),
+        "{error:#}"
+    );
     // A slot frees when its session is verified or ends.
     drop(first);
     let third = UnverifiedSlot::take(&state, 2).unwrap();
@@ -2469,8 +2518,29 @@ fn local_records_track_pending_enrollments_and_unconfirmed_refreshes() {
     // lost: the server may already trust the new key, so the next copy
     // logs in to finish it even though the recorded key still signs.
     assert!(!needs_refresh(&metadata, &directory));
+    let state = || {
+        state_of(
+            load_local_enrollments_in(temporary.path()).unwrap(),
+            &metadata.host,
+            metadata.port,
+            &metadata.target_login,
+        )
+    };
+    assert_eq!(state(), EnrollmentState::Ready);
+    assert_eq!(
+        state_of(
+            load_local_enrollments_in(temporary.path()).unwrap(),
+            "elsewhere",
+            metadata.port,
+            &metadata.target_login,
+        ),
+        EnrollmentState::Missing
+    );
     atomic_write(&directory, REFRESH_FILE, b"", 0o600).unwrap();
     assert!(needs_refresh(&metadata, &directory));
+    // Approving the next copy updates syq there: the prompt says so, and a
+    // dry run is refused before it.
+    assert_eq!(state(), EnrollmentState::Outdated);
     complete_local_enrollment(&directory, &metadata).unwrap();
     assert!(!needs_refresh(&metadata, &directory));
     let mut other_build = metadata.clone();
@@ -6471,7 +6541,6 @@ fn receivers_refuse_root_and_effective_capabilities() {
 fn only_enrolled_grants_leave_bandwidth_to_the_sender() {
     assert!(enrolled_grant("c2lnbmVkLWdyYW50"));
     assert!(!enrolled_grant("named-v2:route"));
-    assert!(!enrolled_grant(crate::destination::RETURN_GRANT));
     assert!(!enrolled_grant(crate::destination::peer_bridge::GRANT));
 }
 
