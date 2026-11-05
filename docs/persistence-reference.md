@@ -40,11 +40,14 @@ account access.
 A `--for HOST` override wins over the default. Matching uses the exact hostname
 or SSH alias typed in the command, for every login and port; aliases are
 not expanded through SSH configuration or DNS. `--for` takes no login or port.
+`SYQ_AUTH_FROM` in the environment wins over both saved settings, for one shell
+or script; see [Environment](environment.md#choose-authorization-through-the-environment).
 An explicit `--auth-from` (`--syq-auth-from` for `syq rsync`), including `auto`,
-wins over both saved settings.
+wins over all of them.
 `--reset --for HOST` removes one override; `--reset` restores the default to
 `auto` while keeping host overrides. Omit the value to show saved choices, or
-add `--for HOST` to show that host's effective choice.
+add `--for HOST` to show that host's effective choice. Both also show when
+`SYQ_AUTH_FROM` overrides the saved choices.
 
 Defaults apply to `syq ssh`, copies using approved account connections, and the
 SSH endpoints of `rsync`, `rm`, `map`, and `clean-partials`. A copy explicitly
@@ -492,25 +495,30 @@ syq on both machines and reconnect from your laptop.
 
 ## Updating connections
 
-Before upgrading, run `syq persist off` on the receiving machine to stop its
-background services. Replacing the executable alone does not update running
-services. Close script scopes with `syq persist off --pscope PATH` too.
-After upgrading both machines, run `syq persist connect server` for each server
-you want to use. If receiving was disabled, enable it first with
-`syq persist receive on`, or enable and connect together with
-`syq persist receive on --connection server`.
+After upgrading syq on both machines, run `syq persist connect server` on the
+receiving machine for each server you use, adding `--pscope PATH` for a scoped
+domain. A connection from the new version stops the receiving service that the
+older version left running, starts the new one, and keeps your settings. If
+receiving was disabled, enable it first with `syq persist receive on`, or
+enable and connect together with `syq persist receive on --connection server`.
 
-Use the current binary to close explicit domains. An older binary may stop their
-services but refuse to remove newer settings; rerun scoped `off` with the current
-binary to finish cleanup. Older global receiving commands do not manage newly
-created domains. If you enable receiving in a scope created by an older version,
-avoid using that older version's global receiving commands at the same time.
+You do not need `syq persist off` before upgrading. For a scoped domain it
+also deletes that domain's settings and remembered permissions.
+
+Receiving starts again with the new version, so requests that were waiting
+for approval do not carry over: run them again on the server and approve the
+new requests. Session permissions (**Allow**) end with the old receiving
+connection, so the next account access asks again unless you chose
+**Remember**.
+
+Manage receiving with the new version afterwards. An older binary may refuse
+settings that a newer one wrote, and its global receiving commands do not
+manage scoped domains created by a newer version.
 
 Saved names, directories, and limits carry over. Existing working directories
 remain explicitly selected. Settings using the former `--approve always` now
 require approval; choose `--auto-approve-root` explicitly to enable unattended
-downloads. Older binaries reject the updated preferences; use the newer binary
-to manage receiving.
+downloads.
 
 Connections created before persistent receiver identities remain discoverable.
 Their names become assigned when an updated receiving machine reconnects.

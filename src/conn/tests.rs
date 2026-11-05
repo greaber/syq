@@ -445,7 +445,7 @@ fn excessive_probe_candidates_fail_before_resolution() {
             same_as_ssh_target: false,
         })
         .collect();
-    assert!(probe_reachable(&mut candidates, 1)
+    assert!(probe_reachable(&mut candidates, 1, TCP_PROBE_CEILING)
         .unwrap_err()
         .to_string()
         .contains("too many"));
@@ -2201,6 +2201,7 @@ fn verbose_ssh_is_limited_to_nonpersistent_unrestricted_helpers() {
         session_pool: true,
         reuse_for_workers: AtomicBool::new(false),
         workers_rejected: AtomicBool::new(false),
+        starting_master: AtomicBool::new(false),
     }));
     assert!(!verbose(&spec, true));
     assert!(!spec
@@ -2228,6 +2229,7 @@ fn persistent_control_path_is_one_byte_exact_openssh_argument() {
         session_pool: true,
         reuse_for_workers: AtomicBool::new(false),
         workers_rejected: AtomicBool::new(false),
+        starting_master: AtomicBool::new(false),
     };
     let spec = RemoteSpec {
         local_process: false,
@@ -2307,7 +2309,7 @@ fn probe_reachable_probes_each_socket_address_once() {
         candidate("localhost"),
         candidate("127.0.0.1"),
     ];
-    let probed = probe_reachable(&mut candidates, port);
+    let probed = probe_reachable(&mut candidates, port, TCP_PROBE_CEILING);
     // Queue a marker after the probes, then wait until the acceptor reaches
     // it. Stopping after the first acceptance could miss a duplicate probe
     // whose completed connection was not yet ready to accept.
@@ -2370,8 +2372,13 @@ fn replay_probe_results(
         })
         .collect();
     let (tx, rx) = std::sync::mpsc::channel();
-    for &result in results {
-        tx.send(result).unwrap();
+    for &(target, accepted) in results {
+        let answer = if accepted {
+            ProbeAnswer::Accepted
+        } else {
+            ProbeAnswer::Failed
+        };
+        tx.send((target, answer)).unwrap();
     }
     drop(tx);
     collect_probe_results(
@@ -3102,4 +3109,107 @@ fn ending_worker_setups_ends_a_login_in_progress_and_later_retry_waits() {
     canceller.join().unwrap();
     assert!(started_file.exists(), "the login did not start again");
     assert!(result.is_err_and(|error| error.is::<SetupCancelled>()));
+}
+
+#[test]
+fn route_probes_wait_a_few_ssh_round_trips_within_fixed_bounds() {
+    let ms = std::time::Duration::from_millis;
+    // Unmeasured: the old fixed wait.
+    assert_eq!(tcp_probe_wait(None), TCP_PROBE_CEILING);
+    assert_eq!(TCP_PROBE_CEILING, ms(1000));
+    // A LAN round trip waits the floor.
+    assert_eq!(
+        tcp_probe_wait(Some(std::time::Duration::from_micros(300))),
+        ms(200)
+    );
+    // Three round trips plus 100 ms in between.
+    assert_eq!(tcp_probe_wait(Some(ms(50))), ms(250));
+    assert_eq!(tcp_probe_wait(Some(ms(100))), ms(400));
+    // A very slow route waits no longer than before.
+    assert_eq!(tcp_probe_wait(Some(ms(400))), TCP_PROBE_CEILING);
+    assert_eq!(
+        tcp_probe_wait(Some(std::time::Duration::MAX)),
+        TCP_PROBE_CEILING
+    );
+}
+
+/// A listener whose accept queue is full makes Linux drop new connection
+/// attempts without answering, as a firewall that silently drops packets
+/// does. Probes give up on it after their bound, not the old fixed second.
+#[cfg(target_os = "linux")]
+#[test]
+fn route_probes_give_up_on_a_silent_address_after_their_bound() {
+    use socket2::{Domain, Socket, Type};
+    let listener = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    listener
+        .bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
+        .unwrap();
+    listener.listen(0).unwrap();
+    let address = listener.local_addr().unwrap().as_socket().unwrap();
+    let _queued = TcpStream::connect_timeout(&address, std::time::Duration::from_secs(10)).unwrap();
+    // Let the listener queue the completed connection.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let mut candidates = vec![TcpCandidate {
+        address: "127.0.0.1".into(),
+        speed_mbps: 0,
+        source: DataAddressSource::RemoteInterface,
+        reachable: None,
+        selected: false,
+        same_as_ssh_target: false,
+    }];
+    let wait = std::time::Duration::from_millis(200);
+    let started = std::time::Instant::now();
+    let unanswered = probe_reachable(&mut candidates, address.port(), wait).unwrap();
+    let elapsed = started.elapsed();
+    assert!(unanswered);
+    assert_ne!(candidates[0].reachable, Some(true));
+    assert!(elapsed >= wait, "{elapsed:?}");
+    assert!(
+        elapsed < std::time::Duration::from_millis(700),
+        "{elapsed:?}"
+    );
+    drop(listener);
+}
+
+#[test]
+fn a_kept_reply_reports_when_it_arrived_rather_than_when_it_was_taken() {
+    let mut conn = connection_replaying(&[Response::Ok, Response::Err("later".into())]);
+    let kept = conn.send_pending(Request::Shutdown).unwrap();
+    // The later request's reply follows the kept one, so the kept one has
+    // arrived once the later call returns.
+    assert!(matches!(
+        conn.call(Request::Shutdown).unwrap(),
+        Response::Err(error) if error == "later"
+    ));
+    let answered = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let (reply, arrived) = conn.take_reply_with_arrival(kept).unwrap();
+    assert!(matches!(reply, Response::Ok));
+    assert!(arrived <= answered);
+}
+
+#[test]
+fn the_background_notice_names_what_keeps_running_and_how_to_stop_it() {
+    assert_eq!(
+        background_notice("server", true, true, true, "syq persist off"),
+        "persistence keeps these running in the background: the SSH connection to server, a ready syq session there, and receiving through it. `syq persist off` stops them."
+    );
+    assert_eq!(
+        background_notice("server", true, true, false, "syq persist off"),
+        "persistence keeps these running in the background: the SSH connection to server and a ready syq session there. `syq persist off` stops them."
+    );
+    assert_eq!(
+        background_notice("server", true, false, false, "syq persist off"),
+        "persistence keeps this running in the background: the SSH connection to server. `syq persist off` stops it."
+    );
+    assert_eq!(
+        background_notice(
+            "user@server",
+            false,
+            false,
+            true,
+            "syq persist off --pscope /run/scope"
+        ),
+        "persistence keeps this running in the background: receiving through user@server. `syq persist off --pscope /run/scope` stops it."
+    );
 }

@@ -5,7 +5,7 @@ human output:
 
 ```sh
 syq cp --srcs-in project --into backup --results copy.ndjson
-syq rm old-output --results removal.ndjson
+syq rm --src-dir old-output --results removal.ndjson
 ```
 
 Each line is a JSON record. **Require a final `result` record before trusting
@@ -40,9 +40,8 @@ including the ones it refused or that failed there, come from the receiver
 itself, and failures reading the source come from the coordinating server; see
 [Results from the destination](remote-reference.md#results-from-the-destination).
 
-`--results` supports native `cp` (including pruning), `rm`, and `clean-partials`.
-Cleanup uses the removal records described below. Results cannot combine with
-`--detach`. The restricted receiver supports copy changes,
+`clean-partials` uses the removal records described below. Results cannot
+combine with `--detach`. The restricted receiver supports copy changes,
 including capped pruning, but not native removal.
 
 Records arrive in `seq` order; error and terminal records are flushed
@@ -68,21 +67,20 @@ interruptions can leave the terminal record missing.
   `encoding` values.
 - Treat human `message` text as display only; parse structured fields.
 
-`--results` includes both progress samples and final outcomes; use it for new
-integrations, including live progress displays.
+`--results` includes progress samples as well as final outcomes, so a live
+progress display can read the same stream.
 
 ## Exit codes
 
 | Code | Terminal status | Meaning |
 |---|---|---|
 | `0` | `success` | Requested operation succeeded |
-| `1` | `failed` / `aborted` | Fatal failure or abort |
+| `1` | `failed` / `aborted`, or no stream | Fatal failure or abort; with no stream, the results sink could not be opened |
 | `2` | No stream | Invalid arguments |
 | `23` | `partial` | Per-entry failures; independent work finished |
 | `25` | `refused` | A safety cap refused deletions |
 
-Removal terminals use only `success`, `partial`, or `failed`. A results-sink
-startup error also exits 1 without a stream.
+Removal terminals use only `success`, `partial`, or `failed`.
 
 ## Record envelope
 
@@ -91,7 +89,7 @@ Every record carries:
 | Field | Value |
 |---|---|
 | `schema` | `"syq.automation"` |
-| `schema_version` | `4`; Stream mappings use `5` |
+| `schema_version` | `4`; `5` for stream mappings |
 | `seq` | Integer starting at 0, strictly increasing |
 | `type` | Record type |
 
@@ -109,9 +107,7 @@ seconds), `syq_version` (what `syq --version` prints, such as `0.7.1`, or
 `dry_run`, and `endpoints`.
 Endpoints identify role and kind (`local`, `ssh`, or `s3`). SSH endpoints carry
 host/user; S3 endpoints carry `host: "s3://BUCKET"` without a user. They omit
-credentials, headers, ports, and raw command arguments. Clients that predate S3
-must be upgraded to decode S3 endpoint kinds; local and SSH streams retain
-their existing representation.
+credentials, headers, ports, and raw command arguments.
 
 Copy runs also carry `prune` and `mapping`. Removal has one source endpoint
 regardless of selector count and omits those copy fields.
@@ -128,9 +124,6 @@ optional `rate_bytes_per_second` and `eta_ms` estimates.
 Removal has zero byte and unchanged/excluded counts; its file counts reflect
 outcomes received so far. Copies that reach transfer completion emit a final
 progress sample, even for short copies. The terminal record owns final totals.
-
-For performance measurements collected with `--stats`, see
-[Performance measurements](performance-measurements.md).
 
 ### `trace`
 
@@ -214,8 +207,9 @@ include `message`. These records identify callbacks within this invocation;
 they cannot be converted to a pathname retry manifest. Ordinary entries in a
 mixed mapping still emit their usual records. The
 [Python callback reference](https://greaber.github.io/syq/python-streams.html#callback-mappings) describes
-publication and application retries. Callback admission uses the SDK's private
-channel, so these runs do not emit `stream_ready`.
+publication and application retries. These runs do not emit `stream_ready`;
+the [stream-mapping protocol](stream-mappings.md#entry-lifecycle) starts each
+entry instead.
 
 ### Removal records
 
@@ -275,15 +269,18 @@ carry the same object, with measurements advancing while that work runs:
 | Field | What it measures |
 |---|---|
 | `total_ms` | The coordinator's measured run, including helper installation, setup, planning, transfer, and finalization |
-| `setup_ms` | Preparing endpoints, establishing control and worker connections (including connections added during copying), and choosing the data transport; excludes helper installation |
+| `setup_ms` | Preparing endpoints, establishing control and worker connections, and choosing the data transport, including the TCP route check; excludes helper installation. It also counts data connections the copy adds while files are already copying, so it can approach `total_ms` |
 | `planning_ms` | Discovering source entries, inspecting destinations, deciding what to copy, and preparing the work, including directories created during planning |
 | `transfer_ms` | From the first selected file operation to the last completed file operation, including reads, hashing, writes, per-file metadata, waits, and retries |
 | `finalization_ms` | Work after file workers finish: remaining hardlinks, pruning, and directory metadata |
 | `helper_install_ms` | Installing matching helpers and remote syq commands, including the installation's platform probe |
 
 Setup and planning count the time spent in those activities, counting concurrent
-work of the same kind once. Transfer is one span across workers, including gaps.
-Total also includes coordinator bookkeeping between measured activities.
+work of the same kind once. The `timing:` line under a copy's summary shows
+setup only until file work begins, so connections added while copying do not
+count there; `setup_ms` keeps them. Transfer is one span across workers,
+including gaps. Total also includes coordinator bookkeeping between measured
+activities.
 These measurements can overlap; they are not numbers to add together. For example,
 copying can begin while planning continues. Installation on two hosts also counts
 once where it overlaps.
@@ -304,7 +301,13 @@ A copy with no selected file work reports zero transfer time.
 
 Copy totals include transferred/unchanged files, excluded entries, created directories,
 symlinks and specials, transferred/unchanged bytes, and on pruning runs
-`deletions_planned`, `deletions_completed`, and `deletions_blocked`. With
+`deletions_planned`, `deletions_completed`, and `deletions_blocked`.
+`bytes_transferred` counts the file data syq copied. `bytes_unchanged` counts
+data it did not need to copy because the destination already had it: the whole
+size of each unchanged file, plus the parts of transferred files it reused, such
+as matching blocks or a partial file left by an interrupted copy. So
+`bytes_unchanged` can be nonzero while `files_unchanged` is zero. The summary
+line shows the reused part with the transferred files. With
 `--in-place=update`, `replaced_not_in_place` counts the existing files syq
 replaced instead of updating them in place, by reason: `other_names`,
 `untrusted_filesystem`, `owner`, `privileges`, `wider_permissions` and

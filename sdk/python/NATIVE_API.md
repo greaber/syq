@@ -57,7 +57,7 @@ Use `src=["a", "b"]` for CLI `--srcs a b`, and likewise `src_non_dir` and `src_d
 | `*sources`, `src` | Select named objects |
 | `srcs_in` | Select a directory's contents |
 | `src_non_dir`, `src_dir` | Require non-directory objects or directories |
-| `cwd` | Source resolution base; may be remote for `cp` and `rm` |
+| `cwd` | Source resolution base, interpreted on the source endpoint, which may be remote |
 | `root` | Confine source resolution beneath this directory; requires relative selectors; conflicts with `cwd` |
 | `follow`, `follow_src` | Follow source symlinks; `follow` also enables destination following for `cp` |
 | `auth_from` | `"auto"`, `"ssh"`, `"@NAME"`, or an SSH provider endpoint; SSH operations request or reuse account access. S3 `cp` and `rm` can request operation authorization through `"@NAME"` |
@@ -93,12 +93,13 @@ In addition to the shared arguments above, it accepts:
 | `hash_or_copy` | Boolean: like `hash`, but compare only files the transfer strategy would compare (by default, every file with a remote syq endpoint) and copy the rest, so identical files may be rewritten; cannot combine with `hash` |
 | `integrity_checking` | Comma-separated string, e.g. `"transfer=sha256"`; defaults to size/mtime comparison and no extra payload checks |
 | `if_exists` | `"error-if-different"`, `"error"`, `"keep"`, `"update"` (default), or `"update-if-older"` |
+| `where`, `copy_if` | Expression strings: `where` selects non-directory source entries; `copy_if` decides which entries the copy may create or update; see [expressions](https://greaber.github.io/syq/expressions.html) |
 | `ignore` | Pattern string, `IgnoreFrom(path)`, or ordered iterable of either |
 | `ignore_from` | Rule file path or iterable of paths; applied after `ignore` |
 | `copy_metadata` | Metadata string or iterable; applies even on unchanged files: `mtime`, `times` (alias for `mtime`), `permissions`, `ownership`, `specials`, `hardlinks`, `acls`, `xattrs`, `atimes`, `crtimes`; S3-to-S3 copies also accept `content-type`, `content-encoding`, `content-language`, `content-disposition`, `cache-control`, `expires`, `website-redirect`, `user-metadata`, `tags`, `storage-class`; see [S3 metadata](https://greaber.github.io/syq/object-storage.html#copies-between-s3-buckets) and [filesystem preservation](https://greaber.github.io/syq/reference.html#preserve-metadata) for platform and route support |
 | `open_noatime` | Boolean: request file reads without access-time updates; warns and continues if unavailable |
 | `sparse` | Boolean: turn written zero ranges into sparse holes on filesystem destinations |
-| `in_place` | `"new"`: write new files directly at their final names, with no staging file; existing files are still replaced. `"update"`: also update existing files in place where syq can vouch for them, as `--in-place=update` does. The earlier `inplace=` keyword raises `SyqInvocationError` naming `in_place="new"` |
+| `in_place` | `"new"`: write new files directly at their final names, with no staging file; existing files are still replaced. `"update"`: also update existing files in place where syq can vouch for them, as `--in-place=update` does. The earlier `inplace=` keyword raises `SyqInvocationError`; `in_place="update"` is closest to its behavior |
 | `no_compress` | Boolean: disable compression |
 | `max_delete` | Nonnegative integer deletion limit; requires `prune=True` or `prune_before=True` |
 | `resource_limits` | Comma-separated ceilings that keep automatic tuning, e.g. `"bandwidth=10M,workers=4"`; a concurrency key conflicts with the same key in `performance_tuning` |
@@ -163,7 +164,8 @@ endpoint, independently of the client's local `process_cwd`. Both accept `rsh`,
 `dry_run`, `stats`, `verbose`, `quiet`, `progress`, `no_progress`,
 and `timeout` with the same meanings as `cp`. `open_writer` also accepts
 `s3_write_header`.
-See the CLI stream reference for the applicable tuning and integrity controls.
+See the [CLI stream reference](https://greaber.github.io/syq/commands/cp.html#transport-and-limits)
+for the tuning and integrity controls that apply to streams.
 The client supplies the executable, process working directory, environment,
 and default timeout. Stream calls always check transfer failures.
 
@@ -319,8 +321,8 @@ For S3, `mtime` is stored filesystem time, omitted when unavailable;
 `s3_last_modified` is the independent S3 object modification time. Requesting
 `kind` or `mtime` reads S3 object metadata; generation never downloads bodies.
 
-Connection options are `auth_from`, `rsh`, `syq_path`, `no_bootstrap`, `s3_endpoint`,
-`s3_region`, `s3_profile`, and `s3_header`, with the same types as on `cp`.
+Connection options are `auth_from`, `rsh`, `syq_path`, `no_bootstrap`, `pscope`,
+`s3_endpoint`, `s3_region`, `s3_profile`, and `s3_header`, with the same types as on `cp`.
 Explicit connection options are kept through transformations and copying.
 For example, the consumer uses the same object service here:
 
@@ -437,8 +439,8 @@ or source-tree ignore rules. Filter entries in your script. Named receiver
 grants authorize paths and do not accept callbacks. Callbacks run locally;
 mixed pathname transfers between SSH hosts require `coordinate_at="local"`.
 
-Callback runs emit `MappingStreamResult` events with the original zero-based
-entry index, `source` and `destination` (`PathValue`, or `None` for a callback),
+Callback runs emit `MappingStreamResult` events with `entry`, the original
+zero-based entry index, `source` and `destination` (`PathValue`, or `None` for a callback),
 `disposition`, `dry_run`, optional `bytes`, and optional error `message`.
 After a completed run, use failed entry indices to construct an application
 retry. Callbacks are never replayed automatically. Their automation records use
@@ -562,7 +564,7 @@ unsuccessful copy. Read attributes directly, for example
 | `specials_created` | `int` | Special filesystem objects created |
 | `bytes_transferred` | `int` | File-content bytes transferred, not compressed network traffic |
 | `bytes_total_known` | `bool \| None` | For descriptor copies, whether the source length is known; otherwise absent (`None`) |
-| `bytes_unchanged` | `int` | Bytes in unchanged files |
+| `bytes_unchanged` | `int` | Bytes not copied because the destination already had them: unchanged files and data reused inside transferred files |
 | `deletions_planned` | `int` or `None` | Entries selected for pruning |
 | `deletions_completed` | `int` or `None` | Entries pruned |
 | `deletions_blocked` | `int` or `None` | Pruning deletions blocked by a safety limit |
@@ -657,8 +659,10 @@ String enum: compare with `syq.OperationStatus.SUCCESS`, or use `.value` for
 stored in the result. `AsyncClient` accepts synchronous or awaitable callbacks;
 awaitable callbacks count toward the timeout.
 
-`AutomationEvent` is the union of the event classes below and `CpResult` and
-`RmResult`. Each event is a frozen dataclass. Its fields are listed below;
+`AutomationEvent` is the union of the event classes below, `CpResult`,
+`RmResult`, and `MappingStreamResult` from
+[callback mappings](https://greaber.github.io/syq/python-streams.html#callback-mappings).
+Each event is a frozen dataclass. Its fields are listed below;
 all events also carry `protocol: ProtocolMetadata`, just like results.
 `event.protocol.type` identifies the wire record type. Optional fields use `None` when unavailable.
 

@@ -660,7 +660,7 @@ fn small_push_mtime_precision_matches_stats_dry_run_and_hash() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 assert!(
                     stdout.contains(&format!(
-                        "  scanned entries: 1\n  files to transfer: {}\n  files unchanged: {}\n  files excluded: 0\n  bytes transferred: {}\n  bytes unchanged: {}\n",
+                        "  scanned entries: 1\n  files to transfer: {}\n  files unchanged: {}\n  files excluded: 0\n  bytes transferred: {}\n  bytes unchanged or reused: {}\n",
                         u64::from(!matches),
                         u64::from(matches),
                         if matches { 0 } else { 3 },

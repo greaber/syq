@@ -53,7 +53,8 @@ Your machine keeps the entry key and its own record in
 commands; it is not a disposable cache.
 
 Copies cannot write the receiver's protected paths: the account's
-`~/.ssh`, syq's stored programs, enrollment state on either side, and syq's
+`~/.ssh`, syq's stored programs (including all of `~/.local/libexec`, where
+older versions kept the receiver), enrollment state on either side, and syq's
 receiving state, such as `~/.config/syq` and its runtime directory
 `$XDG_RUNTIME_DIR/syq-persist-UID`. Without `XDG_RUNTIME_DIR`, the runtime
 directory is `/tmp/syq-persist-UID` on macOS and `$TMPDIR/syq-persist-UID`
@@ -125,6 +126,11 @@ refresh cannot start a new copy; copies already running finish. Releases stay
 in `~/.local/lib/syq` until you delete them. Delete a release's directory only
 when no syq line in `authorized_keys` names it.
 
+Enrollment detects the destination platform and installs a matching executable.
+Source builds require compatible platforms; `--syq-path` does not select the
+restricted receiver. See [Developing syq](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md#direct-server-to-server-copies)
+for testing source builds.
+
 If the server loses an enrollment's state, its receiver refuses every copy.
 `syq receiver enroll` then sets up a new enrollment in its place and removes
 the old line. If only the record of authorizations already used is lost, or
@@ -134,13 +140,22 @@ authorizations signed before then are refused.
 
 ### Enrollments from older versions
 
-Syq 0.4.0 to 0.7.1 made one enrollment per destination directory. This
-version does not use, list, or remove them, and an older syq can keep copying
-through them until you remove them. Revoke them with the older version before
-upgrading, or remove them by hand: on the server, delete the
-`authorized_keys` lines whose command runs `~/.local/libexec/syq-receiver`,
-then `~/.local/share/syq/restricted` and `~/.local/libexec/syq-receiver`; on
-your machine, delete `~/.local/state/syq/restricted`.
+Syq 0.7.1 and earlier made one enrollment per destination directory. This
+version does not use, list, or revoke them; the first copy to the account
+sets up a new enrollment beside them. Until you remove them, an older syq can
+keep copying through them. When the account you run `syq receiver list` in
+still holds their files, it prints a notice that points here.
+
+To remove them, revoke them with the older version before upgrading, or
+delete them by hand:
+
+- On the server, delete each line in `~/.ssh/authorized_keys` whose command
+  runs `~/.local/libexec/syq-receiver`, written with your home directory's
+  full path. Keep the lines whose command runs syq from `~/.local/lib/syq`:
+  they belong to this version's enrollments, even though their comments also
+  start with `syq-enrollment:`. Then delete the directory
+  `~/.local/share/syq/restricted` and the file `~/.local/libexec/syq-receiver`.
+- On your machine, delete the directory `~/.local/state/syq/restricted`.
 
 A copy between servers that sends its data over SSH can add a temporary line
 to the destination account's `~/.ssh/authorized_keys`. Its comment starts with
@@ -149,11 +164,6 @@ copy removes the line when it ends, but a copy that is killed, or whose server
 restarts, leaves the line behind, and syq does not remove it later. A leftover
 line lets nothing in: only its copy held the key, and that copy has ended.
 Delete such lines when no copy to that account is running.
-
-Enrollment detects the destination platform and installs a matching executable.
-Source builds require compatible platforms; `--syq-path` does not select the
-restricted receiver. See [Developing syq](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md#direct-server-to-server-copies)
-for testing source builds.
 
 ## Limits and unsupported options
 
@@ -254,8 +264,9 @@ still be running. The coordinating server needs `/bin/kill` and either
 ## Authorization selection
 
 For `syq cp` between this machine and one SSH server, omitted `--auth-from`
-uses your [saved authorization choice](persistence-reference.md#authorization-defaults),
-or `auto` if none is set. `--auth-from auto` tries this machine's native SSH
+uses `SYQ_AUTH_FROM` when it is set, then your
+[saved authorization choice](persistence-reference.md#authorization-defaults),
+or `auto` if neither is set. `--auth-from auto` tries this machine's native SSH
 access, regardless of existing approved account connections.
 SSH keeps its normal prompts and configured
 timeouts. If SSH
@@ -266,7 +277,16 @@ machine uses its own SSH configuration and trusted host keys. Timeouts,
 temporary DNS failures, and unrecognized SSH errors end the attempt without
 trying a receiving machine.
 Offline or unsupported receiving connections are skipped. With none available,
-the SSH error is reported. Unsupported copy options use only the source
+the SSH error is reported.
+
+When a receiving machine is asked, syq prints one line saying why, unless
+this machine simply has no SSH credentials to offer: no keys in its agent and
+none of the key files its SSH configuration names. Asking the receiving
+machine is then the normal way to authorize the copy. Otherwise the line names
+what went wrong and how to fix it: this machine's keys did not get it in,
+nothing answers at the agent socket SSH uses, the agent there did not list
+its keys, or the SSH error itself.
+Unsupported copy options use only the source
 machine's SSH access. Helper setup and copy errors do not trigger another
 authorization attempt. Once approval is requested, refusal or failure ends
 the attempt. Elapsed time includes authorization setup; handoffs to older helpers

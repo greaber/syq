@@ -3,8 +3,8 @@
 List the files, change their destination names, then copy them. `syq map`
 produces the list, a script changes it, and `syq cp --mapping` makes the copy.
 
-For Python scripts, see the [Python SDK](python.md) and its
-[mapping examples](python.md).
+For Python scripts, see "Rename while copying" in the
+[Python SDK guide](python.md).
 
 ## Lowercase destination names
 
@@ -35,9 +35,10 @@ syq map photo.jpg --as albums/cover.jpg
 
 `map` lists sources without copying them. Add `--from HOST` for SSH or
 `--from s3://BUCKET` for S3. It emits `src` and `dst` by default; request
-additional fields with `--include`, for example `--include kind,size,mtime`. Use the same source directory
-when making the copy: a list produced with `--srcs-in photos` needs `-C photos`
-on `cp`. Each listed directory includes separate entries for its contents.
+additional fields with `--include`, for example `--include kind,size,mtime`.
+Use the same source directory when making the copy: a list produced with
+`--srcs-in photos` needs `-C photos` on `cp`. Each listed directory includes
+separate entries for its contents.
 
 ## Group photos by modification month
 

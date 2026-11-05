@@ -8,7 +8,8 @@ syq cp --srcs-in project --to server --into backup --dry-run -v
 ```
 
 Put source selectors and `--mapping` before `--to` or a placement option.
-For scripting, see [environment variables](../environment.md)
+For scripting, `SYQ_CP_OPTIONS` supplies extra arguments and `SYQ_AUTH_FROM`
+chooses authorization; see [environment variables](../environment.md)
 and [results](../automation.md).
 
 <!-- CLI: cp -->
@@ -102,7 +103,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--no-compress` | Disable transport compression |
 | `--receiver-max-entries <N>` | Command-restricted receiver ceiling: refuse to touch more than N destination entries |
 | `--receiver-max-bytes <SIZE>` | Command-restricted receiver ceiling: refuse to write more than SIZE bytes of file data in total |
-| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Override saved authorization: try native SSH (auto), require native SSH (ssh), or authorize through @NAME or an SSH host (@NAME also supports S3 copies). Eligible native copies can request laptop authorization after SSH failure |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Override SYQ_AUTH_FROM and saved authorization: try native SSH (auto), require native SSH (ssh), or authorize through @NAME or an SSH host (@NAME also supports S3 copies). Eligible native copies can request laptop authorization after SSH failure |
 | `--coordinate-at <COORDINATE_AT>` | Choose the endpoint that runs the coordinator<br><br>Possible values:<br>- auto: Run locally unless both endpoints are remote, then run at the source<br>- src: Run the coordinator at the source endpoint<br>- dst: Run the coordinator at the destination endpoint<br>- local: Keep the coordinator on the invoking machine and relay the data there<br><br>[default: auto] |
 | `--rsh <COMMAND>` | Remote shell command (default: ssh); the command owns SSH and agent policy when set. An ssh command keeps shared and persistent connections unless its options configure connection sharing; -v shares them only within the run |
 | `--syq-path <PATH>` | Use this remote syq executable instead of installing a helper |
@@ -167,13 +168,11 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 
 ## Update policies
 
-The default `--if-exists=update` updates existing files when their contents
-differ. Use `error-if-different` to accept matching contents and reject differences,
-`error` to require every selected file to be absent, `keep` to leave existing
-files untouched, or `update-if-older` to keep newer destinations and otherwise
-update differing contents. Timestamp ties use the normal comparison. These choices
-do not change whether size/time or hashes are used for comparison. See
-[existing-file policies](../reference.md#choose-which-existing-files-to-update).
+`--if-exists` chooses what happens to existing destination files; see
+[existing-file policies](../reference.md#choose-which-existing-files-to-update)
+for each value. When the timestamps are equal, `update-if-older` compares the
+files as `update` does. Policies that compare files trust matching size and
+modification time unless you add `--hash`.
 
 `--into-existing` requires the destination directory to exist but allows new
 files inside it. `--if-exists=keep` can add children to an existing directory; it
@@ -183,14 +182,16 @@ makes a read-only one writable only as
 `--if-exists=keep` and `update-if-older` cannot combine with `--in-place`:
 an interrupted copy could leave an incomplete file that a retry skips. The
 default `update` policy repairs that file on a retry. With `--in-place`, a
-file that must be new, an `--as-new` file or a new file under
-`--if-exists=error` or `error-if-different`, is still written under a temporary
-name and then renamed into place, so an interrupted copy leaves no incomplete
-file at its name, and a retry resumes it. Every destination publishes such
-a file without replacing anything: a file put at its name in the meantime is
-kept, and that file's copy fails. S3 destinations do not support
-`--in-place`. See [In-place writes](../reference.md#in-place-writes) for which
-existing files `--in-place=update` writes into.
+file that must be new (an `--as-new` file, or a new file under
+`--if-exists=error` or `error-if-different`) is still written under a temporary
+name, so an interrupted copy leaves no incomplete file at its name, and a retry
+resumes it. Syq renames it into place only while the name is still free: a
+file that appears there first is kept, and that file's copy fails. A few
+filesystems cannot make this check exact; see
+[existing-file policies](../reference.md#choose-which-existing-files-to-update).
+S3 destinations do not support `--in-place`. See
+[In-place writes](../reference.md#in-place-writes) for which existing files
+`--in-place=update` writes into.
 
 These policies do not disable requested pruning. Descriptor-specific
 restrictions are listed under [file descriptors](#file-descriptors).
@@ -203,9 +204,10 @@ for source selection to finish, then removes extras before copying. A later
 copy failure does not restore those removals. Both modes honor `--max-delete`
 and skip deletions if scanning reports errors.
 
-Ignored paths, syq partial files, and recovery entries are
-kept. This also keeps their parent directories; extra hard links to copied
-files may be kept too. An interruption during deletion can leave some extras
+Ignored paths, syq partial files, and
+[recovery entries](clean-partials.md#which-files-are-removed) are kept. This
+also keeps their parent directories; extra hard links to copied files may be
+kept too. An interruption during deletion can leave some extras
 already removed.
 
 Keep the source outside the destination. Syq detects overlap locally and for
@@ -243,9 +245,10 @@ reject entries created by the earlier attempt. See
 ## Metadata details
 
 Source setuid, setgid, and sticky bits are not copied without
-`--copy-metadata=permissions`. Ownership uses numeric IDs. On macOS, an existing
-destination directory must be readable before syq can temporarily repair
-missing write or search permission.
+`--copy-metadata=permissions`. Ownership uses numeric IDs. On macOS,
+[`--widen-dirs`](../reference.md#copy-metadata) can add missing write or search
+permission to an existing destination directory only when that directory is
+readable.
 
 Creating or updating named file contents sets the source modification time.
 Unchanged contents require `--copy-metadata=mtime` to update their timestamp. Output
@@ -289,7 +292,8 @@ only after your producer succeeds.
 An output descriptor may contain incomplete data after a failure. Check syq's
 exit status before using the result. A consumer closing early makes syq fail.
 Forced termination can leave a `.syq-stream-*` temporary file beside the
-destination.
+destination; `syq clean-partials` does not remove it, so delete it yourself
+once no copy is writing there.
 
 ### Options and file behavior
 
@@ -299,8 +303,8 @@ unknown until EOF. Use `--resource-limits bandwidth=RATE` to limit throughput.
 
 <a id="selection-and-previews"></a>
 
-`--if-exists=keep` skips a destination that exists. Existing directories, S3 key
-prefixes, and dangling symlinks also count as existing for `--if-exists=keep`. Skips succeed without reading input or
+`--if-exists=keep` skips a destination that exists, including a directory, an
+S3 key prefix, or a dangling symlink. Skips succeed without reading input or
 opening a named FIFO. A shell producer can therefore receive SIGPIPE; in Python, check the writer's
 `skipped` property before producing bytes. An output FD already exists, so
 `--if-exists=keep --as-fd N` always skips after validating the source.
@@ -321,16 +325,18 @@ request or reuse [account access](../persistence-reference.md#approved-account-c
 streams do not request per-copy SSH approval. S3 transfers one object using
 multipart controls; see [Descriptor copies](../object-storage.md#descriptor-copies).
 
-Restart recovery, named receiving destinations, detached execution,
-directory selection, and `--hash` are unsupported.
+Named receiving destinations and restart recovery are unsupported. Options
+written for file trees, such as `--hash`, `--in-place`, `--prune`, `--where`,
+`--ignore`, `--transfer-strategy`, and `--detach`, are refused rather than
+ignored.
 `--if-exists=error` rejects an existing named destination before reading input
 when syq can inspect it. If an object-storage provider denies or fails that
 inspection, syq sends the stream using conditional creation, which still refuses
 replacement. `--if-exists=error-if-different` compares an existing named destination
 with the received stream before accepting it; a dry run cannot perform that comparison.
-Output descriptors are already opened by the caller and receive bytes directly;
-they do not apply the per-path existing-file policy (except `keep`, which always
-skips).
+Output descriptors are already opened by the caller and receive bytes directly,
+so `--if-exists` does not apply to them, except that `keep` always skips and
+`update-if-older` is refused.
 
 ### Descriptor offsets and metadata
 
@@ -354,8 +360,9 @@ when attributes are requested; time preservation uses S3's modification time if
 no syq attributes are stored.
 
 Input pipes, sockets, and devices have no payload metadata, so they reject
-`--copy-metadata`. Their new named destinations use `0666` limited by the umask,
-or by the directory's default ACL if it has one, and the time of the write; existing files keep their permissions.
+`--copy-metadata` and `--if-exists=update-if-older`. Their new named
+destinations use `0666` limited by the umask, or by the directory's default ACL
+if it has one, and the time of the write; existing files keep their permissions.
 Output pipes likewise cannot preserve times, permissions, or ownership. Parent
 directories are created as needed. The source `--cwd` / `--root` options
 apply to pathname sources. `--root` with `--src-fd` is rejected because it cannot

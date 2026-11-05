@@ -1982,6 +1982,7 @@ impl Planner<'_> {
                 if ff != 0 || opts.inode_metadata_differs(&dst_rel, &e, d) {
                     self.progress.files_unchanged.fetch_add(1, Relaxed);
                     self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
+                    self.progress.add_unchanged_file_bytes(e.size);
                     if opts.dry_run {
                         self.dry_run_changes.metadata_files += 1;
                         self.emit_trace(
@@ -2027,6 +2028,7 @@ impl Planner<'_> {
             }
             self.progress.files_unchanged.fetch_add(1, Relaxed);
             self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
+            self.progress.add_unchanged_file_bytes(e.size);
         } else if opts.dry_run
             && opts.previews_by_comparing()
             && dst_entry
@@ -3127,6 +3129,9 @@ impl Planner<'_> {
                     } = *replacement;
                     self.progress.files_unchanged.fetch_sub(1, Relaxed);
                     self.progress.bytes_unchanged.fetch_sub(entry.size, Relaxed);
+                    self.progress
+                        .bytes_in_unchanged_files
+                        .fetch_sub(entry.size, Relaxed);
                     self.enqueue_with(source, dst, rel, dst_rel, entry, Some(destination), reason);
                 }
                 (Some(error), _) => self.report_metadata_failure(Some(&dst), kind, &error),

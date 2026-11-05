@@ -48,9 +48,9 @@ and a writable home directory; an unavailable release or unsupported platform
 is an error. `latest` and version ranges are not accepted.
 
 Official and source builds support this option. The syq you invoke must
-understand `--use-version`; the selected release does not need to. That release interprets the command and controls its remote helpers
-and shared state. Selecting an older release also selects its limitations and
-bugs; this option does not add newer behavior to it.
+understand `--use-version`; the selected release does not need to. That
+release interprets the command and controls its remote helpers and shared
+state, so selecting an older release also selects its limitations and bugs.
 
 ### Check the invoked version
 
@@ -75,7 +75,6 @@ Expressions use a small numeric comparison language:
 
 AND binds more tightly than OR. Each version has three nonnegative decimal
 integer components, compared in order, so `1.10.0` is newer than `1.9.9`.
-Leading zeros do not change the number; each component must fit in 64 bits.
 Spaces around comparisons, operators, commas, and bars are allowed. Quote the
 expression to protect `<`, `>`, and `|` from the shell. Partial versions,
 wildcards, `~`, `^`, parentheses, and `||` are not supported.
@@ -88,8 +87,8 @@ initially invoked executable before downloading or running the selected release:
 syq --version-is '>=0.7.1' --use-version 0.7.0 cp photos --into backup
 ```
 
-The check is consumed by the initial executable; it is not passed to the selected
-release or remote helpers. A version mismatch or a development build exits with
+Only the syq you invoked checks the expression; the selected release and remote
+helpers do not see it. A version mismatch or a development build exits with
 status 1 before the command runs. Invalid expressions or misplaced options exit
 with status 2. Only release builds with numeric `x.y.z` versions are supported;
 prerelease and development-build identities cannot be used in expressions.
@@ -121,11 +120,9 @@ for Homebrew.
 A command that is already running when you update keeps running its own
 version. On macOS, if it then needs to start another syq process, such as the
 receiver of a local copy, and the update installed a different version, it
-stops with a message to rerun the command instead of starting the new version;
-reinstalling the same version does not stop it. A receiving connection started
-before the update refuses in the same way and names the command that restarts
-it, `syq persist connect SERVER`, which replaces a receiving connection from
-another version and keeps your settings. See
+stops and asks you to rerun the command. A receiving connection started before
+the update refuses requests in the same way and names the command that restarts
+it, `syq persist connect SERVER`, which keeps your settings. See
 [Updating connections](persistence-reference.md#updating-connections).
 
 Standalone and Homebrew installs may print an update reminder in a terminal,

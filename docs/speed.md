@@ -63,9 +63,12 @@ for a more detailed comparison. The quick script above does not use syq-bench.
 <tr><th scope="row">rsync</th><td>18.3 MB/s</td></tr>
 </tbody>
 </table>
-<figcaption>One 1.07 GB file, held in memory at both ends; three runs per tool.
-From the separate <a href="https://greaber.github.io/syq-bench/all-results.html#public-wan-forward">syq-bench project</a>,
-measured on September 13, 2026 (<a href="https://greaber.github.io/syq-bench/data/release-060-public-wan-forward.json">raw results</a>).
+<figcaption>One 1.07 GB file, held in memory at both ends, over a route with about
+108 ms round-trip time; three runs per tool. The syq row sends data over
+encrypted TCP; syq over SSH sends it through SSH instead. Measured with syq 0.6.0
+and rsync 3.4.1 on September 13, 2026, by the separate
+<a href="https://greaber.github.io/syq-bench/all-results.html#public-wan-forward">syq-bench project</a>
+(<a href="https://greaber.github.io/syq-bench/data/release-060-public-wan-forward.json">raw results</a>).
 Your results will depend on your machines and connection.</figcaption>
 </figure>
 
@@ -99,7 +102,11 @@ A second copy into the same destination may just measure skipping existing files
 
 SSH authenticates remote copies. When reachable, encrypted TCP carries file
 data on a port in `47600–47699`; otherwise copies use SSH on the same route.
-See [Make TCP reachable](server-tuning.md#make-tcp-reachable) for firewall settings.
+Before opening data connections, syq checks that TCP gets through, waiting a
+few times the round trip it measured over SSH and never more than a second.
+When TCP does not get through, the copy says so in one line. If TCP never works with a server,
+`--no-tcp` skips the check. See
+[Make TCP reachable](server-tuning.md#make-tcp-reachable) for firewall settings.
 To [Run the copy from a server](remote-to-remote.md#run-the-copy-from-a-server)
 with your laptop’s approval, direct encrypted TCP must be reachable.
 

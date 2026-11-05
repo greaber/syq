@@ -254,11 +254,7 @@ pub(super) fn select(
         }) else {
             return Err(error);
         };
-        crate::output::diagnostic!(
-            "syq: {}; trying source authorization through @{}",
-            error.root_cause(),
-            found.0
-        );
+        super::notices::asking(&error, &spec, &found.0, &format!("this copy from {target}"));
         found
     };
     Ok(Some(handoff::Selection::new(
@@ -279,7 +275,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
     let target = target.context("source authorization target missing")?;
     let command = crate::approval_command::copy_command(args)?;
     let request = request(args)?;
-    crate::output::diagnostic!("syq: requesting permission from @{name} to read from {target:?}; approve on that machine with its desktop prompt or syq persist receive pending");
+    super::notices::waiting(&format!("@{name}"), &format!("this copy from {target}"));
     let (stream, reply) = exchange(
         &registration,
         Message::Pull {

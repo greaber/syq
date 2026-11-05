@@ -55,9 +55,8 @@ syq.cp("data", to="user@server", into="/backup")
 syq.cp("report.csv", from_="user@server", cwd="/exports", into="downloads")
 ```
 
-SSH hosts and paths are separate arguments. See
-[Copy between servers](https://greaber.github.io/syq/remote-to-remote.html)
-for copies with two remote endpoints.
+SSH hosts and paths are separate arguments. Pass both `from_` and `to` to
+[copy between servers](https://greaber.github.io/syq/remote-to-remote.html).
 
 ## Preview changes
 
@@ -86,6 +85,20 @@ result = syq.cp(
 )
 ```
 
+## Filter with expressions
+
+Pass `where` to select source files, and `copy_if` to decide which files the
+copy may create or update:
+
+```python
+syq.cp(srcs_in="project", into="backup",
+       where='src.kind = "file" and src.size >= 1MiB',
+       copy_if='not dst.exists or src.mtime > dst.mtime')
+```
+
+See [Select entries with expressions](https://greaber.github.io/syq/expressions.html)
+for the fields and operators.
+
 ## Remove files
 
 ```python
@@ -97,7 +110,7 @@ Positional paths and `src` refuse directories. Use `src_dir` to remove
 a tree, or `srcs_in` to recursively empty it while keeping its root.
 
 `root` confines removal to that directory. Add `on="server"` to remove files
-over ordinary SSH. Command-restricted receivers do not support `rm`. See
+on an SSH server, or `on="s3://bucket"` for S3. See
 [Remove files](https://greaber.github.io/syq/remove.html) for selector behavior.
 
 ## Handle failures
@@ -153,13 +166,12 @@ with syq.map(srcs_in="photos") as mapping:
     result = syq.cp(mapping=renamed, into="published")
 ```
 
-This places the contents of `photos` under `published/archive`. The mapping
-carries its source endpoint, base, explicit connection options, and
-symlink-following policy through the transform. Use `from_="server"` or
-`from_="s3://bucket"` for remote generation.
-By default entries contain only source and destination paths. Request extra
-fields with `include=["kind", "size", "mtime"]`; S3 object time is separately
-available as `s3_last_modified`. Missing stored S3 `mtime` stays `None`.
+This places the contents of `photos` under `published/archive`. The
+transformed mapping remembers where its sources are and how to connect, so the
+copy reads them from the same place. Pass `from_="server"` or
+`from_="s3://bucket"` to `map` to list remote sources. Entries contain only
+source and destination paths unless you request more with `include`, such as
+`include=["kind", "size", "mtime"]`.
 Return `None` from the transform to skip an entry. The entire transform must
 finish successfully before copying starts; a failed transform leaves the
 destination untouched. See
@@ -262,8 +274,6 @@ default; pass `timeout=None` to disable it for that call:
 ```python
 result = client.cp("data", into="backup", timeout=None)
 ```
-
-The timeout also applies while collecting subprocess output after syq exits.
 
 To use an existing executable, pass `Client(executable="/opt/bin/syq")`.
 This bypasses the bundled version; see

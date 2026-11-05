@@ -140,6 +140,7 @@ impl Planner<'_> {
                 self.progress
                     .bytes_unchanged
                     .fetch_add(leaf.e.size, Relaxed);
+                self.progress.add_unchanged_file_bytes(leaf.e.size);
                 if self.opts.metadata_fix_flags(
                     &leaf.dst_rel,
                     &leaf.e,

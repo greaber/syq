@@ -54,9 +54,14 @@ syq receiver enroll [OPTIONS] <[USER@]HOST>
 
 Prints one tab-separated line per enrollment: its ID, `active` or `pending`,
 and the account. Active enrollments add the receiver's release and the
-fingerprint of the login key it trusts. When this machine still holds
-enrollments from syq 0.4.0 to 0.7.1, a notice says where to read how to
-remove them.
+fingerprint of the login key it trusts.
+
+Enrollments made by syq 0.7.1 and earlier are not listed, and this version
+cannot use or revoke them. When this account still holds their files, `list`
+prints a notice. To remove them, revoke them with the older version, or delete
+syq's old lines in the server's `authorized_keys` and its old files on both
+machines as [Enrollments from older versions](../remote-reference.md#enrollments-from-older-versions)
+describes.
 
 <!-- CLI: receiver list -->
 ```text
@@ -66,6 +71,10 @@ syq receiver list
 <!-- /CLI -->
 
 ## syq receiver revoke
+
+Stops copies running through the enrollment, removes syq's line and state from
+the server account, and then removes this machine's record. If the server
+cannot be reached, nothing is removed; run the command again.
 
 <!-- CLI: receiver revoke -->
 ```text

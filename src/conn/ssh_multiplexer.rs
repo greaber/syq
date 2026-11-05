@@ -23,6 +23,9 @@ pub(crate) struct SshMultiplexer {
     pub(super) session_pool: bool,
     pub(super) reuse_for_workers: AtomicBool,
     pub(super) workers_rejected: AtomicBool,
+    /// A control session ran when no persistent master was live, so it became
+    /// the master, which keeps running after this command.
+    pub(super) starting_master: AtomicBool,
 }
 
 // Keepalives detect dead transports so a later command can reconnect. Durable
@@ -309,6 +312,43 @@ pub(crate) fn require_constrained_openssh(program: &str, location: &str) -> Resu
     }
 }
 
+/// What a command left running in the background for `label`, and the
+/// command that stops it.
+pub(super) fn background_notice(
+    label: &str,
+    master: bool,
+    pool: bool,
+    receiving: bool,
+    stop: &str,
+) -> String {
+    let mut running = Vec::new();
+    if master {
+        running.push(format!("the SSH connection to {label}"));
+    }
+    if pool && master {
+        running.push("a ready syq session there".to_owned());
+    }
+    if receiving {
+        running.push(if master {
+            "receiving through it".to_owned()
+        } else {
+            format!("receiving through {label}")
+        });
+    }
+    let list = match running.as_slice() {
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+        [] => String::new(),
+    };
+    let (these, them) = if running.len() == 1 {
+        ("this", "it")
+    } else {
+        ("these", "them")
+    };
+    format!("persistence keeps {these} running in the background: {list}. `{stop}` stops {them}.")
+}
+
 impl SshMultiplexer {
     pub(crate) fn new() -> Result<Self> {
         let directory = crate::private_broker::private_temp_dir("syq-ssh-")
@@ -327,6 +367,7 @@ impl SshMultiplexer {
             session_pool: false,
             reuse_for_workers: AtomicBool::new(false),
             workers_rejected: AtomicBool::new(false),
+            starting_master: AtomicBool::new(false),
         })
     }
 
@@ -356,6 +397,7 @@ impl SshMultiplexer {
             session_pool: ssh.is_none(),
             reuse_for_workers: AtomicBool::new(false),
             workers_rejected: AtomicBool::new(false),
+            starting_master: AtomicBool::new(false),
         })
     }
 
@@ -377,6 +419,7 @@ impl SshMultiplexer {
             session_pool: true,
             reuse_for_workers: AtomicBool::new(false),
             workers_rejected: AtomicBool::new(false),
+            starting_master: AtomicBool::new(false),
         }
     }
 
@@ -387,6 +430,17 @@ impl SshMultiplexer {
 
     pub(crate) fn control_path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// Before a control session that becomes this endpoint's persistent
+    /// master when none is live: note that it will start one.
+    pub(super) fn note_master_start(&self) {
+        if self.persistent
+            && !self.existing_only
+            && !crate::persistence::socket_is_ready(&self.path).unwrap_or(true)
+        {
+            self.starting_master.store(true, Ordering::Relaxed);
+        }
     }
 
     pub(super) fn set_reuse_for_workers(&self, reuse: bool) {

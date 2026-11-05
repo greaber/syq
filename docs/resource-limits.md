@@ -20,12 +20,13 @@ syq cp data --to server --into backup --resource-limits bandwidth=10M
 
 For ordinary SSH and TCP copies, this limits outgoing bytes to 10 MiB/s
 across all workers, including when workers use both transports. It counts
-compressed bytes and syq framing. TCP also counts its encryption records;
-SSH counts bytes passed to OpenSSH, excluding OpenSSH encryption overhead.
-Connection setup, separate control traffic, and IP/TCP headers are excluded.
-The small-copy shortcut also paces file data sent on its control connection.
-Compressible files can therefore copy at a higher logical rate. Small bursts
-remain possible because the operating system buffers network writes.
+compressed bytes, so compressible files can copy at a higher logical rate.
+The count includes syq's framing and, for TCP, its encryption records; for
+SSH it covers the bytes passed to OpenSSH, not OpenSSH's own encryption
+overhead. Connection setup, separate control traffic, and IP/TCP headers are
+not counted, but file data that a small copy sends over its control connection
+is. Small bursts remain possible because the operating system buffers network
+writes.
 
 Remote-to-remote relays apply the rate to each network leg separately: a
 10 MiB/s cap permits up to 10 MiB/s inbound and 10 MiB/s outbound at the relay. Local,
@@ -60,10 +61,8 @@ limit can allow more concurrency. Fixed worker settings still report failures
 when their requested resources are unavailable.
 
 Copies can also continue with less parallel work when threads or file handles
-are scarce. On Linux, this includes retrying small-file creation once on network
-or FUSE mounts that report descriptor shortages as permission errors. Persistent
-failures remain errors. Syq does not reserve memory or disk space, or guarantee
-success under every resource limit.
+are scarce; persistent failures remain errors. Syq does not reserve memory or
+disk space, or guarantee success under every resource limit.
 
 [Restricted receiver limits](remote-reference.md#limits-and-unsupported-options)
 still apply. S3 ceilings constrain the route's normal automatic range without
@@ -72,7 +71,7 @@ aggregate request ceiling. A fixed setting for one count still operates within
 ceilings on the other counts.
 
 Use `workers` only for filesystem copies and the S3 keys only for S3 copies.
-Limits apply to the remote coordinator too and are not saved.
+Limits also apply when a server coordinates the copy, and are not saved.
 
 ## Bandwidth units
 
@@ -91,18 +90,21 @@ below 512 bytes/s are rejected. For example, `1024` and `1M` both select 1 MiB/s
 
 ## Where the limit applies
 
-For filesystem copies, workers share one aggregate limit. Buffering, streaming,
-and SSH/TCP overhead can produce bursts.
-[`bw-pacing`](tuning.md#average-rate-and-burst-patterns) controls pacing.
-A capped copy uses normal copying instead of local filesystem cloning.
+For filesystem copies, workers share one aggregate limit. Buffering and
+streaming can still produce short bursts. Where the limit counts file data
+rather than transport bytes,
+[`bw-pacing`](tuning.md#average-rate-and-burst-patterns) chooses how requests
+are spaced. A capped copy uses normal copying instead of local filesystem
+cloning.
 
-For local/S3 copies, the limit applies to scheduled data, with upload bursts
-up to a part. Server-side S3 copies do not pass object bodies through this
-machine and are not paced by this setting.
+For copies between local files and S3, the limit applies as data is scheduled
+for transfer, so uploads can burst by up to one part. Server-side S3 copies do
+not pass object bodies through this machine and are not paced by this setting.
 
-A worker ceiling also limits the starting connection count and leaves the
-[remembered count](tuning.md#remembered-connection-counts) unchanged.
-A bandwidth limit alone still allows syq to update it.
+A worker ceiling also limits the starting connection count. Measurements from
+a copy with a ceiling still inform later starting counts, but the ceiling alone
+does not lower a [remembered count](tuning.md#remembered-connection-counts).
+Copies with a bandwidth limit remember counts separately for each rate.
 
 In `syq rsync`, `--bwlimit RATE` selects the same rate limit. Do not combine it
 with `--resource-limits bandwidth=RATE`.
