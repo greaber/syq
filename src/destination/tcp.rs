@@ -12,9 +12,8 @@ pub(super) struct ProbeRequest {
     advertised: Vec<(String, u32)>,
     congestion_control: Option<String>,
     /// How long the receiving machine waits for an address to answer, from
-    /// the coordinator's measured round trip. Absent, it waits the most.
-    #[serde(default)]
-    wait_ms: Option<u64>,
+    /// the coordinator's measured round trip.
+    wait_ms: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -40,7 +39,7 @@ pub(crate) fn probe(
             ports,
             advertised,
             congestion_control,
-            wait_ms: Some(wait.as_millis() as u64),
+            wait_ms: wait.as_millis() as u64,
         }),
         START_TIMEOUT,
         None,
@@ -101,12 +100,8 @@ impl Receiver {
             true,
         )?;
         // The coordinator measured the round trip between the two machines.
-        let wait = request
-            .wait_ms
-            .map_or(crate::conn::TCP_PROBE_CEILING, |wait| {
-                Duration::from_millis(wait)
-                    .clamp(crate::conn::TCP_PROBE_FLOOR, crate::conn::TCP_PROBE_CEILING)
-            });
+        let wait = Duration::from_millis(request.wait_ms)
+            .clamp(crate::conn::TCP_PROBE_FLOOR, crate::conn::TCP_PROBE_CEILING);
         let candidates = self
             .tcp_peer
             .probe_tcp_addresses(request.advertised, request.port, wait)?

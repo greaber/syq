@@ -1971,6 +1971,9 @@ fn a_named_route_probe_that_reaches_nothing_answers_with_no_route() {
     let mut spec = crate::conn::RemoteSpec::local_receiver(true);
     spec.restricted_grant = Some(route(registration, approved.token));
     let _control = spec.connect_with(false, false).unwrap();
+    // Opening the control channel measured the round trip that bounds the
+    // receiving machine's probes, rather than leaving them the full second.
+    assert!(spec.diagnostics().route_round_trip.is_some());
     // On Linux a listener whose accept queue is full drops new connections
     // without answering; elsewhere a closed port refuses them.
     #[cfg(target_os = "linux")]
