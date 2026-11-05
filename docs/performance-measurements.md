@@ -68,11 +68,11 @@ to three parts:
 | `prefetch` | `prefetch_advice` | Asking Linux to read ahead; its bytes were requested, not read |
 
 Percentages are shares of each part's own time, so don't compare them across
-parts or with worker time. The seconds in parentheses are how long that part
-was busy; compare them with the copy's elapsed time. A `filesystem` part that
-was busy for most of it points to that side's storage or hashing. A `server`
-that mostly waits for requests was idle, but that alone doesn't show a network
-limit.
+parts or with worker time. The seconds in parentheses are the part's time in
+the operations listed. For a `filesystem` part that is working time: if it
+covers most of the copy's elapsed time, that side's storage or hashing is the
+likely limit. A `server` that mostly waits for requests was idle, but that
+alone doesn't show a network limit.
 
 ### Process CPU
 

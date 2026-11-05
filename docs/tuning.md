@@ -136,7 +136,9 @@ script.
 To measure what [block reuse](reference.md#choose-a-transfer-strategy) costs
 and saves, run the same copy with `--transfer-strategy aligned-block` and with
 `whole-file`, adding `--performance-tuning copy-path=ranges` to both so that
-copy shortcuts don't hide the difference.
+copy shortcuts don't hide the difference. Block reuse saves network traffic,
+but the destination still writes a complete new file unless its filesystem
+supports reflinks.
 
 ### Scattered edits in existing files
 
