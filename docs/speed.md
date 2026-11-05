@@ -1,8 +1,9 @@
 # Speed
 
-Syq copies files in parallel and adjusts its connection count automatically.
-Start with the defaults. To avoid logging in for every remote copy, see
-[Keep connections open](install.md#keep-connections-open).
+Syq copies files in parallel and adjusts its number of connections
+automatically, so start with the defaults. This page shows how to measure syq
+on your machines and find out why a copy is slow. To avoid logging in for every
+remote copy, see [Keep connections open](persistence.md).
 
 ## Quick comparison
 
@@ -26,20 +27,23 @@ short to measure sustained speed, choose a larger workload.
 
 <a id="what-the-comparison-measures"></a>
 
-Compare tools using the main table, which times each whole command, including
-connection startup, into an empty destination. Network results show average
-MB/s; local results show seconds, since filesystem cloning may avoid moving the
-bytes. The separate syq timing table splits out setup time; its copying-only
-rate is not comparable with another tool's rate. Network tests disable SSH
-connection reuse for both tools. Caches are not flushed and copies do not wait
-for durable storage, so local times do not measure disk bandwidth.
+The script prints a comparison table and, below it, a syq timing breakdown.
+Use the comparison table to compare tools: it times each whole command,
+including connection startup, copying into an empty destination. Network
+results show average MB/s; local results show seconds, because filesystem
+cloning can avoid moving the bytes at all. The timing breakdown leaves setup
+out of its copying rate, so don't compare that rate with another tool's.
+
+Network tests turn off SSH connection reuse for both tools. The script doesn't
+flush caches or wait for data to reach the disk, so local times don't measure
+disk bandwidth.
 
 ## Benchmarks
 
 The separate [syq-bench project](https://greaber.github.io/syq-bench/) runs more
 extensive experiments across workloads, storage systems, and network routes.
 Browse its results, or [run its experiments](https://greaber.github.io/syq-bench/reproduce.html)
-for a more detailed comparison. The quick script above does not use syq-bench.
+for a more detailed comparison.
 
 <figure class="benchmark-example">
 <table>
@@ -68,11 +72,11 @@ Your results will depend on your machines and connection.</figcaption>
 syq cp -vv --stats data --to server --into /backup
 ```
 
-`-vv` shows the chosen transport and connections; `--stats` adds totals, TCP
-statistics, where workers spent their time, and process CPU. These measurements
-help locate delays but do not prove their cause. Add `--results run.ndjson` to
-see how they change over time; see
-[performance measurements](performance-measurements.md) for how to read them.
+`-vv` shows whether the data travels over TCP or SSH and the connections syq
+opens. `--stats` adds totals, TCP statistics, how syq's parallel workers spent
+their time, and CPU time. These help locate a delay but don't prove its cause.
+To see how they change during the copy, add `--results run.ndjson` and see
+[performance measurements](performance-measurements.md).
 
 | Symptom | Try |
 |---|---|
@@ -86,10 +90,10 @@ A second copy into the same destination may just measure skipping existing files
 
 ## Local copies and NFS
 
-For local copies, syq uses the filesystem's copy optimizations automatically
-when it can. On filesystems that support cloning, this can avoid physically
-copying every byte, so the displayed rate can exceed disk throughput. You can
-also copy to or from a mounted NFS directory using its local path.
+For local copies, syq uses the filesystem's own copy features when it can. On
+filesystems that support cloning, the copy can share data instead of writing
+every byte, so the displayed rate can exceed the disk's speed. A mounted NFS
+directory works like any local path.
 
 <a id="tcp-data-connections"></a>
 <a id="limit-bandwidth"></a>
@@ -107,18 +111,14 @@ also copy to or from a mounted NFS directory using its local path.
 ## Other options
 
 Remote copies send file data over encrypted TCP on a port in `47600–47699`
-when it is reachable, and otherwise fall back to SSH, except for
-[downloads your laptop approves per copy](receive.md#authorize-copies-between-servers),
-which need TCP. See [Make TCP reachable](server-tuning.md#make-tcp-reachable)
-for firewall settings. `--no-tcp` uses
-SSH without trying TCP, `--tcp-ports LO-HI` chooses another port range, and on
+when the server's port is reachable, and through SSH otherwise; see
+[Make TCP reachable](server-tuning.md#make-tcp-reachable). `--no-tcp` uses SSH
+without trying TCP, `--tcp-ports LO-HI` chooses another port range, and on
 Linux `--tcp-congestion ALGO` selects a congestion control algorithm.
-`--no-tcp-encryption` disables data encryption and authentication; use it only
-on a trusted network. Restricted receivers refuse it.
+`--no-tcp-encryption` turns off encryption and authentication of the data; use
+it only on a trusted network.
 
 `--resource-limits bandwidth=RATE` leaves bandwidth for other work; see
-[Resource limits](resource-limits.md). `--no-compress` can help when
-compression costs more CPU time than it saves in network traffic; see
-[Transport compression](reference.md#transport-compression). Manual connection
-counts and other [tuning options](tuning.md) are for troubleshooting; normal
-copies should not need them.
+[Resource limits](resource-limits.md). Manual connection counts and other
+[tuning options](tuning.md) are for troubleshooting; most copies don't need
+them.

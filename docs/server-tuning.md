@@ -1,23 +1,23 @@
 # Server setup
 
-Start by checking TCP access and the source and destination filesystems.
-Use test data when comparing settings.
+These server settings can make syq copies faster. Start with TCP access, and
+use test data when comparing settings.
 
 ## Make TCP reachable
 
-Syq listens on one available port in `47600–47699` during a copy. Choose another
-range with `--tcp-ports LO-HI`. For a server using ufw, an administrator can allow
-a trusted client:
+During a copy, syq on the server listens for file data on one free port in
+`47600–47699`; choose another range with `--tcp-ports LO-HI`. For a server
+using ufw, an administrator can allow a trusted client:
 
 ```sh
 sudo ufw allow from <trusted-client-address> to any port 47600:47699 proto tcp
 ```
 
-Allow the range in any cloud firewall too. Check the transport with
-`syq cp -vv --stats`. When TCP is blocked, copies fall back to SSH and say so,
-except [downloads your laptop approves per copy](receive.md#authorize-copies-between-servers),
-which need TCP. On Linux, syq also finds addresses on IP over InfiniBand
-(IPoIB) interfaces.
+Allow the range in any cloud firewall too. When TCP is blocked, copies fall
+back to SSH and say so; `syq cp -vv` shows which one a copy used.
+[Downloads your laptop approves per copy](receive.md#authorize-copies-between-servers)
+can't fall back: they need TCP. On Linux, syq also uses IP over InfiniBand
+(IPoIB) addresses.
 
 ### Tailscale
 
