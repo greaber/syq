@@ -331,8 +331,7 @@ an SSH host key or a verified requesting machine.
 The `command`, `argv`, and `cwd` strings are escaped for display; don't run
 them as shell input. `ssh` and `provider_ssh` requests grant
 [full account access](security.md#ssh-account-access), whatever `command`
-shows. Inspect and approve requests with an up-to-date syq, and don't treat an
-unknown kind as a copy request.
+shows. Don't treat an unknown kind as a copy request.
 
 ## Remembered account permissions
 

@@ -4,8 +4,7 @@
 and controlled benchmarks; leave it unset for everyday copies. To keep the
 automatic choices under a ceiling instead, use
 [resource limits](resource-limits.md). These experimental keys can change or
-disappear between releases without deprecation, so pin the syq version in
-scripts that use them.
+disappear between releases without deprecation.
 
 `syq cp` and `syq rsync` accept the keys below; for `syq rm` and
 `syq clean-partials`, see [Deletion](#deletion).
