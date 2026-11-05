@@ -630,6 +630,18 @@ pub(crate) struct StatusSnapshot {
     pub rows: Vec<Status>,
     pub errors: Vec<String>,
 }
+/// Whether a live approved account connection in this domain was
+/// authorized by `provider`: it keeps an authorization channel through the
+/// provider's connection for as long as it lives.
+pub(crate) fn uses_provider(domain: &Domain, provider: &Provider) -> bool {
+    status(domain).is_ok_and(|snapshot| {
+        snapshot
+            .rows
+            .iter()
+            .any(|row| row.connected && row.authorizer == *provider)
+    })
+}
+
 pub(crate) fn status(domain: &Domain) -> Result<StatusSnapshot> {
     if !domain.approved_index_path().exists() {
         return Ok(StatusSnapshot::default());

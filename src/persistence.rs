@@ -465,12 +465,18 @@ pub(crate) fn connect_domain(
         );
     }
     // A switch runs in the background, where nobody waits for it: bound its
-    // time, and keep how it went for status
+    // time, with what it started, and keep how it went for status
     // (`receive_service::record_attempt`).
-    unsafe { libc::alarm(crate::receive_service::switch::SWITCH_TIMEOUT.as_secs() as u32) };
     let control = multiplexer.control_path().to_path_buf();
     use crate::receive_service::{record_attempt, Attempt};
     record_attempt(&control, &Attempt::new("switching", None));
+    let timed_out = control.clone();
+    crate::receive_service::switch::end_switch_at(move || {
+        record_attempt(
+            &timed_out,
+            &Attempt::new("failed", Some(crate::receive_service::switch::timed_out())),
+        )
+    });
     let result = connect_receiving(
         domain,
         multiplexer,

@@ -920,7 +920,7 @@ pub(crate) fn refresh_outdated(domain: &Domain, quiet: bool) {
         {
             continue;
         }
-        let Ok(Some(state)) = running_status(&control, Retry::No, REFRESH_ANSWER) else {
+        let Some(state) = status_by(&control, Instant::now() + REFRESH_ANSWER) else {
             continue;
         };
         if state.identity == crate::identity::build() || !busy_of(&state).idle() {
@@ -980,6 +980,31 @@ pub(crate) fn refresh_outdated(domain: &Domain, quiet: bool) {
 /// answers within a millisecond; one that does not is skipped until the
 /// next claim (`claim_switch_attempt`).
 const REFRESH_ANSWER: Duration = Duration::from_millis(50);
+
+/// The status of the service at `control`, if it answers by `deadline`:
+/// connecting, asking and reading the answer all end by then.
+fn status_by(control: &Path, deadline: Instant) -> Option<Status> {
+    if !is_running(control) {
+        return None;
+    }
+    let request = LocalRequest {
+        version: VERSION,
+        stop: false,
+        decision: None,
+        retry: false,
+        restart: false,
+        stop_if_idle: false,
+    };
+    crate::destination::local_exchange::<Status>(
+        &suffixed(control, SOCKET),
+        &request,
+        deadline,
+        MAX_STATUS,
+        "receiving status",
+    )
+    .ok()
+    .filter(|status| status.version == VERSION)
+}
 
 /// The last switch to a new build started for a connection, kept so that
 /// status can say how it went even when the service it would replace cannot
@@ -1133,7 +1158,7 @@ fn start_switch(domain: &Domain, endpoint: &str) -> Result<()> {
     }
     let mut child = command.spawn_guarded()?;
     std::thread::spawn(move || {
-        let _ = child.wait();
+        let _ = switch::wait_and_end_group(&mut child);
     });
     Ok(())
 }
@@ -3343,19 +3368,20 @@ mod tests {
 
     /// Serve a stand-in service on `control` until it is asked to stop, or
     /// agrees to, answering each request with `reply`; return the requests.
-    /// `then` runs once it has gone, as another service might start then.
+    /// Once it has removed its socket, `then` gets its lock, to drop or hand
+    /// to a service that takes over.
     fn stand_in(
         control: &Path,
         lock: File,
         reply: impl Fn(&LocalRequest) -> Status + Send + 'static,
     ) -> std::thread::JoinHandle<Vec<String>> {
-        stand_in_then(control, lock, reply, || {})
+        stand_in_then(control, lock, reply, drop)
     }
     fn stand_in_then(
         control: &Path,
         lock: File,
         reply: impl Fn(&LocalRequest) -> Status + Send + 'static,
-        then: impl FnOnce() + Send + 'static,
+        then: impl FnOnce(File) + Send + 'static,
     ) -> std::thread::JoinHandle<Vec<String>> {
         let socket = suffixed(control, SOCKET);
         let listener = UnixListener::bind(&socket).unwrap();
@@ -3381,8 +3407,7 @@ mod tests {
                 write_status(&mut client, &answer).unwrap();
                 if request.stop || answer.stopping {
                     fs::remove_file(&socket).unwrap();
-                    drop(lock);
-                    then();
+                    then(lock);
                     return requests;
                 }
             }
@@ -3462,9 +3487,9 @@ mod tests {
                 state.pid = 1111;
                 state
             },
-            move || {
-                // The next owner, busy, starts at once.
-                let lock = try_lock(&next, true).unwrap().unwrap();
+            move |lock| {
+                // The next owner, busy, takes the lock as the first lets go,
+                // before a probe of the command could.
                 *started.lock().unwrap() = Some(stand_in(&next, lock, |_| {
                     let mut state = answer(
                         "another",

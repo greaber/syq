@@ -3041,6 +3041,11 @@ fn receiving_ssh(t: &Tmp) -> PathBuf {
         &path,
         br#"#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_RSH_LOG"
+# Hang, as ssh waiting for a key or a network does.
+if [ -n "${FAKE_SSH_HANG:-}" ] && [ "$1" != -V ]; then
+    echo $$ > "$FAKE_SSH_HANG"
+    exec sleep 600
+fi
 if [ -n "${FAKE_SSH_REFUSE:-}" ] && [ "$1" != -V ]; then
     echo 'ssh: connect to host test-server port 22: Connection refused' >&2
     exit 255
@@ -3338,15 +3343,10 @@ fn older_service(
     other_service(installed, pending, None, None)
 }
 
-/// As `older_service`; with `busy`, it reports what it has in progress as
-/// services do since syq follows updates, and agrees to stop when idle.
-/// With `pending_once`, its `pending` requests appear once that file exists.
-fn other_service(
-    installed: &Installed,
-    pending: serde_json::Value,
-    busy: Option<serde_json::Value>,
-    pending_once: Option<PathBuf>,
-) -> std::thread::JoinHandle<Vec<serde_json::Value>> {
+/// Stop the fixture's receiving service and record its control as an older
+/// build's, holding its lock as that service would. Returns the control
+/// socket's path, where a stand-in may listen, and the lock.
+fn retire_service(installed: &Installed) -> (PathBuf, File) {
     let control = installed.control();
     let suffixed = |suffix: &str| PathBuf::from(format!("{}{suffix}", control.display()));
     let pid = installed.request(serde_json::json!({"version": 2, "stop": false}))["pid"]
@@ -3381,7 +3381,19 @@ fn other_service(
     record["identity"] = "v0.7.1".into();
     fs::write(suffixed(".recv-json"), serde_json::to_vec(&record).unwrap()).unwrap();
     fs::set_permissions(suffixed(".recv-json"), fs::Permissions::from_mode(0o600)).unwrap();
-    let socket = suffixed(".recv");
+    (suffixed(".recv"), lock)
+}
+
+/// As `older_service`; with `busy`, it reports what it has in progress as
+/// services do since syq follows updates, and agrees to stop when idle.
+/// With `pending_once`, its `pending` requests appear once that file exists.
+fn other_service(
+    installed: &Installed,
+    pending: serde_json::Value,
+    busy: Option<serde_json::Value>,
+    pending_once: Option<PathBuf>,
+) -> std::thread::JoinHandle<Vec<serde_json::Value>> {
+    let (socket, lock) = retire_service(installed);
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     std::thread::spawn(move || {
@@ -3794,6 +3806,166 @@ fn a_switch_does_not_turn_persistence_back_on() {
         assert_eq!(enabled(), false);
         assert!(!t.path("rsh.log").exists(), "it logged in");
     }
+}
+
+/// Run a no-op local copy in the fixture's scope, which looks at its stale
+/// service, and return how long it took.
+fn local_copy(t: &Tmp, installed: &Installed) -> std::time::Duration {
+    fs::write(t.path("source"), b"data").unwrap();
+    let started = std::time::Instant::now();
+    let copied = installed
+        .command(
+            Path::new(env!("CARGO_BIN_EXE_syq")),
+            &[
+                "cp",
+                "--pscope",
+                installed.scope.to_str().unwrap(),
+                &t.s("source"),
+                "--as",
+                &t.s("copy"),
+            ],
+        )
+        .run()
+        .unwrap();
+    assert_output_ok(&copied);
+    started.elapsed()
+}
+
+/// A command waits only briefly for a stale service that accepts its status
+/// request but never answers: it gives up on the connection within its
+/// short budget rather than a socket timeout's second.
+#[test]
+fn a_silent_stale_service_holds_a_command_only_briefly() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let (socket, lock) = retire_service(&installed);
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let silent = std::thread::spawn(move || {
+        let (mut client, _) = listener.accept().unwrap();
+        let accepted = std::time::Instant::now();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        // Read the request and wait, never answering, until the client
+        // gives up.
+        let _ = std::io::copy(&mut client, &mut std::io::sink());
+        let held = accepted.elapsed();
+        fs::remove_file(&socket).unwrap();
+        drop(lock);
+        held
+    });
+    local_copy(&t, &installed);
+    let held = silent.join().unwrap();
+    assert!(held < std::time::Duration::from_millis(500), "{held:?}");
+}
+
+/// A stale service whose control socket's listen queue is full does not
+/// block a command: it does not wait to connect.
+#[test]
+fn a_stale_service_with_a_full_queue_does_not_block_a_command() {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let (socket, lock) = retire_service(&installed);
+    let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+    listener.bind(&SockAddr::unix(&socket).unwrap()).unwrap();
+    listener.listen(1).unwrap();
+    let mut queued = Vec::new();
+    loop {
+        let client = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        client.set_nonblocking(true).unwrap();
+        match client.connect(&SockAddr::unix(&socket).unwrap()) {
+            Ok(()) => queued.push(client),
+            Err(_) => break,
+        }
+        assert!(queued.len() < 1024, "the listen queue did not fill");
+    }
+    // Without its own deadline, the command's connect would wait here for
+    // as long as nothing accepts.
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            local_copy(&t, &installed);
+            done.send(()).unwrap();
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the command waited on a full listen queue");
+    });
+    drop(queued);
+    drop(listener);
+    fs::remove_file(&socket).unwrap();
+    drop(lock);
+}
+
+/// A switch that runs too long ends itself, with the ssh it started, and
+/// says so in status.
+#[test]
+fn a_switch_that_runs_too_long_ends_with_what_it_started() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let old = older_service(&installed, serde_json::json!([]));
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    let hung = t.path("ssh.pid");
+    // As a service or command starts it: leading its own process group.
+    let mut switch = installed.command(
+        syq,
+        &[
+            "persist",
+            "connect",
+            "test-server",
+            "--auth-from",
+            "ssh",
+            "--when-idle",
+            "--pscope",
+            installed.scope.to_str().unwrap(),
+        ],
+    );
+    let mut switch = switch
+        .env("FAKE_SSH_HANG", &hung)
+        .env("SYQ_TEST_SWITCH_TIMEOUT_MS", "1500")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    wait_for("ssh to start", std::time::Duration::from_secs(20), || {
+        fs::read_to_string(&hung).is_ok_and(|pid| !pid.trim().is_empty())
+    });
+    let ssh: libc::pid_t = fs::read_to_string(&hung).unwrap().trim().parse().unwrap();
+    let status = switch.wait().unwrap();
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGKILL)
+    );
+    wait_for("ssh to end", std::time::Duration::from_secs(10), || {
+        let gone = unsafe { libc::kill(ssh, 0) } != 0;
+        gone || fs::read_to_string(format!("/proc/{ssh}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, fields)| fields.starts_with('Z'))
+        })
+    });
+    let shown = installed.persist(syq, &["status", "--json"]);
+    assert_output_ok(&shown);
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let switched = &shown["connections"][0]["receiving_switch"];
+    assert_eq!(switched["phase"], "failed", "{shown}");
+    assert!(
+        switched["error"]
+            .as_str()
+            .unwrap()
+            .contains("switching took longer than"),
+        "{shown}"
+    );
+    installed.request(serde_json::json!({"version": 2, "stop": true}));
+    old.join().unwrap();
 }
 
 /// A service that an older syq left running cannot follow an update by

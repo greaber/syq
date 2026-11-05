@@ -1908,18 +1908,19 @@ mod tests {
         assert!(error.to_string().contains("already running"), "{error:#}");
     }
 
-    /// A provider of build `build` with process `pid`, answering status,
-    /// stop, and stop if idle, which it agrees to unless `busy`. Once it
-    /// stops, it gives up its socket and lock, then runs `then`. Returns the
+    /// A provider of build `build` with process `pid`, holding `lock`,
+    /// answering status, stop, and stop if idle, which it agrees to unless
+    /// `busy`. Once it stops, it removes its socket and passes its lock to
+    /// `then`, which drops it or hands it to a successor. Returns the
     /// requests it received.
     fn stand_in_provider(
         domain: &Domain,
+        lock: Lock,
         build: &'static str,
         pid: u32,
         busy: usize,
-        then: impl FnOnce() + Send + 'static,
+        then: impl FnOnce(Lock) + Send + 'static,
     ) -> std::thread::JoinHandle<Vec<&'static str>> {
-        let lock = acquire_lock(domain, true).unwrap().unwrap();
         let path = domain.runtime_path().join(SOCKET_FILE);
         let listener = UnixListener::bind(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -1982,8 +1983,7 @@ mod tests {
                 if stopping {
                     // Like a provider, remove the socket before the lock.
                     fs::remove_file(&path).unwrap();
-                    drop(lock);
-                    then();
+                    then(lock);
                     return seen;
                 }
             }
@@ -2000,11 +2000,20 @@ mod tests {
         let successor = Arc::new(Mutex::new(None));
         let (started, next) = (successor.clone(), domain.clone());
         // The process that agreed lives on after it gives up the lock, as
-        // this test's own does; the next one is another.
-        let first = stand_in_provider(&domain, "v0.0.1+first", std::process::id(), 0, move || {
-            *started.lock().unwrap() =
-                Some(stand_in_provider(&next, "v0.0.1+next", 2222, 1, || {}));
-        });
+        // this test's own does; the next one is another. It takes the lock
+        // as the first lets go, before a probe of the switch could.
+        let lock = acquire_lock(&domain, true).unwrap().unwrap();
+        let first = stand_in_provider(
+            &domain,
+            lock,
+            "v0.0.1+first",
+            std::process::id(),
+            0,
+            move |lock| {
+                *started.lock().unwrap() =
+                    Some(stand_in_provider(&next, lock, "v0.0.1+next", 2222, 1, drop));
+            },
+        );
         switch_when_idle(&domain).unwrap();
         assert_eq!(first.join().unwrap(), ["status", "stop if idle"]);
         let next = successor.lock().unwrap().take().unwrap();

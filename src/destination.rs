@@ -559,6 +559,24 @@ pub(crate) fn read_socket_message<T: DeserializeOwned>(
     read_socket_framed(socket, timeout, MAX_MESSAGE, "named destination message")
 }
 /// As `read_socket_message`, for a message of at most `limit` bytes.
+/// Send `request` to the local socket at `path` and read a reply of at most
+/// `limit` bytes, all by `deadline`: neither a full listen queue nor a peer
+/// that never answers holds the caller longer.
+pub(crate) fn local_exchange<T: DeserializeOwned>(
+    path: &Path,
+    request: &impl Serialize,
+    deadline: Instant,
+    limit: usize,
+    what: &str,
+) -> Result<T> {
+    let mut socket = connect_socket(path, deadline, None)?;
+    let mut io = DeadlineSocket {
+        socket: &mut socket,
+        deadline,
+    };
+    write_framed(&mut io, request, MAX_MESSAGE, what)?;
+    read_framed(&mut io, limit, what)
+}
 pub(crate) fn read_socket_framed<T: DeserializeOwned>(
     socket: &mut UnixStream,
     timeout: Duration,

@@ -51,8 +51,60 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// double up to. Each attempt logs in to the server once.
 const RETRY_FIRST: Duration = Duration::from_secs(30);
 const RETRY_MAX: Duration = Duration::from_secs(600);
-/// How long a switch may run before it counts as failed.
-pub(crate) const SWITCH_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long a switch may run before it ends itself, with everything it
+/// started in its process group (`end_switch_at`).
+const SWITCH_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) fn switch_timeout() -> Duration {
+    test_override("SYQ_TEST_SWITCH_TIMEOUT_MS", SWITCH_TIMEOUT)
+}
+/// How long after that the service that started a switch ends it, in case
+/// the switch could not.
+const SWITCH_BACKSTOP: Duration = Duration::from_secs(60);
+
+/// End this switch, a `persist connect --when-idle` that leads its own
+/// process group, once it has run for `switch_timeout`: kill that group,
+/// which holds this process and what it started that stays there, such as
+/// ssh, after `before` records why. Nobody may be waiting for it to answer.
+pub(crate) fn end_switch_at(before: impl FnOnce() + Send + 'static) {
+    std::thread::spawn(move || {
+        std::thread::sleep(switch_timeout());
+        before();
+        unsafe {
+            if libc::getpgrp() == libc::getpid() {
+                libc::kill(0, libc::SIGKILL);
+            }
+            libc::kill(libc::getpid(), libc::SIGKILL);
+        }
+    });
+}
+
+/// Wait for `child`, which leads its own process group, then end what it
+/// left in that group before reaping it, so that its group ID cannot have
+/// been reused by then.
+pub(crate) fn wait_and_end_group(
+    child: &mut std::process::Child,
+) -> std::io::Result<std::process::ExitStatus> {
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+    child.wait()
+}
 /// How long a receiving connection must have had no request before it
 /// counts as idle: one copy's steps, such as identifying the receiver,
 /// asking for approval and opening the copy, arrive as separate requests a
@@ -79,6 +131,14 @@ fn retry_first() -> Duration {
 }
 pub(crate) fn quiet() -> Duration {
     test_override("SYQ_TEST_SWITCH_QUIET_MS", QUIET)
+}
+
+/// Why a switch that ran too long failed.
+pub(crate) fn timed_out() -> String {
+    format!(
+        "switching took longer than {}",
+        crate::destination::retry_wait(switch_timeout())
+    )
 }
 
 /// The wait before attempt `attempts + 1`, after `attempts` failed.
@@ -427,19 +487,15 @@ impl Follower {
             }
             State::Switching(mut running) => match running.done.try_recv() {
                 Err(mpsc::TryRecvError::Empty) => {
-                    if !running.killed && running.started.elapsed() >= SWITCH_TIMEOUT {
+                    if !running.killed
+                        && running.started.elapsed() >= switch_timeout() + SWITCH_BACKSTOP
+                    {
                         unsafe { libc::kill(-running.group, libc::SIGKILL) };
                         running.killed = true;
                     }
                     State::Switching(running)
                 }
-                _ if running.killed => self.failed(
-                    Some(running.build),
-                    format!(
-                        "switching took longer than {} minutes",
-                        SWITCH_TIMEOUT.as_secs() / 60
-                    ),
-                ),
+                _ if running.killed => self.failed(Some(running.build), timed_out()),
                 // The command ended and this service still runs: it was
                 // busy again, another command is replacing it, or the file
                 // changed again. Look again after a while.
@@ -572,7 +628,7 @@ fn start(
     let group = child.id() as libc::pid_t;
     let (sender, done) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = match child.wait() {
+        let result = match wait_and_end_group(&mut child) {
             Ok(status) if status.success() => Ok(()),
             Ok(status) => Err(Ended {
                 error: last_line(&mut output).unwrap_or_else(|| status.to_string()),
@@ -610,6 +666,38 @@ fn last_line(output: &mut File) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Once a switch exits, what it left in its process group ends too.
+    #[test]
+    fn waiting_for_a_switch_ends_what_it_left_in_its_group() {
+        use std::io::Read as _;
+        use std::os::unix::process::CommandExt as _;
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 600 </dev/null >/dev/null 2>&1 & echo $!"])
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut pid = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut pid)
+            .unwrap();
+        let pid: libc::pid_t = pid.trim().parse().unwrap();
+        assert!(wait_and_end_group(&mut child).unwrap().success());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(pid, 0) } == 0
+            && !std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(") ")
+                    .is_some_and(|(_, f)| f.starts_with('Z'))
+            })
+        {
+            assert!(Instant::now() < deadline, "the left process still runs");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn retries_wait_longer_each_time_up_to_the_limit() {
