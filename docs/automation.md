@@ -5,7 +5,7 @@ human output:
 
 ```sh
 syq cp --srcs-in project --into backup --results copy.ndjson
-syq rm old-output --results removal.ndjson
+syq rm --src-dir old-output --results removal.ndjson
 ```
 
 Each line is a JSON record. **Require a final `result` record before trusting
@@ -40,9 +40,8 @@ including the ones it refused or that failed there, come from the receiver
 itself, and failures reading the source come from the coordinating server; see
 [Results from the destination](remote-reference.md#results-from-the-destination).
 
-`--results` supports native `cp` (including pruning), `rm`, and `clean-partials`.
-Cleanup uses the removal records described below. Results cannot combine with
-`--detach`. The restricted receiver supports copy changes,
+`clean-partials` uses the removal records described below. Results cannot
+combine with `--detach`. The restricted receiver supports copy changes,
 including capped pruning, but not native removal.
 
 Records arrive in `seq` order; error and terminal records are flushed
@@ -68,8 +67,8 @@ interruptions can leave the terminal record missing.
   `encoding` values.
 - Treat human `message` text as display only; parse structured fields.
 
-`--results` includes both progress samples and final outcomes; use it for new
-integrations, including live progress displays.
+`--results` includes progress samples as well as final outcomes, so a live
+progress display can read the same stream.
 
 ## Exit codes
 
@@ -81,8 +80,7 @@ integrations, including live progress displays.
 | `23` | `partial` | Per-entry failures; independent work finished |
 | `25` | `refused` | A safety cap refused deletions |
 
-Removal terminals use only `success`, `partial`, or `failed`. A results-sink
-startup error also exits 1 without a stream.
+Removal terminals use only `success`, `partial`, or `failed`.
 
 ## Record envelope
 
@@ -91,7 +89,7 @@ Every record carries:
 | Field | Value |
 |---|---|
 | `schema` | `"syq.automation"` |
-| `schema_version` | `4`; Stream mappings use `5` |
+| `schema_version` | `4`; `5` for stream mappings |
 | `seq` | Integer starting at 0, strictly increasing |
 | `type` | Record type |
 
@@ -109,9 +107,7 @@ seconds), `syq_version` (what `syq --version` prints, such as `0.7.1`, or
 `dry_run`, and `endpoints`.
 Endpoints identify role and kind (`local`, `ssh`, or `s3`). SSH endpoints carry
 host/user; S3 endpoints carry `host: "s3://BUCKET"` without a user. They omit
-credentials, headers, ports, and raw command arguments. Clients that predate S3
-must be upgraded to decode S3 endpoint kinds; local and SSH streams retain
-their existing representation.
+credentials, headers, ports, and raw command arguments.
 
 Copy runs also carry `prune` and `mapping`. Removal has one source endpoint
 regardless of selector count and omits those copy fields.
@@ -128,9 +124,6 @@ optional `rate_bytes_per_second` and `eta_ms` estimates.
 Removal has zero byte and unchanged/excluded counts; its file counts reflect
 outcomes received so far. Copies that reach transfer completion emit a final
 progress sample, even for short copies. The terminal record owns final totals.
-
-For performance measurements collected with `--stats`, see
-[Performance measurements](performance-measurements.md).
 
 ### `trace`
 
@@ -214,8 +207,9 @@ include `message`. These records identify callbacks within this invocation;
 they cannot be converted to a pathname retry manifest. Ordinary entries in a
 mixed mapping still emit their usual records. The
 [Python callback reference](https://greaber.github.io/syq/python-streams.html#callback-mappings) describes
-publication and application retries. Callback admission uses the SDK's private
-channel, so these runs do not emit `stream_ready`.
+publication and application retries. These runs do not emit `stream_ready`;
+the [stream-mapping protocol](stream-mappings.md#entry-lifecycle) starts each
+entry instead.
 
 ### Removal records
 

@@ -87,7 +87,9 @@ variables do not move it.
 
 Syq does not remove old releases from the store. To remove one you no longer
 use, delete its directory, for example `~/.local/lib/syq/v0.7.1`; syq
-downloads or installs it again if it is needed later.
+downloads or installs it again if it is needed later. On a server that accepts
+restricted copies, keep any release that a syq line in `~/.ssh/authorized_keys`
+names; see [Enrollment](remote-reference.md#enrollment).
 
 Syq starts a stored release only when you own its directories and files in the
 store and nobody else can write them, as syq creates them. `~/.local/lib/syq`
@@ -109,9 +111,7 @@ On filesystems that show the same owner and mode for every file, such as FAT,
 exFAT, NTFS, SMB shares and WSL's `/mnt/c`, owners and modes cannot show who
 may change a release. There syq checks a stored release against its signed
 manifest on every run instead, which takes longer, and does not refuse a home
-directory because of the owner it shows. Setting up restricted copying there
-compares a stored receiver's SHA-256 as everywhere, and writes the receiver
-into the store again each time.
+directory because of the owner it shows.
 
 The store trusts the directories above it; see
 [Downloaded executables](security.md#downloaded-executables).

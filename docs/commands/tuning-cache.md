@@ -87,8 +87,10 @@ syq tuning-cache export [id]
 
 ## syq tuning-cache clear
 
-Delete the local history and its filesystem startup hints. The older
-connection-count cache remains unchanged.
+Delete the local history, which also resets the remembered starting worker
+counts. Older syq versions kept connection counts in `~/.cache/syq/tuning.json`;
+current versions do not use that file, so `clear` leaves it alone and you can
+delete it yourself.
 
 <!-- CLI: tuning-cache clear -->
 ```text

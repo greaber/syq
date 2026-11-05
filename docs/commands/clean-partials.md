@@ -21,9 +21,10 @@ Add `--on server` to clean a remote tree. For results output, see
 omitted. It also removes the `.syq-s3-HASH.partial` files that
 [S3 downloads](../object-storage.md) leave beside the files they download,
 where `HASH` is 64 hexadecimal digits; removing one means a later download of
-that file starts over. It does not follow symlinks or remove old partial-name
-formats. A regular file deliberately named like a partial is also selected, so
-preview before deleting.
+that file starts over. It does not follow symlinks, and it does not remove old
+partial-name formats or the `.syq-stream-*` files that a killed
+[descriptor copy](cp.md#completion-and-failures) can leave. A regular file
+deliberately named like a partial is also selected, so preview before deleting.
 
 Interrupted replacements, replacements that race with another program, and
 macOS clones can leave `.syq-swap-...` entries containing displaced files or

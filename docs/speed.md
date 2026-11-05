@@ -63,9 +63,12 @@ for a more detailed comparison. The quick script above does not use syq-bench.
 <tr><th scope="row">rsync</th><td>18.3 MB/s</td></tr>
 </tbody>
 </table>
-<figcaption>One 1.07 GB file, held in memory at both ends; three runs per tool.
-From the separate <a href="https://greaber.github.io/syq-bench/all-results.html#public-wan-forward">syq-bench project</a>,
-measured on September 13, 2026 (<a href="https://greaber.github.io/syq-bench/data/release-060-public-wan-forward.json">raw results</a>).
+<figcaption>One 1.07 GB file, held in memory at both ends, over a route with about
+108 ms round-trip time; three runs per tool. The syq row sends data over
+encrypted TCP; syq over SSH sends it through SSH instead. Measured with syq 0.6.0
+and rsync 3.4.1 on September 13, 2026, by the separate
+<a href="https://greaber.github.io/syq-bench/all-results.html#public-wan-forward">syq-bench project</a>
+(<a href="https://greaber.github.io/syq-bench/data/release-060-public-wan-forward.json">raw results</a>).
 Your results will depend on your machines and connection.</figcaption>
 </figure>
 

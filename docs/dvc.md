@@ -45,12 +45,13 @@ These options have the same meaning as in DVC:
 | `-r NAME`, `--remote NAME` | Use this DVC remote instead of the default one |
 | `-f`, `--force` | Let `pull` replace files you have changed and remove untracked files from tracked directories. Without it, `pull` stops and lists them |
 
-And two are the script's own:
+These are the script's own:
 
 | Option | Meaning |
 |---|---|
 | `--verify` | Check downloaded files against their DVC MD5 and reject mismatches |
 | `--dry-run` | Show what would be copied |
+| `--syq PATH` | Run this syq executable instead of the one installed with the Python package |
 
 ## How it works
 

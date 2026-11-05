@@ -14,7 +14,7 @@ See [`syq rsync`](commands/rsync.md) for all accepted options.
 | `--ignore-existing` | Keeps an existing non-directory even where the source would create a directory |
 | Type changes | Refuses replacement between a directory and any non-directory, even when the directory is empty |
 | `--update` | Checks mtimes only for regular files; replacements between non-directory types still occur |
-| Read-only destination directories | Like rsync, briefly adds owner access to directories the copy includes, but always restores each one's exact mode; rsync can leave owner read and search added. `--syq-widen-dirs=none` or `all` widens nothing or more ([details](reference.md#copy-metadata)) |
+| Read-only destination directories | Like rsync, briefly adds owner access to directories the copy includes, but then restores each one's exact mode; rsync can leave owner read and search added. `--syq-widen-dirs=none` or `all` widens nothing or more ([details](reference.md#copy-metadata)) |
 | Resume | Keeps syq partial files a later copy can resume from; cannot reuse rsync partials |
 | Existing files | Often replaced where rsync changes them in place; see [below](#existing-files) |
 | Delta transfer | Reuses matching blocks at the same offsets in the corresponding destination file; shifted blocks are not matched. Local copies default to whole-file and remote copies to block reuse. `-W` / `--whole-file` disables reuse; `--no-W` / `--no-whole-file` enables it |
@@ -32,9 +32,9 @@ of the old file keep it as it was:
   Other existing files are updated in place, as rsync does.
 - When only metadata changed, a file with other hard links, or one not owned
   as syq expects, is replaced. Access times (`-U`) are still set in place.
-- On filesystems whose link counts syq does not trust (SMB, SSHFS, NFS
-  mounted with `nocto`, macOS volumes other than APFS and HFS+), every
-  metadata-only change rewrites the file.
+- On filesystems whose link counts syq does not trust (such as SMB, SSHFS,
+  NFS mounted with `nocto`, and macOS volumes other than APFS and HFS+),
+  every metadata-only change rewrites the file.
 - Symlinks, named pipes and devices whose metadata changes are created
   again.
 
@@ -44,9 +44,9 @@ Scan and copy errors prevent deletion. A destination that contains its source
 on the same host cannot be pruned. Preview deletion scope with `--dry-run -v`;
 see [deletion rules](reference.md#mirror-a-directory).
 
-The compatibility command uses rsync's default size-and-whole-second timestamp
-quick check. Native `syq cp` also compares fractional seconds at the precision
-suggested by the destination timestamp; see [timestamp matching](reference.md#check-file-contents).
+`syq rsync` uses rsync's default size-and-whole-second timestamp quick check.
+Native `syq cp` also compares fractional seconds at the precision suggested by
+the destination timestamp; see [timestamp matching](integrity-checking.md#comparison).
 Use `-c` to compare contents when size and timestamp match; source timestamps
 are preserved, so ordinary clock skew does not require the source timestamp
 to be newer. `-I` (`--ignore-times`) also stops skipping those files, but
@@ -66,8 +66,8 @@ default; `-z` does not enable anything extra. `-B` / `--block-size` changes
 syq's comparison and reuse block size; see the [tuning table](tuning.md#transfer-controls)
 for its default and allowed range. Values outside that range are rejected.
 
-`-H` preserves hardlinks between selected regular files. Linux copies also support
-`-A` for POSIX ACLs and `-X` for extended attributes. `-S` turns written zero
+`-H` preserves hardlinks between selected regular files. On Linux and macOS,
+`-A` preserves ACLs and `-X` extended attributes. `-S` turns written zero
 ranges into sparse holes. See the
 [preservation rules and limits](reference.md#copy-metadata).
 
@@ -113,10 +113,11 @@ created as needed.
 ## Syq extensions
 
 Most syq-specific options carry a `--syq-` prefix. Common ones are
-`--syq-ignore` and `--syq-ignore-from`.
-
-Use [`--integrity-checking`](integrity-checking.md) to choose comparison and
-transfer hashes in rsync mode. `-c` selects content comparison.
+`--syq-ignore` and `--syq-ignore-from`. `syq rsync` also accepts syq's
+`--performance-tuning`, `--resource-limits`, and
+[`--integrity-checking`](integrity-checking.md) for extra payload checks.
+Rsync's `--bwlimit` and `-c` / `--checksum` (BLAKE3 content comparison) keep
+their usual spellings.
 
 Filters are last-match-wins with `!` re-inclusion, unlike rsync's first-match
 rules. Check the [gitignore examples](reference.md#ignoring-paths) when
@@ -132,7 +133,3 @@ syq rsync -ancv project/ backup/
 ```
 
 Compares contents without copying and lists planned changes.
-
-Performance controls use `--performance-tuning`; resource ceilings use
-`--resource-limits`. The standard rsync spelling `--bwlimit` remains available
-in `syq rsync`, as does `--checksum` for BLAKE3 content comparison.

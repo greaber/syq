@@ -28,15 +28,15 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 | `comparison-block-size` | 4 MiB; 64 KiB for replaced files up to 64 MiB | 64 KiB through 64 MiB; filesystem copies only |
 | `request-size` | Automatic remote requests up to the hash block size (normally 4 MiB); at most 2 MiB for streaming | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
-| `copy-path` | `auto` | `auto` takes shortcuts where they apply (copies and clones the receiver makes on its own machine, small-file batches, and sending a few small files in one turn) and streams long remote ranges; `ranges` copies every file in range requests without those shortcuts, which shows the range engine alone; experimental `streaming` also streams every range; experimental `auto-streaming` keeps the shortcuts and streams every other range |
+| `copy-path` | `auto` | `auto` takes shortcuts where they apply (copies and clones the receiver makes on its own machine, small-file batches, and sending a few small files in one turn) and streams long remote ranges; `ranges` copies every file in range requests without those shortcuts; experimental `streaming` also streams every range; experimental `auto-streaming` keeps the shortcuts and streams every other range |
 | `batch-files` | Up to 2048, sharing queued files across active workers | 1 through 4096 files per worker batch |
 | `batch-bytes` | 16 MiB | 512 bytes through 64 MiB per worker batch, including the first file |
 | `split-min-size` | 32 MiB, at least two hash blocks | 1 byte through 1 GiB, raised to at least two hash blocks |
 | `bw-pacing` | `125ms` when capped | `average`, or an integer interval from `1ms` through `10s`; requires a nonzero `--resource-limits bandwidth=RATE` |
 
 Sizes accept `K`, `M`, and `G`, using powers of 1024. Unknown keys, repeated
-keys, and out-of-range values fail the command. Overrides apply to the remote
-coordinator too and are not saved.
+keys, and out-of-range values fail the command. Overrides also apply when a
+server coordinates the copy, and are not saved.
 
 ## S3 copies
 
@@ -72,6 +72,8 @@ copies, an explicit part size also selects the multipart threshold, capped at
 5 GiB. Without an explicit part limit, server-side copies can use the shared
 request budget's full tuning range.
 
+<a id="s3-streams"></a>
+
 For S3 streams, see [Descriptor copies](object-storage.md#descriptor-copies)
 for buffering and upload-size limits. S3 tuning is not saved between runs.
 
@@ -85,41 +87,35 @@ pagination at the original prefix.
 ## Deletion
 
 `syq rm`, `syq clean-partials`, and pruning after a copy adjust deletion
-concurrency using completed entries per second. Filesystem deletion runs on
-the machine holding the target filesystem. S3 deletion adjusts concurrent
-requests while keeping supported batch requests. These measurements are
-separate from copying file contents and are not saved between runs. When a
-higher deletion count brings no clear throughput gain, syq returns to the
-previous count. It keeps a lower count when that improves throughput, such as
-when excess workers contend for the same filesystem locks.
+concurrency from the number of entries completed per second. They return to a
+lower count when more workers bring no clear gain, for example when the workers
+contend for the same filesystem locks. These measurements are not saved between
+runs. Filesystem deletion runs on the machine holding the target filesystem;
+S3 deletion adjusts concurrent requests while keeping supported batch requests.
 
 For `rm` and `clean-partials`, `--performance-tuning workers=N` fixes the
 filesystem worker count. For S3 removal, `--performance-tuning s3-requests=N`
 fixes the request count. For copies, the S3 request override and ceiling also
-apply during S3 pruning.
-Filesystem copy-worker settings apply to copying; filesystem pruning tunes its
-own workers. Filesystem deletion finishes children before removing their parent
-directories.
-
-<a id="s3-streams"></a>
+apply during S3 pruning. Filesystem copy-worker settings apply only to copying;
+filesystem pruning tunes its own workers.
 
 ## Remembered connection counts
 
 Syq remembers useful starting worker counts from successful filesystem copies
 and continues adjusting as the next copy runs. History is matched to the route,
-filesystems, transport, and copy settings when that information is available.
-A remembered count is a starting point, not a fixed limit or a promise of the
-best speed for a different workload.
+filesystems, transport, and copy settings, such as compression and any
+bandwidth limit, when that information is available. A remembered count is a
+starting point, not a fixed limit or a promise of the best speed for a
+different workload. A long copy alone does not guarantee a remembered count:
+that requires usable measurements at more than one worker count.
 
-On macOS and Linux, remote-copy hints also distinguish local networks using
-available default-router hardware addresses, without requesting Wi-Fi location
-permission. These are hints about the network around the machine running syq;
-they cannot detect changes upstream of a phone hotspot. Linux currently reads
-IPv4 routers; macOS also reads IPv6 routers. If the network cannot be identified,
-syq uses its existing route and filesystem matches. Hints without network
-context remain available for that fallback; a known network starts its own
-history. Local-copy hints are unchanged. A change of transport or observed
-network context during a copy prevents saving a new hint for its initial path.
+On macOS and Linux, remote copies also keep separate counts for each local
+network, identified by the hardware addresses of its default routers, without
+requesting Wi-Fi location permission. This describes the network around the
+machine running syq, so it cannot detect changes upstream of a phone hotspot.
+Linux reads only IPv4 routers; macOS also reads IPv6 routers. When the network
+cannot be identified, syq uses counts remembered without network context.
+Local copies do not use network context.
 
 `--performance-tuning` bypasses automatic starting choices.
 `--resource-limits workers=N` caps the starting count and subsequent exploration.
@@ -141,11 +137,10 @@ decisions. It does not contain filenames, command lines, file contents, or
 Wi-Fi names, and nothing is uploaded. Timing and sizes still reveal activity;
 this is performance history, not anonymous data or a complete audit trail.
 
-TCP preflight events record opaque candidate-address identifiers, reported link
-speeds (`null` when unknown), reachability (`null` when the probe had not finished
-at selection time), and selection. Selected addresses are eligible for data
-connections; they may not all carry data. Reported speeds are interface hints,
-not measured throughput. These observations do not change startup-hint reuse.
+For TCP, the history also records each candidate address as an opaque
+identifier, with the link speed its interface reports, whether it was
+reachable, and whether it was selected for data connections. Reported speeds
+are interface hints, not measured throughput.
 
 ```sh
 syq tuning-cache list
@@ -162,8 +157,8 @@ NDJSON. These diagnostic records are versioned, but their event details may
 evolve; they are separate from the [automation results](automation.md) contract.
 
 The timeline distinguishes requested workers from workers ready to copy, and
-shows which measurements informed each decision. Copies completed by a single
-control request record that copy path without a tuning timeline.
+shows which measurements informed each decision. Copies small enough to finish
+in a single request record their copy path but no tuning timeline.
 
 Descriptor and pipe copies also record their tuning decisions, but do not use
 filesystem history to choose their starting count. S3 copies do not currently
@@ -204,9 +199,9 @@ syq cp --srcs-in source --into destination \
 Size/time quick checks still skip completed files. Explicit `--hash` (or rsync
 `--checksum`) still compares contents even when reuse is disabled; if copying
 is required, the final destination contributes no reusable blocks. Expected
-hashes, payload checks and publication-recovery checks stay in effect. Partial-file resume remains enabled
-in every mode: matching bytes from interrupted copies can still be reused,
-even with `whole-file`. The setting controls reuse of the final destination, not partials.
+hashes, payload checks, and the checks made when recovering interrupted copies
+stay in effect. Partial-file resume works with every strategy: matching bytes
+from interrupted copies can still be reused, even with `whole-file`.
 
 With block reuse enabled, a replaced file of up to 64 MiB is compared before
 any of its contents are sent, together with other files. The receiving side
@@ -215,10 +210,7 @@ source and sends only the blocks that differ, and the receiving side
 builds the new file from those and its own matching blocks, which must be
 unchanged since they were hashed. A file whose contents already match is kept, and only
 its metadata is updated. Comparing a batch of files costs about one round trip,
-however many files it holds. A file of which more than 16 MiB differs sends
-its differing blocks after its batch, in pieces of about 4 MiB (or one
-comparison block, when that is larger) as they are read, and the receiving
-side writes each piece as it arrives. With
+however many files it holds. With
 [`--in-place=update`](reference.md#in-place-writes), an existing file of up to
 16 MiB that syq updates in place goes in these batches too, except in a
 same-machine copy without block reuse. The receiving side writes only the
@@ -229,12 +221,8 @@ Explicit `--hash` comparisons of files up to 64 MiB use the same batches;
 without block reuse, they only decide whether a file is unchanged, and a file
 that differs is then copied whole. Same-machine copies without block reuse
 and larger files are compared one file at a time, in comparison blocks of
-4 MiB by default. For
-those, a difference near the end can add almost a full extra read of both
-files before copying. An output already being written by the current run
-resumes before that probe. Leftover partials from earlier runs do not bypass
-checking whether the completed file already matches, and a file with leftover
-partials takes this path so that it can resume from them.
+4 MiB by default. For those, a difference near the end can add almost a full
+extra read of both files before copying.
 
 Changed files still use atomic replacement.
 Reflinks can reduce replacement writes on supporting filesystems; otherwise the
@@ -243,8 +231,7 @@ use up to 64 MiB of destination buffers per worker (up to 32 MiB at default
 request settings), in addition to source payload buffers. Increasing the worker
 count increases this memory cost.
 
-This setting does not select a sequential writer. To isolate comparison and
-reuse costs while keeping range transfers, compare
+To isolate comparison and reuse costs, compare
 `--performance-tuning=copy-path=ranges --transfer-strategy=aligned-block`
 with `--performance-tuning=copy-path=ranges --transfer-strategy=whole-file`.
 Restore the same initial destination before each run and keep worker counts,
@@ -287,19 +274,13 @@ limits, rather than the smaller requests chosen during a copy.
 shortcuts. `copy-path=auto-streaming` keeps those shortcuts and streams the
 remaining ranges.
 
-Ordinary remote requests adapt to each worker's observed completion times.
-Slow workers issue smaller requests and allow idle workers to take smaller
-unread parts of their files, including while checking connection delay. A new
-worker starts with the size suggested by the work it takes over, then adapts to
-its own connection. Workers with measurements already use their own size.
-Connection-delay checks help requests grow again when competing traffic changes
-the delay. A worker skips periodic checks while it reaches the request-size
-ceiling without any slow replies; after a slow reply, checks remain enabled.
-Already-issued requests must still finish or fail. Local requests, streaming
-blocks, and comparison blocks keep their existing sizes. Explicit
-`request-size`, `comparison-block-size`, `--block-size`, `pipeline-depth`, or
-`split-min-size` settings disable ordinary request adaptation for controlled
-comparisons.
+Ordinary remote requests adapt to each worker's observed completion times:
+slow workers issue smaller requests, and idle workers can take over smaller
+unread parts of their files. Requests already issued must still finish or fail.
+Local requests, streaming blocks, and comparison blocks keep their sizes.
+Explicit `request-size`, `comparison-block-size`, `--block-size`,
+`pipeline-depth`, or `split-min-size` settings turn this adaptation off for
+controlled comparisons.
 
 Staged block reuse and partial resume use bounded comparison requests in every
 copy-path mode, including `streaming`.
@@ -328,19 +309,11 @@ syq cp --srcs-in small-files --to server --into /scratch/benchmark-small \
   --performance-tuning workers=1,batch-files=256,batch-bytes=8M -v
 ```
 
-By default, workers adjust the size of small-file request groups to their own
-observed completion times. Slow workers issue smaller groups, leaving unread
-files available to others. Workers occasionally recheck connection delay after
-slow replies and on connections whose latency allowance exceeds 250 ms. The
-first periodic check waits 30 seconds; a large drop in the group budget can
-trigger an earlier check. These checks briefly pause new requests on that worker
-and help it recover when competing traffic changes the delay. Default source
-read-ahead also allows for the group's expected completion time, at least
-250 ms, before treating a source reply as stalled. A group still contains whole
-files: one slow file can exceed the estimate, and requests already sent must
-finish or fail.
-Explicit `batch-files`, `batch-bytes`, `request-size`, or `pipeline-depth` settings
-disable this adjustment for controlled comparisons.
+By default, workers size their small-file request groups from their own
+observed completion times, so slow workers send smaller groups and leave unread
+files for others. A group still contains whole files, so one slow file can
+exceed the estimate. Explicit `batch-files`, `batch-bytes`, `request-size`, or
+`pipeline-depth` settings turn this adjustment off for controlled comparisons.
 
 Explicit batch settings replace the small-copy shortcut with worker batches.
 With logical-byte bandwidth pacing, each batch contains at most one file.
@@ -368,28 +341,14 @@ Splits normally align to comparison blocks and need twice the minimum remaining
 size. With automatic ordinary remote requests, slow workers can share smaller
 unread regions without changing comparison blocks.
 
-Capped SSH and TCP copies tune from continuous transport-byte activity so waiting for a
-large batch acknowledgment does not look like an idle link. Completion counters
-still report acknowledged file data. Saved starting counts require the same
-bandwidth limit and compression setting; a capped plateau does not select the
-starting count for an uncapped copy. Transport-byte history is also kept separate
-from older logical-byte-cap history.
-
-Small-file copies can continue exploring worker counts after files have been
-assigned to batches, while unread work can still be shared with other workers.
-Requests already in flight do not count as work an additional worker can take.
-After reducing the count, measurements wait for retiring workers to finish
-their outstanding requests, including streamed and compared file data.
-A long copy alone does not guarantee a saved starting count: that requires
-sufficient usable measurements at more than one worker count.
-
 ### Average rate and burst patterns
 
 Ordinary SSH and TCP copies pace compressed bytes at the sender without
 changing copy request sizes or batching. `bw-pacing` does not change that pacing;
-syq prints a notice if you explicitly set it for these copies.
-For the other routes listed in [Resource limits](resource-limits.md), `bw-pacing`
-controls logical-byte pacing:
+syq prints a notice if you explicitly set it for these copies. S3 copies do
+not accept it. Local, descriptor, and receiver-approved copies count file data
+before compression (see [Resource limits](resource-limits.md)); for them,
+`bw-pacing` chooses how requests are paced:
 
 - `125ms` (default): send smaller requests at regular intervals. The first
   request starts immediately, so short copies can exceed the average rate.

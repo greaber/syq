@@ -53,7 +53,8 @@ Your machine keeps the entry key and its own record in
 commands; it is not a disposable cache.
 
 Copies cannot write the receiver's protected paths: the account's
-`~/.ssh`, syq's stored programs, enrollment state on either side, and syq's
+`~/.ssh`, syq's stored programs (including all of `~/.local/libexec`, where
+older versions kept the receiver), enrollment state on either side, and syq's
 receiving state, such as `~/.config/syq` and its runtime directory
 `$XDG_RUNTIME_DIR/syq-persist-UID`. Without `XDG_RUNTIME_DIR`, the runtime
 directory is `/tmp/syq-persist-UID` on macOS and `$TMPDIR/syq-persist-UID`
@@ -125,6 +126,11 @@ refresh cannot start a new copy; copies already running finish. Releases stay
 in `~/.local/lib/syq` until you delete them. Delete a release's directory only
 when no syq line in `authorized_keys` names it.
 
+Enrollment detects the destination platform and installs a matching executable.
+Source builds require compatible platforms; `--syq-path` does not select the
+restricted receiver. See [Developing syq](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md#direct-server-to-server-copies)
+for testing source builds.
+
 If the server loses an enrollment's state, its receiver refuses every copy.
 `syq receiver enroll` then sets up a new enrollment in its place and removes
 the old line. If only the record of authorizations already used is lost, or
@@ -134,18 +140,22 @@ authorizations signed before then are refused.
 
 ### Enrollments from older versions
 
-Syq 0.4.0 to 0.7.1 made one enrollment per destination directory. This
-version does not use, list, or remove them, and an older syq can keep copying
-through them until you remove them. Revoke them with the older version before
-upgrading, or remove them by hand: on the server, delete the
-`authorized_keys` lines whose command runs `~/.local/libexec/syq-receiver`,
-then `~/.local/share/syq/restricted` and `~/.local/libexec/syq-receiver`; on
-your machine, delete `~/.local/state/syq/restricted`.
+Syq 0.7.1 and earlier made one enrollment per destination directory. This
+version does not use, list, or revoke them; the first copy to the account
+sets up a new enrollment beside them. Until you remove them, an older syq can
+keep copying through them. When the account you run `syq receiver list` in
+still holds their files, it prints a notice that points here.
 
-Enrollment detects the destination platform and installs a matching executable.
-Source builds require compatible platforms; `--syq-path` does not select the
-restricted receiver. See [Developing syq](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md#direct-server-to-server-copies)
-for testing source builds.
+To remove them, revoke them with the older version before upgrading, or
+delete them by hand:
+
+- On the server, delete each line in `~/.ssh/authorized_keys` whose command
+  runs `~/.local/libexec/syq-receiver`, written with your home directory's
+  full path. Keep the lines whose command runs syq from `~/.local/lib/syq`:
+  they belong to this version's enrollments, even though their comments also
+  start with `syq-enrollment:`. Then delete the directory
+  `~/.local/share/syq/restricted` and the file `~/.local/libexec/syq-receiver`.
+- On your machine, delete the directory `~/.local/state/syq/restricted`.
 
 ## Limits and unsupported options
 

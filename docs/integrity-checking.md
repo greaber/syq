@@ -18,7 +18,10 @@ fractional digits as are zero in the destination timestamp: destination
 `.120000000` seconds matches source `.123456789`, and a whole-second destination
 timestamp ignores the source fraction entirely. This accommodates destinations
 that truncate fractional seconds. `syq rsync` compares whole seconds, as rsync
-does.
+does. FAT keeps modification times in two-second steps, so when either command
+copies into a directory on FAT, times less than two seconds apart count as
+matching; [Check file contents](reference.md#check-file-contents) lists the
+exceptions.
 
 Local/S3 copies compare timestamps exactly, including stored nanoseconds.
 Uploads need syq metadata on the existing object for this shortcut. Downloads
@@ -91,7 +94,7 @@ hashing, or expected hashes.
 
 Filesystem descriptor copies accept `transfer=ALGORITHM` for optional payload
 checks. S3 descriptor copies reject extra transfer hashing because they do not
-store syq hash metadata. Descriptor copies do not reread the result by default.
+store syq hash metadata. Descriptor copies do not reread the result.
 
 <a id="expected-digests"></a>
 
@@ -102,22 +105,25 @@ to require known whole-file contents. The expectation includes its algorithm
 and hexadecimal value, independently of the comparison and transfer settings.
 
 Syq checks the complete result, including reused bytes. A mismatch fails the
-file. Checking happens before replacing an existing destination; a file
-written with `--in-place` is already at its name. Matching size and
+file. Checking happens before replacing an existing destination. A file
+written in place, a new file with `--in-place=new` or one that
+`--in-place=update` updates, is already at its name, and keeps the copied
+contents when the check fails. Matching size and
 time allow syq to check the existing destination first and skip copying if its
 hash matches. Selection filters still apply. Dry runs do not check expectations.
 
 ## Compare without copying
 
-Use `--dry-run --hash` to compare without copying:
+Use `--dry-run --hash` to compare without copying, with `-v` to list each
+difference:
 
 ```sh
-syq cp --dry-run --hash --srcs-in project --into backup
+syq cp --dry-run -v --hash --srcs-in project --into backup
 ```
 
-Differences are shown as planned updates. Add `--if-exists=error-if-different`
-to report them as errors instead. For machine-readable output, add
-[`--results`](automation.md); for two servers, see
+Each file whose contents differ is listed as a planned update. Add
+`--if-exists=error-if-different` to report them as errors instead. For
+machine-readable output, add [`--results`](automation.md); for two servers, see
 [remote comparisons](remote-reference.md#verification).
 
 ## Consistency and durability
@@ -128,9 +134,9 @@ create a snapshot; use a filesystem snapshot or stop the writer when you need
 a consistent view. Filesystem-to-filesystem copies recheck source size and
 modification time after reading, before replacing the destination. A detected
 change can trigger a retry; a failed check leaves the previous destination in
-place. These checks do not detect every concurrent change. `--in-place` lets
-destination readers see incomplete files, including after an interrupted
-copy.
+place. These checks do not detect every concurrent change. Both `--in-place`
+modes let destination readers see incomplete files, including after an
+interrupted copy.
 
 On Linux's ext2/3/4, XFS, Btrfs, ZFS and tmpfs filesystems, syq checks that
 blocks reused when replacing a destination file still match what it compared,

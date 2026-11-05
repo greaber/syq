@@ -500,6 +500,12 @@ you want to use. If receiving was disabled, enable it first with
 `syq persist receive on`, or enable and connect together with
 `syq persist receive on --connection server`.
 
+Receiving starts again with the new version, so requests that were waiting
+for approval do not carry over: run them again on the server and approve the
+new requests. Session permissions (**Allow**) end with the old receiving
+connection, so the next account access asks again unless you chose
+**Remember**.
+
 Use the current binary to close explicit domains. An older binary may stop their
 services but refuse to remove newer settings; rerun scoped `off` with the current
 binary to finish cleanup. Older global receiving commands do not manage newly

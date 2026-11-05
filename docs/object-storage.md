@@ -22,7 +22,7 @@ Syq uses your AWS credentials and detects AWS bucket regions automatically.
 | `--s3-endpoint URL` | Use an S3-compatible service; also accepts `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL` |
 | `--s3-region REGION` | Set the signing region explicitly |
 | `--s3-header 'NAME: VALUE'` | Add a provider header to every request; repeatable |
-| `--s3-write-header 'NAME: VALUE'` | Add a header only to requests that create or replace objects: uploads, multipart starts, and copies; repeatable. Use it for settings such as storage class, or a server-side encryption method or KMS key, that the service rejects or ignores on other requests. Customer-provided encryption key headers (`x-amz-server-side-encryption-customer-*`) are also required on part uploads and reads, so they cannot be write-only. A write header takes precedence over an `--s3-header` of the same name |
+| `--s3-write-header 'NAME: VALUE'` | Add a header only to requests that create or replace objects: uploads, multipart starts, and copies; repeatable. Use it for settings such as storage class, or a server-side encryption method or KMS key, that the service rejects or ignores on other requests. Pass customer-provided encryption key headers (`x-amz-server-side-encryption-customer-*`) with `--s3-header` instead, because part uploads and reads need them too. A write header takes precedence over an `--s3-header` of the same name |
 | `--s3-retries N` | Retry each request up to N times (0–100, default 10) after a dropped connection, a timeout, a server error or throttling; 0 disables retries |
 
 See [S3 copies](tuning.md#s3-copies) for concurrency and part sizes.
@@ -69,16 +69,16 @@ objects.
 - **Buckets and prefixes:** keys must be relative UTF-8 paths. A named source selects an exact object if present, otherwise its
   `NAME/` prefix. Use `--srcs-in` for prefix contents. A prefix exists when it
   contains objects, including an empty directory marker.
-- **Metadata:** syq stores timestamps, permissions, ownership, and symlinks in
-  object metadata or contents. Downloads restore symlinks and set filesystem
-  modification time from the stored source time, falling back to S3 Last-Modified
-  when unavailable. Existing files with matching contents keep their time unless
-  `--copy-metadata=mtime` requests a metadata update;
-  `--copy-metadata=permissions,ownership` also restores permissions and ownership.
-  New or changed uploads store these source file attributes. For matching
-  contents, `--copy-metadata` selects which file attributes to reconcile. S3
-  metadata updates have the object-copy effects described below. Special files
-  are unsupported.
+- **Metadata:** Uploads store each file's modification time, permissions,
+  ownership, and symlink target in object metadata or contents. Downloads
+  restore symlinks and set modification times from the stored time, or from
+  S3 Last-Modified when an object has none; add
+  `--copy-metadata=permissions,ownership` to restore permissions and ownership
+  too. Files and objects whose contents already match keep their metadata
+  unless `--copy-metadata` selects attributes to update, such as `mtime`.
+  Updating an object's metadata rewrites it within S3, as described under
+  [Copies between S3 buckets](#copies-between-s3-buckets). Special files are
+  unsupported.
 - **Updates:** `--if-exists=keep`, `--into-new`, and `--as-new` protect individual
   objects against concurrent creation. How reliably this works depends on the
   consistency guarantees of your storage service. Prefix checks are not
@@ -87,7 +87,8 @@ objects.
   to S3 Last-Modified when an object has no stored timestamp. S3 Last-Modified
   reflects uploads and metadata rewrites, rather than the original file's age.
   Equal timestamps use the normal content comparison.
-  `--in-place` and SSH/S3 combinations are unsupported.
+  `--in-place` is unsupported, as are copies between S3 and an SSH host; run
+  syq on the machine that has the files.
 - **Recovery:** Retrying a copy can reuse multipart work. Recovery records are
   stored in the local user cache and removed on success. If that cache cannot be used, for example
   because it is read-only or belongs to another user, the copy continues with a
@@ -98,8 +99,8 @@ objects.
   can resume once there is space; remove that partial, or run
   [`syq clean-partials`](commands/clean-partials.md) on the destination, to
   start over instead.
-  If the copy fails for another reason, syq warns, removes the earlier
-  partial and downloads the object again.
+  If copying those parts fails for another reason, syq warns, removes the
+  earlier partial and downloads the whole object again.
   If you abandon an upload, remove its unfinished parts with provider tools or a
   lifecycle rule.
 
@@ -132,30 +133,28 @@ do not have corresponding source or destination attributes.
 Tag-only changes use the tagging API without rewriting the object or creating a
 new object version. Comparing tags requires permission to read source and
 destination tags; updating them requires permission to write destination tags.
-Reading tags uses a known object version when available. Tag updates using
-your own credentials also use the known destination version. Your provider may
-require separate permissions for reading and writing versioned tags. With
-`--auth-from`, updates always target the current destination object; upload
-approval does not allow changing historical versions.
+On versioned buckets, your provider may require separate permissions for the
+tags of specific object versions. With `--auth-from`, tag updates always apply
+to the current destination object.
 
-New or changed copies that fit in one server-side copy request use the provider's
-native tag-copy operation, without a separate tag read or support check. Providers
-without tag support may accept that copy without tags. With `tags` explicitly
-selected, multipart copies and tag comparisons read tags separately; if a
-required tagging operation is unsupported, the copy fails.
+New or changed copies that fit in one server-side copy request use the
+provider's own tag copying; a provider without tag support may accept such a
+copy without its tags. With `tags` selected, copies made in parts and tag
+comparisons read tags separately, and fail if a tagging operation they need is
+unsupported.
 
 Updating other metadata copies the destination object onto itself within
 S3, preserving its contents and unselected content headers, tags, and user metadata.
 It retains the destination storage class and the encryption method, KMS key,
-and S3 Bucket Key setting returned by the service. Encryption settings given
-with `--s3-header` or `--s3-write-header` override the selected fields:
-changing a KMS key retains the compatible encryption method, while switching
-away from KMS drops inherited KMS settings. Incompatible explicit encryption settings cause an error. Syq also
-refuses the update if the service reports that it omitted existing metadata from
-its response, because replacing that metadata could lose entries. These rules
-apply to multipart metadata updates too. The update changes S3 Last-Modified and
-creates a new version when bucket versioning is enabled. Object ACLs, Object Lock
-settings, and custom KMS encryption contexts are not preserved by this operation.
+and S3 Bucket Key setting returned by the service, unless encryption settings
+given with `--s3-header` or `--s3-write-header` override them: changing a KMS
+key retains the compatible encryption method, while switching away from KMS
+drops inherited KMS settings. Incompatible explicit encryption settings cause
+an error. Syq also refuses the update if the service reports that it omitted
+existing metadata from its response, because replacing that metadata could
+lose entries. The update changes S3 Last-Modified and creates a new version
+when bucket versioning is enabled. Object ACLs, Object Lock settings, and
+custom KMS encryption contexts are not preserved by this operation.
 
 New or changed uploads and bucket copies use the provider's storage and encryption
 defaults unless overridden with `--s3-write-header` or, for bucket copies, selecting
@@ -171,13 +170,12 @@ whole-object checksum the provider reports for both decides: SHA-256, or else
 CRC64NVME, which AWS adds to new objects by default. That lets a rerun skip an
 object uploaded in parts and copied in one request, whose ETags never match.
 Otherwise, equal ETags or equal stored sizes and modification times count as
-matching. The 32-bit CRCs, SHA-1, and checksums combined from parts are not
-used: matching 32-bit CRCs are not rare enough to show that contents match.
-When the contents do not match, the default policy replaces the destination.
-Use `--if-exists=error-if-different` to reject copies whose contents cannot be
-established as matching. Syq does not
-download both bodies to compare them on this route. `--hash`, `--hash-or-copy`,
-and expected hashes are unsupported.
+matching. Other provider checksums, such as 32-bit CRCs, SHA-1, and checksums
+combined from parts, are not used. When the contents do not match, the default
+policy replaces the destination. Use `--if-exists=error-if-different` to reject
+copies whose contents cannot be established as matching. Syq does not download
+both bodies to compare them on this route. `--hash`, `--hash-or-copy`, and
+expected hashes are unsupported.
 
 ## Authorize from your laptop
 
@@ -210,7 +208,8 @@ output file. Pipes carry only bytes. No local temporary file is created. See
 [File descriptors](commands/cp.md#file-descriptors) for command examples.
 
 S3 descriptor copies default to four parallel 16 MiB parts, with about one
-part of payload buffering per worker plus one input/output part. Use the `s3-part-size` tuning key and `--s3-retries` to change the part size and the retries.
+part of payload buffering per worker plus one input/output part. Set
+`--performance-tuning s3-part-size=SIZE` to change the part size.
 The usual S3 request and part concurrency controls apply; object concurrency
 is always one. Unknown-length uploads stop at 10,000 parts: 156.25 GiB at the
 default part size. Select a larger part size before starting a larger upload.
@@ -230,12 +229,11 @@ markers, or `--s3-version-id ID` for one version. Deleting a marker can reveal
 an older version. Preview version deletions with `--dry-run -v`.
 
 For Tigris endpoints at `t3.storage.dev` or under `tigris.dev`, syq sends
-permanent version deletions individually because Tigris's batch API ignores
-version IDs. Both flags can therefore take longer for large version histories.
-This exception applies only to these two flags.
+these permanent version deletions one at a time, because Tigris's batch API
+ignores version IDs, so they can take longer for large version histories.
 
-A custom proxy hostname that hides Tigris does not receive this exception.
-Batched requests can then leave versions intact and add delete markers that
+Syq does not recognize Tigris behind a custom proxy hostname, and sends
+batched requests there. They can leave versions intact and add delete markers that
 hide current objects; syq reports failure. Use a Tigris endpoint for permanent
 version deletion. To undo an unintended deletion, use your provider's version
 listing to identify the markers created by the failed attempt, then remove
@@ -244,7 +242,6 @@ to purge all versions, rerun the original `--s3-all-versions` command through
 that endpoint; this also removes the extra markers.
 
 Named removal selectors choose exact keys; `--src-dir` and `--srcs-in` choose
-prefix trees and accept a trailing `/`. Removing an object does not require its
-metadata to be valid UTF-8. When deleting an exact directory-marker
+prefix trees and accept a trailing `/`. When deleting an exact directory-marker
 version, keep the trailing `/` in its key. An empty S3 source prefix is rejected
 by `cp`, so it cannot prune an entire local destination.

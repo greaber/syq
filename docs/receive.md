@@ -117,11 +117,11 @@ directory follows the hard root, then the automatic approval root, then your
 home directory. See [Directories](persistence-reference.md#directories) for
 changing or resetting these settings.
 
-Changing a profile's settings stops its active copies, commands, and pending
-requests, except copies you approved from a server to another server: those
-run until they finish, until someone interrupts them on the server, or until
-you revoke the destination's enrollment with `syq receiver revoke`. Other
-profiles keep working.
+Changing a profile's settings, other than `--notify`, stops its active copies,
+commands, and pending requests, except copies you approved from a server to
+another server: those run until they finish, until someone interrupts them on
+the server, or until you revoke the destination's enrollment with
+`syq receiver revoke`. Other profiles keep working.
 
 <a id="unattended-copies"></a>
 

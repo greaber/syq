@@ -107,10 +107,9 @@ or requesting approval.
 ## Authorization selection
 
 Omitting `--auth-from` uses your [saved choice](../persistence-reference.md#authorization-defaults),
-then `auto`. This runs native SSH once using its ordinary configuration and
-syq's native persistent connections when enabled. Existing approved account
-connections do not change the selected authorization or endpoint.
-Explicit `ssh` selection also uses native authentication.
+or `auto` when none is saved. For `syq ssh`, `auto` and `ssh` both run native
+SSH once, with your ordinary SSH configuration and syq's persistent connections
+when they are enabled; an existing approved account connection is not used.
 A failed login or command is never retried through a receiving machine.
 Use `--auth-from @NAME` or save that preference to ask your laptop directly.
 An ordinary SSH endpoint, such as `--auth-from alice@provider:2222`, instead
