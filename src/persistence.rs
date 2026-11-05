@@ -58,10 +58,10 @@ enum PersistAction {
         /// Whose SSH access to connect with: this machine's own (auto or ssh), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST)
         #[arg(long, value_name = "auto|ssh|@NAME|HOST")]
         auth_from: Option<String>,
-        /// Run the syq at PATH on the remote machine instead of the matching copy syq installs automatically
+        /// Run the remote syq at PATH instead of syq's automatically installed copy
         #[arg(long, value_name = "PATH", conflicts_with = "no_bootstrap")]
         syq_path: Option<String>,
-        /// Run syq from the remote machine's PATH instead of the matching copy syq installs automatically
+        /// Run the syq found in the remote $PATH instead of syq's automatically installed copy
         #[arg(long)]
         no_bootstrap: bool,
         /// After connecting, wait up to this many seconds for receiving to be ready
@@ -74,7 +74,7 @@ enum PersistAction {
         #[arg(long, conflicts_with = "pscope")]
         ephemeral: bool,
     },
-    /// Turn persistence off and close its open SSH connections, including receiving; for an isolated set from persist on --ephemeral, also delete its settings and remembered permissions
+    /// Turn persistence off and close its SSH connections, including receiving; a set made by on --ephemeral is deleted with its settings
     Off {},
     /// Show connection readiness and any receiving problem
     Status {

@@ -18,7 +18,7 @@ syq persist [OPTIONS] <COMMAND>
 | [`persist destinations`](#syq-persist-destinations) | On a server, list or release receiving names |
 | [`persist connect`](#syq-persist-connect) | Connect to a server now and keep the connection open for later commands |
 | [`persist on`](#syq-persist-on) | Keep SSH connections open for later syq commands |
-| [`persist off`](#syq-persist-off) | Turn persistence off and close its open SSH connections, including receiving; for an |
+| [`persist off`](#syq-persist-off) | Turn persistence off and close its SSH connections, including receiving; a set made |
 | [`persist status`](#syq-persist-status) | Show connection readiness and any receiving problem |
 
 **Options (also available on subcommands)**
@@ -412,8 +412,8 @@ syq persist connect [OPTIONS] <HOST>
 | Argument / option | Meaning |
 |---|---|
 | `--auth-from <auto\|ssh\|@NAME\|HOST>` | Whose SSH access to connect with: this machine's own (auto or ssh), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST) |
-| `--syq-path <PATH>` | Run the syq at PATH on the remote machine instead of the matching copy syq installs automatically |
-| `--no-bootstrap` | Run syq from the remote machine's PATH instead of the matching copy syq installs automatically |
+| `--syq-path <PATH>` | Run the remote syq at PATH instead of syq's automatically installed copy |
+| `--no-bootstrap` | Run the syq found in the remote $PATH instead of syq's automatically installed copy |
 | `--timeout <SECONDS>` | After connecting, wait up to this many seconds for receiving to be ready<br><br>[default: 30] |
 
 <!-- /CLI -->
