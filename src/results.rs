@@ -411,7 +411,7 @@ impl ResultsWriter {
             "type": "run",
             "run_id": run.run_id,
             "started_at": run.started_at,
-            "syq_version": env!("CARGO_PKG_VERSION"),
+            "syq_version": crate::identity::version(),
             "mode": run.mode,
             "dry_run": run.dry_run,
             "endpoints": endpoints,

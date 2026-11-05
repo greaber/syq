@@ -6,8 +6,15 @@ use anyhow::{Context, Result};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
-/// Commands are small; this bound only keeps a hostile request cheap to reject.
+/// The longest command an approval carries, counting a terminator for each
+/// argument. It bounds a copy on an approval to as many named sources as
+/// fit, which `docs/reference.md` states, and keeps a hostile request cheap
+/// to reject.
 pub(crate) const MAX_COMMAND_BYTES: usize = 256 * 1024;
+
+fn command_bytes(command: &[Vec<u8>]) -> usize {
+    command.iter().map(|arg| arg.len() + 1).sum()
+}
 
 /// The requesting process's public command line, after options taken from the
 /// environment, without the program name.
@@ -19,6 +26,26 @@ pub(crate) fn current() -> Result<Vec<Vec<u8>>> {
         .collect())
 }
 
+/// This process's command for a copy's approval, refused with advice before
+/// anything is asked when an approval cannot carry it.
+pub(crate) fn copy_command(args: &crate::cli::Args) -> Result<Vec<Vec<u8>>> {
+    let command = current()?;
+    ensure_command_fits(&command, args.locations.len().saturating_sub(1))?;
+    Ok(command)
+}
+
+fn ensure_command_fits(command: &[Vec<u8>], sources: usize) -> Result<()> {
+    let length = command_bytes(command);
+    anyhow::ensure!(
+        length <= MAX_COMMAND_BYTES,
+        "this copy names {sources} sources, which make its command {} KiB, more than the {} KiB its approval can carry; {}",
+        length.div_ceil(1024),
+        MAX_COMMAND_BYTES / 1024,
+        crate::fsops::FEWER_SOURCES
+    );
+    Ok(())
+}
+
 /// Parse a requesting command without reading its input files, descriptors,
 /// this machine's filesystem, or its environment options.
 pub(crate) fn parse(command: &[Vec<u8>]) -> Result<crate::cli::Args> {
@@ -27,7 +54,7 @@ pub(crate) fn parse(command: &[Vec<u8>]) -> Result<crate::cli::Args> {
 
 fn parse_with(command: &[Vec<u8>], sources: crate::cli::SourceProbe) -> Result<crate::cli::Args> {
     anyhow::ensure!(
-        command.iter().map(|arg| arg.len() + 1).sum::<usize>() <= MAX_COMMAND_BYTES,
+        command_bytes(command) <= MAX_COMMAND_BYTES,
         "requesting command is too long"
     );
     let argv: Vec<OsString> = command

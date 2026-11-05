@@ -51,8 +51,9 @@ writing it. Filesystem work can continue, leaving an incomplete stream.
 
 Argument errors exit 2 without a stream. Failure to open the results sink
 exits 1 without a stream. Once opened, completed runs and fatal setup failures
-emit a terminal record if the sink remains writable. Crashes and interruptions
-can leave it missing.
+emit a terminal record if the sink remains writable; a fatal failure first
+emits an `error` record with its message, counted in `errors`. Crashes and
+interruptions can leave the terminal record missing.
 
 ## Consumer rules
 
@@ -103,7 +104,9 @@ count fields are non-negative integers within the `u64` range.
 ### `run`
 
 Always first. Identifies the invocation with `run_id`, `started_at` (Unix
-seconds), `syq_version`, `mode` (`cp` or `rm`), `dry_run`, and `endpoints`.
+seconds), `syq_version` (what `syq --version` prints, such as `0.7.1`, or
+`0.7.1+dev.0123456789ab` for a development build), `mode` (`cp` or `rm`),
+`dry_run`, and `endpoints`.
 Endpoints identify role and kind (`local`, `ssh`, or `s3`). SSH endpoints carry
 host/user; S3 endpoints carry `host: "s3://BUCKET"` without a user. They omit
 credentials, headers, ports, and raw command arguments. Clients that predate S3

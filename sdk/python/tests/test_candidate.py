@@ -17,6 +17,18 @@ EXECUTABLE = os.environ.get("SYQ_CANDIDATE_EXECUTABLE")
 EXPECTED_VERSION = os.environ.get("SYQ_CANDIDATE_VERSION")
 
 
+def reported_version(executable: str | os.PathLike[str]) -> str:
+    """The version the candidate should report: `SYQ_CANDIDATE_VERSION` for
+    a release build. A development build of that release reports its build
+    identity without the leading `v`, so it is not taken for the release."""
+
+    assert EXPECTED_VERSION is not None
+    identity = syq.run(["--build-identity"], executable=executable).stdout.decode().strip()
+    release = f"v{EXPECTED_VERSION}"
+    assert identity == release or identity.startswith(f"{release}+dev."), identity
+    return identity.removeprefix("v")
+
+
 def resolved_temporary_directory() -> tempfile.TemporaryDirectory[str]:
     """Create product-facing fixtures below the physical temporary directory."""
 
@@ -64,7 +76,7 @@ class CandidateCompatibilityTests(unittest.TestCase):
         assert EXECUTABLE is not None
         assert EXPECTED_VERSION is not None
         executable = Path(EXECUTABLE)
-        self.assertEqual(syq.version(executable=executable), EXPECTED_VERSION)
+        self.assertEqual(syq.version(executable=executable), reported_version(executable))
 
         with resolved_temporary_directory() as temporary_directory:
             root = Path(temporary_directory)
@@ -372,7 +384,7 @@ class AsyncCandidateCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             (root / "source" / "a").write_bytes(b"async")
             client = syq.AsyncClient(executable=EXECUTABLE, process_cwd=root)
 
-            self.assertEqual(await client.version(), EXPECTED_VERSION)
+            self.assertEqual(await client.version(), reported_version(EXECUTABLE))
             saved_results = io.BytesIO()
             preview = await client.cp(
                 srcs_in="source",

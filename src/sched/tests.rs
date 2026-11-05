@@ -1415,3 +1415,15 @@ fn destination_names_count_the_jobs_planned_for_each_linked_file() {
     assert_eq!(jobs.destination_names(0), 3);
     assert_eq!(jobs.destination_names(3), 3);
 }
+
+#[test]
+fn only_a_jobs_first_preparation_is_first() {
+    let mut jobs = Jobs::default();
+    for idx in [0, 63, 64, 1000] {
+        assert!(jobs.first_preparation(idx), "{idx}");
+        assert!(!jobs.first_preparation(idx), "{idx}");
+    }
+    assert!(jobs.first_preparation(1));
+    // One bit per job up to the highest prepared.
+    assert_eq!(jobs.prepared.len(), 1000 / 64 + 1);
+}

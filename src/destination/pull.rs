@@ -277,13 +277,14 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
         ..
     } = selection;
     let target = target.context("source authorization target missing")?;
+    let command = crate::approval_command::copy_command(args)?;
     let request = request(args)?;
     crate::output::diagnostic!("syq: requesting permission from @{name} to read from {target:?}; approve on that machine with its desktop prompt or syq persist receive pending");
     let (stream, reply) = exchange(
         &registration,
         Message::Pull {
             target,
-            command: crate::approval_command::current()?,
+            command,
             cwd: crate::approval_command::current_directory(),
             request: Box::new(request),
         },
@@ -402,11 +403,15 @@ pub(super) fn receive() -> Result<i32> {
     }
     let mut input = unsafe { File::from_raw_fd(fd) };
     let setup = (|| {
-        let request: HelperRequest = read_message(&mut forward::DeadlineIo {
-            inner: &mut input,
-            deadline: Instant::now() + Duration::from_secs(10),
-            cancelled: None,
-        })?;
+        let started = Instant::now();
+        let request: HelperRequest = read_message_extending(
+            &mut forward::DeadlineIo {
+                inner: &mut input,
+                deadline: started + Duration::from_secs(10),
+                cancelled: None,
+            },
+            |input| input.deadline = started + super::LARGE_MESSAGE_TIMEOUT,
+        )?;
         anyhow::ensure!(
             request.version == HELPER_VERSION && request.identity == crate::identity::build(),
             "return source helper build mismatch"

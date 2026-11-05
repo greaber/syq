@@ -793,7 +793,7 @@ impl Args {
                 std::process::exit(0);
             }
             "--version" | "-V" => {
-                println!("syq {}", env!("CARGO_PKG_VERSION"));
+                println!("syq {}", crate::identity::version());
                 std::process::exit(0);
             }
             // Installation lifecycle switches remain top-level. Internal

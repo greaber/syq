@@ -2334,6 +2334,11 @@ impl<W: Write> postcard::ser_flavors::Flavor for MessageOutput<'_, W> {
     }
 }
 
+/// Whether `msg` is too large for a `FrameWriter` to send.
+pub(crate) fn exceeds_message_limit<T: Serialize + SizeHint>(msg: &T) -> bool {
+    postcard::experimental::serialized_size(msg).is_ok_and(|size| size >= msg.frame_limit())
+}
+
 pub struct FrameWriter<W: Write> {
     w: BufWriter<W>,
     pub compress: bool,

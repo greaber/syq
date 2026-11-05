@@ -107,6 +107,11 @@ jobs:
             cargo-rsync-compat-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Test compatibility harness
         run: python tests/rsync-compat/harness_test.py
+      # The root-only protected-regular case skips when this sysctl is off,
+      # as on the ubuntu-26.04 image. 2 is Ubuntu's usual default.
+      - name: Enable Linux fs.protected_regular
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w fs.protected_regular=2
       - name: Run classified upstream tests
         run: python scripts/rsync-compat.py --require-tests --test-timeout 120 -j 4
       - name: Run suite as root, including root-only circumstances

@@ -1025,6 +1025,41 @@ fn delegated_operand(path: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD_NO_PAD.encode(path)
 }
 
+/// The two words that name `source` on the coordinator's command line.
+fn source_words(source: &Location) -> [String; 2] {
+    [
+        match source.selection {
+            SourceSelection::Contents => "--srcs-in",
+            SourceSelection::File => "--src-non-dir",
+            SourceSelection::Directory => "--src-dir",
+            SourceSelection::Named | SourceSelection::NamedNoFollow | SourceSelection::Rsync => {
+                "--src"
+            }
+        }
+        .into(),
+        delegated_operand(&source.path),
+    ]
+}
+
+/// The longest coordinator command a server can run. Its SSH server hands
+/// the command to the login shell as one argument, and Linux holds at most
+/// 128 KiB in one argument, with its terminating NUL.
+const MAX_COORDINATOR_COMMAND: usize = 128 * 1024 - 1;
+
+/// Refuse a coordinator command of `length` bytes that a server cannot run,
+/// before anything starts there, rather than let it fail with "Argument list
+/// too long".
+fn ensure_coordinator_command_fits(length: usize, sources: usize) -> Result<()> {
+    if length > MAX_COORDINATOR_COMMAND {
+        bail!(
+            "this copy between two servers names {sources} sources, which make its coordinator's command line {} KiB, more than the 128 KiB a server accepts; {}",
+            length.div_ceil(1024),
+            crate::fsops::FEWER_SOURCES
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn endpoint_arg(
     location: &Location,
     login_user: Option<&str>,
@@ -1112,6 +1147,17 @@ fn run_remote(
     results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
 ) -> Result<i32> {
     let started = std::time::Instant::now();
+    // The coordinator gets the named sources on its command line. Refuse
+    // more than it can take before asking for any approval or signature.
+    if args.mapping_contents.is_none() {
+        ensure_coordinator_command_fits(
+            srcs.iter()
+                .flat_map(source_words)
+                .map(|word| word.len() + 1)
+                .sum(),
+            srcs.len(),
+        )?;
+    }
     let mut peer_bridge = args
         .peer_bridge
         .as_deref()
@@ -1205,7 +1251,7 @@ fn run_remote(
             .then(|| {
                 crate::directive::validate_restricted_args(args)?;
                 crate::restricted::prepare_transfer(crate::restricted::Issue {
-                    command: crate::approval_command::current()?,
+                    command: crate::approval_command::copy_command(args)?,
                     cwd: crate::approval_command::current_directory(),
                     inputs: crate::directive::Inputs {
                         ignore: args.ignore_lines.clone(),
@@ -1535,18 +1581,7 @@ fn run_remote(
         remote.push("--mapping=-".into());
     } else {
         for source in srcs {
-            remote.push(
-                match source.selection {
-                    SourceSelection::Contents => "--srcs-in",
-                    SourceSelection::File => "--src-non-dir",
-                    SourceSelection::Directory => "--src-dir",
-                    SourceSelection::Named
-                    | SourceSelection::NamedNoFollow
-                    | SourceSelection::Rsync => "--src",
-                }
-                .into(),
-            );
-            remote.push(delegated_operand(&source.path));
+            remote.extend(source_words(source));
         }
     }
     if !coordinator_at_dst && !same_host {
@@ -1670,6 +1705,7 @@ fn run_remote(
     } else {
         remote_cmd
     };
+    ensure_coordinator_command_fits(remote_cmd.len(), srcs.len())?;
 
     let make_command = || {
         if spec.ssh_multiplexer.is_some() {
