@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -16,6 +17,13 @@ def positive(value):
     if number <= 0:
         raise argparse.ArgumentTypeError('Must be positive')
     return number
+
+
+def effort(value):
+    # Codex receives the level inside a TOML string, so keep it to a plain word.
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', value):
+        raise argparse.ArgumentTypeError('Use a level name such as high or xhigh')
+    return value
 
 
 def parser():
@@ -62,22 +70,27 @@ def parser():
     p.add_argument('--notify', action='store_true')
     review = groups.add_parser('review').add_subparsers(dest='action', required=True)
     review.add_parser('list')
-    p = review.add_parser('start', help='Launch reviewer in a new tmux window; requester drives triage/auto loop')
+    p = review.add_parser('start', help='Run the reviewer in the background; requester drives triage/auto loop')
     p.add_argument('--pr', type=positive, required=True)
     p.add_argument('--agent', required=True)
     p.add_argument('--brief', required=True, help='Markdown task context, including actual requirements and open questions')
-    p.add_argument('--reviewer', choices=['claude', 'codex'], required=True)
+    p.add_argument('--reviewer', choices=['claude', 'codex'], default='claude')
+    p.add_argument('--model', help='Reviewer model; default claude-opus-5-5 for Claude, gpt-6-astra for Codex')
+    p.add_argument('--effort', type=effort, help='Reviewer effort level; default xhigh')
+    p.add_argument('--reviewer-option', action='append', metavar='ARG',
+                   help='One extra reviewer command argument, used on launch and resume; repeat for each. '
+                        'Write values starting with - as --reviewer-option=ARG')
     p.add_argument('--additional-reviewer', action='store_true',
                    help='Explicitly start another independent reviewer for this task')
     p.add_argument('--mode', choices=['collect', 'triage', 'auto'], default='triage')
     p.add_argument('--max-rounds', type=positive, default=3)
     p.add_argument('--notify', action='store_true', help='Also queue a hint to the requesting agent’s registered Codex endpoint')
-    for action in ('status', 'wait', 'next', 'stop-loop', 'worker', 'resume', 'bind-session'):
+    for action in ('status', 'wait', 'next', 'stop', 'stop-loop', 'worker', 'resume'):
         p = review.add_parser(action)
         p.add_argument('id')
         if action == 'wait':
             p.add_argument('--timeout', type=positive, default=60)
-        if action in ('next', 'stop-loop', 'resume'):
+        if action in ('next', 'stop', 'stop-loop', 'resume'):
             p.add_argument('--agent', required=True)
         if action == 'next':
             p.add_argument('--allow-unchanged', action='store_true', help='Explicitly request re-review of an already reviewed SHA')
@@ -85,7 +98,6 @@ def parser():
             p.add_argument('--session', help='Exact saved session ID, if not recorded automatically')
         if action == 'worker':
             p.add_argument('--round', type=positive, required=True)
-            p.add_argument('--resume', action='store_true')
     p = review.add_parser('submit')
     p.add_argument('id')
     p.add_argument('--round', type=positive, required=True)
@@ -179,10 +191,12 @@ def dispatch(store, args):
     if args.action == 'triage':
         args.action = args.decision
         return reviews.triage(store, args)
-    if args.action == 'bind-session':
-        return reviews.bind_session(store, args.id)
     if args.action == 'worker':
-        return reviews.worker(store, args.id, args.round, args.resume)
+        return reviews.worker(store, args.id, args.round)
+    if args.action == 'status':
+        return reviews.status(store, args.id)
+    if args.action == 'stop':
+        return reviews.stop(store, args.id, args.agent)
     if args.action == 'wait':
         return reviews.wait(store, args.id, args.timeout)
     if args.action == 'resume':
@@ -191,12 +205,10 @@ def dispatch(store, args):
         return reviews.next_round(store, args.id, args.agent, args.allow_unchanged)
     with store.locked() as state:
         review = reviews.get(state, args.id)
-        if args.action == 'stop-loop':
-            if review['agent'] != args.agent:
-                raise Error('Only the requester can stop the loop')
-            review['status'] = 'stopped'
-            review['reason'] = 'Automatic continuation stopped. Existing reviewer terminal was not interrupted.'
-            reviews.publish_stop(store, state, review)
+        if review['agent'] != args.agent:
+            raise Error('Only the requester can stop the loop')
+        review['status'] = 'stopped'
+        review['reason'] = 'Automatic continuation stopped. A running reviewer process was not interrupted.'
         return reviews.view(review)
 
 
