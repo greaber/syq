@@ -57,8 +57,7 @@ syq.cp("report.csv", from_="user@server", cwd="/exports", into="downloads")
 
 SSH hosts and paths are separate arguments. See
 [Copy between servers](https://greaber.github.io/syq/remote-to-remote.html)
-for copies with two remote endpoints. A typed remote-to-remote preview needs
-`coordinate_at="local"`; a live copy can also use an enrolled receiver.
+for copies with two remote endpoints.
 
 ## Preview changes
 

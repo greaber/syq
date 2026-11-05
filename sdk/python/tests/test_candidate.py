@@ -369,6 +369,24 @@ exec /bin/sh -c "$1"
             self.assertEqual(result.status, syq.OperationStatus.SUCCESS)
             self.assertEqual(destination.read_bytes(), b"remote coordinator")
 
+            # A preview coordinated by the source server relays its results.
+            preview_destination = root / "preview"
+            preview = client.cp(
+                src=source,
+                from_="hostA",
+                to="hostB",
+                as_=preview_destination,
+                dry_run=True,
+                rsh=os.fspath(rsh),
+                syq_path=EXECUTABLE,
+                no_tcp=True,
+            )
+
+            self.assertTrue(preview.dry_run)
+            self.assertEqual(preview.files_transferred, 1)
+            self.assertEqual(preview.bytes_transferred, len(b"remote coordinator"))
+            self.assertFalse(preview_destination.exists())
+
 
 @unittest.skipUnless(
     EXECUTABLE and EXPECTED_VERSION,

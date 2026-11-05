@@ -289,12 +289,15 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(argv[argv.index("--transfer-strategy") + 1], "aligned-block")
         self.assertNotIn("--performance-tuning", argv)
 
-    async def test_s3_to_s3_dry_run_needs_no_coordinator_override(self) -> None:
-        await self.client.cp("source", from_="s3://source", to="s3://destination",
-                       into="prefix", dry_run=True)
-        argv = self.argv()
-        self.assertIn("--dry-run", argv)
-        self.assertNotIn("--coordinate-at", argv)
+    async def test_two_endpoint_dry_run_needs_no_coordinator_override(self) -> None:
+        for from_, to in (("s3://source", "s3://destination"), ("alpha", "beta")):
+            with self.subTest(from_=from_, to=to):
+                result = await self.client.cp("source", from_=from_, to=to,
+                                              into="prefix", dry_run=True)
+                self.assertTrue(result.dry_run)
+                argv = self.argv()
+                self.assertIn("--dry-run", argv)
+                self.assertNotIn("--coordinate-at", argv)
 
     async def test_s3_options_and_literal_headers(self) -> None:
         await self.client.cp("source", to="s3://bucket", into="prefix",

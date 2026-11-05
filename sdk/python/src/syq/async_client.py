@@ -872,19 +872,6 @@ class AsyncClient:
         from_, cwd, root, follow_src = _source_options(
             mapping, from_=from_, cwd=cwd, root=root, follow_src=follow_src,
         )
-        if (
-            from_ is not None
-            and to is not None
-            and not (str(from_).startswith("s3://") and str(to).startswith("s3://"))
-            and dry_run
-            and coordinate_at != "local"
-        ):
-            # Mirrors the CLI's usage-lane refusal: a dry run's traces exist
-            # only on the coordinator, which these placements move remote.
-            raise SyqInvocationError(
-                "a remote-to-remote dry run cannot produce the results "
-                "stream this surface relies on; pass coordinate_at='local'"
-            )
         results = await _complete_task(
             asyncio.create_task(asyncio.to_thread(_prepare_results_file, results))
         )
