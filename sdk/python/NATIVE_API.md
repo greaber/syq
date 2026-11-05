@@ -85,21 +85,21 @@ In addition to the shared arguments above, it accepts:
 | `into`, `into_new`, `into_existing` | Destination directory paths |
 | `as_`, `as_new`, `as_existing` | Exact destination paths |
 | `mapping` | `Mapping`, `MapStream`, manifest path, or iterable of `MappingEntry`; replaces selectors; conflicts with `as_*`, `prune`, and `prune_before`. Async clients also accept `AsyncMapping` and async iterables |
-| `stream_concurrency` | Maximum callback entries active at once; default `4`, range `1..256`; transport worker and request limits are shared across entries |
+| `stream_concurrency` | Maximum callback entries active at once; default `4`, range `1..256` |
 | `follow_dst` | Boolean: follow destination symlinks |
 | `prune_before` | Boolean: remove extras before copying to free space; implies pruning. Later copy failures do not restore removals |
-| `widen_dirs` | `"none"`, `"rsync"`, or `"all"`: which directories you own may temporarily get the owner permission the copy needs; `"rsync"` covers the directories the copy includes, and `"all"` also covers the directory it goes into and the directories above it. Each is restored afterwards, unless explicit permission metadata takes precedence. When omitted, `syq cp`'s default applies |
+| `widen_dirs` | `"none"` (default), `"rsync"`, or `"all"`: which directories you own may briefly get the owner permission the copy needs, as `--widen-dirs` describes |
 | `prune`, `dry_run`, `hash` | Boolean: mirror, preview, or compare content |
-| `hash_or_copy` | Boolean: like `hash`, but compare only files the transfer strategy would compare (by default, every file with a remote syq endpoint) and copy the rest, so identical files may be rewritten; cannot combine with `hash` |
+| `hash_or_copy` | Boolean: like `hash`, but compare only where the transfer strategy reuses blocks and copy other files whole; cannot combine with `hash` |
 | `integrity_checking` | Comma-separated string, e.g. `"transfer=sha256"`; defaults to size/mtime comparison and no extra payload checks |
 | `if_exists` | `"error-if-different"`, `"error"`, `"keep"`, `"update"` (default), or `"update-if-older"` |
 | `where`, `copy_if` | Expression strings: `where` selects non-directory source entries; `copy_if` decides which entries the copy may create or update; see [expressions](https://greaber.github.io/syq/expressions.html) |
 | `ignore` | Pattern string, `IgnoreFrom(path)`, or ordered iterable of either |
 | `ignore_from` | Rule file path or iterable of paths; applied after `ignore` |
-| `copy_metadata` | Metadata string or iterable; applies even on unchanged files: `mtime`, `times` (alias for `mtime`), `permissions`, `ownership`, `specials`, `hardlinks`, `acls`, `xattrs`, `atimes`, `crtimes`; S3-to-S3 copies also accept `content-type`, `content-encoding`, `content-language`, `content-disposition`, `cache-control`, `expires`, `website-redirect`, `user-metadata`, `tags`, `storage-class`; see [S3 metadata](https://greaber.github.io/syq/object-storage.html#copies-between-s3-buckets) and [filesystem preservation](https://greaber.github.io/syq/reference.html#preserve-metadata) for platform and route support |
+| `copy_metadata` | Metadata string or iterable, with the values [`--copy-metadata`](https://greaber.github.io/syq/commands/cp.html#metadata-and-symlinks) accepts (`times` is an alias for `mtime`); applies even on unchanged files |
 | `open_noatime` | Boolean: request file reads without access-time updates; warns and continues if unavailable |
 | `sparse` | Boolean: turn written zero ranges into sparse holes on filesystem destinations |
-| `in_place` | `"new"`: write new files directly at their final names, with no staging file; existing files are still replaced. `"update"`: also update existing files in place where syq can vouch for them, as `--in-place=update` does. The earlier `inplace=` keyword raises `SyqInvocationError`; `in_place="update"` is closest to its behavior |
+| `in_place` | `"new"`: write new files directly at their final names, with no staging file; existing files are still replaced. `"update"`: also update existing files in place, as `--in-place=update` does |
 | `no_compress` | Boolean: disable compression |
 | `max_delete` | Nonnegative integer deletion limit; requires `prune=True` or `prune_before=True` |
 | `resource_limits` | Comma-separated ceilings that keep automatic tuning, e.g. `"bandwidth=10M,workers=4"`; a concurrency key conflicts with the same key in `performance_tuning` |
@@ -123,22 +123,15 @@ and [Object storage](https://greaber.github.io/syq/object-storage.html).
 
 For example, `client.cp("data", to="s3://bucket", into="backup",
 s3_header=["X-Tigris-Consistent: true"])` uploads local data using credentials
-from the subprocess environment or AWS configuration. Copies between two S3
-endpoints use server-side copying within the same service; content verification
-options that require reading object bodies are rejected. SSH/S3 combinations
-are not supported. S3 results use `EndpointKind.S3`.
+from the subprocess environment or AWS configuration. A copy cannot combine an
+SSH endpoint with an S3 endpoint.
 
-`pscope` selects an isolated domain for local connections, receiving settings,
-and saved authorization choices. Return copies and commands can use it too;
-receiving names advertised by other machines remain shared. See
-[persistence in scripts](https://greaber.github.io/syq/persistence-reference.html#isolated-script-scopes)
-for setup and cleanup, and
-[Compatibility](https://greaber.github.io/syq/python-operations.html#compatibility)
-for executable selection.
+`pscope` selects an isolated domain for connections, receiving settings, and
+saved authorization choices; see
+[persistence in scripts](https://greaber.github.io/syq/persistence-reference.html#isolated-script-scopes).
 
 Typed SSH-to-SSH copies use an enrolled receiver, approved account access to
-both endpoints, or `coordinate_at="local"`. Selecting an authorization provider
-requests account connections when needed. Use `run` for detached commands and
+both endpoints, or `coordinate_at="local"`. Use `run` for detached commands and
 human output options.
 
 `IgnoreFrom(path)` is a frozen dataclass holding a rule-file path (`str`,
@@ -152,36 +145,32 @@ human output options.
 `client.open_writer(*, as_=None, as_new=None, as_existing=None, to=None,
 follow_dst=False, ...)` returns a `StreamWriter`. Choose exactly one of
 `as_`, `as_new`, or `as_existing`; the latter two require the destination to
-be absent or present, following `cp` placement semantics. Writers have no
-source basename, so they require an exact destination path.
+be absent or present, as in `cp`.
 `client.open_reader(src, *, from_=None, cwd=None, root=None, follow_src=False, ...)`
-returns a `StreamReader`. `cwd` resolves relative sources; `root` also confines
-them. Choose at most one, as with `cp`. These bases belong to the source
-endpoint, independently of the client's local `process_cwd`. Both accept `rsh`,
+returns a `StreamReader`. `cwd` resolves relative sources on the source
+endpoint, and `root` also confines them; choose at most one. Both accept `rsh`,
 `syq_path`, `pscope`, `no_bootstrap`, `no_compress`, `no_tcp`, `no_tcp_encryption`,
-`tcp_ports`, `tcp_congestion`, `auth_from` (S3 authorization or requested/reused SSH account access), `s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
+`tcp_ports`, `tcp_congestion`, `auth_from`, `s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
 `s3_retries`, `performance_tuning`, `resource_limits`, `integrity_checking`, `if_exists`,
 `dry_run`, `stats`, `verbose`, `quiet`, `progress`, `no_progress`,
 and `timeout` with the same meanings as `cp`. `open_writer` also accepts
 `s3_write_header`.
 See the [CLI stream reference](https://greaber.github.io/syq/commands/cp.html#transport-and-limits)
-for the tuning and integrity controls that apply to streams.
-The client supplies the executable, process working directory, environment,
-and default timeout. Stream calls always check transfer failures.
+for the tuning and integrity controls that apply to streams. Stream calls
+always check transfer failures.
 
 These methods transfer raw bytes, using the CLI's [stream semantics](https://greaber.github.io/syq/commands/cp.html#file-descriptors)
 for destination permissions, metadata, and endpoint restrictions. They are
-sequential, non-seekable interfaces; use one
-operation at a time on each stream. No whole-object retry or restart recovery
-is attempted. S3 can retry buffered multipart parts.
+sequential and not seekable; use one operation at a time on each stream. An
+interrupted stream is not resumed.
 
 | Object | Operations |
 |---|---|
 | `StreamWriter` | `write(bytes)` writes the complete buffer and returns its length; `flush()` has no Python buffer to flush; `close()` ends payload input; `commit()` publishes and checks completion; `abort()` cancels |
-| `StreamReader` | `read(size=-1)`, `readinto(buffer)`; `close()` drains remaining bytes in bounded chunks and checks completion; `abort()` cancels |
+| `StreamReader` | `read(size=-1)`, `readinto(buffer)`; `close()` reads any remaining bytes and checks completion; `abort()` cancels |
 
-Streams use bounded transport buffers. `read()` without a size collects all
-remaining bytes in Python memory and checks completion before returning.
+`read()` without a size collects all remaining bytes in memory and checks
+completion before returning.
 
 ### Writer completion
 
@@ -194,20 +183,18 @@ Writers support `io.BufferedWriter` and `io.TextIOWrapper`. Close the wrapper
 before committing the underlying writer so its buffered data is flushed.
 
 Outside a context, finish with `commit()` or `abort()`; `close()` alone leaves
-the transfer pending. `commit()` can follow payload closure, is repeatable
-after success, and fails after an abort. Explicit commit publishes immediately,
-so later application errors cannot undo it.
-A timeout or connection loss during commit can leave the outcome uncertain;
-the method reports failure rather than claiming rollback. Whole datasets
-need their own final publication step after all object transfers succeed.
+the transfer pending. `commit()` publishes immediately, so later application
+errors cannot undo it; it can be repeated after success and fails after an
+abort. A timeout or connection loss during commit can leave the outcome
+uncertain, and the method then reports failure. A dataset of several objects
+needs its own final publication step after every transfer succeeds.
 
 ### Skips and previews
 
-Writers normally return while destination setup continues, so opening several
-writers lets their connections start concurrently. Setup errors can surface at
-`write()` or `commit()`. With `if_exists="keep"` or `dry_run=True`,
-opening waits for the destination decision (also for options inherited from the
-environment). Check `output.skipped` before producing data:
+Opening a writer returns before the destination is ready, so setup errors can
+surface at `write()` or `commit()`. With `if_exists="keep"` or `dry_run=True`,
+opening waits for the destination decision; check `output.skipped` before
+producing data:
 
 ```python
 with client.open_writer(to="server", as_="archive.tar", if_exists="keep") as output:
@@ -232,19 +219,16 @@ elapsed time. It remains `None` if no terminal result arrived, such as after
 forced termination. Missing or invalid completion records raise
 `SyqProtocolError` even if the process exits successfully.
 
-A bounded reader call can yield partial data before a later transfer error.
-An unbounded `read()` checks transfer completion before returning its bytes.
-An exception inside either context cancels the transfer
-and preserves the original exception. Writers that have not committed are
-aborted during garbage collection, including after payload closure; cleanup
-can block, so use explicit contexts for timely cleanup.
+A bounded `read(size)` can return data before a later transfer error. An
+exception inside either context cancels the transfer and propagates unchanged.
+A writer that was never committed is aborted when it is garbage collected,
+which can block, so use a `with` block for timely cleanup.
 
-`timeout` covers the stream's lifetime, including blocked reads/writes. Timeout
-raises `subprocess.TimeoutExpired` unless the transfer has completed successfully;
-transfer failures raise `SyqProcessError`,
-whose result contains the exit status and the last 8 KiB of diagnostics, without
-capturing payload bytes. The stream's `stderr` property exposes those same
-last 8 KiB as bytes, including on success. For example, request `stats=True`
+`timeout` covers the stream's whole lifetime, including blocked reads and
+writes, and raises `subprocess.TimeoutExpired` unless the transfer has already
+succeeded. Transfer failures raise `SyqProcessError`, whose result contains the
+exit status and the last 8 KiB of diagnostics. The stream's `stderr` property
+holds the same bytes, including on success; for example, request `stats=True`
 and read `output.stderr.decode()` after the writer context exits.
 
 ### Async streams
@@ -260,11 +244,10 @@ async with client.open_reader("generated.bin", from_="server") as source:
         await consume(chunk)
 ```
 
-Async streams start on context entry. Cancellation terminates the owned
-transfer process and releases blocked I/O. `AsyncStreamReader` and
-`AsyncStreamWriter` expose async `read`/`write`, `close`, and `abort` methods.
-`AsyncStreamWriter.commit()` explicitly publishes, with the same semantics
-as its synchronous counterpart; successful async context exit commits automatically.
+Async streams start on context entry, and cancellation stops the transfer.
+`AsyncStreamReader` and `AsyncStreamWriter` have async `read`/`write`, `close`,
+and `abort` methods, and `AsyncStreamWriter.commit()` works like its
+synchronous counterpart.
 <!-- ANCHOR_END: streams -->
 
 <!-- ANCHOR: removal -->
@@ -281,21 +264,19 @@ always unlinked. Both `follow_src=True` and `follow=True` permit symlinks in
 Directory and contents selectors reject a final symlink even with following
 enabled.
 
-`rm(*sources, **options)` → [RmResult](https://greaber.github.io/syq/python-results.html#rmresult) removes selected entries. Besides the shared
-arguments, it accepts `on`, `dry_run`, `performance_tuning`, `syq_path`,
-`no_bootstrap`, `pscope`, `on_event`, `results`, and `check` with the types above.
-It supports local, ordinary SSH, and S3 endpoints. Command-restricted receivers
-reject removal. `performance_tuning="workers=N"` fixes filesystem deletion
-concurrency; `performance_tuning="s3-requests=N"` fixes S3 deletion concurrency.
-Omitting it lets syq tune deletion separately from copying. See
-[Remove files](https://greaber.github.io/syq/remove.html).
+`rm(*sources, **options)` → [RmResult](https://greaber.github.io/syq/python-results.html#rmresult) removes selected entries on local, SSH, or S3
+endpoints; restricted receivers refuse removal. Besides the shared arguments, it accepts `on`, `dry_run`,
+`performance_tuning`, `syq_path`, `no_bootstrap`, `pscope`, `on_event`,
+`results`, and `check` with the types above. `performance_tuning="workers=N"`
+fixes filesystem deletion concurrency, and `"s3-requests=N"` fixes it for S3.
+See [Remove files](https://greaber.github.io/syq/remove.html).
 
 S3 removal uses `rm(..., on="s3://bucket")` with optional `s3_endpoint`,
 `s3_region`, `s3_profile`, `s3_header`, `s3_retries`, and `auth_from="@NAME"`. `s3_all_versions=True` permanently
 removes all selected versions and delete markers; `s3_version_id="ID"` selects
 one version of one exact key. These options are mutually exclusive.
 `RemovalTrace` and `RemovalResult` expose optional `s3_version_id` and
-`s3_delete_marker` fields. The same arguments work with `AsyncClient.rm`.
+`s3_delete_marker` fields.
 <!-- ANCHOR_END: removal -->
 
 <!-- ANCHOR: mappings -->
@@ -314,12 +295,10 @@ directories, and expression fields are included in output only when requested
 through `include`.
 
 By default entries contain only source and destination paths. `include` is an
-iterable of field names: `kind`, `size`, `mtime`, and `s3_last_modified`.
+iterable of field names: `kind`, `size`, `mtime`, and `s3_last_modified`, with
+the meanings given in the
+[mapping format](https://greaber.github.io/syq/commands/map.html#mapping-format).
 `kind` adds a copy-time type check; the other fields are informational.
-For filesystem sources, size and modification time describe regular files.
-For S3, `mtime` is stored filesystem time, omitted when unavailable;
-`s3_last_modified` is the independent S3 object modification time. Requesting
-`kind` or `mtime` reads S3 object metadata; generation never downloads bodies.
 
 Connection options are `auth_from`, `rsh`, `syq_path`, `no_bootstrap`, `pscope`,
 `s3_endpoint`, `s3_region`, `s3_profile`, and `s3_header`, with the same types as on `cp`.
@@ -338,9 +317,9 @@ does not keep it, so pass it to `cp` as well if the copy should use it.
 
 `MapStream` is a `Mapping` and an iterable context manager; use `with`.
 `AsyncMapStream` is an `AsyncMapping` and an async context manager; use
-`async with`. Streams must be consumed inside their context and cannot be reused
-after completion or closure. Async streams capture the producer directory,
-environment, and timeout when created, even though execution starts later.
+`async with`. Consume a stream inside its context; it cannot be reused after
+completion or closure. Async streams use the client's directory, environment,
+and timeout as they were when the stream was created.
 
 ### Mapping and AsyncMapping
 
@@ -372,26 +351,22 @@ and returns a replacement entry, or `None` to omit it. Transformations can be
 chained. Async transforms also accept awaitable callbacks and await them in
 entry order. Neither form caches entries; reuse depends on the supplied iterable.
 
-A context-carrying mapping rejects `from_`, `cwd`, and `root` overrides on `cp`.
-It also rejects conflicting values for connection options explicitly supplied
-when it was created; repeating the same value is allowed. A captured
-`no_bootstrap=True` remains enabled. Header iterables are captured at construction.
-Unspecified connection settings still use the copy's environment and configuration; specify `s3_endpoint` when the service must stay
-fixed across clients. The mapping does not snapshot credentials or source data.
-It automatically enables the source-following policy used by `map`; enabling
-`follow` or `follow_src` on the copy is also permitted. The destination options
-remain independent. `map(root=..., srcs_in=...)` carries the selected directory
-as the consuming copy's root. The copy resolves that root again; it does not
-inherit an open directory handle or a snapshot of the source tree.
+When you copy a mapping that carries a source context, `cp` rejects `from_`,
+`cwd`, and `root`, and rejects connection options that conflict with the ones
+the mapping was created with. Connection settings you did not specify come from
+the copy's environment and configuration, so specify `s3_endpoint` when the
+service must stay the same across clients. The mapping holds no credentials
+and no snapshot of the source; the copy reads the sources again.
+`map(root=..., srcs_in=...)` makes the selected directory the copy's root.
 
-Normal end of stream iteration checks the mapping process status. Leaving its
-context early stops the process. An exhausted or closed stream cannot be copied
-as an empty mapping.
+Iterating a stream to its end checks the mapping process status, and leaving
+its context early stops the process. An exhausted or closed stream cannot be
+copied as an empty mapping.
 
-For `cp(mapping=iterable)`, the entire iterable is saved to a temporary manifest
-before copying starts. An iteration, transformation, or serialization failure
-starts no copy. Plain iterables and manifest paths have no source context; pass
-`cwd`, `root`, or `from_` explicitly as needed. See
+`cp(mapping=iterable)` reads the entire iterable before copying starts, so an
+iteration, transformation, or serialization failure starts no copy. Plain
+iterables and manifest paths have no source context; pass `cwd`, `root`, or
+`from_` as needed. See
 [mapping rules](https://greaber.github.io/syq/mappings.html).
 
 <a id="callback-mappings"></a>
@@ -403,12 +378,11 @@ starts no copy. Plain iterables and manifest paths have no source context; pass
 and `dst` of a `MappingEntry`; callback entries require `kind=None` or `"file"`.
 These objects work with live `cp(mapping=...)` calls, not saved pathname manifests.
 
-The complete iterable is validated before any callback or destination change.
-Callbacks start lazily, with at most `stream_concurrency` entries active; one
-entry can have both a producer and consumer. Pathname entries run first with
-their usual comparison and recovery behavior, then callback entries share
-transfer sessions. A mixed mapping therefore has one endpoint setup per phase.
-A failed entry does not undo entries that already succeeded.
+The complete iterable is validated before any callback runs or the
+destination changes. Callbacks start as needed, with at most
+`stream_concurrency` entries active; one entry can have both a producer and a
+consumer. Pathname entries in the same mapping copy first. A failed entry does
+not undo entries that already succeeded.
 
 Producers receive a writable binary file object. Returning normally authorizes
 publication; closing the object only ends the bytes. An exception, including
@@ -420,31 +394,27 @@ after `cp` succeeds. syq cannot undo a consumer's own side effects.
 
 `Client` runs callbacks on worker threads. `AsyncClient` accepts the same
 synchronous callbacks, or `async def` callbacks that await `read`, `write`, and
-`close`; async callbacks run on the caller's event loop. Cancellation releases
-blocked payload I/O. Application code that keeps computing without I/O must
-cooperate with cancellation. Do not retain the supplied file object after return.
+`close` on the caller's event loop. Cancellation interrupts blocked reads and
+writes, but code that keeps computing without I/O must check for cancellation
+itself. Do not keep the file object after the callback returns.
 
-`StreamSource.size` promises the exact byte count; a mismatch fails before
-publication. `MappingEntry.size` remains informational. `expected_hash` checks
-the bytes during transfer on every backend; it adds no second download. Without
-an expectation or requested integrity check, no extra whole-stream hash is made.
-`metadata` sets attributes on named destinations without `copy_metadata`. Source
-callbacks have no file metadata to preserve. S3 stores explicit attributes in
-syq's existing object metadata format; omitted attributes use new-file defaults.
+`StreamSource.size` promises the exact byte count, and a mismatch fails before
+publication; `MappingEntry.size` remains informational. `expected_hash` checks
+the bytes as they transfer. `metadata` sets attributes on named destinations
+without `copy_metadata`; source callbacks have no file metadata to preserve.
 
-Skip policies and dry runs do not invoke excluded callbacks. Callbacks always
-transfer when selected; they have no saved content identity for comparison or
-restart recovery. They cannot use `hash`, content comparison, `in_place`, pruning,
-or source-tree ignore rules. Filter entries in your script. Named receiver
-grants authorize paths and do not accept callbacks. Callbacks run locally;
-mixed pathname transfers between SSH hosts require `coordinate_at="local"`.
+Skip policies and dry runs do not invoke excluded callbacks. A selected
+callback always transfers, since there is nothing to compare it with or resume
+from, so callbacks cannot use `hash`, content comparison, `in_place`, pruning,
+or ignore rules; filter entries in your script instead. Copies to or from a
+receiving name do not accept callbacks. Callbacks run locally, so a mapping
+that also copies pathnames between SSH hosts requires `coordinate_at="local"`.
 
 Callback runs emit `MappingStreamResult` events with `entry`, the original
 zero-based entry index, `source` and `destination` (`PathValue`, or `None` for a callback),
 `disposition`, `dry_run`, optional `bytes`, and optional error `message`.
-After a completed run, use failed entry indices to construct an application
-retry. Callbacks are never replayed automatically. Their automation records use
-schema version 5; ordinary pathname and descriptor calls use version 4.
+Use the failed entry indices to build your own retry; callbacks are never
+replayed automatically. These records use automation schema version 5.
 
 <a id="digest-and-hashalgorithm"></a>
 
@@ -456,15 +426,12 @@ regular file. `algorithm` accepts a `HashAlgorithm` value or its string:
 64 digits for BLAKE3 and SHA-256, 32 for MD5 and XXH3-128. The immutable object
 validates the length and characters and stores lowercase hex.
 
-The expectation covers the complete resulting file, including reused bytes.
-A mismatch fails the file rather than reporting a successful copy. Files excluded
-by selection rules are not hash-verified. `hash=True` still controls whether
+The expectation covers the complete resulting file, including reused bytes,
+and a mismatch fails the file. Files that selection rules skip are not checked,
+and dry runs do not check the expectation. `hash=True` still controls whether
 existing contents are compared instead of trusting size and modification time.
-Dry runs preview changes without validating the expectation. An expected
-whole-file hash is independent of the algorithm used for block comparison or
-transport checks. MD5 and XXH3-128 are useful for compatibility
-and accidental-error detection, but do not provide cryptographic collision
-resistance.
+MD5 and XXH3-128 detect accidental errors but do not resist deliberate
+collisions.
 
 ### MappingEntry
 
@@ -484,8 +451,7 @@ of these to `cp(mapping=...)`; use `dataclasses.replace` to change an entry.
 
 `MappingEntry(src, dst, kind=None, size=None, mtime=None, expected_hash=None,
 metadata=None, s3_last_modified=None)` also accepts text or byte paths for
-`src` and `dst` and converts them to `RelativePath`. `size`, `mtime`, and
-`s3_last_modified` do not impose preconditions on the copy. `expected_hash` does: a file
+`src` and `dst` and converts them to `RelativePath`. With `expected_hash`, a file
 cannot succeed unless its contents match. For example, an adapter can supply
 an MD5 from a DVC manifest without changing syq's ordinary comparison algorithm:
 
@@ -498,7 +464,6 @@ client.cp(mapping=[entry], cwd="source", into="download")
 ```
 
 Mapping files encode it as `"expected_hash": {"algorithm": "md5", "value": "..."}`.
-Older syq versions that do not support this field reject the mapping.
 
 ### DestinationMetadata
 
@@ -574,9 +539,7 @@ With `dry_run=True`, mutation totals describe planned changes.
 A failed call reports work completed before it stopped.
 
 Copies have all three deletion fields with `prune=True` or `prune_before=True`;
-otherwise they are `None`. Through a command-restricted receiver, the totals
-of what changed come from the receiver and the others from the coordinating
-server.
+otherwise they are `None`.
 
 ### RmResult
 
@@ -752,9 +715,8 @@ reason: TraceReason
 One copy outcome. `dst` is relative to the destination container. `src` is
 present for mapping entries when available. `bytes` and `attempts` give transfer
 information. Error details are present when known; `message` is display text.
-A command-restricted receiver's own outcomes have no `src`, `attempts`, or
-`retryable`; it reports the changes it refused or that failed there as well as
-those it made.
+Outcomes reported by a restricted receiver have no `src`, `attempts`, or
+`retryable`.
 
 `protocol.type = "operation_result"`. Fields in addition to the common envelope:
 
@@ -870,9 +832,6 @@ values use lowercase, for example `EntryKind.FILE.value == "file"`.
 | `SelectionStatus` | `RESOLVED`, `MISSING` |
 | `RemovalDisposition` | `WOULD_REMOVE`, `REMOVED`, `ALREADY_ABSENT`, `FAILED` |
 
-`Retryability.YES`, `NO`, and `UNKNOWN` state whether a failed entry can be
-retried.
-
 ## Failure model
 
 `SyqError` is the base class for every SDK-defined exception below. Specific
@@ -928,9 +887,9 @@ def copy_data(client: syq.Client, *, timeout: syq.Timeout = syq.CLIENT_DEFAULT):
 and `map`); client constructors and module-level `run` have no client default
 to inherit.
 
-Timeouts cover subprocess execution. Managed installation and mapping-input
-materialization happen before the copy process starts and are not covered by
-its timeout. Async cancellation still stops mapping-input preparation.
+A timeout covers the syq process only, not a managed download or reading a
+mapping iterable before the process starts; async cancellation also stops
+reading the iterable.
 
 For `syq exec`, pass `--cwd` in the argument list to select the receiving
 working directory. The SDK's `cwd=` parameter selects the local working
@@ -960,18 +919,15 @@ file to keep the pairing.
 
 ### Bundled executable
 
-By default, the SDK runs the executable installed with its Python wheel. It
-locates that executable through the package's installation record, without
-searching `PATH`, downloading files, or creating an executable cache. Each
-Python environment has its own installation. Removing the package also removes
-its executable.
+By default, the SDK runs the executable installed with its Python wheel,
+without searching `PATH` or downloading anything. Each Python environment has
+its own copy, and removing the package removes it.
 
 ### Managed executable
 
-For callers using a separate cache, `Client(cache_dir=...)` downloads the matching executable on first use and verifies
-it against the package's embedded release manifest. It checks the cached binary
-before every use and replaces missing or corrupt entries. It does not search
-`PATH`. `syq.managed_executable()` uses the same download and verification checks.
+`Client(cache_dir=...)` instead downloads the matching executable on first use
+and verifies it against the package's embedded release manifest. It checks the
+cached binary before every use and replaces a missing or corrupt one.
 
 The default cache is `$XDG_CACHE_HOME/syq/sdk/python/v<version>/` when
 `XDG_CACHE_HOME` is absolute, or `~/.cache/syq/sdk/python/v<version>/` otherwise.

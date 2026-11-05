@@ -32,7 +32,7 @@ const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope\n";
 #[command(
     name = "syq persist",
     about = "Manage persistent SSH connections, receiving, and return destinations",
-    long_about = "Manage reusable SSH connections, helper sessions, and background receiving. Receiving requires local approval for each copy by default; configure or disable it with syq persist receive. Use syq persist connect HOST to connect without copying files and wait for receiving. With --auth-from PROVIDER, prepare an approved account login without enabling ordinary persistence or receiving. Later commands can request the same account access directly. Durable connections have no idle expiry. The durable setting applies to later syq transfer commands. Explicit scopes isolate connections, receiving profiles, authorization preferences, and permissions. Create one with on --ephemeral and select it with --pscope; persist destinations always lists shared receiving names. Idle SSH connections in ephemeral scopes expire; closing a scope stops its services and removes its settings."
+    long_about = "Manage reusable SSH connections and background receiving. syq persist on keeps connections open for later commands, and syq persist connect HOST connects now. Receiving asks you to approve each copy by default; configure it with syq persist receive. For an isolated setup, see on --ephemeral and --pscope."
 )]
 struct PersistCommand {
     /// Select an isolated persistence domain instead of the default domain
@@ -65,8 +65,8 @@ enum PersistAction {
         /// Use syq on the remote PATH instead of installing a matching helper
         #[arg(long)]
         no_bootstrap: bool,
-        /// Wait this many seconds for receiving after SSH/helper setup
-        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        /// Wait this many seconds for receiving after connecting
+        #[arg(long, value_name = "SECONDS", default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: u64,
     },
     /// Enable persistent connections for later syq commands

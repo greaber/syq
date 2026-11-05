@@ -30,8 +30,8 @@ one:
 - With `--inplace`, a file with other hard links, another owner, or wider
   permissions than the copy gives it ([In-place writes](reference.md#in-place-writes)).
 - When only metadata changed, a file with other hard links or an unexpected
-  owner, and any file on filesystems whose link counts syq does not trust,
-  such as SMB, SSHFS, and some NFS and macOS volumes.
+  owner, and any file where syq can't tell it has no other names, such as on
+  SMB, SSHFS, and some NFS and macOS volumes.
 - Symlinks, named pipes, and devices whose metadata changes.
 
 See [Copy metadata](reference.md#copy-metadata) for the details.

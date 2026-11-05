@@ -11,6 +11,8 @@ pub(crate) fn command_for_help() -> Command {
                 Command::new("list").about("List recent transfers").arg(
                     Arg::new("limit")
                         .long("limit")
+                        .value_name("N")
+                        .help("Show at most N transfers")
                         .default_value("50")
                         .value_parser(clap::value_parser!(u32)),
                 ),
@@ -21,6 +23,8 @@ pub(crate) fn command_for_help() -> Command {
                     .arg(
                         Arg::new("id")
                             .required(true)
+                            .value_name("ID")
+                            .help("Transfer ID shown by tuning-cache list")
                             .value_parser(clap::value_parser!(i64)),
                     )
                     .arg(
@@ -33,7 +37,12 @@ pub(crate) fn command_for_help() -> Command {
             .subcommand(
                 Command::new("export")
                     .about("Export history as NDJSON; omit ID for every transfer")
-                    .arg(Arg::new("id").value_parser(clap::value_parser!(i64))),
+                    .arg(
+                        Arg::new("id")
+                            .value_name("ID")
+                            .help("Transfer ID shown by tuning-cache list; omit to export every transfer")
+                            .value_parser(clap::value_parser!(i64)),
+                    ),
             )
             .subcommand(
                 Command::new("clear").about("Delete recorded history and filesystem startup hints"),

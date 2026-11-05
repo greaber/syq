@@ -99,7 +99,7 @@ pub(crate) struct Flags {
 /// Copy-only headers; removal and listing never create objects.
 #[derive(clap::Args, Debug, Default)]
 pub(crate) struct WriteFlags {
-    /// Add a header before signing S3 requests that create or replace objects: uploads, multipart starts, and copies (repeatable; S3-to-S3 metadata/tag overrides are refused)
+    /// Add a header to S3 requests that create or replace objects (repeatable; S3-to-S3 metadata/tag overrides are refused)
     #[arg(long, value_name = "NAME: VALUE", help_heading = "Object storage")]
     s3_write_header: Vec<Header>,
 }

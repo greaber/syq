@@ -27,8 +27,8 @@ syq tuning-cache <COMMAND>
 
 ## syq tuning-cache list
 
-List recent transfers, newest first. The worker column contains saved counts
-from older records; new transfers show `?`.
+List recent transfers, newest first. The worker column shows `?` for new
+transfers; only older records have a count.
 
 <!-- CLI: tuning-cache list -->
 ```text
@@ -39,7 +39,7 @@ syq tuning-cache list [OPTIONS]
 
 | Argument / option | Meaning |
 |---|---|
-| `--limit <limit>` | [default: 50] |
+| `--limit <N>` | Show at most N transfers<br><br>[default: 50] |
 
 <!-- /CLI -->
 
@@ -50,14 +50,14 @@ stdout to a file and open it in a browser for an interactive timeline.
 
 <!-- CLI: tuning-cache show -->
 ```text
-syq tuning-cache show [OPTIONS] <id>
+syq tuning-cache show [OPTIONS] <ID>
 ```
 
 **Arguments**
 
 | Argument / option | Meaning |
 |---|---|
-| `<id>` | See the command description above. |
+| `<ID>` | Transfer ID shown by tuning-cache list |
 
 **Options**
 
@@ -69,28 +69,26 @@ syq tuning-cache show [OPTIONS] <id>
 
 ## syq tuning-cache export
 
-Export one transfer, or all retained transfers when the ID is omitted, as
-NDJSON. Each transfer record is followed by its event records.
+Each transfer record is followed by its event records.
 
 <!-- CLI: tuning-cache export -->
 ```text
-syq tuning-cache export [id]
+syq tuning-cache export [ID]
 ```
 
 **Arguments**
 
 | Argument / option | Meaning |
 |---|---|
-| `[id]` | See the command description above. |
+| `[ID]` | Transfer ID shown by tuning-cache list; omit to export every transfer |
 
 <!-- /CLI -->
 
 ## syq tuning-cache clear
 
-Delete recorded history and the filesystem startup hints learned from it, so
-later copies choose their starting worker counts afresh. Older syq versions
-kept connection counts in `~/.cache/syq/tuning.json`; current versions do not
-use that file, so `clear` leaves it alone and you can delete it yourself.
+Delete recorded history and the startup hints learned from it, so later
+copies choose their starting worker counts afresh. `clear` leaves alone
+`~/.cache/syq/tuning.json`, which older versions used; you can delete it.
 
 <!-- CLI: tuning-cache clear -->
 ```text

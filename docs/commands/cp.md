@@ -29,16 +29,16 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--from <ENDPOINT>` | Source endpoint ([USER@]HOST[:PORT] or s3://BUCKET); omitted means local |
 | `-C, --cwd <DIR>` | Resolve relative source selectors from DIR |
 | `--root <DIR>` | Resolve source selectors beneath DIR and refuse any escape |
-| `--src <PATH>` | Select a named source object; attach =PATH when it begins with `-` (repeatable) |
-| `--srcs-in <DIR>` | Select a directory's contents; attach =DIR when it begins with `-` (repeatable) |
-| `--src-non-dir <PATH>` | Select a named non-directory source object; attach =PATH when it begins with `-` (repeatable) |
-| `--src-dir <DIR>` | Select a named source directory; attach =DIR when it begins with `-` (repeatable) |
+| `--src <PATH>` | Select a named source object (repeatable) |
+| `--srcs-in <DIR>` | Select a directory's contents (repeatable) |
+| `--src-non-dir <PATH>` | Select a named non-directory source object (repeatable) |
+| `--src-dir <DIR>` | Select a named source directory (repeatable) |
 | `--src-non-dirs <PATH>...` | Select several named non-directory source objects |
 | `--src-dirs <DIR>...` | Select several named source directories |
 | `--srcs <PATH>...` | Select several named source objects |
-| `--where <EXPR>` | Select non-directory source entries with a typed expression; directories follow normal copy rules |
-| `--ignore <PATTERN>` | Skip directory-relative paths or explicit source basenames using a gitignore-style pattern (repeatable) |
-| `--ignore-from <FILE>` | Securely open and read gitignore-style patterns from raw-byte FILE (repeatable; stacks in command-line order) |
+| `--where <EXPR>` | Select non-directory entries with an expression; directories are not filtered |
+| `--ignore <PATTERN>` | Skip paths matching a gitignore-style pattern (repeatable) |
+| `--ignore-from <FILE>` | Read gitignore-style patterns from FILE (repeatable; applied in command-line order with --ignore) |
 | `[PATH]...` | Named source objects (shorthand for --src) |
 
 <a id="destination-placement"></a>
@@ -55,7 +55,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--as <PATH>` | Map one named source exactly to PATH; never follow its final entry |
 | `--as-new <PATH>` | Map one named source exactly to PATH; its final entry must not exist and is never followed |
 | `--as-existing <PATH>` | Map one named source exactly to PATH; its final entry must exist and is never followed |
-| `--mapping <FILE>` | Copy the entries of a local NDJSON mapping manifest (`-` reads stdin), acquired before destination changes, instead of selecting sources; entry src paths are relative to -C and dst paths are relative to the --into container. Filter the mapping entries themselves instead of combining this with --ignore or --ignore-from |
+| `--mapping <FILE>` | Copy the entries of a local NDJSON mapping file (`-` reads stdin) instead of selecting sources; src paths are relative to -C and dst paths to the --into directory. Cannot be combined with --ignore or --ignore-from |
 
 <a id="copy-policy-and-filtering"></a>
 
@@ -63,11 +63,11 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 
 | Argument / option | Meaning |
 |---|---|
-| `--if-exists <POLICY>` | How to handle existing destination files; directories remain containers<br><br>Possible values:<br>- error-if-different: Reject detected content differences; trusts matching size and mtime unless --hash is set<br>- error: Report an error for every existing destination leaf<br>- keep: Leave existing entries and their metadata alone<br>- update: Update contents when they differ and apply requested metadata<br>- update-if-older: Keep newer destinations; otherwise update differing contents<br><br>[default: update] |
+| `--if-exists <POLICY>` | How to handle existing destination files<br><br>Possible values:<br>- error-if-different: Reject detected content differences; trusts matching size and mtime unless --hash is set<br>- error: Report an error for every existing destination file<br>- keep: Leave existing entries and their metadata alone<br>- update: Update contents when they differ and apply requested metadata<br>- update-if-older: Keep newer destinations; otherwise update differing contents<br><br>[default: update] |
 | `--copy-if <EXPR>` | Update only entries satisfying a source/destination expression |
-| `--in-place <MODE>` | Write files directly at their final names, with no staging file; interruption can leave them incomplete<br><br>Possible values:<br>- new: Only files the copy creates; an existing file is still replaced through a staging file<br>- update: Also existing files syq can vouch for, writing only what changed; others are replaced. Anyone who has such a file open can read its new contents, and an interruption leaves it partly updated |
-| `--prune` | After copying, remove target-only objects in mapped directory scopes; ignored source paths remain protected |
-| `--prune-before` | Remove target-only objects before copying to free space. Implies --prune; later copy failures do not restore removed objects |
+| `--in-place <MODE>` | Write files directly at their final names, with no staging file; interruption can leave them incomplete<br><br>Possible values:<br>- new: Only files the copy creates; an existing file is still replaced through a staging file<br>- update: Also existing files that syq can update where they are, writing only what changed; others are replaced. Anyone who has such a file open can read its new contents, and an interruption leaves it partly updated |
+| `--prune` | After copying, remove destination entries the source does not have, within the copied directories; ignored paths are kept |
+| `--prune-before` | Like --prune, but remove the extra entries before copying to free space; a later copy failure does not restore them |
 | `--max-delete <N>` | With --prune or --prune-before, refuse all removals if more than N are planned |
 
 ## Metadata and symlinks
@@ -77,7 +77,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--follow` | Follow symlinks in all directly supplied filesystem paths |
 | `--follow-src` | Follow symlinks in directly supplied source paths |
 | `--follow-dst` | Follow symlinks in directly supplied destination paths |
-| `--copy-metadata <FEATURE>` | Match selected source metadata, including on unchanged files (repeatable/comma-separated)<br><br>Possible values:<br>- mtime: Match source modification times, including on unchanged files<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files<br>- hardlinks: Preserve hard links between selected regular files<br>- acls: Preserve native Linux or macOS ACLs and permission bits<br>- xattrs: Preserve Linux or macOS extended attributes<br>- atimes: Preserve access times captured before reading<br>- crtimes: Preserve birth times; requires a macOS destination<br>- content-type: Match Content-Type on S3-to-S3 copies<br>- content-encoding: Match Content-Encoding on S3-to-S3 copies<br>- content-language: Match Content-Language on S3-to-S3 copies<br>- content-disposition: Match Content-Disposition on S3-to-S3 copies<br>- cache-control: Match Cache-Control on S3-to-S3 copies<br>- expires: Match Expires on S3-to-S3 copies<br>- website-redirect: Match the website redirect on S3-to-S3 copies<br>- user-metadata: Match application user metadata on S3-to-S3 copies (excluding syq-* keys)<br>- tags: Match the complete tag set on S3-to-S3 copies<br>- storage-class: Use the source storage class on S3-to-S3 copies |
+| `--copy-metadata <FEATURE>` | Match selected source metadata, including on unchanged files (repeatable/comma-separated)<br><br>Possible values:<br>- mtime: Match source modification times<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files<br>- hardlinks: Preserve hard links between selected regular files<br>- acls: Preserve native Linux or macOS ACLs and permission bits<br>- xattrs: Preserve Linux or macOS extended attributes<br>- atimes: Preserve access times captured before reading<br>- crtimes: Preserve birth times; requires a macOS destination<br>- content-type: Content-Type (S3-to-S3 only)<br>- content-encoding: Content-Encoding (S3-to-S3 only)<br>- content-language: Content-Language (S3-to-S3 only)<br>- content-disposition: Content-Disposition (S3-to-S3 only)<br>- cache-control: Cache-Control (S3-to-S3 only)<br>- expires: Expires (S3-to-S3 only)<br>- website-redirect: Website redirect (S3-to-S3 only)<br>- user-metadata: User metadata, except syq-* keys (S3-to-S3 only)<br>- tags: The complete tag set (S3-to-S3 only)<br>- storage-class: Storage class (S3-to-S3 only) |
 | `--widen-dirs <MODE>` | Which directories you own may briefly get the owner permission the copy needs; each is restored afterwards<br><br>Possible values:<br>- none: Never change directory permissions<br>- rsync: Directories the copy includes, as rsync does, but not the directory it copies into<br>- all: Also the directory the copy goes into and the directories above it<br><br>[default: none] |
 | `--open-noatime` | Request reads without access-time updates; warn and continue if unavailable |
 | `--sparse` | Turn written zero ranges into sparse holes |
@@ -89,7 +89,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | Argument / option | Meaning |
 |---|---|
 | `--hash` | Hash existing source and destination files instead of trusting size and modification time |
-| `--hash-or-copy` | Like --hash, but compare only files the transfer strategy would compare (by default, every file with a remote syq endpoint) and copy the rest, so identical files may be rewritten |
+| `--hash-or-copy` | Like --hash, but compare only where the transfer strategy reuses blocks (by default, with a remote syq endpoint) and copy other files whole, even if identical |
 | `--integrity-checking <KEY=VALUE,...>` | [Payload checks](../integrity-checking.md) |
 
 <a id="ssh-and-transport"></a>
@@ -101,19 +101,19 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | Argument / option | Meaning |
 |---|---|
 | `--no-compress` | Disable transport compression |
-| `--receiver-max-entries <N>` | Command-restricted receiver ceiling: refuse to touch more than N destination entries |
-| `--receiver-max-bytes <SIZE>` | Command-restricted receiver ceiling: refuse to write more than SIZE bytes of file data in total |
-| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Override SYQ_AUTH_FROM and saved authorization: try native SSH (auto), require native SSH (ssh), or authorize through @NAME or an SSH host (@NAME also supports S3 copies). Eligible native copies can request laptop authorization after SSH failure |
-| `--coordinate-at <COORDINATE_AT>` | Choose the endpoint that runs the coordinator<br><br>Possible values:<br>- auto: Run locally unless both endpoints are remote, then run at the source<br>- src: Run the coordinator at the source endpoint<br>- dst: Run the coordinator at the destination endpoint<br>- local: Keep the coordinator on the invoking machine and relay the data there<br><br>[default: auto] |
-| `--rsh <COMMAND>` | Remote shell command (default: ssh); the command owns SSH and agent policy when set. An ssh command keeps shared and persistent connections unless its options configure connection sharing; -v shares them only within the run |
+| `--receiver-max-entries <N>` | Refuse a restricted copy that would touch more than N destination entries |
+| `--receiver-max-bytes <SIZE>` | Refuse a restricted copy that would write more than SIZE bytes of file data |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | How to authorize, overriding SYQ_AUTH_FROM and the saved choice: auto tries native SSH and may then ask a receiving machine, ssh uses only native SSH, and @NAME or HOST asks that receiving machine or SSH provider (@NAME also authorizes S3 copies) |
+| `--coordinate-at <WHERE>` | Choose which machine runs the copy<br><br>Possible values:<br>- auto: This machine, unless both endpoints are remote; then the source<br>- src: The source endpoint<br>- dst: The destination endpoint<br>- local: This machine, relaying the data through it<br><br>[default: auto] |
+| `--rsh <COMMAND>` | Remote shell command (default: ssh); when set, it controls SSH options and agent forwarding |
 | `--syq-path <PATH>` | Use this remote syq executable instead of installing a helper |
 | `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |
-| `--no-tcp-encryption` | Send TCP data without encryption or authentication (trusted networks only); checks payloads with xxh3-128 unless --integrity-checking sets transfer |
+| `--no-tcp-encryption` | Send TCP data without encryption or authentication; use only on trusted networks |
 | `--no-tcp` | Send file data through SSH rather than separate TCP data connections |
 | `--tcp-ports <LO-HI>` | Port range remote listeners use for TCP data connections<br><br>[default: 47600-47699] |
 | `--tcp-congestion <ALGO>` | Use this congestion-control algorithm for TCP data sockets (Linux only) |
-| `--detach` | Run at the remote coordinator and return after launch; requires --peer-auth own-credentials or --rsh |
-| `--peer-auth <MODE>` | How the coordinator authenticates to the peer (see the values below); --rsh takes over this policy entirely<br><br>Possible values:<br>- restricted: The peer's enrolled command-restricted receiver, entered with its entry key; forwards no agent<br>- broker: Constrained agent broker only; the peer runs no command-restricted receiver<br>- own-credentials: Forward nothing; the coordinator must hold its own credentials for the peer<br>- full-agent: Expose the complete local SSH agent to the coordinator, as `ssh -A` would<br><br>[default: restricted] |
+| `--detach` | Return as soon as the copy starts on the server that runs it; requires --peer-auth own-credentials or --rsh |
+| `--peer-auth <MODE>` | How the server running the copy logs in to the other server; --rsh takes over this choice<br><br>Possible values:<br>- restricted: Reach the other server only through its enrolled restricted receiver; forwards no agent<br>- broker: Let it use your agent for that host and user, with full access to that account<br>- own-credentials: Forward nothing; it must have its own credentials for the other server<br>- full-agent: Forward your whole SSH agent, as ssh -A does<br><br>[default: restricted] |
 | `--pscope <PATH>` | Use an isolated persistence domain created by `syq persist on --ephemeral` |
 
 ## S3 connection settings
@@ -125,7 +125,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--s3-profile <NAME>` | AWS shared configuration/credentials profile |
 | `--s3-header <NAME: VALUE>` | Add a header before signing every S3 request (repeatable; S3-to-S3 metadata/tag overrides are refused) |
 | `--s3-retries <N>` | Retry each S3 request up to N times after a transient failure or throttling, 0..100 (default 10; 0 disables retries) |
-| `--s3-write-header <NAME: VALUE>` | Add a header before signing S3 requests that create or replace objects: uploads, multipart starts, and copies (repeatable; S3-to-S3 metadata/tag overrides are refused) |
+| `--s3-write-header <NAME: VALUE>` | Add a header to S3 requests that create or replace objects (repeatable; S3-to-S3 metadata/tag overrides are refused) |
 
 <a id="performance-tuning"></a>
 
@@ -136,7 +136,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | Argument / option | Meaning |
 |---|---|
 | `--performance-tuning <KEY=VALUE,...>` | [Workers, request sizes, and copy methods](../tuning.md) |
-| `--transfer-strategy <STRATEGY>` | Choose how filesystem copies transfer file contents: whole-file copies selected files without reusing blocks from the final destination; aligned-block reuses matching blocks at the same offsets in the corresponding destination file. locality (the default) uses whole-file for local copies, including mounted network filesystems, and aligned-block when a syq endpoint is remote. Size/time skips, explicit content checks, and partial-file resume apply to all strategies.<br><br>Possible values:<br>- whole-file: Copy selected files without comparing blocks in the final destination<br>- aligned-block: Reuse matching blocks at the same offsets in the corresponding destination file<br>- locality: Use whole-file locally and aligned-block with a remote syq endpoint |
+| `--transfer-strategy <STRATEGY>` | Choose whether filesystem copies reuse matching blocks of the destination file they replace (default: locality; mounted network filesystems count as local).<br><br>Possible values:<br>- whole-file: Copy selected files without comparing blocks in the final destination<br>- aligned-block: Reuse matching blocks at the same offsets in the corresponding destination file<br>- locality: Use whole-file locally and aligned-block with a remote syq endpoint |
 | `--resource-limits <KEY=VALUE,...>` | [Bandwidth and concurrency ceilings](../resource-limits.md) |
 
 <a id="progress-and-results"></a>
@@ -149,12 +149,12 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 |---|---|
 | `--results <FILE>` | Write the machine-readable NDJSON result stream to FILE (created fresh; an existing file is refused) |
 | `--results-fd <FD>` | Write the result stream to an inherited file descriptor the caller opened (e.g. `--results-fd 3 3>run.ndjson`); must be above 2 |
-| `-n, --dry-run` | Preview without changing copy/removal data; remote setup may still install the helper or syq; requested results files are still written |
-| `-v, --verbose...` | List files with -v; explain helpers and transport with -vv |
+| `-n, --dry-run` | Preview without changing files; remote setup may still install syq, and requested results files are still written |
+| `-v, --verbose...` | List files with -v; show connection details with -vv |
 | `-q, --quiet` | Suppress non-error messages |
 | `--progress` | Show progress even when stderr is not a terminal |
 | `--no-progress` | Never show the human progress display |
-| `--stats` | Print transfer statistics, worker waits, endpoint operations and CPU at the end |
+| `--stats` | Print transfer statistics at the end |
 
 ## Help and version
 
@@ -166,205 +166,139 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 
 <!-- /CLI -->
 
+<a id="copying-and-failures"></a>
+
+<a id="capacity-checks"></a>
+
 ## Update policies
 
 `--if-exists` chooses what happens to existing destination files; see
 [existing-file policies](../reference.md#choose-which-existing-files-to-update)
-for each value. When the timestamps are equal, `update-if-older` compares the
-files as `update` does. Policies that compare files trust matching size and
-modification time unless you add `--hash`.
+for each value. A retry after a failure is subject to the same placement and
+policy, so a `-new` placement or `--if-exists=error` can reject entries the
+failed attempt created; see
+[resuming a copy](../reference.md#resume-an-interrupted-copy).
 
-`--into-existing` requires the destination directory to exist but allows new
-files inside it. `--if-exists=keep` can add children to an existing directory; it
-makes a read-only one writable only as
-[`--widen-dirs`](../reference.md#copy-metadata) allows.
-
-`--if-exists=keep` and `update-if-older` cannot combine with `--in-place`:
-an interrupted copy could leave an incomplete file that a retry skips. The
-default `update` policy repairs that file on a retry. With `--in-place`, a
-file that must be new (an `--as-new` file, or a new file under
-`--if-exists=error` or `error-if-different`) is still written under a temporary
-name, so an interrupted copy leaves no incomplete file at its name, and a retry
-resumes it. Syq renames it into place only while the name is still free: a
-file that appears there first is kept, and that file's copy fails. A few
-filesystems cannot make this check exact; see
-[existing-file policies](../reference.md#choose-which-existing-files-to-update).
-S3 destinations do not support `--in-place`. See
+`--in-place` cannot be combined with `--if-exists=keep` or `update-if-older`:
+an interrupted copy could leave an incomplete file that a retry would then skip.
+With `--in-place`, a file that must be new (an `--as-new` file, or a new file
+under `--if-exists=error` or `error-if-different`) is still written under a
+temporary name, so an interruption never leaves an incomplete file there. S3
+destinations do not support `--in-place`. See
 [In-place writes](../reference.md#in-place-writes) for which existing files
 `--in-place=update` writes into.
 
-These policies do not disable requested pruning. Descriptor-specific
-restrictions are listed under [file descriptors](#file-descriptors).
-
 ## Pruning
 
-`--prune` deletes only within the copied directories, after copying succeeds.
-Use `--prune-before` instead when you need to free disk space first. It waits
-for source selection to finish, then removes extras before copying. A later
-copy failure does not restore those removals. Both modes honor `--max-delete`
-and skip deletions if scanning reports errors.
+Pruning keeps ignored paths, syq partial files, and
+[recovery entries](clean-partials.md#which-files-are-removed). An interruption
+during deletion can leave some extras already removed.
 
-Ignored paths, syq partial files, and
-[recovery entries](clean-partials.md#which-files-are-removed) are kept. This
-also keeps their parent directories; extra hard links to copied files may be
-kept too. An interruption during deletion can leave some extras
-already removed.
-
-Keep the source outside the destination. Syq detects overlap locally and for
-remote paths using the same host name, user, and port. Different SSH aliases
-or shared storage can hide overlap from this check. Wait for other copies
-into the destination to finish before pruning, so their new files are not
-deleted as extras.
+Keep the source outside the destination. Syq detects overlap for local paths
+and for remote paths with the same host name, user, and port, but different SSH
+aliases or shared storage can hide it. Wait for other copies into the
+destination to finish before pruning, so their new files are not deleted as
+extras.
 
 ## Filename and type conflicts
 
-If the source has both `Report.txt` and `report.txt`, a case-insensitive
-destination cannot store both. Syq does not check for that before copying,
-and a later file can replace the earlier one or, with a protective existing-file
-policy, report a conflict. The same problem applies to distinct
-Unicode spellings that the destination treats as one name. Rename the source
-entries or use a destination that can distinguish them. Unsupported names
-are reported as copy errors.
+A case-insensitive destination cannot store both `Report.txt` and `report.txt`,
+and the same goes for different Unicode spellings that the destination treats
+as one name. Syq does not check for this before copying: the later file can
+replace the earlier one or, under a protective `--if-exists` policy, be
+reported as a conflict. Rename the source entries or use a destination that can
+tell them apart.
 
-Syq refuses replacements between directories and non-directories, including
-empty directories. Move or remove the conflicting destination before retrying.
-Other replacements can fail if the filesystem lacks the operation needed to
-replace an entry safely; the old entry is kept.
-
-<a id="capacity-checks"></a>
-
-## Copying and failures
-
-Syq can copy files while it scans the source. If scanning or copying fails,
-completed files remain and the command reports failure. A retry can reuse
-completed files and recoverable partials. Placement conditions and the selected
-existing-file policy still apply: a `-new` placement or `--if-exists=error` can
-reject entries created by the earlier attempt. See
-[resuming a copy](../reference.md#resume-an-interrupted-copy).
+Syq refuses to replace a directory with a non-directory or the reverse, even an
+empty directory. Move or remove the conflicting destination entry before
+retrying.
 
 ## Metadata details
 
-Source setuid, setgid, and sticky bits are not copied without
-`--copy-metadata=permissions`. Ownership uses numeric IDs. On macOS,
-[`--widen-dirs`](../reference.md#copy-metadata) can add missing write or search
-permission to an existing destination directory only when that directory is
+Without `--copy-metadata=permissions`, setuid, setgid, and sticky bits are not
+copied. Ownership is copied as numeric user and group IDs. On macOS,
+`--widen-dirs` can widen an existing destination directory only if it is
 readable.
-
-Creating or updating named file contents sets the source modification time.
-Unchanged contents require `--copy-metadata=mtime` to update their timestamp. Output
-descriptors require explicit `--copy-metadata=mtime`; see below.
 
 ## File descriptors
 
-`--src-fd 0` reads stdin; `--as-fd 1` writes stdout. Use them to connect local,
-SSH, or S3 copies to other programs; see
+`--src-fd 0` reads stdin and `--as-fd 1` writes stdout, so you can connect
+local, SSH, or S3 copies to other programs; see
 [Shell pipelines and file descriptors](../reference.md#shell-pipelines-and-file-descriptors).
-Bash process substitution also works with ordinary source syntax:
+Bash process substitution also works as an ordinary source:
 
 ```sh
 syq cp --src <(gzip -c data) --to server --as data.gz
 ```
 
-Paths such as `/dev/fd/63` refer to descriptors in the local syq process.
-
 Each stream copy takes one source. Stdin and process substitution have no
-filename, so use `--as` to choose one, or `--as-fd` to write to a descriptor.
-A named pipe can use `--into`: `syq cp incoming.fifo --into saved` waits for a
-writer, then saves its bytes as the regular file `saved/incoming.fifo`.
-A symlink to a pipe requires `--follow-src`. Selecting a pipe alongside other
-sources, including through a shell glob, is an error. Directory copies never
-read pipes; `--copy-metadata=specials` copies the pipe itself.
+filename, so use `--as` to name the destination, or `--as-fd` to write to a
+descriptor. A named pipe can use `--into`: `syq cp incoming.fifo --into saved`
+waits for a writer, then saves its bytes as the regular file
+`saved/incoming.fifo`. A symlink to a pipe requires `--follow-src`. Directory
+copies never read pipes; `--copy-metadata=specials` copies the pipe itself.
+
+Other inherited descriptors work too, except 2, which is reserved for
+diagnostics. Syq advances the descriptor's offset and respects append mode; it
+does not truncate it. A literal `-` is a filename.
 
 ### Completion and failures
 
-A named destination is replaced only after the transfer succeeds. The `-new`
-and `-existing` placement conditions apply as usual, before a named pipe is
-opened. S3 `-new` placements and `--if-exists=keep` also refuse replacement
-if an object appears during the upload.
+A named destination is replaced only after the transfer succeeds. End of input
+does not tell syq whether the producer succeeded, so a failed producer can still
+leave a saved file. Use Bash's `set -o pipefail` or check a process
+substitution's status separately; in Python,
+[managed streams](https://greaber.github.io/syq/python-streams.html#byte-streams)
+commit only after your producer succeeds.
 
-If the producer fails halfway through, syq can still successfully save the
-bytes it received: EOF does not tell it whether the producer succeeded.
-Bash's `set -o pipefail` detects failures in a pipeline but cannot undo a file
-already saved. Process substitution needs a separate check of the producer's
-status. In Python, [managed streams](https://greaber.github.io/syq/python-streams.html#byte-streams) let you commit
-only after your producer succeeds.
+An output descriptor may contain incomplete data after a failure, so check
+syq's exit status before using it. A consumer that closes early makes syq fail.
+A killed copy can leave a `.syq-stream-*` temporary file beside the
+destination, which `syq clean-partials` does not remove; delete it once no copy
+is writing there.
 
-An output descriptor may contain incomplete data after a failure. Check syq's
-exit status before using the result. A consumer closing early makes syq fail.
-Forced termination can leave a `.syq-stream-*` temporary file beside the
-destination; `syq clean-partials` does not remove it, so delete it yourself
-once no copy is writing there.
-
-### Options and file behavior
-
-Progress, `--stats`, and `-v` go to stderr, leaving stdout for payload.
-Statistics report bytes, elapsed time, and average rate; pipe lengths are
-unknown until EOF. Use `--resource-limits bandwidth=RATE` to limit throughput.
+<a id="options-and-file-behavior"></a>
 
 <a id="selection-and-previews"></a>
 
-`--if-exists=keep` skips a destination that exists, including a directory, an
-S3 key prefix, or a dangling symlink. Skips succeed without reading input or
-opening a named FIFO. A shell producer can therefore receive SIGPIPE; in Python, check the writer's
-`skipped` property before producing bytes. An output FD already exists, so
-`--if-exists=keep --as-fd N` always skips after validating the source.
+### Skips and previews
 
-Use `--dry-run` to check source and destination placement without reading input,
-opening a named pipe, or changing the destination. It cannot check a payload
-hash or predict the length of a pipe. `--results` and `--results-fd` report
-[`stream_result`](../automation.md#stream_result) records separately from payload;
-results and payload/completion descriptors must differ.
+Progress, `--stats`, and `-v` go to stderr, leaving stdout for the payload.
+
+`--if-exists=keep` skips a destination that already exists without reading
+input or opening a named pipe, so a shell producer can receive SIGPIPE; in
+Python, check the writer's `skipped` property first. An output descriptor
+always exists, so `--if-exists=keep --as-fd N` always skips.
+
+`--dry-run` checks source and destination placement without reading input or
+changing the destination; it cannot check a payload hash or predict the length
+of a pipe. `--results` and `--results-fd` report
+[`stream_result`](../automation.md#stream_result) records, and must use a
+different descriptor from the payload.
 
 ### Transport and limits
 
-Filesystem streams use parallel data workers over SSH or encrypted TCP, with
-automatic worker tuning as in regular-file copies. They accept `workers`,
-`request-size`, `pipeline-depth`, and `bw-pacing` tuning; `workers=N` fixes the
-worker count, and `--no-tcp` keeps data on SSH. An authorization provider can
-request or reuse [account access](../persistence-reference.md#approved-account-connections);
-streams do not request per-copy SSH approval. S3 transfers one object using
-multipart controls; see [Descriptor copies](../object-storage.md#descriptor-copies).
+Filesystem streams accept only the `workers`, `request-size`, `pipeline-depth`,
+and `bw-pacing` performance-tuning keys. For S3 streams, see [Descriptor copies](../object-storage.md#descriptor-copies).
 
-Named receiving destinations and restart recovery are unsupported. Options
-written for file trees, such as `--hash`, `--in-place`, `--prune`, `--where`,
-`--ignore`, `--transfer-strategy`, and `--detach`, are refused rather than
-ignored.
-`--if-exists=error` rejects an existing named destination before reading input
-when syq can inspect it. If an object-storage provider denies or fails that
-inspection, syq sends the stream using conditional creation, which still refuses
-replacement. `--if-exists=error-if-different` compares an existing named destination
-with the received stream before accepting it; a dry run cannot perform that comparison.
-Output descriptors are already opened by the caller and receive bytes directly,
-so `--if-exists` does not apply to them, except that `keep` always skips and
-`update-if-older` is refused.
+Streams cannot go to receiving names, and an interrupted stream starts over.
+Options for file trees, such as `--hash`, `--in-place`, `--prune`, `--where`,
+`--ignore`, `--transfer-strategy`, and `--detach`, are refused. `--root` cannot
+be combined with `--src-fd`.
 
-### Descriptor offsets and metadata
+`--if-exists` does not apply to output descriptors, except that `keep` always
+skips and `update-if-older` is refused.
 
-Other inherited descriptors work too, except 2, which is reserved for
-diagnostics. Dedicate each descriptor to the copy. Syq advances its offset,
-respects append mode, and leaves its blocking mode alone;
-it does not truncate it. A literal `-` is a filename.
+<a id="descriptor-offsets-and-metadata"></a>
 
-When a regular file is copied to a named destination, syq preserves its
-modification time. New named files use the source permissions limited by the
-destination umask, or by the directory's default ACL if it has one; existing
-files keep their permissions. S3 uploads store file
-attributes in object metadata.
+### Descriptor metadata
 
-Output descriptors use the timestamps from normal writes, including when
-appending to an existing file. Add `--copy-metadata=mtime` to copy the source
-modification time instead; this changes the whole destination file's timestamp
-even for a partial write. `--copy-metadata=permissions,ownership` copies those
-attributes without changing timestamps. S3 downloads interpret object metadata
-when attributes are requested; time preservation uses S3's modification time if
-no syq attributes are stored.
+Output descriptors get the timestamps of ordinary writes. Add
+`--copy-metadata=mtime` to set the source modification time instead, which
+changes the whole destination file's timestamp even after a partial write;
+`--copy-metadata=permissions,ownership` copies those attributes.
 
-Input pipes, sockets, and devices have no payload metadata, so they reject
-`--copy-metadata` and `--if-exists=update-if-older`. Their new named
-destinations use `0666` limited by the umask, or by the directory's default ACL
-if it has one, and the time of the write; existing files keep their permissions.
-Output pipes likewise cannot preserve times, permissions, or ownership. Parent
-directories are created as needed. The source `--cwd` / `--root` options
-apply to pathname sources. `--root` with `--src-fd` is rejected because it cannot
-confine a descriptor that is already open. Symlink handling is unchanged; see [Symlinks](../reference.md#symlinks). Named remote
-sources must be regular files.
+Pipes, sockets, and devices have no metadata to copy, so they reject
+`--copy-metadata` and `--if-exists=update-if-older`, and their new named
+destinations get mode `0666` limited by the umask or the directory's default
+ACL. Named remote sources must be regular files.

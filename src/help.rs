@@ -227,8 +227,8 @@ pub(crate) fn filesystem(command: Command) -> Command {
                 }
                 "include" if map => "Output fields",
                 "s3_endpoint" | "s3_region" | "s3_profile" | "s3_header" | "s3_write_header"
-                | "s3_retries"
-                    if map =>
+                | "s3_retries" | "s3_all_versions" | "s3_version_id"
+                    if map || rm =>
                 {
                     "Object storage"
                 }
@@ -269,8 +269,15 @@ pub(crate) fn filesystem(command: Command) -> Command {
             arg = arg.help("Use this exact syq executable on the remote removal endpoint");
         } else if rm && id == "verbose" {
             arg = arg.help("List removed paths");
+        } else if rm && id == "performance_tuning" {
+            // Removal accepts only its own concurrency key, never the copy keys.
+            arg = arg.long_help(if clean {
+                "Fix the number of filesystem removal workers, which syq otherwise adjusts as it runs: workers=N, 1..65536. Leave it unset unless you are investigating a performance problem."
+            } else {
+                "Fix removal concurrency, which syq otherwise adjusts as it runs. Keys:\n\nworkers=N: filesystem removal workers, 1..65536.\ns3-requests=N: simultaneous S3 delete requests, 1..65536.\n\nLeave it unset unless you are investigating a performance problem."
+            });
         } else if id == "verbose" && !map {
-            arg = arg.help("List files with -v; explain helpers and transport with -vv");
+            arg = arg.help("List files with -v; show connection details with -vv");
         }
         arg
     });
@@ -328,14 +335,14 @@ fn copy_heading(id: &str) -> (&'static str, usize) {
 
 pub(crate) fn root() -> Command {
     configure(Command::new("syq")
-        .about("Copy files and directories locally or over SSH")
+        .about("Copy files and directories locally, over SSH, or with S3")
         .override_usage("syq [--version-is EXPR] [--use-version VERSION] <COMMAND> [OPTIONS]\n       syq --self-update")
         .before_help("Examples:\n  syq cp photos --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq map photos --as archive/photos")
         .arg(Arg::new("version").short('V').long("version").action(ArgAction::Version).help("Print version"))
         .version(crate::identity::version())
         .arg(Arg::new("version_is").long("version-is").value_name("EXPR")
             .help("Require the invoked release to match EXPR (before the command and other options)")
-            .long_help("Require the invoked release to match EXPR before running anything or selecting --use-version. Bare x.y.z means exact equality; operators: == != < <= > >=. Commas mean AND; | means OR, with AND binding more tightly. Quote expressions in the shell. Development builds are unsupported. Put --version-is and --use-version before the command and other options, in either order."))
+            .long_help("Require the invoked release to match EXPR before running anything. Bare x.y.z means exact equality; operators: == != < <= > >=. Commas mean AND; | means OR, with AND binding more tightly. Quote expressions in the shell. Development builds are unsupported. Put --version-is and --use-version before the command, in either order."))
         .arg(Arg::new("use_version").long("use-version").value_name("VERSION")
             .help("Run an exact official release, downloading it if needed (before the command and other options)"))
         .arg(Arg::new("self_update").long("self-update").action(ArgAction::SetTrue)

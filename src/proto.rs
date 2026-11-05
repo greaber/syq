@@ -1976,7 +1976,7 @@ impl ReplaceReason {
         match self {
             Self::NotRegular => "that were not regular files",
             Self::OtherNames => "with other hard links",
-            Self::UntrustedFilesystem => "on filesystems whose link counts syq does not trust",
+            Self::UntrustedFilesystem => "where syq can't tell they have no other names",
             Self::Owner => "with another owner or group",
             Self::Privileges => "with set-ID bits or privileged attributes",
             Self::WiderPermissions => "with wider permissions",

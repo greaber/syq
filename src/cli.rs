@@ -62,7 +62,7 @@ impl TransferStrategy {
     }
 }
 
-const TRANSFER_STRATEGY_HELP: &str = "Choose how filesystem copies transfer file contents: whole-file copies selected files without reusing blocks from the final destination; aligned-block reuses matching blocks at the same offsets in the corresponding destination file. locality (the default) uses whole-file for local copies, including mounted network filesystems, and aligned-block when a syq endpoint is remote. Size/time skips, explicit content checks, and partial-file resume apply to all strategies.";
+const TRANSFER_STRATEGY_HELP: &str = "Choose whether filesystem copies reuse matching blocks of the destination file they replace (default: locality; mounted network filesystems count as local).";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Existence {
@@ -93,7 +93,7 @@ pub enum SourceSelection {
 pub enum IfExists {
     /// Reject detected content differences; trusts matching size and mtime unless --hash is set.
     ErrorIfDifferent,
-    /// Report an error for every existing destination leaf.
+    /// Report an error for every existing destination file.
     Error,
     /// Leave existing entries and their metadata alone.
     Keep,
@@ -109,7 +109,7 @@ pub enum IfExists {
 pub enum InPlace {
     /// Only files the copy creates; an existing file is still replaced through a staging file
     New,
-    /// Also existing files syq can vouch for, writing only what changed; others are replaced. Anyone who has such a file open can read its new contents, and an interruption leaves it partly updated
+    /// Also existing files that syq can update where they are, writing only what changed; others are replaced. Anyone who has such a file open can read its new contents, and an interruption leaves it partly updated
     Update,
 }
 
@@ -154,14 +154,14 @@ pub const NATIVE_WIDEN_DIRS: WidenDirs = WidenDirs::None;
 /// Endpoint that owns the transfer coordinator for a native copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum CoordinateAt {
-    /// Run locally unless both endpoints are remote, then run at the source.
+    /// This machine, unless both endpoints are remote; then the source.
     #[default]
     Auto,
-    /// Run the coordinator at the source endpoint.
+    /// The source endpoint.
     Src,
-    /// Run the coordinator at the destination endpoint.
+    /// The destination endpoint.
     Dst,
-    /// Keep the coordinator on the invoking machine and relay the data there.
+    /// This machine, relaying the data through it.
     Local,
 }
 
@@ -351,7 +351,7 @@ pub struct Args {
     /// Preserve native Linux or macOS ACLs; implies permissions
     #[arg(short = 'A', long)]
     pub acls: bool,
-    /// Preserve extended attributes in the selected privilege namespaces
+    /// Preserve extended attributes
     #[arg(short = 'X', long)]
     pub xattrs: bool,
     /// Preserve permissions
@@ -382,7 +382,7 @@ pub struct Args {
     #[arg(short = 'D')]
     pub devices: bool,
 
-    /// Increase verbosity (-v lists files; -vv also explains copy helpers and transport)
+    /// Increase verbosity (-v lists files; -vv also shows connection details)
     #[arg(short = 'v', long, action = clap::ArgAction::Count)]
     pub verbose: u8,
     /// Suppress non-error messages
@@ -399,8 +399,8 @@ pub struct Args {
     /// Disable transport compression
     #[arg(long, overrides_with = "compress")]
     pub no_compress: bool,
-    /// Resolve mappings and transport, then estimate transfers, exclusions, and deletions;
-    /// leave source and destination data unchanged (remote setup may still install the helper or syq)
+    /// Show what would be transferred, skipped, and deleted without changing source or
+    /// destination files (remote setup may still install syq)
     #[arg(short = 'n', long)]
     pub dry_run: bool,
     /// No-op accepted for rsync compatibility (sizes are always human-readable)
@@ -432,14 +432,14 @@ pub struct Args {
     #[arg(long, visible_alias = "no-W", overrides_with_all = ["whole_file", "no_whole_file"])]
     pub no_whole_file: bool,
     /// Override transfer internals for performance troubleshooting (normally automatic)
-    #[arg(long = "performance-tuning", value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP, help_heading = "Advanced controls")]
+    #[arg(long = "performance-tuning", value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::RSYNC_HELP, help_heading = "Advanced controls")]
     pub performance_tuning: Vec<String>,
     #[arg(skip)]
     pub tuning_options: Option<crate::transfer_tuning::TransferTuning>,
     /// Limit bandwidth and automatically chosen copy concurrency
     #[arg(
         long = "resource-limits",
-        long_help = crate::advanced::RESOURCE_HELP,
+        long_help = crate::advanced::RSYNC_RESOURCE_HELP,
         value_name = "KEY=VALUE,...",
         help_heading = "Advanced controls"
     )]
@@ -456,7 +456,7 @@ pub struct Args {
     pub integrity_checking_arg: Vec<String>,
     #[arg(skip)]
     pub integrity_checking: Option<crate::advanced::IntegrityChecking>,
-    /// Limit aggregate bytes per second across all workers; SSH and TCP copies count compressed transport bytes, other routes count file data (default unit: KiB/s; 0 disables)
+    /// Limit the total transfer rate, the same limit as the bandwidth resource limit; SSH and TCP copies count compressed bytes (default unit: KiB/s; 0 disables)
     #[arg(long, value_name = "RATE")]
     pub bwlimit: Option<String>,
     #[arg(skip)]
@@ -474,14 +474,14 @@ pub struct Args {
     /// No-op accepted for rsync compatibility (syq keeps partial files a later copy can resume from)
     #[arg(long)]
     pub partial: bool,
-    /// Print transfer statistics, worker waits, endpoint operations and CPU at the end
+    /// Print transfer statistics at the end
     #[arg(long)]
     pub stats: bool,
 
     /// Skip quick check; compare file contents block by block and repair differences
     #[arg(short = 'c', long)]
     pub checksum: bool,
-    /// Don't skip files whose size and modification time match; compare those that block reuse would compare (by default, every file with a remote syq endpoint) and copy the rest
+    /// Don't skip files whose size and modification time match: compare them where blocks are reused (by default, with a remote syq endpoint) and copy the rest whole
     #[arg(short = 'I', long = "ignore-times")]
     pub hash_or_copy: bool,
     /// Algorithm for file content comparisons and optional transfer checks
@@ -492,18 +492,16 @@ pub struct Args {
     pub transfer_integrity: bool,
     #[arg(skip)]
     pub transfer_hash_type: Option<crate::hashing::HashAlgorithm>,
-    /// Update files in place instead of writing a partial and renaming, as syq cp
-    /// --in-place=update does: a file with other hard links, another owner or wider permissions
-    /// than the copy gives it is replaced instead. Cannot be combined with -u or --ignore-existing:
-    /// an interrupted in-place write leaves a newer-looking final file those filters would then
-    /// skip forever
+    /// Update existing files in place, writing only what changed, as syq cp --in-place=update
+    /// does. Cannot be combined with -u or --ignore-existing, which would skip a file that an
+    /// interrupted update left incomplete
     #[arg(long, conflicts_with_all = ["update", "ignore_existing"])]
     pub inplace: bool,
     /// Existing files are updated in place too (`--in-place=update`, and
     /// `syq rsync --inplace`), where the receiver can vouch for them.
     #[arg(skip)]
     pub in_place_update: bool,
-    /// Remote shell command (default: ssh); controls agent forwarding when set. An ssh command keeps shared and persistent connections unless its options configure connection sharing; -v shares them only within the run
+    /// Remote shell command (default: ssh); when set, it controls SSH options and agent forwarding
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     pub rsh: Option<String>,
     /// Override SYQ_AUTH_FROM and saved authorization with auto, native SSH (ssh), or an authorization provider (@NAME or HOST). When omitted, use SYQ_AUTH_FROM, then the saved choice, then auto
@@ -515,7 +513,7 @@ pub struct Args {
     /// Syq extension: require syq on the remote PATH instead of installing a versioned helper
     #[arg(long = "syq-no-bootstrap")]
     pub no_bootstrap: bool,
-    /// Syq extension: send TCP data without encryption or authentication (trusted networks only); checks payloads with xxh3-128 unless --integrity-checking sets transfer
+    /// Syq extension: send TCP data without encryption or authentication; use only on trusted networks
     #[arg(long = "syq-no-tcp-encryption")]
     pub no_tcp_encryption: bool,
     /// Syq extension: send all data over ssh instead of separate TCP data connections
@@ -569,20 +567,16 @@ pub struct Args {
     /// then end of input when that syq ends.
     #[arg(skip)]
     pub(crate) requester_stdin: Option<u64>,
-    /// Syq extension: skip paths matching PATTERN (gitignore syntax: `foo` matches at any depth, `/foo` only
-    /// at the source root, `foo/` only directories, `!pat` re-includes). Repeatable.
-    /// Named non-directory sources match their basename. Combined
-    /// with --syq-ignore-from the patterns act like the lines of one .gitignore file, in
-    /// command-line order, anchored at each source root. Skipping a directory skips its
-    /// whole subtree, so to copy only *.jpg use: --syq-ignore '*' --syq-ignore '!*/'
-    /// --syq-ignore '!*.jpg'
+    /// Syq extension: skip paths matching a gitignore-style PATTERN (repeatable). Skipping a
+    /// directory skips its whole subtree, so to copy only *.jpg use: --syq-ignore '*'
+    /// --syq-ignore '!*/' --syq-ignore '!*.jpg'
     #[arg(
         long = "syq-ignore",
         value_name = "PATTERN",
         allow_hyphen_values = true
     )]
     pub ignore: Vec<String>,
-    /// Syq extension: securely open and read ignore patterns from raw-byte FILE (one per line, # comments); repeatable
+    /// Syq extension: read gitignore-style patterns from FILE (repeatable)
     #[arg(long = "syq-ignore-from", value_name = "FILE")]
     pub ignore_from: Vec<OsString>,
     /// Syq extension: which directories you own may briefly get the owner permission the copy needs; each is restored afterwards
@@ -608,11 +602,9 @@ pub struct Args {
     #[arg(skip)]
     pending_files_from: bool,
 
-    /// Delete extraneous files from the destination directories (paths the source does not
-    /// have). Deletion happens after the transfer and is skipped entirely if the source scan
-    /// reported any error. Ignored paths (--syq-ignore) are protected on both sides. rsync's
-    /// --delete-after and --delete-delay mean the same thing and are accepted. Cannot be combined
-    /// with --files-from
+    /// After copying, delete destination files the source does not have; skipped if scanning
+    /// reported errors, and ignored paths are kept. Also accepted as --delete-after or
+    /// --delete-delay. Cannot be combined with --files-from
     #[arg(
         long,
         aliases = ["delete-after", "delete-delay"],
@@ -660,10 +652,9 @@ pub struct Args {
     /// Don't transfer regular files smaller than SIZE
     #[arg(long, value_name = "SIZE")]
     pub min_size: Option<String>,
-    /// Copy only the paths listed in raw-byte FILE, securely opened before transfer (one per line,
-    /// relative to the single source directory; `-` reads stdin). Listed directories are
-    /// copied without their contents unless -r is given explicitly; missing parent
-    /// directories are created
+    /// Copy only the paths listed in FILE, one per line, relative to the single source
+    /// directory (`-` reads stdin). Listed directories are copied without their contents
+    /// unless -r is given explicitly
     #[arg(long, value_name = "FILE", conflicts_with_all = ["ignore", "ignore_from"])]
     pub files_from: Option<OsString>,
     /// --files-from entries are NUL-separated instead of one per line
@@ -1246,16 +1237,16 @@ struct NativeSourceArgs {
     /// Follow symlinks in directly supplied source paths
     #[arg(long)]
     follow_src: bool,
-    /// Select a named source object; attach =PATH when it begins with `-` (repeatable)
+    /// Select a named source object (repeatable)
     #[arg(long, value_name = "PATH")]
     src: Vec<OsString>,
-    /// Select a directory's contents; attach =DIR when it begins with `-` (repeatable)
+    /// Select a directory's contents (repeatable)
     #[arg(long, value_name = "DIR")]
     srcs_in: Vec<OsString>,
-    /// Select a named non-directory source object; attach =PATH when it begins with `-` (repeatable)
+    /// Select a named non-directory source object (repeatable)
     #[arg(long, value_name = "PATH")]
     src_non_dir: Vec<OsString>,
-    /// Select a named source directory; attach =DIR when it begins with `-` (repeatable)
+    /// Select a named source directory (repeatable)
     #[arg(long, value_name = "DIR")]
     src_dir: Vec<OsString>,
     /// Select several named non-directory source objects
@@ -1298,16 +1289,16 @@ struct NativeRmSelectionArgs {
     /// Follow symlinks in --cwd, --root, and selector parent directories; always unlink a final selected symlink
     #[arg(long)]
     follow_src: bool,
-    /// Select a non-directory object; attach =PATH when it begins with `-` (repeatable)
+    /// Select a non-directory object (repeatable)
     #[arg(long, value_name = "PATH")]
     src: Vec<OsString>,
-    /// Recursively select a directory's contents, keeping the directory; attach =DIR when it begins with `-` (repeatable)
+    /// Recursively select a directory's contents, keeping the directory (repeatable)
     #[arg(long, value_name = "DIR")]
     srcs_in: Vec<OsString>,
-    /// Select a non-directory object; attach =PATH when it begins with `-` (repeatable)
+    /// Select a non-directory object (repeatable)
     #[arg(long, value_name = "PATH")]
     src_non_dir: Vec<OsString>,
-    /// Select a directory tree; attach =DIR when it begins with `-` (repeatable)
+    /// Select a directory tree (repeatable)
     #[arg(long, value_name = "DIR")]
     src_dir: Vec<OsString>,
     /// Select several non-directory objects
@@ -1326,7 +1317,7 @@ struct NativeRmSelectionArgs {
 
 #[derive(clap::Args, Debug)]
 struct NativeOperationalArgs {
-    /// Preview without changing copy/removal data; remote setup may still install the helper or syq; requested results files are still written
+    /// Preview without changing files; remote setup may still install syq, and requested results files are still written
     #[arg(short = 'n', long)]
     dry_run: bool,
     /// Increase verbosity
@@ -1365,19 +1356,19 @@ struct NativeCopyOperationalArgs {
     /// Hash existing source and destination files instead of trusting size and modification time
     #[arg(long)]
     hash: bool,
-    /// Like --hash, but compare only files the transfer strategy would compare (by default, every file with a remote syq endpoint) and copy the rest, so identical files may be rewritten
+    /// Like --hash, but compare only where the transfer strategy reuses blocks (by default, with a remote syq endpoint) and copy other files whole, even if identical
     #[arg(long, conflicts_with = "hash")]
     hash_or_copy: bool,
     /// Choose a file transfer strategy (default: locality)
     #[arg(long, value_enum, value_name = "STRATEGY", long_help = TRANSFER_STRATEGY_HELP)]
     transfer_strategy: Option<TransferStrategy>,
-    /// How to handle existing destination files; directories remain containers
+    /// How to handle existing destination files
     #[arg(long, value_enum, value_name = "POLICY", default_value_t = IfExists::Update)]
     if_exists: IfExists,
     /// Update only entries already present; create no missing entries or directories
     #[arg(long = "only-existing", hide = true, conflicts_with_all = ["into_new", "as_new"])]
     existing: bool,
-    /// Select non-directory source entries with a typed expression; directories follow normal copy rules
+    /// Select non-directory entries with an expression; directories are not filtered
     #[arg(long = "where", value_name = "EXPR")]
     where_expression: Option<String>,
     /// Update only entries satisfying a source/destination expression
@@ -1402,13 +1393,13 @@ struct NativeCopyOperationalArgs {
         help_heading = "Advanced controls"
     )]
     integrity_checking_arg: Vec<String>,
-    /// Print transfer statistics, worker waits, endpoint operations and CPU at the end
+    /// Print transfer statistics at the end
     #[arg(long)]
     stats: bool,
-    /// Skip directory-relative paths or explicit source basenames using a gitignore-style pattern (repeatable)
+    /// Skip paths matching a gitignore-style pattern (repeatable)
     #[arg(long = "ignore", value_name = "PATTERN")]
     ignore: Vec<String>,
-    /// Securely open and read gitignore-style patterns from raw-byte FILE (repeatable; stacks in command-line order)
+    /// Read gitignore-style patterns from FILE (repeatable; applied in command-line order with --ignore)
     #[arg(long, value_name = "FILE")]
     ignore_from: Vec<OsString>,
     /// Match selected source metadata, including on unchanged files (repeatable/comma-separated)
@@ -1429,10 +1420,10 @@ struct NativeCopyOperationalArgs {
     /// Replaced by --in-place=new
     #[arg(long, hide = true)]
     inplace: bool,
-    /// Command-restricted receiver ceiling: refuse to touch more than N destination entries
+    /// Refuse a restricted copy that would touch more than N destination entries
     #[arg(long, value_name = "N", help_heading = REMOTE_TO_REMOTE_HEADING)]
     receiver_max_entries: Option<u64>,
-    /// Command-restricted receiver ceiling: refuse to write more than SIZE bytes of file data in total
+    /// Refuse a restricted copy that would write more than SIZE bytes of file data
     #[arg(long, value_name = "SIZE", help_heading = REMOTE_TO_REMOTE_HEADING)]
     receiver_max_bytes: Option<String>,
 }
@@ -1441,14 +1432,14 @@ struct NativeCopyOperationalArgs {
 /// remote-to-remote copy.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum PeerAuth {
-    /// The peer's enrolled command-restricted receiver, entered with its entry key; forwards no agent
+    /// Reach the other server only through its enrolled restricted receiver; forwards no agent
     #[default]
     Restricted,
-    /// Constrained agent broker only; the peer runs no command-restricted receiver
+    /// Let it use your agent for that host and user, with full access to that account
     Broker,
-    /// Forward nothing; the coordinator must hold its own credentials for the peer
+    /// Forward nothing; it must have its own credentials for the other server
     OwnCredentials,
-    /// Expose the complete local SSH agent to the coordinator, as `ssh -A` would
+    /// Forward your whole SSH agent, as ssh -A does
     FullAgent,
 }
 
@@ -1483,18 +1474,18 @@ pub(crate) fn parse_auth_from(value: &str) -> Result<AuthFrom> {
 
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteArgs {
-    /// Override SYQ_AUTH_FROM and saved authorization: try native SSH (auto), require native SSH (ssh), or authorize through @NAME or an SSH host (@NAME also supports S3 copies). Eligible native copies can request laptop authorization after SSH failure
+    /// How to authorize, overriding SYQ_AUTH_FROM and the saved choice: auto tries native SSH and may then ask a receiving machine, ssh uses only native SSH, and @NAME or HOST asks that receiving machine or SSH provider (@NAME also authorizes S3 copies)
     #[arg(long, value_name = "auto|ssh|@NAME|HOST", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
-    /// Choose the endpoint that runs the coordinator
-    #[arg(long, value_enum, default_value_t = CoordinateAt::Auto, help_heading = REMOTE_TO_REMOTE_HEADING)]
+    /// Choose which machine runs the copy
+    #[arg(long, value_enum, value_name = "WHERE", default_value_t = CoordinateAt::Auto, help_heading = REMOTE_TO_REMOTE_HEADING)]
     coordinate_at: CoordinateAt,
-    /// Remote shell command (default: ssh); the command owns SSH and agent policy when set. An ssh command keeps shared and persistent connections unless its options configure connection sharing; -v shares them only within the run
+    /// Remote shell command (default: ssh); when set, it controls SSH options and agent forwarding
     #[arg(long = "rsh", value_name = "COMMAND")]
     rsh: Option<String>,
     #[command(flatten)]
     helper: NativeRemoteHelperArgs,
-    /// Send TCP data without encryption or authentication (trusted networks only); checks payloads with xxh3-128 unless --integrity-checking sets transfer
+    /// Send TCP data without encryption or authentication; use only on trusted networks
     #[arg(long)]
     no_tcp_encryption: bool,
     /// Send file data through SSH rather than separate TCP data connections
@@ -1511,10 +1502,10 @@ struct NativeRemoteArgs {
         conflicts_with = "no_tcp"
     )]
     tcp_congestion: Option<String>,
-    /// Run at the remote coordinator and return after launch; requires --peer-auth own-credentials or --rsh
+    /// Return as soon as the copy starts on the server that runs it; requires --peer-auth own-credentials or --rsh
     #[arg(long, help_heading = REMOTE_TO_REMOTE_HEADING)]
     detach: bool,
-    /// How the coordinator authenticates to the peer (see the values below); --rsh takes over this policy entirely
+    /// How the server running the copy logs in to the other server; --rsh takes over this choice
     #[arg(
         long,
         value_enum,
@@ -1527,7 +1518,7 @@ struct NativeRemoteArgs {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum NativeCopyMetadata {
-    /// Match source modification times, including on unchanged files
+    /// Match source modification times
     #[value(alias = "times")]
     Mtime,
     /// Preserve permission bits
@@ -1546,25 +1537,25 @@ enum NativeCopyMetadata {
     Atimes,
     /// Preserve birth times; requires a macOS destination
     Crtimes,
-    /// Match Content-Type on S3-to-S3 copies
+    /// Content-Type (S3-to-S3 only)
     ContentType,
-    /// Match Content-Encoding on S3-to-S3 copies
+    /// Content-Encoding (S3-to-S3 only)
     ContentEncoding,
-    /// Match Content-Language on S3-to-S3 copies
+    /// Content-Language (S3-to-S3 only)
     ContentLanguage,
-    /// Match Content-Disposition on S3-to-S3 copies
+    /// Content-Disposition (S3-to-S3 only)
     ContentDisposition,
-    /// Match Cache-Control on S3-to-S3 copies
+    /// Cache-Control (S3-to-S3 only)
     CacheControl,
-    /// Match Expires on S3-to-S3 copies
+    /// Expires (S3-to-S3 only)
     Expires,
-    /// Match the website redirect on S3-to-S3 copies
+    /// Website redirect (S3-to-S3 only)
     WebsiteRedirect,
-    /// Match application user metadata on S3-to-S3 copies (excluding syq-* keys)
+    /// User metadata, except syq-* keys (S3-to-S3 only)
     UserMetadata,
-    /// Match the complete tag set on S3-to-S3 copies
+    /// The complete tag set (S3-to-S3 only)
     Tags,
-    /// Use the source storage class on S3-to-S3 copies
+    /// Storage class (S3-to-S3 only)
     StorageClass,
 }
 
@@ -1621,10 +1612,9 @@ struct NativeCopyFields {
     /// Map one named source exactly to PATH; its final entry must exist and is never followed
     #[arg(long, value_name = "PATH", group = "placement")]
     as_existing: Option<OsString>,
-    /// Copy the entries of a local NDJSON mapping manifest (`-` reads stdin), acquired before
-    /// destination changes, instead of selecting sources; entry src paths are relative to
-    /// -C and dst paths are relative to the --into container. Filter the mapping entries
-    /// themselves instead of combining this with --ignore or --ignore-from.
+    /// Copy the entries of a local NDJSON mapping file (`-` reads stdin) instead of selecting
+    /// sources; src paths are relative to -C and dst paths to the --into directory. Cannot be
+    /// combined with --ignore or --ignore-from
     #[arg(long, value_name = "FILE", conflicts_with_all = ["ignore", "ignore_from"])]
     mapping: Option<OsString>,
     /// Programmatic stream-mapping control socket (protocol in docs/stream-mappings.md).
@@ -1642,9 +1632,9 @@ struct NativeCopyFields {
 #[command(
     name = "syq cp",
     version,
-    about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nDirectories are copied recursively and symlinks as symlinks. Creating or updating\ncontents sets the source modification time. Use --copy-metadata to match selected metadata even on unchanged files. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Existing files are updated when their contents differ; --if-exists selects another policy.\nSource arguments must precede destination arguments.\nExplicit local pipe sources and --src-fd FD read raw bytes; --as-fd FD writes them.",
+    about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home\nand --from into the local current directory. Local copies and --prune need\nplacement. Existing files are updated when their contents differ; --if-exists\nselects another policy. Destination-only files remain unless you add --prune.\nPut sources before the destination.",
     before_help = "Examples:\n  syq cp foo --to j5\n  syq cp foo --from j5\n  syq cp photos --into backup\n  syq cp --copy-metadata=permissions project --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq cp report.txt --as report-backup.txt\n  syq cp data --to s3://bucket --into backup",
-    long_about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Existing files are updated when their contents differ; --if-exists selects another policy.\n\nNative copies recurse and copy symlinks as symlinks. Creating or updating file contents sets the source modification time. Use --copy-metadata to apply selected metadata even when contents already match. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored paths. --prune-before does this before copying to free space; later copy failures do not restore removed objects. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.\n\nExplicit local FIFOs and process-substitution paths are byte sources with --src, --src-non-dir, or a positional source. --copy-metadata=specials copies the FIFO node instead; recursive copies never consume pipes. A named FIFO can use --into DIR. Anonymous input (including /dev/fd/N) requires --as PATH (or its -new/-existing variant) or --as-fd FD. Placement conditions also apply to stream copies; --root confines pathname sources. --src-fd FD selects an inherited descriptor directly; --as-fd FD replaces destination placement. Each stream copy takes one source. Descriptors belong to this process (0 is stdin, 1 is stdout); stderr is reserved. Regular-file sources preserve modification times at named destinations and support --copy-metadata; pipes have no source metadata. Output descriptors receive source timestamps only with --copy-metadata=mtime. These copies use no restart state; they send progress and requested statistics to stderr. Streams use parallel SSH or TCP data connections, like regular-file copies. EOF ends input; it does not prove producer success. Output descriptors can contain partial bytes after failure.",
+    long_about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nPlacement chooses the destination: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present. With --to and no placement, syq copies into the remote home directory; with --from and no --to, into the local current directory. Local copies and --prune require a placement option.\n\nDirectories are copied recursively and symlinks as symlinks. Creating or updating a file sets its modification time to the source's; --copy-metadata copies other metadata. Existing files are updated when their contents differ; --if-exists selects another policy. Destination-only entries remain unless you add --prune. Put the source endpoint, source base, selectors, and --mapping before --to or a placement option. Attach option values that begin with `-` with `=`, for example --src-dir=-.\n\n--src-fd and --as-fd copy raw bytes from or to an inherited descriptor, and a named pipe or process-substitution path given as a source is read as a byte stream. Each stream copy takes one source. End of input does not show that the producer succeeded, and an output descriptor can hold partial bytes after a failure.",
     override_usage = "syq cp [OPTIONS] SOURCE... [PLACEMENT]\n       syq cp [OPTIONS] --src-fd FD --as PATH\n       syq cp [OPTIONS] SOURCE --as-fd FD"
 )]
 #[command(group(clap::ArgGroup::new("pruning").args(["prune", "prune_before"]).multiple(true)))]
@@ -1660,12 +1650,12 @@ struct NativeCopyCommand {
     /// Use an isolated persistence domain created by `syq persist on --ephemeral`
     #[arg(long, value_name = "PATH")]
     pscope: Option<PathBuf>,
-    /// After copying, remove target-only objects in mapped directory scopes;
-    /// ignored source paths remain protected
+    /// After copying, remove destination entries the source does not have, within the copied
+    /// directories; ignored paths are kept
     #[arg(long, conflicts_with = "mapping")]
     prune: bool,
-    /// Remove target-only objects before copying to free space. Implies --prune;
-    /// later copy failures do not restore removed objects
+    /// Like --prune, but remove the extra entries before copying to free space; a later copy
+    /// failure does not restore them
     #[arg(long, conflicts_with = "mapping")]
     prune_before: bool,
     /// With --prune or --prune-before, refuse all removals if more than N are planned
@@ -1732,7 +1722,7 @@ fn validate_native_copy_argument_order(matches: &clap::ArgMatches) -> Result<()>
     version,
     about = "Print source-to-destination mappings as NDJSON.\n\nScan local, SSH, or S3 sources and write one JSON object per line for later cp --mapping.\n--as changes placement relative to that copy's destination directory.\nNamed selectors must be relative (use -C for the source base).\n--srcs-in must be the only selector; --as requires one named object.\nNames must be valid UTF-8. No destination is contacted.",
     before_help = "Examples:\n  syq map --srcs-in photos\n  syq map photos --as archive/photos > mapping.ndjson\n  syq cp --mapping mapping.ndjson --into backup",
-    long_about = "Print source-to-destination mappings as NDJSON.\n\nScan local, SSH, or S3 sources for later cp --mapping. Named selectors must be relative (use -C for the source base). --srcs-in must be the only selector; --as requires one named object and changes its placement relative to the future destination directory.\n\nOne JSON object per line: tagged src and dst paths (src relative to the source base, dst relative to a future target container), with optional fields selected by --include. kind adds a copy-time type check. size and timestamps are informational. Missing stored S3 mtime is omitted; s3_last_modified is independent of filesystem mtime. Generation reads sources without contacting a destination. Names must be valid UTF-8. Attach path option values beginning with `-` by using `=`, for example --src-dir=-.",
+    long_about = "Print source-to-destination mappings as NDJSON.\n\nScan local, SSH, or S3 sources for a later cp --mapping, without contacting a destination. Named selectors must be relative to the source base (-C or --root). --srcs-in must be the only selector; --as requires one named object and sets its destination path.\n\nEach line has src and dst paths, plus the optional fields that --include selects. kind adds a type check when the mapping is copied; size and timestamps are informational. Names must be valid UTF-8. Attach option values that begin with `-` with `=`, for example --src-dir=-.",
     override_usage = "syq map [OPTIONS] PATH...\n       syq map [OPTIONS] --srcs-in DIR"
 )]
 struct NativeMapCommand {
@@ -1745,12 +1735,12 @@ struct NativeMapCommand {
     /// Filter emitted mapping entries with a source expression
     #[arg(long = "where", value_name = "EXPR")]
     where_expression: Option<String>,
-    /// Remote shell command (default: ssh). An ssh command keeps shared and persistent connections unless its options configure connection sharing; -v shares them only within the run
+    /// Remote shell command (default: ssh)
     #[arg(long, value_name = "COMMAND")]
     rsh: Option<String>,
     #[command(flatten)]
     helper: NativeRemoteHelperArgs,
-    /// Use an approved SSH account connection, or native SSH authentication
+    /// How to authorize SSH access: auto, ssh (native SSH only), @NAME (a receiving machine), or HOST (an SSH provider)
     #[arg(long, value_name = "auto|ssh|@NAME|HOST", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
     /// Use an isolated persistence domain created by `syq persist on --ephemeral`
@@ -1760,7 +1750,7 @@ struct NativeMapCommand {
     s3: crate::s3::Flags,
     #[command(flatten)]
     source: NativeSourceArgs,
-    /// Emit the single selected root at PATH, relative to the future destination container; PATH may be nested
+    /// Emit the selected object at PATH, relative to the directory it is later copied into; PATH may be nested
     #[arg(long, value_name = "PATH")]
     r#as: Option<OsString>,
 }
@@ -1769,9 +1759,9 @@ struct NativeMapCommand {
 #[command(
     name = "syq rm",
     version,
-    about = "Remove selected files, directory trees, or S3 objects and prefixes.\n\nNamed paths must be non-directories. --src-dir recursively removes a tree; --srcs-in recursively removes its contents, keeping the directory.\nSelected symlinks are always removed as links. --follow-src permits parent-directory symlink traversal; directory and contents selectors reject final symlinks.",
+    about = "Remove selected files, directory trees, or S3 objects and prefixes.\n\nNamed paths must be non-directories. --src-dir recursively removes a tree; --srcs-in recursively removes its contents, keeping the directory.\nSelected symlinks are always removed as links. Directory and contents selectors reject final symlinks.",
     before_help = "Examples:\n  syq rm --dry-run --src-dir old-backup\n  syq rm --src-dir old-backup\n  syq rm --on nas --srcs-in /backup/old\n  syq rm --on s3://bucket --src-dir old --s3-all-versions --dry-run",
-    long_about = "Remove selected files, directory trees, or S3 objects and prefixes. Use --on s3://BUCKET for S3; ordinary removal respects bucket versioning. Named paths must be non-directories. --src-dir recursively removes a tree; --srcs-in recursively removes its contents, keeping the directory. Selected symlinks are always removed as links. --follow-src permits parent-directory symlink traversal; directory and contents selectors reject final symlinks.\n\nAttach path option values beginning with `-` by using `=`, for example --src-dir=-.",
+    long_about = "Remove selected files, directory trees, or S3 objects and prefixes. Use --on s3://BUCKET for S3; ordinary removal respects bucket versioning. Named paths must be non-directories. --src-dir recursively removes a tree; --srcs-in recursively removes its contents, keeping the directory. Selected symlinks are always removed as links. Directory and contents selectors reject final symlinks.\n\nAttach path option values beginning with `-` by using `=`, for example --src-dir=-.",
     override_usage = "syq rm [OPTIONS] PATH...\n       syq rm [OPTIONS] --srcs-in DIR"
 )]
 struct NativeRmCommand {
@@ -1800,7 +1790,7 @@ struct NativeRmCommand {
     name = "syq clean-partials",
     version,
     about = "Delete syq partial files below the selected directories.",
-    long_about = "Delete new-format syq partial files recursively, including those S3 downloads leave, leaving other files and directories intact. Stop copies writing into these trees first. Older partial formats are not selected. Symlinks are not followed.",
+    long_about = "Delete syq partial files below the given trees, including those S3 downloads leave; other files and directories are left alone. Stop copies writing into these trees first. Symlinks are not followed.",
     before_help = "Examples:\n  syq clean-partials --dry-run backup\n  syq clean-partials --on nas /backup"
 )]
 struct CleanPartialsCommand {
@@ -1820,7 +1810,7 @@ struct CleanPartialsCommand {
     operational: NativeOperationalArgs,
     #[command(flatten)]
     helper: NativeRemoteHelperArgs,
-    /// Use an approved SSH account connection, or native SSH authentication
+    /// How to authorize SSH access: auto, ssh (native SSH only), @NAME (a receiving machine), or HOST (an SSH provider)
     #[arg(long, value_name = "auto|ssh|@NAME|HOST", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
     /// Use an isolated persistence domain created by `syq persist on --ephemeral`

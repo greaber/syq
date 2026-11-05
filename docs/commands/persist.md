@@ -20,7 +20,7 @@ syq persist [OPTIONS] <COMMAND>
 | [`persist off`](#syq-persist-off) | Disable persistence and close its live SSH control connections |
 | [`persist status`](#syq-persist-status) | Show connection readiness and any receiving problem |
 
-**Options**
+**Options (also available on subcommands)**
 
 | Argument / option | Meaning |
 |---|---|
@@ -55,7 +55,6 @@ syq persist auth-from [OPTIONS] [auto|ssh|@NAME|HOST]
 | Argument / option | Meaning |
 |---|---|
 | `--for <HOST>` | Apply to this exact destination hostname or SSH alias, for any login/port |
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
 | `--reset` | Remove the selected override so it inherits the default |
 
 <!-- /CLI -->
@@ -81,7 +80,6 @@ syq persist ssh-config [OPTIONS] <HOST>
 | Argument / option | Meaning |
 |---|---|
 | `--auth-from <auto\|ssh\|@NAME\|HOST>` | Select existing approval; omitted uses SYQ_AUTH_FROM, then the saved preference, then auto |
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
 
 <!-- /CLI -->
 
@@ -108,17 +106,11 @@ syq persist receive [OPTIONS] <COMMAND>
 | [`persist receive status`](#syq-persist-receive-status) | Show receiving settings and background connection state |
 | [`persist receive wait`](#syq-persist-receive-wait) | Wait for a connection with a deadline |
 
-**Options**
-
-| Argument / option | Meaning |
-|---|---|
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
-
 <!-- /CLI -->
 
 ## syq persist receive pending
 
-`--json` prints structured requests. `--wait` waits for a request, up to `--timeout` seconds (default 30). Use the returned request ID with `approve` or `deny`.
+Use a returned request ID with `approve` or `deny`.
 
 <!-- CLI: persist receive pending -->
 ```text
@@ -129,16 +121,14 @@ syq persist receive pending [OPTIONS]
 
 | Argument / option | Meaning |
 |---|---|
-| `--json` | See the command description above. |
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
+| `--json` | Print the requests as JSON |
 | `--wait` | Wait for an incoming request, with a deadline |
-| `--timeout <TIMEOUT>` | [default: 30] |
+| `--timeout <SECONDS>` | With --wait, give up after this many seconds<br><br>[default: 30] |
 
 <!-- /CLI -->
 
 ## syq persist receive approve
 
-`ID` is a pending request ID from `persist receive pending` on this machine.
 Copy and command approvals apply once. SSH account requests grant
 [session access](../persistence-reference.md#account-permissions); add `--remember`
 to permit future account authentications too.
@@ -152,20 +142,17 @@ syq persist receive approve [OPTIONS] <ID>
 
 | Argument / option | Meaning |
 |---|---|
-| `<ID>` | See the command description above. |
+| `<ID>` | Request ID shown by persist receive pending |
 
 **Options**
 
 | Argument / option | Meaning |
 |---|---|
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
 | `--remember` | Remember this SSH account permission for future receiving connections or provider logins |
 
 <!-- /CLI -->
 
 ## syq persist receive deny
-
-`ID` is a pending request ID from `persist receive pending` on this machine.
 
 <!-- CLI: persist receive deny -->
 ```text
@@ -176,13 +163,7 @@ syq persist receive deny [OPTIONS] <ID>
 
 | Argument / option | Meaning |
 |---|---|
-| `<ID>` | See the command description above. |
-
-**Options**
-
-| Argument / option | Meaning |
-|---|---|
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
+| `<ID>` | Request ID shown by persist receive pending |
 
 <!-- /CLI -->
 
@@ -200,12 +181,6 @@ syq persist receive permissions [OPTIONS] <COMMAND>
 |---|---|
 | [`persist receive permissions list`](#syq-persist-receive-permissions-list) | Show remembered SSH account permissions |
 | [`persist receive permissions remove`](#syq-persist-receive-permissions-remove) | Stop future authentications; already authenticated sessions may continue |
-
-**Options**
-
-| Argument / option | Meaning |
-|---|---|
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
 
 <!-- /CLI -->
 
@@ -225,15 +200,11 @@ syq persist receive permissions list [OPTIONS]
 
 | Argument / option | Meaning |
 |---|---|
-| `--json` | See the command description above. |
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
+| `--json` | Print the permissions as JSON |
 
 <!-- /CLI -->
 
 ## syq persist receive permissions remove
-
-Remove the listed permission ID. Future login requests ask again; already
-authenticated connections may continue.
 
 <!-- CLI: persist receive permissions remove -->
 ```text
@@ -244,24 +215,18 @@ syq persist receive permissions remove [OPTIONS] <ID>
 
 | Argument / option | Meaning |
 |---|---|
-| `<ID>` | See the command description above. |
-
-**Options**
-
-| Argument / option | Meaning |
-|---|---|
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
+| `<ID>` | Permission ID shown by persist receive permissions list |
 
 <!-- /CLI -->
 
 ## syq persist receive on
 
-Omitted settings keep saved values. New profiles ask for approval with desktop
-prompts and use the home directory. Set `--root` to confine copies to a directory.
-Only endpoints supplied with `--connection` are connected explicitly; otherwise
-receiving applies to active and future connections. Changing access settings
-cancels the profile’s active requests; changing `--notify` preserves them. See
-[profile settings](../persistence-reference.md#names-and-profiles) and
+Omitted settings keep their saved values. A new profile asks for approval with
+desktop prompts and uses your home directory; set `--root` to confine copies to
+a directory. Without `--connection`, a new profile applies to all existing and
+future connections, and an existing profile keeps its allowed list. Changing
+access settings cancels the profile's active requests.
+See [profile settings](../persistence-reference.md#names-and-profiles) and
 [copy limits](../persistence-reference.md#copy-limits).
 
 <!-- CLI: persist receive on -->
@@ -273,20 +238,19 @@ syq persist receive on [OPTIONS]
 
 | Argument / option | Meaning |
 |---|---|
-| `--auto-approve-root <AUTO_APPROVE_ROOT>` | Automatically approve downloads confined to this directory |
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
+| `--auto-approve-root <DIR>` | Automatically approve downloads confined to this directory |
 | `--no-auto-approve-root` | Require approval for every download again |
-| `--connection <ENDPOINT>` | Replace the allowed connection list and connect these endpoints now (repeat for several)<br><br>Only endpoints supplied in this invocation are connected. Omitting this option keeps the saved restriction without dialing dormant endpoints. |
+| `--connection <ENDPOINT>` | Replace the allowed connection list and connect these endpoints now (repeat for several) |
 | `--all-connections` | Make this profile available through every connected SSH account |
-| `--notify <NOTIFICATIONS>` | Show desktop prompts, or use only local pending/approve/deny commands<br><br>[possible values: desktop, off] |
+| `--notify <MODE>` | Show desktop prompts, or use only local pending/approve/deny commands<br><br>[possible values: desktop, off] |
 | `--name <NAME>` | Create or update this named profile; omitted means the first profile |
-| `-C, --cwd <CWD>` | Default destination directory; absolute paths and .. may select elsewhere |
+| `-C, --cwd <DIR>` | Default destination directory; absolute paths and .. may select elsewhere |
 | `--auto-cwd` | Choose cwd from root, auto-approve-root, then HOME |
-| `--root <ROOT>` | Confinement boundary for every download, even with approval |
+| `--root <DIR>` | Confinement boundary for every download, even with approval |
 | `--no-root` | Remove the hard download boundary |
-| `--max-bytes <MAX_BYTES>` | Maximum bytes one transfer may reserve/write (default: 100G) |
-| `--max-entries <MAX_ENTRIES>` | Maximum entries one transfer may touch (default: 1000000) |
-| `--max-delete <MAX_DELETE>` | Permit pruning up to N entries per transfer (default: 0) |
+| `--max-bytes <SIZE>` | Maximum bytes one transfer may write (default: 100G) |
+| `--max-entries <N>` | Maximum entries one transfer may touch (default: 1000000) |
+| `--max-delete <N>` | Permit pruning up to N entries per transfer (default: 0) |
 
 <!-- /CLI -->
 
@@ -304,13 +268,13 @@ syq persist receive off [OPTIONS]
 | Argument / option | Meaning |
 |---|---|
 | `--name <NAME>` | Stop only this profile; without --name, stop all profiles |
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
 
 <!-- /CLI -->
 
 ## syq persist receive remove
 
-`NAME` identifies the saved profile to remove. Its connections and requests stop. The last profile can be disabled but cannot be removed; server-side name assignments remain until explicitly forgotten.
+The last profile can be disabled but not removed. Names it registered on
+servers remain until you [forget them](#syq-persist-destinations-forget).
 
 <!-- CLI: persist receive remove -->
 ```text
@@ -321,19 +285,11 @@ syq persist receive remove [OPTIONS] <NAME>
 
 | Argument / option | Meaning |
 |---|---|
-| `<NAME>` | See the command description above. |
-
-**Options**
-
-| Argument / option | Meaning |
-|---|---|
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
+| `<NAME>` | Profile to remove |
 
 <!-- /CLI -->
 
 ## syq persist receive status
-
-Show all profiles, or select one with `--name`. Use `--json` for structured output.
 
 <!-- CLI: persist receive status -->
 ```text
@@ -344,15 +300,14 @@ syq persist receive status [OPTIONS]
 
 | Argument / option | Meaning |
 |---|---|
-| `--json` | See the command description above. |
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
-| `--name <NAME>` | See the command description above. |
+| `--json` | Print the settings and state as JSON |
+| `--name <NAME>` | Show only this profile |
 
 <!-- /CLI -->
 
 ## syq persist receive wait
 
-`HOST` is the SSH server endpoint. Wait for the selected profile, or every enabled profile when `--name` is omitted. `--timeout` is in seconds; failure or timeout exits nonzero. This command does not start a connection.
+Failure or timeout exits nonzero. This command does not start a connection.
 
 <!-- CLI: persist receive wait -->
 ```text
@@ -363,15 +318,14 @@ syq persist receive wait [OPTIONS] <HOST>
 
 | Argument / option | Meaning |
 |---|---|
-| `<HOST>` | See the command description above. |
+| `<HOST>` | SSH server whose receiving connection to wait for |
 
 **Options**
 
 | Argument / option | Meaning |
 |---|---|
 | `--name <NAME>` | Wait for this profile; otherwise wait for every enabled profile |
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
-| `--timeout <TIMEOUT>` | [default: 30] |
+| `--timeout <SECONDS>` | Give up after this many seconds<br><br>[default: 30] |
 
 <!-- /CLI -->
 
@@ -392,12 +346,6 @@ syq persist destinations [OPTIONS] <COMMAND>
 | [`persist destinations forget`](#syq-persist-destinations-forget) | Remove an offline destination name so another laptop can register it |
 | [`persist destinations wait`](#syq-persist-destinations-wait) | Wait for a connection with a deadline |
 
-**Options**
-
-| Argument / option | Meaning |
-|---|---|
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
-
 <!-- /CLI -->
 
 ## syq persist destinations list
@@ -407,17 +355,12 @@ syq persist destinations [OPTIONS] <COMMAND>
 syq persist destinations list [OPTIONS]
 ```
 
-**Options**
-
-| Argument / option | Meaning |
-|---|---|
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
-
 <!-- /CLI -->
 
 ## syq persist destinations forget
 
-`NAME` is an offline receiving name to release before replacing its machine. Forgetting a live connection is refused.
+Use this before replacing the laptop that registered a name. Forgetting a name
+whose laptop is still connected is refused.
 
 <!-- CLI: persist destinations forget -->
 ```text
@@ -428,19 +371,11 @@ syq persist destinations forget [OPTIONS] <NAME>
 
 | Argument / option | Meaning |
 |---|---|
-| `<NAME>` | See the command description above. |
-
-**Options**
-
-| Argument / option | Meaning |
-|---|---|
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
+| `<NAME>` | Receiving name to release, without @ |
 
 <!-- /CLI -->
 
 ## syq persist destinations wait
-
-`NAME` is a receiving name without `@`. Wait up to `--timeout` seconds for it to respond; timeout exits nonzero.
 
 <!-- CLI: persist destinations wait -->
 ```text
@@ -451,22 +386,19 @@ syq persist destinations wait [OPTIONS] <NAME>
 
 | Argument / option | Meaning |
 |---|---|
-| `<NAME>` | See the command description above. |
+| `<NAME>` | Receiving name to wait for, without @ |
 
 **Options**
 
 | Argument / option | Meaning |
 |---|---|
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
-| `--timeout <TIMEOUT>` | [default: 30] |
+| `--timeout <SECONDS>` | Give up after this many seconds<br><br>[default: 30] |
 
 <!-- /CLI -->
 
 ## syq persist connect
 
-Connect to `HOST` and wait for receiving to be ready. `--timeout` applies to
-the receiving wait after SSH and helper setup. `--syq-path` and `--no-bootstrap`
-cannot combine. Use `--pscope` for an existing ephemeral scope.
+Connect to `HOST` and wait up to `--timeout` seconds for receiving to be ready.
 
 <!-- CLI: persist connect -->
 ```text
@@ -484,10 +416,9 @@ syq persist connect [OPTIONS] <HOST>
 | Argument / option | Meaning |
 |---|---|
 | `--auth-from <auto\|ssh\|@NAME\|HOST>` | Authorize a reusable destination-account login through @NAME or an SSH provider |
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
 | `--syq-path <PATH>` | Use this remote syq executable instead of installing a matching helper |
 | `--no-bootstrap` | Use syq on the remote PATH instead of installing a matching helper |
-| `--timeout <TIMEOUT>` | Wait this many seconds for receiving after SSH/helper setup<br><br>[default: 30] |
+| `--timeout <SECONDS>` | Wait this many seconds for receiving after connecting<br><br>[default: 30] |
 
 <!-- /CLI -->
 
@@ -503,7 +434,6 @@ syq persist on [OPTIONS]
 | Argument / option | Meaning |
 |---|---|
 | `--ephemeral` | Create an ephemeral scope and print its path instead of changing the user setting |
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
 
 <!-- /CLI -->
 
@@ -514,21 +444,15 @@ syq persist on [OPTIONS]
 syq persist off [OPTIONS]
 ```
 
-**Options**
-
-| Argument / option | Meaning |
-|---|---|
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
-
 <!-- /CLI -->
 
 ## syq persist status
 
-Inspect connections without starting them. `--json` uses the [connection-status contract](../automation.md#connection-status). `--pscope` selects an ephemeral scope.
-If individual approved-account records cannot be inspected, status still shows
-healthy connections, reports the inspection errors, and exits unsuccessfully.
-See [approved account status](../persistence-reference.md#approved-account-connections)
-for the JSON fields.
+Show connections without starting them. `--json` prints the
+[connection-status contract](../automation.md#connection-status), with the
+[approved account](../persistence-reference.md#approved-account-connections)
+fields. If some approved-account records cannot be read, status still shows the
+healthy connections, reports the errors, and exits nonzero.
 
 <!-- CLI: persist status -->
 ```text
@@ -540,6 +464,5 @@ syq persist status [OPTIONS]
 | Argument / option | Meaning |
 |---|---|
 | `--json` | Print structured connection state |
-| `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
 
 <!-- /CLI -->
