@@ -39,11 +39,10 @@ own changes; see
 `clean-partials` writes [removal records](#removal-records). `--results` can't
 be combined with `--detach`.
 
-Records arrive in `seq` order. If writing the stream fails, syq warns and stops
-writing it, but the copy or removal can continue. Once the stream is open, a
-completed run or a fatal failure ends with a terminal record, preceded for a
-fatal failure by an `error` record. A crash or interruption can leave the
-terminal record missing.
+If writing the stream fails, syq warns and stops writing it, but the copy or
+removal can continue. Once the stream is open, a completed run or a fatal
+failure ends with a terminal record, preceded for a fatal failure by an `error`
+record. A crash or interruption can leave the terminal record missing.
 
 ## Consumer rules
 
@@ -298,14 +297,14 @@ provider is an object whose `ssh` field holds the provider endpoint.
 `authorized_ssh_errors` lists account records that couldn't be read; the command
 then exits nonzero after printing the valid entries.
 
-`persist receive status --json` reports every profile's settings in `profiles`
-and the first selected profile's in `settings`. Each profile has `cwd`,
-`cwd_explicit`, `root`, `auto_approve_root` (null when every download asks),
-and `servers`, the endpoints set with `--connection` (empty means all).
-`connections` lists the profiles allowed on each endpoint. `provider` reports
-the local SSH authorization service, or is null when it isn't running; its
-`profiles` contain `settings`, `sessions`, and `pending` requests, and
-`decision_error` reports a failed local approval.
+`persist receive status --json` reports the receiving settings:
+
+| Field | Meaning |
+|---|---|
+| `profiles` | Every profile's `cwd`, `cwd_explicit`, `root`, `auto_approve_root` (null when every download asks), and `servers` (the endpoints set with `--connection`; empty means all) |
+| `settings` | The first selected profile's settings |
+| `connections` | The profiles allowed on each endpoint |
+| `provider` | The local SSH authorization service, or null when it isn't running; its `profiles` contain `settings`, `sessions`, and `pending` requests, and `decision_error` reports a failed local approval |
 
 `syq persist receive pending --json` prints the requests waiting for approval,
 from receiving connections and the local SSH provider. Each has `id`, `from`,
