@@ -60,6 +60,20 @@ advance, run `syq persist connect HOST --auth-from @NAME`. `syq persist off`
 closes them, and `persist status --json` lists them in
 [`authorized_ssh`](automation.md#connection-status).
 
+To use an approved connection with plain `ssh`, `scp`, Git, or rsync, export
+an OpenSSH configuration for it:
+
+```sh
+syq persist ssh-config hostB > hostB.ssh
+ssh -F hostB.ssh hostB hostname
+scp -F hostB.ssh report hostB:report
+GIT_SSH_COMMAND='ssh -F hostB.ssh' git clone hostB:project.git
+```
+
+`HOST` must match the login, host, and port that opened the connection. The
+file contains no private key and works only while the connection is open, so
+export it again after reconnecting.
+
 Account access needs:
 
 - OpenSSH 8.9 or newer for the requesting server's SSH client and the
@@ -77,20 +91,6 @@ selects the matching key in your laptop's agent.
 When a copy carries file data over SSH, each SSH connection logs in under the
 same permission without another prompt, so the laptop or provider must stay
 available. An agent that requires confirmation or a touch asks for each one.
-
-To use the connection with other SSH tools, export an OpenSSH configuration
-for it:
-
-```sh
-syq persist ssh-config hostB > hostB.ssh
-ssh -F hostB.ssh hostB hostname
-GIT_SSH_COMMAND='ssh -F hostB.ssh' git clone hostB:project.git
-rsync -e 'ssh -F hostB.ssh' report hostB:report
-```
-
-`HOST` must match the login, host, and port that opened the connection. The
-file contains no private key and works only while the connection is open, so
-export it again after reconnecting.
 
 ### SSH authorization providers
 
@@ -230,9 +230,11 @@ plans more deletions than your `--max-delete` or `--max-entries`, or its own
 `--max-delete`, deletes nothing and exits 25, and so does its dry run, so you
 can check first.
 
-Copies are refused while syq runs as root on the receiving machine, and they
-never follow a destination symlink, even with `--follow-dst`; name the link's
-target instead. `--no-tcp` sends file data over SSH, and `--tcp-ports` sets
+Copies to a receiving name cannot preserve hard links, ACLs, extended
+attributes, or access or birth times, and cannot use `--open-noatime` or
+`--sparse`; the other `--copy-metadata` options work. They are refused while
+syq runs as root on the receiving machine, and they never follow a destination
+symlink, even with `--follow-dst`; name the link's target instead. `--no-tcp` sends file data over SSH, and `--tcp-ports` sets
 the server's port range for TCP.
 
 ## Connection lifetime and waits

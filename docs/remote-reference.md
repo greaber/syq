@@ -140,7 +140,9 @@ on the receiving machine ends the copy.
 
 Per-copy approval does not work with a root login on the destination,
 `--detach`, `--rsh`, `--syq-path`, `--no-bootstrap`, other `--peer-auth` or
-`--coordinate-at` values, or `--no-tcp-encryption`; such copies use only their
+`--coordinate-at` values, or `--no-tcp-encryption`, and an approved upload
+cannot preserve hard links, ACLs, extended attributes, or access or birth
+times, or use `--open-noatime` or `--sparse`. Such copies need this machine's
 own SSH access. The receiving machine's copy limits apply, including its
 `--max-delete` and `--max-entries`.
 
