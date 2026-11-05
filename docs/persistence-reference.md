@@ -11,141 +11,148 @@ its own connections, authorization defaults, receiving profiles, and
 remembered account permissions. See [Isolated script scopes](#isolated-script-scopes)
 for creation, lifetime, and cleanup.
 
-## Authorization defaults
+## Account access
 
-On a server, choose the authorization provider for later SSH access:
+A server can log in to other servers with your laptop's SSH access, as shown
+in [Open a shell on another server](receive.md#open-a-shell-on-another-server).
+This section covers the choices, requirements, and lifetime of that access;
+see [SSH account access](security.md#ssh-account-access) for what approving it
+grants.
+
+### Authorization defaults
+
+`--auth-from` chooses how a command authorizes its SSH logins:
+
+| Value | Meaning |
+|---|---|
+| `auto` (default) | Use this machine's own SSH access. A copy between this machine and one server can then ask a receiving machine to approve just that copy; see [Authorization selection](remote-reference.md#authorization-selection). Other commands run native SSH once. |
+| `ssh` | Use only this machine's own SSH access, ignoring approved account connections |
+| `@NAME` | Use or request access to the destination account through that receiving machine, without first trying this machine's own access; fails if the machine is unavailable or refuses |
+| `[USER@]HOST[:PORT]` | The same, through an [SSH authorization provider](#ssh-authorization-providers) |
+
+To save a choice on a server, for all hosts or for one:
 
 ```sh
 syq persist auth-from @laptop
-# Or use an ordinary SSH provider:
-syq persist auth-from alice@provider:2222
 syq persist auth-from ssh --for backup
 syq persist auth-from
 syq persist auth-from --reset --for backup
 syq persist auth-from --reset
 ```
 
-`@laptop` goes straight to that receiving machine without first trying the
-server's SSH credentials, and the command fails if it is unavailable or
-refuses. An ordinary SSH endpoint such as `alice@provider:2222` instead
-connects to that account as an [authorization provider](receive.md#use-an-ssh-authorization-provider).
-Either one reuses existing account access, and lets a command request access
-when it has none. `ssh` uses the server's own access and ignores approved
-account connections. `auto`, the default, also starts with native SSH; an
-eligible copy can then ask an available receiving machine after an SSH failure
-(see [Authorization selection](remote-reference.md#authorization-selection)),
-while other commands run native SSH once.
+A command uses the first of these that is set:
 
-A `--for HOST` override wins over the default. It matches the exact hostname
-or SSH alias typed in the command, for every login and port, without expanding
-aliases; `--for` takes no login or port. `SYQ_AUTH_FROM` in the environment
-wins over both saved settings, for one shell or script; see
-[Environment](environment.md#choose-authorization-through-the-environment).
-An explicit `--auth-from` (`--syq-auth-from` for `syq rsync`), including `auto`,
-wins over all of them.
-`--reset --for HOST` removes one override; `--reset` restores the default to
-`auto` while keeping host overrides. Omit the value to show saved choices, or
-add `--for HOST` to show that host's effective choice. Both also show when
-`SYQ_AUTH_FROM` overrides the saved choices.
+1. Its `--auth-from` option (`--syq-auth-from` for `syq rsync`), including `auto`.
+2. The `SYQ_AUTH_FROM` environment variable, for one shell or script. An empty
+   value counts as unset.
+3. A saved `--for HOST` choice. It matches the exact hostname or SSH alias
+   typed in the command, for every login and port, without expanding aliases.
+4. The saved default.
+5. `auto`.
 
-Defaults apply to `syq ssh`, copies using approved account connections, and the
-SSH endpoints of `rsync`, `rm`, `map`, and `clean-partials`. A copy explicitly
-using `--coordinate-at local` selects access separately for each endpoint.
-Custom `--rsh` routes, copies to receiving names, and object storage keep their
-own authentication. The setting works whether or not native SSH persistence is
-enabled.
+`--reset --for HOST` removes one host's choice; `--reset` restores the default
+to `auto` and keeps host choices. Omit the value to show saved choices, or add
+`--for HOST` to show that host's effective choice; both say when
+`SYQ_AUTH_FROM` overrides them. Choices are saved in `auth-from.json` in the
+selected domain.
 
-Choices are saved in `auth-from.json` in the selected domain; the default
-domain keeps it alongside `persistence.json`. If the file is invalid or from an
-unsupported version, commands report its path without changing it: repair it,
-or pass `--auth-from` (`--syq-auth-from` for rsync) to bypass it for one
-command. Setting or resetting a choice keeps the other saved choices, so it
-cannot repair an unreadable file; to discard all saved choices, remove the
-file yourself.
+Saved choices and `SYQ_AUTH_FROM` apply to every command that takes
+`--auth-from`, whether or not persistence is on: `syq ssh`, `persist connect`,
+`persist ssh-config`, and the SSH endpoints of `cp`, `rsync`, `rm`, `map`, and
+`clean-partials`. So with `@laptop` saved, `syq persist connect hostB` opens an
+approved account connection rather than an ordinary persistent one. A copy
+with `--coordinate-at local` selects access separately for each endpoint. Custom `--rsh` routes, copies to receiving names, and object storage
+keep their own authentication; S3 storage authorization needs an explicit
+`--auth-from @NAME`.
 
-## Approved account connections
+### Approved account connections
 
-Commands selecting `@NAME` or an ordinary SSH provider request an approved
-account connection when needed.
-`syq persist connect HOST --auth-from PROVIDER` prepares the same connection in
-advance. Neither operation enables ordinary persistence or receiving on `HOST`.
-`--pscope` selects the domain that owns the connection. Helper overrides do not
-apply in this mode, and `--timeout`, which is for native receiving setup, is
-rejected when account authorization is selected.
+Commands selecting `@NAME` or an SSH provider open an approved account
+connection when they need one, and `syq persist connect HOST --auth-from @NAME`
+opens one in advance. Neither enables ordinary persistence or receiving on
+`HOST`. Later commands that select the same provider reuse the connection,
+including `ssh`, copies, `rsync`, `rm`, `map`, `clean-partials`, and
+descriptor copies; for copies between two other servers, see
+[Approved account copies](remote-reference.md#approved-account-copies). Remote
+path completion reuses a matching connection, but never requests approval or
+opens one. `persist status --json` lists these connections in
+[`authorized_ssh`](automation.md#connection-status), and `syq persist off`
+closes them.
 
-An ordinary SSH provider uses its default persistence domain and first
-configured receiving profile, which must be enabled. A local `--pscope` does
-not select a domain on the provider.
+Account access needs:
 
-The requesting machine's SSH configuration determines the destination account,
-host, port, identity selection, and route. `persist status --json` lists these
-connections in [`authorized_ssh`](automation.md#connection-status).
+- OpenSSH 8.9 or newer for the requesting server's SSH client and the
+  destination's SSH server.
+- Exact plain host keys for both servers, trusted by the laptop; host
+  certificates alone are not enough. The laptop looks up each key under the
+  alias you typed, with any port you wrote, or your `HostKeyAlias`, in its own
+  SSH configuration, so an alias may lead to different addresses on the two
+  machines as long as both reach the same host.
+- The laptop's key loaded in its SSH agent. The requesting server's SSH
+  configuration chooses the destination account, address, port, and route,
+  and its `IdentityFile` and `IdentitiesOnly` settings choose which keys to
+  offer: an `IdentityFile` naming a public key selects the matching key in the
+  laptop's agent, and a `CertificateFile` can pair a user certificate with it.
 
-Later commands that select the same provider reuse the approved connection,
-including copies, SSH data with `--no-tcp`, `rsync`, `rm`, `map`,
-`clean-partials`, and descriptor copies; for copies between two other servers,
-see [Approved account copies](remote-reference.md#approved-account-copies). The
-prompt grants the account's authority, not permission for only the displayed
-operation. Remote path completion reuses a matching connection, but never
-contacts the provider, requests approval, or opens a connection.
+When a copy uses SSH for file data, because TCP is unavailable or you chose
+`--no-tcp`, each data connection logs in under the same permission without
+another approval prompt. The laptop or provider must stay available, and
+withdrawing the permission stops the copy. An agent that requires
+confirmation or a hardware-key touch asks for each connection.
 
-When TCP is unavailable or you use `--no-tcp`, data workers open their own SSH
-connections under the same account permission. Your authorization provider
-must remain available, but workers never request another syq approval:
-missing or withdrawn permission stops the copy. An agent that requires
-confirmation or a hardware-key touch can ask for each connection.
+`syq persist ssh-config HOST` prints an OpenSSH configuration for one approved
+connection, for use with `ssh -F FILE`, `scp`, `sftp`, Git, or rsync:
 
-After a remote operation or path completion, syq can keep a helper ready on the
-connection for the next one. It occupies one SSH session, so with the server's
-`MaxSessions 1`, a shell or another tool sharing that connection has no session
-left.
+```sh
+syq persist ssh-config hostB > hostB.ssh
+ssh -F hostB.ssh hostB hostname
+GIT_SSH_COMMAND='ssh -F hostB.ssh' git clone hostB:project.git
+rsync -e 'ssh -F hostB.ssh' report hostB:report
+```
 
-`syq persist ssh-config HOST [--auth-from auto|ssh|@NAME|HOST]` prints a
-standalone OpenSSH configuration for one existing approved login. Use it with
-`ssh`, `scp`, or `sftp` through `-F FILE`, or with Git and rsync's SSH command
-option. The endpoint must match the user, host spelling, and port used to open
-the approved connection. The command never requests approval or opens a login,
-and native-only `ssh` selection cannot export approved access. Once its
-connection closes, it fails without trying other authentication, so export it
-again after reconnecting. It contains no private key.
+`HOST` must match the login, host spelling, and port that opened the
+connection. The command never requests approval or opens a login, and the file
+contains no private key. Once the connection closes, tools using the file fail
+without trying other authentication, so export it again after reconnecting.
+Use its absolute path when a tool runs from another directory.
 
-## Account permissions
+### SSH authorization providers
 
-The laptop asks before granting access from a source server account to a
-destination account. **Allow** lasts for its current receiving connection to
-the source. **Remember** saves that permission for later connections through
-the same profile. Both accounts, resolved endpoints, and trusted host keys are
-part of the permission; changing them requires approval again. Permission is
-shared by processes running as the requesting account.
+An [SSH authorization provider](receive.md#use-an-ssh-authorization-provider)
+needs the same syq build as the machines that use it. Its default domain's
+first receiving profile must be enabled. Its SSH server must allow local
+forwarding (`AllowTcpForwarding` and `AllowStreamLocalForwarding` set to
+`local` or `yes`), and the login key's `authorized_keys` entry must not block
+it with `restrict` or `no-port-forwarding`. After updating syq, run
+`syq persist receive on` on the provider again.
 
-With an ordinary SSH provider, see
-[provider trust](security.md#ordinary-ssh-authorization-providers) for what
-**Allow** and **Remember** cover.
+### Account permissions
 
-For a pending account request, use the desktop controls or decide locally:
+**Allow** lasts until the laptop's receiving connection to the requesting
+server ends, or for a provider, until that provider login ends. **Remember**
+keeps the permission for later connections through the same receiving profile,
+until you remove it. See [SSH account access](security.md#ssh-account-access)
+for exactly what each covers.
+
+Decide pending requests with the desktop prompt or locally, and manage
+remembered permissions on the laptop:
 
 ```sh
 syq persist receive approve REQUEST_ID
 syq persist receive approve REQUEST_ID --remember
 syq persist receive deny REQUEST_ID
 syq persist receive permissions list
-syq persist receive permissions list --json
 syq persist receive permissions remove PERMISSION_ID
 ```
 
-`--remember` is accepted only for account-access requests. Removing a
-remembered permission makes future authentication requests ask again. To close
-syq's owned connections, run `syq persist off` on the requesting machine, with
-`--pscope PATH` if they belong to an explicit domain. Run
-`syq persist receive off` on the authorizing machine to end session permission
-and prevent further authorization, selecting its domain with `--pscope` when
-needed. See [account access](security.md#ssh-account-access) for what these
-actions do not stop.
-
-Remembered permissions belong to the authorizing laptop's selected domain and
-are stored separately from receiving settings. A new domain on that laptop does
-not inherit them, and creating a domain on the requesting server does not
-revoke permissions already granted to that server account.
+`--remember` is accepted only for account-access requests. To stop further
+access, run `syq persist off` on the requesting server to close its
+connections, and `syq persist receive off` on the laptop to end session
+permissions and stop further authorization; see
+[SSH account access](security.md#ssh-account-access) for what this does not
+undo. Add `--pscope PATH` on either machine for an isolated domain. Remembered permissions belong to the laptop's selected domain: a new
+domain on the laptop starts without them, and a new domain on the server does
+not revoke what that server account was already granted.
 
 ## Names and profiles
 
@@ -361,18 +368,13 @@ approvals, and remembered-permission management.
 
 A domain does not isolate processes running as the same OS account; see
 [Persistent connections](security.md#persistent-connections). Receiving names
-are shared too: `persist destinations list`, `wait`, and `forget` work across
-the account even with `--pscope`, so forgetting an offline name releases it
-for the whole account.
+are shared by all domains; see
+[`persist destinations`](commands/persist.md#syq-persist-destinations).
 
 Scoped `persist off` closes that domain's connections and receiving services,
 then removes its settings and remembered permissions; the path cannot be
 reused afterwards. Default `persist off` closes default-domain connections but
-keeps its saved settings and remembered permissions. Idle connection expiry
-alone removes nothing, but a scope in a temporary or runtime directory, with
-its remembered permissions, can disappear when the system cleans that
-directory, including at reboot. A scope in a durable location survives,
-though its SSH connections must be reopened.
+keeps its saved settings and remembered permissions.
 
 ## Setup and recovery
 

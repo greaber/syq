@@ -47,11 +47,7 @@ incompatible types fail before copying starts. Evaluation errors, including
 division by zero and failed metadata reads, fail the copy and prevent pruning;
 files already completed can remain.
 
-Conditions use observed metadata. They are not locks or atomic assertions
-against concurrent changes. `--copy-if` cannot combine with `--in-place`.
-A [restricted receiver](remote-reference.md#enrollment) does not enforce
-expressions; it enforces only what was approved for the copy, such as its
-destination and limits.
+`--copy-if` cannot combine with `--in-place`.
 
 ## Fields
 
@@ -129,18 +125,13 @@ Patterns and timestamp arguments must be quoted literals. Regex backslashes
 need a string escape, as in the JPEG example above.
 
 Types must agree: compare a size with `10B`, not `10` or `"10B"`. Subtracting
-timestamps yields a duration; adding or subtracting a duration shifts a
-timestamp. Sizes and durations can be multiplied or divided by integers;
-dividing two sizes or two durations yields an integer. Decimal quantities must
-resolve to whole bytes or nanoseconds. Overflow is an error.
+timestamps yields a duration, and adding a duration to a timestamp shifts it.
+Arithmetic and bitwise operators bind more tightly than comparisons, which
+bind more tightly than `not`, then `and`, then `or`; use parentheses to group
+conditions otherwise. `and` and `or` evaluate left to right and stop as soon as the
+result is known, and `if` and `coalesce` evaluate only the needed branch, so
+put an availability check before a condition that needs the value.
 
-From highest to lowest precedence: unary minus; multiplication/division/remainder;
-addition/subtraction; bitwise `&`, then `^`, then `|`; comparisons and membership;
-`not`; `and`; `or`. Parentheses override precedence. `and` and `or` evaluate
-left to right and short-circuit. `if` and `coalesce` evaluate only the needed
-branch. Put an availability check before a condition that needs the value.
-
-Expressions are limited to 64 KiB, 512 tokens, and 64 nested parser levels.
-They cannot execute commands, read arbitrary files, or query other entries.
-For collection-wide selection or external data, generate a
+Expressions cannot execute commands, read arbitrary files, or query other
+entries. For collection-wide selection or external data, generate a
 [mapping](mappings.md) with a program.

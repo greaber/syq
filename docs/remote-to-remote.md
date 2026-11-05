@@ -32,8 +32,10 @@ the copy finishes; the copy stops if it ends.
   SSH agent, or a key file without a passphrase. Password and multi-factor
   logins cannot authorize these copies.
 - OpenSSH 7.2 or newer on hostB, with a writable `~/.ssh/authorized_keys`.
-- SSH connectivity from hostA to hostB. Copies are faster when hostA can also
-  reach a TCP data port on hostB; see [Make TCP reachable](server-tuning.md#make-tcp-reachable).
+- Direct SSH connectivity from hostA to hostB; a `ProxyJump` or
+  `ProxyCommand` in hostA's configuration is not used. Copies are faster when
+  hostA can also reach a TCP data port on hostB; see
+  [Make TCP reachable](server-tuning.md#make-tcp-reachable).
 - An existing parent directory for the destination.
 - A hostB login other than root.
 
@@ -43,9 +45,7 @@ The first copy to your hostB account sets up restricted copying there, using
 your usual SSH login: it adds one line to hostB's `~/.ssh/authorized_keys` whose
 key can only start syq's receiver, and installs syq in `~/.local/lib/syq`.
 After that, your machine signs each copy with the key you log in with, and
-hostB checks the signature before writing anything. With a FIDO key, each copy
-needs one touch, and a copy that sets up or refreshes restricted copying needs
-about three.
+hostB checks the signature before writing anything.
 
 To set up hostB ahead of time, including before a dry run:
 
@@ -63,10 +63,9 @@ syq receiver revoke ID
 
 Use the ID from `list`. Revocation stops active copies for that enrollment
 and removes its access; completed writes remain. See
-[Enrollment](remote-reference.md#enrollment) for which keys can sign, key
-changes, and updates. Enrollments made by syq 0.7.1 and earlier do not appear
-in `list`; see [Enrollments from older versions](remote-reference.md#enrollments-from-older-versions)
-to remove them.
+[Enrollment](remote-reference.md#enrollment) for which keys can sign, FIDO
+touches, key changes, and updates. If you used syq 0.7.1 or earlier, remove
+its [old enrollments](remote-reference.md#enrollments-from-older-versions).
 
 If your machine cannot reach hostB, a copy tries again through hostA; for
 `enroll` or `revoke`, add `--via hostA`.
@@ -88,16 +87,13 @@ syq persist connect hostC --auth-from @laptop
 syq cp --from hostB --srcs-in data --to hostC --into /archive --auth-from @laptop
 ```
 
-Approve each account on the laptop. The requesting server has full access to
-those accounts while the approvals remain open. HostB receives only permission
-for the current copy to hostC, and file data goes directly from hostB to hostC.
-Keep the copy and the laptop's receiving connection open until it finishes.
-
-HostB's SSH server must allow remote Unix-socket forwarding, and on OpenSSH
-7.8 and later remote TCP forwarding too. Copying over SSH needs a writable
-`~/.ssh/authorized_keys` on hostC for a temporary restricted key. See
-[Approved account copies](remote-reference.md#approved-account-copies)
-for option support.
+Approve each account on the laptop; this gives the requesting server
+[full access to both accounts](security.md#ssh-account-access). HostB receives
+only permission for this copy to hostC, and file data goes directly from hostB
+to hostC. Keep the copy and the laptop's receiving connection open until it
+finishes. HostB's SSH server must allow remote forwarding; see
+[Approved account copies](remote-reference.md#approved-account-copies) for
+requirements and option support.
 
 ## Mirror a directory
 
