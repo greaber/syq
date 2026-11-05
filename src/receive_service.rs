@@ -3303,11 +3303,13 @@ mod tests {
     }
 
     /// A status as the service at `control` answers it.
+    /// The service process is this test's own, which lives on after the
+    /// stand-in gives up the control, as a stopping service's would not.
     fn answer(identity: &str, busy: Option<Busy>, stopping: bool) -> Status {
         Status {
             version: VERSION,
             identity: identity.into(),
-            pid: 4242,
+            pid: std::process::id(),
             endpoint: "example".into(),
             name: "laptop".into(),
             connection: ConnectionState::default(),
