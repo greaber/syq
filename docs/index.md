@@ -39,9 +39,9 @@ syq cp --srcs-in project --to server --into backup
 ```
 
 Use `--dry-run` to preview a summary without copying, or `--dry-run -v`
-to list the planned changes by path.
-Existing destination files are updated when needed. Unrelated files stay
-unless you request `--prune`.
+to list the planned changes by path. Files already in the destination are
+updated when they differ, and other files there stay unless you add
+`--prune`.
 
 <a id="already-use-rsync"></a>
 
