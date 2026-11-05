@@ -281,7 +281,10 @@ fn transfer_strategies_select_payloads_for_local_and_remote_replacements() {
                                     .parse()
                                     .unwrap()
                             };
-                            (stat("bytes transferred: "), stat("bytes unchanged: "))
+                            (
+                                stat("bytes transferred: "),
+                                stat("bytes unchanged or reused: "),
+                            )
                         };
                         // Replaced files up to 64 MiB are compared in 64 KiB
                         // blocks, with or without an explicit content check.

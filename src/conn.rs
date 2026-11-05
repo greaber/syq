@@ -1816,7 +1816,7 @@ pub(crate) struct ProbedRoutes {
 /// The longest route probes wait for an address to accept a connection.
 pub(crate) const TCP_PROBE_CEILING: std::time::Duration = std::time::Duration::from_millis(1000);
 /// The shortest, however quick the SSH round trip was.
-const TCP_PROBE_FLOOR: std::time::Duration = std::time::Duration::from_millis(200);
+pub(crate) const TCP_PROBE_FLOOR: std::time::Duration = std::time::Duration::from_millis(200);
 /// Slack for starting the probes and collecting their answers.
 const TCP_PROBE_COLLECTION: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -1860,6 +1860,9 @@ impl std::error::Error for NoTcpRoute {}
 #[derive(Clone, Debug, Default)]
 pub struct RemoteDiagnostics {
     pub tcp_probe_time: Option<(std::time::Instant, std::time::Instant)>,
+    /// A round trip measured while opening a named destination's control
+    /// channel, which the receiving machine's route probes are bounded by.
+    pub route_round_trip: Option<std::time::Duration>,
     pub helper_installation: Option<(std::time::Instant, std::time::Instant)>,
     pub peer: Option<PeerInfo>,
     pub tcp_probe: Option<TcpProbe>,
@@ -2583,10 +2586,16 @@ impl RemoteSpec {
                 .then(|| approved.take_control())
                 .transpose()?
         } else if crate::destination::is_named(&self.restricted_grant) {
-            Some(crate::destination::connect(
-                self.restricted_grant.as_deref().unwrap(),
-                matches!(role, ConnectionRole::Control),
-            )?)
+            let control = matches!(role, ConnectionRole::Control);
+            let started = std::time::Instant::now();
+            let stream =
+                crate::destination::connect(self.restricted_grant.as_deref().unwrap(), control)?;
+            if control {
+                // Opening the control channel is a round trip to the
+                // receiving machine; it bounds that machine's route probes.
+                self.diagnostics.lock().unwrap().route_round_trip = Some(started.elapsed());
+            }
+            Some(stream)
         } else {
             None
         };
@@ -3030,7 +3039,7 @@ impl RemoteSpec {
             TcpListenReply::Pending(reply) => reply,
         };
         let (reply, arrived) = ctl.take_reply_with_arrival(reply)?;
-        let wait = tcp_probe_wait(Some(arrived.saturating_duration_since(sent)));
+        let wait = self.route_probe_wait(Some(arrived.saturating_duration_since(sent)));
         let (port, advertised, remote_congestion_control) = match reply {
             Response::TcpCongestionRejected(error) => return Err(TcpCongestionError(error).into()),
             response => match ok(response, "tcp listen")? {
@@ -3064,6 +3073,21 @@ impl RemoteSpec {
             remote_congestion_control,
             probe,
         })
+    }
+
+    /// How long this endpoint's route probes wait for an answer. A source
+    /// reached through an approved return connection without SSH has no
+    /// fallback when TCP fails, so giving up early would fail the copy: it
+    /// waits the ceiling.
+    pub(crate) fn route_probe_wait(
+        &self,
+        round_trip: Option<std::time::Duration>,
+    ) -> std::time::Duration {
+        if self.forwarded.as_ref().is_some_and(|copy| !copy.has_ssh()) {
+            TCP_PROBE_CEILING
+        } else {
+            tcp_probe_wait(round_trip)
+        }
     }
 
     pub(crate) fn probe_tcp_addresses(

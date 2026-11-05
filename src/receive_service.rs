@@ -755,9 +755,9 @@ fn read_spec(control: &Path) -> Result<ServiceSpec> {
     Ok(spec)
 }
 
-/// Called after a successful ordinary persistent SSH control connection. A
+/// Called after a successful ordinary persistent SSH control connection to
+/// start receiving through this endpoint when enabled and not running. A
 /// failed return setup is visible but does not invalidate that ordinary copy.
-/// Start receiving through this endpoint when enabled and not running.
 /// Returns whether this call started a service process.
 pub(crate) fn ensure(domain: &Domain, control: &Path, remote: &crate::conn::RemoteSpec) -> bool {
     match ensure_inner(domain, control, remote, Retry::IfDue) {
@@ -854,9 +854,6 @@ pub(crate) fn profile_names(domain: &Domain) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// `retry` is what to do with a failed connection to this server: what a
-/// command connecting to it asks (`Retry::IfDue`), or `persist connect`
-/// (`Retry::Now`).
 /// Whether receiving through an endpoint is on, and whether starting it
 /// took a new service process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -866,6 +863,9 @@ enum Receiving {
     Started,
 }
 
+/// `retry` is what to do with a failed connection to this server: what a
+/// command connecting to it asks (`Retry::IfDue`), or `persist connect`
+/// (`Retry::Now`).
 fn ensure_inner(
     domain: &Domain,
     control: &Path,

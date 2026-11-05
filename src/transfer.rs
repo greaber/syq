@@ -1716,7 +1716,9 @@ fn print_statistics(opts: &Opts, progress: &Progress, connections: &str, tcp_sta
                 "files to transfer",
                 "files unchanged",
                 "bytes transferred",
-                "bytes unchanged",
+                // Like `bytes_unchanged`, also data reused inside
+                // transferred files.
+                "bytes unchanged or reused",
                 progress.bytes_done.load(Relaxed),
             )
         };

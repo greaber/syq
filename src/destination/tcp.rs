@@ -11,6 +11,10 @@ pub(super) struct ProbeRequest {
     ports: (u16, u16),
     advertised: Vec<(String, u32)>,
     congestion_control: Option<String>,
+    /// How long the receiving machine waits for an address to answer, from
+    /// the coordinator's measured round trip. Absent, it waits the most.
+    #[serde(default)]
+    wait_ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -25,6 +29,7 @@ pub(crate) fn probe(
     ports: (u16, u16),
     advertised: Vec<(String, u32)>,
     congestion_control: Option<String>,
+    wait: Duration,
 ) -> Result<Vec<TcpCandidate>> {
     let route = decode_route(grant)?;
     let (_, reply) = exchange(
@@ -35,6 +40,7 @@ pub(crate) fn probe(
             ports,
             advertised,
             congestion_control,
+            wait_ms: Some(wait.as_millis() as u64),
         }),
         START_TIMEOUT,
         None,
@@ -94,15 +100,16 @@ impl Receiver {
             },
             true,
         )?;
-        // This side has measured no round trip to the coordinator, so it
-        // waits as long as an unmeasured probe does.
+        // The coordinator measured the round trip between the two machines.
+        let wait = request
+            .wait_ms
+            .map_or(crate::conn::TCP_PROBE_CEILING, |wait| {
+                Duration::from_millis(wait)
+                    .clamp(crate::conn::TCP_PROBE_FLOOR, crate::conn::TCP_PROBE_CEILING)
+            });
         let candidates = self
             .tcp_peer
-            .probe_tcp_addresses(
-                request.advertised,
-                request.port,
-                crate::conn::TCP_PROBE_CEILING,
-            )?
+            .probe_tcp_addresses(request.advertised, request.port, wait)?
             .candidates;
         // Use the ordinary speed selection on both peers. This temporary spec
         // has no helper or control connection and performs no filesystem work.
@@ -113,7 +120,9 @@ impl Receiver {
             .map(|c| c.address.clone())
             .collect::<Vec<_>>();
         if addrs.is_empty() {
-            bail!("no advertised data address is reachable");
+            // Nothing reached: say so as an ordinary result, so that the
+            // coordinator reports the fallback as it does for any route.
+            return write_message(&mut stream, &Reply::TcpProbed(selected));
         }
         let info = TcpInfo {
             pacing: None,

@@ -67,15 +67,16 @@ running after it finishes, so the next command to that server starts sooner:
 - Receiving through the server, when receiving is on. It runs until
   `syq persist off` or `syq persist receive off`.
 
-The command that starts them says so in one line, naming the command that
-stops them:
+A copy or other file command that starts them says so in one line, naming the
+command that stops them:
 
 ```text
 syq: persistence keeps these running in the background: the SSH connection to server, a ready syq session there, and receiving through it. `syq persist off` stops them.
 ```
 
 Later commands that find them running say nothing, and neither does a command
-run with `-q`. `syq persist status` shows what is running.
+run with `-q`. Tab completion and `syq ssh` can also open the SSH connection,
+without saying so. `syq persist status` shows what is running.
 
 ## Reuse laptop-authorized account access
 

@@ -367,7 +367,10 @@ fn native_comparison_blocks_reuse_only_verified_matching_bytes() {
     assert_eq!(read(&t.path("dst")), edited);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("bytes transferred: 262,144"), "{stdout}");
-    assert!(stdout.contains("bytes unchanged: 262,151"), "{stdout}");
+    assert!(
+        stdout.contains("bytes unchanged or reused: 262,151"),
+        "{stdout}"
+    );
     // The summary counts the reused blocks with the file that was rewritten,
     // and "unchanged" only for files left alone.
     assert!(

@@ -3129,6 +3129,9 @@ impl Planner<'_> {
                     } = *replacement;
                     self.progress.files_unchanged.fetch_sub(1, Relaxed);
                     self.progress.bytes_unchanged.fetch_sub(entry.size, Relaxed);
+                    self.progress
+                        .bytes_in_unchanged_files
+                        .fetch_sub(entry.size, Relaxed);
                     self.enqueue_with(source, dst, rel, dst_rel, entry, Some(destination), reason);
                 }
                 (Some(error), _) => self.report_metadata_failure(Some(&dst), kind, &error),

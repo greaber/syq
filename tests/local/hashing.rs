@@ -61,8 +61,9 @@ fn checksum_repairs_silent_corruption() {
     let out = run_ok(&["-ac", "-B1M", "--no-whole-file", &t.s("src/"), &t.s("dst/")]);
     assert_eq!(transferred(&out), 1, "{out}");
     assert!(read(&t.path("dst/f.bin")) == data, "-c should repair");
+    // The other four blocks are reused, not counted as an unchanged file.
     assert!(
-        out.contains("(1.00 MiB)"),
+        out.contains("(1.00 MiB, plus 4.00 MiB reused), 0 B unchanged (0 files)"),
         "only one block should be resent: {out}"
     );
     assert_same_tree(&t.path("src"), &t.path("dst"));
