@@ -159,10 +159,16 @@ def check():
                             ok=False, capture=True)
             assert 'existence condition failed' in refused.stderr, refused.stderr
             assert c.request('GET', bare)[1] == b'not a prefix'
-        refused = c.run([source / 'link', '--to', remote, '--as-existing', empty],
+        refused = c.run(['--src-non-dir', source / 'link', '--to', remote, '--as-existing', empty],
                         ok=False, capture=True)
         assert 'prefix, not an object' in refused.stderr, refused.stderr
-        c.run([source / 'link', '--to', remote, '--as-existing', bare, '--if-exists=update'])
+        c.run(['--src-non-dir', source / 'link', '--to', remote, '--as-existing', bare,
+               '--if-exists=update'])
+        # A link named as a plain source is refused rather than uploaded as a link.
+        refused = c.run([source / 'link', '--to', remote, '--as', c.PREFIX + '/named-link'],
+                        ok=False, capture=True)
+        assert '--follow-src' in refused.stderr and '--src-non-dir' in refused.stderr, refused.stderr
+        assert c.PREFIX + '/named-link' not in c.listing()
         assert c.request('GET', bare)[1] == b'small + %.txt'
         mirror = c.PREFIX + '/prune-file-descendants'
         stale = mirror + '/a/stale'

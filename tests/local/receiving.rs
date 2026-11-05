@@ -83,23 +83,43 @@ fn native_copy_distinguishes_named_contents_and_exact_placement() {
 }
 
 #[test]
-fn native_copy_named_selector_preserves_a_root_symlink() {
+fn native_copy_named_root_symlink_needs_follow_or_src_non_dir() {
     use std::os::unix::fs::symlink;
 
     let t = Tmp::new();
     write(&t.path("real/file"), b"data");
     symlink("real", t.path("link")).unwrap();
 
-    run_native_ok(&["cp", "--src", &t.s("link"), "--into", &t.s("preserved")]);
+    let link_with_slashes = format!("{}///", t.s("link"));
+    for (source, placement) in [
+        (t.s("link"), "refused"),
+        (link_with_slashes.clone(), "refused-with-slashes"),
+    ] {
+        let refused = native_syq(&["cp", "--src", &source, "--into", &t.s(placement)]);
+        assert!(!refused.status.success());
+        assert!(
+            stderr_of(&refused).contains("--follow-src"),
+            "{}",
+            stderr_of(&refused)
+        );
+        assert!(!t.path(placement).exists());
+    }
+
+    run_native_ok(&[
+        "cp",
+        "--src-non-dir",
+        &t.s("link"),
+        "--into",
+        &t.s("preserved"),
+    ]);
     assert_eq!(
         fs::read_link(t.path("preserved/link")).unwrap(),
         Path::new("real")
     );
 
-    let link_with_slashes = format!("{}///", t.s("link"));
     run_native_ok(&[
         "cp",
-        "--src",
+        "--src-non-dir",
         &link_with_slashes,
         "--into",
         &t.s("preserved-with-slashes"),

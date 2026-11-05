@@ -30,7 +30,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--root <DIR>` | Resolve source paths inside DIR and refuse any that lead outside it |
 | `--src <PATH>` | Select a named source object (repeatable) |
 | `--srcs-in <DIR>` | Select a directory's contents (repeatable) |
-| `--src-non-dir <PATH>` | Select a named non-directory source object (repeatable) |
+| `--src-non-dir <PATH>` | Select a named non-directory source object, such as a symlink itself (repeatable) |
 | `--src-dir <DIR>` | Select a named source directory (repeatable) |
 | `--src-non-dirs <PATH>...` | Select several named non-directory source objects |
 | `--src-dirs <DIR>...` | Select several named source directories |

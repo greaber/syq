@@ -264,6 +264,11 @@ pub(super) fn upload_plan(args: &Args) -> Result<UploadPlan> {
     }
     let mut out = Vec::new();
     let mut claims = BTreeMap::new();
+    // Resolve and check every selector before walking any tree, so a bad
+    // selector fails at once. Named symlinks are reported together.
+    let mut links = Vec::new();
+    let named_sources = selectors.len();
+    let mut selected = Vec::with_capacity(selectors.len());
     for (path, destination, selection, declared_kind, expected_hash, metadata) in selectors {
         let resolved = crate::fsops::resolve(&path);
         let pinned = if resolved.is_absolute() {
@@ -321,6 +326,17 @@ pub(super) fn upload_plan(args: &Args) -> Result<UploadPlan> {
             }
             _ => bail!("source cannot be selected for S3 upload"),
         };
+        if source.kind() == ObjectKind::Symlink {
+            if crate::transfer::refuses_named_symlink(selection, crate::proto::Kind::Symlink) {
+                links.push(source.label.clone());
+                continue;
+            }
+            crate::transfer::validate_native_source_type(
+                &source.label,
+                selection,
+                crate::proto::Kind::Symlink,
+            )?;
+        }
         if (selection == SourceSelection::File && source.kind() == ObjectKind::Dir)
             || (matches!(
                 selection,
@@ -344,6 +360,16 @@ pub(super) fn upload_plan(args: &Args) -> Result<UploadPlan> {
         if source.expected_hash.is_some() && source.kind() != ObjectKind::File {
             bail!("an expected digest requires a regular file");
         }
+        selected.push((source, selection));
+    }
+    if !links.is_empty() {
+        let links: Vec<&[u8]> = links.iter().map(Vec::as_slice).collect();
+        return Err(crate::transfer::named_symlink_sources_error(
+            &links,
+            named_sources,
+        ));
+    }
+    for (source, selection) in selected {
         if args.delete && source.kind() == ObjectKind::Dir {
             prune.scope(source.key.as_bytes());
         }

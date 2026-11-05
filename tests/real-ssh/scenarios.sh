@@ -1129,6 +1129,36 @@ case "$follow_output" in
     *) printf '%s\n' "$follow_output" >&2; exit 1 ;;
 esac
 
+printf 'case: a symlink named as a source needs --follow-src or --src-non-dir\n'
+# The coordinator runs on the source server here, so its refusal must reach
+# the runner before anything is created on the destination.
+ssh source 'rm -rf /tmp/syq-real-ssh/named-link-source &&
+    mkdir -p /tmp/syq-real-ssh/named-link-source/real &&
+    printf "named link\n" > /tmp/syq-real-ssh/named-link-source/real/file &&
+    ln -s real /tmp/syq-real-ssh/named-link-source/link'
+ssh destination 'rm -rf /tmp/syq-real-ssh/named-link && mkdir /tmp/syq-real-ssh/named-link'
+if named_link_output=$(syq cp --no-progress --from source \
+    /tmp/syq-real-ssh/named-link-source/link \
+    --to destination --into /tmp/syq-real-ssh/named-link/refused 2>&1); then
+    echo 'a named source symlink was copied without --follow-src' >&2
+    exit 1
+fi
+case "$named_link_output" in
+    *'is a symlink; pass --follow-src'*'--src-non-dir'*) ;;
+    *) printf '%s\n' "$named_link_output" >&2; exit 1 ;;
+esac
+ssh destination 'test ! -e /tmp/syq-real-ssh/named-link/refused'
+syq cp --no-progress --from source --follow-src \
+    /tmp/syq-real-ssh/named-link-source/link \
+    --to destination --into /tmp/syq-real-ssh/named-link/followed
+syq cp --no-progress --from source --src-non-dir \
+    /tmp/syq-real-ssh/named-link-source/link \
+    --to destination --into /tmp/syq-real-ssh/named-link/linked
+ssh destination 'test -d /tmp/syq-real-ssh/named-link/followed/link &&
+    test ! -L /tmp/syq-real-ssh/named-link/followed/link &&
+    test "$(cat /tmp/syq-real-ssh/named-link/followed/link/file)" = "named link" &&
+    test "$(readlink /tmp/syq-real-ssh/named-link/linked/link)" = real'
+
 printf 'case: restricted copies accept --pscope\n'
 # --pscope selects which local connections are kept; the receiver's own
 # connection stays private to the copy.

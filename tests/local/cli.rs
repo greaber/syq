@@ -2126,10 +2126,29 @@ fn a_closed_stdout_stops_a_streaming_command() {
     for index in 0..3000 {
         fs::write(t.path(&format!("src/big/file-{index:05}")), b"").unwrap();
     }
+    // A later selector that fails only once map walks it: map checks every
+    // selector before writing, so a missing one would fail before any output.
+    // Root can read the unreadable directory, so the check needs another user.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    struct Readable(PathBuf);
+    impl Drop for Readable {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+    fs::create_dir_all(t.path("src/later/unreadable")).unwrap();
+    let _readable = Readable(t.path("src/later/unreadable"));
+    fs::set_permissions(
+        t.path("src/later/unreadable"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
     let (reader, writer) = std::io::pipe().unwrap();
     drop(reader);
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args(["map", "--cwd", &t.s("src"), "big", "absent"])
+        .args(["map", "--cwd", &t.s("src"), "big", "later"])
         .stdin(Stdio::null())
         .stdout(writer)
         .stderr(Stdio::piped())

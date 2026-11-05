@@ -161,6 +161,208 @@ fn native_copy_typed_selectors_are_source_preconditions() {
 }
 
 #[test]
+fn native_copy_refuses_a_named_symlink_unless_followed_or_selected_as_a_link() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("home/real/config"), b"config");
+    symlink("../config", t.path("home/real/inner")).unwrap();
+    symlink("real", t.path("home/.kube")).unwrap();
+    let home = t.s("home");
+
+    // A named link is refused before anything is created, however it is named.
+    for (case, selector) in [
+        ("positional", vec![".kube"]),
+        ("src", vec!["--src", ".kube"]),
+        ("srcs", vec!["--srcs", ".kube"]),
+    ] {
+        for placement in ["--into", "--as"] {
+            let target = t.s(&format!("refused-{case}{placement}/.kube"));
+            let mut args = vec!["cp", "-C", &home];
+            args.extend(&selector);
+            args.extend([placement, &target]);
+            let refused = native_syq(&args);
+            assert!(!refused.status.success(), "{case} {placement}");
+            let stderr = stderr_of(&refused);
+            assert!(
+                stderr.contains("source .kube is a symlink")
+                    && stderr.contains("--follow-src")
+                    && stderr.contains("--src-non-dir .kube"),
+                "{stderr}"
+            );
+            assert!(
+                !t.path(&format!("refused-{case}{placement}")).exists(),
+                "{case} {placement}"
+            );
+        }
+    }
+
+    // --follow-src copies what the link points to; links inside stay links.
+    run_native_ok(&[
+        "cp",
+        "-C",
+        &home,
+        "--follow-src",
+        ".kube",
+        "--into",
+        &t.s("followed"),
+    ]);
+    assert!(fs::symlink_metadata(t.path("followed/.kube"))
+        .unwrap()
+        .is_dir());
+    assert_eq!(read(&t.path("followed/.kube/config")), b"config");
+    assert_eq!(
+        fs::read_link(t.path("followed/.kube/inner")).unwrap(),
+        Path::new("../config")
+    );
+
+    // --src-non-dir copies the link itself; --follow-src then needs a non-directory.
+    run_native_ok(&[
+        "cp",
+        "-C",
+        &home,
+        "--src-non-dir",
+        ".kube",
+        "--into",
+        &t.s("linked"),
+    ]);
+    assert_eq!(
+        fs::read_link(t.path("linked/.kube")).unwrap(),
+        Path::new("real")
+    );
+    let followed_non_dir = native_syq(&[
+        "cp",
+        "-C",
+        &home,
+        "--follow-src",
+        "--src-non-dir",
+        ".kube",
+        "--into",
+        &t.s("followed-non-dir"),
+    ]);
+    assert!(!followed_non_dir.status.success());
+    assert!(stderr_of(&followed_non_dir).contains("--src-non-dir selector .kube is a directory"));
+    assert!(!t.path("followed-non-dir").exists());
+
+    // syq map applies the same rule to its selectors, and a symlink entry in
+    // a mapping is still copied as a link.
+    let map = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["map", "-C", &home])
+            .args(args)
+            .run()
+            .expect("run syq map")
+    };
+    let refused_map = map(&[".kube"]);
+    assert!(!refused_map.status.success());
+    assert!(stderr_of(&refused_map).contains("--src-non-dir .kube"));
+    let mapped = map(&["--src-non-dir", ".kube", "--include", "kind"]);
+    assert!(mapped.status.success(), "{}", stderr_of(&mapped));
+    let entry: serde_json::Value = serde_json::from_slice(&mapped.stdout).unwrap();
+    assert_eq!(entry["kind"], "symlink");
+    fs::write(t.path("mapping.ndjson"), &mapped.stdout).unwrap();
+    run_native_ok(&[
+        "cp",
+        "-C",
+        &home,
+        "--mapping",
+        &t.s("mapping.ndjson"),
+        "--into",
+        &t.s("mapped"),
+    ]);
+    assert_eq!(
+        fs::read_link(t.path("mapped/.kube")).unwrap(),
+        Path::new("real")
+    );
+}
+
+#[test]
+fn native_named_symlinks_are_refused_together_and_map_writes_nothing() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("proj/a"), b"a");
+    fs::create_dir(t.path("proj/real")).unwrap();
+    symlink("real", t.path("proj/current")).unwrap();
+    symlink("a", t.path("proj/flink")).unwrap();
+    symlink("real", t.path("proj/my link")).unwrap();
+    let proj = t.s("proj");
+    // What a shell glob such as proj/* would pass.
+    let glob = ["a", "current", "flink", "my link", "real"];
+
+    // One error lists every named link, quoted for the shell, and nothing is copied.
+    let mut args = vec!["cp", "-C", &proj];
+    args.extend(glob);
+    let into = t.s("out");
+    args.extend(["--into", &into]);
+    let refused = native_syq(&args);
+    assert!(!refused.status.success());
+    let stderr = stderr_of(&refused);
+    assert!(
+        stderr.contains("sources current, flink and 'my link' are symlinks")
+            && stderr.contains("--follow-src")
+            && stderr.contains("--src-non-dir")
+            && stderr.contains("--srcs-in DIR"),
+        "{stderr}"
+    );
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(!t.path("out").exists());
+
+    // A single named link gets a suggestion that can be pasted as is.
+    let single = native_syq(&["cp", "-C", &proj, "my link", "--into", &into]);
+    assert!(!single.status.success());
+    assert!(
+        stderr_of(&single).contains("or --src-non-dir 'my link' to copy the link itself"),
+        "{}",
+        stderr_of(&single)
+    );
+    assert!(!stderr_of(&single).contains("--srcs-in"));
+
+    // A name that starts with `-` is suggested attached, as clap needs it.
+    symlink("a", t.path("proj/-dash")).unwrap();
+    let dash = native_syq(&["cp", "-C", &proj, "--src=-dash", "--into", &into]);
+    assert!(!dash.status.success());
+    assert!(
+        stderr_of(&dash).contains("or --src-non-dir=-dash to copy the link itself"),
+        "{}",
+        stderr_of(&dash)
+    );
+    run_native_ok(&["cp", "-C", &proj, "--src-non-dir=-dash", "--into", &into]);
+    assert_eq!(fs::read_link(t.path("out/-dash")).unwrap(), Path::new("a"));
+    fs::remove_dir_all(t.path("out")).unwrap();
+
+    // syq map checks every selector before writing any entry, so a pipeline
+    // into `syq cp --mapping -` never gets a partial mapping.
+    for (selectors, expected) in [
+        (vec!["a", "current"], "--src-non-dir current"),
+        (vec!["a", "missing"], "missing"),
+    ] {
+        let mapped = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["map", "-C", &proj])
+            .args(&selectors)
+            .run()
+            .expect("run syq map");
+        assert!(!mapped.status.success(), "{selectors:?}");
+        assert!(
+            mapped.stdout.is_empty(),
+            "{selectors:?}: {:?}",
+            mapped.stdout
+        );
+        assert!(
+            stderr_of(&mapped).contains(expected),
+            "{selectors:?}: {}",
+            stderr_of(&mapped)
+        );
+    }
+    let mapped = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["map", "-C", &proj, "current", "flink"])
+        .run()
+        .expect("run syq map");
+    assert!(stderr_of(&mapped).contains("sources current and flink are symlinks"));
+    assert!(mapped.stdout.is_empty());
+}
+
+#[test]
 fn native_cp_with_prune_checks_all_typed_sources_before_mutation() {
     let t = Tmp::new();
     write(&t.path("src/good"), b"new");
