@@ -28,7 +28,7 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | `--insecure-links` | Follow symlinks in this machine's rsync operator paths regardless of ownership (local only, as in rsync) |
 | `-H, --hard-links` | Preserve hard links between selected regular files |
 | `-A, --acls` | Preserve POSIX access and default ACLs; implies permissions |
-| `-X, --xattrs` | Preserve extended attributes in the selected privilege namespaces |
+| `-X, --xattrs` | Preserve extended attributes |
 | `-p, --perms` | Preserve permissions |
 | `-t, --times` | Preserve modification times |
 | `-U, --atimes...` | Preserve access times; repeat to request source no-atime reads |
@@ -40,7 +40,7 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | `-D` | Preserve device and special files |
 | `-h, --human-readable` | No-op accepted for rsync compatibility (sizes are always human-readable) |
 | `--numeric-ids` | No-op accepted for rsync compatibility (syq always uses numeric uid/gid) |
-| `--bwlimit <RATE>` | Limit the aggregate file-data rate across all workers (default unit: KiB/s; 0 disables) |
+| `--bwlimit <RATE>` | Limit the total transfer rate, the same limit as the bandwidth resource limit (default unit: KiB/s; 0 disables) |
 | `-P` | Same as --progress --partial |
 | `--partial` | No-op accepted for rsync compatibility (syq keeps partial files a later copy can resume from) |
 | `-c, --checksum` | Skip quick check; compare file contents block by block and repair differences |
@@ -64,7 +64,7 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 
 | Argument / option | Meaning |
 |---|---|
-| `-v, --verbose...` | List files with -v; explain helpers and transport with -vv |
+| `-v, --verbose...` | List files with -v; show connection details with -vv |
 | `-q, --quiet` | Suppress non-error messages |
 | `-n, --dry-run` | Show what would be transferred, skipped, and deleted without changing source or destination files (remote setup may still install syq) |
 
@@ -74,7 +74,7 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 |---|---|
 | `-z, --compress` | Compress remote data in transit automatically (default) |
 | `--no-compress` | Disable transport compression |
-| `-e, --rsh <COMMAND>` | Remote shell command (default: ssh); when set, it controls SSH options and agent forwarding. An ssh command still uses persistent connections unless its options set up connection sharing |
+| `-e, --rsh <COMMAND>` | Remote shell command (default: ssh); when set, it controls SSH options and agent forwarding |
 | `--syq-auth-from <auto\|ssh\|@NAME\|HOST>` | Override SYQ_AUTH_FROM and saved authorization with auto, native SSH (ssh), or an authorization provider (@NAME or HOST). When omitted, use SYQ_AUTH_FROM, then the saved choice, then auto |
 | `--rsync-path <PATH>` | Use this exact syq executable on the remote instead of the managed helper |
 | `--syq-no-bootstrap` | Syq extension: require syq on the remote PATH instead of installing a versioned helper |
@@ -111,7 +111,7 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 |---|---|
 | `--progress` | Show progress (default when stderr is a terminal) |
 | `--no-progress` | Never show progress |
-| `--stats` | Print transfer statistics, worker waits, endpoint operations and CPU at the end |
+| `--stats` | Print transfer statistics at the end |
 
 ## Sources and selection
 

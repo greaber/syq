@@ -27,8 +27,8 @@ syq tuning-cache <COMMAND>
 
 ## syq tuning-cache list
 
-List recent transfers, newest first. The worker column shows `?` for
-transfers that did not record a count.
+List recent transfers, newest first. The worker column shows `?` for new
+transfers; only older records have a count.
 
 <!-- CLI: tuning-cache list -->
 ```text

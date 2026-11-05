@@ -49,10 +49,10 @@ syq rm [OPTIONS] --srcs-in DIR
 | `--root <DIR>` | Confine resolution and removal beneath DIR |
 | `--follow` | Like --follow-src; also follow symlinks in the --results path |
 | `--follow-src` | Follow symlinks in --cwd, --root, and selector parent directories; always unlink a final selected symlink |
-| `--src <PATH>` | Select a non-directory object; attach =PATH when it begins with `-` (repeatable) |
-| `--srcs-in <DIR>` | Recursively select a directory's contents, keeping the directory; attach =DIR when it begins with `-` (repeatable) |
-| `--src-non-dir <PATH>` | Select a non-directory object; attach =PATH when it begins with `-` (repeatable) |
-| `--src-dir <DIR>` | Select a directory tree; attach =DIR when it begins with `-` (repeatable) |
+| `--src <PATH>` | Select a non-directory object (repeatable) |
+| `--srcs-in <DIR>` | Recursively select a directory's contents, keeping the directory (repeatable) |
+| `--src-non-dir <PATH>` | Select a non-directory object (repeatable) |
+| `--src-dir <DIR>` | Select a directory tree (repeatable) |
 | `--src-non-dirs <PATH>...` | Select several non-directory objects |
 | `--src-dirs <DIR>...` | Select several directory trees |
 | `--srcs <PATH>...` | Select several non-directory objects |
@@ -98,6 +98,3 @@ Named paths, `--src`, and `--src-non-dir` require non-directories. Use
 contents and keep the directory; both reject a final symlink even when
 following is enabled. Syq checks every selection before deleting anything.
 Filters are not supported.
-
-If another program renames a selected directory during removal, the directory
-can survive under its new name even though removal succeeds.

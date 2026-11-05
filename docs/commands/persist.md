@@ -223,8 +223,9 @@ syq persist receive permissions remove [OPTIONS] <ID>
 
 Omitted settings keep their saved values. A new profile asks for approval with
 desktop prompts and uses your home directory; set `--root` to confine copies to
-a directory. Without `--connection`, the profile applies to existing and future
-connections. Changing access settings cancels the profile's active requests.
+a directory. Without `--connection`, a new profile applies to all existing and
+future connections, and an existing profile keeps its allowed list. Changing
+access settings cancels the profile's active requests.
 See [profile settings](../persistence-reference.md#names-and-profiles) and
 [copy limits](../persistence-reference.md#copy-limits).
 

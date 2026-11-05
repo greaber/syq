@@ -753,7 +753,7 @@ fn files_on_untrusted_filesystems_are_replaced() {
         set_mtime(&t.path("src/file"), 1_700_000_000);
         let before = inode(&t.path("dst/file"));
         let env = [("SYQ_TEST_UNTRUSTED_LINK_COUNTS", "1")];
-        let summary = "existing file instead of updating it in place: 1 on filesystems whose link counts syq does not trust";
+        let summary = "existing file instead of updating it in place: 1 where syq can't tell they have no other names";
         let out = cp_update(&t, route, &["--dry-run"], &env);
         assert_output_ok(&out);
         assert!(

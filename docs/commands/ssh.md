@@ -65,15 +65,10 @@ This needs:
   `IdentityFile` naming a public key there selects the matching key in the
   laptop's agent, and a `CertificateFile` can pair a user certificate with it.
 
-The laptop looks up the host key under the alias you typed, or your
-`HostKeyAlias`, using its own SSH configuration. The same alias can therefore
-use a private address between servers and a public one on the laptop, as long
-as both reach the same trusted host. `ProxyJump` hosts need their own
-approvals, and a custom `ProxyCommand` uses the requesting server's own
-authentication.
-
-Stopping receiving prevents new laptop-authorized logins, but sessions and
-commands that already authenticated are not guaranteed to end.
+The laptop looks up the host key under the alias you typed, with any port you
+wrote, or your `HostKeyAlias`, using its own SSH configuration. The same alias
+can therefore use a private address between servers and a public one on the
+laptop, as long as both reach the same trusted host.
 
 ## Commands and terminals
 

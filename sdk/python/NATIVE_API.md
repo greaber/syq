@@ -96,7 +96,7 @@ In addition to the shared arguments above, it accepts:
 | `where`, `copy_if` | Expression strings: `where` selects non-directory source entries; `copy_if` decides which entries the copy may create or update; see [expressions](https://greaber.github.io/syq/expressions.html) |
 | `ignore` | Pattern string, `IgnoreFrom(path)`, or ordered iterable of either |
 | `ignore_from` | Rule file path or iterable of paths; applied after `ignore` |
-| `copy_metadata` | Metadata string or iterable; applies even on unchanged files: `mtime`, `times` (alias for `mtime`), `permissions`, `ownership`, `specials`, `hardlinks`, `acls`, `xattrs`, `atimes`, `crtimes`; S3-to-S3 copies also accept `content-type`, `content-encoding`, `content-language`, `content-disposition`, `cache-control`, `expires`, `website-redirect`, `user-metadata`, `tags`, `storage-class`; see [S3 metadata](https://greaber.github.io/syq/object-storage.html#copies-between-s3-buckets) and [filesystem preservation](https://greaber.github.io/syq/reference.html#preserve-metadata) for platform and route support |
+| `copy_metadata` | Metadata string or iterable, with the values [`--copy-metadata`](https://greaber.github.io/syq/commands/cp.html#metadata-and-symlinks) accepts (`times` is an alias for `mtime`); applies even on unchanged files |
 | `open_noatime` | Boolean: request file reads without access-time updates; warns and continues if unavailable |
 | `sparse` | Boolean: turn written zero ranges into sparse holes on filesystem destinations |
 | `in_place` | `"new"`: write new files directly at their final names, with no staging file; existing files are still replaced. `"update"`: also update existing files in place, as `--in-place=update` does |
@@ -266,7 +266,7 @@ Directory and contents selectors reject a final symlink even with following
 enabled.
 
 `rm(*sources, **options)` → [RmResult](https://greaber.github.io/syq/python-results.html#rmresult) removes selected entries on local, SSH, or S3
-endpoints. Besides the shared arguments, it accepts `on`, `dry_run`,
+endpoints; restricted receivers refuse removal. Besides the shared arguments, it accepts `on`, `dry_run`,
 `performance_tuning`, `syq_path`, `no_bootstrap`, `pscope`, `on_event`,
 `results`, and `check` with the types above. `performance_tuning="workers=N"`
 fixes filesystem deletion concurrency, and `"s3-requests=N"` fixes it for S3.
@@ -452,8 +452,7 @@ of these to `cp(mapping=...)`; use `dataclasses.replace` to change an entry.
 
 `MappingEntry(src, dst, kind=None, size=None, mtime=None, expected_hash=None,
 metadata=None, s3_last_modified=None)` also accepts text or byte paths for
-`src` and `dst` and converts them to `RelativePath`. `size`, `mtime`, and
-`s3_last_modified` do not impose preconditions on the copy. `expected_hash` does: a file
+`src` and `dst` and converts them to `RelativePath`. With `expected_hash`, a file
 cannot succeed unless its contents match. For example, an adapter can supply
 an MD5 from a DVC manifest without changing syq's ordinary comparison algorithm:
 
@@ -890,7 +889,8 @@ and `map`); client constructors and module-level `run` have no client default
 to inherit.
 
 A timeout covers the syq process only, not a managed download or reading a
-mapping iterable before the process starts; async cancellation stops either.
+mapping iterable before the process starts; async cancellation also stops
+reading the iterable.
 
 For `syq exec`, pass `--cwd` in the argument list to select the receiving
 working directory. The SDK's `cwd=` parameter selects the local working

@@ -306,7 +306,8 @@ fn everyday_copy_controls_stay_visible_but_performance_overrides_do_not() {
         } else {
             "Performance tuning"
         }));
-        assert!(full.contains("Normal copies tune automatically"));
+        let unwrapped = full.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(unwrapped.contains("See the performance tuning reference"));
     }
     let short = help(&["cp", "--help"]);
     assert!(!short.contains("--auth-from"));

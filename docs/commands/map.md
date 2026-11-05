@@ -28,10 +28,10 @@ syq map [OPTIONS] --srcs-in DIR
 | `--root <DIR>` | Resolve source selectors beneath DIR and refuse any escape |
 | `--follow` | Follow symlinks in all directly supplied filesystem paths |
 | `--follow-src` | Follow symlinks in directly supplied source paths |
-| `--src <PATH>` | Select a named source object; attach =PATH when it begins with `-` (repeatable) |
-| `--srcs-in <DIR>` | Select a directory's contents; attach =DIR when it begins with `-` (repeatable) |
-| `--src-non-dir <PATH>` | Select a named non-directory source object; attach =PATH when it begins with `-` (repeatable) |
-| `--src-dir <DIR>` | Select a named source directory; attach =DIR when it begins with `-` (repeatable) |
+| `--src <PATH>` | Select a named source object (repeatable) |
+| `--srcs-in <DIR>` | Select a directory's contents (repeatable) |
+| `--src-non-dir <PATH>` | Select a named non-directory source object (repeatable) |
+| `--src-dir <DIR>` | Select a named source directory (repeatable) |
 | `--src-non-dirs <PATH>...` | Select several named non-directory source objects |
 | `--src-dirs <DIR>...` | Select several named source directories |
 | `--srcs <PATH>...` | Select several named source objects |
@@ -53,10 +53,10 @@ syq map [OPTIONS] --srcs-in DIR
 
 | Argument / option | Meaning |
 |---|---|
-| `--rsh <COMMAND>` | Remote shell command (default: ssh). An ssh command still uses persistent connections unless its options set up connection sharing |
+| `--rsh <COMMAND>` | Remote shell command (default: ssh) |
 | `--syq-path <PATH>` | Use this remote syq executable instead of installing a helper |
 | `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |
-| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Use an approved SSH account connection, or native SSH authentication |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | How to authorize SSH access: auto, ssh (native SSH only), @NAME (a receiving machine), or HOST (an SSH provider) |
 | `--pscope <PATH>` | Use an isolated persistence domain created by `syq persist on --ephemeral` |
 
 ## Object storage
@@ -113,8 +113,9 @@ when the mapping is copied. Sizes and timestamps are information for your own
 filters and do not change copying. Both timestamps are Unix seconds: `mtime` is
 the file's modification time, which for S3 is the time syq stored and is
 omitted when there is none, and `s3_last_modified` is S3's own object time.
-Requesting `kind` or `mtime` from S3 reads object metadata; `map` never
-downloads object bodies.
+`size` and `mtime` appear only on regular files, and only S3 sources can
+request `s3_last_modified`. Requesting `kind` or `mtime` from S3 reads object
+metadata; `map` never downloads object bodies.
 
 `--where` selects entries with the same [expressions](../expressions.md) as
 `cp`, and as in `cp` it does not filter directories. A condition can use fields

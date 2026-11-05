@@ -78,14 +78,15 @@ terminal in the session you want. Stdin is closed and there is no terminal.
 ## Output, completion and cancellation
 
 Stdout and stderr stream back to your terminal, and syq returns the command's
-exit code, or `128 + signal` if a signal killed it. Commands are not retried,
-and completed file changes are not rolled back.
+exit code, or `128 + signal` if a signal killed it. Setup failures, and losing
+the connection before the status arrives, also exit nonzero. Commands are not
+retried, and completed file changes are not rolled back.
 
 Interrupting the request, stopping or changing receiving, or losing the
 connection kills the command's process group without running its cleanup
 handlers. Processes left in that group are also stopped when the program exits,
 but detached processes and applications started through macOS `open` can
-survive. Commands do not write copy result records.
+survive.
 
 ## Execution details
 

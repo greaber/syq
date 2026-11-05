@@ -32,7 +32,7 @@ const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope\n";
 #[command(
     name = "syq persist",
     about = "Manage persistent SSH connections, receiving, and return destinations",
-    long_about = "Manage reusable SSH connections and background receiving. syq persist on keeps connections open for later syq commands, with no idle timeout; syq persist connect HOST connects now without copying files, and with --auth-from PROVIDER prepares an approved account login. Receiving asks for local approval of each copy by default; configure it with syq persist receive. An isolated scope, created with on --ephemeral and selected with --pscope, keeps its own connections, receiving profiles, and authorization settings; its idle connections expire, and closing it stops its services and removes its settings."
+    long_about = "Manage reusable SSH connections and background receiving. syq persist on keeps connections open for later commands, and syq persist connect HOST connects now. Receiving asks you to approve each copy by default; configure it with syq persist receive. For an isolated setup, see on --ephemeral and --pscope."
 )]
 struct PersistCommand {
     /// Select an isolated persistence domain instead of the default domain

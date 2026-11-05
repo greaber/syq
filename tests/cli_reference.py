@@ -208,7 +208,10 @@ def main():
                         for signature, description in rows if signature.startswith(flag + " ")]
         if len(descriptions) != 1:
             raise ValueError(f"missing advanced group in cp help: {flag}")
+        # Keys appear as KEY=VALUE descriptions or as a "Keys: a, b." list.
         keys = set(re.findall(r"(?<![\w-])([a-z][a-z-]*)=", descriptions[0]))
+        for listed in re.findall(r"Keys: ([a-z0-9, -]+)\.", descriptions[0]):
+            keys |= {key for key in listed.split(", ") if re.fullmatch(r"[a-z][a-z-]*", key)}
         text = (ROOT / "docs" / page).read_text()
         documented = set(re.findall(r"^\| `([a-z][a-z-]*)` \|", text, re.M))
         if keys != documented:

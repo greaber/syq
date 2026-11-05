@@ -277,7 +277,7 @@ pub(crate) fn filesystem(command: Command) -> Command {
                 "Fix removal concurrency, which syq otherwise adjusts as it runs. Keys:\n\nworkers=N: filesystem removal workers, 1..65536.\ns3-requests=N: simultaneous S3 delete requests, 1..65536.\n\nLeave it unset unless you are investigating a performance problem."
             });
         } else if id == "verbose" && !map {
-            arg = arg.help("List files with -v; explain helpers and transport with -vv");
+            arg = arg.help("List files with -v; show connection details with -vv");
         }
         arg
     });
