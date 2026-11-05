@@ -73,9 +73,7 @@ helpers and installation exceptions.
 ## Updates
 
 Use `syq --self-update` for a standalone installation, or `brew upgrade syq`
-for Homebrew. Commands already running keep their own version. A receiving
-connection started before the update refuses new requests and names the
-command that restarts it; see [Updating connections](persistence-reference.md#updating-connections).
+for Homebrew. Commands already running keep their own version.
 
 When a newer release is out, standalone and Homebrew installs remind you in a
 terminal, at most once a day after a successful command, and name the upgrade
@@ -109,8 +107,7 @@ syq completion fish | source
 ```
 
 Completion suggests options, hosts, and paths, including remote paths over
-your usual SSH login. Open a new shell after adding the setup line or
-upgrading syq. See [`syq completion`](commands/completion.md) for all options.
+your usual SSH login. Open a new shell after adding the setup line. See [`syq completion`](commands/completion.md) for all options.
 
 ## Keep connections open
 
