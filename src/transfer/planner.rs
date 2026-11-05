@@ -312,6 +312,23 @@ pub(super) fn path_is_inside(path: &[u8], root: &[u8]) -> bool {
     path.starts_with(root) && (root.ends_with(b"/") || path.get(root.len()) == Some(&b'/'))
 }
 
+/// The paths of `roots`, sorted by path, that lie inside `root`. They all
+/// begin with `root` and a separator, so they sort together: finding them
+/// costs a binary search rather than a comparison with every root.
+pub(super) fn roots_inside<T>(roots: &[(PathBytes, T)], root: &[u8]) -> Vec<PathBytes> {
+    let mut prefix = root.to_vec();
+    if !prefix.ends_with(b"/") {
+        prefix.push(b'/');
+    }
+    let start = roots.partition_point(|(path, _)| path.as_slice() < prefix.as_slice());
+    roots[start..]
+        .iter()
+        .take_while(|(path, _)| path.starts_with(&prefix))
+        .filter(|(path, _)| path != root)
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
 /// Everything the planner decided about one source entry, made once in the
 /// mapping loop so the directory pass and the per-kind arms can't disagree.
 pub(super) struct Planned {
@@ -3760,11 +3777,7 @@ impl Planner<'_> {
             // Every root is walked with its own --ignore anchoring. A root nested in
             // this one (`syq rsync --delete a b/ dst`: dst/a inside dst) is left to
             // its own walk, so its patterns apply and nothing is deleted twice.
-            let nested: Vec<PathBytes> = roots
-                .iter()
-                .filter(|(r, _)| *r != root && path_is_inside(r, &root))
-                .map(|(r, _)| r.clone())
-                .collect();
+            let nested = roots_inside(&roots, &root);
             // Not there yet (a dry run into a new destination): nothing to delete.
             if stat_one(self.dst, &root, false)?.is_none() {
                 continue;

@@ -3401,8 +3401,11 @@ impl FsOps {
                 .check_searchable_operator_directory(path, *allow_missing, *symlink_policy)
                 .with_context(|| format!("resolve operator directory {}", resolve(path).display()))
                 .map(Response::DirectorySelection),
-            Request::CheckOperatorDirectoryAncestry { checks } => self
-                .check_operator_directory_ancestry(checks, None)
+            Request::CheckOperatorDirectoryAncestry {
+                checks,
+                shared_suffixes,
+            } => self
+                .check_operator_directory_ancestry(checks, shared_suffixes, None)
                 .map(Response::DirectoryRelations),
             Request::ReceiverUser => Ok(Response::ReceiverUser(crate::rooted::own_uid())),
             Request::NewFileOwner { path, probe } => {
@@ -3455,9 +3458,14 @@ impl FsOps {
                 .map(|()| Response::Ok),
             Request::CheckOperatorDirectoryAncestryWithAccess {
                 checks,
+                shared_suffixes,
                 selection_in_copy,
             } => self
-                .check_operator_directory_ancestry(checks, Some(*selection_in_copy))
+                .check_operator_directory_ancestry(
+                    checks,
+                    shared_suffixes,
+                    Some(*selection_in_copy),
+                )
                 .map(Response::DirectoryRelations),
             Request::RegisterSourceRoots {
                 base,

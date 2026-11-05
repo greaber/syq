@@ -206,7 +206,7 @@ pub(super) fn planning(control: Option<Duration>, workers: usize, request_limit:
 }
 pub(super) fn finish() {
     if let Some(trace) = trace() {
-        eprintln!(
+        crate::output::diagnostic!(
             "S3_DIAGNOSTICS {}",
             json!({"events":*trace.events.lock().unwrap(),"elapsed_s":trace.start.elapsed().as_secs_f64()})
         );

@@ -1,5 +1,6 @@
 //! Human output must not change the outcome of a filesystem operation.
-//! These writes can still block; they deliberately do not buffer or drop slow output.
+//! These writes can still block; they deliberately do not buffer or drop slow
+//! output. Output that fails to write, as to a closed pipe, is dropped.
 
 use std::fmt::Arguments;
 use std::io::{self, IsTerminal, Write};
@@ -127,6 +128,35 @@ pub(crate) fn warn_stdout(error: &io::Error) {
     }
 }
 
+/// Pass another process's human output through to ours. After a write
+/// fails, keep reading and drop the rest. Closing the pipe instead would fail
+/// the other process's writes, and an OpenSSH client that cannot write a
+/// session's stderr stops crediting its flow-control window, which stalls
+/// the session once enough stderr arrives. Returns the first write error.
+pub(crate) fn pass_through(
+    mut input: impl io::Read,
+    output: &mut impl Write,
+) -> io::Result<Option<io::Error>> {
+    let mut buffer = [0; 8192];
+    let mut failed = None;
+    loop {
+        let count = match input.read(&mut buffer) {
+            Ok(0) => return Ok(failed),
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if failed.is_none() {
+            if let Err(error) = output
+                .write_all(&buffer[..count])
+                .and_then(|()| output.flush())
+            {
+                failed = Some(error);
+            }
+        }
+    }
+}
+
 macro_rules! diagnostic {
     ($($arg:tt)*) => { $crate::output::emit_diagnostic(format_args!($($arg)*)) };
 }
@@ -140,6 +170,32 @@ pub(crate) use human_stdout;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pass_through_keeps_reading_after_its_output_fails() {
+        struct Closed(usize);
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                self.0 += 1;
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let input = vec![7; 100_000];
+        let mut reader = io::Cursor::new(input);
+        let mut output = Closed(0);
+        let error = pass_through(&mut reader, &mut output).unwrap().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(reader.position(), 100_000, "the writer must be drained");
+        assert_eq!(output.0, 1, "output stops at the first failure");
+
+        let mut output = Vec::new();
+        let input = b"passed through".as_slice();
+        assert!(pass_through(input, &mut output).unwrap().is_none());
+        assert_eq!(output, b"passed through");
+    }
 
     #[test]
     fn concurrent_process_diagnostics_do_not_split_lines() {

@@ -2459,3 +2459,92 @@ fn connecting_again_replaces_a_receiving_connection_from_another_build() {
     assert_eq!(status(false)["identity"], build.trim());
     assert_eq!(read(&scope.join("receive.json")), settings);
 }
+
+/// A server that refuses remote forwarding cannot carry receiving, however
+/// often syq dials it: the connection fails with a status saying why,
+/// instead of logging in again every half minute for as long as receiving
+/// stays enabled.
+#[test]
+fn a_server_refusing_remote_forwarding_is_not_redialed() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    fs::create_dir(t.path("root")).unwrap();
+    fs::create_dir(t.path("home")).unwrap();
+    let ssh = fake_ssh(&t);
+    // The receiving connection asks for its return socket with -R, which
+    // this server refuses the way OpenSSH reports it.
+    executable(
+        &t.path("refusing-bin/ssh"),
+        format!(
+            "#!/bin/sh\n\
+             for argument in \"$@\"; do\n\
+             \x20   if [ \"$argument\" = -R ]; then\n\
+             \x20       echo dialed >> \"$FAKE_FORWARD_LOG\"\n\
+             \x20       echo 'Error: remote port forwarding failed for listen path /tmp/syq-return-test.sock' >&2\n\
+             \x20       exit 255\n\
+             \x20   fi\n\
+             done\n\
+             exec {} \"$@\"\n",
+            ssh.display()
+        )
+        .as_bytes(),
+    );
+    let scope = ephemeral_scope(&t);
+    let _off = ScopeOff(&t, scope.clone());
+    let run = |args: &[&str]| {
+        persistence_command(&t, args)
+            .args(["--pscope", scope.to_str().unwrap()])
+            .env("HOME", t.path("home"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("FAKE_FORWARD_LOG", t.path("forward.log"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", t.path("refusing-bin").display()),
+            )
+            .run()
+            .unwrap()
+    };
+    assert_output_ok(&run(&[
+        "receive",
+        "on",
+        "--notify",
+        "off",
+        "--root",
+        &t.s("root"),
+        "--all-connections",
+    ]));
+    let started = std::time::Instant::now();
+    let connect = run(&[
+        "connect",
+        "test-server",
+        "--timeout",
+        "20",
+        "--syq-path",
+        env!("CARGO_BIN_EXE_syq"),
+    ]);
+    assert!(!connect.status.success(), "{connect:?}");
+    let stderr = stderr_of(&connect);
+    assert!(stderr.contains("refuses remote forwarding"), "{stderr}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "connect waited for its whole timeout: {stderr}"
+    );
+    // A redial would come one second after the refusal, then two more.
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    assert_eq!(read(&t.path("forward.log")), b"dialed\n");
+    let status = run(&["receive", "status", "--json"]);
+    assert_output_ok(&status);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let connection = &status["connections"][0]["connection"];
+    assert_eq!(connection["phase"], "failed", "{status}");
+    assert!(
+        connection["error"]
+            .as_str()
+            .unwrap()
+            .contains("refuses remote forwarding"),
+        "{status}"
+    );
+}

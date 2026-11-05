@@ -263,6 +263,24 @@ pub(crate) fn capture_output_bounded(
     cancelled: &dyn Fn() -> bool,
     max_output_bytes: usize,
 ) -> std::io::Result<Output> {
+    capture_output_bounded_with(
+        command,
+        deadline,
+        cancelled,
+        max_output_bytes,
+        &mut std::thread::sleep,
+    )
+}
+
+/// `capture_output_bounded`, waiting with `wait` before each new look for
+/// the exit of a command that has closed its output.
+fn capture_output_bounded_with(
+    command: &mut Command,
+    deadline: std::time::Instant,
+    cancelled: &dyn Fn() -> bool,
+    max_output_bytes: usize,
+    wait: &mut dyn FnMut(std::time::Duration),
+) -> std::io::Result<Output> {
     use std::io::{self, Read};
     use std::os::fd::{AsRawFd, RawFd};
     use std::time::{Duration, Instant};
@@ -336,6 +354,12 @@ pub(crate) fn capture_output_bounded(
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let (mut out_done, mut err_done) = (false, false);
     let mut total = 0;
+    // The longest wait between checks of the deadline and cancellation.
+    const CHECK_INTERVAL: Duration = Duration::from_millis(20);
+    // How long to wait before looking again for the exit of a command that
+    // has closed its output: briefly at first, since it is usually exiting
+    // already, then up to the check interval for one that lingers.
+    let mut exit_wait = Duration::from_micros(100);
     loop {
         check(deadline, cancelled)?;
         if !out_done {
@@ -360,6 +384,9 @@ pub(crate) fn capture_output_bounded(
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error),
             }
+            wait(exit_wait.min(deadline.saturating_duration_since(Instant::now())));
+            exit_wait = (exit_wait * 2).min(CHECK_INTERVAL);
+            continue;
         }
         let mut descriptors = [
             libc::pollfd {
@@ -375,7 +402,7 @@ pub(crate) fn capture_output_bounded(
         ];
         let timeout = deadline
             .saturating_duration_since(Instant::now())
-            .min(Duration::from_millis(20))
+            .min(CHECK_INTERVAL)
             .as_millis() as i32;
         let result = unsafe {
             libc::poll(
@@ -530,6 +557,40 @@ mod bounded_tests {
         assert_eq!(output.status.code(), Some(17));
         assert_eq!(output.stdout, b"output");
         assert_eq!(output.stderr, b"error");
+    }
+
+    #[test]
+    fn looks_for_the_exit_soon_after_the_output_closes() {
+        // A command that has closed its output is about to exit, as ssh is
+        // once it has printed its configuration; waiting a whole check
+        // interval for that would add the interval to every SSH
+        // configuration check. Record the waits rather than time the
+        // command, whose start-up time varies widely between hosts.
+        let mut waits = Vec::new();
+        let output = capture_output_bounded_with(
+            Command::new("sh").args(["-c", "printf done; exec >&- 2>&-; sleep 0.2"]),
+            Instant::now() + Duration::from_secs(10),
+            &|| false,
+            64,
+            &mut |wait| {
+                waits.push(wait);
+                std::thread::sleep(wait);
+            },
+        )
+        .unwrap();
+        assert_eq!(output.stdout, b"done");
+        assert!(output.status.success());
+        let interval = Duration::from_millis(20);
+        assert!(
+            waits
+                .first()
+                .is_some_and(|first| *first <= Duration::from_millis(1)),
+            "{waits:?}"
+        );
+        // Then less and less often, never longer than the check interval.
+        for pair in waits.windows(2) {
+            assert_eq!(pair[1], (pair[0] * 2).min(interval), "{waits:?}");
+        }
     }
 
     #[test]

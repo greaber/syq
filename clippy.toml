@@ -18,3 +18,11 @@ disallowed-methods = [
     "libc::execv",
     "libc::execvp",
 ]
+
+# Denied outside tests by src/main.rs. These panic when stderr is closed, as
+# under `2>&1 | head`, and a panicking transfer thread can leave a copy
+# unfinished. crate::output::diagnostic! drops output it cannot write.
+disallowed-macros = [
+    { path = "std::eprint", reason = "panics when stderr is closed; use crate::output::diagnostic!" },
+    { path = "std::eprintln", reason = "panics when stderr is closed; use crate::output::diagnostic!" },
+]

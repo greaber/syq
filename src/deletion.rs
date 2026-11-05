@@ -125,7 +125,7 @@ impl Control {
                 self.sampler.reset();
                 #[cfg(debug_assertions)]
                 if std::env::var_os("SYQ_TEST_DELETE_TUNING").is_some() {
-                    eprintln!(
+                    crate::output::diagnostic!(
                         "syq: deletion workers {before} -> {} ({score:.0} entries/s)",
                         self.limit()
                     );

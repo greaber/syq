@@ -655,6 +655,8 @@ pub struct RemoteConn {
     observation: std::sync::Arc<crate::transfer_observations::RemoteSample>,
     child: Option<Child>,
     approved_login: Option<crate::destination::ssh::workers::Guard>,
+    /// Lets the copy end this worker's login while it is still being set up.
+    worker_setup: Option<SetupWatch>,
     w: FrameWriter<Box<dyn Write + Send>>,
     /// Responses are parsed on a reader thread so the network keeps flowing
     /// while the caller processes the previous one.
@@ -886,10 +888,10 @@ impl RemoteConn {
         );
         let (rx, reader, batch_receipts) =
             spawn_observed_reader(Box::new(session.stdout), replies, None, observation.clone())?;
-        let mut stderr = session.stderr;
+        let stderr = session.stderr;
         std::thread::Builder::new()
             .spawn(move || {
-                let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
+                let _ = crate::output::pass_through(stderr, &mut std::io::stderr());
             })
             .map_err(crate::resources::allocation_error)
             .context("start pooled stderr reader")?;
@@ -899,6 +901,7 @@ impl RemoteConn {
             observation,
             child: None,
             approved_login: None,
+            worker_setup: None,
             w: FrameWriter::with_preamble_written(Box::new(session.stdin), compress),
             rx: Some(rx),
             replies,
@@ -944,9 +947,10 @@ impl RemoteConn {
 
     fn io_err(&mut self, e: anyhow::Error) -> anyhow::Error {
         self.dead = true;
-        // The watcher may signal this child. Stop it before try_wait can reap
-        // the process and allow the kernel to reuse its PID.
+        // The watchers may signal this child. Stop them before try_wait can
+        // reap the process and allow the kernel to reuse its PID.
         self.approved_login.take();
+        self.worker_setup.take();
         let detail = format!("{e:#}");
         // If the child has exited (or does so shortly), that's usually the
         // more useful error. A multiplexed SSH refusal in particular must win
@@ -1428,6 +1432,9 @@ impl Conn for RemoteConn {
 
 impl Drop for RemoteConn {
     fn drop(&mut self) {
+        // Stop the setup watch before the child is reaped below, so that
+        // its PID cannot be reused while registered.
+        self.worker_setup.take();
         // Cancel the reply collector before joining the underlying response
         // reader: otherwise it still owns the channel receiver on an unwind.
         if let Some(stream) = self.write_stream.take() {
@@ -1504,13 +1511,144 @@ static CONNECTS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
 static CONNECTS_CV: std::sync::Condvar = std::sync::Condvar::new();
 
 struct ConnectSlot;
-fn connect_slot() -> ConnectSlot {
+fn connect_slot(setups: Option<&std::sync::Arc<WorkerSetups>>) -> Result<ConnectSlot> {
     let mut n = CONNECTS.lock().unwrap();
     while *n >= CONNECT_LIMIT.load(std::sync::atomic::Ordering::Relaxed) {
+        if setups.is_some_and(|setups| setups.cancelled()) {
+            // Pass on a wakeup this waiter may have taken from a released slot.
+            drop(n);
+            CONNECTS_CV.notify_one();
+            return Err(SetupCancelled.into());
+        }
         n = CONNECTS_CV.wait(n).unwrap();
     }
     *n += 1;
-    ConnectSlot
+    Ok(ConnectSlot)
+}
+
+/// A worker connection setup ended because its copy no longer needed it.
+#[derive(Debug)]
+pub(crate) struct SetupCancelled;
+impl std::fmt::Display for SetupCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("worker connection setup cancelled: the copy has ended")
+    }
+}
+impl std::error::Error for SetupCancelled {}
+
+/// The data connections one copy is still setting up. Once the copy has
+/// finished or failed, none of them can be used, so `cancel` ends them: it
+/// terminates their login processes and stops their retries and waits for a
+/// connection slot. Connections already set up are not affected. Whether
+/// the copy has ended is asked of the copy each time (`ended`), never
+/// remembered: work queued again after a moment that looked like the end
+/// gets its connections.
+#[derive(Default)]
+pub(crate) struct WorkerSetups {
+    state: std::sync::Mutex<SetupState>,
+    wake: std::sync::Condvar,
+    ended: std::sync::OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
+}
+
+#[derive(Default)]
+struct SetupState {
+    next: u64,
+    /// Unreaped login processes and whether each leads its own process group.
+    logins: std::collections::HashMap<u64, (libc::pid_t, bool)>,
+}
+
+/// SIGTERM, not SIGKILL: ssh restores the terminal if it was asking for a
+/// password, and a multiplexing client releases its channel on the master.
+/// An ordinary login shares syq's process group so that ssh can prompt on the
+/// terminal; only the process syq started is signalled then, and anything it
+/// started in turn, such as a ProxyCommand, ends when its connection closes.
+fn end_login(pid: libc::pid_t, group: bool) {
+    unsafe { libc::kill(if group { -pid } else { pid }, libc::SIGTERM) };
+}
+
+impl WorkerSetups {
+    /// Ask `ended` whether the copy has finished or failed. It must not wait
+    /// for anything that calls `cancel`.
+    pub(crate) fn set_ended(&self, ended: impl Fn() -> bool + Send + Sync + 'static) {
+        assert!(
+            self.ended.set(Box::new(ended)).is_ok(),
+            "worker setups already watch a copy"
+        );
+    }
+
+    /// The copy has ended, so the setups under way cannot be used: end
+    /// their logins and wake their waits.
+    pub(crate) fn cancel(&self) {
+        let state = self.state.lock().unwrap();
+        for &(pid, group) in state.logins.values() {
+            end_login(pid, group);
+        }
+        drop(state);
+        self.wake.notify_all();
+        // Taking the lock orders this wakeup after any waiter's check.
+        drop(CONNECTS.lock().unwrap());
+        CONNECTS_CV.notify_all();
+    }
+
+    /// Whether the copy has ended, as it says now.
+    pub(crate) fn cancelled(&self) -> bool {
+        self.ended.get().is_some_and(|ended| ended())
+    }
+
+    /// Wait before a retry, unless the copy ends first.
+    pub(crate) fn sleep(&self, delay: std::time::Duration) -> Result<()> {
+        let state = self.state.lock().unwrap();
+        let _ = self
+            .wake
+            .wait_timeout_while(state, delay, |_| !self.cancelled())
+            .unwrap();
+        if self.cancelled() {
+            return Err(SetupCancelled.into());
+        }
+        Ok(())
+    }
+
+    /// Let `cancel` end this unreaped login process, or end it now if the copy
+    /// has already ended.
+    fn watch(self: &std::sync::Arc<Self>, pid: u32, group: bool) -> SetupWatch {
+        let pid = pid as libc::pid_t;
+        let mut state = self.state.lock().unwrap();
+        if self.cancelled() {
+            end_login(pid, group);
+        }
+        let id = state.next;
+        state.next += 1;
+        state.logins.insert(id, (pid, group));
+        SetupWatch {
+            setups: self.clone(),
+            id,
+        }
+    }
+}
+
+/// A login process `WorkerSetups::cancel` may still end. Drop this BEFORE
+/// reaping the process, so its PID cannot be reused while registered.
+pub(crate) struct SetupWatch {
+    setups: std::sync::Arc<WorkerSetups>,
+    id: u64,
+}
+
+impl SetupWatch {
+    /// The connection is ready: from now on the copy keeps it, unless the
+    /// copy ended first.
+    fn finish(self) -> Result<()> {
+        self.setups.state.lock().unwrap().logins.remove(&self.id);
+        if self.setups.cancelled() {
+            return Err(SetupCancelled.into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SetupWatch {
+    fn drop(&mut self) {
+        self.setups.state.lock().unwrap().logins.remove(&self.id);
+    }
 }
 
 /// A data connect failed in a way that looks like the server shedding load:
@@ -1565,6 +1703,12 @@ pub struct TcpCandidate {
     /// None means the probe did not finish before route selection.
     pub reachable: Option<bool>,
     pub selected: bool,
+    /// Whether this address and the SSH target name lead to the same place:
+    /// for an advertised address, the name resolved to it; for the SSH
+    /// target, every address the name resolved to was advertised too.
+    /// Diagnostics then show the address once, under the name the user gave.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub same_as_ssh_target: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2062,13 +2206,13 @@ impl RemoteSpec {
         } else {
             ConnectionRole::Control
         };
-        self.connect_with_role(compress, limited, role, false, false)
+        self.connect_with_role(compress, limited, role, false, false, None)
     }
 
     /// Ordinary SSH settings, with diagnostics inspected only to decide whether
     /// automatic authorization can try another machine after a recognized failure.
     pub(crate) fn connect_for_authorization(&self, compress: bool) -> Result<RemoteConn> {
-        self.connect_with_role(compress, false, ConnectionRole::Control, false, true)
+        self.connect_with_role(compress, false, ConnectionRole::Control, false, true, None)
     }
 
     /// One non-retrying control connection for speculative shell completion.
@@ -2080,7 +2224,7 @@ impl RemoteSpec {
             return Ok(conn);
         }
         let role = ConnectionRole::Control;
-        let first = self.connect_once(false, SshConnection::Control, role.clone(), false);
+        let first = self.connect_once(false, SshConnection::Control, role.clone(), false, None);
         let Err(first_error) = first else {
             return first;
         };
@@ -2088,7 +2232,7 @@ impl RemoteSpec {
             return Err(first_error);
         }
         self.install_helper()?;
-        self.connect_once(false, SshConnection::Control, role, false)
+        self.connect_once(false, SshConnection::Control, role, false, None)
             .with_context(|| {
                 format!(
                     "could not start the {} helper installed on {}",
@@ -2105,6 +2249,7 @@ impl RemoteSpec {
         role: ConnectionRole,
         first_worker: bool,
         classify_ssh_failure: bool,
+        setups: Option<&std::sync::Arc<WorkerSetups>>,
     ) -> Result<RemoteConn> {
         if matches!(role, ConnectionRole::Control) {
             // Automatic authorization may already have opened this exact
@@ -2127,6 +2272,7 @@ impl RemoteSpec {
             role.clone(),
             first_worker,
             classify_ssh_failure,
+            setups,
         );
         let Err(first_error) = first else {
             return first;
@@ -2136,14 +2282,21 @@ impl RemoteSpec {
         }
 
         self.install_helper()?;
-        self.connect_retried(compress, limited, role, first_worker, classify_ssh_failure)
-            .with_context(|| {
-                format!(
-                    "could not start the {} helper installed on {}",
-                    remote_helper::helper_identity(),
-                    self.label()
-                )
-            })
+        self.connect_retried(
+            compress,
+            limited,
+            role,
+            first_worker,
+            classify_ssh_failure,
+            setups,
+        )
+        .with_context(|| {
+            format!(
+                "could not start the {} helper installed on {}",
+                remote_helper::helper_identity(),
+                self.label()
+            )
+        })
     }
 
     fn connect_retried(
@@ -2153,6 +2306,7 @@ impl RemoteSpec {
         role: ConnectionRole,
         mut first_worker: bool,
         classify_ssh_failure: bool,
+        setups: Option<&std::sync::Arc<WorkerSetups>>,
     ) -> Result<RemoteConn> {
         let mut delay = std::time::Duration::from_millis(200);
         let mut last = None;
@@ -2161,10 +2315,20 @@ impl RemoteSpec {
         // repeated authentication or deterministic local configuration errors.
         let attempts = if limited { 6 } else { 1 };
         for attempt in 0..attempts {
-            let _slot = limited.then(connect_slot);
+            let _slot = limited.then(|| connect_slot(setups)).transpose()?;
             let ssh_connection = self.ssh_connection(limited, first_worker);
-            match self.connect_once(compress, ssh_connection, role.clone(), classify_ssh_failure) {
+            match self.connect_once(
+                compress,
+                ssh_connection,
+                role.clone(),
+                classify_ssh_failure,
+                setups,
+            ) {
                 Ok(c) => return Ok(c),
+                // Ending the copy's setups may itself have caused the failure.
+                Err(_) if setups.is_some_and(|setups| setups.cancelled()) => {
+                    return Err(SetupCancelled.into());
+                }
                 Err(e)
                     if ssh_connection == SshConnection::Worker
                         && is_multiplexed_ssh_session_error(&e) =>
@@ -2209,7 +2373,10 @@ impl RemoteSpec {
                         );
                     }
                     last = Some(e);
-                    std::thread::sleep(delay);
+                    match setups {
+                        Some(setups) => setups.sleep(delay)?,
+                        None => std::thread::sleep(delay),
+                    }
                     delay *= 2;
                 }
             }
@@ -2239,6 +2406,7 @@ impl RemoteSpec {
             observation,
             child: None,
             approved_login: None,
+            worker_setup: None,
             w: FrameWriter::new(Box::new(stream.try_clone()?), compress),
             rx: Some(rx),
             replies,
@@ -2265,7 +2433,11 @@ impl RemoteSpec {
         ssh_connection: SshConnection,
         role: ConnectionRole,
         classify_ssh_failure: bool,
+        setups: Option<&std::sync::Arc<WorkerSetups>>,
     ) -> Result<RemoteConn> {
+        if setups.is_some_and(|setups| setups.cancelled()) {
+            return Err(SetupCancelled.into());
+        }
         // The receiver child is on this machine, not across the network.
         // Recompressing forwarded blocks here adds CPU work to downloads.
         let compress = compress && !self.local_process;
@@ -2465,12 +2637,14 @@ impl RemoteSpec {
                 return Err(error);
             }
         };
+        let worker_setup = setups.map(|setups| setups.watch(child.id(), independent_approved));
         let conn = RemoteConn {
             batch_receipts,
             transport_stop: pacing.as_ref().map(|p| p.scheduler.clone()),
             observation,
             child: Some(child),
             approved_login,
+            worker_setup,
             w: FrameWriter::with_admission(writer, compress, admission),
             rx: Some(rx),
             replies,
@@ -2490,7 +2664,7 @@ impl RemoteSpec {
         if let ConnectionRole::SourceWorker { send_budget, .. } = &mut role {
             *send_budget = pacing.as_ref().and_then(|p| p.source_budget.clone());
         }
-        let conn = hello(conn, compress, Vec::new(), role).map_err(|mut error| {
+        let mut conn = hello(conn, compress, Vec::new(), role).map_err(|mut error| {
             // Drain diagnostics before reporting any error, including helper
             // errors. A ProxyCommand descendant may keep stderr open after ssh
             // exits, so bound the wait and leave unclassified failures alone.
@@ -2511,6 +2685,9 @@ impl RemoteSpec {
             }
             error
         })?;
+        if let Some(setup) = conn.worker_setup.take() {
+            setup.finish()?;
+        }
         if let Some(login) = &conn.approved_login {
             // SSH and the exact helper are authenticated. The original
             // approved master now owns the worker's lifetime; release the
@@ -2730,6 +2907,7 @@ impl RemoteSpec {
                 source: DataAddressSource::RemoteInterface,
                 reachable: None,
                 selected: false,
+                same_as_ssh_target: false,
             })
             .collect();
         // Always also try the name we reached ssh through: a server behind
@@ -2752,6 +2930,7 @@ impl RemoteSpec {
                         source: DataAddressSource::SshTarget,
                         reachable: None,
                         selected: false,
+                        same_as_ssh_target: false,
                     },
                 );
             }
@@ -2955,6 +3134,7 @@ impl RemoteSpec {
             observation,
             child: None,
             approved_login: None,
+            worker_setup: None,
             w: FrameWriter::new(Box::new(writer), compress),
             rx: Some(rx),
             replies,
@@ -3057,6 +3237,8 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) -> Result<()> {
         }
     }
 
+    mark_ssh_target_addresses(candidates, &resolved);
+
     // Probe each distinct socket address once. An advertised literal and the
     // ssh target name commonly resolve to the same address; one probe answers
     // for every candidate that led there.
@@ -3100,6 +3282,32 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) -> Result<()> {
         std::time::Instant::now() + timeout + std::time::Duration::from_millis(100),
     );
     Ok(())
+}
+
+/// Note which advertised addresses the SSH target name resolved to, and
+/// whether it resolved to nothing else (`TcpCandidate::same_as_ssh_target`).
+fn mark_ssh_target_addresses(candidates: &mut [TcpCandidate], resolved: &[Vec<SocketAddr>]) {
+    let Some(target) = candidates
+        .iter()
+        .position(|candidate| candidate.source == DataAddressSource::SshTarget)
+    else {
+        return;
+    };
+    let target_addresses = &resolved[target];
+    let mut advertised = std::collections::HashSet::new();
+    for (index, addresses) in resolved.iter().enumerate() {
+        if index == target {
+            continue;
+        }
+        advertised.extend(addresses.iter().copied());
+        candidates[index].same_as_ssh_target = addresses
+            .iter()
+            .any(|address| target_addresses.contains(address));
+    }
+    candidates[target].same_as_ssh_target = !target_addresses.is_empty()
+        && target_addresses
+            .iter()
+            .all(|address| advertised.contains(address));
 }
 
 fn collect_probe_results(
@@ -3380,7 +3588,7 @@ impl Endpoint {
     }
 
     pub(crate) fn connect_control(&self, compress: bool) -> Result<Box<dyn Conn>> {
-        self.connect_with_role(compress, ConnectionRole::Control, false)
+        self.connect_with_role(compress, ConnectionRole::Control, false, None)
     }
 
     pub(crate) fn connect_stream(
@@ -3394,14 +3602,18 @@ impl Endpoint {
             compress,
             ConnectionRole::StreamWorker { ticket, settings },
             first_worker,
+            None,
         )
     }
 
+    /// `setups` lets a copy end this connection's setup once it is no
+    /// longer needed.
     pub(crate) fn connect_with_sources(
         &self,
         compress: bool,
         roots: Vec<RegisteredSourceRoot>,
         first_worker: bool,
+        setups: Option<&std::sync::Arc<WorkerSetups>>,
     ) -> Result<Box<dyn Conn>> {
         self.connect_with_role(
             compress,
@@ -3410,6 +3622,7 @@ impl Endpoint {
                 send_budget: None,
             },
             first_worker,
+            setups,
         )
     }
 
@@ -3419,6 +3632,7 @@ impl Endpoint {
         destination: Option<DestinationRoot>,
         copy_sources: Vec<RegisteredSourceRoot>,
         first_worker: bool,
+        setups: Option<&std::sync::Arc<WorkerSetups>>,
     ) -> Result<Box<dyn Conn>> {
         self.connect_with_role(
             compress,
@@ -3427,6 +3641,7 @@ impl Endpoint {
                 copy_sources,
             },
             first_worker,
+            setups,
         )
     }
 
@@ -3435,6 +3650,7 @@ impl Endpoint {
         compress: bool,
         role: ConnectionRole,
         first_worker: bool,
+        setups: Option<&std::sync::Arc<WorkerSetups>>,
     ) -> Result<Box<dyn Conn>> {
         match self {
             Endpoint::Local { descriptor_session } => {
@@ -3484,6 +3700,10 @@ impl Endpoint {
                         {
                             return Err(e);
                         }
+                        // The copy ended; this is no reason to stop using TCP.
+                        Err(_) if setups.is_some_and(|setups| setups.cancelled()) => {
+                            return Err(SetupCancelled.into());
+                        }
                         Err(e) => {
                             #[cfg(debug_assertions)]
                             if std::env::var_os("SYQ_TEST_REQUIRE_TCP").is_some() {
@@ -3523,6 +3743,7 @@ impl Endpoint {
                     role,
                     first_worker,
                     false,
+                    setups,
                 )?))
             }
         }

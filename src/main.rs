@@ -1,3 +1,7 @@
+// Product code writes stderr through crate::output, never std's eprint! or
+// eprintln!, which panic when stderr is closed (see clippy.toml).
+#![cfg_attr(not(test), deny(clippy::disallowed_macros))]
+
 // The receiver modules below forbid subprocess launches on macOS: SCM_RIGHTS
 // has no atomic close-on-exec receive there. Other executable roles can spawn.
 
