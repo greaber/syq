@@ -320,7 +320,7 @@ fn enrollment_account(value: &str) -> Result<(String, String)> {
 const RELEASED_ENROLLMENTS_DOCS: &str =
     "https://greaber.github.io/syq/remote-reference.html#enrollments-from-older-versions";
 
-/// A notice when `home` holds state from enrollments syq 0.4.0 to 0.7.1
+/// A notice when `home` holds state from enrollments syq 0.7.1 and earlier
 /// made, which this version neither lists nor removes: their enrolling
 /// machine's records or a server's state.
 pub(super) fn released_enrollment_notice(home: &Path) -> Option<String> {
@@ -330,7 +330,7 @@ pub(super) fn released_enrollment_notice(home: &Path) -> Option<String> {
         .find(|path| path.exists())
         .map(|path| {
             format!(
-                "syq: {} holds enrollments made by syq 0.4.0 to 0.7.1, which this version does not list or use; to remove them, see {RELEASED_ENROLLMENTS_DOCS}",
+                "syq: {} holds enrollments made by syq 0.7.1 and earlier, which this version does not list or use; to remove them, see {RELEASED_ENROLLMENTS_DOCS}",
                 path.display()
             )
         })

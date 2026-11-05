@@ -113,7 +113,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--tcp-ports <LO-HI>` | Port range remote listeners use for TCP data connections<br><br>[default: 47600-47699] |
 | `--tcp-congestion <ALGO>` | Use this congestion-control algorithm for TCP data sockets (Linux only) |
 | `--detach` | Return as soon as the copy starts on the server that runs it; requires --peer-auth own-credentials or --rsh |
-| `--peer-auth <MODE>` | How the server running the copy logs in to the other server; --rsh takes over this choice<br><br>Possible values:<br>- restricted: Reach the other server only through its restricted receiver<br>- broker: Let it use your agent for that host and user, with full access to that account<br>- own-credentials: Forward nothing; it must have its own credentials for the other server<br>- full-agent: Forward your whole SSH agent, as ssh -A does<br><br>[default: restricted] |
+| `--peer-auth <MODE>` | How the server running the copy logs in to the other server; --rsh takes over this choice<br><br>Possible values:<br>- restricted: Reach the other server only through its enrolled restricted receiver; forwards no agent<br>- broker: Let it use your agent for that host and user, with full access to that account<br>- own-credentials: Forward nothing; it must have its own credentials for the other server<br>- full-agent: Forward your whole SSH agent, as ssh -A does<br><br>[default: restricted] |
 | `--pscope <PATH>` | Use an isolated persistence domain created by `syq persist on --ephemeral` |
 
 ## S3 connection settings

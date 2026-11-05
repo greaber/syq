@@ -69,10 +69,12 @@ Keep an administrative session open. See [OpenSSH's settings](https://man.openbs
 
 ## Reduce allocation contention
 
-XFS filesystems with only four allocation groups can bottleneck concurrent SSD
-transfers. [More allocation groups](https://man7.org/linux/man-pages/man8/mkfs.xfs.8.html)
-can reduce contention. 512 is one example; our tests found similar performance
-across a wide range of higher counts.
+XFS divides a filesystem into allocation groups, and the
+[`mkfs.xfs` manual](https://man7.org/linux/man-pages/man8/mkfs.xfs.8.html)
+notes that more groups allow more blocks and inodes to be allocated in
+parallel. A filesystem with only a few groups can therefore slow copies that
+write many files at once. The count is set with `-d agcount=N` when the
+filesystem is created.
 
 ## Measure and track improvements
 

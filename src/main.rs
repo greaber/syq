@@ -291,6 +291,9 @@ fn run() {
         }
         fsops::reserve_startup_descriptors();
         if let Err(error) = server::run_checker(enrollment, generation) {
+            if error.is::<server::ClientGone>() {
+                crate::output::exit(1);
+            }
             let code = if crate::restricted::is_sessions_full(&error) {
                 crate::restricted::SESSIONS_FULL_EXIT
             } else {
@@ -317,6 +320,9 @@ fn run() {
         let local_receiver = argv.get(1).and_then(|arg| arg.to_str()) == Some("--server")
             && argv.get(2).and_then(|arg| arg.to_str()) == Some("--local-receiver");
         if let Err(e) = server::run(local_receiver) {
+            if e.is::<server::ClientGone>() {
+                crate::output::exit(1);
+            }
             crate::output::exit_on_error(&e, 1, "syq server");
         }
         return;

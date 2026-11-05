@@ -348,7 +348,7 @@ pub struct Args {
     /// Preserve hard links between selected regular files
     #[arg(short = 'H', long = "hard-links")]
     pub hardlinks: bool,
-    /// Preserve POSIX access and default ACLs; implies permissions
+    /// Preserve native Linux or macOS ACLs; implies permissions
     #[arg(short = 'A', long)]
     pub acls: bool,
     /// Preserve extended attributes
@@ -456,7 +456,7 @@ pub struct Args {
     pub integrity_checking_arg: Vec<String>,
     #[arg(skip)]
     pub integrity_checking: Option<crate::advanced::IntegrityChecking>,
-    /// Limit the total transfer rate, the same limit as the bandwidth resource limit (default unit: KiB/s; 0 disables)
+    /// Limit the total transfer rate, the same limit as the bandwidth resource limit; SSH and TCP copies count compressed bytes (default unit: KiB/s; 0 disables)
     #[arg(long, value_name = "RATE")]
     pub bwlimit: Option<String>,
     #[arg(skip)]
@@ -1432,7 +1432,7 @@ struct NativeCopyOperationalArgs {
 /// remote-to-remote copy.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum PeerAuth {
-    /// Reach the other server only through its restricted receiver
+    /// Reach the other server only through its enrolled restricted receiver; forwards no agent
     #[default]
     Restricted,
     /// Let it use your agent for that host and user, with full access to that account
@@ -2157,10 +2157,11 @@ fn parse_descriptor_copy(
                 | "follow_src"
                 | "follow_dst"
         ) {
-            bail!(
-                "--{} is not supported with descriptor copies",
-                id.as_str().replace('_', "-")
-            );
+            // Name the option as typed: some IDs differ from their spelling.
+            let option = argument
+                .get_long()
+                .map_or_else(|| id.as_str().replace('_', "-"), str::to_owned);
+            bail!("--{option} is not supported with descriptor copies");
         }
     }
     let copy = parsed.copy;
@@ -2412,6 +2413,8 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
                         || argv.windows(2).any(|args| args[0] == "--preserve" && args[1] == "-mtime") =>
                         Some("--preserve=-mtime is not a syq cp option; creating or updating file contents sets the source timestamp and cannot be disabled"),
                     "--preserve" => Some("--preserve is not a syq cp option; use --copy-metadata to select source metadata to apply, including on unchanged files"),
+                    "--tcp-plain" => Some("--tcp-plain is not a syq cp option; use --no-tcp-encryption for unencrypted TCP data connections on trusted networks"),
+                    "--receiver-receipt" => Some("--receiver-receipt is not a syq cp option; per-file hashes are no longer reported. Copies through an enrolled receiver always check the destination's own reports, and --results FILE saves them"),
                     _ => None,
                 };
                 if let Some(message) = message {
@@ -3588,6 +3591,9 @@ fn message_for_long(base: &str) -> Option<&'static str> {
         }
         "link-dest" | "compare-dest" | "copy-dest" => {
             "syq does not implement --link-dest/--compare-dest/--copy-dest."
+        }
+        "syq-tcp-plain" => {
+            "--syq-tcp-plain is not a syq rsync option; use --syq-no-tcp-encryption for unencrypted TCP data connections on trusted networks."
         }
         _ => return None,
     })
