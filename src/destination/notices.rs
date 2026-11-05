@@ -28,6 +28,17 @@ pub(super) fn waiting_for_earlier(who: &str, what: &str) {
     );
 }
 
+/// Say that @`name`'s receiving connection runs syq `build`, another
+/// version than this command, so the command runs with the helper that
+/// connection installed here. A receiving machine switches its connection to
+/// a newer syq by itself once one is installed there and nothing is in
+/// progress (`receive_service::switch`).
+pub(super) fn other_build(name: &str, build: &str) {
+    crate::output::diagnostic!(
+        "syq: @{name} is connected with syq {build}, so this command runs as syq {build}"
+    );
+}
+
 /// This machine's hostname and login name. Someone at a receiving machine
 /// can use them to work out which HOST reaches this server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,11 +148,12 @@ pub(super) fn reconnect(problem: &str, here: Option<&Here>) -> String {
     )
 }
 
-/// The syq on `@name` is too old for `what`.
-pub(super) fn outdated(name: &str, what: &str, here: Option<&Here>) -> String {
+/// The syq on `@name` is too old for `what`. Such an old receiving
+/// connection cannot follow an update by itself; any syq command run on
+/// that machine after the update switches it (`receive_service::refresh_outdated`).
+pub(super) fn outdated(name: &str, what: &str) -> String {
     format!(
-        "the syq connected as @{name} does not support {what}; update syq on that machine, then {}",
-        connect_instruction("it", here)
+        "the syq connected as @{name} does not support {what}; update syq on that machine and run any syq command there"
     )
 }
 
@@ -372,8 +384,8 @@ mod tests {
         assert!(copy_from("master", here).ends_with(&format!(
             "run `syq cp PATH --to HOST` on it, where HOST is how it reaches this server {server}."
         )));
-        assert!(outdated("laptop", "syq ssh", here)
-            .ends_with(&format!("update syq on that machine, then {connect}")));
+        assert!(outdated("laptop", "syq ssh")
+            .ends_with("update syq on that machine and run any syq command there"));
         assert!(reconnect("the registration for @laptop is invalid", here).ends_with(
             &format!("is invalid; to reconnect, run `syq persist connect HOST` on the receiving machine (for example your laptop), where HOST is how it reaches this server {server}")
         ));

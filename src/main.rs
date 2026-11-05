@@ -343,6 +343,12 @@ fn run() {
     ) {
         agent_socket::repair_from_tmux();
     }
+    // `syq ssh` does this once it knows its persistence domain.
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("exec")
+        && !destination::handoff::handed_off()
+    {
+        receive_service::refresh_outdated(&persistence::Domain::default(), false);
+    }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("ssh") {
         match destination::ssh::run(&argv[1..]) {
             Ok(code) => crate::output::exit(code),
@@ -462,6 +468,13 @@ fn run() {
         }
     }
     let quiet = args.quiet;
+    // A command handed off to another build's helper leaves the services to
+    // the build that started them.
+    if !destination::handoff::handed_off() {
+        if let Ok(domain) = persistence::Domain::select(args.pscope.as_deref()) {
+            receive_service::refresh_outdated(&domain, quiet);
+        }
+    }
     let result = if args.stream_mapping_fd.is_some() {
         stream_mapping::run(args)
     } else if args.descriptor_copy.is_some() {

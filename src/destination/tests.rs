@@ -429,6 +429,7 @@ fn broker_with_limits(
         )),
         exec_count: AtomicU64::new(0),
         ssh_count: AtomicU64::new(0),
+        account_relays: AtomicU64::new(0),
         account_source: Mutex::new(Err("test source not configured".into())),
         account_sessions: Mutex::new(HashMap::new()),
         forward_count: std::sync::atomic::AtomicUsize::new(0),
@@ -2012,4 +2013,52 @@ fn a_named_route_probe_that_reaches_nothing_answers_with_no_route() {
         "{candidates:?}"
     );
     assert!(elapsed < Duration::from_millis(800), "{elapsed:?}");
+}
+
+/// A receiving connection counts as idle, for its service to switch builds,
+/// only once no request is in progress and none arrived for a quiet while:
+/// one copy's steps arrive as separate requests. Once its service closes it
+/// to stop, it refuses new requests.
+#[test]
+fn a_receiving_connection_is_idle_only_after_its_requests_and_a_quiet_while() {
+    let activity = Activity {
+        quiet: Duration::from_millis(200),
+        ..Default::default()
+    };
+    assert!(activity.idle());
+    let request = activity.begin().unwrap();
+    assert_eq!(activity.requests(), 1);
+    assert!(!activity.idle());
+    assert!(!activity.close_if_idle());
+    drop(request);
+    assert_eq!(activity.requests(), 0);
+    // A copy's next step may still come.
+    assert!(!activity.idle());
+    assert!(!activity.close_if_idle());
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(activity.idle());
+    assert!(activity.close_if_idle());
+    assert!(activity.begin().is_none());
+    activity.reopen();
+    assert!(activity.begin().is_some());
+}
+
+/// An approved account connection is counted apart from other requests,
+/// for as long as its relay runs, so that status can say what keeps the
+/// connection busy.
+#[test]
+fn open_account_connections_are_counted_apart() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let (_broker, receiver, _registration, _prompts) = broker(temporary.path(), Approval::Ask);
+    let activity = Activity::default();
+    *activity.receiver.lock().unwrap() = Arc::downgrade(&receiver);
+    assert_eq!(activity.accounts(), 0);
+    // The relay runs within a request.
+    let request = activity.begin().unwrap();
+    receiver.account_relays.fetch_add(1, Ordering::AcqRel);
+    assert_eq!((activity.requests(), activity.accounts()), (1, 1));
+    assert!(!activity.idle());
+    receiver.account_relays.fetch_sub(1, Ordering::AcqRel);
+    drop(request);
+    assert_eq!((activity.requests(), activity.accounts()), (0, 0));
 }

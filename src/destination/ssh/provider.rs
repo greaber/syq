@@ -464,6 +464,49 @@ impl Drop for OwnedRecord {
     }
 }
 
+/// What became of a keeper this build cannot use.
+#[derive(Debug, PartialEq, Eq)]
+enum OtherKeeper {
+    /// None, or one of this build.
+    None,
+    /// One of another build, asked to stop.
+    Stopping,
+    /// One of another build that an account connection still uses, or may
+    /// (`in_use`): stopping it would cut the copies and sessions through it,
+    /// or a request waiting for approval.
+    InUse { build: String },
+}
+
+/// A keeper another syq build left, as after this machine updated syq,
+/// cannot serve this build: ask it to stop (as `stop_all` does) instead of
+/// waiting out the setup deadline, unless `in_use`. Its record names its
+/// build; one this build cannot read is another build's too.
+fn stop_other_build_keeper(
+    domain: &Domain,
+    provider: &Provider,
+    in_use: impl FnOnce() -> bool,
+) -> Result<OtherKeeper> {
+    let build = match read_record(domain, provider) {
+        Ok(Some(record)) if record.build == crate::identity::build() => {
+            return Ok(OtherKeeper::None)
+        }
+        Ok(Some(record)) => record.build,
+        Ok(None) => return Ok(OtherKeeper::None),
+        Err(_) => "another version".into(),
+    };
+    if in_use() {
+        return Ok(OtherKeeper::InUse { build });
+    }
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(record_path(domain, provider)?.with_extension("stop"))?;
+    Ok(OtherKeeper::Stopping)
+}
+
 fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
     if let Some(record) = existing(domain, provider)? {
         return Ok(record);
@@ -475,9 +518,50 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
     let lock = lock_file(&path.with_extension("lock"), true)?;
     let signals = foreground::Signals::new()?;
     let deadline = Instant::now() + SETUP;
+    let mut other = OtherKeeper::None;
+    let mut next_look = Instant::now();
+    let mut off = "syq persist off".to_owned();
+    if let Some(scope) = domain.explicit_path() {
+        off.push_str(&format!(
+            " --pscope {}",
+            shell_words::quote(&scope.to_string_lossy())
+        ));
+    }
     while !try_lock(&lock)? {
         if let Some(record) = existing(domain, provider)? {
             return Ok(record);
+        }
+        // Look again now and then: the account connection may end.
+        if other != OtherKeeper::Stopping && Instant::now() >= next_look {
+            next_look = Instant::now() + Duration::from_secs(5);
+            let previous = std::mem::replace(
+                &mut other,
+                stop_other_build_keeper(domain, provider, || {
+                    persistent::uses_provider(domain, provider)
+                })?,
+            );
+            if let OtherKeeper::InUse { build } = &other {
+                let in_use = format!(
+                    "the connection to {} that syq {build} opened is still in use by an account connection, approved or waiting for approval, and serves only that version",
+                    provider.label()
+                );
+                // In the default domain such a connection does not end by
+                // itself; in an isolated one it closes once idle for a while.
+                if domain.is_default() {
+                    bail!("{in_use}; finish what uses it, or close both with `{off}`, then retry");
+                }
+                if !matches!(previous, OtherKeeper::InUse { .. }) {
+                    crate::output::diagnostic!("syq: waiting: {in_use}; `{off}` closes both");
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            if let OtherKeeper::InUse { build } = &other {
+                bail!(
+                    "the connection to {} that syq {build} opened is still in use by an account connection, approved or waiting for approval; finish what uses it, or close both with `{off}`, then retry",
+                    provider.label()
+                );
+            }
         }
         anyhow::ensure!(
             Instant::now() < deadline && signals.received.load(Ordering::Acquire) == 0,
@@ -808,7 +892,7 @@ fn keeper(startup: Startup) -> Result<()> {
     let hello = hello.map_err(anyhow::Error::msg)?;
     anyhow::ensure!(
         hello.build == crate::identity::build(),
-        "SSH provider attachment uses build {}, but requester uses {}; install the same syq build on both machines and restart receiving locally on the provider",
+        "SSH provider attachment uses build {}, but requester uses {}; install the same syq build on both machines; the provider's service switches to it by itself once idle",
         hello.build,
         crate::identity::build()
     );
@@ -1113,6 +1197,63 @@ mod tests {
             .unwrap();
         write_record(&domain, &record).unwrap();
         (root, domain, record)
+    }
+
+    /// After this machine updates syq, the keeper the old build left is
+    /// asked to stop, which its record says, rather than waited on, unless
+    /// an approved account connection still has a channel through it; one
+    /// of this build is left alone.
+    #[test]
+    fn a_keeper_another_build_left_is_asked_to_stop_unless_in_use() {
+        let (_root, domain, mut record) = cleanup_fixture();
+        let stop = record_path(&domain, &record.provider)
+            .unwrap()
+            .with_extension("stop");
+        let unused = || false;
+        assert_eq!(
+            stop_other_build_keeper(&domain, &record.provider, unused).unwrap(),
+            OtherKeeper::None
+        );
+        assert!(!stop.exists());
+        record.build = "v0.0.1+other-build".into();
+        write_record(&domain, &record).unwrap();
+        // An account connection's channel runs through it: here one waiting
+        // for approval, whose keeper holds its record's lock but has written
+        // no record yet.
+        let request = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(
+                persistent::directory(&domain)
+                    .unwrap()
+                    .join(format!("{}.lock", "0".repeat(64))),
+            )
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(request.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let in_use = || persistent::uses_provider(&domain, &record.provider);
+        assert_eq!(
+            stop_other_build_keeper(&domain, &record.provider, in_use).unwrap(),
+            OtherKeeper::InUse {
+                build: "v0.0.1+other-build".into()
+            }
+        );
+        assert!(!stop.exists());
+        assert!(active(&domain, &record));
+        // Once it ended, its lock is free, though its file stays.
+        drop(request);
+        assert_eq!(
+            stop_other_build_keeper(&domain, &record.provider, in_use).unwrap(),
+            OtherKeeper::Stopping
+        );
+        assert!(stop.exists());
+        // The keeper ends at its next look at its record.
+        assert!(!active(&domain, &record));
     }
 
     #[cfg(target_os = "linux")]

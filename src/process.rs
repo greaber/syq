@@ -52,6 +52,92 @@ pub(crate) fn self_command() -> std::io::Result<Command> {
     Ok(command)
 }
 
+/// The path the user ran this syq by, as given to exec and made absolute,
+/// but not resolved through symbolic links: a Homebrew link keeps naming
+/// whichever version is installed, not one version's directory. Receiving
+/// services follow it to notice updates (`receive_service::switch`). None
+/// for a process syq started from its own running image (`self_command`),
+/// which is told the path by the process that started it.
+pub(crate) fn started_from() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    let path = {
+        use std::os::unix::ffi::OsStrExt;
+        let execfn = unsafe { libc::getauxval(libc::AT_EXECFN) } as *const libc::c_char;
+        if execfn.is_null() {
+            return None;
+        }
+        let path = unsafe { std::ffi::CStr::from_ptr(execfn) }.to_bytes();
+        if path == SELF_EXE.as_bytes() {
+            return None;
+        }
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path))
+    };
+    // macOS reports the path given to exec, without resolving links.
+    #[cfg(not(target_os = "linux"))]
+    let path = std::env::current_exe().ok()?;
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        Some(std::env::current_dir().ok()?.join(path))
+    }
+}
+
+/// A file's device and inode, comparable with `running_image`.
+pub(crate) fn file_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    // st_dev is 32 bits on macOS; the kernel reports it unsigned.
+    #[cfg(target_os = "macos")]
+    return (u64::from(metadata.dev() as u32), metadata.ino());
+    #[cfg(not(target_os = "macos"))]
+    (metadata.dev(), metadata.ino())
+}
+
+/// The device and inode of the file this process runs, which stay the same
+/// after an update replaces or removes that file.
+pub(crate) fn running_image() -> Option<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    return std::fs::metadata(SELF_EXE)
+        .ok()
+        .map(|metadata| file_identity(&metadata));
+    #[cfg(target_os = "macos")]
+    return (*RUNNING.get_or_init(running_file)).map(|(dev, ino)| (u64::from(dev), ino));
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    None
+}
+
+/// The build identity the executable at `path` reports, as syq asks of a
+/// helper or an update before trusting it to speak its protocol.
+pub(crate) fn file_build(path: &std::path::Path) -> std::io::Result<String> {
+    let mut probe = Command::new(path);
+    probe
+        .arg("--build-identity")
+        .env("SYQ_NO_UPDATE_CHECK", "1");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let output =
+        capture_output_bounded(&mut probe, deadline, &|| false, 4096).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                std::io::Error::new(error.kind(), "it did not say its version within 10 s")
+            } else {
+                error
+            }
+        })?;
+    let identity = output
+        .stdout
+        .strip_suffix(b"\n")
+        .and_then(|identity| std::str::from_utf8(identity).ok())
+        .filter(|identity| {
+            !identity.is_empty()
+                && !identity.contains(|c: char| c.is_whitespace() || c.is_control())
+        });
+    match identity {
+        Some(identity) if output.status.success() => Ok(identity.to_owned()),
+        _ => Err(std::io::Error::other(format!(
+            "it did not say its version ({})",
+            output.status
+        ))),
+    }
+}
+
 /// macOS: refuse to start `path` once it names another build than the one
 /// this process runs, as after an upgrade or rebuild replaced or removed it.
 /// The file this process runs is read from the kernel at the first start, so
@@ -63,7 +149,6 @@ pub(crate) fn self_command() -> std::io::Result<Command> {
 #[cfg(target_os = "macos")]
 fn require_started_file(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
-    static RUNNING: std::sync::OnceLock<Option<(u32, u64)>> = std::sync::OnceLock::new();
     static SAME_BUILD: std::sync::Mutex<Option<(u32, u64)>> = std::sync::Mutex::new(None);
     let Some(running) = *RUNNING.get_or_init(running_file) else {
         return Ok(());
@@ -92,14 +177,12 @@ fn require_started_file(path: &std::path::Path) -> std::io::Result<()> {
 /// checks a helper's or an update's.
 #[cfg(target_os = "macos")]
 fn reports_this_build(path: &std::path::Path) -> bool {
-    let mut probe = Command::new(path);
-    probe.arg("--build-identity");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    capture_output_bounded(&mut probe, deadline, &|| false, 4096).is_ok_and(|output| {
-        output.status.success()
-            && output.stdout.strip_suffix(b"\n") == Some(env!("SYQ_BUILD_IDENTITY").as_bytes())
-    })
+    file_build(path).is_ok_and(|build| build == env!("SYQ_BUILD_IDENTITY"))
 }
+
+/// The file this process runs, read from the kernel once (`running_file`).
+#[cfg(target_os = "macos")]
+static RUNNING: std::sync::OnceLock<Option<(u32, u64)>> = std::sync::OnceLock::new();
 
 #[cfg(target_os = "macos")]
 fn replaced(path: &std::path::Path) -> std::io::Error {
@@ -133,9 +216,9 @@ pub(crate) fn running_receiving_connection(endpoint: String, scope: Option<&std:
     let _ = (endpoint, scope);
 }
 
-/// What a refused start says: a command is rerun, and a receiving
-/// connection restarted by connecting again, which replaces a connection
-/// from another version and keeps the domain's settings.
+/// What a refused start says: a command is rerun. A receiving connection
+/// switches to the new version by itself once idle (`receive_service::switch`),
+/// and connecting again switches at once, keeping the domain's settings.
 #[cfg(any(target_os = "macos", test))]
 fn replaced_message(path: &std::path::Path, receiving: Option<&Receiving>) -> String {
     let Some(Receiving { endpoint, scope }) = receiving else {
@@ -150,7 +233,8 @@ fn replaced_message(path: &std::path::Path, receiving: Option<&Receiving>) -> St
     });
     format!(
         "syq at {} was upgraded while the receiving connection to {endpoint} was running; \
-         restart it with `syq persist connect {}{scope}`",
+         it switches to the new version by itself once idle, so retry shortly, or run \
+         `syq persist connect {}{scope}` to switch now",
         path.display(),
         shell_words::quote(endpoint)
     )
@@ -268,6 +352,27 @@ pub(crate) fn capture_output_bounded(
         deadline,
         cancelled,
         max_output_bytes,
+        false,
+        &mut std::thread::sleep,
+    )
+}
+
+/// `capture_output_bounded`, keeping the command in this process's group,
+/// for a process that ends with its whole group, such as a switch that runs
+/// out of time (`receive_service::switch::end_switch_at`): the command ends
+/// with it then, rather than outliving the deadline this process enforced.
+/// What the command leaves running ends with that group, not when it exits.
+pub(crate) fn capture_output_bounded_in_this_group(
+    command: &mut Command,
+    deadline: std::time::Instant,
+    max_output_bytes: usize,
+) -> std::io::Result<Output> {
+    capture_output_bounded_with(
+        command,
+        deadline,
+        &|| false,
+        max_output_bytes,
+        true,
         &mut std::thread::sleep,
     )
 }
@@ -279,6 +384,7 @@ fn capture_output_bounded_with(
     deadline: std::time::Instant,
     cancelled: &dyn Fn() -> bool,
     max_output_bytes: usize,
+    in_this_group: bool,
     wait: &mut dyn FnMut(std::time::Duration),
 ) -> std::io::Result<Output> {
     use std::io::{self, Read};
@@ -341,12 +447,15 @@ fn capture_output_bounded_with(
     }
 
     check(deadline, cancelled)?;
-    let mut group = group::ProcessGroup::spawn(
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    )?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut group = if in_this_group {
+        group::ProcessGroup::spawn_in_this_group(command)?
+    } else {
+        group::ProcessGroup::spawn(command)?
+    };
     let mut stdout = group.child.stdout.take().unwrap();
     let mut stderr = group.child.stderr.take().unwrap();
     nonblocking(stdout.as_raw_fd())?;
@@ -515,13 +624,15 @@ mod replaced_message_tests {
         assert_eq!(
             replaced_message(path, Some(&receiving(None))),
             "syq at /opt/syq/bin/syq was upgraded while the receiving connection to \
-             alice@server was running; restart it with `syq persist connect alice@server`"
+             alice@server was running; it switches to the new version by itself once idle, \
+             so retry shortly, or run `syq persist connect alice@server` to switch now"
         );
         assert_eq!(
             replaced_message(path, Some(&receiving(Some("/tmp/my scope")))),
             "syq at /opt/syq/bin/syq was upgraded while the receiving connection to \
-             alice@server was running; restart it with \
-             `syq persist connect alice@server --pscope '/tmp/my scope'`"
+             alice@server was running; it switches to the new version by itself once idle, \
+             so retry shortly, or run \
+             `syq persist connect alice@server --pscope '/tmp/my scope'` to switch now"
         );
     }
 }
@@ -572,6 +683,7 @@ mod bounded_tests {
             Instant::now() + Duration::from_secs(10),
             &|| false,
             64,
+            false,
             &mut |wait| {
                 waits.push(wait);
                 std::thread::sleep(wait);

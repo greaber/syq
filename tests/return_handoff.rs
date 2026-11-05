@@ -274,6 +274,11 @@ sys.exit(23)
     let output = child.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(23), "{output:?}");
     assert_eq!(output.stdout, input);
+    // It says which version runs the command instead of falling back silently.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "syq: @laptop is connected with syq another-build, so this command runs as syq another-build\n"
+    );
 }
 
 #[test]
@@ -299,6 +304,8 @@ sys.exit(23)
         .capture_output()
         .unwrap();
     assert_eq!(output.status.code(), Some(23), "{output:?}");
+    // --quiet leaves out the notice about the version that runs it.
+    assert!(output.stderr.is_empty(), "{output:?}");
 }
 
 #[cfg(target_os = "linux")]
@@ -431,4 +438,236 @@ sys.exit(23)
         "auto",
     ]);
     assert_eq!(output.status.code(), Some(23), "{output:?}");
+}
+
+/// Point `@laptop` at `socket`, as a receiving connection of build
+/// `identity` registers itself.
+fn register_at(home: &std::path::Path, socket: &std::path::Path, identity: &str, secret: &str) {
+    let value = serde_json::json!({
+        "version": 3, "identity": identity, "socket": socket,
+        "secret": secret, "program": b"/no/such/helper".to_vec(),
+    });
+    let path = home.join(".syq-destinations-v3/laptop.json");
+    let new = path.with_extension("new");
+    fs::write(&new, serde_json::to_vec(&value).unwrap()).unwrap();
+    fs::set_permissions(&new, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::rename(new, path).unwrap();
+}
+
+/// A copy to `@laptop` whose receiving connection switches to build
+/// `switched_to` while the command reads its mapping from a FIFO, after it
+/// chose `@laptop`'s registration. Returns the command's output and the
+/// requests the new connection received; it refuses each. The FIFO shows
+/// when the command reads its input; macOS copies take no FIFO mapping.
+#[cfg(not(target_os = "macos"))]
+fn copy_while_the_receiver_switches(switched_to: &str) -> (Output, Vec<serde_json::Value>) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let fixture = Fixture::new();
+    let build = String::from_utf8(fixture.run(&["--build-identity"]).stdout).unwrap();
+    let build = build.trim();
+    let sockets = crate::test_support::short_tempdir().unwrap();
+    // The connection the command chooses, gone by the time it asks.
+    register_at(
+        fixture.temp.path(),
+        &sockets.path().join("old.sock"),
+        build,
+        "old-secret",
+    );
+    let listener = UnixListener::bind(sockets.path().join("new.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished = done.clone();
+    let receiver = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !finished.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "the copy did not finish");
+            let mut socket = match listener.accept() {
+                Ok((socket, _)) => socket,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            socket.set_nonblocking(false).unwrap();
+            let mut length = [0; 4];
+            socket.read_exact(&mut length).unwrap();
+            let mut bytes = vec![0; u32::from_be_bytes(length) as usize];
+            socket.read_exact(&mut bytes).unwrap();
+            requests.push(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
+            let reply = br#"{"Error":"refused by the test"}"#;
+            socket
+                .write_all(&(reply.len() as u32).to_be_bytes())
+                .unwrap();
+            socket.write_all(reply).unwrap();
+        }
+        requests
+    });
+    let fifo = fixture.temp.path().join("mapping");
+    let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(status.success());
+    let mut child = fixture
+        .command(&[
+            "cp",
+            "--mapping",
+            fifo.to_str().unwrap(),
+            "--to",
+            "@laptop",
+            "--into",
+            "dst",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn_guarded()
+        .unwrap();
+    // Opening the FIFO for writing succeeds once the command reads it,
+    // which is after it chose @laptop's registration.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut mapping = loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+        {
+            Ok(file) => break file,
+            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                if child.try_wait().unwrap().is_some() {
+                    done.store(true, std::sync::atomic::Ordering::Release);
+                    panic!(
+                        "the copy ended before it read its mapping: {:?}",
+                        child.wait_with_output().unwrap()
+                    );
+                }
+                assert!(Instant::now() < deadline, "the copy never read its mapping");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("{error}"),
+        }
+    };
+
+    register_at(
+        fixture.temp.path(),
+        &sockets.path().join("new.sock"),
+        switched_to,
+        "new-secret",
+    );
+    mapping
+        .write_all(br#"{"src":{"encoding":"utf-8","value":"source"},"dst":{"encoding":"utf-8","value":"copied"}}"#)
+        .unwrap();
+    mapping.write_all(b"\n").unwrap();
+    drop(mapping);
+    let output = child.wait_with_output().unwrap();
+    done.store(true, std::sync::atomic::Ordering::Release);
+    (output, receiver.join().unwrap())
+}
+
+/// The copy failed with `text`, after asking for approval (which says it
+/// waits), never naming a registration's secret.
+fn assert_switched_failure(output: &Output, text: &str) {
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(text), "{stderr}");
+    assert!(!stderr.contains("secret"), "{stderr}");
+}
+
+/// A receiving connection that switched to this build while the copy read
+/// its input gets the copy's request: the command asks the new connection
+/// once, before copying anything.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_copy_asks_the_new_connection_once_after_its_receiver_switched() {
+    let build = String::from_utf8(Fixture::new().run(&["--build-identity"]).stdout).unwrap();
+    let (output, requests) = copy_while_the_receiver_switches(build.trim());
+    assert_switched_failure(&output, "receiving machine: refused by the test");
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0]["secret"], "new-secret");
+    assert!(
+        requests[0]["message"].get("Request").is_some(),
+        "{requests:?}"
+    );
+}
+
+/// One that switched to another build cannot take this build's request:
+/// the command says so and asks to be run again.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_copy_whose_receiver_switched_to_another_build_asks_to_run_it_again() {
+    let (output, requests) = copy_while_the_receiver_switches("another-build");
+    assert_switched_failure(
+        &output,
+        "@laptop switched to syq another-build while this command was starting; run the command again",
+    );
+    assert!(requests.is_empty(), "{requests:?}");
+}
+
+/// A copy refused by a receiving connection that is stopping for a switch
+/// waits a little for the new connection to register, then asks it once.
+#[test]
+fn a_copy_refused_while_its_receiver_switches_asks_the_new_connection() {
+    let fixture = Fixture::new();
+    let build = String::from_utf8(fixture.run(&["--build-identity"]).stdout).unwrap();
+    let build = build.trim().to_owned();
+    let sockets = crate::test_support::short_tempdir().unwrap();
+    let home = fixture.temp.path().to_path_buf();
+    register_at(
+        &home,
+        &sockets.path().join("old.sock"),
+        &build,
+        "old-secret",
+    );
+    // Serve one request on `socket`, answering `reply`, then run `then`.
+    let serve =
+        |socket: std::path::PathBuf, reply: &'static [u8], then: Box<dyn FnOnce() + Send>| {
+            let listener = UnixListener::bind(socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "no request came");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                let mut length = [0; 4];
+                socket.read_exact(&mut length).unwrap();
+                let mut bytes = vec![0; u32::from_be_bytes(length) as usize];
+                socket.read_exact(&mut bytes).unwrap();
+                socket
+                    .write_all(&(reply.len() as u32).to_be_bytes())
+                    .unwrap();
+                socket.write_all(reply).unwrap();
+                drop(socket);
+                then();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            })
+        };
+    let new = serve(
+        sockets.path().join("new.sock"),
+        br#"{"Error":"refused by the test"}"#,
+        Box::new(|| {}),
+    );
+    // The old connection refuses while it stops; the new one registers a
+    // moment later.
+    let (new_socket, registered_build) = (sockets.path().join("new.sock"), build.clone());
+    let old = serve(
+        sockets.path().join("old.sock"),
+        br#"{"Error":"receiving is switching to another syq version; retry in a moment"}"#,
+        Box::new(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            register_at(&home, &new_socket, &registered_build, "new-secret");
+        }),
+    );
+    let output = fixture.run(&["cp", "source", "--to", "@laptop", "--into", "dst"]);
+    assert_switched_failure(&output, "receiving machine: refused by the test");
+    assert_eq!(old.join().unwrap()["secret"], "old-secret");
+    let request = new.join().unwrap();
+    assert_eq!(request["secret"], "new-secret");
+    assert!(request["message"].get("Request").is_some(), "{request}");
 }

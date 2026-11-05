@@ -3031,6 +3031,1332 @@ fn connecting_again_replaces_a_receiving_connection_from_another_build() {
     assert_eq!(read(&scope.join("receive.json")), settings);
 }
 
+/// An ssh stand-in for receiving: a receiving connection's ssh (`-R`)
+/// reports ready at once and stays up, so its service has a live
+/// connection with a local socket requests arrive on. Other commands run
+/// locally, as `fake_ssh` runs them.
+fn receiving_ssh(t: &Tmp) -> PathBuf {
+    let path = t.path("receiving-bin/ssh");
+    executable(
+        &path,
+        br#"#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_RSH_LOG"
+if [ -n "${FAKE_SSH_PIDS:-}" ]; then
+    echo $$ >> "$FAKE_SSH_PIDS"
+fi
+# Hang, as ssh waiting for a key or a network does.
+if [ -n "${FAKE_SSH_HANG:-}" ] && [ "$1" != -V ]; then
+    echo $$ > "$FAKE_SSH_HANG"
+    exec sleep 600
+fi
+if [ -n "${FAKE_SSH_REJECT:-}" ] && [ "$1" != -V ]; then
+    echo 'syq@test-server: Permission denied (publickey).' >&2
+    exit 255
+fi
+if [ -n "${FAKE_SSH_REFUSE:-}" ] && [ "$1" != -V ]; then
+    echo 'ssh: connect to host test-server port 22: Connection refused' >&2
+    exit 255
+fi
+# A login of its own, as a receiving connection makes, that the server
+# rejects, while the control connection and helper setup still work.
+case " $* " in
+    *" ControlPath=none "*" PermitLocalCommand=no "*|*" PermitLocalCommand=no "*" ControlPath=none "*)
+        # Wait, as for a touch of a security key that nobody gives, with a
+        # process of its own, as a ProxyJump ssh or ssh-sk-helper.
+        if [ -n "${FAKE_SSH_HANG_DIRECT:-}" ]; then
+            sleep 600 &
+            echo $! > "$FAKE_SSH_HANG_DIRECT.child"
+            echo $$ > "$FAKE_SSH_HANG_DIRECT"
+            exec sleep 600
+        fi
+        if [ -n "${FAKE_SSH_REJECT_DIRECT:-}" ]; then
+            echo 'syq@test-server: Permission denied (publickey).' >&2
+            exit 255
+        fi
+        if [ -n "${FAKE_SSH_DIRECT_MARK:-}" ]; then
+            : > "$FAKE_SSH_DIRECT_MARK"
+        fi
+        ;;
+esac
+for argument in "$@"; do
+    if [ "$argument" = -R ]; then
+        printf '\000\000\000\007"Ready"'
+        exec sleep 600
+    fi
+done
+if [ "$1" = -V ]; then
+    printf 'OpenSSH_9.9p1, fake\n' >&2
+    exit 0
+fi
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -O) if [ "$2" = check ]; then exit 0; fi; shift 2 ;;
+        -o|-l|-p|-S) shift 2 ;;
+        -a|-A|-x|-k|-T) shift ;;
+        --) shift; break ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+shift
+HOME="$FAKE_REMOTE_HOME"
+PATH="$FAKE_REMOTE_BIN:/usr/bin:/bin"
+export HOME PATH
+unset SSH_CONNECTION
+exec /bin/sh -c "$1"
+"#,
+    );
+    path
+}
+
+/// The receiving fixture the update tests share: syq installed at
+/// `bin/syq`, from which receiving through test-server runs, in a scope of
+/// its own.
+struct Installed<'a> {
+    t: &'a Tmp,
+    syq: PathBuf,
+    scope: PathBuf,
+    ssh: PathBuf,
+}
+
+impl Installed<'_> {
+    fn new(t: &Tmp) -> Installed<'_> {
+        fs::create_dir(t.runtime()).unwrap();
+        fs::create_dir_all(t.path("root")).unwrap();
+        fs::create_dir_all(t.path("home")).unwrap();
+        fs::create_dir_all(t.path("remote-home")).unwrap();
+        fs::set_permissions(t.path("remote-home"), fs::Permissions::from_mode(0o700)).unwrap();
+        let syq = t.path("bin/syq");
+        executable_support::copy_executable(Path::new(env!("CARGO_BIN_EXE_syq")), &syq, 0o755);
+        // Nobody else may write where syq follows it from.
+        fs::set_permissions(t.path("bin"), fs::Permissions::from_mode(0o755)).unwrap();
+        let ssh = receiving_ssh(t);
+        let scope = ephemeral_scope(t);
+        Installed { t, syq, scope, ssh }
+    }
+
+    /// `program persist ARGS --pscope SCOPE`, with short waits for following
+    /// an update.
+    fn command(&self, program: &Path, args: &[&str]) -> Command {
+        let t = self.t;
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .env("HOME", t.path("home"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .env("SYQ_TEST_SWITCH_CHECK_MS", "100")
+            .env("SYQ_TEST_SWITCH_QUIET_MS", "500")
+            .env("SYQ_TEST_SWITCH_RETRY_MS", "600000")
+            // Stand-in services on a slow runner may answer late.
+            .env("SYQ_TEST_REFRESH_ANSWER_MS", "5000")
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", self.ssh.parent().unwrap().display()),
+            );
+        command
+    }
+
+    fn persist(&self, program: &Path, args: &[&str]) -> Output {
+        let mut full = vec!["persist"];
+        full.extend_from_slice(args);
+        full.extend(["--pscope", self.scope.to_str().unwrap()]);
+        self.command(program, &full).run().unwrap()
+    }
+
+    /// Receive through test-server, started from the installed syq.
+    fn connect(&self) {
+        assert_output_ok(&self.persist(
+            &self.syq,
+            &[
+                "receive",
+                "on",
+                "--notify",
+                "off",
+                "--root",
+                &self.t.s("root"),
+                "--all-connections",
+            ],
+        ));
+        let connected = self.persist(
+            &self.syq,
+            &[
+                "connect",
+                "test-server",
+                "--timeout",
+                "20",
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+            ],
+        );
+        assert_output_ok(&connected);
+        assert!(
+            String::from_utf8_lossy(&connected.stdout).contains("test-server ready"),
+            "{}",
+            String::from_utf8_lossy(&connected.stdout)
+        );
+    }
+
+    /// The receiving service's control path.
+    fn control(&self) -> PathBuf {
+        let record = fs::read_dir(&self.scope)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.to_str().unwrap().ends_with(".recv-json"))
+            .expect("receiving record");
+        PathBuf::from(record.to_str().unwrap().strip_suffix(".recv-json").unwrap())
+    }
+
+    /// Send one control request to the receiving service.
+    fn request(&self, request: serde_json::Value) -> serde_json::Value {
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(format!("{}.recv", self.control().display()))
+                .unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        write_provider_frame(&mut stream, request);
+        read_provider_frame(&mut stream)
+    }
+
+    /// Replace the installed syq with a stand-in for another build: it
+    /// reports `build` and records the commands it is given in `log`. Like
+    /// an installer, write a new file and rename it over the old one.
+    fn update(&self, build: &str, log: &Path) {
+        let new = self.t.path("bin/syq.new");
+        executable_support::write_executable(
+            &new,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --build-identity ]; then echo {build}; exit 0; fi\n\
+                 printf '%s\\n' \"$*\" >> '{}'\n",
+                log.display()
+            ),
+            0o755,
+        );
+        fs::rename(&new, &self.syq).unwrap();
+    }
+}
+
+/// After an update replaces the syq a receiving service was started from,
+/// the service switches to the new build by itself, by running its
+/// `persist connect` without prompts, but only once nothing is in progress.
+/// A request held open on its connection keeps it waiting, and it says so in
+/// its status; a request to stop it once idle is refused meanwhile.
+#[test]
+fn a_receiving_service_switches_to_a_new_build_at_its_path_once_idle() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let status = || installed.request(serde_json::json!({"version": 2, "stop": false}));
+    let state = status();
+    assert_eq!(state["started_from"], installed.syq.to_str().unwrap());
+    assert_eq!(
+        state["busy"],
+        serde_json::json!({"requests": 0, "pending": 0, "accounts": 0})
+    );
+    assert!(state.get("switch").is_none(), "{state}");
+
+    // Hold a request open on the connection's local socket, as a copy would.
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    let forward = log
+        .lines()
+        .find_map(|line| line.split(" -R ").nth(1))
+        .expect("receiving connection");
+    let broker = forward
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .split_once(':')
+        .unwrap()
+        .1;
+    let mut request = std::os::unix::net::UnixStream::connect(broker).unwrap();
+    request.write_all(&[0, 0]).unwrap();
+    wait_for(
+        "the request to count",
+        std::time::Duration::from_secs(5),
+        || status()["busy"]["requests"] == 1,
+    );
+
+    let switched = t.path("switched.log");
+    // The provider follows the same file and switches as soon as it can;
+    // only the receiving service's switch connects to test-server.
+    let connects = || {
+        fs::read_to_string(&switched)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with("persist connect "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    installed.update("v99.0.0-switch-test", &switched);
+    wait_for(
+        "the service to wait",
+        std::time::Duration::from_secs(10),
+        || status()["switch"]["phase"] == "waiting",
+    );
+    assert_eq!(status()["switch"]["to"], "v99.0.0-switch-test");
+    let shown = persistence_command(
+        &t,
+        &["status", "--pscope", installed.scope.to_str().unwrap()],
+    )
+    .run()
+    .unwrap();
+    assert_output_ok(&shown);
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    assert!(
+        shown.contains("receiving switches to syq v99.0.0-switch-test once idle"),
+        "{shown}"
+    );
+    // Busy: neither the service nor a request to stop once idle switches it.
+    let answer =
+        installed.request(serde_json::json!({"version": 2, "stop": false, "stop_if_idle": true}));
+    assert!(answer.get("stopping").is_none(), "{answer}");
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let state = status();
+    assert_eq!(state["busy"]["requests"], 1, "{state}");
+    assert!(connects().is_empty(), "{:?}: {state}", connects());
+
+    // Once the request ends and a quiet while passes, it runs the new
+    // build's connect, for this server and scope, without prompts.
+    drop(request);
+    wait_for("the switch", std::time::Duration::from_secs(20), || {
+        !connects().is_empty()
+    });
+    assert_eq!(
+        connects(),
+        [format!(
+            "persist connect test-server --auth-from ssh --when-idle --pscope {}",
+            installed.scope.display()
+        )]
+    );
+    // The new build stops it once idle.
+    let answer =
+        installed.request(serde_json::json!({"version": 2, "stop": false, "stop_if_idle": true}));
+    assert_eq!(answer["stopping"], true, "{answer}");
+    let socket = PathBuf::from(format!("{}.recv", installed.control().display()));
+    wait_for(
+        "the service to stop",
+        std::time::Duration::from_secs(15),
+        || !socket.exists(),
+    );
+}
+
+/// Replace the fixture's receiving service with a stand-in for one an
+/// older syq left running: its record names the older build, and it
+/// answers as an older service does, with `pending` requests and without
+/// saying what else it has in progress or what it follows. It returns the
+/// requests it received once stopped.
+fn older_service(
+    installed: &Installed,
+    pending: serde_json::Value,
+) -> std::thread::JoinHandle<Vec<serde_json::Value>> {
+    other_service(installed, pending, None, None)
+}
+
+/// Stop the fixture's receiving service and record its control as an older
+/// build's, holding its lock as that service would. Returns the control
+/// socket's path, where a stand-in may listen, and the lock.
+fn retire_service(installed: &Installed) -> (PathBuf, File) {
+    let control = installed.control();
+    let suffixed = |suffix: &str| PathBuf::from(format!("{}{suffix}", control.display()));
+    let pid = installed.request(serde_json::json!({"version": 2, "stop": false}))["pid"]
+        .as_u64()
+        .unwrap();
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let lock = loop {
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(suffixed(".recv-lock"))
+            .unwrap();
+        if unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&lock),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        } == 0
+            && !suffixed(".recv").exists()
+        {
+            break lock;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the service did not stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&read(&suffixed(".recv-json"))).unwrap();
+    record["identity"] = "v0.7.1".into();
+    fs::write(suffixed(".recv-json"), serde_json::to_vec(&record).unwrap()).unwrap();
+    fs::set_permissions(suffixed(".recv-json"), fs::Permissions::from_mode(0o600)).unwrap();
+    (suffixed(".recv"), lock)
+}
+
+/// As `older_service`; with `busy`, it reports what it has in progress as
+/// services do since syq follows updates, and agrees to stop when idle.
+/// With `pending_once`, its `pending` requests appear once that file exists.
+fn other_service(
+    installed: &Installed,
+    pending: serde_json::Value,
+    busy: Option<serde_json::Value>,
+    pending_once: Option<PathBuf>,
+) -> std::thread::JoinHandle<Vec<serde_json::Value>> {
+    let (socket, lock) = retire_service(installed);
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the older service was not replaced: {requests:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            // A client may have given up and left already; macOS then
+            // refuses socket options.
+            if stream.set_nonblocking(false).is_err()
+                || stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .is_err()
+            {
+                continue;
+            }
+            let request = read_provider_frame(&mut stream);
+            let pending = match &pending_once {
+                Some(file) if !file.exists() => serde_json::json!([]),
+                _ => pending.clone(),
+            };
+            let mut answer = serde_json::json!({
+                "version": 2, "identity": "v0.7.1", "pid": 0,
+                "endpoint": "test-server", "name": "",
+                "connection": {"phase": "online", "error": null, "ssh_pid": null},
+                "pending": pending
+            });
+            let stop =
+                request["stop"] == true || (busy.is_some() && request["stop_if_idle"] == true);
+            if let Some(busy) = &busy {
+                answer["busy"] = busy.clone();
+                answer["stopping"] = stop.into();
+            }
+            requests.push(request);
+            write_provider_frame(&mut stream, answer);
+            if stop {
+                fs::remove_file(&socket).unwrap();
+                drop(lock);
+                return requests;
+            }
+        }
+    })
+}
+
+/// The build of the syq under test.
+fn this_build() -> String {
+    let build = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("--build-identity")
+        .capture_output()
+        .unwrap();
+    String::from_utf8(build.stdout).unwrap().trim().to_owned()
+}
+
+/// The SSH authorization provider follows an update of the syq it was
+/// started from too: once no login or request is in progress, it runs the
+/// new build's command to replace it.
+#[test]
+fn the_provider_switches_to_a_new_build_at_its_path_once_idle() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    assert_output_ok(&installed.persist(
+        &installed.syq,
+        &["receive", "on", "--notify", "off", "--root", &t.s("root")],
+    ));
+    let provider = || {
+        let status = installed.persist(
+            Path::new(env!("CARGO_BIN_EXE_syq")),
+            &["receive", "status", "--json"],
+        );
+        assert_output_ok(&status);
+        serde_json::from_slice::<serde_json::Value>(&status.stdout).unwrap()["provider"].clone()
+    };
+    assert_eq!(provider()["started_from"], installed.syq.to_str().unwrap());
+    assert_eq!(provider()["busy"], 0);
+    let switched = t.path("switched.log");
+    installed.update("v99.0.0-switch-test", &switched);
+    wait_for("the switch", std::time::Duration::from_secs(20), || {
+        switched.exists()
+    });
+    assert_eq!(
+        fs::read_to_string(&switched).unwrap(),
+        format!(
+            "persist receive switch-provider --pscope {}\n",
+            installed.scope.display()
+        )
+    );
+}
+
+/// A Homebrew-style install: syq runs through a link in a group writable
+/// directory, as `/opt/homebrew/bin` is, and an update only points the link
+/// at another version's directory. The service follows the link.
+#[test]
+fn a_receiving_service_follows_a_link_that_an_update_repoints() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    fs::create_dir_all(t.path("Cellar/1")).unwrap();
+    fs::create_dir_all(t.path("Cellar/2")).unwrap();
+    fs::rename(&installed.syq, t.path("Cellar/1/syq")).unwrap();
+    std::os::unix::fs::symlink("../Cellar/1/syq", &installed.syq).unwrap();
+    fs::set_permissions(t.path("bin"), fs::Permissions::from_mode(0o775)).unwrap();
+    installed.connect();
+    let state = installed.request(serde_json::json!({"version": 2, "stop": false}));
+    assert_eq!(state["started_from"], installed.syq.to_str().unwrap());
+
+    let switched = t.path("switched.log");
+    executable_support::write_executable(
+        &t.path("Cellar/2/syq"),
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --build-identity ]; then echo v99.0.0-link-test; exit 0; fi\n\
+             printf '%s\\n' \"$*\" >> '{}'\n",
+            switched.display()
+        ),
+        0o755,
+    );
+    std::os::unix::fs::symlink("../Cellar/2/syq", t.path("bin/syq.new")).unwrap();
+    fs::rename(t.path("bin/syq.new"), &installed.syq).unwrap();
+    wait_for("the switch", std::time::Duration::from_secs(20), || {
+        fs::read_to_string(&switched)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.starts_with("persist connect test-server "))
+    });
+}
+
+/// A switch whose new receiving connection could not log in, though the
+/// control connection works, as when a key was unloaded from the agent,
+/// leaves the old service receiving. It says it waits for a syq command to
+/// the server, and commands wait before trying again.
+#[test]
+fn a_switch_that_cannot_log_in_leaves_the_old_service_receiving() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let old = other_service(
+        &installed,
+        serde_json::json!([]),
+        Some(serde_json::json!({"requests": 0, "pending": 0})),
+        None,
+    );
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    let mut command = installed.command(
+        syq,
+        &[
+            "persist",
+            "connect",
+            "test-server",
+            "--auth-from",
+            "ssh",
+            "--when-idle",
+            "--pscope",
+            installed.scope.to_str().unwrap(),
+        ],
+    );
+    let switched = command.env("FAKE_SSH_REJECT_DIRECT", "1").run().unwrap();
+    assert_eq!(switched.status.code(), Some(78), "{switched:?}");
+    assert!(
+        stderr_of(&switched).contains("logging in to test-server needs you"),
+        "{}",
+        stderr_of(&switched)
+    );
+    // The old service was only asked for its status, and still answers.
+    let state = installed.request(serde_json::json!({"version": 2, "stop": false}));
+    assert_eq!(state["identity"], "v0.7.1");
+    let status = installed.persist(syq, &["status", "--json"]);
+    assert_output_ok(&status);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let switch = &status["connections"][0]["receiving_switch"];
+    assert_eq!(switch["phase"], "login", "{status}");
+    assert_eq!(switch["to"], this_build(), "{status}");
+    let shown = installed.persist(syq, &["status"]);
+    assert!(
+        String::from_utf8_lossy(&shown.stdout)
+            .contains("when you next run a syq copy or ssh command in a terminal"),
+        "{}",
+        String::from_utf8_lossy(&shown.stdout)
+    );
+    // A command without a terminal does not try again: the user is not
+    // there to unlock or touch a key.
+    fs::write(t.path("source"), b"data").unwrap();
+    let copied = installed
+        .command(
+            syq,
+            &[
+                "cp",
+                "--pscope",
+                installed.scope.to_str().unwrap(),
+                &t.s("source"),
+                "--as",
+                &t.s("copy"),
+            ],
+        )
+        .run()
+        .unwrap();
+    assert_output_ok(&copied);
+    assert!(
+        !stderr_of(&copied).contains("switching"),
+        "{}",
+        stderr_of(&copied)
+    );
+    // A switch the service started leaves the user's next command in a
+    // terminal free to try again; one a command started holds commands off
+    // for ten minutes, since each attempt is a failed login on the server.
+    let record = PathBuf::from(format!("{}.json", installed.control().display()));
+    let next_claim = || fs::metadata(&record).unwrap().modified().unwrap();
+    assert!(next_claim() <= std::time::SystemTime::now(), "deferred");
+    let mut by_command = installed.command(
+        syq,
+        &[
+            "persist",
+            "connect",
+            "test-server",
+            "--auth-from",
+            "ssh",
+            "--when-idle",
+            "--pscope",
+            installed.scope.to_str().unwrap(),
+        ],
+    );
+    let switched = by_command
+        .env("FAKE_SSH_REJECT_DIRECT", "1")
+        .env("SYQ_SWITCH_BY_COMMAND", "1")
+        .run()
+        .unwrap();
+    assert_eq!(switched.status.code(), Some(78), "{switched:?}");
+    assert!(
+        next_claim() >= std::time::SystemTime::now() + std::time::Duration::from_secs(9 * 60),
+        "not deferred"
+    );
+    installed.request(serde_json::json!({"version": 2, "stop": true}));
+    let requests = old.join().unwrap();
+    assert!(
+        requests[..requests.len() - 1]
+            .iter()
+            .all(|request| request == &serde_json::json!({"version": 2, "stop": false})),
+        "{requests:?}"
+    );
+}
+
+/// A request that begins waiting for approval while a switch checks its
+/// login keeps an older service, which reports only such requests, running.
+#[test]
+fn a_request_waiting_for_approval_during_the_login_check_keeps_the_old_service() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let checked = t.path("login-checked");
+    let old = other_service(
+        &installed,
+        serde_json::json!([{
+            "id": "0123456789abcdef0123456789abcdef", "from": "test-server",
+            "expires_at": 4102444800u64, "notification": "none",
+            "destination": "/inbox", "permission": "write", "max_bytes": 1,
+            "max_entries": 1, "max_delete": 0, "preserve_permissions": false
+        }]),
+        None,
+        Some(checked.clone()),
+    );
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    let switched = installed
+        .command(
+            syq,
+            &[
+                "persist",
+                "connect",
+                "test-server",
+                "--auth-from",
+                "ssh",
+                "--when-idle",
+                "--pscope",
+                installed.scope.to_str().unwrap(),
+            ],
+        )
+        .env("FAKE_SSH_DIRECT_MARK", &checked)
+        .run()
+        .unwrap();
+    assert_output_ok(&switched);
+    assert!(checked.exists(), "the login was not checked");
+    assert!(
+        String::from_utf8_lossy(&switched.stdout)
+            .contains("keeps running syq v0.7.1 for now, with 1 request waiting for approval"),
+        "{switched:?}"
+    );
+    installed.request(serde_json::json!({"version": 2, "stop": true}));
+    let requests = old.join().unwrap();
+    assert!(
+        requests[..requests.len() - 1]
+            .iter()
+            .all(|request| request == &serde_json::json!({"version": 2, "stop": false})),
+        "{requests:?}"
+    );
+}
+
+/// A switch a command started in the background says in status how it
+/// went, even for a service that cannot report it.
+#[test]
+fn a_background_switch_that_fails_shows_why_in_status() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let _old = older_service(&installed, serde_json::json!([]));
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    fs::write(t.path("source"), b"data").unwrap();
+    let copied = installed
+        .command(
+            syq,
+            &[
+                "cp",
+                "--pscope",
+                installed.scope.to_str().unwrap(),
+                &t.s("source"),
+                "--as",
+                &t.s("copy"),
+            ],
+        )
+        .env("FAKE_SSH_REFUSE", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&copied);
+    assert!(stderr_of(&copied).contains("switching receiving through test-server"));
+    let switch = || {
+        let status = installed.persist(syq, &["status", "--json"]);
+        assert_output_ok(&status);
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        status["connections"][0]["receiving_switch"].clone()
+    };
+    wait_for(
+        "the failed switch",
+        std::time::Duration::from_secs(30),
+        || switch()["phase"] == "failed",
+    );
+    let switch = switch();
+    assert_eq!(switch["to"], this_build());
+    assert!(
+        switch["error"].as_str().unwrap().contains("test-server"),
+        "{switch}"
+    );
+    installed.request(serde_json::json!({"version": 2, "stop": true}));
+}
+
+/// `syq ssh --pscope PATH` switches the services in that domain, not the
+/// default domain's.
+#[test]
+fn ssh_switches_services_in_its_own_domain() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let old = older_service(&installed, serde_json::json!([]));
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    // The default domain, with persistence off, switches nothing.
+    let plain = installed
+        .command(syq, &["ssh", "other.invalid", "--", "true"])
+        .run()
+        .unwrap();
+    assert!(
+        !stderr_of(&plain).contains("switching"),
+        "{}",
+        stderr_of(&plain)
+    );
+    let scoped = installed
+        .command(
+            syq,
+            &[
+                "ssh",
+                "--pscope",
+                installed.scope.to_str().unwrap(),
+                "other.invalid",
+                "--",
+                "true",
+            ],
+        )
+        .run()
+        .unwrap();
+    assert!(
+        stderr_of(&scoped).contains("switching receiving through test-server"),
+        "{}",
+        stderr_of(&scoped)
+    );
+    let requests = old.join().unwrap();
+    assert_eq!(
+        requests.last().unwrap(),
+        &serde_json::json!({"version": 2, "stop": true})
+    );
+}
+
+/// A switch to a new build never turns persistence back on: with it off,
+/// as after `syq persist off`, `persist connect --when-idle` does nothing.
+#[test]
+fn a_switch_does_not_turn_persistence_back_on() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    let _persistence = PersistenceOff(&t);
+    let ssh = fake_ssh(&t);
+    let connect = || {
+        persistence_command(
+            &t,
+            &[
+                "connect",
+                "test-server",
+                "--auth-from",
+                "ssh",
+                "--when-idle",
+            ],
+        )
+        .env("HOME", t.path(""))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+        )
+        .run()
+        .unwrap()
+    };
+    let enabled = || {
+        let status = persistence_command(&t, &["status", "--json"])
+            .run()
+            .unwrap();
+        assert_output_ok(&status);
+        serde_json::from_slice::<serde_json::Value>(&status.stdout).unwrap()["enabled"].clone()
+    };
+    // Never turned on, and turned off.
+    for off in [false, true] {
+        if off {
+            assert_output_ok(&persistence_command(&t, &["off"]).run().unwrap());
+        }
+        let switched = connect();
+        assert_output_ok(&switched);
+        assert!(switched.stdout.is_empty(), "{switched:?}");
+        assert_eq!(enabled(), false);
+        assert!(!t.path("rsh.log").exists(), "it logged in");
+    }
+}
+
+/// Run a no-op local copy in the fixture's scope, which looks at its stale
+/// service with the usual short budget, and return how long it took.
+fn local_copy(t: &Tmp, installed: &Installed) -> std::time::Duration {
+    fs::write(t.path("source"), b"data").unwrap();
+    let started = std::time::Instant::now();
+    let mut command = installed.command(
+        Path::new(env!("CARGO_BIN_EXE_syq")),
+        &[
+            "cp",
+            "--pscope",
+            installed.scope.to_str().unwrap(),
+            &t.s("source"),
+            "--as",
+            &t.s("copy"),
+        ],
+    );
+    let copied = command
+        .env_remove("SYQ_TEST_REFRESH_ANSWER_MS")
+        .run()
+        .unwrap();
+    assert_output_ok(&copied);
+    started.elapsed()
+}
+
+/// A command waits only briefly for a stale service that accepts its status
+/// request but never answers: it gives up on the connection within its
+/// short budget rather than a socket timeout's second.
+#[test]
+fn a_silent_stale_service_holds_a_command_only_briefly() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let (socket, lock) = retire_service(&installed);
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let silent = std::thread::spawn(move || {
+        let (mut client, _) = listener.accept().unwrap();
+        let accepted = std::time::Instant::now();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        // Read the request and wait, never answering, until the client
+        // gives up.
+        let _ = std::io::copy(&mut client, &mut std::io::sink());
+        let held = accepted.elapsed();
+        fs::remove_file(&socket).unwrap();
+        drop(lock);
+        held
+    });
+    local_copy(&t, &installed);
+    let held = silent.join().unwrap();
+    assert!(held < std::time::Duration::from_millis(500), "{held:?}");
+}
+
+/// A stale service whose control socket's listen queue is full does not
+/// block a command: it does not wait to connect.
+#[test]
+fn a_stale_service_with_a_full_queue_does_not_block_a_command() {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let (socket, lock) = retire_service(&installed);
+    let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+    listener.bind(&SockAddr::unix(&socket).unwrap()).unwrap();
+    listener.listen(1).unwrap();
+    let mut queued = Vec::new();
+    loop {
+        let client = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        client.set_nonblocking(true).unwrap();
+        match client.connect(&SockAddr::unix(&socket).unwrap()) {
+            Ok(()) => queued.push(client),
+            Err(_) => break,
+        }
+        assert!(queued.len() < 1024, "the listen queue did not fill");
+    }
+    // Without its own deadline, the command's connect would wait here for
+    // as long as nothing accepts.
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            local_copy(&t, &installed);
+            done.send(()).unwrap();
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the command waited on a full listen queue");
+    });
+    drop(queued);
+    drop(listener);
+    fs::remove_file(&socket).unwrap();
+    drop(lock);
+}
+
+/// A switch that runs too long after logging in, as while installing the
+/// helper over a slow link, ends itself, with the ssh it started, and says
+/// so in status.
+#[test]
+fn a_switch_that_runs_too_long_ends_with_what_it_started() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let old = older_service(&installed, serde_json::json!([]));
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    let started = t.path("ssh.pids");
+    // As a service or command starts it: leading its own process group.
+    let mut switch = installed.command(
+        syq,
+        &[
+            "persist",
+            "connect",
+            "test-server",
+            "--auth-from",
+            "ssh",
+            "--when-idle",
+            "--pscope",
+            installed.scope.to_str().unwrap(),
+        ],
+    );
+    // Its login, which ends 2 s before the switch's time does, is done
+    // long before then.
+    let mut switch = switch
+        .env("FAKE_SSH_PIDS", &started)
+        .env("SYQ_TEST_SWITCH_STALL_MS", "60000")
+        .env("SYQ_TEST_SWITCH_TIMEOUT_MS", "6000")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let status = switch.wait().unwrap();
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGKILL)
+    );
+    let ssh: Vec<libc::pid_t> = fs::read_to_string(&started)
+        .unwrap()
+        .lines()
+        .map(|pid| pid.parse().unwrap())
+        .collect();
+    assert!(!ssh.is_empty());
+    wait_for("ssh to end", std::time::Duration::from_secs(10), || {
+        ssh.iter().all(|&pid| ended(pid))
+    });
+    let shown = installed.persist(syq, &["status", "--json"]);
+    assert_output_ok(&shown);
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let switched = &shown["connections"][0]["receiving_switch"];
+    assert_eq!(switched["phase"], "failed", "{shown}");
+    assert!(
+        switched["error"]
+            .as_str()
+            .unwrap()
+            .contains("switching took longer than"),
+        "{shown}"
+    );
+    installed.request(serde_json::json!({"version": 2, "stop": true}));
+    old.join().unwrap();
+}
+
+/// Whether process `pid` has ended, though perhaps not yet been reaped.
+fn ended(pid: libc::pid_t) -> bool {
+    let gone = unsafe { libc::kill(pid, 0) } != 0;
+    gone || fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(") ")
+            .is_some_and(|(_, fields)| fields.starts_with('Z'))
+    })
+}
+
+/// A switch's control connection whose login gets no answer in time, as
+/// when ssh waits for a touch of a security key that nobody gives, ends the
+/// switch before its time is up, with that ssh, as one that needs the user,
+/// as does a login the server rejects: only a command at a terminal tries
+/// it again, so the key does not ask again unattended.
+#[test]
+fn a_switch_whose_control_login_needs_the_user_waits_for_the_user() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let old = older_service(&installed, serde_json::json!([]));
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    let switch = || {
+        let mut switch = installed.command(
+            syq,
+            &[
+                "persist",
+                "connect",
+                "test-server",
+                "--auth-from",
+                "ssh",
+                "--when-idle",
+                "--pscope",
+                installed.scope.to_str().unwrap(),
+            ],
+        );
+        switch
+            .env("SYQ_TEST_SWITCH_TIMEOUT_MS", "6000")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        switch
+    };
+    let phase = || {
+        let shown = installed.persist(syq, &["status", "--json"]);
+        assert_output_ok(&shown);
+        let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+        shown["connections"][0]["receiving_switch"].clone()
+    };
+
+    // Rejected.
+    let rejected = switch().env("FAKE_SSH_REJECT", "1").output().unwrap();
+    assert_eq!(rejected.status.code(), Some(78), "{rejected:?}");
+    assert!(
+        stderr_of(&rejected).contains("logging in to test-server needs you"),
+        "{}",
+        stderr_of(&rejected)
+    );
+    assert_eq!(phase()["phase"], "login");
+
+    // No answer.
+    let hung = t.path("ssh.pid");
+    let started = std::time::Instant::now();
+    let mut waiting = switch().env("FAKE_SSH_HANG", &hung).spawn().unwrap();
+    wait_for(
+        "its login to start",
+        std::time::Duration::from_secs(20),
+        || fs::read_to_string(&hung).is_ok_and(|pid| !pid.trim().is_empty()),
+    );
+    let ssh: libc::pid_t = fs::read_to_string(&hung).unwrap().trim().parse().unwrap();
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(waiting.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+    let status = waiting.wait().unwrap();
+    assert_eq!(status.code(), Some(78), "{status:?}: {stderr}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(6));
+    assert!(stderr.contains("did not finish logging in"), "{stderr}");
+    wait_for("ssh to end", std::time::Duration::from_secs(10), || {
+        ended(ssh)
+    });
+    let switched = phase();
+    assert_eq!(switched["phase"], "login", "{switched}");
+    assert!(
+        switched["error"]
+            .as_str()
+            .unwrap()
+            .contains("did not finish logging in"),
+        "{switched}"
+    );
+    // The old service still receives.
+    let state = installed.request(serde_json::json!({"version": 2, "stop": false}));
+    assert_eq!(state["identity"], "v0.7.1");
+    installed.request(serde_json::json!({"version": 2, "stop": true}));
+    old.join().unwrap();
+}
+
+/// A switch whose own login gets no answer in time, as when ssh waits for
+/// a touch of a security key that nobody gives, ends before its time is up,
+/// with that ssh, as one that needs the user: only a command at a terminal
+/// tries it again, so the key does not ask again unattended. Its ssh runs in
+/// the switch's process group, so that it ends with the switch whenever
+/// that ends.
+#[test]
+fn a_switch_whose_login_gets_no_answer_waits_for_the_user() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let old = older_service(&installed, serde_json::json!([]));
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    let hung = t.path("ssh.pid");
+    let switch = |timeout: &str| {
+        let _ = fs::remove_file(&hung);
+        let mut switch = installed.command(
+            syq,
+            &[
+                "persist",
+                "connect",
+                "test-server",
+                "--auth-from",
+                "ssh",
+                "--when-idle",
+                "--pscope",
+                installed.scope.to_str().unwrap(),
+            ],
+        );
+        let switch = switch
+            .env("FAKE_SSH_HANG_DIRECT", &hung)
+            .env("SYQ_TEST_SWITCH_TIMEOUT_MS", timeout)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        wait_for(
+            "its login to start",
+            std::time::Duration::from_secs(20),
+            || fs::read_to_string(&hung).is_ok_and(|pid| !pid.trim().is_empty()),
+        );
+        let pid = |path: &Path| -> libc::pid_t {
+            fs::read_to_string(path).unwrap().trim().parse().unwrap()
+        };
+        (switch, pid(&hung), pid(&hung.with_extension("pid.child")))
+    };
+    let (mut first, ssh, child) = switch("8000");
+    let started = std::time::Instant::now();
+    let status = first.wait().unwrap();
+    assert_eq!(status.code(), Some(78), "{status:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(8));
+    // The switch ends its ssh's own processes too, though nobody ends its
+    // group after it, as when the command that started it is gone.
+    wait_for("ssh to end", std::time::Duration::from_secs(10), || {
+        ended(ssh) && ended(child)
+    });
+    let shown = installed.persist(syq, &["status", "--json"]);
+    assert_output_ok(&shown);
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let switched = &shown["connections"][0]["receiving_switch"];
+    assert_eq!(switched["phase"], "login", "{shown}");
+    assert!(
+        switched["error"]
+            .as_str()
+            .unwrap()
+            .contains("did not finish logging in"),
+        "{shown}"
+    );
+    // The old service still receives.
+    let state = installed.request(serde_json::json!({"version": 2, "stop": false}));
+    assert_eq!(state["identity"], "v0.7.1");
+
+    // Ending the switch's group, as its time limit or the service that
+    // started it does, ends its login with it.
+    let (mut second, ssh, child) = switch("60000");
+    unsafe { libc::kill(-(second.id() as libc::pid_t), libc::SIGKILL) };
+    second.wait().unwrap();
+    wait_for("ssh to end", std::time::Duration::from_secs(10), || {
+        ended(ssh) && ended(child)
+    });
+    installed.request(serde_json::json!({"version": 2, "stop": true}));
+    old.join().unwrap();
+}
+
+/// A service that an older syq left running cannot follow an update by
+/// itself. Any syq command run here replaces it with this build once it is
+/// idle, in the background, and says so; the service's settings stay.
+#[test]
+fn commands_replace_an_idle_service_an_older_syq_left_running() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let settings = read(&installed.scope.join("receive.json"));
+    let old = older_service(&installed, serde_json::json!([]));
+
+    // A local copy, which talks to no server.
+    fs::write(t.path("source"), b"data").unwrap();
+    let copied = installed
+        .command(
+            Path::new(env!("CARGO_BIN_EXE_syq")),
+            &[
+                "cp",
+                "--pscope",
+                installed.scope.to_str().unwrap(),
+                &t.s("source"),
+                "--as",
+                &t.s("copy"),
+            ],
+        )
+        .run()
+        .unwrap();
+    assert_output_ok(&copied);
+    // An older service cannot say whether a copy is in progress.
+    assert!(
+        stderr_of(&copied).contains(
+            "switching receiving through test-server, which runs syq v0.7.1, to this version of syq in the background (a copy in progress through it would be interrupted)"
+        ),
+        "{}",
+        stderr_of(&copied)
+    );
+    let requests = old.join().unwrap();
+    // It never sent the older service a request it cannot read.
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.get("stop_if_idle").is_none()),
+        "{requests:?}"
+    );
+    assert_eq!(
+        requests.last().unwrap(),
+        &serde_json::json!({"version": 2, "stop": true})
+    );
+    let socket = PathBuf::from(format!("{}.recv", installed.control().display()));
+    wait_for(
+        "this build's service",
+        std::time::Duration::from_secs(20),
+        || {
+            std::os::unix::net::UnixStream::connect(&socket).is_ok()
+                && installed.request(serde_json::json!({"version": 2, "stop": false}))["identity"]
+                    == this_build()
+        },
+    );
+    assert_eq!(read(&installed.scope.join("receive.json")), settings);
+}
+
+/// A service an older syq left running with a request waiting for approval
+/// keeps running: a command leaves it, and a switch says why it waits.
+/// `persist connect` run by hand replaces it at once and says what that
+/// cuts off.
+#[test]
+fn a_busy_service_is_replaced_only_by_hand_saying_what_that_cuts_off() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let old = older_service(
+        &installed,
+        serde_json::json!([{
+            "id": "0123456789abcdef0123456789abcdef", "from": "test-server",
+            "expires_at": 4102444800u64, "notification": "none",
+            "destination": "/inbox", "permission": "write", "max_bytes": 1,
+            "max_entries": 1, "max_delete": 0, "preserve_permissions": false
+        }]),
+    );
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    fs::write(t.path("source"), b"data").unwrap();
+    let copied = installed
+        .command(
+            syq,
+            &[
+                "cp",
+                "--pscope",
+                installed.scope.to_str().unwrap(),
+                &t.s("source"),
+                "--as",
+                &t.s("copy"),
+            ],
+        )
+        .run()
+        .unwrap();
+    assert_output_ok(&copied);
+    assert!(
+        !stderr_of(&copied).contains("switching"),
+        "{}",
+        stderr_of(&copied)
+    );
+    let waiting = installed.persist(
+        syq,
+        &[
+            "connect",
+            "test-server",
+            "--auth-from",
+            "ssh",
+            "--when-idle",
+        ],
+    );
+    assert_output_ok(&waiting);
+    assert_eq!(
+        String::from_utf8_lossy(&waiting.stdout),
+        "receiving through test-server keeps running syq v0.7.1 for now, with 1 request waiting for approval; once nothing is in progress, a syq command run here switches it to this version\n"
+    );
+
+    let replaced = installed.persist(
+        syq,
+        &[
+            "connect",
+            "test-server",
+            "--timeout",
+            "20",
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+        ],
+    );
+    assert_output_ok(&replaced);
+    assert!(
+        stderr_of(&replaced).contains(
+            "replacing receiving through test-server, which runs syq v0.7.1, cuts off 1 request waiting for approval"
+        ),
+        "{}",
+        stderr_of(&replaced)
+    );
+    let requests = old.join().unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.get("stop_if_idle").is_none()),
+        "{requests:?}"
+    );
+    assert_eq!(
+        installed.request(serde_json::json!({"version": 2, "stop": false}))["identity"],
+        this_build()
+    );
+}
+
 /// A server that refuses remote forwarding cannot carry receiving, however
 /// often syq dials it: the connection fails with a status saying why,
 /// instead of logging in again every half minute for as long as receiving

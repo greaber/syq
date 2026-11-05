@@ -67,6 +67,10 @@ enum PersistAction {
         /// After connecting, wait up to this many seconds for receiving to be ready
         #[arg(long, value_name = "SECONDS", default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: u64,
+        /// Replace a receiving service from another build only once it is
+        /// idle, as a switch to a new build does (`receive_service::switch`)
+        #[arg(long, hide = true)]
+        when_idle: bool,
     },
     /// Keep SSH connections open for later syq commands
     On {
@@ -204,6 +208,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
             syq_path,
             no_bootstrap,
             timeout,
+            when_idle,
         } => {
             let endpoint =
                 crate::cli::parse_native_endpoint(Some(&host))?.context("SSH endpoint missing")?;
@@ -238,13 +243,32 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                     explicit_mode,
                 )?;
             } else {
-                connect_domain(
+                let connected = connect_domain(
                     &domain,
                     &host,
                     syq_path,
                     no_bootstrap,
                     Duration::from_secs(timeout),
-                )?;
+                    if when_idle {
+                        crate::receive_service::Replace::WhenIdle
+                    } else {
+                        crate::receive_service::Replace::Now
+                    },
+                );
+                // A switch to a new build tells the service that started it
+                // that it waits for the user (`switch::LOGIN_NEEDED_EXIT`).
+                if let Err(error) = &connected {
+                    if when_idle
+                        && error
+                            .downcast_ref::<crate::receive_service::switch::LoginNeeded>()
+                            .is_some()
+                    {
+                        crate::output::diagnostic!("syq persist: {error:#}");
+                        crate::receive_service::switch::end_own_group();
+                        return Ok(crate::receive_service::switch::LOGIN_NEEDED_EXIT);
+                    }
+                }
+                connected?;
             }
         }
         PersistAction::On { ephemeral: true } => {
@@ -381,17 +405,26 @@ fn reject_receiving_name(host: &str) -> Result<()> {
     Ok(())
 }
 
+/// `replace` says what to do with a receiving service from another build:
+/// replace it at once, as when the user runs `persist connect`, or only
+/// once idle, as a switch to a new build does.
 pub(crate) fn connect_domain(
     domain: &Domain,
     host: &str,
     syq_path: Option<String>,
     no_bootstrap: bool,
     timeout: Duration,
+    replace: crate::receive_service::Replace,
 ) -> Result<()> {
     let endpoint =
         crate::cli::parse_native_endpoint(Some(host))?.context("SSH endpoint missing")?;
     reject_receiving_name(&endpoint.host)?;
     let was_enabled = domain.enabled()?;
+    let when_idle = replace == crate::receive_service::Replace::WhenIdle;
+    // A switch to a new build never turns persistence back on.
+    if when_idle && !was_enabled {
+        return Ok(());
+    }
     let scope = domain.enable()?;
     if !was_enabled {
         crate::output::command_human_stdout!(
@@ -406,13 +439,103 @@ pub(crate) fn connect_domain(
         None,
     )?;
     multiplexer.defer_receiving();
+    let mut _switching = None;
+    if when_idle {
+        // One switch at a time per connection; others leave it to that one.
+        let Some(lock) = lock_endpoint_record(multiplexer.control_path())? else {
+            return Ok(());
+        };
+        _switching = Some(lock);
+        // Leave a busy service, or one following another installed syq,
+        // before logging in to the server for nothing.
+        if let Some(ready) = crate::receive_service::keeps_running(multiplexer.control_path()) {
+            report_ready(domain, &endpoint_label(&endpoint), ready);
+            return Ok(());
+        }
+    }
     let multiplexer = Arc::new(multiplexer);
+    if !when_idle {
+        return connect_receiving(
+            domain,
+            multiplexer,
+            endpoint,
+            syq_path,
+            no_bootstrap,
+            timeout,
+            replace,
+        );
+    }
+    // A switch runs in the background, where nobody waits for it: bound its
+    // time, with what it started, and keep how it went for status
+    // (`receive_service::record_attempt`).
+    let control = multiplexer.control_path().to_path_buf();
+    use crate::receive_service::{record_attempt, Attempt};
+    record_attempt(&control, &Attempt::new("switching", None));
+    let timed_out = control.clone();
+    crate::receive_service::switch::end_switch_at(move || {
+        record_attempt(
+            &timed_out,
+            &Attempt::new("failed", Some(crate::receive_service::switch::timed_out())),
+        )
+    });
+    let result = connect_receiving(
+        domain,
+        multiplexer,
+        endpoint,
+        syq_path,
+        no_bootstrap,
+        timeout,
+        replace,
+    );
+    match &result {
+        Ok(()) => crate::receive_service::clear_attempt(&control),
+        Err(error) => {
+            let login = error
+                .downcast_ref::<crate::receive_service::switch::LoginNeeded>()
+                .is_some();
+            record_attempt(
+                &control,
+                &Attempt::new(
+                    if login { "login" } else { "failed" },
+                    Some(format!("{error:#}")),
+                ),
+            );
+        }
+    }
+    result
+}
+
+fn connect_receiving(
+    domain: &Domain,
+    multiplexer: Arc<crate::conn::SshMultiplexer>,
+    endpoint: crate::cli::NativeEndpoint,
+    syq_path: Option<String>,
+    no_bootstrap: bool,
+    timeout: Duration,
+    replace: crate::receive_service::Replace,
+) -> Result<()> {
+    let when_idle = replace == crate::receive_service::Replace::WhenIdle;
     let remote = crate::conn::RemoteSpec {
         local_process: false,
         user: endpoint.user,
         host: endpoint.host,
         port: endpoint.port,
-        rsh: vec!["ssh".into()],
+        // A switch runs in the background: a login that needs the user fails
+        // rather than asks, as receiving's own reconnects do.
+        rsh: if when_idle {
+            // An unreachable server fails soon, as an ordinary failure,
+            // rather than at the login's deadline as one that needs the user
+            // (`switch::LoginWatch`); as the login check does.
+            vec![
+                "ssh".into(),
+                "-o".into(),
+                "BatchMode=yes".into(),
+                "-o".into(),
+                "ConnectTimeout=10".into(),
+            ]
+        } else {
+            vec!["ssh".into()]
+        },
         bootstrap_helper: syq_path.is_none() && !no_bootstrap,
         syq_path,
         restricted_grant: None,
@@ -430,23 +553,146 @@ pub(crate) fn connect_domain(
     crate::output::command_human_stdout!("Connecting to {}...", remote.label());
     // This uses the same pinned-helper bootstrap and authentication as a copy.
     // No source roots, data workers or filesystem operations are requested.
-    let connection = remote.connect_with(true, false)?;
-    let receiving =
-        crate::receive_service::ensure_ready(domain, multiplexer.control_path(), &remote, timeout)?;
-    drop(connection);
-    match receiving {
-        Some(names) => {
-            crate::output::command_human_stdout!(
-                "{} ready; receiving as @{}",
-                remote.label(),
-                names.join(", @")
-            )
+    // A switch reads ssh's errors to tell a login that needs the user from
+    // other failures, and bounds a login that waits for one.
+    let connected = if when_idle {
+        let _login = crate::receive_service::switch::LoginWatch::start(
+            multiplexer.control_path(),
+            remote.label(),
+        );
+        remote.connect_for_authorization(true)
+    } else {
+        remote.connect_with(true, false)
+    };
+    let connection = match connected {
+        Ok(connection) => connection,
+        Err(error)
+            if when_idle
+                && matches!(
+                    crate::conn::ssh_authorization_failure(&error),
+                    Some(crate::conn::SshLoginFailure::Credentials)
+                        | Some(crate::conn::SshLoginFailure::HostKey)
+                ) =>
+        {
+            crate::receive_service::switch::defer_after_login(multiplexer.control_path());
+            return Err(error.context(crate::receive_service::switch::LoginNeeded(remote.label())));
         }
-        None => {
-            crate::output::command_human_stdout!("{} ready; receiving is disabled", remote.label())
-        }
+        Err(error) => return Err(error),
+    };
+    // Tests stand for work after the login that takes too long.
+    #[cfg(debug_assertions)]
+    if let Some(millis) = when_idle
+        .then(|| std::env::var("SYQ_TEST_SWITCH_STALL_MS").ok())
+        .flatten()
+        .and_then(|millis| millis.parse().ok())
+    {
+        std::thread::sleep(Duration::from_millis(millis));
     }
+    let receiving = crate::receive_service::ensure_ready(
+        domain,
+        multiplexer.control_path(),
+        &remote,
+        timeout,
+        replace,
+    )?;
+    drop(connection);
+    report_ready(domain, &remote.label(), receiving);
     Ok(())
+}
+
+fn endpoint_label(endpoint: &crate::cli::NativeEndpoint) -> String {
+    EndpointRecord::new(
+        endpoint.user.as_deref(),
+        &endpoint.host,
+        endpoint.port,
+        None,
+    )
+    .label()
+}
+
+fn report_ready(domain: &Domain, label: &str, ready: crate::receive_service::Ready) {
+    use crate::receive_service::Ready;
+    match ready {
+        Ready::Online(names) => {
+            crate::output::command_human_stdout!("{label} ready; receiving as @{}", names.join(", @"))
+        }
+        Ready::Off => {
+            crate::output::command_human_stdout!("{label} ready; receiving is disabled")
+        }
+        Ready::Other {
+            build,
+            busy: Some(busy),
+            follows_this_file,
+        } => crate::output::command_human_stdout!(
+            "{}",
+            crate::receive_service::busy_notice(
+                label,
+                &build,
+                &busy,
+                follows_this_file,
+                &crate::receive_service::connect_command(label, domain.explicit_path())
+            )
+        ),
+        Ready::Other {
+            build, busy: None, ..
+        } => crate::output::command_human_stdout!(
+            "receiving through {label} keeps running syq {build}, which follows another installed syq; `{}` replaces it",
+            crate::receive_service::connect_command(label, domain.explicit_path())
+        ),
+    }
+}
+
+/// Take the endpoint record's lock for one switch to a new build at a time,
+/// or None while another holds it. The record is never rewritten, so its
+/// lock stays on one file while the scope lasts.
+fn lock_endpoint_record(control: &Path) -> Result<Option<File>> {
+    let mut path = control.as_os_str().to_owned();
+    path.push(".json");
+    let record = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .with_context(|| format!("open endpoint record {}", Path::new(&path).display()))?;
+    if unsafe { libc::flock(record.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(record));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return Ok(None);
+    }
+    Err(error.into())
+}
+
+/// Keep commands from starting a switch for this connection for `wait`
+/// (`claim_switch_attempt`).
+pub(crate) fn defer_switch_attempts(control: &Path, wait: Duration) {
+    let mut path = control.as_os_str().to_owned();
+    path.push(".json");
+    if let Ok(record) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+    {
+        let _ = record.set_modified(std::time::SystemTime::now() + wait);
+    }
+}
+
+/// Whether a command may start a switch for this connection now: at most
+/// one in `interval`, so that commands run while its server is unreachable
+/// do not each log in again, and none while a switch holds the endpoint
+/// record's lock. A claim, made under that lock, sets the record's
+/// modification time ahead to when the next one is due; nothing else uses
+/// that time, as the record is never rewritten.
+pub(crate) fn claim_switch_attempt(control: &Path, interval: Duration) -> bool {
+    let Ok(Some(record)) = lock_endpoint_record(control) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now();
+    let due = record
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|next| next <= now);
+    due && record.set_modified(now + interval).is_ok()
 }
 
 /// Remember whether the command explicitly selected a scope without touching
@@ -980,6 +1226,14 @@ struct ConnectionStatus {
     receiving_name: Option<String>,
     receiving_profiles: Vec<crate::receive_service::NamedConnection>,
     receiving: Option<crate::receive_service::ConnectionState>,
+    /// The receiving service's build, when it is running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receiving_build: Option<String>,
+    /// Its switch to a new build, while waiting for one or after one failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receiving_switch: Option<crate::receive_service::switch::Report>,
+    #[serde(skip)]
+    receiving_note: Option<String>,
     session_pool: bool,
 }
 
@@ -1026,7 +1280,21 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
             _ if ssh_live => "ready",
             _ => "inactive",
         };
+        let receiving_note = receiving.as_ref().and_then(|receiving| {
+            crate::receive_service::build_note(
+                &receiving.build,
+                receiving.started_from.as_deref(),
+                receiving.switch.as_ref(),
+                receiving.busy.as_ref(),
+                Some(&record.label()),
+                &crate::receive_service::connect_command(&record.label(), domain.explicit_path()),
+                true,
+            )
+        });
         connections.push(ConnectionStatus {
+            receiving_build: receiving.as_ref().map(|s| s.build.clone()),
+            receiving_switch: receiving.as_ref().and_then(|s| s.switch.clone()),
+            receiving_note,
             endpoint: record.label(),
             ssh_options: record.ssh_options.clone(),
             ssh_options_directory: record.ssh_options_directory.clone(),
@@ -1040,6 +1308,12 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
         });
     }
     let authorized_ssh = crate::destination::ssh::persistent::status(domain)?;
+    // The local SSH authorization provider, when it runs another build or is
+    // switching to a new one.
+    let provider = crate::receive_service::provider::snapshot(domain)
+        .ok()
+        .flatten()
+        .filter(|provider| provider.build != crate::identity::build() || provider.switch.is_some());
     if json {
         crate::output::command_println!(
             "{}",
@@ -1048,6 +1322,9 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
                 "scope": scope, "connections": connections, "receiving_error": receiving_error,
                 "authorized_ssh": authorized_ssh.rows,
                 "authorized_ssh_errors": authorized_ssh.errors,
+                "provider": provider.as_ref().map(|provider| serde_json::json!({
+                    "build": provider.build, "switch": provider.switch,
+                })),
             })
         );
         anyhow::ensure!(
@@ -1098,6 +1375,9 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
                 line.push_str(&format!(": {error}"));
             }
         }
+        if let Some(note) = &connection.receiving_note {
+            line.push_str(&format!("; receiving {note}"));
+        }
         // Only a copy with the same --rsh options reopens such a connection.
         if connection.state == "inactive" && connection.ssh_options.is_empty() {
             line.push_str(&format!(
@@ -1112,6 +1392,26 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
             }
         }
         crate::output::command_human_stdout!("{line}");
+    }
+    if let Some(provider) = provider {
+        let mut fix = "syq persist receive on".to_owned();
+        if kind != "global" {
+            fix.push_str(&format!(
+                " --pscope {}",
+                shell_words::quote(&scope.to_string_lossy())
+            ));
+        }
+        if let Some(note) = crate::receive_service::build_note(
+            &provider.build,
+            provider.started_from.as_deref(),
+            provider.switch.as_ref(),
+            provider.busy().as_ref(),
+            None,
+            &fix,
+            false,
+        ) {
+            crate::output::command_human_stdout!("  local SSH provider: {note}");
+        }
     }
     anyhow::ensure!(
         authorized_ssh.errors.is_empty(),
@@ -1400,6 +1700,38 @@ mod tests {
         assert!(prepare_endpoint(&long, None, "example", None, None).is_err());
         close_scope(&long).unwrap();
         assert!(!long.exists());
+    }
+
+    /// Many commands at once claim at most one switch for a connection in
+    /// its interval, and none while a switch holds its record's lock.
+    #[test]
+    fn concurrent_commands_claim_one_switch_attempt() {
+        let temporary = crate::test_support::short_tempdir().unwrap();
+        let scope = temporary.path().join("scope");
+        initialize_scope(&scope).unwrap();
+        let control = prepare_endpoint(&scope, None, "example", None, None).unwrap();
+        for _ in 0..5 {
+            defer_switch_attempts(&control, Duration::ZERO);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(64));
+            let claims: usize = (0..64)
+                .map(|_| {
+                    let (control, barrier) = (control.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        claim_switch_attempt(&control, Duration::from_secs(60))
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|join| usize::from(join.join().unwrap()))
+                .sum();
+            assert_eq!(claims, 1);
+        }
+        defer_switch_attempts(&control, Duration::ZERO);
+        let switching = lock_endpoint_record(&control).unwrap().unwrap();
+        assert!(!claim_switch_attempt(&control, Duration::from_secs(60)));
+        drop(switching);
+        assert!(claim_switch_attempt(&control, Duration::from_secs(60)));
     }
 
     #[test]

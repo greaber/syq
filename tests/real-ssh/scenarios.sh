@@ -21,6 +21,9 @@ cleanup() {
     if [ -n "${upgrade_scope:-}" ]; then
         syq persist off --pscope "$upgrade_scope" >/dev/null 2>&1 || true
     fi
+    if [ -n "${switch_scope:-}" ]; then
+        syq persist off --pscope "$switch_scope" >/dev/null 2>&1 || true
+    fi
     syq persist off >/dev/null 2>&1 || true
     if [ -n "${SSH_AGENT_PID:-}" ]; then
         ssh-agent -k >/dev/null 2>&1 || true
@@ -445,6 +448,59 @@ assert connection["receiving"]["phase"] == "online", connection
 '
 syq persist off --pscope "$upgrade_scope"
 upgrade_scope=
+
+printf 'case: a receiving service switches to a new build installed where it was started from\n'
+# Receive with another build installed at /tmp/syq-switch-bin/syq, then
+# update that file to this build, as an installer would. The service notices
+# and, once idle, runs the new build's connect, which installs its helper on
+# the server and replaces the service. Nothing else is run.
+switch_scope=$(syq persist on --ephemeral)
+mkdir -p /tmp/syq-switch-bin /tmp/syq-switch-receive
+chmod 0755 /tmp/syq-switch-bin
+cp /usr/local/bin/syq-other-build /tmp/syq-switch-bin/syq
+SYQ_TEST_SWITCH_CHECK_MS=200 SYQ_TEST_SWITCH_QUIET_MS=1000 \
+    /tmp/syq-switch-bin/syq persist receive on --pscope "$switch_scope" --notify off \
+    --root /tmp/syq-switch-receive --all-connections
+SYQ_TEST_SWITCH_CHECK_MS=200 SYQ_TEST_SWITCH_QUIET_MS=1000 \
+    /tmp/syq-switch-bin/syq persist connect source --pscope "$switch_scope"
+cp "$switch_scope/receive.json" /tmp/syq-switch-settings.json
+other_build=$(syq-other-build --build-identity)
+this_build=$(syq --build-identity)
+syq persist receive status --json --pscope "$switch_scope" | python3 -c '
+import json, sys
+state = json.load(sys.stdin)
+(connection,) = state["connections"]
+assert connection["identity"] == sys.argv[1], connection
+assert connection["started_from"] == "/tmp/syq-switch-bin/syq", connection
+assert connection["connection"]["phase"] == "online", connection
+' "$other_build"
+cp /usr/local/bin/syq /tmp/syq-switch-bin/syq.new
+mv /tmp/syq-switch-bin/syq.new /tmp/syq-switch-bin/syq
+python3 - "$switch_scope" "$this_build" <<'PYSWITCH'
+import json, subprocess, sys, time
+
+scope, build = sys.argv[1], sys.argv[2]
+deadline = time.monotonic() + 90
+progress = time.monotonic()
+while True:
+    state = json.loads(subprocess.run(
+        ["syq", "persist", "receive", "status", "--json", "--pscope", scope],
+        check=True, capture_output=True, text=True).stdout)
+    connections = state["connections"]
+    if (len(connections) == 1 and connections[0]["identity"] == build
+            and connections[0]["connection"]["phase"] == "online"):
+        assert connections[0]["started_from"] == "/tmp/syq-switch-bin/syq", connections
+        break
+    if time.monotonic() >= deadline:
+        raise SystemExit(f"receiving did not switch to {build}: {connections}")
+    if time.monotonic() >= progress:
+        print(f"waiting for receiving to switch: {connections}", file=sys.stderr)
+        progress = time.monotonic() + 10
+    time.sleep(0.5)
+PYSWITCH
+cmp "$switch_scope/receive.json" /tmp/syq-switch-settings.json
+syq persist off --pscope "$switch_scope"
+switch_scope=
 
 printf 'case: named return destination works from independent server shells without agent forwarding\n'
 receive_root=/tmp/syq-real-ssh-receive

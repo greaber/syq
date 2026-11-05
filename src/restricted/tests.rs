@@ -300,13 +300,18 @@ fn released_enrollment_state_is_never_read_or_touched() {
     write(&misplaced.join("config.json"), receiver, 0o600);
     assert!(read_receiver_config(&misplaced).is_err());
 
-    // `syq receiver list` points at the docs, and changes nothing.
+    // `syq receiver list` says how to remove them, and changes nothing.
     let notice = released_enrollment_notice(home).unwrap();
     assert!(notice.contains("syq 0.7.1 and earlier"), "{notice}");
-    assert!(
-        notice.contains("#enrollments-from-older-versions"),
-        "{notice}"
-    );
+    for step in [
+        "~/.ssh/authorized_keys",
+        "~/.local/libexec/syq-receiver",
+        "~/.local/share/syq/restricted",
+        "~/.local/state/syq/restricted",
+    ] {
+        assert!(notice.contains(step), "{notice}");
+    }
+    assert!(!notice.contains("https://"), "{notice}");
     assert!(released_enrollment_notice(&home.join("missing")).is_none());
 
     // The enrolling machine lists only current enrollments.

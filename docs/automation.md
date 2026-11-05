@@ -295,6 +295,14 @@ command's options, with relative paths made absolute, and
 can't be read, every `receiving_enabled` is `null` and `receiving_error` says
 why.
 
+`receiving_build` names the syq build an endpoint's receiving service runs.
+While it switches to a newer installed syq, `receiving_switch` has `to` (the
+new build), `phase` (`waiting` until nothing is in progress, `switching`,
+`login` until a syq command run in a terminal tries again, or `failed`), and
+`error`.
+`provider` reports the same `build` and `switch` for the local SSH
+authorization provider when it runs another build or switches.
+
 `authorized_ssh` lists approved account connections, each with `authorizer`,
 `requested` (the original selection), `endpoint` (the resolved account and
 address), `control`, and `connected`; the two endpoint objects have `user`,
@@ -309,7 +317,7 @@ then exits nonzero after printing the valid entries.
 |---|---|
 | `profiles` | Every profile's `cwd`, `cwd_explicit`, `root`, `auto_approve_root` (null when every download asks), and `servers` (the endpoints set with `--connection`; empty means all) |
 | `settings` | The first selected profile's settings |
-| `connections` | The profiles allowed on each endpoint |
+| `connections` | The profiles allowed on each endpoint, and its service's build (`identity`), requests in progress and open account connections (`busy`), the syq path it follows (`started_from`), and any `switch` to a new build |
 | `provider` | The local SSH authorization service, or null when it isn't running; its `profiles` contain `settings`, `sessions`, and `pending` requests, and `decision_error` reports a failed local approval |
 
 `syq persist receive pending --json` prints the requests waiting for approval,

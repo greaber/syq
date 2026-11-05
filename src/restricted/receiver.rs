@@ -315,25 +315,25 @@ fn enrollment_account(value: &str) -> Result<(String, String)> {
     Ok((policy.login_user, host.to_owned()))
 }
 
-/// Where the documentation says how to remove enrollments from older
-/// versions.
-const RELEASED_ENROLLMENTS_DOCS: &str =
-    "https://greaber.github.io/syq/remote-reference.html#enrollments-from-older-versions";
-
 /// A notice when `home` holds state from enrollments syq 0.7.1 and earlier
 /// made, which this version neither lists nor removes: their enrolling
-/// machine's records or a server's state.
+/// machine's records or a server's state. It says how to remove them; syq
+/// does not remove them itself.
 pub(super) fn released_enrollment_notice(home: &Path) -> Option<String> {
-    [".local/state/syq/restricted", ".local/share/syq/restricted"]
+    let path = [".local/state/syq/restricted", ".local/share/syq/restricted"]
         .into_iter()
         .map(|path| home.join(path))
-        .find(|path| path.exists())
-        .map(|path| {
-            format!(
-                "syq: {} holds enrollments made by syq 0.7.1 and earlier, which this version does not list or use; to remove them, see {RELEASED_ENROLLMENTS_DOCS}",
-                path.display()
-            )
-        })
+        .find(|path| path.exists())?;
+    Some(format!(
+        "syq: {} holds enrollments made by syq 0.7.1 and earlier, which this version does not list or use. \
+         To remove them, revoke them with that older syq, or delete them by hand:\n\
+         - On each server account, delete the lines in ~/.ssh/authorized_keys whose command runs \
+         ~/.local/libexec/syq-receiver, written with the account's full home directory path \
+         (keep the lines that run syq from ~/.local/lib/syq), then delete the directory \
+         ~/.local/share/syq/restricted and the file ~/.local/libexec/syq-receiver.\n\
+         - On the machine that enrolled them, delete the directory ~/.local/state/syq/restricted.",
+        path.display()
+    ))
 }
 
 /// `syq receiver enroll|list|revoke`: the receiver enrollment system is one

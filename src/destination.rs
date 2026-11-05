@@ -559,6 +559,24 @@ pub(crate) fn read_socket_message<T: DeserializeOwned>(
     read_socket_framed(socket, timeout, MAX_MESSAGE, "named destination message")
 }
 /// As `read_socket_message`, for a message of at most `limit` bytes.
+/// Send `request` to the local socket at `path` and read a reply of at most
+/// `limit` bytes, all by `deadline`: neither a full listen queue nor a peer
+/// that never answers holds the caller longer.
+pub(crate) fn local_exchange<T: DeserializeOwned>(
+    path: &Path,
+    request: &impl Serialize,
+    deadline: Instant,
+    limit: usize,
+    what: &str,
+) -> Result<T> {
+    let mut socket = connect_socket(path, deadline, None)?;
+    let mut io = DeadlineSocket {
+        socket: &mut socket,
+        deadline,
+    };
+    write_framed(&mut io, request, MAX_MESSAGE, what)?;
+    read_framed(&mut io, limit, what)
+}
 pub(crate) fn read_socket_framed<T: DeserializeOwned>(
     socket: &mut UnixStream,
     timeout: Duration,
@@ -1187,16 +1205,59 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         crate::destination_results::ReceiptPolicy::unused()?,
     )?;
     notices::waiting(&format!("@{name}"), "this copy");
-    let (_, reply) = exchange(
-        &registration,
-        Message::Request {
-            command,
-            cwd: crate::approval_command::current_directory(),
-            request: Box::new(request),
-        },
-        REQUEST_TIMEOUT + Duration::from_secs(10),
-        None,
-    )?;
+    let cwd = crate::approval_command::current_directory();
+    let ask = |registration: &Registration| {
+        exchange(
+            registration,
+            Message::Request {
+                command: command.clone(),
+                cwd: cwd.clone(),
+                request: Box::new(request.clone()),
+            },
+            REQUEST_TIMEOUT + Duration::from_secs(10),
+            None,
+        )
+    };
+    let (registration, reply) = match ask(&registration) {
+        Ok((_, reply)) => (registration, reply),
+        // The receiving machine may have switched its connection to another
+        // syq build since this command chose it, as after an update, while
+        // the command read its input: the connection it chose is gone or
+        // refuses requests. Nothing has been copied yet: ask the new
+        // connection once, if this build can. A decision of the old one,
+        // such as a denial, stands.
+        Err(error) if switched_away(&error) => {
+            // A connection refusing requests while it stops for a switch is
+            // replaced within moments; wait a little for the new one to
+            // register.
+            let deadline = Instant::now()
+                + if format!("{error:#}").contains(SWITCHING) {
+                    SWITCH_REGISTRATION_WAIT
+                } else {
+                    Duration::ZERO
+                };
+            let current = loop {
+                match load_registration(&name) {
+                    Ok(current)
+                        if (&current.socket, &current.secret)
+                            != (&registration.socket, &registration.secret) =>
+                    {
+                        break current
+                    }
+                    _ if Instant::now() >= deadline => return Err(error),
+                    _ => std::thread::sleep(Duration::from_millis(100)),
+                }
+            };
+            anyhow::ensure!(
+                current.identity == crate::identity::build(),
+                "@{name} switched to syq {} while this command was starting; run the command again",
+                current.identity
+            );
+            let (_, reply) = ask(&current)?;
+            (current, reply)
+        }
+        Err(error) => return Err(error),
+    };
     let Reply::Approved(approved) = reply else {
         bail!("unexpected named destination response");
     };
@@ -1211,6 +1272,23 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         })?)
     ));
     Ok(())
+}
+
+/// How long a copy refused by a receiving connection stopping for a switch
+/// waits for the new connection to register before asking it.
+const SWITCH_REGISTRATION_WAIT: Duration = Duration::from_secs(5);
+
+/// What a receiving connection that stopped for a switch to another syq
+/// build answers requests in its last moments.
+const SWITCHING: &str = "receiving is switching to another syq version; retry in a moment";
+
+/// Whether a request failed because the receiving connection it went to
+/// is gone, or is going for a switch, rather than because it answered.
+fn switched_away(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+        || format!("{error:#}").contains(SWITCHING)
 }
 
 pub(crate) fn connect(grant: &str, control: bool) -> Result<UnixStream> {
@@ -1280,6 +1358,9 @@ struct Receiver {
     active_streams: Arc<crate::private_broker::ConnectionRegistry>,
     exec_count: AtomicU64,
     ssh_count: AtomicU64,
+    /// Approved account logins whose agent requests this connection relays
+    /// now (`ssh_auth::AuthorizationContext::relaying`).
+    account_relays: AtomicU64,
     account_source: Mutex<std::result::Result<crate::receive_approval::AccountIdentity, String>>,
     account_sessions: Mutex<HashMap<String, u64>>,
     forward_count: std::sync::atomic::AtomicUsize,
@@ -1605,6 +1686,46 @@ fn ssh_command(endpoint: &crate::persistence::EndpointRecord) -> Command {
     }
     cmd
 }
+/// Log in to `endpoint` as a receiving connection does (`ssh_command`),
+/// without forwarding anything, to learn whether a new receiving service
+/// could before an old one is stopped for it, by `deadline`, keeping ssh in
+/// this process's group when `in_this_group`. On failure, whether the user
+/// is needed: the server rejected the login (`conn::login_rejection`), or
+/// ssh did not finish, as while it waits for a touch of a security key.
+/// Then what ssh said.
+pub(crate) fn check_receiving_login(
+    endpoint: &crate::persistence::EndpointRecord,
+    deadline: Instant,
+    in_this_group: bool,
+) -> std::result::Result<(), (bool, String)> {
+    let mut command = ssh_command(endpoint);
+    command.arg("--").arg(&endpoint.host).arg("true");
+    const LIMIT: usize = 64 * 1024;
+    let output = if in_this_group {
+        crate::process::capture_output_bounded_in_this_group(&mut command, deadline, LIMIT)
+    } else {
+        crate::process::capture_output_bounded(&mut command, deadline, &|| false, LIMIT)
+    }
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            (true, crate::receive_service::switch::NO_ANSWER.to_owned())
+        } else {
+            (false, error.to_string())
+        }
+    })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let message = stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("ssh failed")
+        .to_owned();
+    Err((crate::conn::login_rejection(&stderr).is_some(), message))
+}
 fn pin_receiving_source(
     command: &mut Command,
     policy: &crate::agent_broker::HostPolicy,
@@ -1654,6 +1775,110 @@ fn pin_receiving_source(
     Ok(identity)
 }
 
+/// What a receiving connection is doing, so that its service can stop it to
+/// switch to another syq build without cutting anything off
+/// (`receive_service::switch`).
+pub(crate) struct Activity {
+    state: Mutex<ActivityState>,
+    receiver: Mutex<std::sync::Weak<Receiver>>,
+    /// How long after its last request the connection counts as idle.
+    quiet: Duration,
+}
+impl Default for Activity {
+    fn default() -> Self {
+        Self {
+            state: Default::default(),
+            receiver: Default::default(),
+            quiet: crate::receive_service::switch::quiet(),
+        }
+    }
+}
+#[derive(Default)]
+struct ActivityState {
+    requests: usize,
+    last: Option<Instant>,
+    closed: bool,
+}
+/// One request being handled, until dropped.
+struct Handling<'a>(&'a Activity);
+impl Drop for Handling<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.requests -= 1;
+        state.last = Some(Instant::now());
+    }
+}
+impl Activity {
+    /// Count a request until the result is dropped; None once the service
+    /// has closed this connection to switch builds.
+    fn begin(&self) -> Option<Handling<'_>> {
+        let mut state = self.state.lock().unwrap();
+        if state.closed {
+            return None;
+        }
+        state.requests += 1;
+        state.last = Some(Instant::now());
+        Some(Handling(self))
+    }
+    /// Requests in progress: copies and the approvals they wait for,
+    /// commands, account access, and copies approved but not yet opened.
+    /// Includes `accounts`.
+    pub(crate) fn requests(&self) -> usize {
+        let requests = self.state.lock().unwrap().requests;
+        requests + self.approved()
+    }
+    /// Approved account connections open through this connection: logins
+    /// it authorized whose agent requests it still relays.
+    pub(crate) fn accounts(&self) -> usize {
+        self.receiver
+            .lock()
+            .unwrap()
+            .upgrade()
+            .map_or(0, |receiver| {
+                receiver.account_relays.load(Ordering::Acquire) as usize
+            })
+    }
+    fn approved(&self) -> usize {
+        self.receiver
+            .lock()
+            .unwrap()
+            .upgrade()
+            .map_or(0, |receiver| {
+                receiver
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|session| !session.opened && session.issued.elapsed() < START_TIMEOUT)
+                    .count()
+            })
+    }
+    fn idle_locked(&self, state: &ActivityState) -> bool {
+        state.requests == 0
+            && state.last.is_none_or(|last| last.elapsed() >= self.quiet)
+            && self.approved() == 0
+    }
+    /// Whether nothing is in progress, nor arrived just now: one copy's
+    /// steps arrive as separate requests (`switch::quiet`).
+    pub(crate) fn idle(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        self.idle_locked(&state)
+    }
+    /// Refuse new requests if idle, so the service can stop to switch builds
+    /// without cutting one off; whether it did.
+    pub(crate) fn close_if_idle(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if !self.idle_locked(&state) {
+            return false;
+        }
+        state.closed = true;
+        true
+    }
+    pub(crate) fn reopen(&self) {
+        self.state.lock().unwrap().closed = false;
+    }
+}
+
 pub(crate) fn serve_background(
     config: crate::receive_service::Settings,
     spec: crate::receive_service::ServiceSpec,
@@ -1662,6 +1887,7 @@ pub(crate) fn serve_background(
     woken: mpsc::Receiver<()>,
     state: Arc<Mutex<crate::receive_service::ConnectionState>>,
     approvals: Arc<crate::receive_approval::Queue>,
+    activity: Arc<Activity>,
 ) -> Result<()> {
     #[cfg(test)]
     let (prompts, _requests) = mpsc::sync_channel(1);
@@ -1702,12 +1928,14 @@ pub(crate) fn serve_background(
         )),
         exec_count: AtomicU64::new(0),
         ssh_count: AtomicU64::new(0),
+        account_relays: AtomicU64::new(0),
         account_source: Mutex::new(Err("receiving SSH connection is not ready".into())),
         account_sessions: Mutex::new(HashMap::new()),
         forward_count: std::sync::atomic::AtomicUsize::new(0),
         request_lock: Mutex::new(()),
         stop: stop.clone(),
     });
+    *activity.receiver.lock().unwrap() = Arc::downgrade(&receiver);
     let handler = receiver.clone();
     let broker = PrivateBroker::start_managed(
         PrivateBrokerConfig {
@@ -1721,6 +1949,12 @@ pub(crate) fn serve_background(
         },
         move |stream, _| {
             let writer = stream.try_clone();
+            let Some(_handling) = activity.begin() else {
+                if let Ok(mut writer) = writer {
+                    let _ = ssh_auth::reply_error(&mut writer, &anyhow::anyhow!(SWITCHING));
+                }
+                return;
+            };
             if let Err(error) = handler.handle(stream) {
                 if let Ok(mut writer) = writer {
                     let _ = ssh_auth::reply_error(&mut writer, &error);
