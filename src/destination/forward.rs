@@ -211,8 +211,8 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
     // Refused with advice before anything is asked when an approval cannot
     // carry the command.
     let command = crate::approval_command::copy_command(args)?;
-    // The rules come from the command; only what it read from files, which
-    // only narrows the copy, travels beside it.
+    // The rules come from the command; only what it read from files travels
+    // beside it.
     let inputs = crate::directive::Inputs {
         ignore: args.ignore_lines.clone(),
         mapping: crate::directive::mapping_authorization(args)?,
@@ -504,7 +504,9 @@ impl Prepare {
             )?),
             agent: self.agent.as_deref(),
             allow_enrollment: self.allow_enrollment,
-            // No terminal: never prompt, and never trust a new host key.
+            // No terminal: never prompt. Where the SSH configuration
+            // would ask about a host key nobody knows, accept it the first
+            // time, as `accept-new` does.
             batch: true,
         })
     }

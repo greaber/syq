@@ -245,7 +245,7 @@ fn the_destination_rules_come_from_the_signed_command() {
         assert_eq!(grant.copy.destination, expected.as_bytes(), "{destination}");
     }
 
-    // What the command read from files comes beside it, and only narrows.
+    // What the command read from files comes beside it.
     let mut ignoring = directive(&[
         "cp",
         "--from",

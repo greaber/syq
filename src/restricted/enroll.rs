@@ -497,8 +497,9 @@ pub(super) type DestinationCheck<'a> = Option<&'a dyn Fn(&Path, &[PathBuf]) -> R
 /// The enrollment for `login@host:port`, set up when there is none, and
 /// refreshed when it runs another build or `refresh` asks to find the
 /// login key again. Returns the login key's signer when this logged in to
-/// the server. With `batch`, SSH neither prompts nor accepts a host key the
-/// user has not trusted.
+/// the server. With `batch`, SSH never prompts; where the SSH configuration
+/// would ask about a host key nobody knows, it accepts it the first time, as
+/// `accept-new` does.
 pub(super) fn enroll(
     host: &str,
     port: Option<u16>,

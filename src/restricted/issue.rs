@@ -37,8 +37,10 @@ pub(crate) struct Issue<'a> {
     /// Whether this may set up or refresh the enrollment: never for a dry
     /// run.
     pub allow_enrollment: bool,
-    /// Enroll without prompting and without accepting a host key the user
-    /// has not trusted: for the receiving service, which has no terminal.
+    /// Enroll without prompting, for the receiving service, which has no
+    /// terminal. Where the SSH configuration would ask about a host key
+    /// nobody knows, the login accepts it the first time, as `accept-new`
+    /// does.
     pub batch: bool,
 }
 
