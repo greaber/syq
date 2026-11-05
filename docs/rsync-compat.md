@@ -8,7 +8,7 @@ See [`syq rsync`](commands/rsync.md) for all accepted options.
 | Area | Syq behavior |
 |---|---|
 | Filters | Gitignore syntax via `--syq-ignore` / `--syq-ignore-from`; rsync filters are unsupported |
-| Deletion timing | Extras are deleted after copying; no delete-before or delete-during mode |
+| Deletion timing | Extras are deleted after copying, and not at all after scan or copy errors; no delete-before or delete-during mode ([rules](reference.md#mirror-a-directory)) |
 | Positive `--max-delete N` | Deletes nothing if the plan exceeds N; rsync deletes up to N |
 | Destination collisions | Distinct sources claiming the same destination fail before copying |
 | `--ignore-existing` | Keeps an existing non-directory even where the source would create a directory |
@@ -23,9 +23,9 @@ See [`syq rsync`](commands/rsync.md) for all accepted options.
 
 ### Existing files
 
-Rsync changes some files in place, through every name a file has. In these
-cases syq gives the name a new file instead, and other hard links keep the old
-one:
+Rsync changes some existing files in place, so every hard link to the file
+sees the change. In these cases syq instead replaces the file at the name it
+copies to, and other hard links keep the old file:
 
 - With `--inplace`, a file with other hard links, another owner, or wider
   permissions than the copy gives it ([In-place writes](reference.md#in-place-writes)).
@@ -36,23 +36,23 @@ one:
 
 See [Copy metadata](reference.md#copy-metadata) for the details.
 
-Scan and copy errors prevent deletion. A destination that contains its source
-on the same host cannot be pruned. Preview deletion scope with `--dry-run -v`;
-see [deletion rules](reference.md#mirror-a-directory).
+### Comparison
 
-`syq rsync` uses rsync's default size-and-whole-second timestamp quick check;
-see [timestamp matching](integrity-checking.md#comparison). Use `-c` to compare
-contents when size and timestamp match. `-I` (`--ignore-times`) compares only
-the files block reuse would compare, by default every file in a remote copy,
-and copies the rest whole, so files that already match may be rewritten. `-c`
-takes precedence when both are given.
+Like rsync, `syq rsync` skips files whose size and modification time match to
+the whole second ([details](integrity-checking.md#comparison)), and `-c`
+compares their contents too. `-I` (`--ignore-times`) also stops trusting size
+and time, but compares only the files block reuse would compare (by default,
+every file in a remote copy) and copies the rest whole, so files that already
+match can be rewritten. `-c` wins when both are given.
 
-Syq uses numeric IDs and keeps partial files a later copy can resume from (see
-[Resume an interrupted copy](reference.md#resume-an-interrupted-copy)), so
-`--numeric-ids` and `--partial` are accepted no-ops. `-P` enables progress. Compression is on by
-default; `-z` does not enable anything extra. `-B` / `--block-size` changes
-syq's comparison and reuse block size; see the [tuning table](tuning.md#transfer-controls)
-for its default and allowed range. Values outside that range are rejected.
+### Other options
+
+`--numeric-ids` and `--partial` are accepted and change nothing: syq always
+uses numeric IDs and keeps [partial files to resume
+from](reference.md#resume-an-interrupted-copy). `-P` shows progress.
+Compression is on by default, so `-z` adds nothing. `-B` / `--block-size` sets
+syq's comparison and reuse block size, within the range in the [tuning
+table](tuning.md#transfer-controls).
 
 `-H` preserves hardlinks between selected regular files. On Linux and macOS,
 `-A` preserves ACLs and `-X` extended attributes. `-S` turns written zero
@@ -72,37 +72,28 @@ ranges into sparse holes. See the
 | Other comparison and output controls | `--size-only`, `--modify-window` (FAT destinations are compared at two seconds automatically), `--chmod`, `--log-file`, `-i` / `--itemize-changes` |
 | Daemon connections | `rsync://`, `host::module` |
 
-Unsupported common flags are rejected with an explanation. Selected symlink
-targets are copied unchanged. `--insecure-links` only relaxes the ownership
-check on symlinks in paths you type; it does not follow symlinks beneath a
-selected source.
+Symlinks are copied with their targets unchanged. `--insecure-links` only
+relaxes the ownership check on symlinks in paths you type; it does not follow
+symlinks beneath a selected source.
 
 ## File-list parsing and help
 
-`--files-from` cannot combine with syq ignore rules or deletion. A listed
-source whose parent is a symlink fails that entry with exit 23.
+With `--files-from`:
 
-Other parsing differences:
-
-- `..` components are rejected rather than clamped at the source root.
 - `dir/` and `dir` select the same entry. Neither selects contents unless
   `-r` is explicitly supplied; `-a` alone does not enable recursion here.
-- `.` and `/` are rejected as root entries.
-- Use `--from0` for NUL separators; `-0` is unsupported.
-
-Blank entries and names starting with `#` or `;` are ignored in both separator
-modes; use `./#name` for a literal name.
+- Blank entries and names starting with `#` or `;` are ignored, also with
+  `--from0`; use `./#name` for a literal name.
+- A listed source whose parent is a symlink fails that entry with exit 23.
+- Use `--from0`, not `-0`, for NUL separators.
 
 `-h` alone does not show help; use `--help` or `--help-all`.
 
 ## Syq extensions
 
-Most syq-specific options carry a `--syq-` prefix. Common ones are
-`--syq-ignore` and `--syq-ignore-from`. `syq rsync` also accepts syq's
-`--performance-tuning`, `--resource-limits`, and
+Most syq-specific options carry a `--syq-` prefix. `syq rsync` also accepts
+syq's `--performance-tuning`, `--resource-limits`, and
 [`--integrity-checking`](integrity-checking.md) for extra payload checks.
-Rsync's `--bwlimit` and `-c` / `--checksum` (BLAKE3 content comparison) keep
-their usual spellings.
 
 Filters are last-match-wins with `!` re-inclusion, unlike rsync's first-match
 rules. Check the [gitignore examples](reference.md#ignoring-paths) when

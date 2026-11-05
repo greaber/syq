@@ -1,24 +1,22 @@
 # Performance tuning
 
-`--performance-tuning` overrides syq's automatic choices. To keep automatic
-choices within a ceiling, use [resource limits](resource-limits.md) instead.
-Leave performance tuning unset for everyday copies: these experimental
-controls are for troubleshooting and controlled benchmarks. Their keys, values,
-and behavior may change or be removed between releases without deprecation,
-so pin the syq version when a script depends on them.
+`--performance-tuning` overrides syq's automatic choices for troubleshooting
+and controlled benchmarks; leave it unset for everyday copies. To keep the
+automatic choices under a ceiling instead, use
+[resource limits](resource-limits.md). These experimental keys can change or
+disappear between releases without deprecation, so pin the syq version in
+scripts that use them.
 
-`syq cp` and `syq rsync` accept the keys below. For removal, `syq rm` accepts
-`workers` for filesystems or `s3-requests` for S3, and `syq clean-partials`
-accepts `workers`.
+`syq cp` and `syq rsync` accept the keys below; for `syq rm` and
+`syq clean-partials`, see [Deletion](#deletion).
 
 ## Transfer controls
 
 Supply comma-separated `KEY=VALUE` pairs:
 
 ```sh
-syq cp large-file --to server --as /scratch/benchmark-copy \
-  --performance-tuning workers=1 -v \
-  --performance-tuning copy-path=ranges,request-size=1M,pipeline-depth=8
+syq cp large-file --to server --as /scratch/benchmark-copy -v \
+  --performance-tuning workers=1,copy-path=ranges,request-size=1M,pipeline-depth=8
 ```
 
 <a id="average-rate-and-burst-patterns"></a>
@@ -29,20 +27,26 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 | `comparison-block-size` | 4 MiB; 64 KiB for replaced files up to 64 MiB | 64 KiB through 64 MiB; filesystem copies only |
 | `request-size` | Automatic, normally up to 4 MiB; at most 2 MiB for streaming | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
-| `copy-path` | `auto` | `auto` takes shortcuts where they apply, such as local clones and small-file batches, and streams long remote ranges; `ranges` copies every file in range requests without those shortcuts; experimental `streaming` streams every range without the shortcuts; experimental `auto-streaming` keeps the shortcuts and streams every other range |
+| `copy-path` | `auto` | `auto`, `ranges`, `streaming`, `auto-streaming`; see below |
 | `batch-files` | Up to 2048 | 1 through 4096 files per worker batch |
 | `batch-bytes` | 16 MiB | 512 bytes through 64 MiB per worker batch |
 | `split-min-size` | 32 MiB | 1 byte through 1 GiB: the smallest part of a file an idle worker can take over from another |
-| `bw-pacing` | `125ms` | Requires a nonzero `--resource-limits bandwidth=RATE`. Chooses how local, descriptor, and receiver-approved copies pace file data: an integer interval from `1ms` through `10s` sends smaller requests at that spacing, and `average` waits for each request's byte budget, so data can arrive in bursts. Ordinary SSH and TCP copies ignore it; S3 copies reject it |
+| `bw-pacing` | `125ms` | An integer interval from `1ms` through `10s`, or `average`; see below |
 
-Sizes accept `K`, `M`, and `G`, using powers of 1024. Unknown keys, repeated
-keys, and out-of-range values fail the command. Explicit request, block,
-pipeline, split, and batch settings also turn off the matching automatic
-adjustments during the copy, which keeps comparisons controlled. Batch
-controls cannot combine with
-`copy-path=ranges` or `streaming`, and `pipeline-depth` cannot combine with
-either streaming mode. Overrides also apply when a server coordinates the copy,
-and are not saved.
+`copy-path=auto` takes shortcuts where they apply, such as local clones and
+small-file batches, and streams long remote ranges. `ranges` copies every file
+in range requests without those shortcuts. The experimental `streaming`
+streams every range without shortcuts, and `auto-streaming` keeps the
+shortcuts and streams all other ranges.
+
+`bw-pacing` needs a nonzero `--resource-limits bandwidth=RATE` and applies to
+local, descriptor, and receiver-approved copies; other SSH and TCP copies
+ignore it. An interval sends smaller requests that far apart, while `average`
+waits for each request's byte budget, so data arrives in bursts.
+
+Sizes accept `K`, `M`, and `G`, using powers of 1024. Setting a request, block,
+pipeline, split, or batch value also stops syq from adjusting it during the
+copy, which keeps comparisons controlled.
 
 ## S3 copies
 
@@ -63,44 +67,34 @@ syq cp data --to s3://backups --into archive \
 ```
 
 This allows four objects in progress and up to eight parts per object, with at
-most sixteen simultaneous data requests across them. Each count you set here is
-fixed, and unused slots can remain idle. To let syq choose counts within these
-ceilings instead, pass the same keys through `--resource-limits`; a count
-cannot be specified in both. Part size grows when needed to stay within
-S3's limit of 10,000 parts per upload.
+most sixteen simultaneous data requests across them. Each count you set is
+fixed, and unused slots can stay idle; to let syq choose counts under these
+ceilings, pass the same keys to `--resource-limits` instead. Part size grows
+when needed to stay within S3's limit of 10,000 parts per upload. For retries,
+see [`--s3-retries`](object-storage.md#retries).
 
 <a id="s3-streams"></a>
 
-For S3 streams, see [Descriptor copies](object-storage.md#descriptor-copies).
-`--s3-retries` sets how many times each request is retried; see
-[Retries](object-storage.md#retries).
-
 ## Deletion
 
-`syq rm`, `syq clean-partials`, and pruning after a copy adjust their
-concurrency automatically while they run. For `rm` and `clean-partials`,
-`--performance-tuning workers=N` fixes the filesystem worker count. For S3
-removal, `s3-requests=N` fixes the request count; in a copy, the S3 request
-setting also applies to S3 pruning. Filesystem pruning tunes its own workers.
+Removal and pruning adjust their concurrency automatically. To fix it, use
+`--performance-tuning workers=N` with `syq rm` and `syq clean-partials`, or
+`s3-requests=N` for S3 removal; in a copy, `s3-requests` also applies to S3
+pruning. Filesystem pruning always tunes its own workers.
 
 ## Remembered connection counts
 
-Syq remembers useful worker counts from successful filesystem copies, starts
-later copies of the same kind from them, and keeps adjusting as each copy
-runs.
-
-`--performance-tuning workers=N` bypasses the remembered count, and
-`--resource-limits workers=N` caps it. Set `SYQ_TUNING_CACHE` to an empty value
-to turn off history and remembered counts.
+Syq starts each filesystem copy from the number of workers, and so of
+connections, that worked for earlier copies of the same kind, then keeps
+adjusting. `--performance-tuning workers=N`
+bypasses the remembered count, and `--resource-limits workers=N` caps it. To
+turn off both the history and remembered counts, set `SYQ_TUNING_CACHE` to an
+empty value.
 
 ## Inspect tuning history
 
-Filesystem copies record a local timeline of their tuning decisions. The
-history contains opaque endpoint, filesystem, and network-address identifiers,
-the UTC date, copy settings, numerical progress, and tuning decisions. It does
-not contain filenames, command lines, file contents, or Wi-Fi names, and
-nothing is uploaded. Timing and sizes still reveal activity; this is
-performance history, not anonymous data or a complete audit trail.
+To see why syq chose its worker counts, inspect the local timeline that each
+filesystem copy records:
 
 ```sh
 syq tuning-cache list
@@ -110,26 +104,28 @@ syq tuning-cache export 42 > tuning-42.ndjson
 syq tuning-cache clear
 ```
 
-Open the HTML file in a browser to plot worker counts and byte progress and
-inspect the evidence for each decision. `export` without an ID exports all
-retained transfers as NDJSON. These diagnostic records may change between
-versions; they are separate from the [automation results](automation.md)
-contract. Clearing history also resets remembered starting counts.
+The HTML file plots worker counts and progress with the evidence for each
+decision, and `export` without an ID exports every recorded transfer. These
+records can change between versions and are not part of the
+[automation results](automation.md) contract. Clearing history also resets
+remembered counts. When a server coordinates a copy, the history is on that
+server; S3 copies record none.
 
-S3 copies do not record timelines. When a server coordinates a copy, the
-history is on that server; run the inspection commands there.
-
-See [Environment](environment.md#other-variables) for the history file's
+The history holds opaque endpoint, filesystem, and network-address
+identifiers, the UTC date, copy settings, progress numbers, and tuning
+decisions, but no filenames, command lines, file contents, or Wi-Fi names, and
+nothing is uploaded. Timing and sizes still reveal activity, so it isn't
+anonymous. See [Environment](environment.md#other-variables) for the file's
 location and size.
 
 ## Filesystem tuning examples
 
 <a id="recording-a-comparison"></a>
 
-Use disposable destinations when comparing settings, and restore the same
-initial destination before each run. With overrides, `-v` reports the effective
-settings and a final `syq: tuning observed:` line. See
-[Quick comparison](speed.md#quick-comparison) for a benchmark script.
+Compare settings on disposable destinations, restoring the same starting
+destination before each run. With overrides, `-v` reports the settings in
+effect. See [Quick comparison](speed.md#quick-comparison) for a benchmark
+script.
 
 ### Compare block reuse with full replacement
 
@@ -145,8 +141,7 @@ syq cp --srcs-in source --into destination \
 ```
 
 Block reuse saves network traffic, but the destination still writes a complete
-new file unless its filesystem supports reflinks. Comparison can use up to
-64 MiB of memory per worker.
+new file unless its filesystem supports reflinks.
 
 ### Scattered edits in existing files
 
@@ -158,24 +153,10 @@ syq cp --srcs-in source --to host --into destination \
   --performance-tuning comparison-block-size=64K,request-size=4M
 ```
 
-Set `request-size` too: it otherwise follows the comparison block size.
-Both endpoints still read the full file to compare it. In `syq rsync`,
-`-B` / `--block-size` selects the comparison block size; do not combine it
-with `comparison-block-size`.
+Set `request-size` too, since it otherwise follows the comparison block size.
+In `syq rsync`, `-B` / `--block-size` sets the comparison block size.
 
 <a id="streaming-and-request-windows"></a>
-
-### Pipeline depth
-
-To compare pipeline depths, hold the worker count and request size fixed:
-
-```sh
-syq cp data.bin --to host --as /scratch/pipeline.bin --performance-tuning workers=1 -v \
-  --performance-tuning copy-path=ranges,request-size=1M,pipeline-depth=4
-```
-
-Repeat with `pipeline-depth=8` and `16`, and compare with the defaults too;
-larger windows may add memory use without improving speed.
 
 ### Batch size and splitting
 
