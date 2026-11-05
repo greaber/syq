@@ -123,8 +123,7 @@ needs the same syq build as the machines that use it. Its default domain's
 first receiving profile must be enabled. Its SSH server must allow local
 forwarding (`AllowTcpForwarding` and `AllowStreamLocalForwarding` set to
 `local` or `yes`), and the login key's `authorized_keys` entry must not block
-it with `restrict` or `no-port-forwarding`. After updating syq, run
-`syq persist receive on` on the provider again.
+it with `restrict` or `no-port-forwarding`.
 
 ### Account permissions
 
@@ -328,6 +327,9 @@ SSH connections expire after five to ten minutes. An enabled receiving service
 keeps its connection until you stop it and reconnects after interruptions;
 other SSH logins reopen on their next use. Syq installs no login service, so
 connect again after a reboot. Copies are not queued or retried automatically.
+After you update syq, receiving services and the SSH authorization provider
+switch to the new version by themselves once no copy, command, login, or
+approval is in progress.
 
 Use `syq persist receive wait server --timeout 30` to wait without starting or
 restarting a connection. `syq ssh` can open or reuse a persistent SSH login,
@@ -407,7 +409,7 @@ receiving retries with growing waits of up to 10 minutes. In both cases
 
 The server command uses the matching helper installed by the receiving
 connection. If that helper is missing or does not recognize an option, update
-syq on both machines and reconnect from your laptop.
+syq on both machines.
 
 ## Updating connections
 

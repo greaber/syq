@@ -175,6 +175,11 @@ fn accepts_command(kind: Kind, argv: &[OsString]) -> bool {
     }
 }
 
+/// Whether this process runs a command another build handed off to it.
+pub(crate) fn handed_off() -> bool {
+    ACCEPTED.get().is_some()
+}
+
 pub(crate) fn validate_account_selection(mode: &crate::cli::AuthFrom) -> Result<()> {
     let Some(guard) = ACCEPTED.get().filter(|guard| guard.kind == Kind::Account) else {
         return Ok(());
@@ -229,7 +234,9 @@ fn supports_requester_ssh_policy(program: &std::ffi::OsStr) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
-pub(super) fn maybe_exec(selection: &Selection) -> Result<()> {
+/// Run the command with the helper @NAME's receiving connection installed
+/// when that is another build than this one, saying so unless `quiet`.
+pub(super) fn maybe_exec(selection: &Selection, quiet: bool) -> Result<()> {
     check_selection(selection)?;
     if selection.registration.identity == crate::identity::build() {
         return Ok(());
@@ -242,14 +249,14 @@ pub(super) fn maybe_exec(selection: &Selection) -> Result<()> {
             .capture_output()
             .is_ok_and(|output| output.status.success());
         if !supported {
-            bail!("the registered helper for @{} does not support source authorization; update syq on the receiving machine and reconnect with syq persist connect SERVER", selection.name);
+            bail!("the registered helper for @{} does not support source authorization; update syq on the receiving machine", selection.name);
         }
     }
     if selection.kind == Kind::Account {
         anyhow::ensure!(!ACCOUNT_PREFLIGHT_DONE.load(std::sync::atomic::Ordering::Acquire),
             "receiving connection changed after account preflight; retry the command to use its matching helper");
         if !supports_requester_ssh_policy(program) {
-            bail!("the registered helper for @{} does not support requester-selected SSH configuration; update syq on the receiving machine and reconnect with syq persist connect SERVER", selection.name);
+            bail!("the registered helper for @{} does not support requester-selected SSH configuration; update syq on the receiving machine", selection.name);
         }
     }
     if matches!(selection.kind, Kind::Ssh | Kind::SshPersistent) {
@@ -261,8 +268,11 @@ pub(super) fn maybe_exec(selection: &Selection) -> Result<()> {
             .capture_output()
             .is_ok_and(|output| output.status.success());
         if !supported {
-            bail!("the registered helper for @{} does not support syq ssh; update syq on the receiving machine and reconnect with syq persist connect SERVER", selection.name);
+            bail!("the registered helper for @{} does not support syq ssh; update syq on the receiving machine", selection.name);
         }
+    }
+    if !quiet {
+        super::notices::other_build(&selection.name, &selection.registration.identity);
     }
     let guard = serde_json::to_string(&selection.guard()?)?;
     let argv = command_line()?;
@@ -304,7 +314,7 @@ pub(crate) fn copy(
         {
             bail!("hardlink, ACL, xattr, access-time and birth-time preservation, no-atime reads and sparse allocation are not supported by named or receiving destinations");
         }
-        maybe_exec(selection)?;
+        maybe_exec(selection, args.quiet)?;
     } else if ACCEPTED
         .get()
         .is_some_and(|guard| guard.kind != Kind::Account)

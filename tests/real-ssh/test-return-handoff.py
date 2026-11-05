@@ -28,6 +28,15 @@ for name in ("@laptop",):
         "--to", name, "--as", target,
     ]))
     assert (root / target).read_bytes() == expected
+# The command says it runs as the receiving connection's version.
+notice = subprocess.run(["ssh", "source", shlex.join([
+    "syq-other-build", "cp", "/tmp/syq-real-ssh/return-source/message.txt",
+    "--to", "@laptop", "--as", "skew-notice",
+])], capture_output=True, timeout=40)
+assert notice.returncode == 0, notice
+build = identity.strip()
+assert (b"syq: @laptop is connected with syq " + build + b", so this command runs as syq "
+        + build + b"\n") in notice.stderr, notice.stderr
 
 print("case: handoff preserves inherited results fd and raw path bytes", flush=True)
 script = r'''

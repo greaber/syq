@@ -1644,6 +1644,98 @@ fn pin_receiving_source(
     Ok(identity)
 }
 
+/// What a receiving connection is doing, so that its service can stop it to
+/// switch to another syq build without cutting anything off
+/// (`receive_service::switch`).
+pub(crate) struct Activity {
+    state: Mutex<ActivityState>,
+    receiver: Mutex<std::sync::Weak<Receiver>>,
+    /// How long after its last request the connection counts as idle.
+    quiet: Duration,
+}
+impl Default for Activity {
+    fn default() -> Self {
+        Self {
+            state: Default::default(),
+            receiver: Default::default(),
+            quiet: crate::receive_service::switch::quiet(),
+        }
+    }
+}
+#[derive(Default)]
+struct ActivityState {
+    requests: usize,
+    last: Option<Instant>,
+    closed: bool,
+}
+/// One request being handled, until dropped.
+struct Handling<'a>(&'a Activity);
+impl Drop for Handling<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.requests -= 1;
+        state.last = Some(Instant::now());
+    }
+}
+impl Activity {
+    /// Count a request until the result is dropped; None once the service
+    /// has closed this connection to switch builds.
+    fn begin(&self) -> Option<Handling<'_>> {
+        let mut state = self.state.lock().unwrap();
+        if state.closed {
+            return None;
+        }
+        state.requests += 1;
+        state.last = Some(Instant::now());
+        Some(Handling(self))
+    }
+    /// Requests in progress: copies and the approvals they wait for,
+    /// commands, account access, and copies approved but not yet opened.
+    pub(crate) fn requests(&self) -> usize {
+        let requests = self.state.lock().unwrap().requests;
+        requests + self.approved()
+    }
+    fn approved(&self) -> usize {
+        self.receiver
+            .lock()
+            .unwrap()
+            .upgrade()
+            .map_or(0, |receiver| {
+                receiver
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|session| !session.opened && session.issued.elapsed() < START_TIMEOUT)
+                    .count()
+            })
+    }
+    fn idle_locked(&self, state: &ActivityState) -> bool {
+        state.requests == 0
+            && state.last.is_none_or(|last| last.elapsed() >= self.quiet)
+            && self.approved() == 0
+    }
+    /// Whether nothing is in progress, nor arrived just now: one copy's
+    /// steps arrive as separate requests (`switch::quiet`).
+    pub(crate) fn idle(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        self.idle_locked(&state)
+    }
+    /// Refuse new requests if idle, so the service can stop to switch builds
+    /// without cutting one off; whether it did.
+    pub(crate) fn close_if_idle(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if !self.idle_locked(&state) {
+            return false;
+        }
+        state.closed = true;
+        true
+    }
+    pub(crate) fn reopen(&self) {
+        self.state.lock().unwrap().closed = false;
+    }
+}
+
 pub(crate) fn serve_background(
     config: crate::receive_service::Settings,
     spec: crate::receive_service::ServiceSpec,
@@ -1652,6 +1744,7 @@ pub(crate) fn serve_background(
     woken: mpsc::Receiver<()>,
     state: Arc<Mutex<crate::receive_service::ConnectionState>>,
     approvals: Arc<crate::receive_approval::Queue>,
+    activity: Arc<Activity>,
 ) -> Result<()> {
     #[cfg(test)]
     let (prompts, _requests) = mpsc::sync_channel(1);
@@ -1698,6 +1791,7 @@ pub(crate) fn serve_background(
         request_lock: Mutex::new(()),
         stop: stop.clone(),
     });
+    *activity.receiver.lock().unwrap() = Arc::downgrade(&receiver);
     let handler = receiver.clone();
     let broker = PrivateBroker::start_managed(
         PrivateBrokerConfig {
@@ -1711,6 +1805,17 @@ pub(crate) fn serve_background(
         },
         move |stream, _| {
             let writer = stream.try_clone();
+            let Some(_handling) = activity.begin() else {
+                if let Ok(mut writer) = writer {
+                    let _ = ssh_auth::reply_error(
+                        &mut writer,
+                        &anyhow::anyhow!(
+                            "receiving is switching to another syq version; retry in a moment"
+                        ),
+                    );
+                }
+                return;
+            };
             if let Err(error) = handler.handle(stream) {
                 if let Ok(mut writer) = writer {
                     let _ = ssh_auth::reply_error(&mut writer, &error);

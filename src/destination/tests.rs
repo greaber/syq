@@ -2013,3 +2013,31 @@ fn a_named_route_probe_that_reaches_nothing_answers_with_no_route() {
     );
     assert!(elapsed < Duration::from_millis(800), "{elapsed:?}");
 }
+
+/// A receiving connection counts as idle, for its service to switch builds,
+/// only once no request is in progress and none arrived for a quiet while:
+/// one copy's steps arrive as separate requests. Once its service closes it
+/// to stop, it refuses new requests.
+#[test]
+fn a_receiving_connection_is_idle_only_after_its_requests_and_a_quiet_while() {
+    let activity = Activity {
+        quiet: Duration::from_millis(200),
+        ..Default::default()
+    };
+    assert!(activity.idle());
+    let request = activity.begin().unwrap();
+    assert_eq!(activity.requests(), 1);
+    assert!(!activity.idle());
+    assert!(!activity.close_if_idle());
+    drop(request);
+    assert_eq!(activity.requests(), 0);
+    // A copy's next step may still come.
+    assert!(!activity.idle());
+    assert!(!activity.close_if_idle());
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(activity.idle());
+    assert!(activity.close_if_idle());
+    assert!(activity.begin().is_none());
+    activity.reopen();
+    assert!(activity.begin().is_some());
+}

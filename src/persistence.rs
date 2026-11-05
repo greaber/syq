@@ -68,6 +68,10 @@ enum PersistAction {
         /// Wait this many seconds for receiving after connecting
         #[arg(long, value_name = "SECONDS", default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: u64,
+        /// Replace a receiving service from another build only once it is
+        /// idle, as a switch to a new build does (`receive_service::switch`)
+        #[arg(long, hide = true)]
+        when_idle: bool,
     },
     /// Enable persistent connections for later syq commands
     On {
@@ -205,6 +209,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
             syq_path,
             no_bootstrap,
             timeout,
+            when_idle,
         } => {
             let endpoint =
                 crate::cli::parse_native_endpoint(Some(&host))?.context("SSH endpoint missing")?;
@@ -244,6 +249,11 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                     syq_path,
                     no_bootstrap,
                     Duration::from_secs(timeout),
+                    if when_idle {
+                        crate::receive_service::Replace::WhenIdle
+                    } else {
+                        crate::receive_service::Replace::Now
+                    },
                 )?;
             }
         }
@@ -370,12 +380,16 @@ pub(crate) fn parse_account_connect(
     ])
 }
 
+/// `replace` says what to do with a receiving service from another build:
+/// replace it at once, as when the user runs `persist connect`, or only
+/// once idle, as a switch to a new build does.
 pub(crate) fn connect_domain(
     domain: &Domain,
     host: &str,
     syq_path: Option<String>,
     no_bootstrap: bool,
     timeout: Duration,
+    replace: crate::receive_service::Replace,
 ) -> Result<()> {
     let endpoint =
         crate::cli::parse_native_endpoint(Some(host))?.context("SSH endpoint missing")?;
@@ -397,6 +411,20 @@ pub(crate) fn connect_domain(
         None,
     )?;
     multiplexer.defer_receiving();
+    let mut _switching = None;
+    if replace == crate::receive_service::Replace::WhenIdle {
+        // One switch at a time per connection; others leave it to that one.
+        let Some(lock) = lock_endpoint_record(multiplexer.control_path())? else {
+            return Ok(());
+        };
+        _switching = Some(lock);
+        // Leave a busy service, or one following another installed syq,
+        // before logging in to the server for nothing.
+        if let Some(ready) = crate::receive_service::keeps_running(multiplexer.control_path()) {
+            report_ready(domain, &endpoint_label(&endpoint), ready);
+            return Ok(());
+        }
+    }
     let multiplexer = Arc::new(multiplexer);
     let remote = crate::conn::RemoteSpec {
         local_process: false,
@@ -422,22 +450,101 @@ pub(crate) fn connect_domain(
     // This uses the same pinned-helper bootstrap and authentication as a copy.
     // No source roots, data workers or filesystem operations are requested.
     let connection = remote.connect_with(true, false)?;
-    let receiving =
-        crate::receive_service::ensure_ready(domain, multiplexer.control_path(), &remote, timeout)?;
+    let receiving = crate::receive_service::ensure_ready(
+        domain,
+        multiplexer.control_path(),
+        &remote,
+        timeout,
+        replace,
+    )?;
     drop(connection);
-    match receiving {
-        Some(names) => {
-            crate::output::command_human_stdout!(
-                "{} ready; receiving as @{}",
-                remote.label(),
-                names.join(", @")
-            )
-        }
-        None => {
-            crate::output::command_human_stdout!("{} ready; receiving is disabled", remote.label())
-        }
-    }
+    report_ready(domain, &remote.label(), receiving);
     Ok(())
+}
+
+fn endpoint_label(endpoint: &crate::cli::NativeEndpoint) -> String {
+    EndpointRecord::new(
+        endpoint.user.as_deref(),
+        &endpoint.host,
+        endpoint.port,
+        None,
+    )
+    .label()
+}
+
+fn report_ready(domain: &Domain, label: &str, ready: crate::receive_service::Ready) {
+    use crate::receive_service::Ready;
+    match ready {
+        Ready::Online(names) => {
+            crate::output::command_human_stdout!("{label} ready; receiving as @{}", names.join(", @"))
+        }
+        Ready::Off => {
+            crate::output::command_human_stdout!("{label} ready; receiving is disabled")
+        }
+        Ready::Other {
+            build,
+            busy: Some(busy),
+            follows_this_file,
+        } => crate::output::command_human_stdout!(
+            "{}",
+            crate::receive_service::busy_notice(label, &build, &busy, follows_this_file)
+        ),
+        Ready::Other {
+            build, busy: None, ..
+        } => crate::output::command_human_stdout!(
+            "receiving through {label} keeps running syq {build}, which follows another installed syq; `{}` replaces it",
+            crate::receive_service::connect_command(label, domain.explicit_path())
+        ),
+    }
+}
+
+/// Take the endpoint record's lock for one switch to a new build at a time,
+/// or None while another holds it. The record is never rewritten, so its
+/// lock stays on one file while the scope lasts.
+fn lock_endpoint_record(control: &Path) -> Result<Option<File>> {
+    let mut path = control.as_os_str().to_owned();
+    path.push(".json");
+    let record = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .with_context(|| format!("open endpoint record {}", Path::new(&path).display()))?;
+    if unsafe { libc::flock(record.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(record));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return Ok(None);
+    }
+    Err(error.into())
+}
+
+/// Whether a switch to a new build for this connection is under way.
+pub(crate) fn endpoint_record_locked(control: &Path) -> bool {
+    lock_endpoint_record(control).is_ok_and(|lock| lock.is_none())
+}
+
+/// Whether a command may start a switch for this connection now: at most
+/// one in `interval`, so that commands run while its server is unreachable
+/// do not each log in again. A claim sets the endpoint record's modification
+/// time ahead to when the next one is due; nothing else uses that time, as
+/// the record is never rewritten.
+pub(crate) fn claim_switch_attempt(control: &Path, interval: Duration) -> bool {
+    let mut path = control.as_os_str().to_owned();
+    path.push(".json");
+    let Ok(record) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+    else {
+        return false;
+    };
+    let now = std::time::SystemTime::now();
+    let due = record
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|next| next <= now);
+    due && record.set_modified(now + interval).is_ok()
 }
 
 /// Remember whether the command explicitly selected a scope without touching
@@ -971,6 +1078,14 @@ struct ConnectionStatus {
     receiving_name: Option<String>,
     receiving_profiles: Vec<crate::receive_service::NamedConnection>,
     receiving: Option<crate::receive_service::ConnectionState>,
+    /// The receiving service's build, when it is running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receiving_build: Option<String>,
+    /// Its switch to a new build, while waiting for one or after one failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receiving_switch: Option<crate::receive_service::switch::Report>,
+    #[serde(skip)]
+    receiving_note: Option<String>,
     session_pool: bool,
 }
 
@@ -1017,7 +1132,19 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
             _ if ssh_live => "ready",
             _ => "inactive",
         };
+        let receiving_note = receiving.as_ref().and_then(|receiving| {
+            crate::receive_service::build_note(
+                &receiving.build,
+                receiving.started_from.as_deref(),
+                receiving.switch.as_ref(),
+                &crate::receive_service::connect_command(&record.label(), domain.explicit_path()),
+                true,
+            )
+        });
         connections.push(ConnectionStatus {
+            receiving_build: receiving.as_ref().map(|s| s.build.clone()),
+            receiving_switch: receiving.as_ref().and_then(|s| s.switch.clone()),
+            receiving_note,
             endpoint: record.label(),
             ssh_options: record.ssh_options.clone(),
             ssh_options_directory: record.ssh_options_directory.clone(),
@@ -1031,6 +1158,12 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
         });
     }
     let authorized_ssh = crate::destination::ssh::persistent::status(domain)?;
+    // The local SSH authorization provider, when it runs another build or is
+    // switching to a new one.
+    let provider = crate::receive_service::provider::snapshot(domain)
+        .ok()
+        .flatten()
+        .filter(|provider| provider.build != crate::identity::build() || provider.switch.is_some());
     if json {
         crate::output::command_println!(
             "{}",
@@ -1039,6 +1172,9 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
                 "scope": scope, "connections": connections, "receiving_error": receiving_error,
                 "authorized_ssh": authorized_ssh.rows,
                 "authorized_ssh_errors": authorized_ssh.errors,
+                "provider": provider.as_ref().map(|provider| serde_json::json!({
+                    "build": provider.build, "switch": provider.switch,
+                })),
             })
         );
         anyhow::ensure!(
@@ -1089,6 +1225,9 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
                 line.push_str(&format!(": {error}"));
             }
         }
+        if let Some(note) = &connection.receiving_note {
+            line.push_str(&format!("; receiving {note}"));
+        }
         // Only a copy with the same --rsh options reopens such a connection.
         if connection.state == "inactive" && connection.ssh_options.is_empty() {
             line.push_str(&format!(
@@ -1103,6 +1242,24 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
             }
         }
         crate::output::command_human_stdout!("{line}");
+    }
+    if let Some(provider) = provider {
+        let mut fix = "syq persist receive on".to_owned();
+        if kind != "global" {
+            fix.push_str(&format!(
+                " --pscope {}",
+                shell_words::quote(&scope.to_string_lossy())
+            ));
+        }
+        if let Some(note) = crate::receive_service::build_note(
+            &provider.build,
+            provider.started_from.as_deref(),
+            provider.switch.as_ref(),
+            &fix,
+            false,
+        ) {
+            crate::output::command_human_stdout!("  local SSH provider: {note}");
+        }
     }
     anyhow::ensure!(
         authorized_ssh.errors.is_empty(),

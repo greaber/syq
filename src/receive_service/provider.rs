@@ -6,7 +6,7 @@ use crate::private_broker::{ConnectionRegistry, TrackedStream};
 use crate::receive_approval::provider_accounts::ProviderIdentity;
 use crate::receive_approval::Queue;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 pub(crate) const SOCKET_FILE: &str = "provider-v1.sock";
 pub(crate) const LOCK_FILE: &str = "provider-v1.lock";
@@ -36,6 +36,10 @@ enum Control {
     Refresh,
     Decide(Decision),
     Stop,
+    /// Stop only if nothing is in progress, to switch to another build.
+    /// Only a provider whose status reports what it has in progress
+    /// (`Snapshot::busy`) receives it.
+    StopIfIdle,
 }
 #[derive(Serialize, Deserialize)]
 enum Access {
@@ -71,6 +75,18 @@ pub(crate) struct Snapshot {
     pub(crate) pid: u32,
     pub(crate) profiles: Vec<ProfileSnapshot>,
     pub(crate) decision_error: Option<String>,
+    /// Logins and requests in progress, absent from providers from before
+    /// syq followed updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) busy: Option<usize>,
+    /// The path the provider follows to switch to a new build (`switch`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) started_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) switch: Option<super::switch::Report>,
+    /// Whether it stops in answer to `StopIfIdle`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) stopping: bool,
 }
 
 /// Keep this object alive while any operation uses its session ticket. The
@@ -238,7 +254,7 @@ fn exchange_hello(stream: &mut (impl Read + Write), control: bool) -> Result<()>
     );
     anyhow::ensure!(
         control || reply.build == crate::identity::build(),
-        "SSH authorization provider service uses build {}, but this requester/helper uses {}; install the same syq build on the requester and provider, then run syq persist receive on locally on the provider to restart its service",
+        "SSH authorization provider service uses build {}, but this requester/helper uses {}; install the same syq build on the requester and provider, where the service switches to it by itself once idle",
         reply.build,
         crate::identity::build()
     );
@@ -294,6 +310,40 @@ fn running(
     }
     Ok(None)
 }
+/// The hidden `persist receive` subcommand a provider runs with a new build
+/// at its path to switch to it (`switch`).
+pub(crate) const SWITCH_PROVIDER: &str = "switch-provider";
+
+/// Replace a provider from another build with one from this build once it
+/// is idle, as a provider's switch to a new build asks. Leave one that
+/// follows another installed syq file, as `Replace::WhenIdle` does.
+pub(super) fn switch_when_idle(domain: &Domain) -> Result<()> {
+    if !domain.enabled()? || !preferences(domain)?.enabled() {
+        return Ok(());
+    }
+    if let Some(state) = running(domain, ANSWER_TIMEOUT, || Control::Status)? {
+        if state.build == crate::identity::build() {
+            return refresh(domain);
+        }
+        if super::switch::follows_other_file(state.started_from.as_deref()) {
+            crate::output::command_human_stdout!(
+                "The SSH authorization provider keeps running syq {}, which follows another installed syq",
+                state.build
+            );
+            return Ok(());
+        }
+        if state.busy.is_some() && !query(domain, Control::StopIfIdle)?.stopping {
+            crate::output::command_human_stdout!(
+                "The SSH authorization provider keeps running syq {} until its logins and requests finish",
+                state.build
+            );
+            return Ok(());
+        }
+        stop(domain)?;
+    }
+    ensure(domain)
+}
+
 /// Stop a provider from another build, and report whether there was one.
 pub(super) fn stop_other_build(domain: &Domain) -> Result<bool> {
     if running(domain, ANSWER_TIMEOUT, || Control::Status)?
@@ -357,9 +407,21 @@ struct Service {
     stop: Arc<AtomicBool>,
     streams: Arc<ConnectionRegistry>,
     inner: Mutex<Inner>,
+    /// Logins and requests being handled, besides local control requests.
+    requests: AtomicUsize,
+    /// The path the provider follows, and its switch to a new build.
+    started_from: Option<String>,
+    switch: Mutex<Option<super::switch::Report>>,
+}
+/// One login or request being handled, until dropped.
+struct Counted<'a>(&'a AtomicUsize);
+impl Drop for Counted<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 impl Service {
-    fn new(domain: Domain) -> Result<Self> {
+    fn new(domain: Domain, started_from: Option<String>) -> Result<Self> {
         let preferences = preferences(&domain)?;
         let service = Self {
             domain_identity: domain.identity()?,
@@ -371,6 +433,9 @@ impl Service {
                 profiles: HashMap::new(),
                 sessions: HashMap::new(),
             }),
+            requests: AtomicUsize::new(0),
+            started_from,
+            switch: Mutex::new(None),
         };
         service.refresh()?;
         Ok(service)
@@ -425,6 +490,33 @@ impl Service {
         );
         Ok(())
     }
+    /// Logins open through it, requests being handled, and requests
+    /// waiting for approval.
+    fn busy(&self) -> usize {
+        let inner = self.inner.lock().unwrap();
+        self.requests.load(Ordering::SeqCst)
+            + inner.sessions.len()
+            + inner
+                .profiles
+                .values()
+                .map(|profile| profile.approvals.snapshots().len())
+                .sum::<usize>()
+    }
+    /// Stop if nothing is in progress; whether it did. A login or request
+    /// counted after this check finds the provider stopping and is refused.
+    fn stop_if_idle(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let idle = self.requests.load(Ordering::SeqCst) == 0
+            && inner.sessions.is_empty()
+            && inner
+                .profiles
+                .values()
+                .all(|profile| profile.approvals.snapshots().is_empty());
+        if idle {
+            self.stop.store(true, Ordering::SeqCst);
+        }
+        idle
+    }
     fn close(&self) {
         self.stop.store(true, Ordering::Release);
         let mut inner = self.inner.lock().unwrap();
@@ -434,10 +526,15 @@ impl Service {
         self.streams.shutdown_all();
     }
     fn snapshot(&self, decision_error: Option<String>) -> Snapshot {
+        let busy = self.busy();
         let inner = self.inner.lock().unwrap();
         Snapshot {
             build: crate::identity::build().into(),
             pid: std::process::id(),
+            busy: Some(busy),
+            started_from: self.started_from.clone(),
+            switch: self.switch.lock().unwrap().clone(),
+            stopping: self.stop.load(Ordering::SeqCst),
             decision_error,
             profiles: inner
                 .preferences
@@ -496,6 +593,10 @@ impl Service {
                     self.stop.store(true, Ordering::Release);
                     None
                 }
+                Control::StopIfIdle => {
+                    self.stop_if_idle();
+                    None
+                }
                 Control::Decide(decision) => {
                     // Decisions use the matching build's Summary/Kind semantics.
                     anyhow::ensure!(
@@ -538,6 +639,8 @@ impl Service {
             hello.build == crate::identity::build(),
             "local provider build changed"
         );
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        let _counted = Counted(&self.requests);
         let request: Access =
             crate::destination::read_message(&mut crate::destination::DeadlineIo {
                 inner: &mut stream,
@@ -799,9 +902,11 @@ pub(super) fn ensure(domain: &Domain) -> Result<()> {
     let (mut startup, child_output) = crate::process::with_inheritance_guard(UnixStream::pair)?;
     startup.set_read_timeout(Some(STOP_TIMEOUT))?;
     let mut command = crate::process::self_command()?;
+    command.arg(INTERNAL).arg(domain.runtime_path());
+    if let Some(path) = crate::process::started_from() {
+        command.arg(path);
+    }
     command
-        .arg(INTERNAL)
-        .arg(domain.runtime_path())
         .stdin(Stdio::null())
         .stdout(File::from(std::os::fd::OwnedFd::from(child_output)))
         .stderr(Stdio::null());
@@ -872,9 +977,12 @@ struct Runtime {
     _socket: SocketCleanup,
     listener: UnixListener,
     service: Arc<Service>,
+    follower: Option<super::switch::Follower>,
 }
 impl Runtime {
-    fn new(domain: Domain) -> Result<Self> {
+    /// `started_from` is the path the user runs syq by, which the provider
+    /// follows to switch to a new build (`switch`).
+    fn new(domain: Domain, started_from: Option<PathBuf>) -> Result<Self> {
         let scope = domain.ensure_runtime()?;
         anyhow::ensure!(
             domain.enabled()? && preferences(&domain)?.enabled(),
@@ -882,6 +990,10 @@ impl Runtime {
         );
         let lock = lock_for_start(|| acquire_lock(&domain, true))?
             .context("local SSH authorization provider is already running")?;
+        // Only a UTF-8 path can be reported in a status.
+        let follower = started_from
+            .filter(|path| path.to_str().is_some())
+            .map(super::switch::Follower::new);
         let path = scope.join(SOCKET_FILE);
         match fs::symlink_metadata(&path) {
             Ok(metadata)
@@ -905,10 +1017,17 @@ impl Runtime {
                 identity: (socket_metadata.dev(), socket_metadata.ino()),
             },
             listener,
-            service: Arc::new(Service::new(domain)?),
+            service: Arc::new(Service::new(
+                domain,
+                follower
+                    .as_ref()
+                    .and_then(|follower| follower.path().to_str())
+                    .map(str::to_owned),
+            )?),
+            follower,
         })
     }
-    fn run(&self) -> Result<()> {
+    fn run(&mut self) -> Result<()> {
         let (mut wake, sender) = crate::process::with_inheritance_guard(UnixStream::pair)?;
         wake.set_nonblocking(true)?;
         sender.set_nonblocking(true)?;
@@ -916,8 +1035,22 @@ impl Runtime {
         let _signals = SignalWake::new(self.service.stop.clone(), &sender)?;
         let (completed, completions) = std::sync::mpsc::channel();
         let mut workers = Vec::<std::thread::JoinHandle<()>>::new();
+        let mut switch_args: Vec<OsString> = ["persist", "receive", SWITCH_PROVIDER]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        if let Some(scope) = self.service.domain.explicit_path() {
+            switch_args.extend([OsString::from("--pscope"), scope.into()]);
+        }
+        // With a path to follow, wake now and then to look at it.
+        let wait = if self.follower.is_some() { 1000 } else { -1 };
         let result = (|| {
             while !self.service.stop.load(Ordering::Acquire) {
+                if let Some(follower) = &mut self.follower {
+                    let service = &self.service;
+                    follower.tick(&|| service.busy() == 0, &switch_args);
+                    *service.switch.lock().unwrap() = follower.report();
+                }
                 // Completion is queued before waking poll; join also covers the
                 // short interval between that wake and the thread's return.
                 for id in completions.try_iter() {
@@ -944,7 +1077,7 @@ impl Runtime {
                         }));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        wait_for_event(&self.listener, &mut wake)?;
+                        wait_for_event(&self.listener, &mut wake, wait)?;
                     }
                     Err(error) => return Err(error.into()),
                 }
@@ -960,8 +1093,9 @@ impl Runtime {
 }
 
 // Worker completion and control requests use the same event channel as signals.
-// An idle service does no periodic configuration or filesystem reads.
-fn wait_for_event(listener: &UnixListener, wake: &mut UnixStream) -> Result<()> {
+// An idle service reads no configuration periodically; following its path to
+// a new build, it wakes every `timeout` milliseconds.
+fn wait_for_event(listener: &UnixListener, wake: &mut UnixStream, timeout: i32) -> Result<()> {
     let mut descriptors = [
         libc::pollfd {
             fd: listener.as_raw_fd(),
@@ -974,7 +1108,7 @@ fn wait_for_event(listener: &UnixListener, wake: &mut UnixStream) -> Result<()> 
             revents: 0,
         },
     ];
-    let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, -1) };
+    let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, timeout) };
     if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
         return Err(std::io::Error::last_os_error().into());
     }
@@ -1015,12 +1149,14 @@ pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
         return None;
     }
     Some((|| {
+        // The domain, and the path the user runs syq by (`switch`).
         anyhow::ensure!(
-            argv.len() == 3,
+            (3..=4).contains(&argv.len()),
             "local provider service needs its persistence domain path"
         );
         crate::fsops::reserve_startup_descriptors();
-        let runtime = Domain::select(Some(Path::new(&argv[2]))).and_then(Runtime::new);
+        let runtime = Domain::select(Some(Path::new(&argv[2])))
+            .and_then(|domain| Runtime::new(domain, argv.get(3).map(PathBuf::from)));
         let ready = runtime
             .as_ref()
             .map(|_| ())
@@ -1074,7 +1210,7 @@ mod tests {
         config.profiles[0].enabled = false;
         config.profiles[1].servers = vec!["outbound-only".into()];
         save_settings(&domain, &config).unwrap();
-        let service = Service::new(domain).unwrap();
+        let service = Service::new(domain, None).unwrap();
         let error = service
             .open_identified(None, || panic!("disabled profile must not load identity"))
             .err()
@@ -1087,10 +1223,36 @@ mod tests {
         service.close();
     }
 
+    /// The provider stops to switch builds only with no login open and no
+    /// request in progress, and admits nothing once it decided to stop.
+    #[test]
+    fn a_provider_stops_to_switch_only_when_idle() {
+        let (_directory, domain, _) = fixture();
+        let service = Service::new(domain, None).unwrap();
+        let (ticket, _session) = service.open_identified(None, identity).unwrap();
+        assert_eq!(service.busy(), 1);
+        assert!(!service.stop_if_idle());
+        service
+            .inner
+            .lock()
+            .unwrap()
+            .sessions
+            .remove(&ticket.session);
+        service.requests.fetch_add(1, Ordering::SeqCst);
+        assert!(!service.stop_if_idle());
+        service.requests.fetch_sub(1, Ordering::SeqCst);
+        assert_eq!(service.busy(), 0);
+        assert!(service.stop_if_idle());
+        assert!(service.snapshot(None).stopping);
+        let error = service.open_identified(None, identity).err().unwrap();
+        assert!(error.to_string().contains("stopping"), "{error}");
+        service.close();
+    }
+
     #[test]
     fn forwarded_readiness_only_exchanges_hello_without_creating_authority() {
         let (_directory, domain, _) = fixture();
-        let service = Arc::new(Service::new(domain).unwrap());
+        let service = Arc::new(Service::new(domain, None).unwrap());
         let (client, server) = pair(&service);
         let serving = service.clone();
         let worker = std::thread::spawn(move || serving.handle(server));
@@ -1161,7 +1323,7 @@ mod tests {
     #[test]
     fn service_allows_forwarding_latency_before_hello_and_access() {
         let (_directory, domain, _) = fixture();
-        let service = Arc::new(Service::new(domain).unwrap());
+        let service = Arc::new(Service::new(domain, None).unwrap());
         let (mut client, server) = pair(&service);
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -1198,7 +1360,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_build_mismatch_names_both_builds_and_matching_restart() {
+    fn provider_build_mismatch_names_both_builds_and_says_the_provider_follows() {
         let (client, mut server) = UnixStream::pair().unwrap();
         let reply = std::thread::spawn(move || {
             server
@@ -1221,13 +1383,13 @@ mod tests {
         assert!(error.contains("provider-other-build"));
         assert!(error.contains(crate::identity::build()));
         assert!(error.contains("install the same syq build on the requester and provider"));
-        assert!(error.contains("persist receive on locally on the provider"));
+        assert!(error.contains("switches to it by itself once idle"));
     }
 
     #[test]
     fn build_is_checked_before_account_or_resolution_bytes_are_interpreted() {
         let (_directory, domain, _) = fixture();
-        let service = Arc::new(Service::new(domain).unwrap());
+        let service = Arc::new(Service::new(domain, None).unwrap());
         let (mut client, server) = pair(&service);
         let worker = std::thread::spawn(move || service.handle(server));
         crate::destination::write_message(
@@ -1249,7 +1411,7 @@ mod tests {
     #[test]
     fn attachment_eof_revokes_ticket_and_live_operations_but_not_other_sessions() {
         let (_directory, domain, _) = fixture();
-        let service = Arc::new(Service::new(domain).unwrap());
+        let service = Arc::new(Service::new(domain, None).unwrap());
         let (ticket, session) = service.open_identified(None, identity).unwrap();
         let (other_ticket, other) = service.open_identified(None, identity).unwrap();
         session.grants.lock().unwrap().insert("account".into(), 0);
@@ -1302,7 +1464,7 @@ mod tests {
         let (_directory, domain, mut config) = fixture();
         config.profiles[0].notifications = Notifications::Desktop;
         save_settings(&domain, &config).unwrap();
-        let service = Service::new(domain.clone()).unwrap();
+        let service = Service::new(domain.clone(), None).unwrap();
         let (ticket, session) = service.open_identified(None, identity).unwrap();
         let (mut client, server) = UnixStream::pair().unwrap();
         client
@@ -1406,7 +1568,7 @@ mod tests {
     #[test]
     fn profile_stop_closes_only_its_attachments_and_preserves_other_pending_authority() {
         let (_directory, domain, mut config) = fixture();
-        let service = Service::new(domain.clone()).unwrap();
+        let service = Service::new(domain.clone(), None).unwrap();
         let (first_ticket, first) = service.open_identified(Some("first"), identity).unwrap();
         let (second_ticket, second) = service.open_identified(Some("second"), identity).unwrap();
         second
@@ -1439,7 +1601,7 @@ mod tests {
             Kind, Notifications,
         };
         let (_directory, domain, _) = fixture();
-        let service = Arc::new(Service::new(domain).unwrap());
+        let service = Arc::new(Service::new(domain, None).unwrap());
         let (_, session) = service.open_identified(None, identity).unwrap();
         let permission = ProviderLoginPermission::new(
             "first".into(),
@@ -1520,7 +1682,7 @@ mod tests {
     #[test]
     fn idle_runtime_stops_on_control_event_without_a_timer() {
         let (_directory, domain, _) = fixture();
-        let runtime = Runtime::new(domain.clone()).unwrap();
+        let mut runtime = Runtime::new(domain.clone(), None).unwrap();
         let (finished, completion) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let result = runtime.run();
@@ -1544,7 +1706,7 @@ mod tests {
     #[test]
     fn request_admission_checks_domain_and_current_profile_without_idle_polling() {
         let (_directory, domain, mut config) = fixture();
-        let service = Service::new(domain.clone()).unwrap();
+        let service = Service::new(domain.clone(), None).unwrap();
         let (ticket, session) = service.open_identified(None, identity).unwrap();
         config.profiles[0].enabled = false;
         save_settings(&domain, &config).unwrap();
@@ -1569,8 +1731,8 @@ mod tests {
     fn runtime_socket_is_private_and_domains_have_independent_services() {
         let (_first_dir, first_domain, _) = fixture();
         let (_second_dir, second_domain, _) = fixture();
-        let first = Runtime::new(first_domain.clone()).unwrap();
-        let second = Runtime::new(second_domain.clone()).unwrap();
+        let first = Runtime::new(first_domain.clone(), None).unwrap();
+        let second = Runtime::new(second_domain.clone(), None).unwrap();
         let path = first_domain.runtime_path().join(SOCKET_FILE);
         let metadata = fs::symlink_metadata(&path).unwrap();
         assert!(metadata.file_type().is_socket());
@@ -1610,7 +1772,7 @@ mod tests {
             let listener = early.unwrap_or_else(|| UnixListener::bind(&path).unwrap());
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
             listener.set_nonblocking(true).unwrap();
-            let service = Service::new(domain).unwrap();
+            let service = Service::new(domain, None).unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
             for _ in 0..answers {
                 let stream = loop {
@@ -1684,7 +1846,7 @@ mod tests {
         let (_directory, domain, _) = fixture();
         let _owner = acquire_lock(&domain, true).unwrap().unwrap();
         let started = Instant::now();
-        let error = Runtime::new(domain.clone()).err().unwrap();
+        let error = Runtime::new(domain.clone(), None).err().unwrap();
         assert!(started.elapsed() >= PROBE_GRACE, "{:?}", started.elapsed());
         assert!(error.to_string().contains("already running"), "{error:#}");
     }
@@ -1726,11 +1888,16 @@ mod tests {
                     },
                 )
                 .unwrap();
+                // As a provider from before syq followed updates answers.
                 let reply = Snapshot {
                     build: OTHER.into(),
                     pid: 1,
                     profiles: Vec::new(),
                     decision_error: None,
+                    busy: None,
+                    started_from: None,
+                    switch: None,
+                    stopping: false,
                 };
                 match crate::destination::read_message(&mut stream).unwrap() {
                     Control::Status => seen.push("status"),
@@ -1743,6 +1910,7 @@ mod tests {
                         lock = None;
                     }
                     Control::Decide(_) => panic!("unexpected decision"),
+                    Control::StopIfIdle => panic!("an older provider cannot read this"),
                 }
                 crate::destination::write_framed(
                     &mut stream,

@@ -22,6 +22,17 @@ pub(super) fn waiting_for_earlier(who: &str, what: &str) {
     );
 }
 
+/// Say that @`name`'s receiving connection runs syq `build`, another
+/// version than this command, so the command runs with the helper that
+/// connection installed here. A receiving machine switches its connection to
+/// a newer syq by itself once one is installed there and nothing is in
+/// progress (`receive_service::switch`).
+pub(super) fn other_build(name: &str, build: &str) {
+    crate::output::diagnostic!(
+        "syq: @{name} is connected with syq {build}, so this command runs as syq {build}"
+    );
+}
+
 /// After this machine's own SSH login to `spec` failed with `error`, say in
 /// one line why syq asks `@name` to approve `what` instead, and how to avoid
 /// it. Nothing is said when this machine simply has no SSH credentials to

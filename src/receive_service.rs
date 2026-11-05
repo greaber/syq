@@ -1,6 +1,7 @@
 //! Background return connections owned by a persistence scope. Settings are
 //! durable; each endpoint's process and advertisement exist only while enabled.
 pub(crate) mod provider;
+pub(crate) mod switch;
 
 use crate::persistence::Domain;
 use crate::process::CommandExt as _;
@@ -202,6 +203,10 @@ enum Action {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Replace an SSH authorization provider from another build once idle,
+    /// as a provider following a new build asks (`switch`)
+    #[command(name = "switch-provider", hide = true)]
+    SwitchProvider,
     /// Wait until the receiving connection through HOST is ready
     Wait {
         /// SSH server whose receiving connection to wait for
@@ -587,6 +592,51 @@ struct Status {
     decision_error: Option<String>,
     #[serde(default)]
     profiles: Vec<ProfileStatus>,
+    /// Requests in progress. Services from before syq followed updates
+    /// cannot say, and a status for them has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    busy: Option<Busy>,
+    /// The path the service follows to switch to a new syq build by itself
+    /// (`switch`), absent when it cannot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started_from: Option<String>,
+    /// Its switch to a new build, while waiting for one or after one failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    switch: Option<switch::Report>,
+    /// Whether it stops in answer to a `stop_if_idle` request.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    stopping: bool,
+}
+/// What a receiving service has in progress.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Busy {
+    /// Copies, commands and account access in progress.
+    pub(crate) requests: usize,
+    /// Requests waiting for approval.
+    pub(crate) pending: usize,
+}
+impl Busy {
+    pub(crate) fn idle(&self) -> bool {
+        self.requests == 0 && self.pending == 0
+    }
+    /// What stopping it now cuts off, as "1 request in progress and 2
+    /// requests waiting for approval".
+    pub(crate) fn describe(&self) -> String {
+        let count = |count: usize, what: &str| {
+            format!("{count} {what}{}", if count == 1 { "" } else { "s" })
+        };
+        let mut parts = Vec::new();
+        if self.requests > 0 {
+            parts.push(format!("{} in progress", count(self.requests, "request")));
+        }
+        if self.pending > 0 {
+            parts.push(format!(
+                "{} waiting for approval",
+                count(self.pending, "request")
+            ));
+        }
+        parts.join(" and ")
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ProfileStatus {
@@ -608,6 +658,11 @@ struct LocalRequest {
     /// (`ensure_inner`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     restart: bool,
+    /// Stop only if nothing is in progress, refusing new requests from then
+    /// on, to switch to another build. Only a service whose status reports
+    /// what it has in progress (`Status::busy`) receives it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    stop_if_idle: bool,
 }
 
 /// What a request asks the service to do with its failed connections.
@@ -645,19 +700,23 @@ fn query_retry(
     decision: Option<Decision>,
     retry: Retry,
 ) -> Result<Status> {
-    let mut socket = UnixStream::connect(suffixed(control, SOCKET))?;
-    socket.set_read_timeout(Some(Duration::from_secs(1)))?;
-    socket.set_write_timeout(Some(Duration::from_secs(1)))?;
-    crate::destination::write_message(
-        &mut socket,
+    send(
+        control,
         &LocalRequest {
             version: VERSION,
             stop,
             decision,
             retry: retry == Retry::IfDue,
             restart: retry == Retry::Now,
+            stop_if_idle: false,
         },
-    )?;
+    )
+}
+fn send(control: &Path, request: &LocalRequest) -> Result<Status> {
+    let mut socket = UnixStream::connect(suffixed(control, SOCKET))?;
+    socket.set_read_timeout(Some(Duration::from_secs(1)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(1)))?;
+    crate::destination::write_message(&mut socket, request)?;
     let result: Status = read_status(&mut socket)?;
     if result.version != VERSION {
         bail!("unsupported background receive protocol; stop its original build before upgrading");
@@ -774,8 +833,22 @@ fn read_spec(control: &Path) -> Result<ServiceSpec> {
 /// failed return setup is visible but does not invalidate that ordinary copy.
 /// Returns whether this call started a service process.
 pub(crate) fn ensure(domain: &Domain, control: &Path, remote: &crate::conn::RemoteSpec) -> bool {
-    match ensure_inner(domain, control, remote, Retry::IfDue) {
-        Ok(receiving) => receiving == Receiving::Started,
+    match ensure_inner(domain, control, remote, Retry::IfDue, Replace::WhenIdle) {
+        Ok(Receiving::Started) => true,
+        Ok(Receiving::Other {
+            build,
+            busy: Some(busy),
+            follows_this_file,
+        }) => {
+            if !remote.quiet {
+                crate::output::diagnostic!(
+                    "syq: {}",
+                    busy_notice(&remote.label(), &build, &busy, follows_this_file)
+                );
+            }
+            false
+        }
+        Ok(_) => false,
         Err(error) => {
             crate::output::diagnostic!(
                 "syq: background receiving through {}: {error:#}",
@@ -785,22 +858,192 @@ pub(crate) fn ensure(domain: &Domain, control: &Path, remote: &crate::conn::Remo
         }
     }
 }
+/// What a command says when a receiving service from another build keeps
+/// running because it is busy.
+pub(crate) fn busy_notice(
+    endpoint: &str,
+    build: &str,
+    busy: &Busy,
+    follows_this_file: bool,
+) -> String {
+    let then = if follows_this_file {
+        "it switches to this version by itself once nothing is in progress"
+    } else {
+        "once nothing is in progress, a syq command run here switches it to this version"
+    };
+    format!(
+        "receiving through {endpoint} keeps running syq {build} for now, with {}; {then}",
+        busy.describe(),
+    )
+}
+/// Run by syq commands (`main`), so that the services an older syq left
+/// running switch to a new build too, not only the one for the server a
+/// command talks to. A service from another build that cannot follow its
+/// path by itself (`switch`), because it predates that or its path is gone,
+/// is replaced by a detached `persist connect` of this build once idle, as a
+/// service's own switch does. A command that finds every service current
+/// reads one directory and each service's small record, and contacts nothing.
+pub(crate) fn refresh_outdated(explicit_scope: Option<&Path>, quiet: bool) {
+    let domain = match explicit_scope {
+        Some(scope) => match Domain::select(Some(scope)) {
+            Ok(domain) => domain,
+            Err(_) => return,
+        },
+        None => Domain::Global,
+    };
+    if !domain.enabled().unwrap_or(false) {
+        return;
+    }
+    let scope = domain.runtime_path();
+    let Ok(entries) = fs::read_dir(&scope) else {
+        return;
+    };
+    /// Only the build; other fields are the service's own.
+    #[derive(Deserialize)]
+    struct Recorded {
+        identity: String,
+    }
+    let mut switching = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(key) = name.as_bytes().strip_suffix(RECORD) else {
+            continue;
+        };
+        let control = scope.join(std::ffi::OsStr::from_bytes(key));
+        let outdated = crate::delegation::read_private_regular(
+            &entry.path(),
+            "background receiving endpoint",
+            64 * 1024,
+        )
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Recorded>(&bytes).ok())
+        .is_some_and(|recorded| recorded.identity != crate::identity::build());
+        if !outdated || crate::persistence::endpoint_record_locked(&control) {
+            continue;
+        }
+        let Ok(Some(state)) = running_status(&control, Retry::No, ANSWER_TIMEOUT) else {
+            continue;
+        };
+        // A service that follows its path switches by itself, or follows
+        // another installed syq.
+        let follows_itself =
+            switch::follows(state.started_from.as_deref()) != switch::Follows::Nothing;
+        if state.identity == crate::identity::build() || follows_itself || !busy_of(&state).idle() {
+            continue;
+        }
+        if crate::persistence::claim_switch_attempt(&control, SWITCH_ATTEMPT_INTERVAL)
+            && start_switch(&domain, &state.endpoint).is_ok()
+        {
+            switching.push(state.endpoint);
+        }
+    }
+    if !switching.is_empty() && !quiet {
+        crate::output::diagnostic!(
+            "syq: switching receiving through {} to this version of syq in the background; `syq persist status` shows how it goes",
+            switching.join(", ")
+        );
+    }
+}
+
+/// How often commands may start a switch for one connection.
+const SWITCH_ATTEMPT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Start `persist connect --when-idle` of this build for `endpoint`,
+/// detached and without prompts: it reports a login that needs the user in
+/// its status rather than asking.
+fn start_switch(domain: &Domain, endpoint: &str) -> Result<()> {
+    let mut command = match crate::process::started_from() {
+        Some(path) => std::process::Command::new(path),
+        None => crate::process::self_command()?,
+    };
+    command
+        .args(switch_command(domain, endpoint))
+        .env("SYQ_NO_UPDATE_CHECK", "1")
+        .env("SSH_ASKPASS_REQUIRE", "never")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn_guarded()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// Whether a switch to this build should leave the service at `control`
+/// running for now: one from another build that is busy, or that follows
+/// another installed syq file by itself. Checked before logging in to the
+/// server; the service itself decides again when asked to stop.
+pub(crate) fn keeps_running(control: &Path) -> Option<Ready> {
+    let state = running_status(control, Retry::No, ANSWER_TIMEOUT).ok()??;
+    if state.identity == crate::identity::build() {
+        return None;
+    }
+    if switch::follows_other_file(state.started_from.as_deref()) {
+        return Some(Ready::Other {
+            build: state.identity,
+            busy: None,
+            follows_this_file: false,
+        });
+    }
+    let busy = busy_of(&state);
+    (!busy.idle()).then(|| Ready::Other {
+        follows_this_file: switch::follows(state.started_from.as_deref())
+            == switch::Follows::ThisFile,
+        build: state.identity,
+        busy: Some(busy),
+    })
+}
+/// What `persist connect` found.
+pub(crate) enum Ready {
+    /// Receiving is off for this endpoint.
+    Off,
+    /// Online as these receiving names.
+    Online(Vec<String>),
+    /// A service from another build keeps running (`Receiving::Other`).
+    Other {
+        build: String,
+        busy: Option<Busy>,
+        follows_this_file: bool,
+    },
+}
 /// Return readiness for one owned endpoint; do not restart a healthy service.
 pub(crate) fn ensure_ready(
     domain: &Domain,
     control: &Path,
     remote: &crate::conn::RemoteSpec,
     timeout: Duration,
-) -> Result<Option<Vec<String>>> {
-    if ensure_inner(domain, control, remote, Retry::Now)? == Receiving::Off {
-        return Ok(None);
+    replace: Replace,
+) -> Result<Ready> {
+    match ensure_inner(domain, control, remote, Retry::Now, replace)? {
+        Receiving::Off => return Ok(Ready::Off),
+        Receiving::Other {
+            build,
+            busy,
+            follows_this_file,
+        } => {
+            return Ok(Ready::Other {
+                build,
+                busy,
+                follows_this_file,
+            })
+        }
+        Receiving::Running | Receiving::Started => {}
     }
     let deadline = Instant::now() + timeout;
     let mut progress = Instant::now();
     loop {
         let observed = match status(control, false) {
             Ok(state) if state.connection.phase == "online" => {
-                return Ok(Some(if state.profiles.is_empty() {
+                return Ok(Ready::Online(if state.profiles.is_empty() {
                     vec![state.name]
                 } else {
                     state
@@ -842,6 +1085,10 @@ pub(crate) struct ReceivingStatus {
     pub name: String,
     pub connection: ConnectionState,
     pub profiles: Vec<NamedConnection>,
+    /// The service's build, and what it says about switching to another.
+    pub build: String,
+    pub started_from: Option<String>,
+    pub switch: Option<switch::Report>,
 }
 #[derive(Serialize)]
 pub(crate) struct NamedConnection {
@@ -850,6 +1097,9 @@ pub(crate) struct NamedConnection {
 }
 pub(crate) fn connection_status(control: &Path) -> Option<ReceivingStatus> {
     status(control, false).ok().map(|s| ReceivingStatus {
+        build: s.identity,
+        started_from: s.started_from,
+        switch: s.switch,
         name: s.name,
         connection: s.connection,
         profiles: s
@@ -862,6 +1112,55 @@ pub(crate) fn connection_status(control: &Path) -> Option<ReceivingStatus> {
             .collect(),
     })
 }
+/// What a status says about a receiving service's build: that it runs
+/// another build than this command, and how it is switching to a new one.
+/// None for a service of this build with nothing to say. `fix` is the
+/// command that replaces it at once; `commands_switch` says whether any syq
+/// command switches one that cannot follow its path (`refresh_outdated`).
+pub(crate) fn build_note(
+    build: &str,
+    started_from: Option<&str>,
+    switch: Option<&switch::Report>,
+    fix: &str,
+    commands_switch: bool,
+) -> Option<String> {
+    let mut note = Vec::new();
+    if build != crate::identity::build() {
+        note.push(format!("runs syq {build}"));
+        if switch.is_none() {
+            note.push(match switch::follows(started_from) {
+                switch::Follows::OtherFile => format!(
+                    "follows {}; `{fix}` replaces it",
+                    started_from.unwrap_or_default()
+                ),
+                switch::Follows::ThisFile => "switches to this version once idle".into(),
+                switch::Follows::Nothing if commands_switch => {
+                    "a syq command run here switches it to this version once idle".into()
+                }
+                switch::Follows::Nothing => format!("`{fix}` switches it to this version"),
+            });
+        }
+    }
+    if let Some(switch) = switch {
+        let mut line = switch.describe();
+        if switch.phase == "failed" {
+            line.push_str(&format!(", or run `{fix}`"));
+        }
+        note.push(line);
+    }
+    (!note.is_empty()).then(|| note.join("; "))
+}
+/// The command that connects receiving through `endpoint` at once.
+pub(crate) fn connect_command(endpoint: &str, scope: Option<&Path>) -> String {
+    let mut command = format!("syq persist connect {}", shell_words::quote(endpoint));
+    if let Some(scope) = scope {
+        command.push_str(&format!(
+            " --pscope {}",
+            shell_words::quote(&scope.to_string_lossy())
+        ));
+    }
+    command
+}
 pub(crate) fn profile_names(domain: &Domain) -> Vec<String> {
     preferences(domain)
         .map(|p| p.profiles.into_iter().map(|p| p.name).collect())
@@ -870,21 +1169,120 @@ pub(crate) fn profile_names(domain: &Domain) -> Vec<String> {
 
 /// Whether receiving through an endpoint is on, and whether starting it
 /// took a new service process.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Receiving {
     Off,
     Running,
     Started,
+    /// A service from another build keeps running: `busy` with requests in
+    /// progress, or (None) following another installed syq file
+    /// (`switch::follows_other_file`). `follows_this_file` says whether it
+    /// switches to this build by itself once idle.
+    Other {
+        build: String,
+        busy: Option<Busy>,
+        follows_this_file: bool,
+    },
+}
+
+/// Whether to replace a running receiving service from another build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Replace {
+    /// For commands, and the switches services and commands start: only
+    /// once nothing is in progress, and never one that follows another
+    /// installed syq file by itself, so that two installed copies do not
+    /// take turns replacing each other's services (`switch`).
+    WhenIdle,
+    /// For `persist connect` run by hand: at once, saying what that cuts off.
+    Now,
+}
+
+/// What a status says is in progress. A service from before syq followed
+/// updates reports only its requests waiting for approval.
+fn busy_of(state: &Status) -> Busy {
+    state.busy.unwrap_or(Busy {
+        requests: 0,
+        pending: state.pending.len(),
+    })
+}
+
+/// Stop a service from another build as `replace` allows, or say why it
+/// keeps running.
+fn replace_other(control: &Path, state: &Status, replace: Replace) -> Result<Option<Receiving>> {
+    let follows_this_file =
+        switch::follows(state.started_from.as_deref()) == switch::Follows::ThisFile;
+    let other = |busy| {
+        Some(Receiving::Other {
+            build: state.identity.clone(),
+            busy,
+            follows_this_file,
+        })
+    };
+    match replace {
+        Replace::Now => {
+            let busy = busy_of(state);
+            if !busy.idle() {
+                crate::output::diagnostic!(
+                    "syq: replacing receiving through {}, which runs syq {}, cuts off {}",
+                    state.endpoint,
+                    state.identity,
+                    busy.describe()
+                );
+            }
+            stop_inner(control, false)?;
+            Ok(None)
+        }
+        Replace::WhenIdle => {
+            if switch::follows_other_file(state.started_from.as_deref()) {
+                return Ok(other(None));
+            }
+            if stop_when_idle(control, state)? {
+                Ok(None)
+            } else {
+                Ok(other(Some(busy_of(state))))
+            }
+        }
+    }
+}
+
+/// Stop a service only if nothing is in progress. A service that reports
+/// what it has in progress decides that itself, refusing new requests from
+/// then on, so nothing can start between the check and the stop. For one
+/// from before syq followed updates, only its pending approvals are known.
+fn stop_when_idle(control: &Path, state: &Status) -> Result<bool> {
+    if state.busy.is_none() {
+        if !state.pending.is_empty() {
+            return Ok(false);
+        }
+    } else {
+        let answer = send(
+            control,
+            &LocalRequest {
+                version: VERSION,
+                stop: false,
+                decision: None,
+                retry: false,
+                restart: false,
+                stop_if_idle: true,
+            },
+        )?;
+        if !answer.stopping {
+            return Ok(false);
+        }
+    }
+    stop_inner(control, false)?;
+    Ok(true)
 }
 
 /// `retry` is what to do with a failed connection to this server: what a
 /// command connecting to it asks (`Retry::IfDue`), or `persist connect`
-/// (`Retry::Now`).
+/// (`Retry::Now`). `replace` is what to do with a service from another build.
 fn ensure_inner(
     domain: &Domain,
     control: &Path,
     remote: &crate::conn::RemoteSpec,
     retry: Retry,
+    replace: Replace,
 ) -> Result<Receiving> {
     let scope = control.parent().context("persistence scope missing")?;
     crate::persistence::validate_scope(scope)?;
@@ -907,7 +1305,9 @@ fn ensure_inner(
     if allowed {
         if let Some(state) = running_status(control, Retry::No, ANSWER_TIMEOUT)? {
             if state.identity != crate::identity::build() {
-                stop_inner(control, false)?;
+                if let Some(other) = replace_other(control, &state, replace)? {
+                    return Ok(other);
+                }
             } else if running_status(control, retry, ANSWER_TIMEOUT)?.is_some() {
                 return Ok(Receiving::Running);
             }
@@ -944,9 +1344,11 @@ impl Started {
 }
 fn spawn(control: &Path) -> Result<Started> {
     let mut command = crate::process::self_command()?;
+    command.arg("--receive-service").arg(control);
+    if let Some(path) = crate::process::started_from() {
+        command.arg(path);
+    }
     command
-        .arg("--receive-service")
-        .arg(control)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -1042,6 +1444,7 @@ struct ProfileWorker {
     config: Settings,
     state: Arc<Mutex<ConnectionState>>,
     approvals: Arc<crate::receive_approval::Queue>,
+    activity: Arc<crate::destination::Activity>,
     worker: Worker,
 }
 impl ProfileWorker {
@@ -1049,13 +1452,15 @@ impl ProfileWorker {
         let state = Arc::new(Mutex::new(ConnectionState::default()));
         let approvals = Arc::new(crate::receive_approval::Queue::new(domain.clone()));
         approvals.set_notifications(config.notifications);
+        let activity = Arc::new(crate::destination::Activity::default());
         let stop = Arc::new(AtomicBool::new(false));
         let (wake, woken) = std::sync::mpsc::channel();
-        let (thread_state, thread_approvals, thread_stop, thread_config) = (
+        let (thread_state, thread_approvals, thread_stop, thread_config, thread_activity) = (
             state.clone(),
             approvals.clone(),
             stop.clone(),
             config.clone(),
+            activity.clone(),
         );
         let thread = std::thread::spawn(move || {
             let result = if !thread_config.cwd.is_dir() {
@@ -1071,6 +1476,7 @@ impl ProfileWorker {
                     woken,
                     thread_state.clone(),
                     thread_approvals,
+                    thread_activity,
                 )
             };
             if let Err(error) = &result {
@@ -1086,6 +1492,7 @@ impl ProfileWorker {
             config,
             state,
             approvals,
+            activity,
             worker: Worker {
                 stop,
                 wake: Some(wake),
@@ -1100,6 +1507,32 @@ impl ProfileWorker {
             pending: self.approvals.snapshots(),
         }
     }
+    fn idle(&self) -> bool {
+        self.approvals.snapshots().is_empty() && self.activity.idle()
+    }
+}
+/// What these workers have in progress.
+fn busy(workers: &[ProfileWorker]) -> Busy {
+    Busy {
+        requests: workers.iter().map(|w| w.activity.requests()).sum(),
+        pending: workers.iter().map(|w| w.approvals.snapshots().len()).sum(),
+    }
+}
+/// Refuse new requests on every worker if all are idle, so the service can
+/// stop to switch builds without cutting anything off; whether it did.
+fn close_if_idle(workers: &[ProfileWorker]) -> bool {
+    if workers.iter().any(|w| !w.approvals.snapshots().is_empty()) {
+        return false;
+    }
+    for (index, worker) in workers.iter().enumerate() {
+        if !worker.activity.close_if_idle() {
+            for closed in &workers[..index] {
+                closed.activity.reopen();
+            }
+            return false;
+        }
+    }
+    true
 }
 fn reconcile(
     domain: &Domain,
@@ -1281,7 +1714,27 @@ fn read_control_request(client: &mut UnixStream) -> Result<LocalRequest> {
     )
 }
 
-fn run(domain: &Domain, control: &Path) -> Result<()> {
+/// The command a receiving service runs with a new build at its path to
+/// switch to it (`switch`): the new build's own `persist connect`, which
+/// installs its helper on the server and replaces this service once idle.
+/// `--auth-from ssh` keeps a saved authorization default from choosing
+/// anything but this machine's own SSH login.
+fn switch_command(domain: &Domain, endpoint: &str) -> Vec<OsString> {
+    let mut args: Vec<OsString> = ["persist", "connect", endpoint, "--auth-from", "ssh"]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    args.push(WHEN_IDLE.into());
+    if let Some(scope) = domain.explicit_path() {
+        args.extend([OsString::from("--pscope"), scope.into()]);
+    }
+    args
+}
+/// The hidden `persist connect` option a switch uses: replace another build
+/// only once idle, never prompting (`Replace::WhenIdle`).
+pub(crate) const WHEN_IDLE: &str = "--when-idle";
+
+fn run(domain: &Domain, control: &Path, started_from: Option<PathBuf>) -> Result<()> {
     let scope = control.parent().context("persistence scope missing")?;
     crate::persistence::validate_scope(scope)?;
     anyhow::ensure!(
@@ -1324,6 +1777,11 @@ fn run(domain: &Domain, control: &Path) -> Result<()> {
         }
         Ok(registrations)
     })?;
+    // Only a UTF-8 path can be reported in a status.
+    let mut follower = started_from
+        .filter(|path| path.to_str().is_some())
+        .map(switch::Follower::new);
+    let switch_args = switch_command(domain, &spec.endpoint.label());
     let result = (|| {
         let mut workers = Vec::<ProfileWorker>::new();
         let mut config = preferences(domain)?;
@@ -1339,6 +1797,9 @@ fn run(domain: &Domain, control: &Path) -> Result<()> {
                 config = preferences(domain)?;
                 reconcile(domain, &mut workers, &config, &spec, Retry::No);
                 last_check = Instant::now();
+                if let Some(follower) = &mut follower {
+                    follower.tick(&|| workers.iter().all(ProfileWorker::idle), &switch_args);
+                }
             }
             match listener.accept() {
                 Ok((mut client, _)) => {
@@ -1346,7 +1807,7 @@ fn run(domain: &Domain, control: &Path) -> Result<()> {
                     // Its socket errors must not stop the receiving service.
                     if let Ok(request) = read_control_request(&mut client) {
                         if request.version == VERSION {
-                            if request.stop {
+                            if request.stop || (request.stop_if_idle && close_if_idle(&workers)) {
                                 shutdown.store(true, Ordering::Release);
                             }
                             let retry = if request.restart {
@@ -1389,6 +1850,12 @@ fn run(domain: &Domain, control: &Path) -> Result<()> {
                                 connection,
                                 approval: profiles.first().map(|p| p.settings.approval),
                                 pending: profiles.iter().flat_map(|p| p.pending.clone()).collect(),
+                                busy: Some(busy(&workers)),
+                                started_from: follower.as_ref().and_then(|follower| {
+                                    follower.path().to_str().map(str::to_owned)
+                                }),
+                                switch: follower.as_ref().and_then(switch::Follower::report),
+                                stopping: shutdown.load(Ordering::Acquire),
                                 profiles,
                                 decision_error,
                             };
@@ -1424,6 +1891,10 @@ fn statuses(domain: &Domain) -> Result<Vec<Status>> {
                     approval: None,
                     pending: Vec::new(),
                     decision_error: None,
+                    busy: None,
+                    started_from: None,
+                    switch: None,
+                    stopping: false,
                     profiles: Vec::new(),
                     connection: ConnectionState {
                         phase: "inactive".into(),
@@ -1545,6 +2016,7 @@ fn configure(domain: &Domain, options: Configure) -> Result<()> {
             None,
             false,
             Duration::from_secs(30),
+            Replace::Now,
         ) {
             failures.push(format!("{endpoint}: {error:#}"));
         }
@@ -1690,14 +2162,16 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
     }
     match argv.get(1).and_then(|s| s.to_str())? {
         "--receive-service" => Some((|| {
-            if argv.len() != 3 {
+            // The control path, and the path the user runs syq by, which
+            // the service follows to switch to a new build (`switch`).
+            if !(3..=4).contains(&argv.len()) {
                 bail!("receive service needs its control path");
             }
             crate::fsops::reserve_startup_descriptors();
             let control = Path::new(&argv[2]);
             let domain =
                 Domain::select(Some(control.parent().context("persistence scope missing")?))?;
-            run(&domain, control)?;
+            run(&domain, control, argv.get(3).map(PathBuf::from))?;
             Ok(0)
         })()),
         _ => None,
@@ -1768,6 +2242,7 @@ fn permission_account_label(
 pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i32> {
     match command.action {
         Action::On(options) => configure(domain, options)?,
+        Action::SwitchProvider => provider::switch_when_idle(domain)?,
         Action::Pending {
             json,
             wait,
@@ -1910,6 +2385,22 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                     config.print_paths();
                 }
                 if let Some(provider) = local_provider {
+                    let mut fix = "syq persist receive on".to_owned();
+                    if let Some(scope) = domain.explicit_path() {
+                        fix.push_str(&format!(
+                            " --pscope {}",
+                            shell_words::quote(&scope.to_string_lossy())
+                        ));
+                    }
+                    if let Some(note) = build_note(
+                        &provider.build,
+                        provider.started_from.as_deref(),
+                        provider.switch.as_ref(),
+                        &fix,
+                        false,
+                    ) {
+                        crate::output::command_human_stdout!("  local SSH provider: {note}");
+                    }
                     for profile in provider.profiles {
                         crate::output::command_human_stdout!(
                             "  local SSH provider {}: {} sessions ({} pending)",
@@ -1920,6 +2411,15 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                     }
                 }
                 for state in connections {
+                    if let Some(note) = build_note(
+                        &state.identity,
+                        state.started_from.as_deref(),
+                        state.switch.as_ref(),
+                        &connect_command(&state.endpoint, domain.explicit_path()),
+                        true,
+                    ) {
+                        crate::output::command_human_stdout!("  {}: {note}", state.endpoint);
+                    }
                     if state.profiles.is_empty() {
                         crate::output::command_human_stdout!(
                             "  {}: {}{}",
@@ -2122,6 +2622,7 @@ mod tests {
                 ..Default::default()
             })),
             approvals: approvals.clone(),
+            activity: Default::default(),
             worker: Worker {
                 stop: stop.clone(),
                 wake: None,
@@ -2357,6 +2858,10 @@ mod tests {
             approval: None,
             pending: Vec::new(),
             decision_error: None,
+            busy: None,
+            started_from: None,
+            switch: None,
+            stopping: false,
             profiles,
         };
         let mut bytes = Vec::new();
@@ -2456,6 +2961,7 @@ mod tests {
                 decision: None,
                 retry: false,
                 restart: false,
+                stop_if_idle: false,
             };
             assert_eq!(serde_json::to_string(&request).unwrap(), old);
             let decoded: LocalRequest = serde_json::from_str(old).unwrap();
@@ -2505,6 +3011,10 @@ mod tests {
                 approval: None,
                 pending: Vec::new(),
                 decision_error: None,
+                busy: None,
+                started_from: None,
+                switch: None,
+                stopping: false,
                 profiles: Vec::new(),
             };
             write_status(&mut client, &state).unwrap();
@@ -2512,6 +3022,115 @@ mod tests {
         let state = running_status(&control, Retry::No, ANSWER_TIMEOUT).unwrap();
         service.join().unwrap();
         assert_eq!(state.unwrap().pid, 4242);
+    }
+
+    /// A status as the service at `control` answers it.
+    fn answer(identity: &str, busy: Option<Busy>, stopping: bool) -> Status {
+        Status {
+            version: VERSION,
+            identity: identity.into(),
+            pid: 4242,
+            endpoint: "example".into(),
+            name: "laptop".into(),
+            connection: ConnectionState::default(),
+            approval: None,
+            pending: Vec::new(),
+            decision_error: None,
+            profiles: Vec::new(),
+            busy,
+            started_from: None,
+            switch: None,
+            stopping,
+        }
+    }
+
+    /// Serve a stand-in service on `control` until it is asked to stop,
+    /// answering each request with `reply`; return the requests.
+    fn stand_in(
+        control: &Path,
+        lock: File,
+        reply: impl Fn(&LocalRequest) -> Status + Send + 'static,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        let socket = suffixed(control, SOCKET);
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let mut client = match listener.accept() {
+                    Ok((client, _)) => client,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return requests;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                let request = read_control_request(&mut client).unwrap();
+                requests.push(serde_json::to_string(&request).unwrap());
+                write_status(&mut client, &reply(&request)).unwrap();
+                if request.stop {
+                    fs::remove_file(&socket).unwrap();
+                    drop(lock);
+                    return requests;
+                }
+            }
+        })
+    }
+
+    /// A service that reports what it has in progress decides itself
+    /// whether it is idle enough to stop; one from before syq followed
+    /// updates is stopped unless it has requests waiting for approval.
+    #[test]
+    fn a_service_from_another_build_is_stopped_only_when_idle() {
+        let (_root, control, lock) = locked_control();
+        let busy = Some(Busy {
+            requests: 1,
+            pending: 0,
+        });
+        let service = stand_in(&control, lock, move |_| answer("other", busy, false));
+        assert!(!stop_when_idle(&control, &answer("other", busy, false)).unwrap());
+        assert!(is_running(&control));
+        // An older service cannot read the request; it is never sent one.
+        let (_root, old_control, old_lock) = locked_control();
+        let old = stand_in(&old_control, old_lock, |_| answer("old", None, false));
+        assert!(stop_when_idle(&old_control, &answer("old", None, false)).unwrap());
+        assert_eq!(old.join().unwrap(), [r#"{"version":2,"stop":true}"#]);
+        assert!(!is_running(&old_control));
+        // The busy one was asked once and kept running.
+        send(
+            &control,
+            &LocalRequest {
+                version: VERSION,
+                stop: true,
+                decision: None,
+                retry: false,
+                restart: false,
+                stop_if_idle: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            service.join().unwrap(),
+            [
+                r#"{"version":2,"stop":false,"stop_if_idle":true}"#,
+                r#"{"version":2,"stop":true}"#
+            ]
+        );
+
+        // An idle one agrees and stops.
+        let (_root, control, lock) = locked_control();
+        let service = stand_in(&control, lock, |request| {
+            answer("other", Some(Busy::default()), request.stop_if_idle)
+        });
+        // Its answer to stop_if_idle says it stops; the stop that follows
+        // waits for it to go.
+        assert!(stop_when_idle(&control, &answer("other", Some(Busy::default()), false)).unwrap());
+        assert!(!is_running(&control));
+        drop(service);
     }
 
     #[test]

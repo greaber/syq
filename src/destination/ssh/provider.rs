@@ -808,7 +808,7 @@ fn keeper(startup: Startup) -> Result<()> {
     let hello = hello.map_err(anyhow::Error::msg)?;
     anyhow::ensure!(
         hello.build == crate::identity::build(),
-        "SSH provider attachment uses build {}, but requester uses {}; install the same syq build on both machines and restart receiving locally on the provider",
+        "SSH provider attachment uses build {}, but requester uses {}; install the same syq build on both machines; the provider's service switches to it by itself once idle",
         hello.build,
         crate::identity::build()
     );

@@ -92,7 +92,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         handoff::Kind::Command,
         None,
     );
-    handoff::maybe_exec(&selection)?;
+    handoff::maybe_exec(&selection, false)?;
     let registration = selection.registration;
     super::notices::waiting(&format!("@{name}"), "this command");
     let (stream, reply) = exchange(

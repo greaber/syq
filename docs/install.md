@@ -71,9 +71,9 @@ for custom helpers and installation exceptions.
 ## Updates
 
 Use `syq --self-update` for a standalone installation, or `brew upgrade syq`
-for Homebrew. Commands already running keep their own version. A receiving
-connection started before the update refuses new requests and names the
-command that restarts it; see [Updating connections](persistence-reference.md#updating-connections).
+for Homebrew. Commands already running keep their own version. Receiving
+connections started before the update switch to the new version by themselves
+once nothing is in progress.
 
 Standalone and Homebrew installs may print an update reminder in a terminal,
 at most once a day after a successful command, naming the upgrade command for

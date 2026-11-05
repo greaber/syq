@@ -274,6 +274,11 @@ sys.exit(23)
     let output = child.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(23), "{output:?}");
     assert_eq!(output.stdout, input);
+    // It says which version runs the command instead of falling back silently.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "syq: @laptop is connected with syq another-build, so this command runs as syq another-build\n"
+    );
 }
 
 #[test]
@@ -299,6 +304,8 @@ sys.exit(23)
         .capture_output()
         .unwrap();
     assert_eq!(output.status.code(), Some(23), "{output:?}");
+    // --quiet leaves out the notice about the version that runs it.
+    assert!(output.stderr.is_empty(), "{output:?}");
 }
 
 #[cfg(target_os = "linux")]

@@ -389,7 +389,7 @@ pub(crate) fn prepare(request: &ssh::SessionRequest) -> Result<()> {
     };
     let selection =
         handoff::Selection::new(name.clone(), registration, handoff::Kind::Account, None);
-    handoff::maybe_exec(&selection)
+    handoff::maybe_exec(&selection, false)
 }
 
 pub(in crate::destination) fn registration_binding(registration: &Registration) -> Result<String> {

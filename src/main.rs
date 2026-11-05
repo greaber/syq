@@ -343,6 +343,13 @@ fn run() {
     ) {
         agent_socket::repair_from_tmux();
     }
+    if matches!(
+        argv.get(1).and_then(|arg| arg.to_str()),
+        Some("ssh" | "exec")
+    ) && !destination::handoff::handed_off()
+    {
+        receive_service::refresh_outdated(None, false);
+    }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("ssh") {
         match destination::ssh::run(&argv[1..]) {
             Ok(code) => crate::output::exit(code),
@@ -462,6 +469,11 @@ fn run() {
         }
     }
     let quiet = args.quiet;
+    // A command handed off to another build's helper leaves the services to
+    // the build that started them.
+    if !destination::handoff::handed_off() {
+        receive_service::refresh_outdated(args.pscope.as_deref(), quiet);
+    }
     let result = if args.stream_mapping_fd.is_some() {
         stream_mapping::run(args)
     } else if args.descriptor_copy.is_some() {
