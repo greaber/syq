@@ -1439,3 +1439,71 @@ fn only_ordinary_keep_copies_rename_unchecked() {
     restricted.restricted_grant = Some(Default::default());
     assert!(!restricted.keeps_unchecked());
 }
+
+/// A leading `@NAME` is a receiving name wherever it appears, never an SSH
+/// login with an empty user name: only a native copy's destination may use
+/// one, and every other position is refused while parsing.
+#[test]
+fn receiving_names_are_refused_where_no_receiving_machine_can_serve() {
+    let parse = |words: &[&str]| Args::parse_args(&argv(words));
+    let error = |words: &[&str]| format!("{:#}", parse(words).unwrap_err());
+    let destination = parse(&["cp", "file", "--to", "@laptop"]).unwrap();
+    let target = destination.locations.last().unwrap();
+    assert_eq!(
+        (target.user.as_deref(), target.host.as_deref()),
+        (None, Some("@laptop"))
+    );
+    for words in [
+        &["cp", ".kube", "--from", "@laptop"][..],
+        &["cp", ".kube", "--from", "@laptop", "--into", "copy"],
+        &["cp", ".kube", "--from", "@laptop", "--to", "server"],
+        &["cp", ".kube", "--from", "@laptop", "--to", "@desk"],
+        &[
+            "cp",
+            "--from",
+            "@laptop",
+            "--mapping",
+            "-",
+            "--into",
+            "copy",
+        ],
+        &["rsync", "@laptop:.kube", "copy/"],
+        &["rsync", "-a", "@laptop:", "copy/"],
+    ] {
+        let message = error(words);
+        assert!(
+            message.starts_with("cannot copy from receiving machine @laptop:")
+                && message.contains("To copy files from that machine to this server, run `syq cp PATH --to HOST` on it"),
+            "{words:?}: {message}"
+        );
+    }
+    assert!(error(&["rsync", "file", "@laptop:copy"])
+        .starts_with("receiving machine @laptop cannot be used with syq rsync; to copy to it, use `syq cp SOURCE --to @laptop`"));
+    for (words, command) in [
+        (&["rm", "--on", "@laptop", "file"][..], "syq rm"),
+        (&["map", "--from", "@laptop", "file"], "syq map"),
+        (
+            &["clean-partials", "--on", "@laptop", "dir"],
+            "syq clean-partials",
+        ),
+    ] {
+        assert!(
+            error(words).starts_with(&format!(
+                "receiving machine @laptop cannot be used with {command};"
+            )),
+            "{words:?}: {}",
+            error(words)
+        );
+    }
+    // Rsync operands that are not valid names still never mean an empty user.
+    for operand in ["@:path", "@host.example:path"] {
+        assert!(
+            super::Location::parse(operand).is_err(),
+            "{operand} parsed as an SSH location"
+        );
+    }
+    // A path containing `@` after a slash or a leading `./` stays local.
+    for operand in ["./@laptop:x", "dir/@laptop:x"] {
+        assert!(!super::Location::parse(operand).unwrap().is_remote());
+    }
+}

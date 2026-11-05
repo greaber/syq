@@ -1785,11 +1785,15 @@ fn return_exec_completion_and_offline_selection_never_contact_ssh() {
         if name == "@absent" {
             let error = String::from_utf8_lossy(&output.stderr);
             assert!(
-                error.contains("no receiving machine named @absent is registered"),
+                error.contains(
+                    "no receiving machine named @absent is connected to this server account; did you mean @laptop?"
+                ),
                 "{error}"
             );
-            assert!(error.contains("Registered names: @laptop"), "{error}");
-            assert!(error.contains("syq persist destinations list"), "{error}");
+            assert!(
+                error.contains("run `syq persist connect HOST` on it"),
+                "{error}"
+            );
             assert!(
                 !error.contains(".syq-destinations") && !error.contains("os error"),
                 "{error}"
@@ -1808,10 +1812,17 @@ fn return_exec_completion_and_offline_selection_never_contact_ssh() {
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(
-        error.contains("On the receiving machine, run `syq persist connect SERVER`"),
+        error.contains("no receiving machine named @laptop is connected to this server account."),
         "{error}"
     );
-    assert!(!error.contains("Registered names:"), "{error}");
+    assert!(
+        error.contains("run `syq persist connect HOST` on it (for example your laptop)"),
+        "{error}"
+    );
+    assert!(
+        !error.contains("did you mean") && !error.contains("Names registered here"),
+        "{error}"
+    );
     // Other read failures still explain their cause rather than claiming absence.
     write(&t.path("home/.syq-destinations-v3/laptop.json"), b"{}");
     fs::set_permissions(

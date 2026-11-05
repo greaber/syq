@@ -69,6 +69,10 @@ profile's starting directory (your home directory unless you set `--cwd`,
 `--root` or `--auto-approve-root`), or to a path you give with `--into` or
 `--as`, relative to that directory or absolute.
 
+Your laptop accepts copies and commands, but it can't be a copy source: to
+copy files from your laptop to the server, run `syq cp PATH --to server` on
+the laptop.
+
 Each copy waits for approval **on your laptop**. The prompt shows the server,
 what is copied where, and a warning for each option that lets the server do
 more than copy files, such as pruning or copying permissions. Choose
