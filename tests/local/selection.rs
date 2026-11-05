@@ -318,6 +318,19 @@ fn native_named_symlinks_are_refused_together_and_map_writes_nothing() {
     );
     assert!(!stderr_of(&single).contains("--srcs-in"));
 
+    // A name that starts with `-` is suggested attached, as clap needs it.
+    symlink("a", t.path("proj/-dash")).unwrap();
+    let dash = native_syq(&["cp", "-C", &proj, "--src=-dash", "--into", &into]);
+    assert!(!dash.status.success());
+    assert!(
+        stderr_of(&dash).contains("or --src-non-dir=-dash to copy the link itself"),
+        "{}",
+        stderr_of(&dash)
+    );
+    run_native_ok(&["cp", "-C", &proj, "--src-non-dir=-dash", "--into", &into]);
+    assert_eq!(fs::read_link(t.path("out/-dash")).unwrap(), Path::new("a"));
+    fs::remove_dir_all(t.path("out")).unwrap();
+
     // syq map checks every selector before writing any entry, so a pipeline
     // into `syq cp --mapping -` never gets a partial mapping.
     for (selectors, expected) in [

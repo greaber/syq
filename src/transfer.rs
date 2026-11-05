@@ -828,6 +828,10 @@ pub(crate) fn named_symlink_sources_error(links: &[&[u8]], sources: usize) -> an
         names.push(format!("{} more", links.len() - SHOWN));
     }
     let mut message = match names.as_slice() {
+        // A value that starts with `-` must be attached, or it reads as an option.
+        [name] if links[0].starts_with(b"-") => format!(
+            "source {name} is a symlink; pass --follow-src to copy what it points to, or --src-non-dir={name} to copy the link itself"
+        ),
         [name] => format!(
             "source {name} is a symlink; pass --follow-src to copy what it points to, or --src-non-dir {name} to copy the link itself"
         ),

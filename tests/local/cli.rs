@@ -2128,7 +2128,18 @@ fn a_closed_stdout_stops_a_streaming_command() {
     }
     // A later selector that fails only once map walks it: map checks every
     // selector before writing, so a missing one would fail before any output.
+    // Root can read the unreadable directory, so the check needs another user.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    struct Readable(PathBuf);
+    impl Drop for Readable {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
     fs::create_dir_all(t.path("src/later/unreadable")).unwrap();
+    let _readable = Readable(t.path("src/later/unreadable"));
     fs::set_permissions(
         t.path("src/later/unreadable"),
         fs::Permissions::from_mode(0o000),
@@ -2145,11 +2156,6 @@ fn a_closed_stdout_stops_a_streaming_command() {
         .unwrap()
         .wait_with_output()
         .unwrap();
-    fs::set_permissions(
-        t.path("src/later/unreadable"),
-        fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert!(output.stderr.is_empty(), "{}", stderr_of(&output));
 }
