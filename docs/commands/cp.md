@@ -192,9 +192,7 @@ aliases for one server, or shared storage, can hide the overlap. Pruning never
 removes ignored paths, partial files, or
 [recovery entries](clean-partials.md#which-files-are-removed).
 
-<a id="filename-and-type-conflicts"></a>
-
-## Filename conflicts
+## Filename and type conflicts
 
 On a case-insensitive destination, `Report.txt` and `report.txt` (or two
 Unicode spellings of one name) collide. Syq does not check for this, so one
