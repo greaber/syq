@@ -34,36 +34,24 @@ to run an exact official release:
 syq --use-version 0.7.1 cp photos --into backup
 ```
 
-Syq downloads and verifies that release the first time it is needed, keeps it
-in `~/.local/lib/syq` alongside other versions, and runs it with your command's
-arguments and environment. Your normal installation stays unchanged. Later
-calls run the stored release offline, like any installed program, without
-checking it again.
-
-Stored releases stay until you delete them. To remove a release, or replace a
-damaged one, delete its directory, for example `~/.local/lib/syq/v0.7.1/` for
-0.7.1 ([stored releases](environment.md#stored-releases-and-helpers)); the next
-call that needs it downloads it again. The first download needs network access
-and a writable home directory; an unavailable release or unsupported platform
-is an error. `latest` and version ranges are not accepted.
-
-Official and source builds support this option. The syq you invoke must
-understand `--use-version`; the selected release does not need to. That
-release interprets the command and controls its remote helpers and shared
-state, so selecting an older release also selects its limitations and bugs.
+Syq downloads and verifies that release the first time it is needed and keeps
+it in `~/.local/lib/syq`; later calls run it offline. Your normal installation
+stays unchanged. The selected release runs the whole command, including its
+remote helpers, so an older release also brings its older limitations and bugs.
+`latest` and version ranges are not accepted. Stored releases stay until you
+delete them; see [stored releases](environment.md#stored-releases-and-helpers).
 
 ### Check the invoked version
 
-Use `--version-is EXPR` to check the release version of the syq executable you
-invoked before it runs your command:
+Use `--version-is EXPR` to check the version of the syq you invoked before it
+runs your command:
 
 ```sh
 syq --version-is '>=0.7.1' cp photos --into backup
-syq --version-is '>=0.7.1, <0.8.0' cp photos --into backup
 syq --version-is '>=0.7.1, <0.8.0 | >=1.0.0, <2.0.0' cp photos --into backup
 ```
 
-Expressions use a small numeric comparison language:
+An expression combines version comparisons:
 
 | Syntax | Meaning |
 | --- | --- |
@@ -73,57 +61,34 @@ Expressions use a small numeric comparison language:
 | `comparison, comparison` | Both comparisons must hold (AND) |
 | `group \| group` | At least one AND group must hold (OR) |
 
-AND binds more tightly than OR. Each version has three nonnegative decimal
-integer components, compared in order, so `1.10.0` is newer than `1.9.9`.
-Spaces around comparisons, operators, commas, and bars are allowed. Quote the
-expression to protect `<`, `>`, and `|` from the shell. Partial versions,
-wildcards, `~`, `^`, parentheses, and `||` are not supported.
+AND binds more tightly than OR. Quote the expression to protect `<`, `>`, and
+`|` from the shell. Partial versions, wildcards, `~`, `^`, parentheses, and
+`||` are not supported.
 
-Put `--version-is` and `--use-version` before the command and all other options.
-Each can occur once, in either order. When both are present, syq checks the
-initially invoked executable before downloading or running the selected release:
-
-```sh
-syq --version-is '>=0.7.1' --use-version 0.7.0 cp photos --into backup
-```
-
-Only the syq you invoked checks the expression; the selected release and remote
-helpers do not see it. A version mismatch or a development build exits with
-status 1 before the command runs. Invalid expressions or misplaced options exit
-with status 2. Only release builds with numeric `x.y.z` versions are supported;
-prerelease and development-build identities cannot be used in expressions.
+Put `--version-is` and `--use-version` before the command and all other
+options, at most once each, in either order. With both, syq checks the
+executable you invoked before it downloads or runs the selected release.
+A version mismatch or a development build exits with status 1 before the
+command runs; an invalid expression or a misplaced option exits with status 2.
 
 ## Automatic installation on SSH servers
 
 Syq installs its SSH helper on the server when needed, in the server's
 `~/.local/lib/syq`, and leaves it there for later copies. Official releases also
-try to make `syq` available at `~/.local/bin/syq` for commands you run there.
-Existing commands and shell startup files are left alone. See
-[stored releases and helpers](environment.md#stored-releases-and-helpers) for
-removing old releases.
-
+try to make `syq` available at `~/.local/bin/syq` for commands you run there,
+without changing existing commands or shell startup files.
 Use `syq --self-update` on the server to update that command, or the standalone
 installer above if it is missing. See [SSH helper installation](environment.md#ssh-helper-installation)
 for custom helpers and installation exceptions.
 
-## Try a benchmark
-
-Compare syq with rsync on your own machines, or with rsync and cp locally.
-See [Quick comparison](speed.md#quick-comparison) for the script and how to
-read its results.
+<a id="try-a-benchmark"></a>
 
 ## Updates
 
 Use `syq --self-update` for a standalone installation, or `brew upgrade syq`
-for Homebrew.
-
-A command that is already running when you update keeps running its own
-version. On macOS, if it then needs to start another syq process, such as the
-receiver of a local copy, and the update installed a different version, it
-stops and asks you to rerun the command. A receiving connection started before
-the update refuses requests in the same way and names the command that restarts
-it, `syq persist connect SERVER`, which keeps your settings. See
-[Updating connections](persistence-reference.md#updating-connections).
+for Homebrew. Commands already running keep their own version. A receiving
+connection started before the update refuses new requests and names the
+command that restarts it; see [Updating connections](persistence-reference.md#updating-connections).
 
 Standalone and Homebrew installs may print an update reminder in a terminal,
 at most once a day after a successful command, naming the upgrade command for
@@ -138,10 +103,9 @@ records each request's time, syq version, platform, the connection's IP
 address, and the country, region, and city derived from that address, so the
 project can see how many installs exist and which versions are in use.
 Nothing identifies an install, and the check sends nothing else.
-Non-interactive use never makes the reminder check. An installed official syq
-verifies self-updates and helper downloads against a signed release manifest.
-See [Downloaded executables](security.md#downloaded-executables) for how that
-verification works and how trust is established during the first installation.
+Non-interactive use never makes the reminder check. Self-updates and helper
+downloads are verified against a signed release manifest; see
+[Downloaded executables](security.md#downloaded-executables).
 
 ## Shell completion
 
@@ -158,10 +122,9 @@ source <(syq completion zsh)
 syq completion fish | source
 ```
 
-Completion suggests options, hosts, and paths, with file details beside path
-matches. In Bash, press Tab again to list matches. Remote paths use your usual
-SSH login. Open a new shell after adding the setup line or upgrading syq.
-See [`syq completion`](commands/completion.md) for all options.
+Completion suggests options, hosts, and paths, including remote paths over
+your usual SSH login. Open a new shell after adding the setup line or
+upgrading syq. See [`syq completion`](commands/completion.md) for all options.
 
 ## Keep connections open
 
