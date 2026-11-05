@@ -86,6 +86,10 @@ const LOGIN_CHECK: Duration = Duration::from_secs(60);
 /// The time a switch keeps after its login check, to say how it went.
 const LOGIN_CHECK_MARGIN: Duration = Duration::from_secs(2);
 
+/// Why a switch's login that ran out of time needs the user.
+pub(crate) const NO_ANSWER: &str =
+    "ssh did not finish logging in by itself in time, as when it waits for a touch of your security key";
+
 /// When a login check must end, and whether it runs in this process's
 /// group. In a switch, it ends before the switch does: a check that ran out
 /// of time, as when ssh waits for a touch of a security key that nobody
@@ -93,7 +97,8 @@ const LOGIN_CHECK_MARGIN: Duration = Duration::from_secs(2);
 /// which only a command at a terminal tries again, not as a failure the
 /// service would retry by itself, touching the key again. It also runs in
 /// the switch's group, which `end_switch_at` ends, so that nothing outlives
-/// the switch.
+/// the switch. `LoginWatch` bounds the switch's control connection's login
+/// the same way.
 pub(crate) fn login_check() -> (Instant, bool) {
     let now = Instant::now();
     let Some(ends) = ENDS.get() else {
@@ -102,6 +107,60 @@ pub(crate) fn login_check() -> (Instant, bool) {
     let by = ends.checked_sub(LOGIN_CHECK_MARGIN).unwrap_or(now).max(now);
     let leads_group = unsafe { libc::getpgrp() == libc::getpid() };
     ((now + LOGIN_CHECK).min(by), leads_group)
+}
+
+/// Bounds, in a switch (`end_switch_at`), the login of its control
+/// connection to the server, which ssh makes when no connection is live,
+/// until dropped once that connection is made or has failed: if it has not
+/// finished by the deadline `login_check` gives, and the connection's
+/// control socket, which ssh opens once logged in, is still not there, the
+/// switch ends at once as one that needs the user (`LOGIN_NEEDED_EXIT`),
+/// with what it started in its process group. What follows the login, such
+/// as installing the helper, is bound only by the switch's own time limit.
+pub(crate) struct LoginWatch(std::sync::Arc<std::sync::Mutex<bool>>);
+impl LoginWatch {
+    pub(crate) fn start(control: &Path, server: String) -> Self {
+        let done = std::sync::Arc::new(std::sync::Mutex::new(false));
+        if ENDS.get().is_some() {
+            let (deadline, _) = login_check();
+            let control = control.to_path_buf();
+            let watched = done.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                // Held until the process exits, so that the login cannot
+                // be taken as done meanwhile.
+                let done = watched
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if *done || crate::persistence::socket_is_ready(&control).unwrap_or(false) {
+                    return;
+                }
+                let error = format!("{}: {NO_ANSWER}", LoginNeeded(server));
+                super::record_attempt(&control, &super::Attempt::new("login", Some(error.clone())));
+                defer_after_login(&control);
+                crate::output::diagnostic!("syq persist: {error}");
+                unsafe {
+                    // End what this switch started, but not this process
+                    // before it exits with its status; whoever started the
+                    // switch then ends anything left in its group.
+                    if libc::getpgrp() == libc::getpid() {
+                        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                        libc::kill(0, libc::SIGTERM);
+                    }
+                    libc::_exit(LOGIN_NEEDED_EXIT);
+                }
+            });
+        }
+        Self(done)
+    }
+}
+impl Drop for LoginWatch {
+    fn drop(&mut self) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    }
 }
 
 /// Wait for `child`, which leads its own process group, then end what it

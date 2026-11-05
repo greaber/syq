@@ -1708,10 +1708,7 @@ pub(crate) fn check_receiving_login(
     }
     .map_err(|error| {
         if error.kind() == std::io::ErrorKind::TimedOut {
-            (
-                true,
-                "ssh did not finish logging in by itself in time, as when it waits for a touch of your security key".to_owned(),
-            )
+            (true, crate::receive_service::switch::NO_ANSWER.to_owned())
         } else {
             (false, error.to_string())
         }

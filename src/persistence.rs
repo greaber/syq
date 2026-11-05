@@ -543,7 +543,18 @@ fn connect_receiving(
     crate::output::command_human_stdout!("Connecting to {}...", remote.label());
     // This uses the same pinned-helper bootstrap and authentication as a copy.
     // No source roots, data workers or filesystem operations are requested.
-    let connection = match remote.connect_with(true, false) {
+    // A switch reads ssh's errors to tell a login that needs the user from
+    // other failures, and bounds a login that waits for one.
+    let connected = if when_idle {
+        let _login = crate::receive_service::switch::LoginWatch::start(
+            multiplexer.control_path(),
+            remote.label(),
+        );
+        remote.connect_for_authorization(true)
+    } else {
+        remote.connect_with(true, false)
+    };
+    let connection = match connected {
         Ok(connection) => connection,
         Err(error)
             if when_idle
@@ -558,6 +569,15 @@ fn connect_receiving(
         }
         Err(error) => return Err(error),
     };
+    // Tests stand for work after the login that takes too long.
+    #[cfg(debug_assertions)]
+    if let Some(millis) = when_idle
+        .then(|| std::env::var("SYQ_TEST_SWITCH_STALL_MS").ok())
+        .flatten()
+        .and_then(|millis| millis.parse().ok())
+    {
+        std::thread::sleep(Duration::from_millis(millis));
+    }
     let receiving = crate::receive_service::ensure_ready(
         domain,
         multiplexer.control_path(),
