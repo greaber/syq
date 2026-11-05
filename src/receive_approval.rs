@@ -1881,6 +1881,14 @@ mod tests {
         // A preview changes nothing.
         request.copy.options.dry_run = true;
         assert_eq!(warnings(&request), none);
+        // One that copies permissions lists none, rather than leaving out the
+        // list and reading as a request stored before warnings existed.
+        request.copy.options.preserve_permissions = true;
+        let preview = Summary::new(&requester(), &[], "~", &request, TIMEOUT, None).unwrap();
+        assert_eq!(
+            serde_json::to_value(&preview).unwrap()["warnings"],
+            serde_json::json!([])
+        );
     }
 
     /// Both routes a server's `cp --mapping` takes to an approval here: to
