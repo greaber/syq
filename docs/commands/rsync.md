@@ -27,7 +27,7 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | `-l, --links` | Copy symlinks as symlinks |
 | `--insecure-links` | Follow symlinks in this machine's rsync operator paths regardless of ownership (local only, as in rsync) |
 | `-H, --hard-links` | Preserve hard links between selected regular files |
-| `-A, --acls` | Preserve POSIX access and default ACLs; implies permissions |
+| `-A, --acls` | Preserve native Linux or macOS ACLs; implies permissions |
 | `-X, --xattrs` | Preserve extended attributes in the selected privilege namespaces |
 | `-p, --perms` | Preserve permissions |
 | `-t, --times` | Preserve modification times |
@@ -40,7 +40,7 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | `-D` | Preserve device and special files |
 | `-h, --human-readable` | No-op accepted for rsync compatibility (sizes are always human-readable) |
 | `--numeric-ids` | No-op accepted for rsync compatibility (syq always uses numeric uid/gid) |
-| `--bwlimit <RATE>` | Limit the aggregate file-data rate across all workers (default unit: KiB/s; 0 disables) |
+| `--bwlimit <RATE>` | Limit aggregate bytes per second across all workers; SSH and TCP copies count compressed transport bytes, other routes count file data (default unit: KiB/s; 0 disables) |
 | `-P` | Same as --progress --partial |
 | `--partial` | No-op accepted for rsync compatibility (syq keeps partial files a later copy can resume from) |
 | `-c, --checksum` | Skip quick check; compare file contents block by block and repair differences |
