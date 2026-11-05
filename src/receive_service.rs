@@ -972,8 +972,10 @@ pub(crate) fn refresh_outdated(domain: &Domain, quiet: bool) {
     }
 }
 
-/// How long a command waits for a stale service's status.
-const REFRESH_ANSWER: Duration = Duration::from_millis(250);
+/// How long a command waits for a stale service's status. A healthy one
+/// answers within a millisecond; one that does not is skipped until the
+/// next claim (`claim_switch_attempt`).
+const REFRESH_ANSWER: Duration = Duration::from_millis(50);
 
 /// The last switch to a new build started for a connection, kept so that
 /// status can say how it went even when the service it would replace cannot

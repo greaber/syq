@@ -297,9 +297,10 @@ why.
 
 `receiving_build` names the syq build an endpoint's receiving service runs.
 While it switches to a newer installed syq, `receiving_switch` has `to` (the
-new build), `phase` (`waiting` until nothing is in progress, `switching`, or
-`failed`), and `error`. `provider` reports the same `build` and `switch` for
-the local SSH authorization provider when it runs another build or switches.
+new build), `phase` (`waiting` until nothing is in progress, `switching`,
+`login` until a syq command to that server logs in, or `failed`), and `error`.
+`provider` reports the same `build` and `switch` for the local SSH
+authorization provider when it runs another build or switches.
 
 `authorized_ssh` lists approved account connections, each with `authorizer`,
 `requested` (the original selection), `endpoint` (the resolved account and

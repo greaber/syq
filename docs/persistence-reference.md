@@ -245,8 +245,10 @@ but does not start receiving.
 In an isolated domain, idle SSH connections close after five to ten minutes;
 in the default domain they stay open. Syq installs no login service, so
 connect again after a reboot. After you update syq, receiving and the SSH
-authorization provider switch to the new version by themselves once no copy,
-command, login, or approval is in progress.
+authorization provider switch to the new version once no copy, command, or
+approval is in progress, by themselves or when you next run syq. If receiving
+needs you to log in to a server, it waits for your next syq command to that
+server. Session permissions (**Allow**) end at the switch, as at any reconnect.
 
 To wait in a script without starting a connection, run
 `syq persist receive wait server --timeout 30` on the laptop, or

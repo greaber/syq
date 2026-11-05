@@ -74,8 +74,9 @@ helpers and installation exceptions.
 
 Use `syq --self-update` for a standalone installation, or `brew upgrade syq`
 for Homebrew. Commands already running keep their own version. Receiving
-connections started before the update switch to the new version by themselves
-once nothing is in progress.
+switches to the new version once nothing is in progress, by itself or when you
+next run syq; if it needs you to log in to a server, it waits for your next syq
+command to that server.
 
 When a newer release is out, standalone and Homebrew installs remind you in a
 terminal, at most once a day after a successful command, and name the upgrade
