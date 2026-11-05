@@ -1160,6 +1160,11 @@ fn removed_remote_options_name_their_replacements() {
             "{option}: {error}"
         );
         assert!(!error.contains("similar argument"), "{option}: {error}");
+        assert_eq!(
+            error.contains("per-file hashes are no longer reported"),
+            name == "--receiver-receipt",
+            "{option}: {error}"
+        );
     }
     let error = Args::parse_rsync(&argv(&["--syq-tcp-plain", "source", "host:destination"]))
         .unwrap_err()

@@ -2424,7 +2424,7 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
                         Some("--preserve=-mtime is not a syq cp option; creating or updating file contents sets the source timestamp and cannot be disabled"),
                     "--preserve" => Some("--preserve is not a syq cp option; use --copy-metadata to select source metadata to apply, including on unchanged files"),
                     "--tcp-plain" => Some("--tcp-plain is not a syq cp option; use --no-tcp-encryption for unencrypted TCP data connections on trusted networks"),
-                    "--receiver-receipt" => Some("--receiver-receipt is not a syq cp option; every copy between servers checks the destination's own reports, and --results FILE saves them"),
+                    "--receiver-receipt" => Some("--receiver-receipt is not a syq cp option; per-file hashes are no longer reported. Copies through an enrolled receiver always check the destination's own reports, and --results FILE saves them"),
                     _ => None,
                 };
                 if let Some(message) = message {
