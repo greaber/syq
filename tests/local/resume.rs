@@ -401,7 +401,7 @@ fn streaming_and_default_copies_share_resume_partials() {
             "switching mode must not consume a candidate"
         );
         assert!(
-            out.contains("1 files (3.00 MiB), 3.00 MiB unchanged"),
+            out.contains("1 files (3.00 MiB, plus 3.00 MiB reused), 0 B unchanged (0 files)"),
             "{out}"
         );
     }
@@ -440,7 +440,7 @@ fn tuning_options_preserve_partial_identity_and_reused_hash_blocks() {
     assert_eq!(read(&t.path("destination")), data);
     assert!(partial.exists(), "overrides must not consume a candidate");
     assert!(
-        out.contains("1 files (3.00 MiB), 3.00 MiB unchanged"),
+        out.contains("1 files (3.00 MiB, plus 3.00 MiB reused), 0 B unchanged (0 files)"),
         "{out}"
     );
 }
@@ -2429,7 +2429,7 @@ fn resume_prefers_a_partial_to_the_old_destination_contents() {
     ]);
     assert_eq!(read(&t.path("out")), contents);
     assert!(
-        out.contains("1 files (2.00 MiB), 3.00 MiB unchanged"),
+        out.contains("1 files (2.00 MiB, plus 3.00 MiB reused), 0 B unchanged (0 files)"),
         "{out}"
     );
     assert_eq!(partial_files(&t.0).len(), 1);

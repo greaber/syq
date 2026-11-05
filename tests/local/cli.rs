@@ -368,6 +368,14 @@ fn native_comparison_blocks_reuse_only_verified_matching_bytes() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("bytes transferred: 262,144"), "{stdout}");
     assert!(stdout.contains("bytes unchanged: 262,151"), "{stdout}");
+    // The summary counts the reused blocks with the file that was rewritten,
+    // and "unchanged" only for files left alone.
+    assert!(
+        stdout.contains(
+            "syq: transferred 1 files (256 KiB, plus 256 KiB reused), 0 B unchanged (0 files),"
+        ),
+        "{stdout}"
+    );
     assert!(partial_files(&t.0).is_empty());
 }
 

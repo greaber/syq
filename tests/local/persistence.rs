@@ -822,6 +822,101 @@ fn session_pool_serves_later_commands_without_new_ssh_sessions() {
     );
 }
 
+/// Closes an explicit persistence scope when dropped, even if the test
+/// fails, so its session pool does not outlive the test.
+struct ScopeOff<'a>(&'a Tmp, String);
+
+impl Drop for ScopeOff<'_> {
+    fn drop(&mut self) {
+        let _ = persistence_command(self.0, &["off", "--pscope", &self.1]).run();
+    }
+}
+
+/// A copy that leaves a new SSH connection and helper running says so once,
+/// naming the command that stops them. A copy that finds them running, or
+/// one run with -q, says nothing.
+#[test]
+fn a_copy_that_starts_background_connections_says_so_once() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    fs::create_dir_all(t.path("remote-home/dest")).unwrap();
+    write(&t.path("local.txt"), b"hello");
+    let ssh = fake_ssh(&t);
+    let executable = env!("CARGO_BIN_EXE_syq");
+    let copy = |scope: &str, quiet: bool| {
+        let mut command = Command::new(executable);
+        command
+            .args([
+                "cp",
+                "--pscope",
+                scope,
+                "--syq-path",
+                executable,
+                "--no-tcp",
+            ])
+            .args(quiet.then_some("-q"))
+            .arg(t.path("local.txt"))
+            .args(["--to", "fake.example", "--into", &t.s("remote-home/dest")])
+            .arg("--no-progress")
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            )
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.runtime());
+        let output = command.run().unwrap();
+        assert_output_ok(&output);
+        output
+    };
+    let notices = |output: &Output| {
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .chain(String::from_utf8_lossy(&output.stdout).lines())
+            .filter(|line| line.contains("running in the background"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    let scope = ephemeral_scope(&t);
+    let scope_text = scope.to_str().unwrap().to_string();
+    let _off = ScopeOff(&t, scope_text.clone());
+    let first = copy(&scope_text, false);
+    let announced = notices(&first);
+    assert_eq!(announced.len(), 1, "{}", stderr_of(&first));
+    // The scope is named by its resolved path.
+    assert!(
+        announced[0].starts_with(
+            "syq: persistence keeps these running in the background: the SSH connection to fake.example and a ready syq session there. `syq persist off --pscope /"
+        ) && announced[0].ends_with("` stops them."),
+        "{}",
+        announced[0]
+    );
+
+    // OpenSSH's master now listens on the control socket.
+    let record = fs::read_dir(&scope)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+                && fs::read_to_string(path).is_ok_and(|text| text.contains("fake.example"))
+        })
+        .expect("endpoint record");
+    let _master = std::os::unix::net::UnixListener::bind(record.with_extension("")).unwrap();
+    let second = copy(&scope_text, false);
+    assert!(notices(&second).is_empty(), "{}", stderr_of(&second));
+    assert_eq!(read(&t.path("remote-home/dest/local.txt")), b"hello");
+
+    let quiet_scope = ephemeral_scope(&t);
+    let quiet_text = quiet_scope.to_str().unwrap().to_string();
+    let _quiet_off = ScopeOff(&t, quiet_text.clone());
+    let quiet = copy(&quiet_text, true);
+    assert!(notices(&quiet).is_empty(), "{}", stderr_of(&quiet));
+}
+
 /// An SSH child can start successfully and only then refuse its exec
 /// channel. Such failures need the same delay as a failed master check.
 #[test]

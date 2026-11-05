@@ -33,7 +33,11 @@ pub struct Progress {
     /// delayed batch acknowledgments. Display/results still use file progress.
     pub(crate) tuning_transport_bytes: Arc<AtomicU64>,
     pub(crate) tuning_transport: AtomicBool,
+    /// Bytes not sent because the destination already had them: whole
+    /// unchanged files, and data reused inside transferred files.
     pub bytes_unchanged: AtomicU64,
+    /// The part of `bytes_unchanged` that belongs to files left unchanged.
+    pub(crate) bytes_in_unchanged_files: AtomicU64,
     pub files_total: AtomicU64,
     // Confirmed completion for display/results. Tuned transfers normally use
     // add_files; fast batches confirm directly after earlier acknowledgment credit.
@@ -189,6 +193,7 @@ impl Progress {
             tuning_transport_bytes: Arc::new(AtomicU64::new(0)),
             tuning_transport: AtomicBool::new(false),
             bytes_unchanged: AtomicU64::new(0),
+            bytes_in_unchanged_files: AtomicU64::new(0),
             files_total: AtomicU64::new(0),
             files_done: AtomicU64::new(0),
             tuning_files: AtomicU64::new(0),
@@ -272,6 +277,15 @@ impl Progress {
         timings
     }
 
+    /// Setup before file work began, in whole milliseconds as the results
+    /// count them, for the timing line. The results' `setup_ms` also counts
+    /// connections added while copying.
+    pub fn setup_before_transfer_ms(&self) -> u64 {
+        self.clock
+            .setup_before(self.start, self.transfer_start.get().copied())
+            .as_millis() as u64
+    }
+
     fn transfer_elapsed(&self) -> Option<Duration> {
         self.transfer_start.get().map(|start| {
             let end = if self.transfer_finished.load(Acquire) {
@@ -335,6 +349,20 @@ impl Progress {
         self.last_copy_end()
             .checked_duration_since(*self.transfer_start.get()?)
             .map(|elapsed| elapsed.as_millis() as u64)
+    }
+
+    /// Count the size of a file left unchanged whose bytes were added to
+    /// `bytes_unchanged`.
+    pub(crate) fn add_unchanged_file_bytes(&self, size: u64) {
+        self.bytes_in_unchanged_files.fetch_add(size, Relaxed);
+    }
+
+    /// Data reused inside transferred files rather than sent: the part of
+    /// `bytes_unchanged` that no unchanged file accounts for.
+    pub(crate) fn bytes_reused(&self) -> u64 {
+        self.bytes_unchanged
+            .load(Relaxed)
+            .saturating_sub(self.bytes_in_unchanged_files.load(Relaxed))
     }
 
     pub fn add_bytes(&self, n: u64) {

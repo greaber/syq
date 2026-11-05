@@ -146,12 +146,13 @@ fn try_lock(control: &Path, create: bool) -> Result<Option<File>> {
 
 /// Start a pool for this endpoint unless one is running. Best effort and
 /// off the critical path: the caller has just opened its own connection.
-pub(crate) fn ensure(control: &Path, endpoint: &PoolEndpoint) {
+/// Returns whether this call started a pool process.
+pub(crate) fn ensure(control: &Path, endpoint: &PoolEndpoint) -> bool {
     if is_running(control) {
-        return;
+        return false;
     }
     let Ok(mut command) = crate::process::self_command() else {
-        return;
+        return false;
     };
     command
         .arg("--session-pool")
@@ -180,12 +181,14 @@ pub(crate) fn ensure(control: &Path, endpoint: &PoolEndpoint) {
             Ok(())
         });
     }
-    if let Ok(mut child) = command.spawn_guarded() {
-        // The pool outlives this process; reap it only if it exits first.
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
-    }
+    let Ok(mut child) = command.spawn_guarded() else {
+        return false;
+    };
+    // The pool outlives this process; reap it only if it exits first.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    true
 }
 
 /// Take a ready session for `program`, or nothing. Every failure is a

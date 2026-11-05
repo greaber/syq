@@ -51,6 +51,32 @@ Receiving reconnects after a network interruption or laptop sleep; native SSH
 connections reopen on their next use. An interrupted copy still needs to be
 rerun to resume. After rebooting, run `syq persist connect server` again.
 
+## What keeps running
+
+With persistence on, a command that connects to a server leaves a few things
+running after it finishes, so the next command to that server starts sooner:
+
+- The SSH connection to the server. It stays open until `syq persist off` or
+  until the network drops it. In an
+  [isolated domain](persistence-reference.md#isolated-script-scopes), it
+  closes on its own after five to ten idle minutes.
+- A ready syq session on the server, which the next command uses instead of
+  starting its own. A small syq process on your machine keeps it ready. Both
+  exit after five minutes without use, and each command that uses the session
+  starts the five minutes again.
+- Receiving through the server, when receiving is on. It runs until
+  `syq persist off` or `syq persist receive off`.
+
+The command that starts them says so in one line, naming the command that
+stops them:
+
+```text
+syq: persistence keeps these running in the background: the SSH connection to server, a ready syq session there, and receiving through it. `syq persist off` stops them.
+```
+
+Later commands that find them running say nothing, and neither does a command
+run with `-q`. `syq persist status` shows what is running.
+
 ## Reuse laptop-authorized account access
 
 On a server connected to your laptop, select it for authorization and start work:

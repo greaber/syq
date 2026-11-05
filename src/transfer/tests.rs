@@ -6178,3 +6178,89 @@ fn kept_small_files_are_listed_by_whoever_saw_them_fail() {
         }
     }
 }
+
+fn summary_record(
+    files_transferred: u64,
+    bytes_transferred: u64,
+    files_unchanged: u64,
+    bytes_unchanged: u64,
+) -> crate::results::ResultRecord {
+    crate::results::ResultRecord {
+        status: "success",
+        exit_code: 0,
+        dry_run: false,
+        files_transferred,
+        files_unchanged,
+        files_excluded: 0,
+        directories_created: 0,
+        symlinks_created: 0,
+        specials_created: 0,
+        errors: 0,
+        bytes_transferred,
+        bytes_unchanged,
+        timings: Default::default(),
+        deletions_planned: None,
+        deletions_completed: None,
+        deletions_blocked: None,
+        replaced_not_in_place: None,
+    }
+}
+
+#[test]
+fn the_summary_shows_reused_data_with_transferred_files_not_as_unchanged() {
+    const MIB: u64 = 1 << 20;
+    // A retry that reused 120 MiB inside the files it finished.
+    let retried = summary_record(4, 136 * MIB, 0, 120 * MIB);
+    assert_eq!(
+        transfer_summary_counts(&retried, Some(120 * MIB)),
+        "transferred 4 files (136 MiB, plus 120 MiB reused), 0 B unchanged (0 files)"
+    );
+    // From the results alone: with no unchanged files, all of it was reused.
+    assert_eq!(
+        transfer_summary_counts(&retried, None),
+        transfer_summary_counts(&retried, Some(120 * MIB))
+    );
+    // Without reuse the line is as before.
+    let plain = summary_record(3, 4096, 2, 10 * MIB);
+    assert_eq!(
+        transfer_summary_counts(&plain, Some(0)),
+        "transferred 3 files (4.00 KiB), 10.0 MiB unchanged (2 files)"
+    );
+    // Both kinds.
+    let both = summary_record(1, MIB, 2, 10 * MIB);
+    assert_eq!(
+        transfer_summary_counts(&both, Some(2 * MIB)),
+        "transferred 1 files (1.00 MiB, plus 2.00 MiB reused), 8.00 MiB unchanged (2 files)"
+    );
+    // The results alone cannot split them.
+    assert_eq!(
+        transfer_summary_counts(&both, None),
+        "transferred 1 files (1.00 MiB), 10.0 MiB unchanged or reused (2 files unchanged)"
+    );
+}
+
+#[test]
+fn the_tcp_fallback_notice_says_why_and_how_to_skip_trying() {
+    let silent = crate::conn::NoTcpRoute {
+        unanswered_after: Some(std::time::Duration::from_millis(250)),
+    };
+    assert_eq!(
+        no_tcp_route_notice("server", &silent, "--no-tcp", false),
+        "server: no answer over TCP within 0.25s; sending file data over SSH instead, which can be slower. If TCP never works with this host, --no-tcp skips the wait"
+    );
+    let refused = crate::conn::NoTcpRoute {
+        unanswered_after: None,
+    };
+    assert_eq!(
+        no_tcp_route_notice("server", &refused, "--syq-no-tcp", false),
+        "server: TCP connections did not get through; sending file data over SSH instead, which can be slower. If TCP never works with this host, --syq-no-tcp skips trying it"
+    );
+    assert_eq!(
+        no_tcp_route_notice("server", &silent, "--no-tcp", true),
+        "server: no answer over TCP within 0.25s; a copy would send file data over SSH instead, which can be slower. If TCP never works with this host, --no-tcp skips the wait"
+    );
+    // A copy says it once for each host.
+    let label = format!("fallback-notice-test-{}", std::process::id());
+    assert!(first_tcp_fallback_notice(&label));
+    assert!(!first_tcp_fallback_notice(&label));
+}

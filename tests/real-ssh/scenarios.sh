@@ -1616,7 +1616,13 @@ make_tree source /tmp/syq-real-ssh/firewall-source firewall
 syq cp --no-progress --performance-tuning workers=2 --copy-metadata=permissions \
     --tcp-ports "$blocked_tcp_port-$blocked_tcp_port" \
     --from source --srcs-in /tmp/syq-real-ssh/firewall-source \
-    --to destination --into /tmp/syq-real-ssh/firewall-destination
+    --to destination --into /tmp/syq-real-ssh/firewall-destination \
+    2>/tmp/syq-real-ssh/firewall.stderr
+# The fallback is said once, with how to skip trying TCP.
+if [ "$(grep -c 'sending file data over SSH instead.*--no-tcp' /tmp/syq-real-ssh/firewall.stderr)" != 1 ]; then
+    cat /tmp/syq-real-ssh/firewall.stderr >&2
+    exit 1
+fi
 assert_same_tree \
     source /tmp/syq-real-ssh/firewall-source \
     destination /tmp/syq-real-ssh/firewall-destination \

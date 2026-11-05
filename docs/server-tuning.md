@@ -15,7 +15,7 @@ sudo ufw allow from <trusted-client-address> to any port 47600:47699 proto tcp
 
 Allow the range in any cloud firewall too. Check the transport with
 `syq cp -vv --stats`. Ordinary copies fall back to SSH on the same route when
-TCP is blocked. To [Run the copy from a server](remote-to-remote.md#run-the-copy-from-a-server)
+TCP is blocked, and say so. To [Run the copy from a server](remote-to-remote.md#run-the-copy-from-a-server)
 with your laptop’s approval, direct encrypted TCP must be reachable.
 
 On Linux, syq can also discover TCP addresses on IP over InfiniBand (IPoIB)

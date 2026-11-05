@@ -94,9 +94,16 @@ impl Receiver {
             },
             true,
         )?;
+        // This side has measured no round trip to the coordinator, so it
+        // waits as long as an unmeasured probe does.
         let candidates = self
             .tcp_peer
-            .probe_tcp_addresses(request.advertised, request.port)?;
+            .probe_tcp_addresses(
+                request.advertised,
+                request.port,
+                crate::conn::TCP_PROBE_CEILING,
+            )?
+            .candidates;
         // Use the ordinary speed selection on both peers. This temporary spec
         // has no helper or control connection and performs no filesystem work.
         let selected = crate::conn::select_tcp_candidates(candidates);

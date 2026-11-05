@@ -152,6 +152,15 @@ pub trait Conn: Send {
             PendingReply::Queued(_) => bail!("this connection has no deferred replies"),
         }
     }
+    /// `take_reply`, with when the reply began to arrive. A connection that
+    /// does not record arrivals reports the time it is taken, which is later.
+    fn take_reply_with_arrival(
+        &mut self,
+        pending: PendingReply,
+    ) -> Result<(Response, std::time::Instant)> {
+        let response = self.take_reply(pending)?;
+        Ok((response, std::time::Instant::now()))
+    }
     /// True once the transport has failed (remote process gone).
     fn is_dead(&self) -> bool {
         false
@@ -398,8 +407,9 @@ enum Deferred {
 struct DeferredReplies {
     /// Oldest first. Their replies precede any other.
     pending: std::collections::VecDeque<Deferred>,
-    /// Replies read ahead of a later one, kept until taken.
-    arrived: std::collections::HashMap<u64, Response>,
+    /// Replies read ahead of a later one, with when each began to arrive,
+    /// kept until taken.
+    arrived: std::collections::HashMap<u64, (Response, std::time::Instant)>,
     next: u64,
     failed: Option<String>,
 }
@@ -1036,11 +1046,12 @@ impl RemoteConn {
                     }
                 }
                 Deferred::Reply { id, expected } => {
-                    let first = self.receive_next_response()?.into_inner();
-                    let reply = assemble_reply(expected, first, || {
+                    let first = self.receive_next_response()?;
+                    let arrival = first.started_at;
+                    let reply = assemble_reply(expected, first.into_inner(), || {
                         Ok(self.receive_next_response()?.into_inner())
                     })?;
-                    self.deferred.arrived.insert(id, reply);
+                    self.deferred.arrived.insert(id, (reply, arrival));
                     if until == Some(id) {
                         break;
                     }
@@ -1227,8 +1238,15 @@ impl Conn for RemoteConn {
         Ok(PendingReply::Queued(id))
     }
     fn take_reply(&mut self, pending: PendingReply) -> Result<Response> {
+        self.take_reply_with_arrival(pending)
+            .map(|(response, _)| response)
+    }
+    fn take_reply_with_arrival(
+        &mut self,
+        pending: PendingReply,
+    ) -> Result<(Response, std::time::Instant)> {
         let id = match pending {
-            PendingReply::Ready(response) => return Ok(response),
+            PendingReply::Ready(response) => return Ok((response, std::time::Instant::now())),
             PendingReply::Queued(id) => id,
         };
         if let Some(reply) = self.deferred.arrived.remove(&id) {
@@ -1760,6 +1778,9 @@ pub(crate) struct RequestedTcpListener {
     token: Vec<u8>,
     congestion_control: Option<String>,
     reply: TcpListenReply,
+    /// When the request was sent. Its reply's arrival measures a round trip
+    /// over SSH, which bounds how long route probes wait for an answer.
+    sent: std::time::Instant,
 }
 
 enum TcpListenReply {
@@ -1782,8 +1803,59 @@ pub(crate) struct PendingTcpSetup {
     token: Vec<u8>,
     congestion_control: Option<String>,
     remote_congestion_control: Option<String>,
-    probe: std::thread::JoinHandle<Result<Vec<TcpCandidate>>>,
+    probe: std::thread::JoinHandle<Result<ProbedRoutes>>,
 }
+
+/// What the route probes found.
+pub(crate) struct ProbedRoutes {
+    pub(crate) candidates: Vec<TcpCandidate>,
+    /// How long they waited, when some address gave no answer in that time.
+    pub(crate) unanswered_after: Option<std::time::Duration>,
+}
+
+/// The longest route probes wait for an address to accept a connection.
+pub(crate) const TCP_PROBE_CEILING: std::time::Duration = std::time::Duration::from_millis(1000);
+/// The shortest, however quick the SSH round trip was.
+const TCP_PROBE_FLOOR: std::time::Duration = std::time::Duration::from_millis(200);
+/// Slack for starting the probes and collecting their answers.
+const TCP_PROBE_COLLECTION: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long route probes wait for an advertised address to answer. A
+/// reachable address accepts a connection in about one network round trip,
+/// and the listener request has just measured one over SSH. Allow a few, plus
+/// a margin for a slower path, so an address that silently drops packets costs
+/// a fraction of a second rather than the full ceiling. Without a measurement,
+/// wait the ceiling.
+pub(crate) fn tcp_probe_wait(ssh_round_trip: Option<std::time::Duration>) -> std::time::Duration {
+    ssh_round_trip.map_or(TCP_PROBE_CEILING, |round_trip| {
+        round_trip
+            .saturating_mul(3)
+            .saturating_add(std::time::Duration::from_millis(100))
+            .clamp(TCP_PROBE_FLOOR, TCP_PROBE_CEILING)
+    })
+}
+
+/// No advertised data address accepted a TCP connection, so data goes over
+/// SSH. `unanswered_after` is set when some address gave no answer at all.
+#[derive(Debug)]
+pub(crate) struct NoTcpRoute {
+    pub(crate) unanswered_after: Option<std::time::Duration>,
+}
+
+impl std::fmt::Display for NoTcpRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.unanswered_after {
+            Some(wait) => write!(
+                f,
+                "no advertised data address answered within {:.2}s",
+                wait.as_secs_f64()
+            ),
+            None => f.write_str("no advertised data address is reachable"),
+        }
+    }
+}
+
+impl std::error::Error for NoTcpRoute {}
 
 #[derive(Clone, Debug, Default)]
 pub struct RemoteDiagnostics {
@@ -2103,7 +2175,9 @@ impl RemoteSpec {
                 self.record_peer(&conn);
                 if multiplexer.automatic_receiving {
                     if let Some(domain) = &multiplexer.domain {
-                        crate::receive_service::ensure(domain, &multiplexer.path, self);
+                        let receiving =
+                            crate::receive_service::ensure(domain, &multiplexer.path, self);
+                        self.announce_background(multiplexer, false, receiving);
                     }
                 }
                 Some(conn)
@@ -2118,6 +2192,43 @@ impl RemoteSpec {
                 None
             }
         }
+    }
+
+    /// Say once what a command left running in the background for this
+    /// endpoint, and how to stop it: a persistent SSH master it started, with
+    /// the session pool and receiving that came with it, or receiving started
+    /// on its own. A pool restarted alone, after it retired idle, is part of
+    /// a master already announced and says nothing.
+    fn announce_background(&self, multiplexer: &SshMultiplexer, pool: bool, receiving: bool) {
+        let master = multiplexer.starting_master.swap(false, Ordering::Relaxed);
+        if self.quiet || !(master || receiving) {
+            return;
+        }
+        // Two endpoints of one command can share a control socket.
+        static ANNOUNCED: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+            std::sync::Mutex::new(std::collections::BTreeSet::new());
+        if !ANNOUNCED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(multiplexer.path.clone())
+        {
+            return;
+        }
+        let stop = match multiplexer
+            .domain
+            .as_ref()
+            .and_then(|domain| domain.explicit_path())
+        {
+            Some(scope) => format!(
+                "syq persist off --pscope {}",
+                shell_words::quote(&scope.to_string_lossy())
+            ),
+            None => "syq persist off".to_owned(),
+        };
+        crate::output::diagnostic!(
+            "syq: {}",
+            background_notice(&self.label(), master, pool, receiving, &stop)
+        );
     }
 
     /// Take a pooled control session now, on the calling thread, for the
@@ -2568,6 +2679,11 @@ impl RemoteSpec {
             {
                 require_constrained_openssh(&self.rsh[0], "on the coordinator host")?;
             }
+            if ssh_connection == SshConnection::Control && self.rsh[0].ends_with("ssh") {
+                if let Some(multiplexer) = &self.ssh_multiplexer {
+                    multiplexer.note_master_start();
+                }
+            }
             let mut command = self.ssh_command(ssh_connection, crate::output::debug());
             let remote_command = if self.restricted_grant.is_some() {
                 // The entry key's forced command runs in place of this text,
@@ -2764,14 +2880,18 @@ impl RemoteSpec {
             // ready. The pool is started here, after this connection is up,
             // so it never sits on the critical path.
             if let Some(multiplexer) = &self.ssh_multiplexer {
+                let mut pool = false;
+                let mut receiving = false;
                 if multiplexer.persistent && multiplexer.session_pool {
-                    crate::session_pool::ensure(&multiplexer.path, &self.pool_endpoint());
+                    pool = crate::session_pool::ensure(&multiplexer.path, &self.pool_endpoint());
                     if multiplexer.automatic_receiving {
                         if let Some(domain) = &multiplexer.domain {
-                            crate::receive_service::ensure(domain, &multiplexer.path, self);
+                            receiving =
+                                crate::receive_service::ensure(domain, &multiplexer.path, self);
                         }
                     }
                 }
+                self.announce_background(multiplexer, pool, receiving);
             }
         }
         Ok(conn)
@@ -2857,6 +2977,7 @@ impl RemoteSpec {
                 reply: TcpListenReply::Reverse(
                     self.begin_reverse_tcp_setup(ports, congestion_control)?,
                 ),
+                sent: std::time::Instant::now(),
             });
         }
         let key = if plain {
@@ -2867,6 +2988,7 @@ impl RemoteSpec {
             ))
         };
         let token = crate::tcp_records::random_bytes(16);
+        let sent = std::time::Instant::now();
         let reply = ctl.send_pending(Request::TcpListen {
             key: key.clone(),
             token: token.clone(),
@@ -2885,6 +3007,7 @@ impl RemoteSpec {
             token,
             congestion_control: congestion_control.map(str::to_owned),
             reply: TcpListenReply::Pending(reply),
+            sent,
         })
     }
 
@@ -2900,12 +3023,15 @@ impl RemoteSpec {
             token,
             congestion_control,
             reply,
+            sent,
         } = requested;
         let reply = match reply {
             TcpListenReply::Reverse(pending) => return Ok(pending),
             TcpListenReply::Pending(reply) => reply,
         };
-        let (port, advertised, remote_congestion_control) = match ctl.take_reply(reply)? {
+        let (reply, arrived) = ctl.take_reply_with_arrival(reply)?;
+        let wait = tcp_probe_wait(Some(arrived.saturating_duration_since(sent)));
+        let (port, advertised, remote_congestion_control) = match reply {
             Response::TcpCongestionRejected(error) => return Err(TcpCongestionError(error).into()),
             response => match ok(response, "tcp listen")? {
                 Response::TcpListening {
@@ -2921,7 +3047,7 @@ impl RemoteSpec {
         let probe = std::thread::Builder::new()
             .spawn(move || {
                 let start = std::time::Instant::now();
-                let result = spec.probe_tcp_addresses(advertised, port);
+                let result = spec.probe_tcp_addresses(advertised, port, wait);
                 spec.diagnostics.lock().unwrap().tcp_probe_time =
                     Some((start, std::time::Instant::now()));
                 result
@@ -2944,7 +3070,8 @@ impl RemoteSpec {
         &self,
         advertised: Vec<(String, u32)>,
         port: u16,
-    ) -> Result<Vec<TcpCandidate>> {
+        wait: std::time::Duration,
+    ) -> Result<ProbedRoutes> {
         if advertised.len() > MAX_ADVERTISED_TCP_ADDRESSES {
             bail!(
                 "TCP listener advertised too many addresses (limit {MAX_ADVERTISED_TCP_ADDRESSES})"
@@ -2986,8 +3113,11 @@ impl RemoteSpec {
                 );
             }
         }
-        probe_reachable(&mut candidates, port)?;
-        Ok(candidates)
+        let unanswered = probe_reachable(&mut candidates, port, wait)?;
+        Ok(ProbedRoutes {
+            candidates,
+            unanswered_after: unanswered.then_some(wait),
+        })
     }
 
     fn finish_tcp_setup_inner(&self, pending: PendingTcpSetup) -> Result<()> {
@@ -3001,7 +3131,10 @@ impl RemoteSpec {
             remote_congestion_control,
             probe,
         } = pending;
-        let candidates = probe
+        let ProbedRoutes {
+            candidates,
+            unanswered_after,
+        } = probe
             .join()
             .map_err(|_| anyhow!("TCP route probe thread panicked"))??;
         let candidates = select_tcp_candidates(candidates);
@@ -3017,7 +3150,7 @@ impl RemoteSpec {
             .map(|candidate| candidate.address.clone())
             .collect();
         if addrs.is_empty() {
-            bail!("no advertised data address is reachable");
+            return Err(NoTcpRoute { unanswered_after }.into());
         }
         if crate::output::debug() {
             crate::output::diagnostic!(
@@ -3249,12 +3382,27 @@ pub(crate) fn select_tcp_candidates(mut candidates: Vec<TcpCandidate>) -> Vec<Tc
     candidates
 }
 
-/// Concurrently probe which (addr, speed) entries accept a TCP connection on
-/// `port`, preserving the server's priority order. Used once per endpoint.
 const MAX_ADVERTISED_TCP_ADDRESSES: usize = 64;
 const MAX_RESOLVED_TCP_ADDRESSES: usize = 128;
 
-fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) -> Result<()> {
+/// How one connection attempt ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeAnswer {
+    Accepted,
+    /// Refused, unreachable, or another error that came back.
+    Failed,
+    /// Nothing came back before the wait ended.
+    NoAnswer,
+}
+
+/// Concurrently probe which (addr, speed) entries accept a TCP connection on
+/// `port` within `wait`, preserving the server's priority order. Used once per
+/// endpoint. Returns whether some address gave no answer at all.
+fn probe_reachable(
+    candidates: &mut [TcpCandidate],
+    port: u16,
+    wait: std::time::Duration,
+) -> Result<bool> {
     // One extra candidate is the coordinator's SSH target.
     if candidates.len() > MAX_ADVERTISED_TCP_ADDRESSES + 1 {
         bail!("too many TCP probe candidates");
@@ -3314,28 +3462,33 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) -> Result<()> {
         }
     }
 
-    let timeout = std::time::Duration::from_millis(1000);
     let (tx, rx) = std::sync::mpsc::channel();
     for (t, (addr, _)) in targets.iter().enumerate() {
         let tx = tx.clone();
         let addr = *addr;
         std::thread::Builder::new()
             .spawn(move || {
-                let _ = tx.send((t, TcpStream::connect_timeout(&addr, timeout).is_ok()));
+                let answer = match TcpStream::connect_timeout(&addr, wait) {
+                    Ok(_) => ProbeAnswer::Accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                        ProbeAnswer::NoAnswer
+                    }
+                    Err(_) => ProbeAnswer::Failed,
+                };
+                let _ = tx.send((t, answer));
             })
             .map_err(crate::resources::allocation_error)
             .context("start TCP address probe")?;
     }
     drop(tx);
 
-    collect_probe_results(
+    Ok(collect_probe_results(
         candidates,
         &targets,
         remaining,
         rx,
-        std::time::Instant::now() + timeout + std::time::Duration::from_millis(100),
-    );
-    Ok(())
+        std::time::Instant::now() + wait + TCP_PROBE_COLLECTION,
+    ))
 }
 
 /// Note which advertised addresses the SSH target name resolved to, and
@@ -3364,13 +3517,16 @@ fn mark_ssh_target_addresses(candidates: &mut [TcpCandidate], resolved: &[Vec<So
             .all(|address| advertised.contains(address));
 }
 
+/// Record the probes' answers until route selection is settled or the
+/// deadline passes. Returns whether some address gave no answer.
 fn collect_probe_results(
     candidates: &mut [TcpCandidate],
     targets: &[(SocketAddr, Vec<usize>)],
     mut remaining: Vec<usize>,
-    rx: std::sync::mpsc::Receiver<(usize, bool)>,
+    rx: std::sync::mpsc::Receiver<(usize, ProbeAnswer)>,
     deadline: std::time::Instant,
-) {
+) -> bool {
+    let mut unanswered = false;
     let unknown_speeds = candidates.iter().all(|candidate| candidate.speed_mbps == 0);
     let mut undetermined = remaining.iter().filter(|&&count| count > 0).count();
     for (candidate, count) in candidates.iter_mut().zip(&remaining) {
@@ -3407,11 +3563,19 @@ fn collect_probe_results(
             break;
         }
         let Some(wait) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            unanswered = true;
             break;
         };
-        let Ok((t, reachable)) = rx.recv_timeout(wait) else {
-            break;
+        let (t, answer) = match rx.recv_timeout(wait) {
+            Ok(received) => received,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                unanswered = true;
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        unanswered |= answer == ProbeAnswer::NoAnswer;
+        let reachable = answer == ProbeAnswer::Accepted;
         for &i in &targets[t].1 {
             if candidates[i].reachable.is_some() {
                 continue;
@@ -3423,6 +3587,7 @@ fn collect_probe_results(
             }
         }
     }
+    unanswered
 }
 
 fn validate_advertised_tcp_port(port: u16, requested: (u16, u16)) -> Result<()> {

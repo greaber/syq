@@ -142,7 +142,7 @@ def direct():
             changed = sorted(r["dst"]["value"] for r in records if r["type"] == "operation_result" and r["disposition"] == "succeeded")
             assert changed == ["directory", "link", "nested", "nested/renamed"] or changed == ["directory", "link", "nested/renamed"], (name, changed)
             if name == "fallback":
-                assert b"data over ssh" in result.stderr, result.stderr
+                assert result.stderr.count(b"sending file data over SSH instead") == 1, result.stderr
             ssh("destination", f"from pathlib import Path; p=Path({destination!r}); assert (p/'nested'/'renamed').read_bytes()==b'mapped contents'; assert (p/'link').is_symlink(); assert (p/'nested').stat().st_mode & 0o777 == 0o755; assert (p/'directory').is_dir(); assert not (p/'directory'/'unselected').exists()")
         print("mapping destination metadata: ordinary and signed SSH", flush=True)
         selected = json.loads(manifest([("file", "file", "file")]))

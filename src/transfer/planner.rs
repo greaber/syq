@@ -1982,6 +1982,7 @@ impl Planner<'_> {
                 if ff != 0 || opts.inode_metadata_differs(&dst_rel, &e, d) {
                     self.progress.files_unchanged.fetch_add(1, Relaxed);
                     self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
+                    self.progress.add_unchanged_file_bytes(e.size);
                     if opts.dry_run {
                         self.dry_run_changes.metadata_files += 1;
                         self.emit_trace(
@@ -2027,6 +2028,7 @@ impl Planner<'_> {
             }
             self.progress.files_unchanged.fetch_add(1, Relaxed);
             self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
+            self.progress.add_unchanged_file_bytes(e.size);
         } else if opts.dry_run
             && opts.previews_by_comparing()
             && dst_entry

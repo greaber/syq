@@ -275,15 +275,18 @@ carry the same object, with measurements advancing while that work runs:
 | Field | What it measures |
 |---|---|
 | `total_ms` | The coordinator's measured run, including helper installation, setup, planning, transfer, and finalization |
-| `setup_ms` | Preparing endpoints, establishing control and worker connections (including connections added during copying), and choosing the data transport; excludes helper installation |
+| `setup_ms` | Preparing endpoints, establishing control and worker connections, and choosing the data transport, including the TCP route check; excludes helper installation. It also counts data connections the copy adds while files are already copying, so it can approach `total_ms` |
 | `planning_ms` | Discovering source entries, inspecting destinations, deciding what to copy, and preparing the work, including directories created during planning |
 | `transfer_ms` | From the first selected file operation to the last completed file operation, including reads, hashing, writes, per-file metadata, waits, and retries |
 | `finalization_ms` | Work after file workers finish: remaining hardlinks, pruning, and directory metadata |
 | `helper_install_ms` | Installing matching helpers and remote syq commands, including the installation's platform probe |
 
 Setup and planning count the time spent in those activities, counting concurrent
-work of the same kind once. Transfer is one span across workers, including gaps.
-Total also includes coordinator bookkeeping between measured activities.
+work of the same kind once. The `timing:` line under a copy's summary shows
+setup only until file work begins, so connections added while copying do not
+count there; `setup_ms` keeps them. Transfer is one span across workers,
+including gaps. Total also includes coordinator bookkeeping between measured
+activities.
 These measurements can overlap; they are not numbers to add together. For example,
 copying can begin while planning continues. Installation on two hosts also counts
 once where it overlaps.
@@ -304,7 +307,13 @@ A copy with no selected file work reports zero transfer time.
 
 Copy totals include transferred/unchanged files, excluded entries, created directories,
 symlinks and specials, transferred/unchanged bytes, and on pruning runs
-`deletions_planned`, `deletions_completed`, and `deletions_blocked`. With
+`deletions_planned`, `deletions_completed`, and `deletions_blocked`.
+`bytes_transferred` counts the file data syq copied. `bytes_unchanged` counts
+data it did not need to copy because the destination already had it: the whole
+size of each unchanged file, plus the parts of transferred files it reused, such
+as matching blocks or a partial file left by an interrupted copy. So
+`bytes_unchanged` can be nonzero while `files_unchanged` is zero. The summary
+line shows the reused part with the transferred files. With
 `--in-place=update`, `replaced_not_in_place` counts the existing files syq
 replaced instead of updating them in place, by reason: `other_names`,
 `untrusted_filesystem`, `owner`, `privileges`, `wider_permissions` and
