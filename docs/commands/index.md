@@ -39,7 +39,7 @@ syq --self-update
 
 | Argument / option | Meaning |
 |---|---|
-| `--version-is <EXPR>` | Stop with an error, before doing anything else, unless this syq release matches EXPR. Bare x.y.z means exactly that version; operators: == != < <= > >=. Commas mean AND; \| means OR, with AND binding more tightly. Quote expressions in the shell. Development builds always fail the check. Put --version-is and --use-version before the command, in either order. |
+| `--version-is <EXPR>` | Stop with an error, before doing anything else, unless the syq you invoked matches EXPR. Bare x.y.z means exactly that version; operators: == != < <= > >=. Commas mean AND; \| means OR, with AND binding more tightly. Quote expressions in the shell. Development builds always fail the check. Put --version-is and --use-version before the command, in either order. |
 | `--use-version <VERSION>` | Run an exact official release, downloading it if needed (before the command and other options) |
 | `--self-update` | Install the newest signed release (standalone installs); Homebrew: brew upgrade syq |
 

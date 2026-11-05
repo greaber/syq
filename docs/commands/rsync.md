@@ -75,9 +75,9 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | `-z, --compress` | Compress remote data in transit automatically (default) |
 | `--no-compress` | Disable transport compression |
 | `-e, --rsh <COMMAND>` | Remote shell command (default: ssh); when set, it controls SSH options and agent forwarding |
-| `--syq-auth-from <auto\|ssh\|@NAME\|HOST>` | Whose SSH access to use: auto, ssh (only this machine's own), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST). When omitted, use SYQ_AUTH_FROM, then the saved choice, then auto |
-| `--rsync-path <PATH>` | Run the syq at PATH on the remote machine instead of the matching copy syq installs automatically |
-| `--syq-no-bootstrap` | Syq extension: run syq from the remote machine's PATH instead of the matching copy syq installs automatically |
+| `--syq-auth-from <auto\|ssh\|@NAME\|HOST>` | Whose SSH access to use: this machine's own (auto or ssh), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST). When omitted, use SYQ_AUTH_FROM, then the saved choice, then auto |
+| `--rsync-path <PATH>` | Run the remote syq at PATH instead of syq's automatically installed copy |
+| `--syq-no-bootstrap` | Syq extension: run the syq found in the remote $PATH instead of syq's automatically installed copy |
 | `--syq-no-tcp-encryption` | Syq extension: send TCP data without encryption or authentication; use only on trusted networks |
 | `--syq-no-tcp` | Syq extension: send all data over ssh instead of separate TCP data connections |
 | `--syq-tcp-ports <LO-HI>` | Syq extension: port range the remote listens on for TCP data connections<br><br>[default: 47600-47699] |

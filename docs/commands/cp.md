@@ -101,19 +101,19 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | Argument / option | Meaning |
 |---|---|
 | `--no-compress` | Disable transport compression |
-| `--receiver-max-entries <N>` | For restricted copying between two servers (see syq receiver), refuse a copy that would change more than N entries on the destination |
-| `--receiver-max-bytes <SIZE>` | For restricted copying between two servers (see syq receiver), refuse a copy that would write more than SIZE bytes of file data |
-| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Whose SSH access to use for servers (default: SYQ_AUTH_FROM, then the saved choice, then auto):<br>- auto: this machine's own; if a copy to or from one server can't log in that way, a receiving machine can approve just that copy<br>- ssh: only this machine's own<br>- @NAME: access approved by that receiving machine; also authorizes S3 copies<br>- HOST: access approved by that SSH authorization provider |
+| `--receiver-max-entries <N>` | Between two servers, refuse a restricted copy that would change more than N destination entries |
+| `--receiver-max-bytes <SIZE>` | Between two servers, refuse a restricted copy that would write more than SIZE bytes of file data |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Whose SSH access to use for servers (default: SYQ_AUTH_FROM, then the saved choice, then auto):<br>- auto: this machine's own, else a receiving machine's approval for a copy with one server<br>- ssh: only this machine's own<br>- @NAME: access approved by that receiving machine; also authorizes S3 copies<br>- HOST: access approved by an SSH authorization provider, a server holding your SSH keys |
 | `--coordinate-at <WHERE>` | Choose which machine runs the copy<br><br>Possible values:<br>- auto: This machine, unless both endpoints are remote; then the source<br>- src: The source endpoint<br>- dst: The destination endpoint<br>- local: This machine, relaying the data through it<br><br>[default: auto] |
 | `--rsh <COMMAND>` | Remote shell command (default: ssh); when set, it controls SSH options and agent forwarding |
-| `--syq-path <PATH>` | Run the syq at PATH on the remote machine instead of the matching copy syq installs automatically |
-| `--no-bootstrap` | Run syq from the remote machine's PATH instead of the matching copy syq installs automatically |
+| `--syq-path <PATH>` | Run the remote syq at PATH instead of syq's automatically installed copy |
+| `--no-bootstrap` | Run the syq found in the remote $PATH instead of syq's automatically installed copy |
 | `--no-tcp-encryption` | Send TCP data without encryption or authentication; use only on trusted networks |
 | `--no-tcp` | Send file data through SSH rather than separate TCP data connections |
 | `--tcp-ports <LO-HI>` | Port range that remote machines listen on for TCP data connections<br><br>[default: 47600-47699] |
 | `--tcp-congestion <ALGO>` | Use this congestion-control algorithm for TCP data sockets (Linux only) |
 | `--detach` | Return as soon as the copy starts on the server that runs it; requires --peer-auth own-credentials or --rsh |
-| `--peer-auth <MODE>` | How the server running the copy logs in to the other server; --rsh takes over this choice<br><br>Possible values:<br>- restricted: Reach the other server only through restricted copying (see syq receiver), which accepts just this copy; forwards no agent<br>- broker: Let it use your agent for that host and user, with full access to that account<br>- own-credentials: Forward nothing; it must have its own credentials for the other server<br>- full-agent: Forward your whole SSH agent, as ssh -A does<br><br>[default: restricted] |
+| `--peer-auth <MODE>` | How the server running the copy logs in to the other server; --rsh takes over this choice<br><br>Possible values:<br>- restricted: Let the other server accept only this copy, through restricted copying (see syq receiver); forwards no agent<br>- broker: Let it use your agent for that host and user, with full access to that account<br>- own-credentials: Forward nothing; it must have its own credentials for the other server<br>- full-agent: Forward your whole SSH agent, as ssh -A does<br><br>[default: restricted] |
 | `--pscope <PATH>` | Use the isolated connections and settings that `syq persist on --ephemeral` created at PATH |
 
 ## S3 connection settings

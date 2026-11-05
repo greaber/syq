@@ -337,8 +337,8 @@ pub(crate) fn root() -> Command {
         .arg(Arg::new("version").short('V').long("version").action(ArgAction::Version).help("Print version"))
         .version(crate::identity::version())
         .arg(Arg::new("version_is").long("version-is").value_name("EXPR")
-            .help("Stop unless this syq release matches EXPR (before the command and other options)")
-            .long_help("Stop with an error, before doing anything else, unless this syq release matches EXPR. Bare x.y.z means exactly that version; operators: == != < <= > >=. Commas mean AND; | means OR, with AND binding more tightly. Quote expressions in the shell. Development builds always fail the check. Put --version-is and --use-version before the command, in either order."))
+            .help("Stop unless the syq you invoked matches EXPR (before the command and other options)")
+            .long_help("Stop with an error, before doing anything else, unless the syq you invoked matches EXPR. Bare x.y.z means exactly that version; operators: == != < <= > >=. Commas mean AND; | means OR, with AND binding more tightly. Quote expressions in the shell. Development builds always fail the check. Put --version-is and --use-version before the command, in either order."))
         .arg(Arg::new("use_version").long("use-version").value_name("VERSION")
             .help("Run an exact official release, downloading it if needed (before the command and other options)"))
         .arg(Arg::new("self_update").long("self-update").action(ArgAction::SetTrue)
@@ -389,7 +389,7 @@ pub(crate) fn receiver() -> Command {
     configure(
         Command::new("syq receiver")
             .about("Manage restricted copying on server accounts")
-            .long_about("Manage restricted copying, which lets another server copy files to or from a server account without a login there: this machine authorizes each copy. Each account set up for it is an enrollment.")
+            .long_about("Manage restricted copying, which lets another server copy files into a server account without getting a login there; this machine authorizes each copy. Each account set up for it is an enrollment.")
             .subcommand_required(true)
             .subcommand(
                 Command::new("enroll")

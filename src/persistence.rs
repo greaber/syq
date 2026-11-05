@@ -32,7 +32,7 @@ const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope\n";
 #[command(
     name = "syq persist",
     about = "Keep SSH connections open, and receive files and requests from connected servers",
-    long_about = "Keep SSH connections open for later syq commands, and receive requests from connected servers. syq persist on keeps connections open, and syq persist connect HOST connects now. Receiving lets connected servers send files and requests to this machine, each with your approval by default; configure it with syq persist receive. For an isolated setup, see on --ephemeral and --pscope."
+    long_about = "syq persist on keeps SSH connections open for later syq commands, and syq persist connect HOST connects now. Receiving lets connected servers send files and requests to this machine, each with your approval by default; set it up with syq persist receive. For an isolated setup, see on --ephemeral and --pscope."
 )]
 struct PersistCommand {
     /// Use the isolated connections and settings at PATH instead of the default ones
@@ -50,7 +50,6 @@ enum PersistAction {
     SshConfig(ssh_config::ExportCommand),
     /// Set up receiving, and approve or deny incoming copy and command requests
     Receive(crate::receive_service::ReceiveCommand),
-    /// On a server: list, wait for, or release the receiving names (such as @laptop) that machines registered for this account. --pscope does not separate them
     Destinations(crate::destination::Destinations),
     /// Connect to a server now and keep the connection open for later commands
     Connect {
@@ -75,7 +74,7 @@ enum PersistAction {
         #[arg(long, conflicts_with = "pscope")]
         ephemeral: bool,
     },
-    /// Turn persistence off and close its open SSH connections, including receiving
+    /// Turn persistence off and close its open SSH connections, including receiving; with --pscope, also delete that scope with its settings and remembered permissions
     Off {},
     /// Show connection readiness and any receiving problem
     Status {

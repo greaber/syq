@@ -17,7 +17,7 @@ syq persist [OPTIONS] <COMMAND>
 | [`persist destinations`](#syq-persist-destinations) | On a server, list or release receiving names |
 | [`persist connect`](#syq-persist-connect) | Connect to a server now and keep the connection open for later commands |
 | [`persist on`](#syq-persist-on) | Keep SSH connections open for later syq commands |
-| [`persist off`](#syq-persist-off) | Turn persistence off and close its open SSH connections, including receiving |
+| [`persist off`](#syq-persist-off) | Turn persistence off and close its open SSH connections, including receiving; with |
 | [`persist status`](#syq-persist-status) | Show connection readiness and any receiving problem |
 
 **Options (also available on subcommands)**
@@ -79,7 +79,7 @@ syq persist ssh-config [OPTIONS] <HOST>
 
 | Argument / option | Meaning |
 |---|---|
-| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Which approved connection to export: the one from this receiving machine (@NAME) or SSH authorization provider (HOST), or with auto, the only matching one; omitted uses SYQ_AUTH_FROM, then the saved choice, then auto |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Which approval to export: the one from @NAME or HOST, or with auto, the only one there is (default: SYQ_AUTH_FROM, then the saved choice, then auto; ssh is not accepted) |
 
 <!-- /CLI -->
 

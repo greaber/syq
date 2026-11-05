@@ -504,13 +504,13 @@ pub struct Args {
     /// Remote shell command (default: ssh); when set, it controls SSH options and agent forwarding
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     pub rsh: Option<String>,
-    /// Whose SSH access to use: auto, ssh (only this machine's own), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST). When omitted, use SYQ_AUTH_FROM, then the saved choice, then auto
+    /// Whose SSH access to use: this machine's own (auto or ssh), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST). When omitted, use SYQ_AUTH_FROM, then the saved choice, then auto
     #[arg(long = "syq-auth-from", value_name = "auto|ssh|@NAME|HOST", value_parser = parse_auth_from, default_value = "auto", hide_default_value = true)]
     pub(crate) auth_from: AuthFrom,
-    /// Run the syq at PATH on the remote machine instead of the matching copy syq installs automatically
+    /// Run the remote syq at PATH instead of syq's automatically installed copy
     #[arg(long = "rsync-path", value_name = "PATH")]
     pub syq_path: Option<String>,
-    /// Syq extension: run syq from the remote machine's PATH instead of the matching copy syq installs automatically
+    /// Syq extension: run the syq found in the remote $PATH instead of syq's automatically installed copy
     #[arg(long = "syq-no-bootstrap")]
     pub no_bootstrap: bool,
     /// Syq extension: send TCP data without encryption or authentication; use only on trusted networks
@@ -1420,10 +1420,10 @@ struct NativeCopyOperationalArgs {
     /// Replaced by --in-place=new
     #[arg(long, hide = true)]
     inplace: bool,
-    /// For restricted copying between two servers (see syq receiver), refuse a copy that would change more than N entries on the destination
+    /// Between two servers, refuse a restricted copy that would change more than N destination entries
     #[arg(long, value_name = "N", help_heading = REMOTE_TO_REMOTE_HEADING)]
     receiver_max_entries: Option<u64>,
-    /// For restricted copying between two servers (see syq receiver), refuse a copy that would write more than SIZE bytes of file data
+    /// Between two servers, refuse a restricted copy that would write more than SIZE bytes of file data
     #[arg(long, value_name = "SIZE", help_heading = REMOTE_TO_REMOTE_HEADING)]
     receiver_max_bytes: Option<String>,
 }
@@ -1432,7 +1432,7 @@ struct NativeCopyOperationalArgs {
 /// remote-to-remote copy.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum PeerAuth {
-    /// Reach the other server only through restricted copying (see syq receiver), which accepts just this copy; forwards no agent
+    /// Let the other server accept only this copy, through restricted copying (see syq receiver); forwards no agent
     #[default]
     Restricted,
     /// Let it use your agent for that host and user, with full access to that account
@@ -1447,10 +1447,10 @@ const REMOTE_TO_REMOTE_HEADING: &str = "Remote-to-remote transfers";
 
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteHelperArgs {
-    /// Run the syq at PATH on the remote machine instead of the matching copy syq installs automatically
+    /// Run the remote syq at PATH instead of syq's automatically installed copy
     #[arg(long, value_name = "PATH", conflicts_with = "no_bootstrap")]
     syq_path: Option<String>,
-    /// Run syq from the remote machine's PATH instead of the matching copy syq installs automatically
+    /// Run the syq found in the remote $PATH instead of syq's automatically installed copy
     #[arg(long)]
     no_bootstrap: bool,
 }
@@ -1472,7 +1472,7 @@ pub(crate) fn parse_auth_from(value: &str) -> Result<AuthFrom> {
     }
 }
 
-const AUTH_FROM_COPY_HELP: &str = "Whose SSH access to use for servers (default: SYQ_AUTH_FROM, then the saved choice, then auto):\n- auto: this machine's own; if a copy to or from one server can't log in that way, a receiving machine can approve just that copy\n- ssh: only this machine's own\n- @NAME: access approved by that receiving machine; also authorizes S3 copies\n- HOST: access approved by that SSH authorization provider";
+const AUTH_FROM_COPY_HELP: &str = "Whose SSH access to use for servers (default: SYQ_AUTH_FROM, then the saved choice, then auto):\n- auto: this machine's own, else a receiving machine's approval for a copy with one server\n- ssh: only this machine's own\n- @NAME: access approved by that receiving machine; also authorizes S3 copies\n- HOST: access approved by an SSH authorization provider, a server holding your SSH keys";
 
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteArgs {

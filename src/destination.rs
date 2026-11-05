@@ -136,8 +136,8 @@ enum Approval {
 #[derive(Parser, Debug)]
 #[command(
     name = "destinations",
-    about = "Inspect named destinations available to this server account",
-    long_about = "Inspect named destinations available to this server account. Registrations are shared across persistence domains: --pscope does not filter names, and forgetting an offline name releases it for the whole account."
+    about = "On a server, list, wait for, or release receiving names",
+    long_about = "On a server: list, wait for, or release the receiving names (such as @laptop) that machines registered for this account. Every --pscope sees the same names."
 )]
 pub(crate) struct Destinations {
     #[command(subcommand)]

@@ -22,8 +22,8 @@ syq rm [OPTIONS] --srcs-in DIR
 | Argument / option | Meaning |
 |---|---|
 | `--auth-from <auto\|ssh\|@NAME\|HOST>` | Whose SSH access to use: this machine's own (auto or ssh), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST); @NAME also authorizes S3 removal |
-| `--syq-path <PATH>` | Run the syq at PATH on the remote machine instead of the matching copy syq installs automatically |
-| `--no-bootstrap` | Run syq from the remote machine's PATH instead of the matching copy syq installs automatically |
+| `--syq-path <PATH>` | Run the remote syq at PATH instead of syq's automatically installed copy |
+| `--no-bootstrap` | Run the syq found in the remote $PATH instead of syq's automatically installed copy |
 | `--pscope <PATH>` | Use the isolated connections and settings that `syq persist on --ephemeral` created at PATH |
 
 <a id="copy-policy-and-filtering"></a>
