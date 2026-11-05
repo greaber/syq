@@ -166,12 +166,14 @@ def trace_length():
     return len(trace.read_text().splitlines())
 
 
-def runner_sessions_to_destination(start):
-    # This machine's SSH connections to the destination since `start`,
-    # other than reading its SSH configuration with -G.
+def runner_logins_for_copies(start):
+    # This machine's logins to the destination for a copy since `start`: one
+    # that enrolls it, or one that runs a receiver here. Its session pool also
+    # connects to the destination in the background, which does not count.
     return [event for event in trace_events(trace.read_text())[start:]
             if event["phase"] == "start" and event["host"].rsplit("@", 1)[-1] == "destination"
-            and event.get("query") != "yes"]
+            and event.get("query") != "yes"
+            and (event.get("enrollment") == "yes" or event["return_receiver"] == "yes")]
 
 
 def alive(pid):
@@ -286,7 +288,7 @@ for option, name in [("--auth-from", "selected")]:
     copy("/tmp/syq-real-ssh/forward/" + name, auth=(option, "auto"))
     # With the destination enrolled, the runner only signs: the server
     # connects to the destination itself, and nothing goes through here.
-    assert runner_sessions_to_destination(start) == [], "the runner logged in to the destination"
+    assert runner_logins_for_copies(start) == [], "the runner logged in to the destination"
     assert remote("sha256sum /tmp/syq-real-ssh/forward/" + name).split()[0] == expected
 
 print("case: another source build hands off automatic and explicit authorization", flush=True)
