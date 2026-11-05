@@ -3,8 +3,8 @@
 # Use your laptop from a server
 
 Receiving lets you work in a server's shell and still use your laptop: copy
-files to it, run commands on it, and let the server use its SSH or storage
-credentials with your approval. It runs over a
+files to it, run commands on it, and let the server use your laptop's SSH or
+storage credentials with your approval. It runs over a
 [persistent connection](persistence.md) that your laptop opens, so your laptop
 needs no SSH server, public address, or incoming network port.
 
@@ -42,9 +42,11 @@ receiving name: your laptop's short hostname, unless you choose another with
 and make requests from any shell on the server, including an existing tmux
 session.
 
-Logging in with `ssh server` doesn't start receiving, so after a reboot, start
-it again with `syq persist connect server` on your laptop. To allow several
-servers, repeat `--connection`; a new list replaces the saved one. See
+The server's SSH server must allow remote forwarding; see
+[Setup and recovery](persistence-reference.md#setup-and-recovery). Receiving
+doesn't survive a reboot, and logging in with `ssh server` doesn't restart it;
+run `syq persist connect server` on your laptop. To allow several servers,
+repeat `--connection`; a new list replaces the saved one. See
 [Names and profiles](persistence-reference.md#names-and-profiles) to use
 separate names and settings for different projects.
 
@@ -60,9 +62,10 @@ syq cp results --to @laptop
 syq cp report.pdf --to @laptop --as reports/latest.pdf
 ```
 
-Write the `@`: without it, `--to laptop` names an SSH server. Files go to your
-home directory on the laptop, or to a path you give with `--into` or `--as`,
-which can be relative to your home directory or absolute.
+Write the `@`: without it, `--to laptop` names an SSH server. Files go to the
+profile's starting directory (your home directory unless you set `--cwd`,
+`--root` or `--auto-approve-root`), or to a path you give with `--into` or
+`--as`, relative to that directory or absolute.
 
 Each copy waits for approval **on your laptop**. The prompt shows the server,
 what is copied where, and a warning for each option that lets the server do
@@ -89,12 +92,14 @@ optional settings with `syq persist receive on` on your laptop:
 - `--cwd DIR` changes where downloads start, and `--root DIR` confines them to
   a directory; see [Directories](persistence-reference.md#directories).
 - `--auto-approve-root DIR` lets downloads into that directory skip approval.
-  This trusts every process running as the server account to write there,
-  including overwriting files; see [Receivers](security.md#receivers).
+  This trusts every process running as any server account the profile
+  allows to write there, including overwriting files; see
+  [Receivers](security.md#receivers).
 - `--notify off` turns off desktop prompts, so you approve only in a terminal.
 
 Changing any of these except `--notify` cancels active copies, commands and
-pending requests.
+pending requests. Copies you approved between two servers keep running; see
+[Copying between servers](security.md#copying-between-servers) to stop them.
 
 ## Run commands on your laptop
 
@@ -153,16 +158,9 @@ Keep the laptop connection open while you work.
 
 Later commands reuse the approval, including copies with `--auth-from @laptop`.
 To make your laptop the default on hostA, run `syq persist auth-from @laptop`.
-To use other SSH tools through the approved connection:
-
-```sh
-syq persist ssh-config hostB > hostB.ssh
-scp -F hostB.ssh report hostB:report
-```
-
 See [Account access](persistence-reference.md#account-access) for how long
-approval lasts, and [`syq ssh`](commands/ssh.md) for terminals and exit
-status.
+approval lasts and how to use other SSH tools through the approved connection,
+and [`syq ssh`](commands/ssh.md) for terminals and exit status.
 
 ## Use an SSH authorization provider
 

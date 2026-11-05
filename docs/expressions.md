@@ -121,9 +121,10 @@ need a string escape, as in the JPEG example above.
 Types must agree: compare a size with `10B`, not `10` or `"10B"`. Subtracting
 timestamps gives a duration, and adding a duration to a timestamp shifts it.
 Arithmetic and bitwise operators bind most tightly, then comparisons, then
-`not`, `and` and `or`; use parentheses to group conditions otherwise. `and`,
-`or`, `if` and `coalesce` evaluate only what they need, so put an availability
-check before a condition that needs the value.
+`not`, then `and`, then `or`; use parentheses to group conditions otherwise.
+`and` and `or` evaluate left to right and stop once the result is known, and
+`if` and `coalesce` evaluate only the branch they need, so put an availability
+check first.
 
 Expressions can't run commands, read other files, or look at other entries.
 To select using external data, generate a [mapping](mappings.md) with a

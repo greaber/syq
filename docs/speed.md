@@ -27,11 +27,12 @@ short to measure sustained speed, choose a larger workload.
 
 <a id="what-the-comparison-measures"></a>
 
-To compare tools, use the main table. It times each whole command, including
-connection startup, copying into an empty destination. Network results show
-average MB/s; local results show seconds, because filesystem cloning can avoid
-moving the bytes at all. The syq timing breakdown below it leaves setup out of
-its copying rate, so don't compare that rate with another tool's.
+The script prints a comparison table and, below it, a syq timing breakdown.
+Use the comparison table to compare tools: it times each whole command,
+including connection startup, copying into an empty destination. Network
+results show average MB/s; local results show seconds, because filesystem
+cloning can avoid moving the bytes at all. The timing breakdown leaves setup
+out of its copying rate, so don't compare that rate with another tool's.
 
 Network tests turn off SSH connection reuse for both tools. The script doesn't
 flush caches or wait for data to reach the disk, so local times don't measure

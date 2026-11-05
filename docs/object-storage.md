@@ -115,8 +115,7 @@ Updating anything but tags rewrites the object within S3: it gets a new
 Last-Modified time, and a new version in a versioned bucket. It keeps its
 storage class and encryption settings unless `--s3-header` or
 `--s3-write-header` overrides them, but loses its ACLs, Object Lock settings,
-and custom KMS encryption contexts. A provider without tag support may drop
-tags from new copies.
+and custom KMS encryption contexts.
 
 New uploads and bucket copies use the provider's storage and encryption
 defaults unless overridden with `--s3-write-header` or, for bucket copies,

@@ -73,7 +73,8 @@ syq receiver revoke ID
 
 Use the ID from `list`. Revoking stops active copies for that enrollment and
 removes its access; completed writes remain. See
-[Enrollment](remote-reference.md#enrollment) for which keys can sign.
+[Enrollment](remote-reference.md#enrollment) for which keys can sign and what
+to do when you change keys.
 
 If your machine cannot reach hostB, a copy tries again through hostA; for
 `enroll` or `revoke`, add `--via hostA`.

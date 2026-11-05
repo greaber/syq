@@ -152,15 +152,17 @@ update only older ones, choose another policy with `--if-exists`:
 A file counts as unchanged when its size and modification time match, unless
 you add [`--hash`](#check-file-contents). `error-if-different` compares
 contents before rejecting a file whose time differs, so it accepts identical
-files. A file rejected for its contents keeps its metadata too. `--as-new` and
+files (between S3 buckets it compares metadata instead; see
+[Copies between S3 buckets](object-storage.md#copies-between-s3-buckets)). A
+file rejected for its contents keeps its metadata too. `--as-new` and
 `--into-new` check only the destination you name; `--if-exists` applies to
 every entry the copy writes.
 
 `keep`, `error`, `error-if-different` and `--as-new` also keep a file that
 another program creates at the same name during the copy. A file created just
 before syq moves its copy into place can still be replaced under `keep` on
-filesystems such as NFS, and under all of them on FAT and exFAT on macOS and
-on rclone mounts.
+filesystems without an atomic no-replace rename, such as NFS, and under all of
+them on FAT and exFAT on macOS and on rclone mounts.
 
 See [Update policies](commands/cp.md#update-policies) for supported
 combinations.
@@ -228,14 +230,14 @@ syq cp --prune --srcs-in build --into backup
 ```
 
 To free space first, use `--prune-before`. It removes extras after syq has
-listed the source but before copying, so a failed copy doesn't bring them
-back. See [Pruning](commands/cp.md#pruning) for restrictions and files kept
+listed the source but before copying. If the copy then fails, the extras stay
+deleted. `--max-delete` applies as with `--prune`. See [Pruning](commands/cp.md#pruning) for restrictions and files kept
 for recovery.
 
 ## Select files by metadata
 
-Use `--where` to select source entries, and `--copy-if` to decide which
-existing destination files may be updated:
+Use `--where` to select source entries, and `--copy-if` to decide, for each
+entry, whether the copy may create or update its destination:
 
 ```sh
 syq cp --srcs-in project --into backup \
@@ -280,14 +282,16 @@ syq cp --ignore 'logs/*' --ignore '!logs/keep/' --srcs-in project --into backup
 
 ## Resume an interrupted copy
 
-Rerun the same command. Syq reuses completed files and the matching parts of
-interrupted ones.
+Rerun the same command. Syq reuses completed files and, where it kept them,
+the matching parts of interrupted ones.
 
 The rerun applies the same placement and `--if-exists` checks, so a `-new`
 placement or `--if-exists=error` refuses entries the first run created, and
 `error-if-different` refuses files that differ, because it can't tell a partly
-written file from one it must leave alone. Rerun with `--if-exists=update` to
-finish such a copy. Directories the first run created can keep temporary
+written file from one it must leave alone. To finish such a copy, rerun with
+`--if-exists=update`, which also updates every other differing file the first
+policy protected, or, for a `-new` placement, with `--into` or `--as`.
+Directories the first run created can keep temporary
 permissions; add `--copy-metadata=permissions,mtime` to the rerun to make them
 match the source.
 
@@ -319,9 +323,8 @@ recopies other files whole. With the default strategy, it recopies every file
 in a copy within one machine.
 
 On FAT, which keeps times in two-second steps, times less than two seconds
-apart count as matching. This doesn't apply when syq updates one named file,
-copies with `--existing`, or copies to a server through its
-[enrollment](remote-to-remote.md#first-copy-and-access-management).
+apart count as matching. This doesn't apply when syq updates one named file
+or copies with `--existing`.
 
 To require known contents, give
 [expected hashes in a mapping](integrity-checking.md#expected-hashes). See
@@ -334,11 +337,13 @@ Syq normally writes each file under a temporary name and renames it into place
 when it's complete. Replacing a file this way needs write permission on its
 directory and room for a second copy. Use `--in-place` when that cost matters:
 
-- `--in-place=new` writes new files directly at their final names. Readers
-  can see a file before it's complete, and an interruption leaves it
-  incomplete until a rerun finishes it.
-- `--in-place=update` also writes only the changed parts into existing files,
-  where they are, so a small change to a large file needs no second copy.
+- `--in-place=new` writes new files directly at their final names, which
+  saves a temporary name and a rename for each one; existing files are still
+  replaced as usual. Readers can see a file before it's complete, and an
+  interruption leaves it incomplete until a rerun finishes it.
+- `--in-place=update` also updates existing files where they are, writing
+  only the changed parts, so a small change to a large file needs no second
+  copy.
   Anyone who has the file open, or opens it during the copy, can read the new
   contents, and an interruption leaves a mix of old and new contents until a
   rerun finishes it. Nothing else should write to the file during the copy.
@@ -348,13 +353,15 @@ directory and room for a second copy. Use `--in-place` when that cost matters:
 syq cp --in-place=update disk.img --to server --into /vm
 ```
 
-Syq writes into an existing file only when that can't give anyone access the
-copy wouldn't. It replaces other files as usual, such as a file with other
-hard links or another owner, or one on a filesystem
+Syq writes into an existing file only when doing so gives nobody access to
+the new contents that an ordinary copy wouldn't. It replaces other files as
+usual, such as a file with other hard links or another owner, or one on a
+filesystem
 [where syq can't tell whether it has other names](#how-syq-changes-existing-files-and-directories);
 the summary says how many and why. Until the copy succeeds, files written in
 place stay writable by their owner, and some are readable only by their
-owner; an interrupted copy can leave them that way. See
+owner; an interrupted copy can leave them that way, and a rerun fixes this
+only with `--copy-metadata=permissions`. See
 [Update policies](commands/cp.md#update-policies) before combining in-place
 writes with other policies.
 
@@ -383,8 +390,9 @@ syq cp --copy-metadata=permissions,ownership project --into backup
 | `--copy-metadata=hardlinks` | `-H` (regular files) |
 | `--copy-metadata=acls` | `-A` (native ACLs; implies permissions) |
 | `--copy-metadata=xattrs` | `-X` (extended attributes) |
-| `--copy-metadata=atimes` | `-U` (access times) |
+| `--copy-metadata=atimes` | `-U` (access times; Linux 5.8 or later) |
 | `--copy-metadata=crtimes` | `-N` (birth times; macOS destination) |
+| `--open-noatime` | `--open-noatime` (reading doesn't update source access times); `-UU` selects it with `-U` |
 
 Setting ownership needs suitable privileges on the destination. Hard links,
 ACLs, xattrs, access times and birth times are not part of `syq rsync -a`, and
@@ -393,6 +401,12 @@ filesystem flags such as immutable, or restores ctime or inode numbers. See
 [metadata details](commands/cp.md#metadata-details), and
 [Copies between S3 buckets](object-storage.md#copies-between-s3-buckets) for
 S3 headers, tags and storage class.
+
+<a id="times-and-sparse-files"></a>
+
+`--sparse` (rsync `-S`) turns runs of zeros into holes in local and SSH
+copies. The destination filesystem must support holes, or the copy fails. It
+isn't part of `-a`.
 
 ### Hard links, ACLs, and extended attributes
 
@@ -417,21 +431,11 @@ attributes, and root copies every namespace except `system.*`, including
 `security.selinux` and `security.capability`. Both remove destination entries
 the source lacks, and a failure to read or set them makes the copy fail.
 
-### Times and sparse files
-
-`--copy-metadata=atimes` copies access times; on Linux it needs kernel 5.8 or
-later.
-`--open-noatime` keeps syq's reads from updating source access times, and
-rsync's `-UU` selects both. `--copy-metadata=crtimes` copies birth times to a
-macOS destination.
-
-`--sparse` (rsync `-S`) turns runs of zeros into holes in local and SSH copies,
-on destination filesystems that support them. It isn't part of `-a`.
-
 ### How syq changes existing files and directories
 
-This matters for hard links, ownership, and copy time. When only an existing
-file's metadata differs, syq changes the metadata in place if all of these
+Read this if destination files have other hard links or another owner, or if
+updating only metadata is unexpectedly slow. When only an existing file's
+metadata differs, syq changes the metadata in place if all of these
 hold:
 
 - syq can tell the file has no other names (hard links),
@@ -455,19 +459,10 @@ A directory gets its copied permissions after its contents, so an interrupted
 copy can leave a new directory open only to its owner.
 
 If a directory you own lacks the write or search permission a change needs,
-`syq cp` names the directory and the changes in it fail. `--widen-dirs`
-(`--syq-widen-dirs` for `syq rsync`) lets syq briefly add the missing owner
-permission:
-
-- `none`, the `syq cp` default, never does.
-- `rsync`, the `syq rsync` default, widens the directories the copy fills or
-  prunes, as rsync does, including the destination of a `--srcs-in` copy, but
-  not the directory a named source or an `--as` target goes into.
-- `all` also widens that directory and the directories above it.
-
-Syq restores each directory's exact mode afterwards, even when the copy fails,
-unless you copy permissions; a crash can leave the temporary permissions in
-place. Dry runs never change permissions.
+`syq cp` names it and the changes in it fail;
+[`--widen-dirs`](commands/cp.md#metadata-and-symlinks) lets syq briefly add
+the missing owner permission and restore it afterwards, as `syq rsync` does by
+default.
 
 ## Symlinks
 
