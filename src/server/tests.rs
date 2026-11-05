@@ -1417,3 +1417,50 @@ fn a_receiver_refuses_handed_connections_beyond_its_limit() {
     }
     slot.close();
 }
+
+#[test]
+fn only_a_closed_pipe_after_the_client_left_is_quiet() {
+    use super::{client_gone_result, ClientGone};
+    let broken = || {
+        Err(
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+                .context("send reply"),
+        )
+    };
+    // The client stopped reading, and the failure is that closed pipe.
+    let error = client_gone_result(broken(), true).unwrap_err();
+    assert!(error.is::<ClientGone>(), "{error:#}");
+    // Another failure is reported even after the client left.
+    let error = client_gone_result(Err(anyhow::anyhow!("disk full")), true).unwrap_err();
+    assert!(!error.is::<ClientGone>(), "{error:#}");
+    // A broken pipe the control output did not see is reported too.
+    let error = client_gone_result(broken(), false).unwrap_err();
+    assert!(!error.is::<ClientGone>(), "{error:#}");
+    assert!(client_gone_result(Ok(()), true).is_ok());
+}
+
+#[test]
+fn client_output_notes_only_a_closed_pipe() {
+    use std::io::Write;
+    struct Failing(std::io::ErrorKind);
+    impl Write for Failing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(self.0.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(self.0.into())
+        }
+    }
+    for (kind, noted) in [
+        (std::io::ErrorKind::PermissionDenied, false),
+        (std::io::ErrorKind::BrokenPipe, true),
+    ] {
+        let gone = std::sync::atomic::AtomicBool::new(false);
+        let mut output = super::ClientOutput {
+            inner: Failing(kind),
+            gone: &gone,
+        };
+        assert!(output.write_all(b"reply").is_err());
+        assert_eq!(gone.load(std::sync::atomic::Ordering::Relaxed), noted);
+    }
+}

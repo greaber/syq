@@ -320,9 +320,16 @@ pub fn run(local_receiver: bool) -> Result<()> {
     );
     descriptor_session.close();
     crate::process::termination::wait_if_terminating();
+    client_gone_result(result, client_gone.load(Relaxed))
+}
+
+/// Mark a failure as [`ClientGone`] when the client stopped reading replies
+/// (`gone`) and the failure is that closed pipe. Every other failure, and a
+/// broken pipe on a connection the client still reads, is reported as is.
+fn client_gone_result(result: Result<()>, gone: bool) -> Result<()> {
     match result {
         Err(error)
-            if client_gone.load(Relaxed)
+            if gone
                 && error.chain().any(|cause| {
                     cause
                         .downcast_ref::<io::Error>()
@@ -337,7 +344,7 @@ pub fn run(local_receiver: bool) -> Result<()> {
 
 /// The client closed the control connection before reading every reply,
 /// as a copy does once one endpoint refuses it. The client reports its own
-/// outcome, so the server has nothing to add.
+/// outcome, so the server exits without a message.
 #[derive(Debug)]
 pub(crate) struct ClientGone;
 
@@ -668,6 +675,7 @@ fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Res
             .try_clone_to_owned()
             .context("take the copy's input")?,
     );
+    let client_gone = std::sync::atomic::AtomicBool::new(false);
     let result = serve(
         crate::destination::HandshakeInput::new(
             input,
@@ -675,7 +683,10 @@ fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Res
             RESTRICTED_START_TIMEOUT,
             RESTRICTED_HELLO_TIMEOUT,
         ),
-        io::stdout().lock(),
+        ClientOutput {
+            inner: io::stdout().lock(),
+            gone: &client_gone,
+        },
         true,
         None,
         None,
@@ -696,7 +707,7 @@ fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Res
     descriptor_session.close();
     authority.close_control();
     crate::process::termination::wait_if_terminating();
-    result
+    client_gone_result(result, client_gone.load(Relaxed))
 }
 
 /// A relayed one-copy control. File payload uses direct TCP or SSH workers.

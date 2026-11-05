@@ -291,6 +291,9 @@ fn run() {
         }
         fsops::reserve_startup_descriptors();
         if let Err(error) = server::run_checker(enrollment, generation) {
+            if error.is::<server::ClientGone>() {
+                crate::output::exit(1);
+            }
             let code = if crate::restricted::is_sessions_full(&error) {
                 crate::restricted::SESSIONS_FULL_EXIT
             } else {
