@@ -86,10 +86,7 @@ setting also applies to S3 pruning. Filesystem pruning tunes its own workers.
 ## Remembered connection counts
 
 Syq remembers useful starting worker counts from successful filesystem copies
-and keeps adjusting as the next copy runs. A remembered count is matched to
-the route, filesystems, transport, and copy settings, and is only a starting
-point. On macOS and Linux, remote copies also keep separate counts for each
-local network.
+of the same kind and keeps adjusting as the next copy runs.
 
 `--performance-tuning workers=N` bypasses the remembered count, and
 `--resource-limits workers=N` caps it. Set `SYQ_TUNING_CACHE` to an empty value
@@ -148,7 +145,7 @@ syq cp --srcs-in source --into destination \
 
 Block reuse saves network traffic, but the destination still writes a complete
 new file unless its filesystem supports reflinks. Comparison can use up to
-64 MiB of destination buffers per worker, so more workers use more memory.
+64 MiB of memory per worker.
 
 ### Scattered edits in existing files
 

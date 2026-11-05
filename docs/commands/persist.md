@@ -62,7 +62,7 @@ syq persist auth-from [OPTIONS] [auto|ssh|@NAME|HOST]
 ## syq persist ssh-config
 
 Export an existing [approved account connection](../persistence-reference.md#approved-account-connections)
-for native SSH tools. Save the output to a file and pass it through `-F`.
+as an OpenSSH configuration for `ssh -F FILE` and other SSH tools.
 
 <!-- CLI: persist ssh-config -->
 ```text
@@ -186,10 +186,9 @@ syq persist receive permissions [OPTIONS] <COMMAND>
 
 ## syq persist receive permissions list
 
-Show remembered account permissions, both for servers connected to this
-machine and for logins through it as an SSH authorization provider, including
-each destination's trusted name and connection route. Use `--json`
-for [structured permission records](../automation.md#remembered-account-permissions).
+Show remembered account permissions, including those for logins through this
+machine as an SSH authorization provider. Use `--json` for
+[structured permission records](../automation.md#remembered-account-permissions).
 
 <!-- CLI: persist receive permissions list -->
 ```text
@@ -333,7 +332,7 @@ syq persist receive wait [OPTIONS] <HOST>
 
 Receiving names are shared by this OS account across persistence domains.
 `--pscope` does not filter this registry; forgetting an offline name releases it
-for every domain. See [shared names](../persistence-reference.md#isolated-script-scopes).
+for every domain.
 
 <!-- CLI: persist destinations -->
 ```text
@@ -449,10 +448,8 @@ syq persist off [OPTIONS]
 ## syq persist status
 
 Show connections without starting them. `--json` prints the
-[connection-status contract](../automation.md#connection-status), with the
-[approved account](../persistence-reference.md#approved-account-connections)
-fields. If some approved-account records cannot be read, status still shows the
-healthy connections, reports the errors, and exits nonzero.
+[connection-status contract](../automation.md#connection-status), including
+[approved account connections](../persistence-reference.md#approved-account-connections).
 
 <!-- CLI: persist status -->
 ```text

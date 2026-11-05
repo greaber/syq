@@ -26,19 +26,14 @@ an SSH key. The receiver does not run as root or with root's capabilities, so
 enroll an ordinary account. The server needs OpenSSH 7.2 or newer and a
 writable `~/.ssh/authorized_keys`; syq checks both before installing anything.
 
-Setup installs three things on the server:
-
-- One line in `~/.ssh/authorized_keys`. Its key, the entry key, can only start
-  syq's receiver. The line's comment names the login key the receiver trusts:
-  `syq-enrollment:ID signer TYPE KEY`.
-- The receiver: this build of syq, at `~/.local/lib/syq/RELEASE/PLATFORM/syq`.
-- Private state in `~/.local/share/syq/enrollments/ID`: the login key the
-  receiver trusts, the record of authorizations already used, and the
-  server's key for signing its reports.
-
-Your machine keeps the entry key and its own record in
-`~/.local/state/syq/enrollments/ID`. Manage that state with `syq receiver`
-commands; it is not a disposable cache.
+Setup adds one line to the server's `~/.ssh/authorized_keys`. Its key, the
+entry key, can only start syq's receiver, and its comment,
+`syq-enrollment:ID signer TYPE KEY`, names the login key the receiver trusts.
+Setup also installs this build of syq at
+`~/.local/lib/syq/RELEASE/PLATFORM/syq` and keeps private state in
+`~/.local/share/syq/enrollments/ID`. Your machine keeps the entry key and its
+own record in `~/.local/state/syq/enrollments/ID`. Manage this state with
+`syq receiver` commands; it is not a disposable cache.
 
 Copies cannot write the receiver's protected paths: the account's `~/.ssh`,
 syq's stored programs (including all of `~/.local/libexec`), enrollment state
@@ -53,29 +48,22 @@ Copying named files or directories into such a directory is fine.
 ### Which key signs
 
 The key you log in with during setup signs each copy's authorization, on your
-machine. Syq signs through your SSH agent (the one your SSH configuration's
-`IdentityAgent` selects for the server, else `SSH_AUTH_SOCK`), or reads the
-key's file when it is not passphrase-protected. Syq never asks for a
-passphrase: load passphrase-protected keys, FIDO keys, and PKCS#11 or PIV keys
-into your agent. Setup checks that the key can sign before installing
-anything. It refuses a key added with `ssh-add -h`, which signs only logins,
-and an RSA key with fewer than 2048 or more than 16384 bits.
+machine, through your SSH agent (the one your SSH configuration's
+`IdentityAgent` selects for the server, else `SSH_AUTH_SOCK`) or from a key
+file without a passphrase. Syq never asks for a passphrase, so load
+passphrase-protected, FIDO, and PKCS#11 or PIV keys into your agent. Setup
+refuses a key added with `ssh-add -h`, which can sign only logins.
 
 - **FIDO keys** need one touch for each copy, and about three for a copy that
   sets up or refreshes restricted copying. The receiver requires a touch and
-  a PIN exactly when your login would, as sshd decides from your
-  `authorized_keys` line (`no-touch-required`, `verify-required`) and any
-  certificate. A certificate whose authority the server trusts through
-  `TrustedUserCAKeys` always needs a touch. A PIN needs an `SSH_ASKPASS`
-  program the agent can run; the agent cannot use syq's terminal.
-- **Certificates:** the certificate's key signs, and the receiver stops
-  accepting copies when the certificate expires. The next copy after that
-  logs in again and records the new certificate's expiry.
+  a PIN whenever your login would. A PIN needs an `SSH_ASKPASS` program the
+  agent can run.
+- **Certificates:** the receiver stops accepting copies when the certificate
+  expires; the next copy logs in again and records the new certificate.
 - **Other logins** cannot set up restricted copying: passwords,
   keyboard-interactive, Kerberos, host-based, and logins that need a second
-  factor, which a key alone would bypass. Use
-  [account access](persistence-reference.md#approved-account-connections) with `--auth-from @NAME`
-  instead.
+  factor. Use [account access](persistence-reference.md#account-access) with
+  `--auth-from @NAME` instead.
 
 ### Changing keys and updating syq
 
@@ -94,35 +82,20 @@ To end an enrollment, run `syq receiver revoke ID`, or remove every
 comment.
 
 After you change syq builds, the next copy logs in once to install the
-matching receiver and rewrite syq's line. Releases stay
-in `~/.local/lib/syq` until you delete them. Delete a release's directory only
-when no syq line in `authorized_keys` names it.
-
-If the server loses an enrollment's state, its receiver refuses every copy,
-and `syq receiver enroll` sets up a new enrollment in its place. If only the
-record of authorizations already used is lost or unusable, for example with
-another owner or mode after a restore from a backup, `syq receiver enroll`
-recreates it, and authorizations signed before then are refused.
+matching receiver.
 
 ### Enrollments from older versions
 
 Syq 0.7.1 and earlier made one enrollment per destination directory. This
-version does not use, list, or revoke them; the first copy to the account
-sets up a new enrollment beside them. Until you remove them, an older syq can
-keep copying through them. When the account you run `syq receiver list` in
-still holds their files, it prints a notice that points here.
-
-To remove them, revoke them with the older version before upgrading, or
-delete them by hand:
+version does not use, list, or revoke them, and sets up a new enrollment on
+the first copy; until you remove the old ones, an older syq can keep copying
+through them. Revoke them with the older version before upgrading, or delete
+them by hand:
 
 - On the server, delete each line in `~/.ssh/authorized_keys` whose command
-  runs `~/.local/libexec/syq-receiver`, written with your home directory's
-  full path. Keep the lines whose command runs syq from `~/.local/lib/syq`:
-  those whose comments start with `syq-enrollment:`, like the old ones, belong
-  to this version's enrollments, and those whose comments start with
-  `syq-copy-worker-` belong to copies through approved account connections
-  (see [below](#limits-and-unsupported-options)). Then delete the directory
-  `~/.local/share/syq/restricted` and the file `~/.local/libexec/syq-receiver`.
+  runs `~/.local/libexec/syq-receiver` (keep those that run syq from
+  `~/.local/lib/syq`), then the directory `~/.local/share/syq/restricted` and
+  the file `~/.local/libexec/syq-receiver`.
 - On your machine, delete the directory `~/.local/state/syq/restricted`.
 
 ## Limits and unsupported options
@@ -154,13 +127,10 @@ A failed direct connection never relays data through your machine; choose
 `--coordinate-at local` to do that.
 
 A copy through [approved account connections](#approved-account-copies) that
-uses SSH workers adds a temporary line to the destination account's
-`~/.ssh/authorized_keys`. Its comment starts with `syq-copy-worker-`, and its
-command runs syq with `--return-ssh-worker`. The copy removes the line when it
-ends, but a copy that is killed, or whose server restarts, leaves the line
-behind, and syq does not remove it later. A leftover line lets nothing in: its
-command only reaches that copy's worker connection, which ended with the copy.
-Delete such lines when no copy to that account is running.
+uses SSH workers adds a temporary line, with a comment starting
+`syq-copy-worker-`, to the destination account's `~/.ssh/authorized_keys`. A
+killed copy can leave it behind; it grants nothing, and you can delete it when
+no copy to that account is running.
 
 <a id="signed-results"></a>
 
@@ -212,51 +182,41 @@ needs `/bin/kill` and either `setsid` or `perl`.
 
 ## Authorization selection
 
-For `syq cp` between this machine and one SSH server, an omitted `--auth-from`
-comes from `SYQ_AUTH_FROM`, then your
-[saved authorization choice](persistence-reference.md#authorization-defaults),
-and otherwise is `auto`. `--auth-from auto` tries this machine's own SSH
-access first, with SSH's normal prompts and timeouts, regardless of existing
-approved account connections. If SSH reports rejected credentials, a host-key
-verification failure, an unresolved hostname, or a refused connection, syq
-asks your live receiving machines in alphabetical order; each uses its own SSH
-configuration and trusted host keys. After a timeout, a temporary DNS failure,
-or another SSH error, or when no receiving machine is available, syq reports
-the SSH error instead. When syq asks a receiving machine, it prints a line
-saying why, unless this machine simply has no SSH credentials to offer.
-
-Copies with options the receiving machine cannot authorize (listed below) use
-only this machine's SSH access. Once approval is requested, refusal or failure
-ends the attempt, and helper setup or copy errors never start another one.
-
-For object-storage copies and removal, explicit `--auth-from @NAME` uses
+[Authorization defaults](persistence-reference.md#authorization-defaults)
+describes how a command picks its `--auth-from` value. For SSH copies, `@NAME`
+and SSH providers use or request an
+[approved account connection](persistence-reference.md#approved-account-connections),
+and `ssh` uses only this machine's own access. For object-storage copies and
+removal, an explicit `--auth-from @NAME` uses
 [storage authorization](object-storage.md#authorize-from-your-laptop).
 
-For SSH copies, `--auth-from @NAME` selects that receiving machine; an ordinary
-SSH endpoint selects an [SSH authorization provider](receive.md#use-an-ssh-authorization-provider).
-An existing [approved account connection](persistence-reference.md#approved-account-connections)
-for the same authorizer and endpoint supplies full account access without
-another prompt. Otherwise an ordinary copy requests account access from the
-provider. See [account permissions](persistence-reference.md#account-permissions)
-for Allow and Remember.
-`--auth-from ssh` uses this machine's native SSH access and ignores account approvals.
+For `syq cp` between this machine and one SSH server, `auto` first tries this
+machine's own SSH access, with SSH's usual prompts and timeouts, even when an
+approved account connection exists. If SSH rejects the credentials, can't
+verify the host key, can't resolve the name, or is refused, syq asks your live
+receiving machines, in alphabetical order, to approve just this copy; each
+uses its own SSH configuration and trusted host keys. After a timeout or
+another SSH error, or with no receiving machine available, syq reports the SSH
+error. Copies with options a receiving machine can't authorize (below) use only
+this machine's access. Once approval is requested, a refusal or failure ends
+the attempt.
 
-Per-copy SSH authorization through a receiving machine does not support a root
-login on the destination, `--detach`, custom `--rsh` or `--syq-path`,
-`--no-bootstrap`, alternative `--peer-auth` or `--coordinate-at`, or
-`--no-tcp-encryption`. The authorizing machine's copy limits apply, including
-its `--max-delete` and `--max-entries` for pruning.
+Per-copy approval does not support a root login on the destination,
+`--detach`, custom `--rsh` or `--syq-path`, `--no-bootstrap`, alternative
+`--peer-auth` or `--coordinate-at`, or `--no-tcp-encryption`. The authorizing
+machine's copy limits apply, including its `--max-delete` and `--max-entries`
+for pruning.
 
-A per-copy upload uses the destination account's [enrollment](#enrollment).
-The authorizing machine sets it up on the first approved copy, and refreshes it
-after you upgrade syq, over its own SSH login and without prompts, so its
-login key must be able to sign without a terminal (in its agent, or an
-unencrypted key file). That login follows the authorizing machine's SSH
-configuration, but accepts and records a destination key it has not seen
-before, as `accept-new` does, because nobody can answer. When it cannot
-connect, it tries again through the source, whose SSH server must then allow
-TCP forwarding. See [Copying between servers](security.md#copying-between-servers)
-for what the source receives.
+A per-copy upload uses the destination account's [enrollment](#enrollment),
+which the authorizing machine sets up on the first approved copy, and
+refreshes after you upgrade syq, over its own SSH login without prompts. Its
+login key must therefore be able to sign without a terminal: in its agent, or
+an unencrypted key file. That login accepts a destination host key it has not
+seen before; see [How hostA checks hostB's key](security.md#how-hosta-checks-hostbs-key).
+If it can't connect, it tries again through the source, whose SSH server must
+then allow TCP forwarding. See
+[Copying between servers](security.md#copying-between-servers) for what the
+source receives.
 
 For per-copy downloads (`--from HOST` to this machine), approval grants read
 access to the displayed source files and directory trees. `--src-non-dir`
@@ -275,32 +235,28 @@ directory, and `~//archive` is `/archive`, as with ordinary SSH. Use
 A direct copy between two other servers can request or reuse
 [approved account connections](persistence-reference.md#approved-account-connections)
 to both endpoints. Both endpoints must select an authorization provider,
-through `--auth-from` or their saved authorization choices; `auto` and `ssh`
-use native authentication regardless of existing approvals. `--auth-from @NAME`
-or `--auth-from PROVIDER_HOST` requests access to both accounts through that
-provider as needed, and each prompt grants the named account's authority. To
-prepare connections in advance, use
-`syq persist connect ENDPOINT --auth-from PROVIDER`.
+through `--auth-from` or their saved choices; `auto` and `ssh` use native
+authentication even when approvals exist. To prepare connections in advance,
+use `syq persist connect ENDPOINT --auth-from PROVIDER`.
 
-This route runs the copy on the source, the default coordinator, with
-`--peer-auth restricted`. It supports `--no-tcp`, helper overrides, mappings,
-and `--results`, and `--pscope` selects the approved connections and
-authorization choices of that local domain. `--coordinate-at local` can reuse approved access to each
-endpoint and relays file data through the invoking machine.
+The copy runs on the source with `--peer-auth restricted`, and supports
+`--no-tcp`, helper overrides, mappings, and `--results`; `--pscope` selects
+the local domain's approved connections and choices. With
+`--coordinate-at local`, it reuses approved access to each endpoint and relays
+file data through the invoking machine instead.
 
-The source's SSH server must permit remote Unix-socket forwarding, and OpenSSH
-7.8 and later also require it to permit remote TCP forwarding; disabled
-forwarding is an error, never a reason to relay file data. That forwarded
-connection carries control and metadata, while file data goes directly between
-the servers, so a `ProxyJump` route that lets your machine reach them does not
-let them reach each other. Each connection needs a free SSH session, and SSH
-workers need a second one on the destination's. Syq starts a receiver for this
+The source's SSH server must permit remote Unix-socket forwarding, and on
+OpenSSH 7.8 and later remote TCP forwarding too; syq never relays file data
+through your machine to work around disabled forwarding. File data goes
+directly between the servers, so a `ProxyJump` route that lets your machine
+reach them does not let them reach each other. Syq starts a receiver for this
 copy over the destination's approved connection, which must not log in as
-root; no enrollment is needed. The destination's
+root; no enrollment is needed, but copying over SSH needs a writable
+`~/.ssh/authorized_keys` there for a
+[temporary line](#limits-and-unsupported-options). The destination's
 [restricted-copy limits](#limits-and-unsupported-options) and
 [results from the destination](#results-from-the-destination) still apply.
-Helpers must match the invoking build; normal bootstrap installs them unless
-disabled.
+Helpers must match the invoking build; normal bootstrap installs them.
 
 ## Verification
 

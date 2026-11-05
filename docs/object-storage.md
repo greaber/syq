@@ -22,7 +22,7 @@ Syq uses your AWS credentials and detects AWS bucket regions automatically.
 | `--s3-endpoint URL` | Use an S3-compatible service; also accepts `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL` |
 | `--s3-region REGION` | Set the signing region explicitly |
 | `--s3-header 'NAME: VALUE'` | Add a provider header to every request; repeatable |
-| `--s3-write-header 'NAME: VALUE'` | Add a header only to requests that create or replace objects, for settings such as storage class or a server-side encryption method or KMS key that other requests reject; repeatable. It takes precedence over an `--s3-header` of the same name. Pass customer-provided encryption key headers (`x-amz-server-side-encryption-customer-*`) with `--s3-header` instead, because reads and part uploads need them too |
+| `--s3-write-header 'NAME: VALUE'` | Add a header only to requests that create or replace objects, such as storage class or server-side encryption settings; repeatable, and overrides `--s3-header`. Pass customer-provided key headers (`x-amz-server-side-encryption-customer-*`) with `--s3-header`, since reads need them too |
 | `--s3-retries N` | Retry each request up to N times (0–100, default 10) after a dropped connection, a timeout, a server error or throttling; 0 disables retries |
 
 See [S3 copies](tuning.md#s3-copies) for concurrency and part sizes.
@@ -114,13 +114,11 @@ when the contents match. A selected attribute absent on the source is cleared
 at the destination, and selecting `user-metadata` or `tags` also removes
 destination-only keys. These selections need S3 on both sides.
 
-Updating tags alone uses the tagging API, which needs permission to read and
-write tags, and does not rewrite the object. A provider without tag support may
-drop tags from new copies. Updating other metadata copies the object onto
-itself within S3, which changes its Last-Modified time and creates a new
-version in a versioned bucket. That rewrite keeps the object's storage class
-and encryption settings unless `--s3-header` or `--s3-write-header` overrides
-them, but not its ACLs, Object Lock settings, or custom KMS encryption contexts.
+Updating metadata other than tags rewrites the object within S3: it gets a new
+Last-Modified time, a new version in a versioned bucket, and loses its ACLs,
+Object Lock settings, and custom KMS encryption contexts. Updating tags needs
+permission to read and write them, and a provider without tag support may drop
+tags from new copies.
 
 New uploads and bucket copies use the provider's storage and encryption
 defaults unless overridden with `--s3-write-header` or, for bucket copies,
@@ -177,11 +175,7 @@ markers, or `--s3-version-id ID` for one version. Deleting a marker can reveal
 an older version. Preview version deletions with `--dry-run -v`. When deleting
 an exact directory-marker version, keep the trailing `/` in its key.
 
-Permanent version deletion on Tigris needs a Tigris endpoint (`t3.storage.dev`
-or under `tigris.dev`) and can take longer for large histories. Syq does not
-recognize Tigris behind a custom proxy hostname: permanent version deletion
-there can leave versions intact and add delete markers that hide current
-objects, and syq reports failure. To undo an unintended deletion, find the
-markers the failed attempt created in your provider's version listing and
-remove them with `--s3-version-id` through a Tigris endpoint, or rerun the
-original `--s3-all-versions` command there if you meant to purge all versions.
+On Tigris, permanent version deletion needs a Tigris endpoint
+(`t3.storage.dev` or under `tigris.dev`). Through a custom proxy hostname it
+fails and can add delete markers that hide current objects; remove them with
+`--s3-version-id` through a Tigris endpoint.

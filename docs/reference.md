@@ -94,9 +94,9 @@ For two SSH endpoints, see [Copy between servers](remote-to-remote.md).
 
 ### Transport compression
 
-Remote filesystem copies compress data in transit by default, adjusting
-compression to the transfer speed. Use `--no-compress` to turn it off, for
-example to compare its effect on CPU use and copy speed.
+Remote filesystem copies compress data in transit by default. Use
+`--no-compress` to turn it off, for example to compare its effect on CPU use
+and copy speed.
 
 <a id="output-and-diagnostics"></a>
 <a id="performance-and-time-limits"></a>
@@ -326,9 +326,8 @@ the interrupted bytes are in the final file itself, and a rerun reuses them
 only as the [transfer strategy](#choose-a-transfer-strategy) allows.
 
 Partial files may remain after a successful retry, and a copy that was killed
-can leave temporary files. Syq does not remove them during a copy, since
-another copy may still be writing one, but says how many files had them. To
-remove them:
+can leave temporary files. Syq does not remove them during a copy, but says
+how many files had them. To remove them:
 
 ```sh
 syq clean-partials --dry-run -v backup
@@ -472,9 +471,8 @@ syq rsync -aHAX --numeric-ids source/ backup/
 
 With `hardlinks`, selected names for the same source regular file share one
 destination inode, on local and SSH filesystem copies. Links to files outside
-the selected sources are not reconstructed. Syq scans all selected sources
-before changing the destination, so large trees take longer to start copying
-and need memory for the complete file list. Hard links across destination
+the selected sources are not reconstructed. A large tree takes longer to
+start copying and needs memory for its complete file list. Hard links across destination
 filesystems fail. On a filesystem without hard links, such as FAT, exFAT or an
 rclone mount, syq copies one name of each group and reports the others as
 failed. A source symlink or special file with several names is rejected.
@@ -546,12 +544,8 @@ SMB, SSHFS and other FUSE filesystems, filesystems it does not recognize, and
 on macOS anything but APFS and HFS+. There every metadata-only change rewrites
 the file, and `--in-place=update` replaces files instead of updating them.
 
-A directory receives its copied permissions and ACLs after its contents. Until
-then, syq keeps a new directory open only to its owner whenever its final group
-or ACL could keep others out, and with `--copy-metadata=permissions` it narrows
-an existing directory that allows more than its source before creating anything
-in it. Someone who opened an existing directory earlier can keep listing the
-names syq creates in it.
+A directory receives its copied permissions and ACLs after its contents, so
+an interrupted copy can leave a new directory open only to its owner.
 
 When a directory you own lacks the write or search permission a change needs,
 `--widen-dirs` (`--syq-widen-dirs` for `syq rsync`) decides whether syq

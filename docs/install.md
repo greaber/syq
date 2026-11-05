@@ -47,29 +47,14 @@ Use `--version-is EXPR` to check the version of the syq you invoked before it
 runs your command:
 
 ```sh
-syq --version-is '>=0.7.1' cp photos --into backup
-syq --version-is '>=0.7.1, <0.8.0 | >=1.0.0, <2.0.0' cp photos --into backup
+syq --version-is '>=0.7.1, <0.8.0 | >=1.0.0' cp photos --into backup
 ```
 
-An expression combines version comparisons:
-
-| Syntax | Meaning |
-| --- | --- |
-| `x.y.z` or `==x.y.z` | Exactly that version |
-| `!=x.y.z` | Any supported release version except that version |
-| `<`, `<=`, `>`, `>=` followed by `x.y.z` | Numeric version comparison |
-| `comparison, comparison` | Both comparisons must hold (AND) |
-| `group \| group` | At least one AND group must hold (OR) |
-
-AND binds more tightly than OR. Quote the expression to protect `<`, `>`, and
-`|` from the shell. Partial versions, wildcards, `~`, `^`, parentheses, and
-`||` are not supported.
-
-Put `--version-is` and `--use-version` before the command and all other
-options, at most once each, in either order. With both, syq checks the
-executable you invoked before it downloads or runs the selected release.
-A version mismatch or a development build exits with status 1 before the
-command runs; an invalid expression or a misplaced option exits with status 2.
+Compare with `==`, `!=`, `<`, `<=`, `>`, or `>=`; `,` means and, and `|` means
+or. Quote the expression for the shell, and put `--version-is` before the
+command, like `--use-version`. A mismatch or a development build exits with
+status 1 before the command runs, and an invalid expression or misplaced
+option exits with status 2. See [`syq`](commands/index.md#syq) for the full syntax.
 
 ## Automatic installation on SSH servers
 

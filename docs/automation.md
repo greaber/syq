@@ -385,8 +385,7 @@ has an `endpoint`, trusted SHA256 fingerprints in `host_keys`, and an optional
 identity, not an SSH host key or a verified requesting machine.
 
 The `command`, `argv`, and `cwd` strings are escaped for display; do not execute
-them as shell input. The displayed command does not restrict an SSH account
-approval. Use an up-to-date syq binary to inspect and approve
+them as shell input. Use an up-to-date syq binary to inspect and approve
 requests, and handle unknown kinds without treating them as copy requests.
 
 ## Remembered account permissions

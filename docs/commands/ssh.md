@@ -1,17 +1,20 @@
 # syq ssh
 
-Open a shell or run a command using your saved authorization choice, or native
-SSH when none is configured:
+Open a shell or run a command on a server:
 
 ```sh
 syq ssh user@hostB
-syq ssh hostB -- hostname
+syq ssh --auth-from @laptop hostB -- hostname
 ```
 
-To authorize through your laptop while working on another server, first
-[connect the laptop to that server](../receive.md#set-up-receiving), then run
-`syq ssh --auth-from @laptop hostB`. The server's SSH configuration still
-chooses the account, address, and route, and the session follows that route.
+Without `--auth-from`, syq uses your
+[saved choice](../persistence-reference.md#authorization-defaults); `auto` and
+`ssh` both run native SSH. `--auth-from @laptop` uses
+[your laptop's SSH access](../receive.md#open-a-shell-on-another-server), and
+an [SSH provider](../receive.md#use-an-ssh-authorization-provider) endpoint
+uses that provider's. Either opens or reuses an
+[approved account connection](../persistence-reference.md#approved-account-connections),
+which gives the server [full access to that account](../security.md#ssh-account-access).
 
 <!-- CLI: ssh -->
 ```text
@@ -43,32 +46,8 @@ syq ssh [OPTIONS] <HOST> [-- [COMMAND]...]
 
 <!-- /CLI -->
 
-## Account access requires approval
-
-The first laptop-authorized login asks permission for the source account to use
-**the destination account**, including running any command and reading or
-changing its files. The command shown describes what the requester intends; it
-does not restrict the permission, and copy roots and byte limits do not apply.
-Later commands and copies reuse the approved connection. See
-[account permission controls](../persistence-reference.md#account-permissions)
-for how long approvals last and how to revoke them, and
-[SSH account access](../security.md#ssh-account-access) for the trust boundary.
-
-This needs:
-
-- OpenSSH 8.9 or newer for the requesting server's SSH client and the
-  destination's SSH server.
-- Exact plain host keys for both servers, trusted by the laptop; trust through
-  host certificates alone is not supported.
-- The laptop's key loaded in its SSH agent. The requesting server's
-  `IdentityFile` and `IdentitiesOnly` settings choose which keys to offer: an
-  `IdentityFile` naming a public key there selects the matching key in the
-  laptop's agent, and a `CertificateFile` can pair a user certificate with it.
-
-The laptop looks up the host key under the alias you typed, with any port you
-wrote, or your `HostKeyAlias`, using its own SSH configuration. The same alias
-can therefore use a private address between servers and a public one on the
-laptop, as long as both reach the same trusted host.
+<a id="account-access-requires-approval"></a>
+<a id="authorization-selection"></a>
 
 ## Commands and terminals
 
@@ -85,18 +64,5 @@ needs:
 syq ssh --auth-from @laptop hostB -- "printf '%s\n' 'two words'"
 ```
 
-This differs from [`syq exec --on @laptop`](exec.md), which runs a program on
-your laptop with literal arguments and closed stdin. `syq ssh` has no
-port-forwarding options.
-
-## Authorization selection
-
-Without `--auth-from`, syq uses your [saved choice](../persistence-reference.md#authorization-defaults),
-or `auto` when none is saved. For `syq ssh`, `auto` and `ssh` both run native
-SSH once, without using an approved account connection, and never fall back to
-a receiving machine. To authorize through your laptop, use
-`--auth-from @NAME`; to use an
-[SSH authorization provider](../receive.md#use-an-ssh-authorization-provider),
-give its endpoint, such as `--auth-from alice@provider:2222`. Either way, syq
-opens or reuses an approved account connection, so you do not need to run
-`persist connect` first.
+To run a program on your laptop instead, use [`syq exec`](exec.md). `syq ssh`
+has no port-forwarding options.

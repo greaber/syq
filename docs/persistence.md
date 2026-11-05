@@ -19,8 +19,8 @@ command that asked for another.
 In the default persistence domain, copies, remote file operations, and
 `persist connect` also start receiving on allowed servers, unless you have
 turned it off. Receiving lets connected servers request file copies to your
-machine, commands on it, and authorization for copies between servers, each
-with approval on your machine; see [Use your laptop from a server](receive.md).
+machine, commands on it, and access to other servers, each with approval on
+your machine; see [Use your laptop from a server](receive.md).
 It starts only on connections made with your plain `ssh`.
 
 To keep SSH connections open only for commands you start locally, turn
@@ -55,51 +55,12 @@ so that the next command to that server starts sooner:
 A copy or other file command that starts them says so in one line that names
 `syq persist off`. `syq persist status` shows what is running.
 
-## Reuse laptop-authorized account access
+<a id="reuse-laptop-authorized-account-access"></a>
 
-On a server connected to your laptop, select it for authorization and start work:
-
-```sh
-syq persist auth-from @laptop
-syq ssh hostB -- hostname
-syq cp report --to hostB --as report
-syq ssh hostB
-syq persist off
-```
-
-The first SSH command asks for access to the destination account, including
-arbitrary commands and file access. See
-[account permissions](persistence-reference.md#account-permissions) to choose
-how long that approval lasts and manage it on the laptop.
-
-Later `ssh`, `cp`, `rsync`, `rm`, `map`, and `clean-partials` commands reuse
-the approved connection. This does not enable ordinary persistence or receiving
-on the server. To prepare a connection before using it, run
-`syq persist connect hostB --auth-from @laptop`.
-See the [SSH authorization requirements](commands/ssh.md#account-access-requires-approval).
-
-For ordinary SSH tools, export a configuration on the server:
-
-```sh
-syq persist ssh-config hostB > hostB.ssh
-ssh -F hostB.ssh hostB hostname
-scp -F hostB.ssh report hostB:report
-sftp -F hostB.ssh hostB
-GIT_SSH_COMMAND='ssh -F hostB.ssh' git clone hostB:project.git
-rsync -e 'ssh -F hostB.ssh' report hostB:report
-```
-
-The configuration uses the approved connection to that host and account and
-needs no forwarded agent. It stops working when the connection closes; export
-again after approving a new one. Use the file's absolute path when a tool runs
-from a different directory.
-
-`syq persist off` closes the server's approved connections. It does not remove
-permissions on the laptop: a later command can request another login under the
-same session or remembered permission. Ending the laptop's receiving connection
-ends its session permissions; reconnecting asks again unless you chose Remember.
-See [SSH account access](security.md#ssh-account-access) for the authority granted
-and the limits of stopping access.
+On a server, connections opened with your laptop's SSH access, as by
+`syq ssh --auth-from @laptop hostB`, are kept for later commands whether or not
+persistence is on, and `syq persist off` closes them; see
+[Open a shell on another server](receive.md#open-a-shell-on-another-server).
 
 See [Persistence details](persistence-reference.md) for troubleshooting,
 upgrading, and isolated connections for scripts, or [`syq persist`](commands/persist.md)

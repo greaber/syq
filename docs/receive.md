@@ -6,9 +6,8 @@ Receiving lets you use your laptop from a connected server:
 
 - [Copy files to your laptop](#copy-files-to-your-laptop).
 - [Run commands on your laptop](#run-commands-on-your-laptop).
-- [Open a shell on another server](#open-a-shell-on-another-server)
-  using your laptop's SSH credentials.
 - [Authorize copies between servers](#authorize-copies-between-servers)
+  and [open a shell on another server](#open-a-shell-on-another-server)
   using your laptop's SSH credentials.
 - [Authorize object-storage transfers](object-storage.md#authorize-from-your-laptop)
   using your laptop's storage credentials.
@@ -168,21 +167,56 @@ code. Interrupting the request or stopping receiving stops the command;
 completed changes are not rolled back. See [`syq exec`](commands/exec.md)
 for arguments, working directories, and cancellation details.
 
+## Authorize copies between servers
+
+In hostA's shell, copy to or from hostB as usual:
+
+```sh
+syq cp results --to hostB --into /archive
+syq cp --from hostB /archive/results --into .
+```
+
+If hostA can't log in to hostB itself, syq asks your laptop to approve just
+this copy, within your laptop's copy limits. File data goes directly between
+the servers. An approved upload finishes even if your laptop disconnects; a
+download needs the laptop connection and a direct encrypted TCP connection
+between the servers. See
+[Authorization selection](remote-reference.md#authorization-selection) for the
+options this supports.
+
+To use only hostA's own SSH access, add `--auth-from ssh`. To use your
+laptop's access to the whole hostB account instead, add `--auth-from @laptop`,
+as described next.
+
 ## Open a shell on another server
 
-From hostA, use your laptop's SSH credentials to open a direct connection to
-hostB:
+From hostA, use your laptop's SSH credentials to reach hostB:
 
 ```sh
 syq ssh --auth-from @laptop user@hostB
 syq ssh --auth-from @laptop hostB -- hostname
 ```
 
-Approve the destination account on your laptop. This permits arbitrary
-commands as that account; the approval is not limited to the command shown.
-Session traffic goes directly between the servers, and your ordinary SSH
-agent is not forwarded. Keep the laptop connection open during the session.
-See [`syq ssh`](commands/ssh.md) for commands, terminals, and requirements.
+Your laptop asks once for access to the hostB account. **Approving lets hostA
+run any command as that account while the approval lasts**, whatever command
+the prompt shows; see [SSH account access](security.md#ssh-account-access).
+Your SSH agent is not forwarded. Keep the laptop connection open while you
+work.
+
+Later commands reuse the approval, including copies with `--auth-from @laptop`.
+To make your laptop the default on hostA, and to use ordinary SSH tools through
+the approved connection:
+
+```sh
+syq persist auth-from @laptop
+syq cp report --to hostB --as report
+syq persist ssh-config hostB > hostB.ssh
+scp -F hostB.ssh report hostB:report
+```
+
+See [Account access](persistence-reference.md#account-access) for saved
+choices, requirements, and how long approval lasts, and
+[`syq ssh`](commands/ssh.md) for terminals and exit status.
 
 ## Use an SSH authorization provider
 
@@ -202,49 +236,8 @@ syq ssh hostB -- hostname
 
 Approve each destination account on the provider with
 `syq persist receive pending` and `syq persist receive approve REQUEST_ID`.
-Your agent is not forwarded, and commands and file data travel directly to
-hostB. The provider's SSH server must allow local forwarding
-(`AllowTcpForwarding` and `AllowStreamLocalForwarding` set to `local` or
-`yes`), and the login key's `authorized_keys` entry must not block it with
-`restrict` or `no-port-forwarding`. After updating syq, run
-`syq persist receive on` on the provider again.
-
+The provider's SSH server must allow local forwarding; see
+[SSH authorization providers](persistence-reference.md#ssh-authorization-providers).
 Anyone who can log in to the provider account can use its credentials without
-going through syq's approval controls; see
+going through syq's approval; see
 [provider trust](security.md#ordinary-ssh-authorization-providers).
-
-## Authorize copies between servers
-
-Use your laptop's SSH access while working in hostA's shell:
-
-```sh
-syq cp results --to hostB --into /archive --auth-from @laptop
-syq cp --from hostB /archive/results --into . --auth-from @laptop
-```
-
-Selecting `@laptop` asks for access to hostB's account on first use. The approval
-permits arbitrary commands and file access as that account. See
-[account permissions](persistence-reference.md#account-permissions) for the
-approval's lifetime and how to manage it on the laptop. File data travels
-directly between the servers, and you do not need to forward your agent.
-
-`--auth-from` and the `SYQ_AUTH_FROM` [environment variable](environment.md#choose-authorization-through-the-environment)
-choose how much to trust hostA:
-
-- `auto`, the default, uses hostA's own SSH access. When that fails, it asks
-  your laptop to approve just this copy; the approval names the permitted
-  paths and applies your laptop's copy limits. If hostA's own credentials
-  failed rather than being absent, syq first prints one line saying what went
-  wrong.
-- `@laptop` asks once for access to each destination account, as described
-  above. Like forwarding your SSH agent, that access lets the server run any
-  command as that account while it lasts.
-- `ssh` uses only hostA's own SSH access and never asks your laptop.
-
-An upload approved under `auto` finishes even if your laptop disconnects. The
-first one to an account sets up hostB's
-[enrollment](remote-reference.md#enrollment) over your laptop's SSH login. A
-download approved this way needs a direct encrypted TCP connection between the
-servers; account access with `@laptop` works over SSH too. See [authorization
-selection](remote-reference.md#authorization-selection) for the options each
-route supports.
