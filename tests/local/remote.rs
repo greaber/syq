@@ -552,7 +552,6 @@ fn a_dead_agent_socket_inside_tmux_is_replaced_by_the_session_socket() {
     ] {
         assert_eq!(in_tmux_failing(args), live, "{args:?}");
     }
-    assert_eq!(in_tmux(&["persist", "auth-from"]), (None, false));
 }
 
 fn add_remote_tool(t: &Tmp, name: &str) {

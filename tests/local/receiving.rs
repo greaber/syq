@@ -2134,7 +2134,7 @@ fn account_access_says_when_it_waits_for_the_laptop() {
     HeldLaptop::expect_line(
         &second_lines,
         &mut seen,
-        "syq: waiting up to 5 minutes for @laptop to approve SSH access to backup, which another command already asked for",
+        "syq: waiting up to 5 minutes for another command to finish setting up SSH access to backup; if it still needs approval, approve it on @laptop in the desktop prompt or with `syq persist receive pending`",
     );
     // The first request is refused; the second command then asks itself.
     laptop.release.send(()).unwrap();

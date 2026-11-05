@@ -13,11 +13,11 @@ pub(super) fn waiting(who: &str, what: &str) {
     );
 }
 
-/// As `waiting`, when another command already asked `who` to approve the
-/// same thing and this one waits for that answer.
+/// As `waiting`, when another command is still setting up the same `what`:
+/// its request may wait for approval, or it may be starting the connection.
 pub(super) fn waiting_for_earlier(who: &str, what: &str) {
     crate::output::diagnostic!(
-        "syq: waiting up to {} minutes for {who} to approve {what}, which another command already asked for; approve it there in the desktop prompt or with `syq persist receive pending`",
+        "syq: waiting up to {} minutes for another command to finish setting up {what}; if it still needs approval, approve it on {who} in the desktop prompt or with `syq persist receive pending`",
         REQUEST_TIMEOUT.as_secs() / 60
     );
 }
