@@ -1497,12 +1497,21 @@ fn access_time_restored_after_lost_finalize_reply_and_resume() {
 #[cfg(target_os = "linux")]
 #[test]
 fn birth_times_reject_linux_destination_before_creation() {
+    // The reason is the only complaint: the receiver does not also report the
+    // pipe that the copy closed after the refusal.
+    let refused = |out: &std::process::Output| {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success());
+        assert!(
+            stderr.contains("birth-time preservation requires a macOS destination"),
+            "{stderr}"
+        );
+        assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    };
     let t = Tmp::new();
     write(&t.path("source"), b"data");
     let out = syq(&["-aN", &t.s("source"), &t.s("rsync-copy")]);
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr)
-        .contains("birth-time preservation requires a macOS destination"));
+    refused(&out);
     assert!(!t.path("rsync-copy").exists());
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
@@ -1514,9 +1523,7 @@ fn birth_times_reject_linux_destination_before_creation() {
         ])
         .run()
         .unwrap();
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr)
-        .contains("birth-time preservation requires a macOS destination"));
+    refused(&out);
     assert!(!t.path("native-copy").exists());
 }
 

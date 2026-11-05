@@ -302,7 +302,7 @@ fn released_enrollment_state_is_never_read_or_touched() {
 
     // `syq receiver list` points at the docs, and changes nothing.
     let notice = released_enrollment_notice(home).unwrap();
-    assert!(notice.contains("0.4.0 to 0.7.1"), "{notice}");
+    assert!(notice.contains("syq 0.7.1 and earlier"), "{notice}");
     assert!(
         notice.contains("#enrollments-from-older-versions"),
         "{notice}"

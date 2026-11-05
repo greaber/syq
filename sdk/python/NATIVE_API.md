@@ -138,8 +138,8 @@ for executable selection.
 
 Typed SSH-to-SSH copies use an enrolled receiver, approved account access to
 both endpoints, or `coordinate_at="local"`. Selecting an authorization provider
-requests account connections when needed. With `dry_run=True`, they require
-`coordinate_at="local"`. Use `run` for detached commands and human output options.
+requests account connections when needed. Use `run` for detached commands and
+human output options.
 
 `IgnoreFrom(path)` is a frozen dataclass holding a rule-file path (`str`,
 `bytes`, or `os.PathLike`). To interleave rule files and inline patterns:

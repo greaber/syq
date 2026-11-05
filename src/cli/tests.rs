@@ -1124,6 +1124,55 @@ fn transfer_strategy_preserves_automatic_tuning_and_existing_defaults() {
 }
 
 #[test]
+fn descriptor_copy_refusals_name_the_option_as_typed() {
+    // `--where` is stored under another internal name.
+    let error = parse_native_copy(&argv(&[
+        "--src-fd",
+        "0",
+        "--as",
+        "destination",
+        "--where",
+        "src.size > 0",
+    ]))
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "--where is not supported with descriptor copies"
+    );
+}
+
+#[test]
+fn removed_remote_options_name_their_replacements() {
+    for (option, replacement) in [
+        ("--tcp-plain", "--no-tcp-encryption"),
+        ("--receiver-receipt=hashes", "--results"),
+        ("--receiver-receipt", "--results"),
+    ] {
+        let error = parse_native_copy(&argv(&[
+            "--from", "hostA", "source", "--to", "hostB", "--as", "copy", option,
+        ]))
+        .unwrap_err()
+        .to_string();
+        let name = option.split('=').next().unwrap();
+        assert!(
+            error.contains(&format!("{name} is not a syq cp option"))
+                && error.contains(replacement),
+            "{option}: {error}"
+        );
+        assert!(!error.contains("similar argument"), "{option}: {error}");
+        assert_eq!(
+            error.contains("per-file hashes are no longer reported"),
+            name == "--receiver-receipt",
+            "{option}: {error}"
+        );
+    }
+    let error = Args::parse_rsync(&argv(&["--syq-tcp-plain", "source", "host:destination"]))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("--syq-no-tcp-encryption"), "{error}");
+}
+
+#[test]
 fn transfer_strategy_rejects_removed_tuning_key_and_nonfilesystem_controls() {
     for legacy in ["auto", "on", "off"] {
         let error = parse_native_copy(&argv(&[

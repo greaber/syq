@@ -118,8 +118,10 @@ delete them by hand:
 - On the server, delete each line in `~/.ssh/authorized_keys` whose command
   runs `~/.local/libexec/syq-receiver`, written with your home directory's
   full path. Keep the lines whose command runs syq from `~/.local/lib/syq`:
-  they belong to this version's enrollments, even though their comments also
-  start with `syq-enrollment:`. Then delete the directory
+  those whose comments start with `syq-enrollment:`, like the old ones, belong
+  to this version's enrollments, and those whose comments start with
+  `syq-copy-worker-` belong to copies through approved account connections
+  (see [below](#limits-and-unsupported-options)). Then delete the directory
   `~/.local/share/syq/restricted` and the file `~/.local/libexec/syq-receiver`.
 - On your machine, delete the directory `~/.local/state/syq/restricted`.
 
@@ -150,6 +152,15 @@ Restricted copies use encrypted TCP when reachable and otherwise SSH workers
 from the source to the destination, under the same authorization and limits.
 A failed direct connection never relays data through your machine; choose
 `--coordinate-at local` to do that.
+
+A copy through [approved account connections](#approved-account-copies) that
+uses SSH workers adds a temporary line to the destination account's
+`~/.ssh/authorized_keys`. Its comment starts with `syq-copy-worker-`, and its
+command runs syq with `--return-ssh-worker`. The copy removes the line when it
+ends, but a copy that is killed, or whose server restarts, leaves the line
+behind, and syq does not remove it later. A leftover line lets nothing in: its
+command only reaches that copy's worker connection, which ended with the copy.
+Delete such lines when no copy to that account is running.
 
 <a id="signed-results"></a>
 

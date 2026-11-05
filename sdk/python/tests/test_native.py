@@ -536,12 +536,15 @@ class NativeClientTests(unittest.TestCase):
         self.assertEqual(operation.disposition, syq.Disposition.SUCCEEDED)
         self.assertEqual(operation.kind, syq.EntryKind.FILE)
 
-    def test_s3_to_s3_dry_run_needs_no_coordinator_override(self) -> None:
-        self.client.cp("source", from_="s3://source", to="s3://destination",
-                       into="prefix", dry_run=True)
-        argv = self.argv()
-        self.assertIn("--dry-run", argv)
-        self.assertNotIn("--coordinate-at", argv)
+    def test_two_endpoint_dry_run_needs_no_coordinator_override(self) -> None:
+        for from_, to in (("s3://source", "s3://destination"), ("alpha", "beta")):
+            with self.subTest(from_=from_, to=to):
+                result = self.client.cp("source", from_=from_, to=to,
+                                        into="prefix", dry_run=True)
+                self.assertTrue(result.dry_run)
+                argv = self.argv()
+                self.assertIn("--dry-run", argv)
+                self.assertNotIn("--coordinate-at", argv)
 
     def test_ssh_account_authorization_for_removal_and_mapping(self) -> None:
         self.client.rm("file", on="server", auth_from="@laptop")
@@ -974,8 +977,6 @@ class NativeClientTests(unittest.TestCase):
             self.client.map("source", cwd="a", root="b")
         with self.assertRaisesRegex(syq.SyqInvocationError, "--coordinate-at"):
             self.client.cp("source", into="target", coordinate_at="elsewhere")
-        with self.assertRaisesRegex(syq.SyqInvocationError, "dry run"):
-            self.client.cp(from_="alpha:src", to="beta:dst", dry_run=True)
         with self.assertRaisesRegex(syq.SyqInvocationError, "--peer-auth"):
             self.client.cp("source", into="target", peer_auth="agent")
         with self.assertRaisesRegex(ValueError, "relative"):

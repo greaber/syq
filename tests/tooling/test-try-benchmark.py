@@ -39,6 +39,10 @@ assert '--pscope' not in args
 # use --copy-metadata and refuse --preserve.
 if ('--copy-metadata=permissions' if os.environ.get('BENCH_TEST_OLD') else '--preserve=permissions') in args:
     print('error: unexpected metadata option', file=sys.stderr); sys.exit(2)
+# Releases through v0.7.1 spell in-place writes --inplace; later builds use
+# --in-place=MODE and refuse --inplace.
+if ('--in-place' if os.environ.get('BENCH_TEST_OLD') else '--inplace') in [a.split('=')[0] for a in args]:
+    print('error: unexpected in-place option', file=sys.stderr); sys.exit(2)
 if '--dry-run' in args: sys.exit(0)
 if os.environ.get('BENCH_TEST_ENV_LOG'):
     with open(os.environ['BENCH_TEST_ENV_LOG'], 'a') as log:
@@ -266,6 +270,25 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIn('3.00s  workers: source response', result.stdout)
         self.assertIn('destination worker 0 / filesystem: destination write', result.stdout)
         self.assertNotIn('2.00s', result.stdout)
+
+    def test_in_place_option_matches_the_syq_version(self):
+        log = self.root / 'args.jsonl'
+        for option, old in [(['--in-place=update'], False), (['--in-place', 'new'], False),
+                            (['--inplace'], True)]:
+            with self.subTest(option=option):
+                log.unlink(missing_ok=True)
+                env = dict(self.env, BENCH_TEST_ARGS_LOG=str(log))
+                if old:
+                    env['BENCH_TEST_OLD'] = '1'
+                result = self.invoke('--tool', 'syq', '--', *option, env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                copies = [args for args in map(json.loads, log.read_text().splitlines())
+                          if args[0] == 'cp' and '--dry-run' not in args]
+                self.assertTrue(copies)
+                for args in copies:
+                    start = args.index(option[0])
+                    self.assertEqual(args[start:start + len(option)], option)
+                self.assert_clean()
 
     def test_explicit_stats_survive_concise_output(self):
         result = self.invoke('--tool', 'syq', '--', '--stats')
