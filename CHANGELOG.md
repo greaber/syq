@@ -153,11 +153,18 @@ and network filesystems are much faster.
   names the sshd setting to change. After a rejected login it backs off, and
   `syq persist status` shows why. `persist receive on` no longer fails
   intermittently while the receiving service starts.
-- `SYQ_AUTH_FROM` sets the authorization choice for a shell or script.
-  Inside tmux, a stale `SSH_AUTH_SOCK` is replaced by the session's current
-  agent. When `auto` falls back to asking your laptop, syq says why, and
-  every wait for approval prints a line saying what it is waiting for.
-  <!-- PR #844; still open when this entry was written. -->
+- `SYQ_AUTH_FROM` sets the SSH authorization choice for every command run in
+  a shell or script. It overrides saved choices, and `--auth-from` still wins
+  over it.
+- Inside tmux, commands that can use SSH replace an `SSH_AUTH_SOCK` that no
+  longer exists with the tmux session's current agent: `syq ssh`, `persist`
+  and `receiver`, copies, removals and listings with an SSH endpoint
+  (including descriptor and pipe copies), and remote path completion.
+- When `auto` asks a receiving machine because this machine's own SSH keys or
+  agent did not work, syq first prints one line saying what went wrong and how
+  to fix it. Every wait for approval says so at once on stderr, even without a
+  terminal. A command queued behind another one says it is waiting for that
+  command to finish setting up SSH access.
 - A command that starts background connections or receiving says so once and
   names `syq persist off`.
 
