@@ -1,35 +1,31 @@
 # syq clean-partials
 
-Remove syq partial files below local or SSH directories. An interrupted copy
-removes most of its own temporary files, but keeps partial files worth resuming
-(see [Resume an interrupted copy](../reference.md#resume-an-interrupted-copy));
-this command removes what remains. Wait for active copies into those
-directories to finish before running cleanup:
+An interrupted copy keeps partial files so that a retry can resume (see
+[Resume an interrupted copy](../reference.md#resume-an-interrupted-copy)).
+When you no longer need to resume, remove them with this command. Let copies
+into the directories finish first, and preview:
 
 ```sh
 syq clean-partials --dry-run -v backup
 syq clean-partials backup
 ```
 
-Add `--on server` to clean a remote tree. For results output, see
-[Removal records](../automation.md#removal-records).
+Add `--on server` to clean a directory on an SSH server. For `--results`
+output, see [Removal records](../automation.md#removal-records).
 
 ## Which files are removed
 
-`clean-partials` removes syq partial files, named `.FILENAME.syq-tmp.RANDOM`,
-and the `.syq-s3-HASH.partial` files that [S3 downloads](../object-storage.md)
-leave beside the files they download; removing one of those means a later
-download of that file starts over. It does not follow symlinks, and it does not
-remove partial files left by older syq versions or the `.syq-stream-*` files
-that a killed [descriptor copy](cp.md#completion-and-failures) can leave. A
-regular file deliberately named like a partial is also selected, so preview
-before deleting.
+It removes regular files named `.FILENAME.syq-tmp.RANDOM`, left by copies, and
+`.syq-s3-HASH.partial`, left by [S3 downloads](../object-storage.md), including
+any file of yours with such a name. It does not follow symlinks, and it leaves
+the `.syq-stream-*` files of killed
+[descriptor copies](cp.md#completion-and-failures) alone.
 
-Interrupted replacements, replacements that race with another program, and
-macOS clones can leave `.syq-swap-...` entries holding displaced files or
-temporary clone data. Neither this command nor pruning removes them. Stop
-copies using the destination, inspect these entries, and recover anything you
-need before removing them yourself.
+Neither this command nor pruning removes `.syq-swap-...` recovery entries.
+Each holds either a file that a copy moved aside while replacing it (after an
+interruption, or when another program wrote the same name at the same time) or
+a killed copy's own unfinished entry. Once no copy is using the destination,
+recover what you need from them and delete them yourself.
 
 <!-- CLI: clean-partials -->
 ```text
@@ -72,10 +68,10 @@ syq clean-partials [OPTIONS] <TREE>...
 
 | Argument / option | Meaning |
 |---|---|
-| `--syq-path <PATH>` | Use this exact syq executable on the remote removal endpoint |
-| `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |
-| `--auth-from <auto\|ssh\|@NAME\|HOST>` | How to authorize SSH access: auto, ssh (native SSH only), @NAME (a receiving machine), or HOST (an SSH provider) |
-| `--pscope <PATH>` | Use an isolated persistence domain created by `syq persist on --ephemeral` |
+| `--syq-path <PATH>` | Run the remote syq at PATH instead of syq's automatically installed copy |
+| `--no-bootstrap` | Run the syq found in the remote $PATH instead of syq's automatically installed copy |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Whose SSH access to use: this machine's own (auto or ssh), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST) |
+| `--pscope <PATH>` | Use the isolated connections and settings that `syq persist on --ephemeral` created at PATH |
 
 ## Help and version
 

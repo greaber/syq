@@ -1,9 +1,10 @@
 # syq receiver
 
-Manage restricted copying on server accounts, for direct server-to-server
-copies. See [access management](../remote-to-remote.md#first-copy-and-access-management)
-and [enrollment details](../remote-reference.md#enrollment) for setup, key
-changes, and upgrades.
+`syq receiver` manages restricted copying, which lets one server
+[copy into your account on another server](../remote-to-remote.md) without
+being given your SSH access to that account. See
+[access management](../remote-to-remote.md#first-copy-and-access-management)
+and [enrollment details](../remote-reference.md#enrollment).
 
 <!-- CLI: receiver -->
 ```text
@@ -13,8 +14,8 @@ syq receiver <COMMAND>
 | Command | Purpose |
 |---|---|
 | [`receiver enroll`](#syq-receiver-enroll) | Manually enroll or refresh a server account |
-| [`receiver list`](#syq-receiver-list) | List local active and pending enrollments |
-| [`receiver revoke`](#syq-receiver-revoke) | Stop active receivers and remove their enrollment from both machines |
+| [`receiver list`](#syq-receiver-list) | List this machine's enrollments, active and pending |
+| [`receiver revoke`](#syq-receiver-revoke) | Stop an enrollment's active copies and remove it from both machines |
 
 **Help (also available on subcommands)**
 
@@ -27,9 +28,9 @@ syq receiver <COMMAND>
 
 ## syq receiver enroll
 
-Sets up restricted copying on a server account, or refreshes it: it installs
-the receiver for this syq build and trusts the key you log in with. Copies do
-this automatically when needed. Copies already running continue.
+Copies enroll an account automatically, so use this to set one up ahead of
+time or to refresh it. It installs the receiver for this syq build and trusts
+the key you log in with; copies already running continue.
 
 <!-- CLI: receiver enroll -->
 ```text
@@ -56,11 +57,6 @@ Prints one tab-separated line per enrollment: its ID, `active` or `pending`,
 and the account. Active enrollments add the receiver's release and the
 fingerprint of the login key it trusts.
 
-Enrollments made by syq 0.7.1 and earlier are not listed; while their files
-remain, `list` prints a notice. See
-[Enrollments from older versions](../remote-reference.md#enrollments-from-older-versions)
-to remove them.
-
 <!-- CLI: receiver list -->
 ```text
 syq receiver list
@@ -70,9 +66,9 @@ syq receiver list
 
 ## syq receiver revoke
 
-Stops copies running through the enrollment, removes syq's line and state from
-the server account, and then removes this machine's record. If the server
-cannot be reached, nothing is removed; run the command again.
+Stops copies running through the enrollment, removes syq's `authorized_keys`
+line and state from the server account, then removes this machine's record. If
+the server cannot be reached, nothing is removed; run it again later.
 
 <!-- CLI: receiver revoke -->
 ```text

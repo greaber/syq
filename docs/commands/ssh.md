@@ -12,12 +12,13 @@ syq ssh --auth-from @laptop hostB -- hostname
 
 Without `--auth-from`, syq uses your
 [saved choice](../persistence-reference.md#authorization-defaults); `auto` and
-`ssh` both run native SSH. `--auth-from @laptop` uses
+`ssh` run native SSH. `@laptop` uses
 [your laptop's SSH access](../receive.md#open-a-shell-on-another-server), and
 an [SSH provider](../receive.md#use-an-ssh-authorization-provider) endpoint
-uses that provider's. Either opens or reuses an
+uses that provider's. Both open or reuse an
 [approved account connection](../persistence-reference.md#approved-account-connections),
-which gives the server [full access to that account](../security.md#ssh-account-access).
+which gives this machine
+[full access to that account](../security.md#ssh-account-access).
 
 <!-- CLI: ssh -->
 ```text
@@ -35,8 +36,8 @@ syq ssh [OPTIONS] <HOST> [-- [COMMAND]...]
 
 | Argument / option | Meaning |
 |---|---|
-| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Authorization source; omitted uses SYQ_AUTH_FROM, then the saved preference, then native SSH |
-| `--pscope <PATH>` | Use connections and authorization preferences from this persistence scope |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Whose SSH access to use: this machine's own (auto or ssh), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST); omitted uses SYQ_AUTH_FROM, then the saved choice, then auto |
+| `--pscope <PATH>` | Use the isolated connections and settings that `syq persist on --ephemeral` created at PATH |
 | `-t` | Request a terminal, including when running a command |
 | `-T` | Disable terminal allocation |
 
@@ -51,14 +52,13 @@ syq ssh [OPTIONS] <HOST> [-- [COMMAND]...]
 
 ## Commands and terminals
 
-Without a command, OpenSSH opens a shell with its usual terminal handling. Use
-`-t` to request a terminal for a command or `-T` to disable one. Syq returns the
+Without a command, you get a shell. Use `-t` to request a terminal for a
+command or `-T` to disable one. Syq returns the
 remote exit status, or 255 for its own connection, authorization, and setup
 failures.
 
-Put `--` before a remote command. As with `ssh`, the destination's shell
-interprets the arguments joined with spaces, so keep the quoting that shell
-needs:
+Put `--` before a remote command. As with `ssh`, the remote shell interprets
+the arguments joined with spaces, so keep the quoting it needs:
 
 ```sh
 syq ssh --auth-from @laptop hostB -- "printf '%s\n' 'two words'"

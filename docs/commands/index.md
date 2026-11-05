@@ -1,9 +1,7 @@
 # Command reference
 
-Look up commands and options below. For copy examples, start with
-[Copy files](../reference.md).
-
-The advanced option groups have separate references:
+Look up commands and options here. For copy examples, start with
+[Copy files](../reference.md). Three option groups have their own pages:
 
 - [Performance tuning](../tuning.md): workers, request sizes, and copy methods.
 - [Resource limits](../resource-limits.md): bandwidth and concurrency ceilings.
@@ -23,23 +21,23 @@ syq --self-update
 | Command | Purpose |
 |---|---|
 | [`cp`](cp.md) | Copy files and directories, optionally removing destination-only files |
-| [`ssh`](ssh.md) | Open an SSH shell or command with native or approved account access |
-| [`exec`](exec.md) | Run a command on a named receiving machine after local approval |
+| [`ssh`](ssh.md) | Open an SSH shell or run a command, using your own or approved SSH access |
+| [`exec`](exec.md) | From a server, run a command on a receiving machine after it approves |
 | [`rm`](rm.md) | Remove selected files and directory trees |
-| [`clean-partials`](clean-partials.md) | Delete syq partial files in directory trees |
+| [`clean-partials`](clean-partials.md) | Delete partial files that interrupted syq copies left in directory trees |
 | [`map`](map.md) | Print source-to-destination mappings as NDJSON |
 | [`rsync`](rsync.md) | Copy using rsync-compatible syntax |
-| [`persist`](persist.md) | Manage persistent connections, receiving, and return destinations |
+| [`persist`](persist.md) | Keep SSH connections open, and receive files and requests from connected servers |
 | [`completion`](completion.md) | Generate shell completion and manage cached endpoint suggestions |
 | [`tuning-cache`](tuning-cache.md) | Inspect and clear local transfer tuning history |
-| [`receiver`](receiver.md) | Manage manual receiver enrollment and recovery |
+| [`receiver`](receiver.md) | Manage restricted copying on server accounts |
 | [`help`](#syq-help) | Show help for any command or nested command |
 
 **Options**
 
 | Argument / option | Meaning |
 |---|---|
-| `--version-is <EXPR>` | Require the invoked release to match EXPR before running anything. Bare x.y.z means exact equality; operators: == != < <= > >=. Commas mean AND; \| means OR, with AND binding more tightly. Quote expressions in the shell. Development builds are unsupported. Put --version-is and --use-version before the command, in either order. |
+| `--version-is <EXPR>` | Stop with an error, before doing anything else, unless the syq you invoked matches EXPR. Bare x.y.z means exactly that version; operators: == != < <= > >=. Commas mean AND; \| means OR, with AND binding more tightly. Quote expressions in the shell. Development builds always fail the check. Put --version-is and --use-version before the command, in either order. |
 | `--use-version <VERSION>` | Run an exact official release, downloading it if needed (before the command and other options) |
 | `--self-update` | Install the newest signed release (standalone installs); Homebrew: brew upgrade syq |
 
@@ -84,13 +82,11 @@ syq --self-update
 syq help [COMMAND...] [--help-all]
 ```
 
-Show common help for a command or nested command, such as `syq help persist
-receive on`. Add `--help-all` for its complete help. With no command, show the
-root help. A trailing `--help` or `-h` selects common help.
+`syq help persist receive on` shows the common help for that command, as
+`syq persist receive on --help` does. Add `--help-all` for every option.
 
 ## Build identity
 
-`syq --build-identity` prints a release's version tag, such as `v0.7.1`, or for
-a build from source that tag plus its revision, such as
-`v0.7.1+dev.0123456789ab`. See
+`syq --build-identity` prints the release tag, such as `v0.7.1`. A build from
+source adds its revision, as in `v0.7.1+dev.0123456789ab`; see
 [development builds](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md#another-platform-with-your-own-helpers).

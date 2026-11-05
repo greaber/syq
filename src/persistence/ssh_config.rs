@@ -12,7 +12,7 @@ use std::process::Command;
 pub(crate) struct ExportCommand {
     /// Approved SSH endpoint: [USER@]HOST[:PORT]
     host: String,
-    /// Select existing approval; omitted uses SYQ_AUTH_FROM, then the saved preference, then auto
+    /// Which approval to export: the one from @NAME or HOST, or with auto, the only one there is (default: SYQ_AUTH_FROM, then the saved choice, then auto; ssh is not accepted)
     #[arg(long, value_name = "auto|ssh|@NAME|HOST", value_parser = crate::cli::parse_auth_from)]
     auth_from: Option<AuthFrom>,
 }
