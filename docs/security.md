@@ -260,10 +260,8 @@ protected paths.
 An enrollment outlives removing or revoking your login key on hostB: end it
 with `syq receiver revoke`. See
 [Changing keys](remote-reference.md#changing-keys-and-updating-syq) for what
-does and does not stop a signed copy.
-
-See [Copy between servers](remote-to-remote.md) for setup and revoking
-access.
+does and does not stop a signed copy, and
+[Copy between servers](remote-to-remote.md) for setup and revoking access.
 
 Alternative authentication modes grant more authority. `--peer-auth broker`
 limits authentication to the chosen host and user but allows that account's
@@ -516,6 +514,7 @@ to that account's processes, not just the shell asking for permission. The
 laptop signs authentication only for the approved destination host keys and
 login account. Its agent is not forwarded, and this permission cannot
 authenticate to a different destination account or sign arbitrary messages.
+An agent key constrained with `ssh-add -h hostB` can authorize this login.
 
 The requesting machine chooses the account and route through its SSH
 configuration, but cannot make the laptop trust a host key by including it in
@@ -523,9 +522,6 @@ a request: the laptop checks its own trusted host information. `ProxyJump`
 requires permission for each jump account as well as the final account.
 Custom proxy commands use local authentication and do not receive the
 laptop's agent socket.
-
-A laptop agent key constrained with `ssh-add -h hostB` can authorize this
-login.
 
 Stopping receiving ends further authorization through that connection, and
 removing a remembered permission requires new approval for future

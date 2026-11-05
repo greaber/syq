@@ -403,8 +403,8 @@ It also assumes that nothing else writes to the file during the copy.
 
 Syq updates a file in place only when that can't give anyone access the copy
 would not, and replaces any other existing file, for example one with other
-names or another owner (see
-[How syq changes existing files](#how-syq-changes-existing-files-and-directories)).
+names or another owner, or any file on a filesystem
+[where syq can't tell it has no other names](#how-syq-changes-existing-files-and-directories).
 The summary, and `replaced_not_in_place` in
 [`--results`](automation.md#result), say how many it replaced and why; a dry
 run's counts are estimates.
