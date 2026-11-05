@@ -457,7 +457,9 @@ fn register_at(home: &std::path::Path, socket: &std::path::Path, identity: &str,
 /// A copy to `@laptop` whose receiving connection switches to build
 /// `switched_to` while the command reads its mapping from a FIFO, after it
 /// chose `@laptop`'s registration. Returns the command's output and the
-/// requests the new connection received; it refuses each.
+/// requests the new connection received; it refuses each. The FIFO shows
+/// when the command reads its input; macOS copies take no FIFO mapping.
+#[cfg(not(target_os = "macos"))]
 fn copy_while_the_receiver_switches(switched_to: &str) -> (Output, Vec<serde_json::Value>) {
     use std::os::unix::fs::OpenOptionsExt;
     let fixture = Fixture::new();
@@ -573,6 +575,7 @@ fn assert_switched_failure(output: &Output, text: &str) {
 /// A receiving connection that switched to this build while the copy read
 /// its input gets the copy's request: the command asks the new connection
 /// once, before copying anything.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_copy_asks_the_new_connection_once_after_its_receiver_switched() {
     let build = String::from_utf8(Fixture::new().run(&["--build-identity"]).stdout).unwrap();
@@ -588,6 +591,7 @@ fn a_copy_asks_the_new_connection_once_after_its_receiver_switched() {
 
 /// One that switched to another build cannot take this build's request:
 /// the command says so and asks to be run again.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_copy_whose_receiver_switched_to_another_build_asks_to_run_it_again() {
     let (output, requests) = copy_while_the_receiver_switches("another-build");
