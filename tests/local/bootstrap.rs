@@ -11,7 +11,7 @@ fn native_as_existing_updates_a_same_type_symlink() {
     run_native_ok(&[
         "cp",
         "--if-exists=update",
-        "--src",
+        "--src-non-dir",
         &t.s("source-link"),
         "--as-existing",
         &t.s("destination-link"),

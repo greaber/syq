@@ -124,6 +124,7 @@ fn matching_symlink_is_accepted_and_different_target_is_rejected() {
     run_native_ok(&[
         "cp",
         "--if-exists=error-if-different",
+        "--src-non-dir",
         &t.s("src"),
         "--as",
         &t.s("dst"),
@@ -133,6 +134,7 @@ fn matching_symlink_is_accepted_and_different_target_is_rejected() {
     let output = native_syq(&[
         "cp",
         "--if-exists=error-if-different",
+        "--src-non-dir",
         &t.s("src"),
         "--as",
         &t.s("dst"),
@@ -151,6 +153,7 @@ fn update_if_older_applies_to_symlink_targets() {
         set_mtime(&t.path("dst"), time);
         run_native_ok(&[
             "cp",
+            "--src-non-dir",
             &t.s("src"),
             "--as",
             &t.s("dst"),

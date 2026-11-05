@@ -321,6 +321,13 @@ pub(super) fn upload_plan(args: &Args) -> Result<UploadPlan> {
             }
             _ => bail!("source cannot be selected for S3 upload"),
         };
+        if source.kind() == ObjectKind::Symlink {
+            crate::transfer::validate_native_source_type(
+                &source.label,
+                selection,
+                crate::proto::Kind::Symlink,
+            )?;
+        }
         if (selection == SourceSelection::File && source.kind() == ObjectKind::Dir)
             || (matches!(
                 selection,

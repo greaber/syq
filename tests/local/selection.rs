@@ -161,6 +161,122 @@ fn native_copy_typed_selectors_are_source_preconditions() {
 }
 
 #[test]
+fn native_copy_refuses_a_named_symlink_unless_followed_or_selected_as_a_link() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("home/real/config"), b"config");
+    symlink("../config", t.path("home/real/inner")).unwrap();
+    symlink("real", t.path("home/.kube")).unwrap();
+    let home = t.s("home");
+
+    // A named link is refused before anything is created, however it is named.
+    for (case, selector) in [
+        ("positional", vec![".kube"]),
+        ("src", vec!["--src", ".kube"]),
+        ("srcs", vec!["--srcs", ".kube"]),
+    ] {
+        for placement in ["--into", "--as"] {
+            let target = t.s(&format!("refused-{case}{placement}/.kube"));
+            let mut args = vec!["cp", "-C", &home];
+            args.extend(&selector);
+            args.extend([placement, &target]);
+            let refused = native_syq(&args);
+            assert!(!refused.status.success(), "{case} {placement}");
+            let stderr = stderr_of(&refused);
+            assert!(
+                stderr.contains("source .kube is a symlink")
+                    && stderr.contains("--follow-src")
+                    && stderr.contains("--src-non-dir .kube"),
+                "{stderr}"
+            );
+            assert!(
+                !t.path(&format!("refused-{case}{placement}")).exists(),
+                "{case} {placement}"
+            );
+        }
+    }
+
+    // --follow-src copies what the link points to; links inside stay links.
+    run_native_ok(&[
+        "cp",
+        "-C",
+        &home,
+        "--follow-src",
+        ".kube",
+        "--into",
+        &t.s("followed"),
+    ]);
+    assert!(fs::symlink_metadata(t.path("followed/.kube"))
+        .unwrap()
+        .is_dir());
+    assert_eq!(read(&t.path("followed/.kube/config")), b"config");
+    assert_eq!(
+        fs::read_link(t.path("followed/.kube/inner")).unwrap(),
+        Path::new("../config")
+    );
+
+    // --src-non-dir copies the link itself; --follow-src then needs a non-directory.
+    run_native_ok(&[
+        "cp",
+        "-C",
+        &home,
+        "--src-non-dir",
+        ".kube",
+        "--into",
+        &t.s("linked"),
+    ]);
+    assert_eq!(
+        fs::read_link(t.path("linked/.kube")).unwrap(),
+        Path::new("real")
+    );
+    let followed_non_dir = native_syq(&[
+        "cp",
+        "-C",
+        &home,
+        "--follow-src",
+        "--src-non-dir",
+        ".kube",
+        "--into",
+        &t.s("followed-non-dir"),
+    ]);
+    assert!(!followed_non_dir.status.success());
+    assert!(stderr_of(&followed_non_dir).contains("--src-non-dir selector .kube is a directory"));
+    assert!(!t.path("followed-non-dir").exists());
+
+    // syq map applies the same rule to its selectors, and a symlink entry in
+    // a mapping is still copied as a link.
+    let map = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["map", "-C", &home])
+            .args(args)
+            .run()
+            .expect("run syq map")
+    };
+    let refused_map = map(&[".kube"]);
+    assert!(!refused_map.status.success());
+    assert!(stderr_of(&refused_map).contains("--src-non-dir .kube"));
+    let mapped = map(&["--src-non-dir", ".kube", "--include", "kind"]);
+    assert!(mapped.status.success(), "{}", stderr_of(&mapped));
+    let entry: serde_json::Value = serde_json::from_slice(&mapped.stdout).unwrap();
+    assert_eq!(entry["kind"], "symlink");
+    fs::write(t.path("mapping.ndjson"), &mapped.stdout).unwrap();
+    run_native_ok(&[
+        "cp",
+        "-C",
+        &home,
+        "--mapping",
+        &t.s("mapping.ndjson"),
+        "--into",
+        &t.s("mapped"),
+    ]);
+    assert_eq!(
+        fs::read_link(t.path("mapped/.kube")).unwrap(),
+        Path::new("real")
+    );
+}
+
+#[test]
 fn native_cp_with_prune_checks_all_typed_sources_before_mutation() {
     let t = Tmp::new();
     write(&t.path("src/good"), b"new");

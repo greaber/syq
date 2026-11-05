@@ -807,12 +807,20 @@ struct SourceMapping<'a> {
     sub: &'a [u8],
 }
 
+/// Check a selected root against its selector. A symlink named as a plain
+/// source is refused rather than copied as a link: people who name a link
+/// usually mean what it points to. `--src-non-dir` selects the link itself.
 pub(crate) fn validate_native_source_type(
     path: &[u8],
     selection: SourceSelection,
     kind: Kind,
 ) -> Result<()> {
     match selection {
+        SourceSelection::NamedNoFollow if kind == Kind::Symlink => bail!(
+            "source {} is a symlink; pass --follow-src to copy what it points to, or --src-non-dir {} to copy the link itself",
+            display(path),
+            display(path)
+        ),
         SourceSelection::Contents | SourceSelection::Directory if kind == Kind::Symlink => bail!(
             "selector {} is a symlink; pass --follow-src (or --follow) to resolve source symlinks",
             display(path)

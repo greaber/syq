@@ -55,7 +55,7 @@ link with `--insecure-links`, which applies to local paths only.)
 
 | Where the symlink appears | Treatment |
 |---|---|
-| In a source path you supply | Followed only with `--follow-src`. Without it, a link you name as the source is copied as a link, and a link elsewhere in the path, even a system one such as macOS's `/tmp`, stops the copy |
+| In a source path you supply | Followed only with `--follow-src`. Without it, a link in the path, even a system one such as macOS's `/tmp`, stops the copy; `--src-non-dir` copies a link you name as the source as a link |
 | In a destination path you supply | Followed only with `--follow-dst`; without it, a link in the path stops the copy. `--as PATH` replaces a link at its final entry instead of following it |
 | Inside a source directory being copied | Copied as a link; its target is not read |
 | Inside a destination directory | Not followed. A copied file can replace the link, but a copied directory cannot use it as a directory |

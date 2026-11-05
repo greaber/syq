@@ -467,14 +467,19 @@ default.
 
 ## Symlinks
 
-Syq copies symlinks as links. To copy through a symlink in a path you supply,
-use `--follow-src` for source paths or `--follow-dst` for destination paths.
-`--follow` does both, and also follows paths given to options such as
-`--ignore-from`.
+Syq copies the symlinks inside a directory as links. A symlink you name as a
+source stops the copy: pass `--follow-src` to copy what it points to, or name
+it with `--src-non-dir` to copy the link itself. A symlink elsewhere in a path
+you supply also stops the copy unless you pass `--follow-src` for source paths
+or `--follow-dst` for destination paths. `--follow` does both, and also
+follows paths given to options such as `--ignore-from`.
 
 ```sh
 # Copy the directory current-project points to as backup/current-project.
 syq cp --follow-src current-project --into backup
+
+# Copy the link current-project itself.
+syq cp --src-non-dir current-project --into backup
 
 # Put project inside the directory that backup points to.
 syq cp project --follow-dst --into backup
@@ -482,9 +487,8 @@ syq cp project --follow-dst --into backup
 
 `--as PATH` names the entry to replace, so `--follow-dst` only applies to its
 parent directories: `syq cp report.txt --as latest --follow-dst` replaces a
-symlink named `latest`, leaving its target unchanged. Links inside a copied
-directory always stay links. See [Filesystem attacks](security.md#filesystem-attacks)
-for the security details.
+symlink named `latest`, leaving its target unchanged. See
+[Filesystem attacks](security.md#filesystem-attacks) for the security details.
 
 <a id="keep-sources-inside-a-directory"></a>
 

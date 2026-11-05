@@ -1621,6 +1621,7 @@ fn access_time_of_explicit_symlink_is_captured_before_reading_its_target() {
                 .args([
                     "cp",
                     "--copy-metadata=atimes",
+                    "--src-non-dir",
                     &t.s("link"),
                     "--as",
                     &t.s("native-link"),
