@@ -95,8 +95,11 @@ pub(crate) fn check_copy(
     let mut derived =
         crate::restricted::named_request(&args, request.constraints.receipt_policy.clone())?;
     // The server supplies ignore rules and mapping file contents; this machine
-    // does not check them. The receiver uses them only to refuse operations
-    // within the checked scopes, policy, and limits, so they only narrow a copy.
+    // does not check them. Neither reaches beyond the checked scopes, policy,
+    // and limits, and ignore rules only narrow a copy, but a mapping's entries
+    // can also set the permissions and group of the files they list without
+    // the matching copy option. The prompt warns of that
+    // (`receive_approval::copy_warnings`).
     if args.native_mapping.is_some() {
         derived.constraints.mapping = request.constraints.mapping.clone();
     }
@@ -250,10 +253,10 @@ fn secret_header(header: &[u8]) -> bool {
     name.ends_with(b"server-side-encryption-customer-key")
 }
 
-/// Join displayed arguments, styling the values of options this machine does not
-/// check: ignore rules and mapping files, which only narrow a copy. With a
-/// `limit`, keep about that many characters, so a long command cannot push the
-/// rest of a prompt out of view.
+/// Join displayed arguments, styling the values of options naming files the
+/// server reads and this machine does not check: ignore rules and mapping
+/// files. With a `limit`, keep about that many characters, so a long command
+/// cannot push the rest of a prompt out of view.
 pub(crate) fn render(
     display: &[String],
     limit: Option<usize>,

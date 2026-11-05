@@ -1908,6 +1908,14 @@ fn statuses(domain: &Domain) -> Result<Vec<Status>> {
         .collect())
 }
 fn configure_profile(domain: &Domain, options: Configure) -> Result<Settings> {
+    // Refuse before saving: a receiving name never names a server to connect to.
+    if let Some(name) = options
+        .connection
+        .iter()
+        .find_map(|endpoint| endpoint.strip_prefix('@'))
+    {
+        bail!("@{name} is a receiving name, not an SSH server: --connection takes the SSH server this machine should connect to, such as `--connection server`");
+    }
     let _lock = settings_lock(domain)?;
     let existed = config_path(domain)?.exists();
     let mut preferences = preferences(domain)?;

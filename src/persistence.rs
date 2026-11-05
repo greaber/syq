@@ -212,6 +212,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         } => {
             let endpoint =
                 crate::cli::parse_native_endpoint(Some(&host))?.context("SSH endpoint missing")?;
+            reject_receiving_name(&endpoint.host)?;
             let explicit = auth_from
                 .as_deref()
                 .map(crate::cli::parse_auth_from)
@@ -379,6 +380,17 @@ pub(crate) fn parse_account_connect(
     ])
 }
 
+/// `persist connect` runs on the receiving machine and names an SSH server.
+fn reject_receiving_name(host: &str) -> Result<()> {
+    if let Some(name) = host.strip_prefix('@') {
+        bail!(crate::destination::notices::connect_takes_server(
+            name,
+            crate::destination::notices::here()
+        ));
+    }
+    Ok(())
+}
+
 /// `replace` says what to do with a receiving service from another build:
 /// replace it at once, as when the user runs `persist connect`, or only
 /// once idle, as a switch to a new build does.
@@ -392,9 +404,7 @@ pub(crate) fn connect_domain(
 ) -> Result<()> {
     let endpoint =
         crate::cli::parse_native_endpoint(Some(host))?.context("SSH endpoint missing")?;
-    if endpoint.host.starts_with('@') {
-        bail!("persist connect needs an SSH server, not a receiving name");
-    }
+    reject_receiving_name(&endpoint.host)?;
     let was_enabled = domain.enabled()?;
     let scope = domain.enable()?;
     if !was_enabled {
