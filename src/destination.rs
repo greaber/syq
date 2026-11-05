@@ -1209,12 +1209,27 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         // connection once, if this build can. A decision of the old one,
         // such as a denial, stands.
         Err(error) if switched_away(&error) => {
-            let Ok(current) = load_registration(&name) else {
-                return Err(error);
+            // A connection refusing requests while it stops for a switch is
+            // replaced within moments; wait a little for the new one to
+            // register.
+            let deadline = Instant::now()
+                + if format!("{error:#}").contains(SWITCHING) {
+                    SWITCH_REGISTRATION_WAIT
+                } else {
+                    Duration::ZERO
+                };
+            let current = loop {
+                match load_registration(&name) {
+                    Ok(current)
+                        if (&current.socket, &current.secret)
+                            != (&registration.socket, &registration.secret) =>
+                    {
+                        break current
+                    }
+                    _ if Instant::now() >= deadline => return Err(error),
+                    _ => std::thread::sleep(Duration::from_millis(100)),
+                }
             };
-            if (&current.socket, &current.secret) == (&registration.socket, &registration.secret) {
-                return Err(error);
-            }
             anyhow::ensure!(
                 current.identity == crate::identity::build(),
                 "@{name} switched to syq {} while this command was starting; run the command again",
@@ -1240,6 +1255,10 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     ));
     Ok(())
 }
+
+/// How long a copy refused by a receiving connection stopping for a switch
+/// waits for the new connection to register before asking it.
+const SWITCH_REGISTRATION_WAIT: Duration = Duration::from_secs(5);
 
 /// What a receiving connection that stopped for a switch to another syq
 /// build answers requests in its last moments.

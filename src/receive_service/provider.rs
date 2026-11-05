@@ -1090,8 +1090,7 @@ impl Runtime {
                 let mut wait = -1;
                 if let Some(follower) = &mut self.follower {
                     let service = &self.service;
-                    // Its switch is local and never logs in.
-                    follower.tick(&|| service.busy() == 0, &|| false, &switch_args);
+                    follower.tick(&|| service.busy() == 0, &switch_args);
                     *service.switch.lock().unwrap() = follower.report();
                     wait = follower.due().as_millis().clamp(1, 60_000) as i32;
                 }

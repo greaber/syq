@@ -442,12 +442,12 @@ sys.exit(23)
 
 /// Point `@laptop` at `socket`, as a receiving connection of build
 /// `identity` registers itself.
-fn register_at(fixture: &Fixture, socket: &std::path::Path, identity: &str, secret: &str) {
+fn register_at(home: &std::path::Path, socket: &std::path::Path, identity: &str, secret: &str) {
     let value = serde_json::json!({
         "version": 3, "identity": identity, "socket": socket,
         "secret": secret, "program": b"/no/such/helper".to_vec(),
     });
-    let path = fixture.temp.path().join(".syq-destinations-v3/laptop.json");
+    let path = home.join(".syq-destinations-v3/laptop.json");
     let new = path.with_extension("new");
     fs::write(&new, serde_json::to_vec(&value).unwrap()).unwrap();
     fs::set_permissions(&new, fs::Permissions::from_mode(0o600)).unwrap();
@@ -466,7 +466,7 @@ fn copy_while_the_receiver_switches(switched_to: &str) -> (Output, Vec<serde_jso
     let sockets = crate::test_support::short_tempdir().unwrap();
     // The connection the command chooses, gone by the time it asks.
     register_at(
-        &fixture,
+        fixture.temp.path(),
         &sockets.path().join("old.sock"),
         build,
         "old-secret",
@@ -538,7 +538,7 @@ fn copy_while_the_receiver_switches(switched_to: &str) -> (Output, Vec<serde_jso
         }
     };
     register_at(
-        &fixture,
+        fixture.temp.path(),
         &sockets.path().join("new.sock"),
         switched_to,
         "new-secret",
@@ -588,4 +588,74 @@ fn a_copy_whose_receiver_switched_to_another_build_asks_to_run_it_again() {
         "@laptop switched to syq another-build while this command was starting; run the command again",
     );
     assert!(requests.is_empty(), "{requests:?}");
+}
+
+/// A copy refused by a receiving connection that is stopping for a switch
+/// waits a little for the new connection to register, then asks it once.
+#[test]
+fn a_copy_refused_while_its_receiver_switches_asks_the_new_connection() {
+    let fixture = Fixture::new();
+    let build = String::from_utf8(fixture.run(&["--build-identity"]).stdout).unwrap();
+    let build = build.trim().to_owned();
+    let sockets = crate::test_support::short_tempdir().unwrap();
+    let home = fixture.temp.path().to_path_buf();
+    register_at(
+        &home,
+        &sockets.path().join("old.sock"),
+        &build,
+        "old-secret",
+    );
+    // Serve one request on `socket`, answering `reply`, then run `then`.
+    let serve =
+        |socket: std::path::PathBuf, reply: &'static [u8], then: Box<dyn FnOnce() + Send>| {
+            let listener = UnixListener::bind(socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "no request came");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                let mut length = [0; 4];
+                socket.read_exact(&mut length).unwrap();
+                let mut bytes = vec![0; u32::from_be_bytes(length) as usize];
+                socket.read_exact(&mut bytes).unwrap();
+                socket
+                    .write_all(&(reply.len() as u32).to_be_bytes())
+                    .unwrap();
+                socket.write_all(reply).unwrap();
+                drop(socket);
+                then();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            })
+        };
+    let new = serve(
+        sockets.path().join("new.sock"),
+        br#"{"Error":"refused by the test"}"#,
+        Box::new(|| {}),
+    );
+    // The old connection refuses while it stops; the new one registers a
+    // moment later.
+    let (new_socket, registered_build) = (sockets.path().join("new.sock"), build.clone());
+    let old = serve(
+        sockets.path().join("old.sock"),
+        br#"{"Error":"receiving is switching to another syq version; retry in a moment"}"#,
+        Box::new(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            register_at(&home, &new_socket, &registered_build, "new-secret");
+        }),
+    );
+    let output = fixture.run(&["cp", "source", "--to", "@laptop", "--into", "dst"]);
+    assert_switched_failure(&output, "receiving machine: refused by the test");
+    assert_eq!(old.join().unwrap()["secret"], "old-secret");
+    let request = new.join().unwrap();
+    assert_eq!(request["secret"], "new-secret");
+    assert!(request["message"].get("Request").is_some(), "{request}");
 }

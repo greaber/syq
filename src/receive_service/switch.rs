@@ -23,10 +23,14 @@
 //! still replaces any build at once.
 //!
 //! A switch that fails leaves this service running and says why in its
-//! status. One that could not log in to the server without the user waits
-//! until the user is there: a syq command to that server, which logs in as
-//! usual and leaves a live control connection the switch can use. Other
-//! failures are tried again with growing waits.
+//! status. One that could not log in to the server without the user is not
+//! tried again by the service: it waits until a syq command run at a
+//! terminal tries it, with the user at hand to touch a security key or
+//! approve an agent's request, at most every ten minutes
+//! (`receive_service::refresh_outdated`). Its status says so. A live
+//! control connection is no sign of the user: it can outlast them, and the
+//! switch's own login check does not use it. Other failures are tried again
+//! with growing waits.
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -127,7 +131,7 @@ impl Report {
             "waiting" => format!("switches to {to} once idle"),
             "switching" => format!("switching to {to}"),
             "login" => format!(
-                "switches to {to} after your next syq command to this server, since it could not log in by itself ({})",
+                "switches to {to} when you next run a syq copy or ssh command in a terminal, since it could not log in by itself ({})",
                 self.error.as_deref().unwrap_or("login failed")
             ),
             _ => format!(
@@ -316,8 +320,8 @@ enum State {
         error: String,
         retry: Instant,
     },
-    /// The last attempt could not log in without the user; try again once
-    /// the user is there (`present`).
+    /// The last attempt could not log in without the user. Only a command
+    /// run at a terminal tries again (see the module comment).
     Login {
         build: String,
         error: String,
@@ -356,7 +360,9 @@ impl Follower {
     pub(crate) fn due(&self) -> Duration {
         let now = Instant::now();
         match &self.state {
-            State::Current | State::Login { .. } => self.next_check.saturating_duration_since(now),
+            State::Current => self.next_check.saturating_duration_since(now),
+            // Nothing to do; a command switches it.
+            State::Login { .. } => Duration::from_secs(3600),
             State::Failed { retry, .. } => retry.saturating_duration_since(now),
             State::Probing(_) | State::Waiting { .. } | State::Switching(_) => {
                 Duration::from_millis(200)
@@ -370,14 +376,7 @@ impl Follower {
 
     /// Look at the path when due. When it holds another build and `idle`
     /// says nothing is in progress, run `args` with that build to switch.
-    /// After a switch could not log in, `present` says when the user is
-    /// there to let it: a live control connection to the server.
-    pub(crate) fn tick(
-        &mut self,
-        idle: &dyn Fn() -> bool,
-        present: &dyn Fn() -> bool,
-        args: &[OsString],
-    ) {
+    pub(crate) fn tick(&mut self, idle: &dyn Fn() -> bool, args: &[OsString]) {
         let now = Instant::now();
         let state = std::mem::replace(&mut self.state, State::Current);
         self.state = match state {
@@ -479,21 +478,8 @@ impl Follower {
                     State::Current
                 }
             }
-            State::Login { build, error } => {
-                if now < self.next_check {
-                    State::Login { build, error }
-                } else {
-                    self.next_check = now + check_interval();
-                    if present() {
-                        // Ask the file again, then switch over the live
-                        // connection once idle.
-                        self.next_check = now;
-                        State::Current
-                    } else {
-                        State::Login { build, error }
-                    }
-                }
-            }
+            // Only reported; a command run at a terminal tries again.
+            State::Login { build, error } => State::Login { build, error },
         };
     }
 
@@ -666,7 +652,7 @@ mod tests {
         while !done(follower) {
             assert!(Instant::now() < deadline, "{:?}", follower.report());
             follower.next_check = Instant::now();
-            follower.tick(idle, &|| false, &["persist".into(), "connect".into()]);
+            follower.tick(idle, &["persist".into(), "connect".into()]);
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -696,7 +682,7 @@ mod tests {
         });
         for _ in 0..3 {
             follower.next_check = Instant::now();
-            follower.tick(&|| true, &|| false, &[]);
+            follower.tick(&|| true, &[]);
             assert!(matches!(follower.state, State::Current));
         }
 
@@ -713,7 +699,7 @@ mod tests {
             matches!(follower.state, State::Waiting { .. })
         });
         for _ in 0..20 {
-            follower.tick(&|| false, &|| false, &[]);
+            follower.tick(&|| false, &[]);
         }
         assert_eq!(switches(&path), 0);
         assert_eq!(
@@ -769,11 +755,12 @@ mod tests {
         tick_until(&mut follower, &|| true, |_| switches(&path) == 1);
     }
 
-    /// A switch that cannot log in without the user is not tried again on
-    /// a timer. It waits until the user is there: a live control
-    /// connection to the server, as a syq command to it leaves.
+    /// A switch that cannot log in without the user is not tried again by
+    /// the service, however long it runs, whether or not a control
+    /// connection to the server stays up: only a command run at a terminal
+    /// tries again.
     #[test]
-    fn a_switch_that_needs_the_user_to_log_in_waits_for_the_user() {
+    fn a_switch_that_needs_the_user_to_log_in_is_not_tried_again_by_the_service() {
         let directory = crate::test_support::tempdir().unwrap();
         let path = directory.path().join("syq");
         script(&path, crate::identity::build());
@@ -799,26 +786,21 @@ mod tests {
         let report = follower.report().unwrap();
         assert_eq!(report.phase, "login");
         assert!(
-            report
-                .describe()
-                .starts_with("switches to syq v99.0.0 after your next syq command to this server"),
+            report.describe().starts_with(
+                "switches to syq v99.0.0 when you next run a syq copy or ssh command in a terminal"
+            ),
             "{}",
             report.describe()
         );
-        // No user, no attempt, however long it waits.
-        for _ in 0..20 {
+        // Idle and due, again and again: no further attempt.
+        for _ in 0..50 {
             follower.next_check = Instant::now();
-            follower.tick(&|| true, &|| false, &[]);
+            follower.tick(&|| true, &[]);
+            std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(switches(&path), 1);
-        // A live control connection lets it try again at once.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while switches(&path) < 2 {
-            assert!(Instant::now() < deadline, "{:?}", follower.report());
-            follower.next_check = Instant::now();
-            follower.tick(&|| true, &|| true, &[]);
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        assert!(matches!(follower.state, State::Login { .. }));
+        assert!(follower.due() >= Duration::from_secs(60));
     }
 
     /// A switch that fails says why and tries again after a wait; one that
@@ -851,7 +833,7 @@ mod tests {
         );
         // Nothing runs again before the wait is over.
         for _ in 0..20 {
-            follower.tick(&|| true, &|| false, &[]);
+            follower.tick(&|| true, &[]);
         }
         assert_eq!(switches(&path), 1);
         assert_eq!(follower.attempts, 1);

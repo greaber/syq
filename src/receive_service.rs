@@ -936,10 +936,14 @@ pub(crate) fn refresh_outdated(domain: &Domain, quiet: bool) {
             _ => {}
         }
         // Logging in again after a login that needed the user is worth it
-        // only with the user at hand.
+        // only with the user at hand, and no more than every ten minutes:
+        // each attempt that fails is a failed login on the server.
         let login = phase.as_deref() == Some("login");
-        if login && (!interactive || quiet) {
-            continue;
+        if login {
+            if !interactive || quiet {
+                continue;
+            }
+            crate::persistence::defer_switch_attempts(&control, switch::LOGIN_RETRY);
         }
         match start_switch(domain, &state.endpoint) {
             Ok(()) => notices.push(if login {
@@ -984,6 +988,9 @@ const REFRESH_ANSWER: Duration = Duration::from_millis(50);
 /// removes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Attempt {
+    /// `ATTEMPT_VERSION`; a reader ignores a record of another version.
+    #[serde(default)]
+    version: u16,
     build: String,
     /// `switching`, `failed`, or `login` (see `switch::Report`).
     phase: String,
@@ -991,9 +998,11 @@ pub(crate) struct Attempt {
     error: Option<String>,
     pid: u32,
 }
+const ATTEMPT_VERSION: u16 = 1;
 impl Attempt {
     pub(crate) fn new(phase: &str, error: Option<String>) -> Self {
         Self {
+            version: ATTEMPT_VERSION,
             build: crate::identity::build().into(),
             phase: phase.into(),
             error,
@@ -1047,7 +1056,9 @@ fn last_attempt(control: &Path) -> Option<Attempt> {
         .take(16 * 1024)
         .read_to_end(&mut bytes)
         .ok()?;
-    serde_json::from_slice(&bytes).ok()
+    serde_json::from_slice::<Attempt>(&bytes)
+        .ok()
+        .filter(|attempt| attempt.version == ATTEMPT_VERSION)
 }
 /// How a service's switch to another build is going: what it reports, or
 /// for one that cannot say, the last switch a command started for it.
@@ -1407,10 +1418,21 @@ fn replace_other(
             // this command used. Make sure it can before stopping a working
             // one: a failure leaves the old service receiving.
             check_login(control, remote)?;
-            if stop_when_idle(control, state)? {
+            // That took a while: decide on what the service says now, such
+            // as a request that began waiting for approval meanwhile.
+            let Some(state) = running_status(control, Retry::No, ANSWER_TIMEOUT)? else {
+                return Ok(None);
+            };
+            if state.identity == crate::identity::build() {
+                return Ok(Some(Receiving::Running));
+            }
+            if switch::follows_other_file(state.started_from.as_deref()) {
+                return Ok(other(None));
+            }
+            if stop_when_idle(control, &state)? {
                 Ok(None)
             } else {
-                Ok(other(Some(busy_of(state))))
+                Ok(other(Some(busy_of(&state))))
             }
         }
     }
@@ -2047,13 +2069,7 @@ fn run(domain: &Domain, control: &Path, started_from: Option<PathBuf>) -> Result
                 reconcile(domain, &mut workers, &config, &spec, Retry::No);
                 last_check = Instant::now();
                 if let Some(follower) = &mut follower {
-                    follower.tick(
-                        &|| workers.iter().all(ProfileWorker::idle),
-                        // A live control connection, as a syq command to the
-                        // server leaves, lets a switch skip logging in.
-                        &|| crate::persistence::socket_is_ready(control).unwrap_or(false),
-                        &switch_args,
-                    );
+                    follower.tick(&|| workers.iter().all(ProfileWorker::idle), &switch_args);
                 }
             }
             let mut accepted = false;
@@ -2123,15 +2139,16 @@ fn run(domain: &Domain, control: &Path, started_from: Option<PathBuf>) -> Result
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => return Err(e.into()),
             }
-            // Answer the next request as soon as it arrives, and do the
-            // periodic work above at least every 20 ms.
+            // Answer the next request as soon as it arrives, and otherwise
+            // wake for the periodic work above, every 200 ms. A stop is a
+            // request, and signals end the wait too.
             if !accepted {
                 let mut descriptor = libc::pollfd {
                     fd: listener.as_raw_fd(),
                     events: libc::POLLIN,
                     revents: 0,
                 };
-                unsafe { libc::poll(&mut descriptor, 1, 20) };
+                unsafe { libc::poll(&mut descriptor, 1, 200) };
             }
         }
         drop(workers);

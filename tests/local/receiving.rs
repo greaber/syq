@@ -3053,6 +3053,9 @@ case " $* " in
             echo 'syq@test-server: Permission denied (publickey).' >&2
             exit 255
         fi
+        if [ -n "${FAKE_SSH_DIRECT_MARK:-}" ]; then
+            : > "$FAKE_SSH_DIRECT_MARK"
+        fi
         ;;
 esac
 for argument in "$@"; do
@@ -3332,15 +3335,17 @@ fn older_service(
     installed: &Installed,
     pending: serde_json::Value,
 ) -> std::thread::JoinHandle<Vec<serde_json::Value>> {
-    other_service(installed, pending, None)
+    other_service(installed, pending, None, None)
 }
 
 /// As `older_service`; with `busy`, it reports what it has in progress as
 /// services do since syq follows updates, and agrees to stop when idle.
+/// With `pending_once`, its `pending` requests appear once that file exists.
 fn other_service(
     installed: &Installed,
     pending: serde_json::Value,
     busy: Option<serde_json::Value>,
+    pending_once: Option<PathBuf>,
 ) -> std::thread::JoinHandle<Vec<serde_json::Value>> {
     let control = installed.control();
     let suffixed = |suffix: &str| PathBuf::from(format!("{}{suffix}", control.display()));
@@ -3400,6 +3405,10 @@ fn other_service(
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
             let request = read_provider_frame(&mut stream);
+            let pending = match &pending_once {
+                Some(file) if !file.exists() => serde_json::json!([]),
+                _ => pending.clone(),
+            };
             let mut answer = serde_json::json!({
                 "version": 2, "identity": "v0.7.1", "pid": 0,
                 "endpoint": "test-server", "name": "",
@@ -3519,6 +3528,7 @@ fn a_switch_that_cannot_log_in_leaves_the_old_service_receiving() {
         &installed,
         serde_json::json!([]),
         Some(serde_json::json!({"requests": 0, "pending": 0})),
+        None,
     );
     let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
     let mut command = installed.command(
@@ -3553,7 +3563,7 @@ fn a_switch_that_cannot_log_in_leaves_the_old_service_receiving() {
     let shown = installed.persist(syq, &["status"]);
     assert!(
         String::from_utf8_lossy(&shown.stdout)
-            .contains("after your next syq command to this server"),
+            .contains("when you next run a syq copy or ssh command in a terminal"),
         "{}",
         String::from_utf8_lossy(&shown.stdout)
     );
@@ -3578,6 +3588,61 @@ fn a_switch_that_cannot_log_in_leaves_the_old_service_receiving() {
         !stderr_of(&copied).contains("switching"),
         "{}",
         stderr_of(&copied)
+    );
+    installed.request(serde_json::json!({"version": 2, "stop": true}));
+    let requests = old.join().unwrap();
+    assert!(
+        requests[..requests.len() - 1]
+            .iter()
+            .all(|request| request == &serde_json::json!({"version": 2, "stop": false})),
+        "{requests:?}"
+    );
+}
+
+/// A request that begins waiting for approval while a switch checks its
+/// login keeps an older service, which reports only such requests, running.
+#[test]
+fn a_request_waiting_for_approval_during_the_login_check_keeps_the_old_service() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let checked = t.path("login-checked");
+    let old = other_service(
+        &installed,
+        serde_json::json!([{
+            "id": "0123456789abcdef0123456789abcdef", "from": "test-server",
+            "expires_at": 4102444800u64, "notification": "none",
+            "destination": "/inbox", "permission": "write", "max_bytes": 1,
+            "max_entries": 1, "max_delete": 0, "preserve_permissions": false
+        }]),
+        None,
+        Some(checked.clone()),
+    );
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    let switched = installed
+        .command(
+            syq,
+            &[
+                "persist",
+                "connect",
+                "test-server",
+                "--auth-from",
+                "ssh",
+                "--when-idle",
+                "--pscope",
+                installed.scope.to_str().unwrap(),
+            ],
+        )
+        .env("FAKE_SSH_DIRECT_MARK", &checked)
+        .run()
+        .unwrap();
+    assert_output_ok(&switched);
+    assert!(checked.exists(), "the login was not checked");
+    assert!(
+        String::from_utf8_lossy(&switched.stdout)
+            .contains("keeps running syq v0.7.1 for now, with 1 request waiting for approval"),
+        "{switched:?}"
     );
     installed.request(serde_json::json!({"version": 2, "stop": true}));
     let requests = old.join().unwrap();
