@@ -378,7 +378,10 @@ within one machine that copies files whole does not: rerunning it copies those
 files whole again, so their partial files are removed.
 
 Partial files may remain after a successful retry, as can temporary files
-left by a copy that was killed. To remove them:
+left by a copy that was killed. A copy reads the partial files an earlier copy
+left, but does not remove them, since another copy may still be writing one;
+when it finds some, it says how many files had them and how to remove them.
+To remove them:
 
 ```sh
 syq clean-partials --dry-run -v backup
@@ -793,6 +796,31 @@ relative destination paths start.
 Use `--root DIR` instead of `-C DIR` when selections must stay inside that
 directory. Sources must then be relative: `../private` is refused, and even
 with `--follow-src`, symlinks cannot lead outside the root. `-C` permits both.
+
+One copy accepts up to 1,024 named sources, such as the names a shell glob
+expands to. Some copies take fewer:
+
+- A copy that runs on an approval, such as a
+  [restricted copy between servers](remote-reference.md#enrollment) or a copy
+  a [receiving machine](receive.md) approves, lists in that approval the
+  destination and each path a named source is copied to, at most 1,024 paths
+  in all. Copied into a directory, such a copy takes up to 1,023 named
+  sources. A receiving machine also limits the size of the request it
+  approves, so long names lower that: to about 890 names of 20 characters, or
+  460 of 50.
+- A [copy between two servers](remote-to-remote.md) passes its named sources
+  to the server that runs it on a command line, which holds 128 KiB, and each
+  path takes about a third more room there than its length. So 1,024 sources
+  fit when their paths average up to about 90 characters, and 500 when they
+  average up to about 190.
+- With `--prune`, a copy checks every named source against every other in
+  one request, which holds about 950 sources with 8-character names, or 630
+  with 20-character names.
+
+For more, select their parent directory with `--srcs-in` and leave out what
+you don't want with `--ignore` or `--where`, or split the copy. Each named
+source adds to the copy's setup time, and with `--prune` that time grows with
+the square of their number.
 
 ## Shell pipelines and file descriptors
 

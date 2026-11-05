@@ -500,6 +500,14 @@ pub(crate) fn copy_operation(
     };
     mutation_scopes.sort_by(|left, right| left.path.cmp(&right.path));
     mutation_scopes.dedup_by(|left, right| left.path == right.path);
+    if mutation_scopes.len() > delegation::MAX_MUTATION_SCOPES {
+        bail!(
+            "this copy names {} sources, more than the {} its approval can list; {}",
+            sources.len(),
+            delegation::MAX_MUTATION_SCOPES - 1,
+            crate::fsops::FEWER_SOURCES
+        );
+    }
     // Per-object policy only. The placement root's own precondition
     // (`--into-existing` and friends) is the separate root-existence rule;
     // folding it in here would forbid creating files inside an existing

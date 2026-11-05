@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import socket
 import sys
 import unittest
@@ -176,6 +177,26 @@ class MappingStreamCopies(unittest.TestCase):
         self.assertEqual((result.exit_code, result.files_transferred, result.errors), (23, 1, 1))
         self.assertEqual(target.read_bytes(), b"old")
         self.assertEqual((self.root / "next").read_bytes(), b"next")
+
+    @unittest.skipIf(os.geteuid() == 0, "root searches a directory without search permission")
+    def test_fatal_pathname_phase_failure_is_recorded_once(self):
+        import io
+        import json
+        blocked = self.root / "blocked"
+        cwd = blocked / "inside"
+        cwd.mkdir(parents=True)
+        (cwd / "file").write_bytes(b"data")
+        blocked.chmod(0)
+        self.addCleanup(blocked.chmod, 0o700)
+        saved = io.BytesIO()
+        result = self.client.cp(mapping=[
+            syq.MappingEntry("file", "copied"),
+            syq.MappingEntry(syq.StreamSource(lambda out: out.write(b"x")), "streamed"),
+        ], cwd=cwd, into=self.root / "destination", results=saved, check=False)
+        records = [json.loads(line) for line in saved.getvalue().splitlines()]
+        errors = [record for record in records if record["type"] == "error"]
+        self.assertEqual(len(errors), 1, records)
+        self.assertEqual((result.exit_code, result.errors), (1, 1))
 
     def test_consumer_eof_validates_transfer_and_normal_early_return_drains(self):
         target = self.root / "source"
