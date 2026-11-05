@@ -75,7 +75,7 @@ progress display can read the same stream.
 | Code | Terminal status | Meaning |
 |---|---|---|
 | `0` | `success` | Requested operation succeeded |
-| `1` | `failed` / `aborted` | Fatal failure or abort |
+| `1` | `failed` / `aborted`, or no stream | Fatal failure or abort; with no stream, the results sink could not be opened |
 | `2` | No stream | Invalid arguments |
 | `23` | `partial` | Per-entry failures; independent work finished |
 | `25` | `refused` | A safety cap refused deletions |

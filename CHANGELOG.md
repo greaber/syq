@@ -83,8 +83,11 @@ and network filesystems are much faster.
   [HTTPS certificates](docs/security.md#https-certificates).
 - **Interrupted S3 multipart uploads** started by 0.7.1 start over after the
   upgrade, and older versions refuse to resume uploads this version started.
-- **Receiving machines** switch to the new version at the next connection;
-  requests that were waiting for approval must be made again.
+- **Receiving machines:** after upgrading both machines, run
+  `syq persist connect SERVER` on the receiving machine. It replaces the
+  receiving connection from the older version and keeps your settings;
+  requests that were waiting for approval must be made again. See
+  [updating connections](docs/persistence-reference.md#updating-connections).
 - **Builds from source**, including `cargo install syq` and Python source
   builds, now report their development version, such as
   `0.7.1+dev.0123456789ab`, from `--version` and in results.
@@ -98,10 +101,11 @@ and network filesystems are much faster.
 - `syq cp` no longer changes the permissions of read-only directories you own
   to copy into them; `--widen-dirs rsync` or `all` allows it. `syq rsync`
   briefly widens the directories it copies, as rsync does (`--syq-widen-dirs`).
-- Without `-p`, new files and directories follow the destination's default ACL
-  or umask on every route, and `syq rsync` keeps read-only source directory
-  modes, as rsync does. With `-p`, an existing destination directory that is
-  wider than its source is narrowed before files are copied into it.
+- Without `--copy-metadata=permissions` (`syq rsync -p`), new files and
+  directories follow the destination's default ACL or umask on every route,
+  and `syq rsync` keeps read-only source directory modes, as rsync does. When
+  permissions are copied, an existing destination directory that is wider
+  than its source is narrowed before files are copied into it.
 - Ignore rules match paths relative to each selected source directory on every
   route, including S3, and skip named file sources whose names match.
 - Bandwidth limits on SSH and TCP copies count bytes sent after compression,
@@ -155,15 +159,16 @@ and network filesystems are much faster.
   every wait for approval prints a line saying what it is waiting for.
   <!-- PR #844; still open when this entry was written. -->
 - A command that starts background connections or receiving says so once and
-  names `syq persist off`. <!-- PR #845; still open when this entry was written. -->
+  names `syq persist off`.
 
 ### Copying
 
-- Preserve hard links (`-H`, `--copy-metadata=hardlinks`), ACLs and extended
-  attributes on Linux and macOS (`-A`, `-X`), access times (`-U`) and macOS
-  birth times (`-N`). `--open-noatime` reads sources without updating their
-  access times, `--sparse` (`-S`) writes zero ranges as holes, and
-  `syq rsync -aHAX` now works.
+- `--copy-metadata=hardlinks,acls,xattrs,atimes,crtimes`
+  (`syq rsync -H -A -X -U -N`) preserves hard links, ACLs and extended
+  attributes on Linux and macOS, access times, and macOS birth times, and
+  `syq rsync -aHAX` now works. `--open-noatime` reads sources without
+  updating their access times, and `--sparse` (`syq rsync -S`) writes zero
+  ranges as holes.
 - `--where` selects files with typed expressions and `--copy-if` decides which
   ones may be created or updated; `syq map` accepts `--where` too. See
   [expressions](docs/expressions.md).
@@ -190,7 +195,6 @@ and network filesystems are much faster.
 - The TCP check waits a few SSH round trips for an answer instead of a full
   second, and says when file data falls back to SSH. The summary shows data
   reused inside transferred files separately from unchanged files.
-  <!-- PR #845; still open when this entry was written. -->
 
 ### S3
 
@@ -205,8 +209,8 @@ and network filesystems are much faster.
   sharply. Buckets that require a checksum get Content-MD5, and uploads over
   plain HTTP always send it.
 - Bucket-to-bucket copies decide whether a destination matches from syq's
-  hashes, full-object SHA-256 or CRC64NVME; 32-bit CRCs and SHA-1 no longer
-  count.
+  hashes, full-object SHA-256 or CRC64NVME, and otherwise ETags or stored size
+  and time; 32-bit CRCs and SHA-1 no longer count.
 - Each request keeps its own retries under throttling and honors
   `Retry-After`. Copies and removals stop after the service stops answering,
   uploads the service received corrupted are sent again, and a missing
@@ -235,7 +239,7 @@ and network filesystems are much faster.
 - Removal and pruning tune their own concurrency and use much less CPU on many
   small files.
 - `syq map` uses up to about 40% less memory on large trees, and published
-  binaries are 16-20% smaller.
+  binaries for Linux and Apple Silicon macOS are 16-20% smaller.
 - Files on compressed btrfs are no longer preallocated, so they stay
   compressed.
 - Copies use more workers under low open-file limits, and recover when they
@@ -246,18 +250,20 @@ and network filesystems are much faster.
 - A same-machine in-place copy could leave an existing file empty when its
   fallback write failed, for example on an rclone mount or a full disk.
 - Delayed write errors, such as a full NFS export, are reported before the file
-  is put in place, and a source that changes during the copy is detected
-  before the destination is replaced.
-- On Linux, destination blocks syq reuses are protected from other programs
-  writing them at the same time.
+  is put in place. In filesystem copies, a source that changes during the copy
+  is usually detected before the destination is replaced.
+- On Linux ext4, XFS, Btrfs, ZFS and tmpfs, destination blocks syq reuses are
+  checked with a read lease, so another program writing them during the copy
+  is noticed.
 - New files and directories stay private until their permissions are set,
-  metadata changes never briefly widen permissions, and a file another program
-  swaps in during a copy never receives the copy's data or metadata. The
-  receiver of a local copy listens only on the loopback interface.
-- SSHFS, FAT, exFAT and macOS FAT32 destinations are handled safely: `-H` and
-  symlink copies work on SSHFS, FAT files with odd-second times are no longer
-  copied again on every run, and a replacement on macOS FAT32 no longer
-  destroys the target.
+  and metadata changes never briefly widen permissions. In ordinary copies, a
+  file another program swaps in during the copy never receives the copy's
+  data or metadata; `--in-place=update` and `--as-fd` write into existing
+  files. The receiver of a local copy listens only on the loopback interface.
+- SSHFS, FAT, exFAT and macOS FAT32 destinations are handled safely: hard
+  links and symlink copies work on SSHFS, FAT files with odd-second times are
+  no longer copied again on every run, and a replacement on macOS FAT32 no
+  longer destroys the target.
 - `syq rm` no longer reports failures after removing directories on NFS,
   SSHFS and other FUSE mounts.
 - Hangs fixed: several SSH helpers starting at once on macOS, undecodable

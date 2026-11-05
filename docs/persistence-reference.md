@@ -492,13 +492,15 @@ syq on both machines and reconnect from your laptop.
 
 ## Updating connections
 
-Before upgrading, run `syq persist off` on the receiving machine to stop its
-background services. Replacing the executable alone does not update running
-services. Close script scopes with `syq persist off --pscope PATH` too.
-After upgrading both machines, run `syq persist connect server` for each server
-you want to use. If receiving was disabled, enable it first with
-`syq persist receive on`, or enable and connect together with
-`syq persist receive on --connection server`.
+After upgrading syq on both machines, run `syq persist connect server` on the
+receiving machine for each server you use, adding `--pscope PATH` for a scoped
+domain. A connection from the new version stops the receiving service that the
+older version left running, starts the new one, and keeps your settings. If
+receiving was disabled, enable it first with `syq persist receive on`, or
+enable and connect together with `syq persist receive on --connection server`.
+
+You do not need `syq persist off` before upgrading. For a scoped domain it
+also deletes that domain's settings and remembered permissions.
 
 Receiving starts again with the new version, so requests that were waiting
 for approval do not carry over: run them again on the server and approve the
@@ -506,17 +508,14 @@ new requests. Session permissions (**Allow**) end with the old receiving
 connection, so the next account access asks again unless you chose
 **Remember**.
 
-Use the current binary to close explicit domains. An older binary may stop their
-services but refuse to remove newer settings; rerun scoped `off` with the current
-binary to finish cleanup. Older global receiving commands do not manage newly
-created domains. If you enable receiving in a scope created by an older version,
-avoid using that older version's global receiving commands at the same time.
+Manage receiving with the new version afterwards. An older binary may refuse
+settings that a newer one wrote, and its global receiving commands do not
+manage scoped domains created by a newer version.
 
 Saved names, directories, and limits carry over. Existing working directories
 remain explicitly selected. Settings using the former `--approve always` now
 require approval; choose `--auto-approve-root` explicitly to enable unattended
-downloads. Older binaries reject the updated preferences; use the newer binary
-to manage receiving.
+downloads.
 
 Connections created before persistent receiver identities remain discoverable.
 Their names become assigned when an updated receiving machine reconnects.

@@ -28,7 +28,7 @@ helpers, or other programs; the rest of the environment is passed through.
 |---|---|
 | `SSL_CERT_FILE`, `SSL_CERT_DIR` | Replace the system CA roots for HTTPS; see [HTTPS certificates](security.md#https-certificates) |
 | `SYQ_NO_UPDATE_CHECK`, `DO_NOT_TRACK` | Disable update reminders; see [Updates](install.md#updates) |
-| `SYQ_TUNING_CACHE` | Select the connection-count cache; an empty value disables it. See [Remembered connection counts](tuning.md#remembered-connection-counts) |
+| `SYQ_TUNING_CACHE` | An empty value turns off tuning history, even when `SYQ_TUNING_HISTORY` is set. Otherwise, when `SYQ_TUNING_HISTORY` is unset, the history is kept at this path with its extension replaced by `.history-v1.sqlite`. See [Remembered connection counts](tuning.md#remembered-connection-counts) |
 | `SYQ_TUNING_HISTORY` | Select the local tuning history; empty disables it. See [Tuning history](tuning.md#inspect-tuning-history) |
 | `SYQ_TUNING_HISTORY_SIZE` | History retention target, default `10M` |
 | `SYQ_DEBUG` | Add internal diagnostics to stderr |
@@ -45,7 +45,7 @@ Default locations include:
 
 | Location | Contents |
 |---|---|
-| `~/.cache/syq/tuning.json` | Learned connection counts in the legacy format |
+| `~/.cache/syq/tuning.json` | Connection counts saved by older versions; no longer used, and safe to delete |
 | `~/.cache/syq/tuning.history-v1.sqlite` | Local tuning timelines and filesystem startup hints |
 | `~/.cache/syq/completion-endpoints.json` | Hosts offered by completion |
 | `~/.config/syq/persistence.json` | Whether persistence is enabled |
