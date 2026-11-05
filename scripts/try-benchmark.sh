@@ -34,9 +34,10 @@ Without --yes, unanswered choices are prompted through /dev/tty (also with curl 
   --help                   Show this help
 
 After --, tune syq with --performance-tuning, --resource-limits,
---tcp-ports, --tcp-congestion (each takes a value), or --no-tcp, --no-compress,
---no-tcp-encryption (--tcp-plain through v0.7.1), --inplace, --stats,
---no-progress, -v/-vv/--verbose.
+--tcp-ports, --tcp-congestion, --in-place (each takes a value), or --no-tcp,
+--no-compress, --no-tcp-encryption, --stats, --no-progress, -v/-vv/--verbose.
+Through v0.7.1, syq spelled --no-tcp-encryption as --tcp-plain and
+--in-place=update as --inplace.
 These options also apply to syq setup/warm-up/calibration; rsync and cp are unchanged.
 Add -v/-vv/--verbose after -- to show full commands and scratch paths.
 Use --tool syq --rounds 1 --size quick for one scored syq copy per workload.
@@ -489,11 +490,11 @@ main() {
                 shift
                 while [[ $# -gt 0 ]]; do
                     case $1 in
-                        --performance-tuning|--resource-limits|--tcp-ports|--tcp-congestion)
+                        --performance-tuning|--resource-limits|--tcp-ports|--tcp-congestion|--in-place)
                             [[ $# -ge 2 && -n $2 ]] || fail "$1 needs a value"
                             case $1 in --performance-tuning) manual_tuning=true ;; esac
                             syq_extra+=("$1" "$2"); shift 2 ;;
-                        --performance-tuning=?*|--resource-limits=?*|--tcp-ports=?*|--tcp-congestion=?*)
+                        --performance-tuning=?*|--resource-limits=?*|--tcp-ports=?*|--tcp-congestion=?*|--in-place=?*)
                             case $1 in --performance-tuning=*) manual_tuning=true ;; esac
                             syq_extra+=("$1"); shift ;;
                         -v|-vv|--verbose)
