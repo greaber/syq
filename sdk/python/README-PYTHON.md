@@ -257,8 +257,9 @@ client's timeout for one call:
 result = client.cp("data", into="backup", timeout=None)
 ```
 
-`Client(executable="/opt/bin/syq")` runs another syq instead of the bundled
-one; see [Compatibility](https://greaber.github.io/syq/python-operations.html#compatibility).
+`Client(executable="/opt/bin/syq")` runs another syq instead of the bundled one;
+see
+[Compatibility](https://greaber.github.io/syq/python-operations.html#compatibility).
 
 <a id="native-api-reference"></a>
 

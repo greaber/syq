@@ -199,6 +199,9 @@ Unicode spellings of one name) collide. Syq does not check for this, so one
 replaces the other or is reported as a conflict. Rename one source, or use a
 destination that can tell them apart.
 
+Syq never replaces a directory with a non-directory or the reverse, even an
+empty one; move or remove the conflicting entry first.
+
 ## Metadata details
 
 When you copy metadata to another machine, check how it carries over. Setuid,
@@ -229,10 +232,10 @@ standard error, so descriptor 2 cannot carry a payload.
 
 ### Completion and failures
 
-A named destination is replaced only after the transfer succeeds, but syq
-cannot tell whether the producer succeeded: if the producer fails partway, syq
-still saves the bytes it received. Check the producer's status, for example with Bash's
-`set -o pipefail`; Python
+A named destination is replaced only after the transfer succeeds, but syq cannot
+tell whether the producer succeeded: if the producer fails partway, syq still
+saves the bytes it received. Check the producer's status, for example with
+Bash's `set -o pipefail`; Python
 [managed streams](https://greaber.github.io/syq/python-streams.html#byte-streams)
 do this for you. Likewise, check syq's exit status before using what it wrote
 to an output descriptor, which can be incomplete after a failure.

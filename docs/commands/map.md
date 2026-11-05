@@ -103,9 +103,9 @@ or generate it with any program:
 | `expected_hash` | Optional whole-file hash, such as `{"algorithm":"md5","value":"900150983cd24fb0d6963f7d28e17f72"}`; the entry fails if the copied file does not match. See [expected hashes](../integrity-checking.md#expected-hashes) |
 
 Each path has an `encoding` and a `value`: `"utf-8"` text, or `"base64"`, the
-standard base64 of the raw filename bytes for a name that is not UTF-8. `syq map` refuses such names,
-but a mapping you write can use them. Paths must be relative, with no `.` or
-`..` components, and unknown fields are refused.
+standard base64 of the raw filename bytes for a name that is not UTF-8.
+`syq map` refuses such names, but a mapping you write can use them. Paths must
+be relative, with no `.` or `..` components, and unknown fields are refused.
 
 Each entry copies one object, and **a directory entry does not copy its
 contents**, so `syq map` lists every descendant as its own entry. An entry
@@ -145,10 +145,10 @@ cannot be combined with `--as`, `--prune`, `--prune-before`, `--ignore`,
 Syq never follows symlinks within an entry's paths; `--follow` and its variants
 apply only to paths on the command line.
 
-Syq checks the whole mapping before copying anything, so a malformed line or
-two entries with the same destination refuse the run; the destination
-directory may already have been created. Read a mapping from a pipeline with `--mapping -`. Entries with
-`kind: "special"` are copied only with `--copy-metadata=specials`.
+Syq checks the whole mapping before copying anything, so a malformed line or two
+entries with the same destination refuse the run; the destination directory may
+already have been created. Read a mapping from a pipeline with `--mapping -`.
+Entries with `kind: "special"` are copied only with `--copy-metadata=specials`.
 
 ## Filter a mapping
 

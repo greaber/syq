@@ -1,7 +1,8 @@
 # syq persist
 
 Keep SSH connections open between commands, and let servers send copies and
-requests to your laptop. Start with [Use your laptop from a server](../receive.md);
+requests to your laptop. Start with
+[Use your laptop from a server](../receive.md);
 [Persistence details](../persistence-reference.md) covers profiles and limits.
 
 <!-- CLI: persist -->

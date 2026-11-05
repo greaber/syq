@@ -42,8 +42,8 @@ syq exec [OPTIONS] --on <@NAME> -- <PROGRAM>...
 
 Every command needs approval on the laptop, even when copies are approved
 automatically. Review the program, arguments, requesting server, and working
-directory before you approve it. If the desktop prompt is missing or truncated, answer from a
-terminal on the laptop:
+directory before you approve it. If the desktop prompt is missing or truncated,
+answer from a terminal on the laptop:
 
 ```sh
 syq persist receive pending
@@ -66,10 +66,10 @@ syq exec --on @laptop --cwd work/project -- sh -c 'cargo build && ./target/debug
 
 Without `--cwd`, the command runs in the receiving profile's directory, which
 `syq persist receive status` shows. A relative `--cwd` is resolved from there,
-an absolute one is used as given, and `~` is not expanded. The command gets the environment of the receiving service on the
-laptop, including its `PATH`, not the server's; to change it, restart
-receiving from a terminal in the session you want. It has no terminal and no
-standard input.
+an absolute one is used as given, and `~` is not expanded. The command gets the
+environment of the receiving service on the laptop, including its `PATH`, not
+the server's; to change it, restart receiving from a terminal in the session you
+want. It has no terminal and no standard input.
 
 ## Output, completion and cancellation
 

@@ -119,8 +119,8 @@ what they do.
 
 To copy between two SSH servers, `cp` uses
 [restricted copying](https://greaber.github.io/syq/remote-to-remote.html) on
-the destination, which the first copy sets up as in the CLI; approved account
-access to both servers; or `coordinate_at="local"`. For `--detach` and
+the destination (the first copy sets it up, as in the CLI), approved account
+access to both servers, or `coordinate_at="local"`. For `--detach` and
 human-readable output options, use `run`.
 
 `IgnoreFrom(path)` names a rule file, so you can interleave files and patterns:
@@ -161,18 +161,17 @@ A stream always raises on a transfer failure; it has no `check` argument.
 ### Writer completion
 
 Use a `with` block: the writer publishes when the block exits without an
-exception. An exception inside a writer's or reader's block cancels the
-transfer, leaves the destination unchanged, and propagates unchanged. Calling
-`close()` in the block does not stop publication; only `abort()` does. If you wrap the writer in
-`io.BufferedWriter` or `io.TextIOWrapper`, close the wrapper before the writer
-commits, so its buffered data is written.
+exception. An exception inside either block cancels the transfer and propagates
+unchanged; a cancelled writer leaves its destination as it was. Calling
+`close()` in the block does not stop publication; only `abort()` does. If you
+wrap the writer in `io.BufferedWriter` or `io.TextIOWrapper`, close the wrapper
+before the writer commits, so its buffered data is written.
 
 Without a `with` block, finish with `commit()` or `abort()`; after `close()`
 alone, the transfer stays pending, and an uncommitted writer is aborted only
-when it is garbage-collected, which can block. `commit()` publishes at once, so a later
-error in your program cannot undo it. If a timeout or lost connection
-interrupts it, `commit()` raises without knowing whether the file was
-published.
+when it is garbage-collected, which can block. `commit()` publishes at once, so
+a later error in your program cannot undo it. If a timeout or lost connection
+interrupts it, `commit()` raises without knowing whether the file was published.
 
 ### Skips and previews
 
@@ -232,13 +231,15 @@ methods are coroutines.
 
 ## rm
 
-`rm(*sources, **options)` → [RmResult](https://greaber.github.io/syq/python-results.html#rmresult)
-removes the selected entries locally, on an SSH server (`on="server"`), or in
-S3 (`on="s3://bucket"`); see [Remove files](https://greaber.github.io/syq/remove.html).
-Besides the shared arguments, it accepts `on`, `dry_run`, `performance_tuning`,
-`syq_path`, `no_bootstrap`, `pscope`, `on_event`, `results`, and `check`, as on
-`cp`. `performance_tuning="workers=N"` sets how many filesystem deletions run
-at once, and `"s3-requests=N"` does the same for S3.
+`rm(*sources, **options)` →
+[RmResult](https://greaber.github.io/syq/python-results.html#rmresult) removes
+the selected entries locally, on an SSH server (`on="server"`), or in S3
+(`on="s3://bucket"`); see
+[Remove files](https://greaber.github.io/syq/remove.html). Besides the shared
+arguments, it accepts `on`, `dry_run`, `performance_tuning`, `syq_path`,
+`no_bootstrap`, `pscope`, `on_event`, `results`, and `check`, as on `cp`.
+`performance_tuning="workers=N"` sets how many filesystem deletions run at once,
+and `"s3-requests=N"` does the same for S3.
 
 Selectors follow the
 [`syq rm` rules](https://greaber.github.io/syq/commands/rm.html#selection-rules):
@@ -380,12 +381,11 @@ the indices of the failed entries.
 
 ### Hash and HashAlgorithm
 
-To require known contents for a mapped file, give its entry an
-`expected_hash`. `Hash(algorithm, value)` is the expected hash of a whole
-regular file.
+To require known contents for a mapped file, give its entry an `expected_hash`.
+`Hash(algorithm, value)` is the expected hash of a whole regular file.
 `algorithm` is a `HashAlgorithm` or its string: `"blake3"`, `"sha256"`, `"md5"`,
-or `"xxh3-128"`. `value` is hexadecimal: 64 digits for BLAKE3 and SHA-256, 32 for MD5 and
-XXH3-128.
+or `"xxh3-128"`. `value` is hexadecimal: 64 digits for BLAKE3 and SHA-256, 32
+for MD5 and XXH3-128.
 
 A file fails if its complete contents do not match; see
 [expected hashes](https://greaber.github.io/syq/integrity-checking.html#expected-hashes)

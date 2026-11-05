@@ -1,6 +1,6 @@
 # syq receiver
 
-Restricted copying lets one server
+`syq receiver` manages restricted copying, which lets one server
 [copy into your account on another server](../remote-to-remote.md) without
 being given your SSH access to that account. See
 [access management](../remote-to-remote.md#first-copy-and-access-management)
