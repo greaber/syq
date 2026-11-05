@@ -1,14 +1,14 @@
 # syq rsync
 
-Copy with rsync-style arguments:
+Run an rsync command with syq by putting `syq` in front of it:
 
 ```sh
 syq rsync -av project/ server:backup/project/
 ```
 
 Check [Rsync compatibility](../rsync-compat.md) before replacing a script.
-Trailing slashes follow rsync's rules. Here `-h` means human-readable sizes;
-use `--help` for help. `SYQ_RSYNC_OPTIONS` supplies
+As in rsync, trailing slashes matter and `-h` means human-readable sizes; use
+`--help` for help. `SYQ_RSYNC_OPTIONS` adds
 [extra arguments](../environment.md#add-options-through-the-environment).
 
 <!-- CLI: rsync -->

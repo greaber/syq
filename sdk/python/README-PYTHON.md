@@ -4,8 +4,10 @@
 
 # Python
 
-Copy, remove, and reorganize files with typed results and streaming events.
-Synchronous and asyncio clients are available.
+The `syq` package runs syq from Python. Copy, remove, and reorganize files,
+and get typed results and events back, with a synchronous or asyncio client.
+The [operations reference](https://greaber.github.io/syq/python-operations.html)
+lists every argument.
 
 <a id="preview-a-copy"></a>
 
@@ -18,8 +20,8 @@ on Linux and macOS:
 python -m pip install syq
 ```
 
-Prebuilt wheels include the matching syq executable, which is also available
-as the `syq` command in the Python environment.
+Prebuilt wheels include the matching syq executable, also available as the
+`syq` command in the Python environment.
 
 <a id="try-a-copy"></a>
 
@@ -40,10 +42,10 @@ To copy just its contents, use `srcs_in`:
 result = syq.cp(srcs_in="data", into="backup")
 ```
 
-Arguments follow the command-line names: replace hyphens with underscores,
-and add a trailing underscore for Python keywords, such as `from_` and `as_`.
-The [copy guide](https://greaber.github.io/syq/reference.html) explains placement,
-filtering, and verification options.
+Arguments use the command-line names, with underscores for hyphens and a
+trailing underscore on Python keywords such as `from_` and `as_`. The
+[copy guide](https://greaber.github.io/syq/reference.html) explains the
+options.
 
 ## Copy over SSH
 
@@ -54,13 +56,13 @@ syq.cp("data", to="user@server", into="/backup")
 syq.cp("report.csv", from_="user@server", cwd="/exports", into="downloads")
 ```
 
-SSH hosts and paths are separate arguments. Pass both `from_` and `to` to
+Pass both `from_` and `to` to
 [copy between servers](https://greaber.github.io/syq/remote-to-remote.html).
 
 ## Preview changes
 
-Pass `dry_run=True` to preview a copy or removal. The result has the same type
-as a live call, with counters describing the planned changes:
+Pass `dry_run=True` to preview a copy or removal; the result counts the
+planned changes:
 
 ```python
 preview = syq.cp("data", into="backup", dry_run=True)
@@ -69,8 +71,8 @@ print(preview.files_transferred, preview.bytes_transferred)
 
 ## Mirror a directory
 
-Use `prune=True` to also remove destination entries absent from the source.
-Here, `staging` must already exist, and `max_delete` limits deletions:
+`prune=True` also removes destination entries the source does not have. Here
+`staging` must already exist, and `max_delete` caps the deletions:
 
 ```python
 result = syq.cp(
@@ -83,8 +85,8 @@ result = syq.cp(
 
 ## Filter with expressions
 
-Pass `where` to select source files, and `copy_if` to decide which files the
-copy may create or update:
+`where` selects source files, and `copy_if` decides which files the copy may
+create or update:
 
 ```python
 syq.cp(srcs_in="project", into="backup",
@@ -102,12 +104,10 @@ result = syq.rm(src_dir="old-output", root="/srv/jobs")
 print(result.entries_removed, result.selectors_missing)
 ```
 
-Positional paths and `src` refuse directories. Use `src_dir` to remove
-a tree, or `srcs_in` to recursively empty it while keeping its root.
-
-`root` confines removal to that directory. Add `on="server"` to remove files
-on an SSH server, or `on="s3://bucket"` for S3. See
-[Remove files](https://greaber.github.io/syq/remove.html) for selector behavior.
+Positional paths and `src` refuse directories; use `src_dir` to remove a tree
+or `srcs_in` to empty it. `root` keeps removal inside that directory. Pass
+`on="server"` or `on="s3://bucket"` to remove files elsewhere; see
+[Remove files](https://greaber.github.io/syq/remove.html).
 
 ## Handle failures
 
@@ -121,14 +121,12 @@ except syq.SyqOperationError as error:
     print(error.stderr.decode(errors="replace"))
 ```
 
-Use `check=False` to receive unsuccessful results without that exception;
-invalid arguments, installation failures, and invalid results still raise.
-Catch `syq.SyqError` to handle any SDK-defined exception. Completed filesystem
-changes are not rolled back.
+Pass `check=False` to get unsuccessful results back instead. Catch
+`syq.SyqError` for any SDK exception. Completed changes are not rolled back.
 
 ## Watch events and save results
 
-`on_event` receives records as the operation runs. For example, show each copied
+`on_event` receives records while the operation runs, for example each copied
 entry or planned change:
 
 ```python
@@ -139,8 +137,8 @@ def observe(event: syq.AutomationEvent) -> None:
 result = syq.cp("data", into="backup", on_event=observe)
 ```
 
-Events are not collected in the returned result. To save the validated NDJSON
-records, pass an open binary stream:
+Events are not kept in the result. To save them as NDJSON, pass a binary
+file:
 
 ```python
 with open("run.ndjson", "wb") as records:
@@ -161,22 +159,18 @@ with syq.map(srcs_in="photos") as mapping:
     result = syq.cp(mapping=renamed, into="published")
 ```
 
-This places the contents of `photos` under `published/archive`. The mapping
-remembers where its sources are, so the copy reads them from the same place;
-pass `from_="server"` or `from_="s3://bucket"` to `map` to list remote sources.
-Entries contain only source and destination paths unless you request more with
-`include`, such as `include=["kind", "size", "mtime"]`. Return `None` from the
-transform to skip an entry. The whole transform finishes before copying starts,
-so a failed transform leaves the destination untouched. See
-[Rename and reorganize](https://greaber.github.io/syq/mappings.html) for mapping rules.
-
-For a complete program built on mappings, see
-[Pull and push DVC data](https://greaber.github.io/syq/dvc.html).
+This puts the contents of `photos` under `published/archive`. Return `None`
+from the transform to skip an entry. The mapping remembers where its sources
+are, so the same code works with `map(from_="server")` or
+`map(from_="s3://bucket")`. A failed transform copies nothing. See
+[Rename and reorganize](https://greaber.github.io/syq/mappings.html), or
+[Pull and push DVC data](https://greaber.github.io/syq/dvc.html) for a complete
+program.
 
 ## Generated data and binary streams
 
-Use `open_writer` to generate one file or object without a temporary payload
-file. For example, the standard library can write an archive directly to S3:
+`open_writer` writes one file or object without a temporary file. For example,
+write an archive directly to S3:
 
 ```python
 import tarfile
@@ -187,7 +181,7 @@ with syq.open_writer(to="s3://backups", as_="dataset.tar") as output:
         archive.add("dataset", arcname="dataset")
 ```
 
-`open_reader` supplies the contents of one local file, SSH file, or S3 object:
+`open_reader` reads one local file, SSH file, or S3 object:
 
 ```python
 with syq.open_reader("dataset.tar", from_="s3://backups") as source:
@@ -195,14 +189,13 @@ with syq.open_reader("dataset.tar", from_="s3://backups") as source:
         consume(chunk)
 ```
 
-The writer commits when its `with` block exits successfully; an exception
-aborts it. The reader checks transfer success when its `with` block exits, or
-call `abort()` to cancel. If you extract files from a stream, make them
-available only after both decoding and the reader context finish successfully.
-See [Byte streams](https://greaber.github.io/syq/python-streams.html#byte-streams)
-for wrappers, explicit completion, and async behavior.
+A writer publishes its file only when its `with` block exits normally. A
+reader checks that the transfer succeeded when its block exits, so if you
+extract files from a stream, use them only after both decoding and the reader's
+block finish. See
+[Byte streams](https://greaber.github.io/syq/python-streams.html#byte-streams).
 
-For several generated files, put producers in a mapping and copy them in one call:
+To generate several files in one copy, put producers in a mapping:
 
 ```python
 from functools import partial
@@ -216,13 +209,13 @@ syq.cp(mapping=[syq.MappingEntry(syq.StreamSource(partial(pack, name)), f"{name}
        to="s3://backups", into="dataset", stream_concurrency=2)
 ```
 
-A `StreamDestination(consumer)` receives downloaded bytes in the same way. See
-[Callback mappings](https://greaber.github.io/syq/python-streams.html#callback-mappings)
-for completion, retries, and async callbacks.
+`StreamDestination(consumer)` receives downloaded bytes the same way; see
+[Callback mappings](https://greaber.github.io/syq/python-streams.html#callback-mappings).
 
 ## Use asyncio
 
-Await operations on `AsyncClient`. Its arguments and results match `Client`:
+`AsyncClient` takes the same arguments and returns the same results; await
+its operations:
 
 ```python
 import asyncio
@@ -236,8 +229,7 @@ async def main():
 asyncio.run(main())
 ```
 
-Async event callbacks are awaited in record order. Mapping streams use
-`async with` and `async for`; there is no `await` before `client.map()`:
+Use mappings with `async with`, without `await` before `client.map()`:
 
 ```python
 async def copy_photos():
@@ -258,33 +250,27 @@ result = client.cp("data", into="backup")
 ```
 
 `process_cwd` sets the local working directory, while `cwd` sets the source
-base, which may be on a remote host. A call uses the client's timeout unless
-it passes its own; `timeout=None` disables it for that call:
+base, which can be on a remote host. Pass `timeout=None` to disable the
+client's timeout for one call:
 
 ```python
 result = client.cp("data", into="backup", timeout=None)
 ```
 
-To use an existing executable, pass `Client(executable="/opt/bin/syq")`.
-This bypasses the bundled version; see
-[Compatibility](https://greaber.github.io/syq/python-operations.html#compatibility).
+`Client(executable="/opt/bin/syq")` runs another syq instead of the bundled
+one; see [Compatibility](https://greaber.github.io/syq/python-operations.html#compatibility).
 
 <a id="native-api-reference"></a>
 
 ## Run other commands
 
-`run` accepts arguments after the executable name and returns captured bytes:
+`run` runs any syq command, such as `rsync` or receiver administration, and
+returns its captured output:
 
 ```python
 result = syq.run(["--help"])
 print(result.stdout.decode())
 ```
-
-Use it for commands without a typed method, including `rsync` and receiver
-administration. See the
-[operations reference](https://greaber.github.io/syq/python-operations.html) for
-process options and [Results and events](https://greaber.github.io/syq/python-results.html#failure-model)
-for exceptions.
 
 To request a command on your receiving machine, use the syq executable you use
 for receiving:
@@ -300,14 +286,13 @@ result = syq.run(
 print(result.stdout.decode())
 ```
 
-It raises on a nonzero exit, and the receiving machine asks for approval
-before running the command. See
-[Run commands on your receiving machine](https://greaber.github.io/syq/receive.html#run-commands-on-your-laptop).
+The receiving machine asks for approval first, and `run` raises if the
+command exits nonzero. See
+[Run commands on your laptop](https://greaber.github.io/syq/receive.html#run-commands-on-your-laptop).
 
 ## Building from source
 
-Installing from a source distribution builds the executable and requires Rust
-and a C compiler. Source builds upload themselves to compatible SSH hosts by
-default. See
-[source builds](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md) for
-compiler requirements and SSH helper selection.
+Installing from a source distribution builds the executable, which needs Rust
+and a C compiler. By default, a source build uploads its own executable to SSH
+servers, so they must be able to run it. See
+[source builds](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md).

@@ -1,15 +1,14 @@
 # syq rm
 
-Remove local files, remote filesystem entries, or S3 objects.
-See [Remove files](../remove.md) for selection rules and
-[Versions and deletion](../object-storage.md#versions-and-deletion) for versioned objects.
+Remove local files, files on an SSH server, or S3 objects. See
+[Remove files](../remove.md) and, for versioned buckets,
+[Versions and deletion](../object-storage.md#versions-and-deletion).
 
 ```sh
 syq rm --src-dir old-output --dry-run -v
 ```
 
-For scripting, see [environment variables](../environment.md)
-and [Removal records](../automation.md#removal-records).
+For scripts, see [Removal records](../automation.md#removal-records).
 
 <!-- CLI: rm -->
 ```text
@@ -93,8 +92,8 @@ syq rm [OPTIONS] --srcs-in DIR
 
 ## Selection rules
 
-Named paths, `--src`, and `--src-non-dir` require non-directories. Use
-`--src-dir` to remove a directory recursively, or `--srcs-in` to remove its
-contents and keep the directory; both reject a final symlink even when
-following is enabled. Syq checks every selection before deleting anything.
-Filters are not supported.
+Named paths, `--src`, and `--src-non-dir` remove only non-directories. Use
+`--src-dir` to remove a directory and its contents, or `--srcs-in` to empty it;
+both refuse a final symlink. Syq checks every selector first, so one naming the
+wrong kind of object stops the run before anything is removed; a missing one
+does not. `rm` has no filters.
