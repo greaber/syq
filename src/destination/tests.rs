@@ -429,6 +429,7 @@ fn broker_with_limits(
         )),
         exec_count: AtomicU64::new(0),
         ssh_count: AtomicU64::new(0),
+        account_relays: AtomicU64::new(0),
         account_source: Mutex::new(Err("test source not configured".into())),
         account_sessions: Mutex::new(HashMap::new()),
         forward_count: std::sync::atomic::AtomicUsize::new(0),
@@ -2040,4 +2041,24 @@ fn a_receiving_connection_is_idle_only_after_its_requests_and_a_quiet_while() {
     assert!(activity.begin().is_none());
     activity.reopen();
     assert!(activity.begin().is_some());
+}
+
+/// An approved account connection is counted apart from other requests,
+/// for as long as its relay runs, so that status can say what keeps the
+/// connection busy.
+#[test]
+fn open_account_connections_are_counted_apart() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let (_broker, receiver, _registration, _prompts) = broker(temporary.path(), Approval::Ask);
+    let activity = Activity::default();
+    *activity.receiver.lock().unwrap() = Arc::downgrade(&receiver);
+    assert_eq!(activity.accounts(), 0);
+    // The relay runs within a request.
+    let request = activity.begin().unwrap();
+    receiver.account_relays.fetch_add(1, Ordering::AcqRel);
+    assert_eq!((activity.requests(), activity.accounts()), (1, 1));
+    assert!(!activity.idle());
+    receiver.account_relays.fetch_sub(1, Ordering::AcqRel);
+    drop(request);
+    assert_eq!((activity.requests(), activity.accounts()), (0, 0));
 }

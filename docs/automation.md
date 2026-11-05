@@ -317,7 +317,7 @@ then exits nonzero after printing the valid entries.
 |---|---|
 | `profiles` | Every profile's `cwd`, `cwd_explicit`, `root`, `auto_approve_root` (null when every download asks), and `servers` (the endpoints set with `--connection`; empty means all) |
 | `settings` | The first selected profile's settings |
-| `connections` | The profiles allowed on each endpoint, and its service's build (`identity`), requests in progress (`busy`), the syq path it follows (`started_from`), and any `switch` to a new build |
+| `connections` | The profiles allowed on each endpoint, and its service's build (`identity`), requests in progress and open account connections (`busy`), the syq path it follows (`started_from`), and any `switch` to a new build |
 | `provider` | The local SSH authorization service, or null when it isn't running; its `profiles` contain `settings`, `sessions`, and `pending` requests, and `decision_error` reports a failed local approval |
 
 `syq persist receive pending --json` prints the requests waiting for approval,

@@ -553,12 +553,7 @@ fn connect_receiving(
                         | Some(crate::conn::SshLoginFailure::HostKey)
                 ) =>
         {
-            // Commands wait before trying such a switch again
-            // (`receive_service::refresh_outdated`).
-            defer_switch_attempts(
-                multiplexer.control_path(),
-                crate::receive_service::switch::LOGIN_RETRY,
-            );
+            crate::receive_service::switch::defer_after_login(multiplexer.control_path());
             return Err(error.context(crate::receive_service::switch::LoginNeeded(remote.label())));
         }
         Err(error) => return Err(error),
@@ -600,7 +595,13 @@ fn report_ready(domain: &Domain, label: &str, ready: crate::receive_service::Rea
             follows_this_file,
         } => crate::output::command_human_stdout!(
             "{}",
-            crate::receive_service::busy_notice(label, &build, &busy, follows_this_file)
+            crate::receive_service::busy_notice(
+                label,
+                &build,
+                &busy,
+                follows_this_file,
+                &crate::receive_service::connect_command(label, domain.explicit_path())
+            )
         ),
         Ready::Other {
             build, busy: None, ..
@@ -1254,6 +1255,8 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
                 &receiving.build,
                 receiving.started_from.as_deref(),
                 receiving.switch.as_ref(),
+                receiving.busy.as_ref(),
+                Some(&record.label()),
                 &crate::receive_service::connect_command(&record.label(), domain.explicit_path()),
                 true,
             )
@@ -1372,6 +1375,8 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
             &provider.build,
             provider.started_from.as_deref(),
             provider.switch.as_ref(),
+            provider.busy().as_ref(),
+            None,
             &fix,
             false,
         ) {

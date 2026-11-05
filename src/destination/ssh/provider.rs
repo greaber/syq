@@ -471,8 +471,9 @@ enum OtherKeeper {
     None,
     /// One of another build, asked to stop.
     Stopping,
-    /// One of another build that an approved account connection still uses
-    /// (`in_use`); stopping it would cut the copies and sessions through it.
+    /// One of another build that an account connection still uses, or may
+    /// (`in_use`): stopping it would cut the copies and sessions through it,
+    /// or a request waiting for approval.
     InUse { build: String },
 }
 
@@ -519,6 +520,13 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
     let deadline = Instant::now() + SETUP;
     let mut other = OtherKeeper::None;
     let mut next_look = Instant::now();
+    let mut off = "syq persist off".to_owned();
+    if let Some(scope) = domain.explicit_path() {
+        off.push_str(&format!(
+            " --pscope {}",
+            shell_words::quote(&scope.to_string_lossy())
+        ));
+    }
     while !try_lock(&lock)? {
         if let Some(record) = existing(domain, provider)? {
             return Ok(record);
@@ -532,19 +540,25 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
                     persistent::uses_provider(domain, provider)
                 })?,
             );
-            if let (OtherKeeper::InUse { build }, false) =
-                (&other, matches!(previous, OtherKeeper::InUse { .. }))
-            {
-                crate::output::diagnostic!(
-                    "syq: waiting for the connection to {} that syq {build} opened, which an approved account connection still uses; it can serve only that version. `syq persist off` closes both",
+            if let OtherKeeper::InUse { build } = &other {
+                let in_use = format!(
+                    "the connection to {} that syq {build} opened is still in use by an account connection, approved or waiting for approval, and serves only that version",
                     provider.label()
                 );
+                // In the default domain such a connection does not end by
+                // itself; in an isolated one it closes once idle for a while.
+                if domain.is_default() {
+                    bail!("{in_use}; finish what uses it, or close both with `{off}`, then retry");
+                }
+                if !matches!(previous, OtherKeeper::InUse { .. }) {
+                    crate::output::diagnostic!("syq: waiting: {in_use}; `{off}` closes both");
+                }
             }
         }
         if Instant::now() >= deadline {
             if let OtherKeeper::InUse { build } = &other {
                 bail!(
-                    "the connection to {} that syq {build} opened is still in use by an approved account connection; finish what uses it, or close both with `syq persist off`, then retry",
+                    "the connection to {} that syq {build} opened is still in use by an account connection, approved or waiting for approval; finish what uses it, or close both with `{off}`, then retry",
                     provider.label()
                 );
             }
@@ -1203,17 +1217,38 @@ mod tests {
         assert!(!stop.exists());
         record.build = "v0.0.1+other-build".into();
         write_record(&domain, &record).unwrap();
-        // An approved account connection's channel runs through it.
+        // An account connection's channel runs through it: here one waiting
+        // for approval, whose keeper holds its record's lock but has written
+        // no record yet.
+        let request = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(
+                persistent::directory(&domain)
+                    .unwrap()
+                    .join(format!("{}.lock", "0".repeat(64))),
+            )
+            .unwrap();
         assert_eq!(
-            stop_other_build_keeper(&domain, &record.provider, || true).unwrap(),
+            unsafe { libc::flock(request.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let in_use = || persistent::uses_provider(&domain, &record.provider);
+        assert_eq!(
+            stop_other_build_keeper(&domain, &record.provider, in_use).unwrap(),
             OtherKeeper::InUse {
                 build: "v0.0.1+other-build".into()
             }
         );
         assert!(!stop.exists());
         assert!(active(&domain, &record));
+        // Once it ended, its lock is free, though its file stays.
+        drop(request);
         assert_eq!(
-            stop_other_build_keeper(&domain, &record.provider, unused).unwrap(),
+            stop_other_build_keeper(&domain, &record.provider, in_use).unwrap(),
             OtherKeeper::Stopping
         );
         assert!(stop.exists());

@@ -69,6 +69,18 @@ pub(crate) struct ProfileSnapshot {
     pub(crate) pending: Vec<crate::receive_approval::Summary>,
     pub(crate) sessions: usize,
 }
+impl Snapshot {
+    /// What it has in progress, as a receiving service reports it.
+    pub(crate) fn busy(&self) -> Option<super::Busy> {
+        let busy = self.busy?;
+        let accounts = self.accounts.unwrap_or(0);
+        Some(super::Busy {
+            requests: busy.saturating_sub(accounts),
+            pending: 0,
+            accounts,
+        })
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Snapshot {
     pub(crate) build: String,
@@ -79,6 +91,10 @@ pub(crate) struct Snapshot {
     /// syq followed updates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) busy: Option<usize>,
+    /// Of those, approved account connections open through it, which hold
+    /// a request for as long as they live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) accounts: Option<usize>,
     /// The path the provider follows to switch to a new build (`switch`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) started_from: Option<String>,
@@ -344,10 +360,24 @@ pub(super) fn switch_when_idle(domain: &Domain) -> Result<()> {
         } else {
             let answer = query(domain, Control::StopIfIdle)?;
             if !answer.stopping {
-                crate::output::command_human_stdout!(
-                    "The SSH authorization provider keeps running syq {} until its requests finish",
-                    state.build
-                );
+                let mut fix = "syq persist receive on".to_owned();
+                if let Some(scope) = domain.explicit_path() {
+                    fix.push_str(&format!(
+                        " --pscope {}",
+                        shell_words::quote(&scope.to_string_lossy())
+                    ));
+                }
+                let busy = answer.busy().unwrap_or_default();
+                match busy.accounts_note(None, &fix) {
+                    Some(accounts) if busy.requests == 0 => crate::output::command_human_stdout!(
+                        "The SSH authorization provider keeps running syq {}: {accounts}",
+                        state.build
+                    ),
+                    _ => crate::output::command_human_stdout!(
+                        "The SSH authorization provider keeps running syq {} until its requests finish",
+                        state.build
+                    ),
+                }
                 return Ok(());
             }
             answer.pid
@@ -444,6 +474,9 @@ struct Service {
     /// Requests being handled for attached logins, such as authorizing an
     /// account login; not the attachments themselves.
     requests: AtomicUsize,
+    /// Of those, approved account logins whose agent requests it relays: an
+    /// approved account connection holds one for as long as it lives.
+    account_relays: AtomicU64,
     /// The path the provider follows, and its switch to a new build.
     started_from: Option<String>,
     switch: Mutex<Option<super::switch::Report>>,
@@ -469,6 +502,7 @@ impl Service {
                 sessions: HashMap::new(),
             }),
             requests: AtomicUsize::new(0),
+            account_relays: AtomicU64::new(0),
             started_from,
             switch: Mutex::new(None),
         };
@@ -567,6 +601,7 @@ impl Service {
             build: crate::identity::build().into(),
             pid: std::process::id(),
             busy: Some(busy),
+            accounts: Some(self.account_relays.load(Ordering::Acquire) as usize),
             started_from: self.started_from.clone(),
             switch: self.switch.lock().unwrap().clone(),
             stopping: self.stop.load(Ordering::SeqCst),
@@ -730,6 +765,7 @@ impl Service {
                         request_lock: &session.request_lock,
                         active_count: &session.active_count,
                         session_grants: &session.grants,
+                        relaying: &self.account_relays,
                     };
                     match *operation {
                         SessionRequest::ResolveLocal(target) => {
@@ -1969,6 +2005,7 @@ mod tests {
                     profiles: Vec::new(),
                     decision_error: None,
                     busy: Some(busy),
+                    accounts: None,
                     started_from: None,
                     switch: None,
                     stopping,
@@ -2068,6 +2105,7 @@ mod tests {
                     profiles: Vec::new(),
                     decision_error: None,
                     busy: None,
+                    accounts: None,
                     started_from: None,
                     switch: None,
                     stopping: false,

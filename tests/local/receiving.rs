@@ -3054,6 +3054,11 @@ fi
 # rejects, while the control connection and helper setup still work.
 case " $* " in
     *" ControlPath=none "*" PermitLocalCommand=no "*|*" PermitLocalCommand=no "*" ControlPath=none "*)
+        # Wait, as for a touch of a security key that nobody gives.
+        if [ -n "${FAKE_SSH_HANG_DIRECT:-}" ]; then
+            echo $$ > "$FAKE_SSH_HANG_DIRECT"
+            exec sleep 600
+        fi
         if [ -n "${FAKE_SSH_REJECT_DIRECT:-}" ]; then
             echo 'syq@test-server: Permission denied (publickey).' >&2
             exit 255
@@ -3244,7 +3249,7 @@ fn a_receiving_service_switches_to_a_new_build_at_its_path_once_idle() {
     assert_eq!(state["started_from"], installed.syq.to_str().unwrap());
     assert_eq!(
         state["busy"],
-        serde_json::json!({"requests": 0, "pending": 0})
+        serde_json::json!({"requests": 0, "pending": 0, "accounts": 0})
     );
     assert!(state.get("switch").is_none(), "{state}");
 
@@ -3586,7 +3591,8 @@ fn a_switch_that_cannot_log_in_leaves_the_old_service_receiving() {
         "{}",
         String::from_utf8_lossy(&shown.stdout)
     );
-    // Commands wait before trying such a switch again.
+    // A command without a terminal does not try again: the user is not
+    // there to unlock or touch a key.
     fs::write(t.path("source"), b"data").unwrap();
     let copied = installed
         .command(
@@ -3607,6 +3613,35 @@ fn a_switch_that_cannot_log_in_leaves_the_old_service_receiving() {
         !stderr_of(&copied).contains("switching"),
         "{}",
         stderr_of(&copied)
+    );
+    // A switch the service started leaves the user's next command in a
+    // terminal free to try again; one a command started holds commands off
+    // for ten minutes, since each attempt is a failed login on the server.
+    let record = PathBuf::from(format!("{}.json", installed.control().display()));
+    let next_claim = || fs::metadata(&record).unwrap().modified().unwrap();
+    assert!(next_claim() <= std::time::SystemTime::now(), "deferred");
+    let mut by_command = installed.command(
+        syq,
+        &[
+            "persist",
+            "connect",
+            "test-server",
+            "--auth-from",
+            "ssh",
+            "--when-idle",
+            "--pscope",
+            installed.scope.to_str().unwrap(),
+        ],
+    );
+    let switched = by_command
+        .env("FAKE_SSH_REJECT_DIRECT", "1")
+        .env("SYQ_SWITCH_BY_COMMAND", "1")
+        .run()
+        .unwrap();
+    assert_eq!(switched.status.code(), Some(78), "{switched:?}");
+    assert!(
+        next_claim() >= std::time::SystemTime::now() + std::time::Duration::from_secs(9 * 60),
+        "not deferred"
     );
     installed.request(serde_json::json!({"version": 2, "stop": true}));
     let requests = old.join().unwrap();
@@ -3954,11 +3989,7 @@ fn a_switch_that_runs_too_long_ends_with_what_it_started() {
         Some(libc::SIGKILL)
     );
     wait_for("ssh to end", std::time::Duration::from_secs(10), || {
-        let gone = unsafe { libc::kill(ssh, 0) } != 0;
-        gone || fs::read_to_string(format!("/proc/{ssh}/stat")).is_ok_and(|stat| {
-            stat.rsplit_once(") ")
-                .is_some_and(|(_, fields)| fields.starts_with('Z'))
-        })
+        ended(ssh)
     });
     let shown = installed.persist(syq, &["status", "--json"]);
     assert_output_ok(&shown);
@@ -3972,6 +4003,98 @@ fn a_switch_that_runs_too_long_ends_with_what_it_started() {
             .contains("switching took longer than"),
         "{shown}"
     );
+    installed.request(serde_json::json!({"version": 2, "stop": true}));
+    old.join().unwrap();
+}
+
+/// Whether process `pid` has ended, though perhaps not yet been reaped.
+fn ended(pid: libc::pid_t) -> bool {
+    let gone = unsafe { libc::kill(pid, 0) } != 0;
+    gone || fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(") ")
+            .is_some_and(|(_, fields)| fields.starts_with('Z'))
+    })
+}
+
+/// A switch whose own login gets no answer in time, as when ssh waits for
+/// a touch of a security key that nobody gives, ends before its time is up,
+/// with that ssh, as one that needs the user: only a command at a terminal
+/// tries it again, so the key does not ask again unattended. Its ssh runs in
+/// the switch's process group, so that it ends with the switch whenever
+/// that ends.
+#[test]
+fn a_switch_whose_login_gets_no_answer_waits_for_the_user() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let old = older_service(&installed, serde_json::json!([]));
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    let hung = t.path("ssh.pid");
+    let switch = |timeout: &str| {
+        let _ = fs::remove_file(&hung);
+        let mut switch = installed.command(
+            syq,
+            &[
+                "persist",
+                "connect",
+                "test-server",
+                "--auth-from",
+                "ssh",
+                "--when-idle",
+                "--pscope",
+                installed.scope.to_str().unwrap(),
+            ],
+        );
+        let switch = switch
+            .env("FAKE_SSH_HANG_DIRECT", &hung)
+            .env("SYQ_TEST_SWITCH_TIMEOUT_MS", timeout)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        wait_for(
+            "its login to start",
+            std::time::Duration::from_secs(20),
+            || fs::read_to_string(&hung).is_ok_and(|pid| !pid.trim().is_empty()),
+        );
+        let ssh: libc::pid_t = fs::read_to_string(&hung).unwrap().trim().parse().unwrap();
+        (switch, ssh)
+    };
+    let (mut first, ssh) = switch("8000");
+    let started = std::time::Instant::now();
+    let status = first.wait().unwrap();
+    assert_eq!(status.code(), Some(78), "{status:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(8));
+    wait_for("ssh to end", std::time::Duration::from_secs(10), || {
+        ended(ssh)
+    });
+    let shown = installed.persist(syq, &["status", "--json"]);
+    assert_output_ok(&shown);
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let switched = &shown["connections"][0]["receiving_switch"];
+    assert_eq!(switched["phase"], "login", "{shown}");
+    assert!(
+        switched["error"]
+            .as_str()
+            .unwrap()
+            .contains("did not finish logging in"),
+        "{shown}"
+    );
+    // The old service still receives.
+    let state = installed.request(serde_json::json!({"version": 2, "stop": false}));
+    assert_eq!(state["identity"], "v0.7.1");
+
+    // Ending the switch's group, as its time limit or the service that
+    // started it does, ends its login with it.
+    let (mut second, ssh) = switch("60000");
+    unsafe { libc::kill(-(second.id() as libc::pid_t), libc::SIGKILL) };
+    second.wait().unwrap();
+    wait_for("ssh to end", std::time::Duration::from_secs(10), || {
+        ended(ssh)
+    });
     installed.request(serde_json::json!({"version": 2, "stop": true}));
     old.join().unwrap();
 }

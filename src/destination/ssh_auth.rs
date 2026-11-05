@@ -234,6 +234,9 @@ pub(crate) struct AuthorizationContext<'a> {
     pub(crate) request_lock: &'a Mutex<()>,
     pub(crate) active_count: &'a AtomicU64,
     pub(crate) session_grants: &'a Mutex<HashMap<String, u64>>,
+    /// Approved logins whose agent requests are relayed now: an approved
+    /// account connection's master holds one for as long as it lives.
+    pub(crate) relaying: &'a AtomicU64,
 }
 
 /// Public connection metadata, not an authorization grant. The provider must
@@ -1033,6 +1036,8 @@ fn authorize_and_relay_inner(
     socket.set_write_timeout(Some(Duration::from_secs(120)))?;
     write_message(&mut stream, &Reply::Ready)?;
     write_message(&mut stream, &approved)?;
+    context.relaying.fetch_add(1, Ordering::AcqRel);
+    let _relaying = Slot(context.relaying);
     crate::agent_broker::relay_frames(&mut stream, &mut upstream)
 }
 
@@ -1103,6 +1108,7 @@ impl Receiver {
             request_lock: &self.request_lock,
             active_count: &self.ssh_count,
             session_grants: &self.account_sessions,
+            relaying: &self.account_relays,
         };
         let (generation, _tracked) = {
             let _sessions = self.sessions.lock().unwrap();
@@ -1303,6 +1309,7 @@ mod tests {
                 request_lock: &lock,
                 active_count: &count,
                 session_grants: &grants,
+                relaying: &AtomicU64::new(0),
             };
             let request = Request::account(policy(1).endpoint, vec![], String::new(), None);
             let error =
@@ -1335,6 +1342,7 @@ mod tests {
         let _other_approval = lock.lock().unwrap();
         let grants = Mutex::new(HashMap::new());
         let count = AtomicU64::new(0);
+        let relaying = AtomicU64::new(0);
         let context = AuthorizationContext {
             origin: AuthorizationOrigin::Provider {
                 profile: "provider",
@@ -1345,6 +1353,7 @@ mod tests {
             request_lock: &lock,
             active_count: &count,
             session_grants: &grants,
+            relaying: &relaying,
         };
         let resolved = policy(1);
         let permission = AccountApproval::new(

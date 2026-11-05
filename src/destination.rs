@@ -1358,6 +1358,9 @@ struct Receiver {
     active_streams: Arc<crate::private_broker::ConnectionRegistry>,
     exec_count: AtomicU64,
     ssh_count: AtomicU64,
+    /// Approved account logins whose agent requests this connection relays
+    /// now (`ssh_auth::AuthorizationContext::relaying`).
+    account_relays: AtomicU64,
     account_source: Mutex<std::result::Result<crate::receive_approval::AccountIdentity, String>>,
     account_sessions: Mutex<HashMap<String, u64>>,
     forward_count: std::sync::atomic::AtomicUsize,
@@ -1685,20 +1688,34 @@ fn ssh_command(endpoint: &crate::persistence::EndpointRecord) -> Command {
 }
 /// Log in to `endpoint` as a receiving connection does (`ssh_command`),
 /// without forwarding anything, to learn whether a new receiving service
-/// could before an old one is stopped for it. On failure, whether the server
-/// rejected the login (`conn::login_rejection`), and what ssh said.
+/// could before an old one is stopped for it, by `deadline`, keeping ssh in
+/// this process's group when `in_this_group`. On failure, whether the user
+/// is needed: the server rejected the login (`conn::login_rejection`), or
+/// ssh did not finish, as while it waits for a touch of a security key.
+/// Then what ssh said.
 pub(crate) fn check_receiving_login(
     endpoint: &crate::persistence::EndpointRecord,
+    deadline: Instant,
+    in_this_group: bool,
 ) -> std::result::Result<(), (bool, String)> {
     let mut command = ssh_command(endpoint);
     command.arg("--").arg(&endpoint.host).arg("true");
-    let output = crate::process::capture_output_bounded(
-        &mut command,
-        Instant::now() + Duration::from_secs(60),
-        &|| false,
-        64 * 1024,
-    )
-    .map_err(|error| (false, error.to_string()))?;
+    const LIMIT: usize = 64 * 1024;
+    let output = if in_this_group {
+        crate::process::capture_output_bounded_in_this_group(&mut command, deadline, LIMIT)
+    } else {
+        crate::process::capture_output_bounded(&mut command, deadline, &|| false, LIMIT)
+    }
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            (
+                true,
+                "ssh did not finish logging in by itself in time, as when it waits for a touch of your security key".to_owned(),
+            )
+        } else {
+            (false, error.to_string())
+        }
+    })?;
     if output.status.success() {
         return Ok(());
     }
@@ -1808,9 +1825,21 @@ impl Activity {
     }
     /// Requests in progress: copies and the approvals they wait for,
     /// commands, account access, and copies approved but not yet opened.
+    /// Includes `accounts`.
     pub(crate) fn requests(&self) -> usize {
         let requests = self.state.lock().unwrap().requests;
         requests + self.approved()
+    }
+    /// Approved account connections open through this connection: logins
+    /// it authorized whose agent requests it still relays.
+    pub(crate) fn accounts(&self) -> usize {
+        self.receiver
+            .lock()
+            .unwrap()
+            .upgrade()
+            .map_or(0, |receiver| {
+                receiver.account_relays.load(Ordering::Acquire) as usize
+            })
     }
     fn approved(&self) -> usize {
         self.receiver
@@ -1902,6 +1931,7 @@ pub(crate) fn serve_background(
         )),
         exec_count: AtomicU64::new(0),
         ssh_count: AtomicU64::new(0),
+        account_relays: AtomicU64::new(0),
         account_source: Mutex::new(Err("receiving SSH connection is not ready".into())),
         account_sessions: Mutex::new(HashMap::new()),
         forward_count: std::sync::atomic::AtomicUsize::new(0),

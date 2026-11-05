@@ -66,6 +66,7 @@ const SWITCH_BACKSTOP: Duration = Duration::from_secs(60);
 /// which holds this process and what it started that stays there, such as
 /// ssh, after `before` records why. Nobody may be waiting for it to answer.
 pub(crate) fn end_switch_at(before: impl FnOnce() + Send + 'static) {
+    let _ = ENDS.set(Instant::now() + switch_timeout());
     std::thread::spawn(move || {
         std::thread::sleep(switch_timeout());
         before();
@@ -76,6 +77,31 @@ pub(crate) fn end_switch_at(before: impl FnOnce() + Send + 'static) {
             libc::kill(libc::getpid(), libc::SIGKILL);
         }
     });
+}
+
+/// When this process, a switch, ends by itself (`end_switch_at`).
+static ENDS: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+/// How long a switch's login check may take.
+const LOGIN_CHECK: Duration = Duration::from_secs(60);
+/// The time a switch keeps after its login check, to say how it went.
+const LOGIN_CHECK_MARGIN: Duration = Duration::from_secs(2);
+
+/// When a login check must end, and whether it runs in this process's
+/// group. In a switch, it ends before the switch does: a check that ran out
+/// of time, as when ssh waits for a touch of a security key that nobody
+/// gave, then ends the switch as one that needs the user (`LoginNeeded`),
+/// which only a command at a terminal tries again, not as a failure the
+/// service would retry by itself, touching the key again. It also runs in
+/// the switch's group, which `end_switch_at` ends, so that nothing outlives
+/// the switch.
+pub(crate) fn login_check() -> (Instant, bool) {
+    let now = Instant::now();
+    let Some(ends) = ENDS.get() else {
+        return (now + LOGIN_CHECK, false);
+    };
+    let by = ends.checked_sub(LOGIN_CHECK_MARGIN).unwrap_or(now).max(now);
+    let leads_group = unsafe { libc::getpgrp() == libc::getpid() };
+    ((now + LOGIN_CHECK).min(by), leads_group)
 }
 
 /// Wait for `child`, which leads its own process group, then end what it
@@ -156,6 +182,21 @@ pub(crate) const LOGIN_NEEDED_EXIT: i32 = 78;
 /// whose switch could not log in without the user: each attempt is a
 /// failed login in the server's logs.
 pub(crate) const LOGIN_RETRY: Duration = Duration::from_secs(600);
+
+/// Set for a switch a command started (`receive_service::refresh_outdated`),
+/// as opposed to a service's own; a command passes it to its own build.
+pub(crate) const STARTED_BY_COMMAND: &str = "SYQ_SWITCH_BY_COMMAND";
+
+/// After a switch could not log in without the user: when a command
+/// started it, keep commands from trying again for `LOGIN_RETRY`, since
+/// each attempt is a failed login on the server. A service's own switch
+/// sets nothing, so that the user's next command in a terminal tries, as
+/// its status says.
+pub(crate) fn defer_after_login(control: &Path) {
+    if std::env::var_os(STARTED_BY_COMMAND).is_some() {
+        crate::persistence::defer_switch_attempts(control, LOGIN_RETRY);
+    }
+}
 
 /// A switch to a new build could not log in to this server without the user.
 #[derive(Debug)]
@@ -358,6 +399,8 @@ struct Ended {
 /// A started switch: the command's exit, and its process group.
 struct Running {
     build: String,
+    /// The file at the path that reported `build`.
+    file: Option<Seen>,
     done: mpsc::Receiver<std::result::Result<(), Ended>>,
     group: libc::pid_t,
     started: Instant,
@@ -372,6 +415,7 @@ enum State {
     /// The file holds `build`; switch once idle.
     Waiting {
         build: String,
+        file: Option<Seen>,
     },
     Switching(Running),
     /// The last attempt failed; look again at `retry`.
@@ -385,6 +429,7 @@ enum State {
     Login {
         build: String,
         error: String,
+        file: Option<Seen>,
     },
 }
 
@@ -422,7 +467,7 @@ impl Follower {
         match &self.state {
             State::Current => self.next_check.saturating_duration_since(now),
             // Nothing to do; a command switches it.
-            State::Login { .. } => Duration::from_secs(3600),
+            State::Login { .. } => self.next_check.saturating_duration_since(now),
             State::Failed { retry, .. } => retry.saturating_duration_since(now),
             State::Probing(_) | State::Waiting { .. } | State::Switching(_) => {
                 Duration::from_millis(200)
@@ -463,19 +508,20 @@ impl Follower {
                     self.attempts = 0;
                     State::Current
                 }
-                Ok((_, Ok(build))) => State::Waiting { build },
+                Ok((file, Ok(build))) => State::Waiting { build, file },
                 Ok((_, Err(error))) => self.failed(
                     None,
                     format!("will not run {}: {error:#}", self.path.display()),
                 ),
             },
-            State::Waiting { build } => {
+            State::Waiting { build, file } => {
                 if !idle() {
-                    State::Waiting { build }
+                    State::Waiting { build, file }
                 } else {
                     match start(&self.path, args) {
                         Ok((done, group)) => State::Switching(Running {
                             build,
+                            file,
                             done,
                             group,
                             started: now,
@@ -509,6 +555,7 @@ impl Follower {
                     State::Login {
                         build: running.build,
                         error,
+                        file: running.file,
                     }
                 }
                 Ok(Err(Ended { error, .. })) => self.failed(Some(running.build), error),
@@ -534,8 +581,22 @@ impl Follower {
                     State::Current
                 }
             }
-            // Only reported; a command run at a terminal tries again.
-            State::Login { build, error } => State::Login { build, error },
+            // A command run at a terminal tries again; the service only
+            // looks whether the path has changed since, as when the
+            // update was undone or another one came, and asks it again.
+            State::Login { build, error, file } => {
+                if now < self.next_check {
+                    State::Login { build, error, file }
+                } else {
+                    self.next_check = now + check_interval();
+                    if seen_at(&self.path) == file {
+                        State::Login { build, error, file }
+                    } else {
+                        self.next_check = now;
+                        State::Current
+                    }
+                }
+            }
         };
     }
 
@@ -564,7 +625,7 @@ impl Follower {
     pub(crate) fn report(&self) -> Option<Report> {
         match &self.state {
             State::Current | State::Probing(_) => None,
-            State::Waiting { build } => Some(Report {
+            State::Waiting { build, .. } => Some(Report {
                 to: Some(build.clone()),
                 phase: "waiting".into(),
                 error: None,
@@ -574,7 +635,7 @@ impl Follower {
                 phase: "switching".into(),
                 error: None,
             }),
-            State::Login { build, error } => Some(Report {
+            State::Login { build, error, .. } => Some(Report {
                 to: Some(build.clone()),
                 phase: "login".into(),
                 error: Some(error.clone()),
@@ -888,7 +949,49 @@ mod tests {
         }
         assert_eq!(switches(&path), 1);
         assert!(matches!(follower.state, State::Login { .. }));
-        assert!(follower.due() >= Duration::from_secs(60));
+
+        // Once the path changes, as when the update is undone, the service
+        // asks it again, without logging in: back to its own build, it has
+        // nothing more to say.
+        script(&path, crate::identity::build());
+        tick_until(&mut follower, &|| true, |follower| {
+            matches!(follower.state, State::Current) && follower.baseline == seen_at(&path)
+        });
+        assert!(follower.report().is_none());
+        assert_eq!(switches(&path), 1);
+    }
+
+    /// Another update after a switch could not log in is asked about, and
+    /// reported, as a new one.
+    #[test]
+    fn another_update_after_a_login_failure_is_followed() {
+        let directory = crate::test_support::tempdir().unwrap();
+        let path = directory.path().join("syq");
+        script(&path, crate::identity::build());
+        let mut follower = Follower::new(path.clone());
+        tick_until(&mut follower, &|| true, |follower| {
+            follower.baseline == seen_at(&path)
+        });
+        let new = path.with_extension("new");
+        crate::test_support::write_executable(
+            &new,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --build-identity ]; then echo v99.0.0; exit 0; fi\n\
+                 echo 'syq persist: logging in to server needs you' >&2\nexit {LOGIN_NEEDED_EXIT}\n"
+            ),
+            0o755,
+        );
+        std::fs::rename(&new, &path).unwrap();
+        tick_until(&mut follower, &|| true, |follower| {
+            matches!(follower.state, State::Login { .. })
+        });
+        script(&path, "v100.0.0");
+        // While busy, it only reports the new build.
+        tick_until(&mut follower, &|| false, |follower| {
+            follower.report().is_some_and(|report| {
+                report.phase == "waiting" && report.to.as_deref() == Some("v100.0.0")
+            })
+        });
     }
 
     /// A switch that fails says why and tries again after a wait; one that

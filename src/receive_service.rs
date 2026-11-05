@@ -610,18 +610,24 @@ struct Status {
 /// What a receiving service has in progress.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Busy {
-    /// Copies, commands and account access in progress.
+    /// Copies, commands and account logins in progress, apart from open
+    /// account connections.
     pub(crate) requests: usize,
     /// Requests waiting for approval.
     pub(crate) pending: usize,
+    /// Approved account connections open through it: each holds a request
+    /// for as long as it lives, whether or not anything runs through it.
+    #[serde(default)]
+    pub(crate) accounts: usize,
 }
 impl Busy {
     pub(crate) fn idle(&self) -> bool {
-        self.requests == 0 && self.pending == 0
+        self.requests == 0 && self.pending == 0 && self.accounts == 0
     }
     /// What stopping it now cuts off, as "1 request in progress and 2
-    /// requests waiting for approval".
-    pub(crate) fn describe(&self) -> String {
+    /// requests waiting for approval". Account connections are named apart,
+    /// `on` the server they were opened from when given.
+    pub(crate) fn describe(&self, on: Option<&str>) -> String {
         let count = |count: usize, what: &str| {
             format!("{count} {what}{}", if count == 1 { "" } else { "s" })
         };
@@ -635,7 +641,33 @@ impl Busy {
                 count(self.pending, "request")
             ));
         }
+        if self.accounts > 0 {
+            parts.push(match on {
+                Some(server) => format!(
+                    "{} on {server}",
+                    count(self.accounts, "approved account connection")
+                ),
+                None => count(self.accounts, "approved account connection"),
+            });
+        }
         parts.join(" and ")
+    }
+    /// For a service with open account connections, which do not end by
+    /// themselves: that it waits for them, and what to run to switch now.
+    /// None without any.
+    pub(crate) fn accounts_note(&self, on: Option<&str>, fix: &str) -> Option<String> {
+        (self.accounts > 0).then(|| {
+            format!(
+                "it waits for {} to close; `{fix}` switches now and closes {}",
+                Busy {
+                    requests: 0,
+                    pending: 0,
+                    ..*self
+                }
+                .describe(on),
+                if self.accounts == 1 { "it" } else { "them" }
+            )
+        })
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -843,7 +875,13 @@ pub(crate) fn ensure(domain: &Domain, control: &Path, remote: &crate::conn::Remo
             if !remote.quiet {
                 crate::output::diagnostic!(
                     "syq: {}",
-                    busy_notice(&remote.label(), &build, &busy, follows_this_file)
+                    busy_notice(
+                        &remote.label(),
+                        &build,
+                        &busy,
+                        follows_this_file,
+                        &connect_command(&remote.label(), domain.explicit_path())
+                    )
                 );
             }
             false
@@ -859,22 +897,36 @@ pub(crate) fn ensure(domain: &Domain, control: &Path, remote: &crate::conn::Remo
     }
 }
 /// What a command says when a receiving service from another build keeps
-/// running because it is busy.
+/// running because it is busy. `fix` replaces it at once.
 pub(crate) fn busy_notice(
     endpoint: &str,
     build: &str,
     busy: &Busy,
     follows_this_file: bool,
+    fix: &str,
 ) -> String {
+    // Open account connections do not end by themselves.
+    if let Some(accounts) = busy.accounts_note(Some(endpoint), fix) {
+        if busy.requests == 0 && busy.pending == 0 {
+            return format!("receiving through {endpoint} keeps running syq {build}: {accounts}");
+        }
+    }
     let then = if follows_this_file {
         "it switches to this version by itself once nothing is in progress"
     } else {
         "once nothing is in progress, a syq command run here switches it to this version"
     };
-    format!(
+    let mut notice = format!(
         "receiving through {endpoint} keeps running syq {build} for now, with {}; {then}",
-        busy.describe(),
-    )
+        busy.describe(Some(endpoint)),
+    );
+    if busy.accounts > 0 {
+        notice.push_str(&format!(
+            "; `{fix}` switches now and closes the account connection{}",
+            if busy.accounts == 1 { "" } else { "s" }
+        ));
+    }
+    notice
 }
 /// Run by syq commands (`main`), so that the services an older syq left
 /// running switch to a new build too, not only the one for the server a
@@ -941,6 +993,9 @@ pub(crate) fn refresh_outdated(domain: &Domain, quiet: bool) {
         let login = phase.as_deref() == Some("login");
         if login {
             if !interactive || quiet {
+                // Leave the next attempt to a command run in a terminal,
+                // however soon it comes.
+                crate::persistence::defer_switch_attempts(&control, Duration::ZERO);
                 continue;
             }
             crate::persistence::defer_switch_attempts(&control, switch::LOGIN_RETRY);
@@ -1155,6 +1210,7 @@ fn start_switch(domain: &Domain, endpoint: &str) -> Result<()> {
     command
         .args(switch_command(domain, endpoint))
         .env("SYQ_NO_UPDATE_CHECK", "1")
+        .env(switch::STARTED_BY_COMMAND, "1")
         .env("SSH_ASKPASS_REQUIRE", "never")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1285,6 +1341,7 @@ pub(crate) struct ReceivingStatus {
     pub build: String,
     pub started_from: Option<String>,
     pub switch: Option<switch::Report>,
+    pub busy: Option<Busy>,
 }
 #[derive(Serialize)]
 pub(crate) struct NamedConnection {
@@ -1294,6 +1351,7 @@ pub(crate) struct NamedConnection {
 pub(crate) fn connection_status(control: &Path) -> Option<ReceivingStatus> {
     status(control, false).ok().map(|s| ReceivingStatus {
         switch: switch_report(control, &s),
+        busy: s.busy,
         build: s.identity,
         started_from: s.started_from,
         name: s.name,
@@ -1317,6 +1375,8 @@ pub(crate) fn build_note(
     build: &str,
     started_from: Option<&str>,
     switch: Option<&switch::Report>,
+    busy: Option<&Busy>,
+    on: Option<&str>,
     fix: &str,
     commands_switch: bool,
 ) -> Option<String> {
@@ -1343,6 +1403,21 @@ pub(crate) fn build_note(
             line.push_str(&format!(", or run `{fix}`"));
         }
         note.push(line);
+    }
+    // What waiting for idle waits for, when that is an open account
+    // connection, which does not end by itself.
+    let waits_for_idle = match switch {
+        Some(switch) => switch.phase == "waiting",
+        None => match switch::follows(started_from) {
+            switch::Follows::ThisFile => true,
+            switch::Follows::Nothing => commands_switch,
+            switch::Follows::OtherFile => false,
+        },
+    };
+    if build != crate::identity::build() && waits_for_idle {
+        if let Some(accounts) = busy.and_then(|busy| busy.accounts_note(on, fix)) {
+            note.push(accounts);
+        }
     }
     (!note.is_empty()).then(|| note.join("; "))
 }
@@ -1404,6 +1479,7 @@ fn busy_of(state: &Status) -> Busy {
     state.busy.unwrap_or(Busy {
         requests: 0,
         pending: state.pending.len(),
+        accounts: 0,
     })
 }
 
@@ -1432,7 +1508,7 @@ fn replace_other(
                     "syq: replacing receiving through {}, which runs syq {}, cuts off {}",
                     state.endpoint,
                     state.identity,
-                    busy.describe()
+                    busy.describe(Some(&state.endpoint))
                 );
             }
             stop_inner(control, false)?;
@@ -1474,9 +1550,9 @@ fn replace_other(
     }
 }
 
-/// Log in as the new receiving service will. A login that needs the user
-/// is `switch::LoginNeeded`, and commands wait a while before trying such
-/// a switch again.
+/// Log in as the new receiving service will. A login that needs the user,
+/// including one that did not finish in time (`switch::login_check`), is
+/// `switch::LoginNeeded`.
 fn check_login(control: &Path, remote: &crate::conn::RemoteSpec) -> Result<()> {
     let endpoint = crate::persistence::EndpointRecord {
         user: remote.user.clone(),
@@ -1485,10 +1561,11 @@ fn check_login(control: &Path, remote: &crate::conn::RemoteSpec) -> Result<()> {
         ssh_options: Vec::new(),
         ssh_options_directory: None,
     };
-    match crate::destination::check_receiving_login(&endpoint) {
+    let (deadline, in_this_group) = switch::login_check();
+    match crate::destination::check_receiving_login(&endpoint, deadline, in_this_group) {
         Ok(()) => Ok(()),
         Err((true, message)) => {
-            crate::persistence::defer_switch_attempts(control, switch::LOGIN_RETRY);
+            switch::defer_after_login(control);
             Err(anyhow::anyhow!("{message}").context(switch::LoginNeeded(remote.label())))
         }
         Err((false, message)) => Err(anyhow::anyhow!(
@@ -1805,9 +1882,15 @@ impl ProfileWorker {
 }
 /// What these workers have in progress.
 fn busy(workers: &[ProfileWorker]) -> Busy {
+    let accounts = workers.iter().map(|w| w.activity.accounts()).sum();
     Busy {
-        requests: workers.iter().map(|w| w.activity.requests()).sum(),
+        requests: workers
+            .iter()
+            .map(|w| w.activity.requests())
+            .sum::<usize>()
+            .saturating_sub(accounts),
         pending: workers.iter().map(|w| w.approvals.snapshots().len()).sum(),
+        accounts,
     }
 }
 /// Refuse new requests on every worker if all are idle, so the service can
@@ -2727,6 +2810,8 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                         &provider.build,
                         provider.started_from.as_deref(),
                         provider.switch.as_ref(),
+                        provider.busy().as_ref(),
+                        None,
                         &fix,
                         false,
                     ) {
@@ -2746,6 +2831,8 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                         &state.identity,
                         state.started_from.as_deref(),
                         state.switch.as_ref(),
+                        state.busy.as_ref(),
+                        Some(&state.endpoint),
                         &connect_command(&state.endpoint, domain.explicit_path()),
                         true,
                     ) {
@@ -3425,6 +3512,114 @@ mod tests {
         })
     }
 
+    /// An approved account connection is reported as what it is, not as a
+    /// copy in progress, with what to run to switch now: it does not end by
+    /// itself.
+    #[test]
+    fn open_account_connections_are_reported_apart_from_requests() {
+        let fix = "syq persist connect server";
+        let accounts = Busy {
+            requests: 0,
+            pending: 0,
+            accounts: 1,
+        };
+        assert!(!accounts.idle());
+        assert_eq!(
+            busy_notice("server", "v0.8.0", &accounts, true, fix),
+            "receiving through server keeps running syq v0.8.0: it waits for 1 approved account connection on server to close; `syq persist connect server` switches now and closes it"
+        );
+        let both = Busy {
+            requests: 1,
+            pending: 0,
+            accounts: 2,
+        };
+        let notice = busy_notice("server", "v0.8.0", &both, true, fix);
+        assert_eq!(
+            notice,
+            "receiving through server keeps running syq v0.8.0 for now, with 1 request in progress and 2 approved account connections on server; it switches to this version by itself once nothing is in progress; `syq persist connect server` switches now and closes the account connections"
+        );
+        let copies = Busy {
+            requests: 1,
+            pending: 0,
+            accounts: 0,
+        };
+        assert!(!busy_notice("server", "v0.8.0", &copies, true, fix).contains("account"));
+
+        // Status says the same while the switch waits.
+        let started_from = std::env::current_exe().unwrap();
+        let started_from = started_from.to_str();
+        let waiting = switch::Report {
+            to: Some(crate::identity::build().into()),
+            phase: "waiting".into(),
+            error: None,
+        };
+        let note = build_note(
+            "v0.8.0",
+            started_from,
+            Some(&waiting),
+            Some(&accounts),
+            Some("server"),
+            fix,
+            true,
+        )
+        .unwrap();
+        assert!(
+            note.ends_with(
+                "; it waits for 1 approved account connection on server to close; `syq persist connect server` switches now and closes it"
+            ),
+            "{note}"
+        );
+        assert!(!note.contains("request"), "{note}");
+        // The provider names no server.
+        let note = build_note(
+            "v0.8.0",
+            started_from,
+            None,
+            Some(&accounts),
+            None,
+            "syq persist receive on",
+            false,
+        )
+        .unwrap();
+        assert!(
+            note.ends_with(
+                "; it waits for 1 approved account connection to close; `syq persist receive on` switches now and closes it"
+            ),
+            "{note}"
+        );
+        // Nothing to wait for once the switch failed, or for one that
+        // follows another file.
+        let failed = switch::Report {
+            phase: "failed".into(),
+            error: Some("broken".into()),
+            ..waiting
+        };
+        let note = build_note(
+            "v0.8.0",
+            started_from,
+            Some(&failed),
+            Some(&accounts),
+            Some("server"),
+            fix,
+            true,
+        )
+        .unwrap();
+        assert!(!note.contains("account"), "{note}");
+        let elsewhere = crate::test_support::tempdir().unwrap();
+        let other = elsewhere.path().join("syq");
+        fs::write(&other, b"").unwrap();
+        let note = build_note(
+            "v0.8.0",
+            other.to_str(),
+            None,
+            Some(&accounts),
+            Some("server"),
+            fix,
+            true,
+        );
+        assert!(!note.is_some_and(|note| note.contains("account")));
+    }
+
     /// A service that reports what it has in progress decides itself
     /// whether it is idle enough to stop; one from before syq followed
     /// updates is stopped unless it has requests waiting for approval.
@@ -3434,6 +3629,7 @@ mod tests {
         let busy = Some(Busy {
             requests: 1,
             pending: 0,
+            accounts: 0,
         });
         let service = stand_in(&control, lock, move |_| answer("other", busy, false));
         assert!(!stop_when_idle(&control, &answer("other", busy, false)).unwrap());
@@ -3507,6 +3703,7 @@ mod tests {
                         Some(Busy {
                             requests: 1,
                             pending: 0,
+                            accounts: 0,
                         }),
                         false,
                     );

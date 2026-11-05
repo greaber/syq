@@ -630,16 +630,52 @@ pub(crate) struct StatusSnapshot {
     pub rows: Vec<Status>,
     pub errors: Vec<String>,
 }
-/// Whether a live approved account connection in this domain was
-/// authorized by `provider`: it keeps an authorization channel through the
-/// provider's connection for as long as it lives.
+/// Whether an account connection in this domain may still use
+/// `provider`'s connection, which carries its authorization channel from
+/// its request until it ends: a live one `provider` authorized, or one
+/// still waiting for approval or connecting. The keeper of each holds its
+/// record's lock throughout (`keeper`), but writes the record, which names
+/// the provider, only once connected; a held lock without a readable
+/// record counts, since its provider is unknown, as does an index that
+/// cannot be read.
 pub(crate) fn uses_provider(domain: &Domain, provider: &Provider) -> bool {
-    status(domain).is_ok_and(|snapshot| {
-        snapshot
-            .rows
-            .iter()
-            .any(|row| row.connected && row.authorizer == *provider)
-    })
+    let directory = match existing_directory(domain) {
+        Ok(Some(directory)) => directory,
+        Ok(None) => return false,
+        Err(_) => return true,
+    };
+    let Ok(entries) = fs::read_dir(&directory) else {
+        return true;
+    };
+    let requested = entries.flatten().any(|entry| {
+        let lock = entry.path();
+        if lock.extension().is_none_or(|extension| extension != "lock") || !held(&lock) {
+            return false;
+        }
+        match read_record(&lock.with_extension("json")) {
+            Ok(Some(record)) => record.authorizer == *provider,
+            _ => true,
+        }
+    });
+    requested
+        || status(domain).is_ok_and(|snapshot| {
+            snapshot
+                .rows
+                .iter()
+                .any(|row| row.connected && row.authorizer == *provider)
+        })
+}
+/// Whether another process holds the lock on `path`. Looking takes a
+/// shared lock for a moment, which a keeper taking it then retries.
+fn held(path: &Path) -> bool {
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+    else {
+        return false;
+    };
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) != 0 }
 }
 
 pub(crate) fn status(domain: &Domain) -> Result<StatusSnapshot> {
@@ -1571,6 +1607,73 @@ mod tests {
             assert!(cached(&domain, "laptop", &requested).is_err());
         }
         fs::set_permissions(&index, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// A provider's connection is in use from an account request through
+    /// it until that ends: while it waits for approval or connects, its
+    /// keeper holds its record's lock with no record yet; once connected,
+    /// the record names the provider.
+    #[test]
+    fn a_provider_is_in_use_from_an_account_request_until_it_ends() {
+        let root = crate::test_support::short_tempdir().unwrap();
+        let scope = root.path().join("scope");
+        crate::persistence::initialize_scope(&scope).unwrap();
+        let domain = Domain::select(Some(&scope)).unwrap();
+        let ssh = |host: &str| Provider::Ssh {
+            endpoint: NativeEndpoint {
+                user: Some("user".into()),
+                host: host.into(),
+                port: Some(22),
+            },
+        };
+        let (provider, other) = (ssh("provider.invalid"), ssh("other.invalid"));
+        assert!(!uses_provider(&domain, &provider));
+        let index = directory(&domain).unwrap();
+        assert!(!uses_provider(&domain, &provider));
+        let path = index.join(format!("{}.json", "0".repeat(64)));
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        // Waiting for approval: which provider is not known yet.
+        assert!(uses_provider(&domain, &provider));
+        assert!(uses_provider(&domain, &other));
+        // Connected through the other provider.
+        let record = Record {
+            version: provider_state_version(&other),
+            authorizer: other.clone(),
+            requested: NativeEndpoint {
+                user: None,
+                host: "destination.invalid".into(),
+                port: None,
+            },
+            endpoint: NativeEndpoint {
+                user: Some("user".into()),
+                host: "destination.invalid".into(),
+                port: Some(22),
+            },
+            control: index.join("unused"),
+        };
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        serde_json::to_writer(&mut file, &record).unwrap();
+        assert!(!uses_provider(&domain, &provider));
+        assert!(uses_provider(&domain, &other));
+        // Ended: the lock is free.
+        drop(lock);
+        assert!(!uses_provider(&domain, &other));
     }
 
     #[test]

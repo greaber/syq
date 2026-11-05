@@ -352,6 +352,27 @@ pub(crate) fn capture_output_bounded(
         deadline,
         cancelled,
         max_output_bytes,
+        false,
+        &mut std::thread::sleep,
+    )
+}
+
+/// `capture_output_bounded`, keeping the command in this process's group,
+/// for a process that ends with its whole group, such as a switch that runs
+/// out of time (`receive_service::switch::end_switch_at`): the command ends
+/// with it then, rather than outliving the deadline this process enforced.
+/// What the command leaves running ends with that group, not when it exits.
+pub(crate) fn capture_output_bounded_in_this_group(
+    command: &mut Command,
+    deadline: std::time::Instant,
+    max_output_bytes: usize,
+) -> std::io::Result<Output> {
+    capture_output_bounded_with(
+        command,
+        deadline,
+        &|| false,
+        max_output_bytes,
+        true,
         &mut std::thread::sleep,
     )
 }
@@ -363,6 +384,7 @@ fn capture_output_bounded_with(
     deadline: std::time::Instant,
     cancelled: &dyn Fn() -> bool,
     max_output_bytes: usize,
+    in_this_group: bool,
     wait: &mut dyn FnMut(std::time::Duration),
 ) -> std::io::Result<Output> {
     use std::io::{self, Read};
@@ -425,12 +447,15 @@ fn capture_output_bounded_with(
     }
 
     check(deadline, cancelled)?;
-    let mut group = group::ProcessGroup::spawn(
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    )?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut group = if in_this_group {
+        group::ProcessGroup::spawn_in_this_group(command)?
+    } else {
+        group::ProcessGroup::spawn(command)?
+    };
     let mut stdout = group.child.stdout.take().unwrap();
     let mut stderr = group.child.stderr.take().unwrap();
     nonblocking(stdout.as_raw_fd())?;
@@ -658,6 +683,7 @@ mod bounded_tests {
             Instant::now() + Duration::from_secs(10),
             &|| false,
             64,
+            false,
             &mut |wait| {
                 waits.push(wait);
                 std::thread::sleep(wait);
