@@ -152,11 +152,67 @@ def _matches(path: Path, *, size: int, sha256: str) -> bool:
         metadata = path.stat(follow_symlinks=False)
         return (
             stat.S_ISREG(metadata.st_mode)
+            and metadata.st_uid == os.geteuid()
+            and metadata.st_mode & 0o022 == 0
             and metadata.st_size == size
             and _sha256_file(path) == sha256
         )
     except OSError:
         return False
+
+
+def _private_install_dir(cache_root: Path, names: tuple[str, ...]) -> Path:
+    """Create or check the directories from ``cache_root`` down to the
+    install directory, so that no other account can replace the executable
+    between its check and its use.
+
+    The cache root may be a symbolic link, and its group may write it, but it
+    must belong to this user or root, and only a sticky directory such as
+    ``/tmp`` may be writable by everyone. Each directory below must be a real
+    directory of this user's that group and others cannot write; one that an
+    older SDK created writable by its group is made private.
+    """
+    user = os.geteuid()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    path = cache_root
+    try:
+        cache_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory = os.open(cache_root, flags)
+    except OSError as error:
+        raise SyqInstallError(f"could not prepare syq SDK cache at {cache_root}") from error
+    try:
+        metadata = os.fstat(directory)
+        if metadata.st_uid not in (user, 0) or (
+            metadata.st_mode & 0o002 and not metadata.st_mode & stat.S_ISVTX
+        ):
+            raise SyqInstallError(
+                f"the syq SDK cache {cache_root} must belong to you, and other "
+                "accounts may not write it"
+            )
+        for name in names:
+            path = path / name
+            try:
+                os.mkdir(name, 0o700, dir_fd=directory)
+            except FileExistsError:
+                pass
+            child = os.open(name, flags | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = child
+            metadata = os.fstat(directory)
+            if metadata.st_uid != user:
+                raise SyqInstallError(
+                    f"the syq SDK cache directory {path} belongs to another account"
+                )
+            if metadata.st_mode & 0o022:
+                os.fchmod(directory, stat.S_IMODE(metadata.st_mode) & ~0o022)
+    except OSError as error:
+        raise SyqInstallError(
+            f"could not prepare syq SDK cache directory {path}; it must be a "
+            "directory of yours that nobody else can write"
+        ) from error
+    finally:
+        os.close(directory)
+    return path
 
 
 def _copy_bounded(
@@ -184,7 +240,7 @@ def _copy_bounded(
     return digest.hexdigest()
 
 
-def _download_archive(url: str, destination: Path, artifact: _Artifact) -> None:
+def _download_archive(url: str, output: BinaryIO, artifact: _Artifact) -> None:
     request = urllib.request.Request(
         url,
         headers={
@@ -193,9 +249,7 @@ def _download_archive(url: str, destination: Path, artifact: _Artifact) -> None:
         },
     )
     try:
-        with urllib.request.urlopen(
-            request, timeout=_DOWNLOAD_TIMEOUT_SECONDS
-        ) as response, destination.open("wb") as output:
+        with urllib.request.urlopen(request, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response:
             final_url = response.geturl()
             if urllib.parse.urlparse(final_url).scheme != "https":
                 raise SyqInstallError("the syq download redirected away from HTTPS")
@@ -214,10 +268,10 @@ def _download_archive(url: str, destination: Path, artifact: _Artifact) -> None:
 
 
 def _decompress_archive(
-    archive_path: Path, binary_path: Path, artifact: _Artifact
+    archive: BinaryIO, output: BinaryIO, artifact: _Artifact
 ) -> None:
     try:
-        with gzip.open(archive_path, "rb") as source, binary_path.open("wb") as output:
+        with gzip.GzipFile(fileobj=archive, mode="rb") as source:
             actual_sha256 = _copy_bounded(
                 source,
                 output,
@@ -273,8 +327,9 @@ def managed_executable(
 ) -> Path:
     """Return the verified executable pinned by this SDK, downloading if needed.
 
-    The executable is cached by syq release and host target. Its complete bytes
-    are checked against the manifest packaged in this SDK before every use.
+    The executable is cached by syq release and host target, in directories
+    that only this user can change. Its complete bytes are checked against the
+    manifest packaged in this SDK before every use.
     """
 
     manifest = _load_release_manifest()
@@ -283,18 +338,9 @@ def managed_executable(
     cache_root = (
         Path(cache_dir) if cache_dir is not None else _default_cache_root()
     )
-    install_dir = (
-        cache_root
-        / "syq"
-        / "sdk"
-        / "python"
-        / f"v{manifest['version']}"
-        / target
+    install_dir = _private_install_dir(
+        cache_root, ("syq", "sdk", "python", f"v{manifest['version']}", target)
     )
-    try:
-        install_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    except OSError as error:
-        raise SyqInstallError(f"could not prepare syq SDK cache at {install_dir}") from error
     executable = install_dir / "syq"
     if _matches(
         executable, size=artifact.binary_size, sha256=artifact.binary_sha256
@@ -309,22 +355,20 @@ def managed_executable(
 
     base_url = f"{_DOWNLOAD_HOST}/{manifest['tag']}"
     url = f"{base_url}/{artifact.archive_name}"
-    archive_path: Path | None = None
     binary_path: Path | None = None
     try:
-        archive_file = tempfile.NamedTemporaryFile(
-            prefix=".syq-download-", suffix=".gz", dir=install_dir, delete=False
-        )
-        archive_path = Path(archive_file.name)
-        archive_file.close()
-        binary_file = tempfile.NamedTemporaryFile(
-            prefix=".syq-install-", dir=install_dir, delete=False
-        )
-        binary_path = Path(binary_file.name)
-        binary_file.close()
-        _download_archive(url, archive_path, artifact)
-        _decompress_archive(archive_path, binary_path, artifact)
-        binary_path.chmod(0o755)
+        # Both are written and read only through the descriptors that created
+        # them, never reopened by name.
+        with tempfile.TemporaryFile(
+            prefix=".syq-download-", suffix=".gz", dir=install_dir
+        ) as archive:
+            descriptor, name = tempfile.mkstemp(prefix=".syq-install-", dir=install_dir)
+            binary_path = Path(name)
+            with os.fdopen(descriptor, "wb") as binary:
+                _download_archive(url, archive, artifact)
+                archive.seek(0)
+                _decompress_archive(archive, binary, artifact)
+                os.fchmod(binary.fileno(), 0o755)
         _validate_binary(binary_path, manifest)
         os.replace(binary_path, executable)
         binary_path = None
@@ -334,9 +378,8 @@ def managed_executable(
     except OSError as error:
         raise SyqInstallError(f"could not install pinned syq at {executable}") from error
     finally:
-        for temporary_path in (archive_path, binary_path):
-            if temporary_path is not None:
-                try:
-                    temporary_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+        if binary_path is not None:
+            try:
+                binary_path.unlink(missing_ok=True)
+            except OSError:
+                pass

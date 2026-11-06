@@ -38,6 +38,9 @@ const MAX_SAFE_JSON_INTEGER: u64 = (1 << 53) - 1;
 /// signature is checked.
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long an interactive download may wait for the response, or for more
+/// of its body, before it fails and is tried again.
+const DOWNLOAD_STALL: Duration = Duration::from_secs(30);
 const RELEASE_PUBLIC_KEY: Option<&str> = option_env!("SYQ_RELEASE_PUBLIC_KEY");
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -134,12 +137,27 @@ pub fn self_update() -> Result<()> {
         }
         std::cmp::Ordering::Greater => {}
     }
-    let installed = install_release(&release, &receipt_path, &mut receipt)?;
-    crate::output::command_println!("updated syq to {}", release.version);
-    // The file installation wrote, never the receipt's spelling of it, which
-    // may name another file by now.
-    switch_receiving(&installed);
+    match install_release(&release, &receipt_path, &mut receipt)? {
+        Installed::Now(installed) => {
+            crate::output::command_println!("updated syq to {}", release.version);
+            // The file installation wrote, never the receipt's spelling of
+            // it, which may name another file by now.
+            switch_receiving(&installed);
+        }
+        Installed::Already(version) => crate::output::command_println!(
+            "another update installed syq {version} meanwhile; leaving it in place"
+        ),
+    }
     Ok(())
+}
+
+/// What `install_release` did.
+enum Installed {
+    /// It installed the release at this path.
+    Now(PathBuf),
+    /// Another update installed this version, as new as the release or
+    /// newer, while this one downloaded, so it left that in place.
+    Already(Version),
 }
 
 /// Have the syq installed at `binary` replace the idle receiving services an
@@ -195,7 +213,14 @@ pub(crate) fn was_standalone_install(binary: &Path) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error).context("inspect previous standalone install receipt"),
     }
-    let bytes = fs::read(&path).context("read previous standalone install receipt")?;
+    let bytes = if is_legacy_receipt(&path) {
+        match read_legacy_receipt(&path) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(false),
+        }
+    } else {
+        fs::read(&path).context("read previous standalone install receipt")?
+    };
     let Ok(receipt) = parse_receipt(&bytes) else {
         return Ok(false);
     };
@@ -437,9 +462,10 @@ pub(crate) enum StoredRelease {
 /// Check a release's directories, from the store root down, and its
 /// `files`.
 /// Each one that exists must be a real directory or file, not a symbolic link,
-/// owned by this user, that group and others cannot write; syq creates them
-/// that way. The store root alone may be a symbolic link, for example to a
-/// larger disk, and then the directory it leads to gets the same check.
+/// owned by this user, that group and others cannot write, by its mode or a
+/// macOS access control list; syq creates them that way. The store root alone
+/// may be a symbolic link, for example to a larger disk, and then the
+/// directory it leads to gets the same check.
 /// Anything else is refused rather than verified and run, because whoever
 /// could change it could also change it again between a check and the `exec`.
 ///
@@ -486,6 +512,8 @@ pub(crate) fn stored_release(
             "is not a regular file"
         } else if metadata.mode() & 0o022 != 0 {
             "is writable by group or others"
+        } else if crate::inode_metadata::acl_lets_others_change(path)? {
+            "has an access control list that lets others change it"
         } else {
             return Ok(true);
         };
@@ -877,7 +905,7 @@ fn install_release(
     release: &VerifiedRelease,
     receipt_path: &Path,
     receipt: &mut InstallReceipt,
-) -> Result<PathBuf> {
+) -> Result<Installed> {
     let target = Target::local().ok_or_else(|| {
         anyhow!(
             "standalone releases do not support {} {}",
@@ -909,6 +937,15 @@ fn install_release(
     let binary = binary.seal_executable()?;
     verify_executable(binary.path(), release)?;
 
+    // Updates take turns replacing the executable, and each replaces only
+    // an older one: another may have installed a newer release since this
+    // one started, and an older release must never replace it.
+    let _lock = lock_directory(parent)?;
+    if let Some(installed) = installed_version(&executable)? {
+        if installed >= release.version {
+            return Ok(Installed::Already(installed));
+        }
+    }
     fs::rename(binary.path(), &executable).with_context(|| {
         format!(
             "replace {} (is its directory writable?)",
@@ -918,7 +955,78 @@ fn install_release(
     sync_parent(parent)?;
     receipt.version = release.version.to_string();
     write_receipt(receipt_path, receipt)?;
-    Ok(executable)
+    Ok(Installed::Now(executable))
+}
+
+/// Lock `directory` until the returned file is dropped, waiting for
+/// another syq that holds it. Where the filesystem cannot lock, nothing is
+/// locked.
+fn lock_directory(directory: &Path) -> Result<Option<File>> {
+    use std::os::fd::AsRawFd;
+    let file = File::open(directory).with_context(|| format!("open {}", directory.display()))?;
+    let lock = |operation| {
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    match lock(libc::LOCK_EX | libc::LOCK_NB) {
+        Ok(()) => return Ok(Some(file)),
+        Err(error) if error.raw_os_error() == Some(libc::EWOULDBLOCK) => {}
+        Err(_) => return Ok(None),
+    }
+    crate::output::diagnostic!(
+        "syq: waiting for another syq update in {} to finish",
+        directory.display()
+    );
+    loop {
+        match lock(libc::LOCK_EX) {
+            Ok(()) => return Ok(Some(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Ok(None),
+        }
+    }
+}
+
+/// The version of the syq at `executable` now, if any. Unless another update
+/// has replaced it since this process started, that is this process's own.
+fn installed_version(executable: &Path) -> Result<Option<Version>> {
+    let metadata = match fs::metadata(executable) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", executable.display()))
+        }
+    };
+    if crate::process::running_image() == Some(crate::process::file_identity(&metadata)) {
+        return current_version().map(Some);
+    }
+    let changed = || {
+        anyhow!(
+            "{} changed during the update and does not report its version; run `syq --self-update` again",
+            executable.display()
+        )
+    };
+    let output = crate::process::capture_output_bounded(
+        Command::new(executable)
+            .arg("--version")
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .stdin(Stdio::null()),
+        std::time::Instant::now() + Duration::from_secs(10),
+        &|| false,
+        4096,
+    )
+    .map_err(|_| changed())?;
+    if !output.status.success() {
+        return Err(changed());
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .strip_prefix("syq ")
+        .and_then(|version| Version::parse(version).ok())
+        .map(Some)
+        .ok_or_else(changed)
 }
 
 fn release_downloads() -> Cow<'static, str> {
@@ -1096,6 +1204,73 @@ impl std::fmt::Display for DownloadTooLarge {
 
 impl std::error::Error for DownloadTooLarge {}
 
+/// A response body stopped arriving.
+#[derive(Debug)]
+struct DownloadStalled {
+    after: Duration,
+}
+
+impl std::fmt::Display for DownloadStalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no data arrived for {} s", self.after.as_secs())
+    }
+}
+
+impl std::error::Error for DownloadStalled {}
+
+/// `copy_bounded`, failing when `source` gives nothing for `stall`. A
+/// blocking read cannot be interrupted, so a thread reads; one that stalls
+/// is left behind, holding only the connection, and ends with it.
+fn copy_bounded_watched(
+    source: impl Read + Send + 'static,
+    destination: &mut dyn Write,
+    limit: u64,
+    stall: Duration,
+) -> Result<u64> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+    std::thread::Builder::new()
+        .name("syq-download".into())
+        .spawn(move || {
+            let mut source = source.take(limit.saturating_add(1));
+            loop {
+                let mut chunk = vec![0; 64 * 1024];
+                let result = match source.read(&mut chunk) {
+                    Ok(count) => {
+                        chunk.truncate(count);
+                        Ok(chunk)
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => Err(error),
+                };
+                let done = !matches!(&result, Ok(chunk) if !chunk.is_empty());
+                if sender.send(result).is_err() || done {
+                    return;
+                }
+            }
+        })
+        .context("start a download thread")?;
+    let mut copied = 0u64;
+    loop {
+        let chunk = match receiver.recv_timeout(stall) {
+            Ok(chunk) => chunk?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                bail!(DownloadStalled { after: stall })
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("the download thread ended unexpectedly")
+            }
+        };
+        if chunk.is_empty() {
+            return Ok(copied);
+        }
+        copied += chunk.len() as u64;
+        if copied > limit {
+            bail!(DownloadTooLarge { limit });
+        }
+        destination.write_all(&chunk)?;
+    }
+}
+
 /// Copy at most `limit` bytes; a longer source fails instead of being
 /// truncated to something that might still look complete.
 fn copy_bounded(source: &mut impl Read, destination: &mut impl Write, limit: u64) -> Result<u64> {
@@ -1159,6 +1334,8 @@ fn fetch_into(url: &str, sink: &mut dyn DownloadSink, mode: FetchMode, limit: u6
         return Ok(());
     }
 
+    // An interactive download may take as long as the connection needs,
+    // but not wait for ever on one that stopped (`DOWNLOAD_STALL`).
     let (connect_timeout, global_timeout, attempts) = match mode {
         FetchMode::Interactive => (Duration::from_secs(10), None, 3),
         FetchMode::BackgroundCheck => (Duration::from_secs(2), Some(Duration::from_secs(5)), 1),
@@ -1166,6 +1343,7 @@ fn fetch_into(url: &str, sink: &mut dyn DownloadSink, mode: FetchMode, limit: u6
     let agent = crate::tls::config_builder()
         .https_only(true)
         .timeout_connect(Some(connect_timeout))
+        .timeout_recv_response(Some(DOWNLOAD_STALL))
         .timeout_global(global_timeout)
         .user_agent(concat!("syq/", env!("CARGO_PKG_VERSION")))
         .build()
@@ -1185,10 +1363,15 @@ fn fetch_into(url: &str, sink: &mut dyn DownloadSink, mode: FetchMode, limit: u6
             if let Some(target) = target {
                 request = request.header("x-syq-target", target);
             }
-            let mut response = request.call().with_context(|| format!("request {url}"))?;
+            let response = request.call().with_context(|| format!("request {url}"))?;
             let mut output = sink.restart()?;
-            copy_bounded(&mut response.body_mut().as_reader(), &mut output, limit)
-                .with_context(|| format!("download {url}"))?;
+            copy_bounded_watched(
+                response.into_body().into_reader(),
+                &mut output,
+                limit,
+                DOWNLOAD_STALL,
+            )
+            .with_context(|| format!("download {url}"))?;
             output
                 .flush()
                 .with_context(|| format!("save download {url}"))?;
@@ -1234,9 +1417,54 @@ fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
 }
 
 fn read_receipt(path: &Path) -> Result<InstallReceipt> {
-    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let bytes = if is_legacy_receipt(path) {
+        read_legacy_receipt(path)?
+    } else {
+        fs::read(path).with_context(|| format!("read {}", path.display()))?
+    };
     parse_receipt(&bytes)
         .with_context(|| format!("read standalone install receipt {}", path.display()))
+}
+
+/// The most a receipt may hold; one is a few hundred bytes.
+const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
+
+fn is_legacy_receipt(path: &Path) -> bool {
+    legacy_receipt_path().is_ok_and(|legacy| legacy == path)
+}
+
+/// Read the receipt that released versions kept in the configuration
+/// directory, away from the executable it names. It must be a regular file
+/// of this user's that group and others cannot write, as syq wrote it, and
+/// is read without following a link: whoever could put it there could
+/// otherwise choose which executable an update replaces.
+fn read_legacy_receipt(path: &Path) -> Result<Vec<u8>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect {}", path.display()))?;
+    if !metadata.is_file()
+        || metadata.uid() != crate::rooted::own_uid()
+        || metadata.mode() & 0o022 != 0
+    {
+        bail!(
+            "{} must be a regular file that you own and nobody else can write",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_RECEIPT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    if bytes.len() as u64 > MAX_RECEIPT_BYTES {
+        bail!("{} is too large to be an install receipt", path.display());
+    }
+    Ok(bytes)
 }
 
 fn parse_receipt(bytes: &[u8]) -> Result<InstallReceipt> {
@@ -1352,39 +1580,22 @@ fn check_is_due(path: &Path) -> bool {
         .map_or(true, |elapsed| elapsed >= CHECK_INTERVAL)
 }
 
+/// Record that a check ran now: a new private file, renamed over the stamp,
+/// so that whatever is at its name, even a link to another file, is
+/// replaced rather than written through.
 fn touch_check_stamp(path: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("update check stamp has no parent directory"))?;
-    create_private_dir(parent)?;
-    OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .context("write update check stamp")?;
-    set_private_file(path)
-}
-
-fn create_private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("set permissions on {}", path.display()))?;
-    }
-    Ok(())
-}
-
-fn set_private_file(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("set permissions on {}", path.display()))?;
-    }
-    Ok(())
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+        .with_context(|| format!("create {}", parent.display()))?;
+    let temporary = TempFile::new(parent, ".stamp")?;
+    temporary.check_path()?;
+    fs::rename(temporary.path(), path).context("write update check stamp")
 }
 
 fn sync_parent(parent: &Path) -> Result<()> {
@@ -1652,6 +1863,40 @@ mod tests {
     }
 
     #[test]
+    fn the_update_check_stamp_replaces_a_link_instead_of_writing_through_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"untouched").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).unwrap();
+        let stamp = dir.path().join("config/syq/last-update-check");
+        fs::create_dir_all(stamp.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&victim, &stamp).unwrap();
+        touch_check_stamp(&stamp).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        let metadata = fs::symlink_metadata(&stamp).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert!(!check_is_due(&stamp));
+        // A missing directory is created private.
+        let fresh = dir.path().join("fresh/syq/last-update-check");
+        touch_check_stamp(&fresh).unwrap();
+        assert_eq!(
+            fs::metadata(fresh.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(fs::read_dir(stamp.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
     fn bounded_copies_fail_instead_of_truncating() {
         let mut output = Vec::new();
         assert_eq!(
@@ -1659,6 +1904,50 @@ mod tests {
             6
         );
         let error = copy_bounded(&mut &b"abcdef"[..], &mut Vec::new(), 5).unwrap_err();
+        assert!(
+            error.downcast_ref::<DownloadTooLarge>().is_some(),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_download_that_stops_arriving_fails_instead_of_waiting_for_ever() {
+        /// Gives `data`, then blocks until the test ends.
+        struct Stalling {
+            data: Option<Vec<u8>>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl Read for Stalling {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if let Some(data) = self.data.take() {
+                    buffer[..data.len()].copy_from_slice(&data);
+                    return Ok(data.len());
+                }
+                let _ = self.release.recv();
+                Ok(0)
+            }
+        }
+        let (release, blocked) = std::sync::mpsc::channel();
+        let source = Stalling {
+            data: Some(b"partial".to_vec()),
+            release: blocked,
+        };
+        let mut output = Vec::new();
+        let error =
+            copy_bounded_watched(source, &mut output, 100, Duration::from_millis(200)).unwrap_err();
+        assert!(error.downcast_ref::<DownloadStalled>().is_some(), "{error}");
+        assert_eq!(output, b"partial");
+        drop(release);
+        // A source that keeps arriving copies in full, within its bound.
+        let mut output = Vec::new();
+        assert_eq!(
+            copy_bounded_watched(&b"abcdef"[..], &mut output, 6, Duration::from_secs(5)).unwrap(),
+            6
+        );
+        assert_eq!(output, b"abcdef");
+        let error =
+            copy_bounded_watched(&b"abcdef"[..], &mut Vec::new(), 5, Duration::from_secs(5))
+                .unwrap_err();
         assert!(
             error.downcast_ref::<DownloadTooLarge>().is_some(),
             "{error}"
@@ -1691,6 +1980,56 @@ mod tests {
             fs::write(&path, corrupt).unwrap();
             assert_eq!(stored_helper(&path, &helper), None);
             assert!(!path.exists());
+        }
+    }
+
+    /// Run `chmod` with `arguments`, as on macOS to change an ACL.
+    #[cfg(target_os = "macos")]
+    fn chmod(arguments: &[&std::ffi::OsStr]) {
+        assert!(Command::new("chmod")
+            .args(arguments)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_stored_release_that_an_acl_lets_others_change_is_refused() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let dir = crate::test_support::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let release = store.join("v1.2.3/macos-arm64");
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&release)
+            .unwrap();
+        let files = [MANIFEST_NAME, STORED_EXECUTABLE];
+        for name in files {
+            fs::write(release.join(name), b"stored").unwrap();
+            fs::set_permissions(release.join(name), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let check = || stored_release(&store, &release, &files);
+        assert_eq!(check().unwrap(), StoredRelease::Complete);
+        let executable = release.join(STORED_EXECUTABLE);
+        // An entry for this user changes nothing.
+        let user = Command::new("id").arg("-un").output().unwrap().stdout;
+        let user = format!(
+            "user:{} allow write",
+            String::from_utf8(user).unwrap().trim()
+        );
+        chmod(&["+a".as_ref(), user.as_ref(), executable.as_os_str()]);
+        assert_eq!(check().unwrap(), StoredRelease::Complete);
+        for (entry, path) in [
+            ("everyone allow write", &executable),
+            ("everyone allow add_file,delete_child", &release),
+        ] {
+            chmod(&["+a".as_ref(), entry.as_ref(), path.as_os_str()]);
+            let error = check().unwrap_err().to_string();
+            assert!(error.contains("access control list"), "{entry}: {error}");
+            chmod(&["-N".as_ref(), path.as_os_str()]);
+            assert_eq!(check().unwrap(), StoredRelease::Complete);
         }
     }
 

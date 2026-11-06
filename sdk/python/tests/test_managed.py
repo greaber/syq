@@ -141,6 +141,55 @@ class BootstrapTests(unittest.TestCase):
             with self.assertRaisesRegex(syq.SyqInstallError, "build identity"):
                 managed.managed_executable(cache_dir=self.cache)
 
+    def _install_dir(self) -> Path:
+        return self.cache / "syq" / "sdk" / "python" / "v9.8.7" / "linux-x86_64"
+
+    def test_a_cache_others_can_change_is_refused(self) -> None:
+        manifest_patch, target_patch = self._patch_release()
+        download = mock.Mock(side_effect=lambda *args, **kwargs: _Response(FAKE_ARCHIVE))
+        with manifest_patch, target_patch, mock.patch.object(
+            managed.urllib.request, "urlopen", download
+        ):
+            # A cache root that every account can write, without the sticky
+            # bit, as another account could have made it.
+            self.cache.chmod(0o777)
+            with self.assertRaisesRegex(syq.SyqInstallError, "other accounts may not write"):
+                managed.managed_executable(cache_dir=self.cache)
+            # A sticky one such as /tmp is fine, as is one its group can write.
+            for mode in (0o1777, 0o770):
+                self.cache.chmod(mode)
+                managed.managed_executable(cache_dir=self.cache)
+            self.cache.chmod(0o700)
+            # A link in place of a directory below the root.
+            python = self.cache / "syq" / "sdk" / "python"
+            elsewhere = self.cache / "elsewhere"
+            python.rename(elsewhere)
+            python.symlink_to(elsewhere)
+            with self.assertRaisesRegex(syq.SyqInstallError, "nobody else can write"):
+                managed.managed_executable(cache_dir=self.cache)
+        self.assertEqual(download.call_count, 1)
+
+    def test_directories_and_executable_others_could_change_are_not_trusted(self) -> None:
+        manifest_patch, target_patch = self._patch_release()
+        download = mock.Mock(side_effect=lambda *args, **kwargs: _Response(FAKE_ARCHIVE))
+        with manifest_patch, target_patch, mock.patch.object(
+            managed.urllib.request, "urlopen", download
+        ):
+            executable = managed.managed_executable(cache_dir=self.cache)
+            # Directories made writable by their group, as an older SDK made
+            # them under a 002 umask, are made private again.
+            for directory in [self.cache / "syq", self._install_dir()]:
+                directory.chmod(0o775)
+            # A cached executable that others could have changed is
+            # downloaded again, even though its contents match.
+            executable.chmod(0o777)
+            again = managed.managed_executable(cache_dir=self.cache)
+        self.assertEqual(again, executable)
+        self.assertEqual(download.call_count, 2)
+        self.assertEqual(executable.stat().st_mode & 0o777, 0o755)
+        for directory in [self.cache / "syq", self._install_dir()]:
+            self.assertEqual(directory.stat().st_mode & 0o777, 0o755)
+
     def test_supported_host_aliases_select_release_targets(self) -> None:
         cases = [
             ("Linux", "x86_64", "linux-x86_64"),

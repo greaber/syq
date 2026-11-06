@@ -239,6 +239,14 @@ fn assert_failure_contains(output: &Output, expected: &str) {
     );
 }
 
+/// Write a legacy receipt in the configuration directory as released
+/// versions did: a file only its owner can read and write.
+fn write_legacy_receipt(path: &Path, contents: &[u8]) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, contents).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
 fn next_release_version() -> String {
     let mut version = Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
     version.patch = version.patch.checked_add(1).unwrap();
@@ -329,6 +337,76 @@ fn signed_self_update_replaces_only_the_receipted_copy() {
         format!("syq {release_version}")
     );
     assert_eq!(fixture.receipt()["version"], release_version);
+}
+
+/// Two updates can overlap, and the one that finishes last may carry the
+/// older release: it must leave the newer one the other installed.
+#[test]
+fn self_update_leaves_a_newer_release_another_update_installed_meanwhile() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let release_version = next_release_version();
+    let fixture = UpdateFixture::new(&release_version, &format!("v{release_version}"));
+    fixture.register();
+    // Hold the update at its archive download.
+    let archive_path = fixture
+        .temp
+        .path(&format!("fixtures/syq-{}.gz", release_target()));
+    let archive = fs::read(&archive_path).unwrap();
+    fs::remove_file(&archive_path).unwrap();
+    assert!(Command::new("mkfifo")
+        .arg(&archive_path)
+        .status()
+        .unwrap()
+        .success());
+    let mut update = fixture
+        .command_builder(&fixture.installed, &["--self-update"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut fifo = loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&archive_path)
+        {
+            Ok(fifo) => break fifo,
+            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                assert!(
+                    update.try_wait().unwrap().is_none(),
+                    "the update ended before downloading: {:?}",
+                    update.wait_with_output().unwrap()
+                );
+                assert!(std::time::Instant::now() < deadline, "no download began");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => panic!("open {}: {error}", archive_path.display()),
+        }
+    };
+    // Meanwhile another update installs a newer release.
+    let mut newer = Version::parse(&release_version).unwrap();
+    newer.patch += 1;
+    let replacement = fixture.temp.path("bin/.newer");
+    executable_support::write_executable(
+        &replacement,
+        format!("#!/bin/sh\necho 'syq {newer}'\n"),
+        0o755,
+    );
+    fs::rename(&replacement, &fixture.installed).unwrap();
+    let newer_program = fs::read(&fixture.installed).unwrap();
+    fifo.write_all(&archive).unwrap();
+    drop(fifo);
+
+    let output = update.wait_with_output().unwrap();
+    assert_success(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains(&format!("another update installed syq {newer} meanwhile")),
+        "{output:?}"
+    );
+    assert_eq!(fs::read(&fixture.installed).unwrap(), newer_program);
+    assert_eq!(fixture.receipt()["version"], env!("CARGO_PKG_VERSION"));
 }
 
 #[test]
@@ -540,8 +618,7 @@ fn self_update_accepts_the_released_v052_receipt() {
         serde_json::from_str(include_str!("fixtures/standalone-install-v0.5.2.json")).unwrap();
     receipt["binary"] = fixture.installed.to_str().unwrap().into();
     let legacy = fixture.config.join("syq/install.json");
-    fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-    fs::write(&legacy, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    write_legacy_receipt(&legacy, &serde_json::to_vec(&receipt).unwrap());
     assert_success(&fixture.command("--self-update"));
     let updated: serde_json::Value = serde_json::from_slice(&fs::read(&legacy).unwrap()).unwrap();
     assert_eq!(updated["version"], version);
@@ -549,6 +626,53 @@ fn self_update_accepts_the_released_v052_receipt() {
         .installed
         .with_file_name(".syq-install.json")
         .exists());
+}
+
+#[test]
+fn self_update_reads_a_legacy_receipt_only_as_a_private_file() {
+    let version = next_release_version();
+    let fixture = UpdateFixture::new(&version, &format!("v{version}"));
+    let mut receipt: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/standalone-install-v0.5.2.json")).unwrap();
+    receipt["binary"] = fixture.installed.to_str().unwrap().into();
+    receipt["target"] = release_target().into();
+    let saved = serde_json::to_vec(&receipt).unwrap();
+    let legacy = fixture.config.join("syq/install.json");
+    write_legacy_receipt(&legacy, &saved);
+    fs::remove_file(&legacy).unwrap();
+    let refused = |what: &str| {
+        let output = fixture.command("--self-update");
+        assert_failure_contains(
+            &output,
+            "self-update is only available for installs made by the standalone installer",
+        );
+        assert_eq!(
+            fs::read(&fixture.installed).unwrap(),
+            fixture.original,
+            "{what}"
+        );
+    };
+    // A link to a receipt elsewhere.
+    let elsewhere = fixture.temp.path("elsewhere.json");
+    fs::write(&elsewhere, &saved).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &legacy).unwrap();
+    refused("linked receipt");
+    // One that others can change.
+    fs::remove_file(&legacy).unwrap();
+    fs::write(&legacy, &saved).unwrap();
+    fs::set_permissions(&legacy, fs::Permissions::from_mode(0o666)).unwrap();
+    refused("receipt others can write");
+    // One far larger than any receipt.
+    let mut padded = saved.clone();
+    padded.resize(128 * 1024, b' ');
+    fs::write(&legacy, &padded).unwrap();
+    fs::set_permissions(&legacy, fs::Permissions::from_mode(0o600)).unwrap();
+    refused("oversized receipt");
+    // The private file syq wrote.
+    fs::write(&legacy, &saved).unwrap();
+    assert_success(&fixture.command("--self-update"));
+    let updated: serde_json::Value = serde_json::from_slice(&fs::read(&legacy).unwrap()).unwrap();
+    assert_eq!(updated["version"], version);
 }
 
 #[test]
@@ -657,14 +781,13 @@ fn legacy_receipt_preserves_deleted_command_and_is_bound_to_its_path() {
             home.join(".config")
         };
         let legacy = config.join("syq/install.json");
-        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         // Preserve the released v0.5.2 fields; only bind the old fixture to this
         // disposable installation, without invoking the current receipt writer.
         let mut receipt: serde_json::Value =
             serde_json::from_str(include_str!("fixtures/standalone-install-v0.5.2.json")).unwrap();
         receipt["binary"] = binary.to_str().unwrap().into();
         let saved = serde_json::to_vec(&receipt).unwrap();
-        fs::write(&legacy, &saved).unwrap();
+        write_legacy_receipt(&legacy, &saved);
         let install = || {
             let mut command = Command::new(&fixture.installed);
             command
@@ -696,7 +819,7 @@ fn legacy_receipt_preserves_deleted_command_and_is_bound_to_its_path() {
         fs::remove_file(&adjacent).unwrap();
         receipt["binary"] = fixture.installed.to_str().unwrap().into();
         let foreign = serde_json::to_vec(&receipt).unwrap();
-        fs::write(&legacy, &foreign).unwrap();
+        write_legacy_receipt(&legacy, &foreign);
         assert_success(&install());
         assert_eq!(fs::read(&binary).unwrap(), fixture.original);
         assert!(adjacent.is_file());

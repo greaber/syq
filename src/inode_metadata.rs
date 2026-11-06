@@ -12,6 +12,20 @@ mod macos_xattrs;
 
 pub(crate) const MAX_INODE_METADATA: usize = 4 * 1024 * 1024;
 
+/// Whether an ACL lets an account other than this one change the file or
+/// directory at `path`, not following a final link, which its mode bits do
+/// not show on macOS. Linux ACLs show in the mode's group bits, so there
+/// this is always false.
+pub(crate) fn acl_lets_others_change(path: &std::path::Path) -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    return macos_acl::others_may_change(path);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Ok(false)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Selection {
     pub acls: bool,

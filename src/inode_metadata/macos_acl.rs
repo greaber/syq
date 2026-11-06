@@ -3,7 +3,7 @@
 //! pointer or internal ACL structure crosses the wire.
 use super::{MacAce, MacAcl};
 use anyhow::{ensure, Context, Result};
-use std::{ffi::c_void, fs::File, io, os::fd::AsRawFd, ptr};
+use std::{ffi::c_void, fs::File, io, os::fd::AsRawFd, path::Path, ptr};
 
 type Acl = *mut c_void;
 const EXTENDED: libc::c_int = 0x100;
@@ -25,6 +25,8 @@ unsafe extern "C" {
     ) -> libc::c_int;
     fn fchmodx_np(fd: libc::c_int, security: *mut c_void) -> libc::c_int;
     fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> Acl;
+    fn acl_get_link_np(path: *const libc::c_char, kind: libc::c_int) -> Acl;
+    fn mbr_uid_to_uuid(uid: libc::uid_t, uuid: *mut u8) -> libc::c_int;
     fn acl_set_fd_np(fd: libc::c_int, acl: Acl, kind: libc::c_int) -> libc::c_int;
     fn acl_init(count: libc::c_int) -> Acl;
     fn acl_free(object: *mut c_void) -> libc::c_int;
@@ -105,7 +107,38 @@ pub(super) fn read(file: &File) -> Result<MacAcl> {
         }
         return Err(error).context("read macOS ACL on held inode");
     }
-    let acl = OwnedAcl(raw);
+    entries(&OwnedAcl(raw))
+}
+
+/// Whether the ACL of the file or directory at `path`, not following a
+/// final link, allows an account other than this one to write it, add or
+/// remove its entries, delete it, or change its permissions or owner,
+/// whatever its mode bits say.
+pub(super) fn others_may_change(path: &Path) -> Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    const ALLOW: u32 = 1;
+    // Write data or add a file, delete, append or add a subdirectory,
+    // delete a child, write security, change owner (<sys/acl.h>).
+    const CHANGE: u64 = (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 12) | (1 << 13);
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("{} contains a NUL byte", path.display()))?;
+    let raw = unsafe { acl_get_link_np(name.as_ptr(), EXTENDED) };
+    if raw.is_null() {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(false);
+        }
+        return Err(error).with_context(|| format!("read the ACL of {}", path.display()));
+    }
+    let acl = entries(&OwnedAcl(raw))?;
+    let mut own = [0u8; 16];
+    let own = (unsafe { mbr_uid_to_uuid(libc::geteuid(), own.as_mut_ptr()) } == 0).then_some(own);
+    Ok(acl.entries.iter().any(|entry| {
+        entry.tag == ALLOW && entry.permissions & CHANGE != 0 && Some(entry.principal) != own
+    }))
+}
+
+fn entries(acl: &OwnedAcl) -> Result<MacAcl> {
     let mut result = MacAcl {
         flags: get_flags(acl.0)?,
         entries: Vec::new(),

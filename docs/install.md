@@ -37,7 +37,10 @@ syq --use-version 0.7.1 cp photos --into backup
 The first time, syq downloads and verifies that release and keeps it in
 `~/.local/lib/syq`; later runs work offline. Your normal installation stays
 unchanged. The selected release runs the whole command, including on servers,
-so an older release brings its older limitations and bugs too. Stored
+so an older release brings its older limitations and bugs too. Receiving or the
+SSH authorization provider that such a command starts on your laptop outlasts
+it; your normal installation switches them to its own version, [as after an
+update](persistence-reference.md#connection-lifetime-and-waits). Stored
 releases stay until you delete them; see
 [stored releases](environment.md#stored-releases-and-helpers).
 

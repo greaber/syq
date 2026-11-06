@@ -387,6 +387,22 @@ pub(super) fn switch_when_idle(domain: &Domain) -> Result<()> {
     Ok(())
 }
 
+/// Replace an idle provider from another build that cannot follow updates
+/// by itself, as `receive_service::switch_outdated_now` does for receiving:
+/// one from before syq followed updates, or one a command run with
+/// `--use-version` started from a release in the binary store.
+pub(super) fn switch_outdated(domain: &Domain) -> Result<()> {
+    let Some(state) = running(domain, ANSWER_TIMEOUT, || Control::Status)? else {
+        return Ok(());
+    };
+    if state.build == crate::identity::build()
+        || super::switch::follows(state.started_from.as_deref()) != super::switch::Follows::Nothing
+    {
+        return Ok(());
+    }
+    switch_when_idle(domain)
+}
+
 /// Wait for provider process `pid`, which is stopping, to give up the
 /// lock: until it has exited, or another provider answers.
 fn await_exit(domain: &Domain, pid: u32) -> Result<()> {
