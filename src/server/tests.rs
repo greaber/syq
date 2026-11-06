@@ -7,6 +7,7 @@ fn read_stream_shrinks_before_the_next_read_and_fences_late_updates() {
         thread: None,
         tcp_socket: None,
         named_socket: None,
+        closed: Default::default(),
     };
     let send = |value| {
         tx.send(Ok(crate::wire_budget::Budgeted {
@@ -443,6 +444,38 @@ impl<R> Drop for ExitObserved<R> {
         self.dropped
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// A peer's compressed requests hold what decompression added to them in
+/// the shared allowance while they are queued and served.
+#[test]
+fn queued_requests_hold_what_decompression_added() {
+    let request = Request::ListDir {
+        directory: vec![b'a'; 1 << 20],
+        prefix: Vec::new(),
+        limit: 1,
+        symlink_policy: OperatorSymlinkPolicy::Refuse,
+        confined_root: None,
+    };
+    let mut bytes = Vec::new();
+    FrameWriter::new(&mut bytes, true)
+        .write_msg(&request)
+        .unwrap();
+    assert!(bytes.len() < 64 << 10, "the request was not compressed");
+    let reader = RequestReader::spawn(
+        FrameReader::new(std::io::Cursor::new(bytes)),
+        None,
+        None,
+        Default::default(),
+        None,
+        None,
+    )
+    .unwrap();
+    let queued = reader.recv().unwrap().unwrap();
+    assert!(queued
+        .hold
+        .expansion_bytes()
+        .is_some_and(|bytes| bytes > 900 << 10));
 }
 
 #[test]

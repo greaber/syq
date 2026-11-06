@@ -1,15 +1,98 @@
 //! Shared accounting for decoded collection storage, whose size is not bounded
 //! by the encoded frame length alone. Reservations travel with queued messages.
 //! Flat byte buffers and strings are bounded separately by frame/queue limits.
+//! A server also charges what decompression adds to a frame (`Expansion`).
 use serde::de::{self, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor};
 use serde::Deserialize;
 use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Duration;
 
 pub(crate) const MEMORY_LIMIT: usize = 512 << 20;
 const RESERVATION_GRANULE: usize = 64 << 10;
+/// Decompressed bytes beyond the bytes that arrived, across the frames a
+/// server's connections hold. Without it, a peer could make each queued
+/// frame hold up to `MAX_FRAME` for a few bytes sent.
+pub(crate) const EXPANSION_LIMIT: usize = 1 << 30;
+/// How often a reader waiting for room checks whether its connection closed.
+const EXPANSION_WAIT_CHECK: Duration = Duration::from_millis(50);
+
+#[derive(Debug)]
+struct ExpansionBudget {
+    used: Mutex<usize>,
+    freed: Condvar,
+    limit: usize,
+}
+
+impl ExpansionBudget {
+    fn shared() -> Arc<Self> {
+        static BUDGET: OnceLock<Arc<ExpansionBudget>> = OnceLock::new();
+        BUDGET
+            .get_or_init(|| Arc::new(Self::with_limit(EXPANSION_LIMIT)))
+            .clone()
+    }
+
+    fn with_limit(limit: usize) -> Self {
+        Self {
+            used: Mutex::new(0),
+            freed: Condvar::new(),
+            limit,
+        }
+    }
+}
+
+/// Room in the shared expansion allowance for one frame's decompressed bytes,
+/// held with the decoded message (`Hold::keep`) until it is dropped.
+#[derive(Debug)]
+pub(crate) struct Expansion {
+    budget: Arc<ExpansionBudget>,
+    bytes: usize,
+}
+
+impl Expansion {
+    /// Wait until `bytes` fit, rather than fail: frames already held are
+    /// being served and free their room as they finish. A reservation always
+    /// fits when nothing else is held, so one frame larger than the limit
+    /// cannot wait forever. Give up once `closed` says the connection ended.
+    pub(crate) fn reserve(bytes: usize, closed: &dyn Fn() -> bool) -> io::Result<Self> {
+        Self::reserve_in(ExpansionBudget::shared(), bytes, closed)
+    }
+
+    fn reserve_in(
+        budget: Arc<ExpansionBudget>,
+        bytes: usize,
+        closed: &dyn Fn() -> bool,
+    ) -> io::Result<Self> {
+        let mut used = budget.used.lock().unwrap();
+        while *used > 0 && used.saturating_add(bytes) > budget.limit {
+            if closed() {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "connection closed while waiting for decompression memory",
+                ));
+            }
+            used = budget
+                .freed
+                .wait_timeout(used, EXPANSION_WAIT_CHECK)
+                .unwrap()
+                .0;
+        }
+        *used += bytes;
+        drop(used);
+        Ok(Self { budget, bytes })
+    }
+}
+
+impl Drop for Expansion {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            *self.budget.used.lock().unwrap() -= self.bytes;
+            self.budget.freed.notify_all();
+        }
+    }
+}
 
 #[derive(Debug)]
 struct Budget {
@@ -23,6 +106,7 @@ pub(crate) struct Hold {
     used: usize,
     reserved: usize,
     exhausted: bool,
+    expansion: Option<Expansion>,
 }
 
 impl Hold {
@@ -40,7 +124,18 @@ impl Hold {
             used: 0,
             reserved: 0,
             exhausted: false,
+            expansion: None,
         }
+    }
+
+    /// Keep a frame's decompression reservation until the message is dropped.
+    pub(crate) fn keep(&mut self, expansion: Expansion) {
+        self.expansion = Some(expansion);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expansion_bytes(&self) -> Option<usize> {
+        self.expansion.as_ref().map(|expansion| expansion.bytes)
     }
 
     pub(crate) fn grow(&mut self, bytes: usize) -> io::Result<()> {
@@ -466,6 +561,7 @@ mod tests {
             used: 0,
             reserved: 0,
             exhausted: false,
+            expansion: None,
         }
     }
     fn budget() -> Arc<Budget> {
@@ -519,6 +615,40 @@ mod tests {
             matches!(decoded.value, crate::proto::Response::Block { data, .. } if data.len() == 8 << 20)
         );
         assert_eq!(shared.used.load(Relaxed), RESERVATION_GRANULE);
+    }
+
+    #[test]
+    fn expansion_waits_for_room_and_gives_up_when_the_connection_closes() {
+        let budget = Arc::new(ExpansionBudget::with_limit(100));
+        let open = || false;
+        let first = Expansion::reserve_in(budget.clone(), 60, &open).unwrap();
+        // More than the limit fits when nothing else is held.
+        let alone = Arc::new(ExpansionBudget::with_limit(100));
+        drop(Expansion::reserve_in(alone.clone(), 150, &open).unwrap());
+        assert_eq!(*alone.used.lock().unwrap(), 0);
+        // A second frame waits until the first is released.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiting = {
+            let budget = budget.clone();
+            std::thread::spawn(move || {
+                let second = Expansion::reserve_in(budget, 60, &|| false).unwrap();
+                tx.send(()).unwrap();
+                second
+            })
+        };
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        let mut hold = Hold::new();
+        hold.keep(first);
+        drop(hold);
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("released room was not handed on");
+        let second = waiting.join().unwrap();
+        assert_eq!(*budget.used.lock().unwrap(), 60);
+        // A reader stops waiting once its connection has closed.
+        let error = Expansion::reserve_in(budget.clone(), 60, &|| true).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        drop(second);
+        assert_eq!(*budget.used.lock().unwrap(), 0);
     }
 
     #[test]

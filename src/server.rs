@@ -26,6 +26,9 @@ struct RequestReader {
     thread: Option<std::thread::JoinHandle<()>>,
     tcp_socket: Option<TcpStream>,
     named_socket: Option<std::os::unix::net::UnixStream>,
+    /// Ends the reader's wait for decompression memory once the connection
+    /// is being closed.
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RequestReader {
@@ -38,6 +41,10 @@ impl RequestReader {
         sweep: Option<SweepOnLoss>,
     ) -> std::io::Result<Self> {
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        // Queued requests hold what decompression added to them, so a peer
+        // cannot make them hold far more than it sent.
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        reader.charge_expansion(closed.clone());
         let thread = std::thread::Builder::new().spawn(move || loop {
             let msg = reader.read_budgeted::<Request>();
             if let (Ok(request), Some(sweep)) = (&msg, &sweep) {
@@ -70,6 +77,7 @@ impl RequestReader {
             thread: Some(thread),
             tcp_socket,
             named_socket,
+            closed,
         })
     }
 
@@ -121,6 +129,8 @@ impl RequestReader {
 
 impl Drop for RequestReader {
     fn drop(&mut self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
         let joinable = self.tcp_socket.is_some() || self.named_socket.is_some();
         if let Some(socket) = &self.named_socket {
             let _ = socket.shutdown(std::net::Shutdown::Both);
