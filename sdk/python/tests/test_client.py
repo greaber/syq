@@ -36,7 +36,11 @@ class ProcessGroupCleanupTests(unittest.TestCase):
     def test_permission_error_reaps_exited_leader_and_retries_group(self):
         from syq.client import _kill_process_group
 
-        process = mock.Mock(pid=123, poll=mock.Mock(return_value=0))
+        # A leader still finishing its exit is not yet reaped by poll(), but a
+        # brief wait reaps it.
+        process = mock.Mock(
+            pid=123, poll=mock.Mock(return_value=None), wait=mock.Mock(return_value=0)
+        )
         for retry in (None, ProcessLookupError()):
             with self.subTest(retry=retry), mock.patch(
                 "syq.client.os.killpg", side_effect=[PermissionError(), retry]
@@ -49,14 +53,16 @@ class ProcessGroupCleanupTests(unittest.TestCase):
     def test_permission_errors_for_live_or_remaining_group_are_visible(self):
         from syq.client import _kill_process_group
 
-        for returncode, attempts in ((None, 1), (0, 2)):
-            with self.subTest(returncode=returncode), mock.patch(
+        live = subprocess.TimeoutExpired("syq", 0.5)
+        for wait, attempts in ((live, 1), (0, 2)):
+            with self.subTest(wait=wait), mock.patch(
                 "syq.client.os.killpg", side_effect=PermissionError("denied")
             ) as kill:
-                process = mock.Mock(pid=123, poll=mock.Mock(return_value=returncode))
+                process = mock.Mock(pid=123, wait=mock.Mock(side_effect=[wait]))
                 with self.assertRaisesRegex(PermissionError, "denied"):
                     _kill_process_group(process)
                 self.assertEqual(kill.call_count, attempts)
+                process.wait.assert_called_once_with(timeout=0.5)
 
 
 class AsyncProcessGroupCleanupTests(unittest.IsolatedAsyncioTestCase):

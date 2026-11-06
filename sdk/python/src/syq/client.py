@@ -52,6 +52,7 @@ Selector = PathArgument | Iterable[PathArgument]
 IgnoreSelector = str | IgnoreFrom | Iterable[str | IgnoreFrom]
 _MAX_STREAM_LINE_BYTES = 16 * 1024 * 1024
 _MAX_STDERR_BYTES = 8 * 1024
+_REAP_WAIT_TIMEOUT = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,12 +254,16 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
     try:
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except PermissionError:
-            # Darwin can report EPERM for a group containing only zombies.
-            # Reap our exited leader, then retry so surviving descendants still
-            # receive the signal and genuine permission failures remain visible.
-            if process.poll() is None:
-                raise
+        except PermissionError as error:
+            # Darwin can report EPERM for a group containing only zombies, or
+            # a leader that has closed its pipes but not finished exiting, so
+            # cannot be reaped yet. Wait briefly to reap our leader, then retry
+            # so surviving descendants still receive the signal, as the async
+            # client does. A live process keeps the permission failure visible.
+            try:
+                process.wait(timeout=_REAP_WAIT_TIMEOUT)
+            except subprocess.TimeoutExpired as timeout:
+                raise error from timeout
             os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
