@@ -3053,6 +3053,17 @@ if [ -n "${FAKE_SSH_REJECT:-}" ] && [ "$1" != -V ]; then
     echo 'syq@test-server: Permission denied (publickey).' >&2
     exit 255
 fi
+# Reject the first login, as a key that a later attempt finds unlocked.
+if [ -n "${FAKE_SSH_REJECT_ONCE:-}" ] && [ "$1" != -V ] && [ ! -e "$FAKE_SSH_REJECT_ONCE" ]; then
+    case " $* " in
+        *" -O "*|*" -G "*) ;;
+        *)
+            : > "$FAKE_SSH_REJECT_ONCE"
+            echo 'syq@test-server: Permission denied (publickey).' >&2
+            exit 255
+            ;;
+    esac
+fi
 if [ -n "${FAKE_SSH_REFUSE:-}" ] && [ "$1" != -V ]; then
     echo 'ssh: connect to host test-server port 22: Connection refused' >&2
     exit 255
@@ -4292,7 +4303,7 @@ fn persist_commands_replace_an_idle_older_service_at_once() {
         assert_output_ok(&output);
         assert!(
             stderr_of(&output).contains(
-                "switching receiving through test-server, which runs syq v0.7.1, to this version of syq (a copy in progress through it would be interrupted)\n"
+                "switching receiving through test-server, which runs syq v0.7.1, to this version of syq (a copy in progress through it would be interrupted); if your security key blinks, touch it\n"
             ),
             "{command:?}: {}",
             stderr_of(&output)
@@ -4562,6 +4573,10 @@ fn a_foreground_switch_never_stops_a_service_that_took_over() {
     let shown = status(Some(&mark));
     assert_output_ok(&shown);
     assert!(mark.exists(), "{}", stderr_of(&shown));
+    // It looked again, at the service that took over.
+    let stdout = String::from_utf8_lossy(&shown.stdout);
+    assert!(stdout.contains("test-server ready"), "{stdout}");
+    assert!(!stdout.contains("keeps running"), "{stdout}");
     // Nothing stopped the service that took over.
     assert!(
         seen.lock()
@@ -4581,6 +4596,95 @@ fn a_foreground_switch_never_stops_a_service_that_took_over() {
             .count(),
         1,
         "{requests:?}"
+    );
+}
+
+/// Without a terminal, a `persist` command's switch whose login gets no
+/// answer, as ssh waiting for a key's touch, ends within the switch's
+/// bounds as one that needs the user, and the old service keeps receiving.
+#[test]
+fn a_foreground_switch_whose_login_gets_no_answer_ends_in_time() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let old = older_service(&installed, serde_json::json!([]));
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    let hung = t.path("ssh.pid");
+    let started = std::time::Instant::now();
+    let mut command = installed.command(
+        syq,
+        &[
+            "persist",
+            "status",
+            "--pscope",
+            installed.scope.to_str().unwrap(),
+        ],
+    );
+    let shown = command
+        .env("FAKE_SSH_HANG", &hung)
+        .env("SYQ_TEST_SWITCH_TIMEOUT_MS", "6000")
+        .run()
+        .unwrap();
+    assert_output_ok(&shown);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(hung.exists(), "{}", stderr_of(&shown));
+    let ssh: libc::pid_t = fs::read_to_string(&hung).unwrap().trim().parse().unwrap();
+    wait_for("ssh to end", std::time::Duration::from_secs(10), || {
+        ended(ssh)
+    });
+    let json = installed.persist(syq, &["status", "--json"]);
+    let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let switched = &json["connections"][0]["receiving_switch"];
+    assert_eq!(switched["phase"], "login", "{json}");
+    let state = installed.request(serde_json::json!({"version": 2, "stop": false}));
+    assert_eq!(state["identity"], "v0.7.1");
+    installed.request(serde_json::json!({"version": 2, "stop": true}));
+    old.join().unwrap();
+}
+
+/// A connection `persist receive on --connection` asks for replaces one
+/// the settings change could not switch: once it is ready, the command
+/// succeeds.
+#[test]
+fn a_requested_connection_replaces_a_failed_switch_of_it() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let old = older_service(&installed, serde_json::json!([]));
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    let mut command = installed.command(
+        syq,
+        &[
+            "persist",
+            "receive",
+            "on",
+            "--connection",
+            "test-server",
+            "--pscope",
+            installed.scope.to_str().unwrap(),
+        ],
+    );
+    let output = command
+        .env("FAKE_SSH_REJECT_ONCE", t.path("rejected"))
+        .run()
+        .unwrap();
+    assert!(t.path("rejected").exists(), "{}", stderr_of(&output));
+    assert_output_ok(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("test-server ready"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    old.join().unwrap();
+    assert_eq!(
+        installed.request(serde_json::json!({"version": 2, "stop": false}))["identity"],
+        this_build()
     );
 }
 

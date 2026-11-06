@@ -73,7 +73,7 @@ struct UpdateFixture {
 impl UpdateFixture {
     fn new(release_version: &str, executable_identity: &str) -> Self {
         let replacement = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'syq {release_version}' ;;\n  --build-identity) echo '{executable_identity}' ;;\n  *) exit 2 ;;\nesac\n"
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'syq {release_version}' ;;\n  --build-identity) echo '{executable_identity}' ;;\n  *) printf '%s\\n' \"$*\" >> \"$0.invocations\"; exit 2 ;;\nesac\n"
         );
         Self::with_program(release_version, replacement.as_bytes())
     }
@@ -275,6 +275,12 @@ fn signed_self_update_replaces_only_the_receipted_copy() {
     assert_success(&update);
     assert!(String::from_utf8_lossy(&update.stdout)
         .contains(&format!("updated syq to {release_version}")));
+    // The installed syq is asked to switch receiving left by an older one.
+    let invocations = fixture.installed.with_file_name("syq.invocations");
+    assert_eq!(
+        fs::read_to_string(&invocations).unwrap(),
+        "persist receive switch-outdated\n"
+    );
 
     let version = Command::new(&fixture.installed)
         .arg("--version")

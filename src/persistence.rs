@@ -432,17 +432,6 @@ pub(crate) enum Login {
     /// `switch::LoginNeeded`, as for a switch without a terminal.
     Unattended,
 }
-impl Login {
-    /// For a switch a command makes on the way: asking only in a terminal.
-    pub(crate) fn for_switch() -> Self {
-        if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-            Self::Bounded
-        } else {
-            Self::Unattended
-        }
-    }
-}
-
 /// `replace` says what to do with a receiving service from another build:
 /// replace it at once, as when the user runs `persist connect`, or only
 /// once idle, as a switch to a new build does. A switch to a new build
@@ -738,19 +727,23 @@ pub(crate) fn claim_switch_attempt(control: &Path, interval: Duration) -> bool {
 pub(crate) enum SwitchClaim {
     /// Another switch holds the endpoint record's lock.
     Underway,
+    /// The endpoint record could not be locked.
+    Unavailable(anyhow::Error),
     /// Held for this switch; `due` says whether commands may try again now
     /// (`claim_switch_attempt`).
-    Claimed { _lock: File, due: bool },
+    Claimed { lock: File, due: bool },
 }
 pub(crate) fn claim_switch_now(control: &Path) -> SwitchClaim {
-    let Ok(Some(record)) = lock_endpoint_record(control) else {
-        return SwitchClaim::Underway;
+    let record = match lock_endpoint_record(control) {
+        Ok(Some(record)) => record,
+        Ok(None) => return SwitchClaim::Underway,
+        Err(error) => return SwitchClaim::Unavailable(error),
     };
     let due = record
         .metadata()
         .and_then(|metadata| metadata.modified())
         .is_ok_and(|next| next <= std::time::SystemTime::now());
-    SwitchClaim::Claimed { _lock: record, due }
+    SwitchClaim::Claimed { lock: record, due }
 }
 
 /// Remember whether the command explicitly selected a scope without touching

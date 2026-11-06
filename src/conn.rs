@@ -491,7 +491,8 @@ pub(crate) fn ssh_authorization_failure(error: &anyhow::Error) -> Option<SshLogi
 pub(crate) struct BootstrapLoginRejected(pub(crate) SshLoginFailure);
 impl std::fmt::Display for BootstrapLoginRejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0.description())
+        // ssh's own message, above it, says what failed.
+        f.write_str("ssh login failed")
     }
 }
 impl std::error::Error for BootstrapLoginRejected {}
