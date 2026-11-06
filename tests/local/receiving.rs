@@ -460,6 +460,7 @@ fn persist_connect_domains_isolate_receiving_and_report_setup_errors_once() {
     let log = fs::read_to_string(t.path("rsh.log")).unwrap();
     assert!(log.contains("ControlPersist=300"), "{log}");
     assert!(!log.contains("ControlPersist=yes"), "{log}");
+    assert_persistent_masters_forward_nothing(&log);
     let output = persistence_command(&t, &["status", "--pscope", scope.to_str().unwrap()])
         .env_remove("HOME")
         .run()

@@ -541,6 +541,23 @@ exec /bin/sh -c "$1"
     path
 }
 
+/// Every ssh command in a `fake_ssh` log that may start or join a persistent
+/// master forwards nothing: sshd would keep a forwarded agent usable on the
+/// server for as long as the connection lasts.
+fn assert_persistent_masters_forward_nothing(log: &str) {
+    let masters: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("ControlMaster=auto"))
+        .collect();
+    assert!(!masters.is_empty(), "no persistent master in:\n{log}");
+    for line in masters {
+        assert!(
+            line.contains("-o ForwardAgent=no -o ClearAllForwardings=yes"),
+            "{line}"
+        );
+    }
+}
+
 fn remote_syq_command(t: &Tmp, rsh: &Path, args: &[&str]) -> Command {
     fs::create_dir_all(t.path("remote-home")).unwrap();
     fs::set_permissions(t.path("remote-home"), fs::Permissions::from_mode(0o700)).unwrap();

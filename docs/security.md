@@ -321,6 +321,12 @@ can use it to reach the server without another key touch or agent approval, even
 with receiving off. `syq persist off` closes the default domain's connections,
 including receiving; add `--pscope PATH` for an isolated domain.
 
+A server can use a forwarded SSH agent for as long as the connection stays
+open, not just while your command runs. Persistent connections therefore
+forward neither your agent nor any port forwards, whatever your SSH
+configuration says. An `--rsh` command that asks for forwarding, as with `-A`,
+gets its own connection that closes when the command ends.
+
 Persistence domains keep separate connections, authorization choices,
 receiving profiles, and remembered account permissions, but share your
 account's SSH configuration, keys, agents, and receiver identity. They are not

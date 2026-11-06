@@ -803,7 +803,7 @@ pub(crate) fn mark_explicit_scope(args: &mut Args) -> Result<()> {
             .is_some_and(|rsh| !crate::conn::rsh_persists_connections(rsh))
     {
         bail!(
-            "--pscope requires the default ssh or an --rsh ssh command without its own connection-sharing options or debug logging"
+            "--pscope requires the default ssh or an --rsh ssh command without its own connection-sharing, forwarding, or debug logging options"
         );
     }
     Ok(())

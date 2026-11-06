@@ -37,14 +37,25 @@ pub(super) const PERSISTENT_SSH_OPTIONS: &[&str] = &[
     "ServerAliveCountMax=3",
 ];
 
+/// Every ssh command that may start or join a connection kept open after the
+/// command forwards nothing. sshd keeps a forwarded agent usable on the server
+/// for as long as the connection lasts, not just for the session that asked
+/// for it, and a configured port forward stays bound with it, so either would
+/// stay available there until `syq persist off`. A mux client's configured
+/// port forwards would also be added to the master and stay with it. syq's own
+/// forwards on such a master use `ssh -O forward`, which these leave alone.
+pub(crate) const PERSISTENT_NO_FORWARDING: &[&str] =
+    &["-o", "ForwardAgent=no", "-o", "ClearAllForwardings=yes"];
+
 /// How syq may share an `--rsh` ssh command's connections.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SshSharing<'a> {
     /// The command's own ssh options, passed through on every session.
     pub(crate) options: &'a [String],
     /// Whether a connection may outlive this run. A debug log level would keep
-    /// writing to the first command's terminal from the background, so such
-    /// commands share connections only within the run.
+    /// writing to the first command's terminal from the background, and a
+    /// connection kept open never forwards (`PERSISTENT_NO_FORWARDING`), so
+    /// commands that ask for either share connections only within the run.
     pub(crate) persist: bool,
 }
 
@@ -73,7 +84,8 @@ pub(crate) fn shareable_ssh_options(rsh: &[String]) -> Option<SshSharing<'_>> {
         for (at, letter) in letters.bytes().enumerate() {
             match letter {
                 b'M' => return None,
-                b'v' => persist = false,
+                // Debug output, or agent or port forwarding.
+                b'v' | b'A' | b'L' | b'R' | b'D' => persist = false,
                 _ => {}
             }
             if VALUED.contains(&letter) {
@@ -95,8 +107,13 @@ pub(crate) fn shareable_ssh_options(rsh: &[String]) -> Option<SshSharing<'_>> {
                         return None;
                     }
                     let setting = setting.to_ascii_lowercase();
-                    if name.eq_ignore_ascii_case("LogLevel")
-                        && (setting.starts_with("debug") || setting == "verbose")
+                    let named = |option: &str| name.eq_ignore_ascii_case(option);
+                    if (named("LogLevel") && (setting.starts_with("debug") || setting == "verbose"))
+                        || (named("ForwardAgent") && setting != "no")
+                        || (named("ClearAllForwardings") && setting != "yes")
+                        || ["LocalForward", "RemoteForward", "DynamicForward"]
+                            .iter()
+                            .any(|forward| named(forward))
                     {
                         persist = false;
                     }

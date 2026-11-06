@@ -2132,6 +2132,9 @@ impl RemoteSpec {
                         .arg("-o")
                         .arg("ControlPersist=no");
                 }
+                if multiplexer.persistent {
+                    cmd.args(PERSISTENT_NO_FORWARDING);
+                }
             } else {
                 // Large-file data connections need independent TCP streams and
                 // cipher processes. Custom remote-shell commands also keep
