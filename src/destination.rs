@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
@@ -814,6 +814,19 @@ fn load_registration(name: &str) -> Result<Registration> {
     }
     Ok(registration)
 }
+#[cfg(test)]
+thread_local! {
+    /// The account a test's exchanges act as, so that a socket this test
+    /// listens on stands for one another user listens on.
+    static EXCHANGE_UID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+fn exchange_uid() -> u32 {
+    #[cfg(test)]
+    if let Some(uid) = EXCHANGE_UID.with(std::cell::Cell::get) {
+        return uid;
+    }
+    unsafe { libc::geteuid() }
+}
 fn exchange(
     registration: &Registration,
     message: Message,
@@ -838,6 +851,20 @@ fn exchange(
             };
             anyhow::Error::new(error).context(message)
         })?;
+    // The socket lives in a shared directory, so once a receiving connection
+    // ends another user can listen at the same path. Only this account's own
+    // SSH login may receive the secret and the request.
+    let listener =
+        crate::sys::peer_uid(&stream).context("identify the receiving socket's owner")?;
+    if listener != exchange_uid() {
+        bail!(notices::reconnect(
+            &format!(
+                "another user (uid {listener}) is listening on the receiving connection's socket {}, so nothing was sent to it",
+                registration.socket.display()
+            ),
+            notices::here()
+        ));
+    }
     // The initial exchange has its own absolute deadline. stream_timeout
     // controls later I/O without changing socket options after a peer reply.
     let mut io = DeadlineSocket {
@@ -2051,11 +2078,12 @@ pub(crate) fn serve_background(
         let mut login_delay = login_retry_first();
         while !stop.load(Ordering::Acquire) {
             let socket = format!("/tmp/syq-return-{}.sock", random_token()?);
+            // The secret goes on standard input: other users on the server
+            // can read a process's arguments.
             let args = [
                 "--destination-register".into(),
                 config.name.clone(),
                 socket.clone(),
-                receiver.secret.clone(),
             ];
             let mut command = ssh_command(&spec.endpoint);
             // Remembered permissions identify the actual locally selected source
@@ -2074,8 +2102,11 @@ pub(crate) fn serve_background(
                 let hosts = broker.socket_path().with_file_name("source-known-hosts");
                 pin_receiving_source(&mut command, &policy, &hosts)
             })();
-            *receiver.account_source.lock().unwrap() = source_identity.map_err(|error|
-                format!("cannot identify the requesting SSH account for account approval: {error:#}; trust this source's plain SSH host key on the laptop and reconnect"));
+            // The reason can name this machine's SSH settings, so it stays
+            // here; a server asking for account access is told only that its
+            // account could not be identified.
+            *receiver.account_source.lock().unwrap() =
+                source_identity.map_err(|error| format!("{error:#}"));
             if stop.load(Ordering::Acquire) {
                 break;
             }
@@ -2100,6 +2131,11 @@ pub(crate) fn serve_background(
                     .spawn_guarded()
                     .context("start receiving SSH connection")?,
             );
+            // A pipe takes this short line at once. If ssh has already
+            // exited, the wait below reports why.
+            if let Some(input) = child.0.stdin.as_mut() {
+                let _ = input.write_all(format!("{}\n", receiver.secret).as_bytes());
+            }
             {
                 let mut state = state.lock().unwrap();
                 state.phase = "connecting".into();
@@ -2378,6 +2414,50 @@ fn register_inner(
     }
     Ok(0)
 }
+/// The laptop sends the return connection's secret as the first line on
+/// standard input. Read only that line, unbuffered: the rest of the input
+/// says when the connection ends.
+fn read_registration_secret(fd: RawFd, timeout: Duration) -> std::io::Result<String> {
+    let deadline = Instant::now() + timeout;
+    let mut secret = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        if !crate::sys::readable_within(fd, remaining) {
+            continue;
+        }
+        let mut byte = 0u8;
+        // SAFETY: one byte is read into a live local.
+        match unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) } {
+            0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            count if count < 0 => {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            _ if byte == b'\n' => break,
+            _ => {
+                if secret.len() == 128 || !(byte.is_ascii_alphanumeric() || b"-_".contains(&byte)) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid return connection credential",
+                    ));
+                }
+                secret.push(byte);
+            }
+        }
+    }
+    if secret.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "empty return connection credential",
+        ));
+    }
+    Ok(String::from_utf8(secret).expect("credential bytes are ASCII"))
+}
 fn available(name: &str, timeout: Duration) -> Result<Registration> {
     let registration = read_registration(name)?;
     if let Some(owner) = identity::owner(&registry()?, name)? {
@@ -2481,14 +2561,27 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
     }
     match argv.get(1).and_then(|s| s.to_str())? {
         "--destination-register" => Some((|| {
-            if argv.len() != 5 {
+            if argv.len() != 4 {
                 bail!("invalid destination registration arguments");
             }
             crate::fsops::reserve_startup_descriptors();
+            let secret = match read_registration_secret(
+                libc::STDIN_FILENO,
+                REGISTRATION_HANDSHAKE_TIMEOUT,
+            ) {
+                Ok(secret) => secret,
+                Err(error) if error.kind() != std::io::ErrorKind::InvalidData => {
+                    // The connection stalled or ended before the laptop's
+                    // line arrived; that is not a rejection.
+                    crate::output::diagnostic!("syq: return connection interrupted: {error}");
+                    return Ok(RECONNECT_PENDING);
+                }
+                Err(error) => return Err(error).context("read the return connection's credential"),
+            };
             register(
                 argv[2].to_str().context("invalid name")?,
                 Path::new(&argv[3]),
-                argv[4].to_str().context("invalid credential")?,
+                &secret,
                 REGISTRATION_HANDSHAKE_TIMEOUT,
             )
         })()),

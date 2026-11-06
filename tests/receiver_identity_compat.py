@@ -106,9 +106,16 @@ def registration(binary, home, key, *, success=True, legacy=False, retry=False, 
 
     thread = threading.Thread(target=serve)
     thread.start()
-    process = subprocess.Popen([binary, "--destination-register", "laptop", str(path),
-                                secret], env=env, stdin=subprocess.PIPE,
+    # v0.5.2 took the secret as an argument; later builds read it as the
+    # first line of standard input, which other users cannot see.
+    arguments = [binary, "--destination-register", "laptop", str(path)]
+    if binary == previous:
+        arguments.append(secret)
+    process = subprocess.Popen(arguments, env=env, stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if binary != previous:
+        process.stdin.write(secret.encode() + b"\n")
+        process.stdin.flush()
     try:
         if retry:
             _, stderr = process.communicate(timeout=15)

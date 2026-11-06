@@ -545,6 +545,27 @@ syq persist receive on --name laptop --root "$receive_root"
 syq persist receive remove "$(hostname)"
 syq persist receive wait source --timeout 30
 ssh source 'syq persist destinations wait laptop --timeout 30'
+# The return connection's secret reaches the server on standard input, never
+# in a command line that other users there can read.
+ssh source python3 - <<'PY_RETURN_SECRET'
+import json
+import os
+from pathlib import Path
+
+record = Path.home() / ".syq-destinations-v3" / "laptop.json"
+secret = json.loads(record.read_text())["secret"].encode()
+registering = 0
+for entry in os.listdir("/proc"):
+    if not entry.isdigit():
+        continue
+    try:
+        arguments = (Path("/proc") / entry / "cmdline").read_bytes()
+    except OSError:
+        continue
+    assert secret not in arguments, arguments
+    registering += b"--destination-register\0" in arguments
+assert registering, "no registration process was found"
+PY_RETURN_SECRET
 printf 'case: hardlinks survive SSH and TCP copies, updates, reruns, and pulls\n'
 python3 - <<'PY_HARDLINKS'
 import os
