@@ -254,6 +254,11 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                     } else {
                         crate::receive_service::Replace::Now
                     },
+                    if when_idle {
+                        Login::Unattended
+                    } else {
+                        Login::Ask
+                    },
                 );
                 // A switch to a new build tells the service that started it
                 // that it waits for the user (`switch::LOGIN_NEEDED_EXIT`).
@@ -414,9 +419,34 @@ fn reject_receiving_name(host: &str) -> Result<()> {
     Ok(())
 }
 
+/// How `connect_domain` logs in to the server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Login {
+    /// As ssh does, as for `persist connect` run by hand.
+    Ask,
+    /// As ssh does, but giving up on an unreachable server after ten
+    /// seconds, as for a switch to a new build that a command makes in a
+    /// terminal on the way.
+    Bounded,
+    /// Never asking: a login that needs the user fails as
+    /// `switch::LoginNeeded`, as for a switch without a terminal.
+    Unattended,
+}
+impl Login {
+    /// For a switch a command makes on the way: asking only in a terminal.
+    pub(crate) fn for_switch() -> Self {
+        if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+            Self::Bounded
+        } else {
+            Self::Unattended
+        }
+    }
+}
+
 /// `replace` says what to do with a receiving service from another build:
 /// replace it at once, as when the user runs `persist connect`, or only
-/// once idle, as a switch to a new build does.
+/// once idle, as a switch to a new build does. A switch to a new build
+/// (`Replace::WhenIdle`) always logs in `Login::Unattended`.
 pub(crate) fn connect_domain(
     domain: &Domain,
     host: &str,
@@ -424,6 +454,7 @@ pub(crate) fn connect_domain(
     no_bootstrap: bool,
     timeout: Duration,
     replace: crate::receive_service::Replace,
+    login: Login,
 ) -> Result<()> {
     let endpoint =
         crate::cli::parse_native_endpoint(Some(host))?.context("SSH endpoint missing")?;
@@ -472,6 +503,7 @@ pub(crate) fn connect_domain(
             no_bootstrap,
             timeout,
             replace,
+            login,
         );
     }
     // A switch runs in the background, where nobody waits for it: bound its
@@ -495,6 +527,7 @@ pub(crate) fn connect_domain(
         no_bootstrap,
         timeout,
         replace,
+        Login::Unattended,
     );
     match &result {
         Ok(()) => crate::receive_service::clear_attempt(&control),
@@ -514,6 +547,7 @@ pub(crate) fn connect_domain(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn connect_receiving(
     domain: &Domain,
     multiplexer: Arc<crate::conn::SshMultiplexer>,
@@ -522,8 +556,10 @@ fn connect_receiving(
     no_bootstrap: bool,
     timeout: Duration,
     replace: crate::receive_service::Replace,
+    login: Login,
 ) -> Result<()> {
     let when_idle = replace == crate::receive_service::Replace::WhenIdle;
+    let unattended = login == Login::Unattended;
     let remote = crate::conn::RemoteSpec {
         local_process: false,
         user: endpoint.user,
@@ -531,19 +567,19 @@ fn connect_receiving(
         port: endpoint.port,
         // A switch runs in the background: a login that needs the user fails
         // rather than asks, as receiving's own reconnects do.
-        rsh: if when_idle {
-            // An unreachable server fails soon, as an ordinary failure,
-            // rather than at the login's deadline as one that needs the user
-            // (`switch::LoginWatch`); as the login check does.
-            vec![
+        // An unreachable server fails soon, as an ordinary failure, rather
+        // than at the login's deadline as one that needs the user
+        // (`switch::LoginWatch`); as the login check does.
+        rsh: match login {
+            Login::Ask => vec!["ssh".into()],
+            Login::Bounded => vec!["ssh".into(), "-o".into(), "ConnectTimeout=10".into()],
+            Login::Unattended => vec![
                 "ssh".into(),
                 "-o".into(),
                 "BatchMode=yes".into(),
                 "-o".into(),
                 "ConnectTimeout=10".into(),
-            ]
-        } else {
-            vec!["ssh".into()]
+            ],
         },
         bootstrap_helper: syq_path.is_none() && !no_bootstrap,
         syq_path,
@@ -564,7 +600,7 @@ fn connect_receiving(
     // No source roots, data workers or filesystem operations are requested.
     // A switch reads ssh's errors to tell a login that needs the user from
     // other failures, and bounds a login that waits for one.
-    let connected = if when_idle {
+    let connected = if unattended {
         let _login = crate::receive_service::switch::LoginWatch::start(
             multiplexer.control_path(),
             remote.label(),
@@ -576,7 +612,7 @@ fn connect_receiving(
     let connection = match connected {
         Ok(connection) => connection,
         Err(error)
-            if when_idle
+            if unattended
                 && matches!(
                     crate::conn::ssh_authorization_failure(&error),
                     Some(crate::conn::SshLoginFailure::Credentials)
@@ -702,6 +738,26 @@ pub(crate) fn claim_switch_attempt(control: &Path, interval: Duration) -> bool {
         .and_then(|metadata| metadata.modified())
         .is_ok_and(|next| next <= now);
     due && record.set_modified(now + interval).is_ok()
+}
+
+/// Whether a switch a command makes on the way may start for a connection
+/// (`receive_service::switch_outdated_now`).
+pub(crate) enum SwitchClaim {
+    /// Another switch holds the endpoint record's lock.
+    Underway,
+    /// Held for this switch; `due` says whether commands may try again now
+    /// (`claim_switch_attempt`).
+    Claimed { _lock: File, due: bool },
+}
+pub(crate) fn claim_switch_now(control: &Path) -> SwitchClaim {
+    let Ok(Some(record)) = lock_endpoint_record(control) else {
+        return SwitchClaim::Underway;
+    };
+    let due = record
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|next| next <= std::time::SystemTime::now());
+    SwitchClaim::Claimed { _lock: record, due }
 }
 
 /// Remember whether the command explicitly selected a scope without touching

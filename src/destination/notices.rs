@@ -44,7 +44,7 @@ fn other_build_message(name: &str, build: &str) -> String {
     if older_than_this(build) {
         message.push_str(&format!(
             "; to use syq {} instead, update syq on that machine if needed and run `syq persist status` there",
-            env!("CARGO_PKG_VERSION")
+            crate::identity::build()
         ));
     }
     message

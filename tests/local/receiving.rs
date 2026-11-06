@@ -3596,8 +3596,9 @@ fn a_switch_that_cannot_log_in_leaves_the_old_service_receiving() {
     assert_eq!(switch["to"], this_build(), "{status}");
     let shown = installed.persist(syq, &["status"]);
     assert!(
-        String::from_utf8_lossy(&shown.stdout)
-            .contains("when you next run a syq copy, ssh, or persist command in a terminal"),
+        String::from_utf8_lossy(&shown.stdout).contains(
+            "when you next run a syq copy or ssh command, or syq persist status, in a terminal"
+        ),
         "{}",
         String::from_utf8_lossy(&shown.stdout)
     );
@@ -4291,7 +4292,7 @@ fn persist_commands_replace_an_idle_older_service_at_once() {
         assert_output_ok(&output);
         assert!(
             stderr_of(&output).contains(
-                "switching receiving through test-server, which runs syq v0.7.1, to this version of syq\n"
+                "switching receiving through test-server, which runs syq v0.7.1, to this version of syq (a copy in progress through it would be interrupted)\n"
             ),
             "{command:?}: {}",
             stderr_of(&output)
@@ -4326,6 +4327,119 @@ fn persist_commands_replace_an_idle_older_service_at_once() {
     );
     installed.request(serde_json::json!({"version": 2, "stop": true}));
     old.join().unwrap();
+}
+
+/// Without a terminal, a `persist` command's switch never asks for a login.
+/// One that needs the user is recorded as such, and the next command
+/// without a terminal leaves it, rather than failing to log in again.
+#[test]
+fn a_switch_without_a_terminal_that_needs_a_login_is_not_retried() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let old = older_service(&installed, serde_json::json!([]));
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    let status = || {
+        let mut command = installed.command(
+            syq,
+            &[
+                "persist",
+                "status",
+                "--pscope",
+                installed.scope.to_str().unwrap(),
+            ],
+        );
+        command.env("FAKE_SSH_REJECT", "1").run().unwrap()
+    };
+    let before = fs::read_to_string(t.path("rsh.log")).unwrap();
+    let shown = status();
+    assert_output_ok(&shown);
+    assert!(
+        stderr_of(&shown).contains("could not switch receiving through test-server"),
+        "{}",
+        stderr_of(&shown)
+    );
+    let logged = fs::read_to_string(t.path("rsh.log")).unwrap();
+    // ssh was told never to ask, and not to wait long for the server.
+    assert!(
+        logged[before.len()..]
+            .contains("-o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=auto"),
+        "{}",
+        &logged[before.len()..]
+    );
+    assert!(
+        String::from_utf8_lossy(&shown.stdout).contains("in a terminal"),
+        "{}",
+        String::from_utf8_lossy(&shown.stdout)
+    );
+    let json = installed.persist(syq, &["status", "--json"]);
+    let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(
+        json["connections"][0]["receiving_switch"]["phase"], "login",
+        "{json}"
+    );
+    // The old service still receives, and the next status leaves it.
+    let state = installed.request(serde_json::json!({"version": 2, "stop": false}));
+    assert_eq!(state["identity"], "v0.7.1");
+    let again = status();
+    assert_output_ok(&again);
+    assert!(
+        !stderr_of(&again).contains("switch"),
+        "{}",
+        stderr_of(&again)
+    );
+    assert_eq!(fs::read_to_string(t.path("rsh.log")).unwrap(), logged);
+    installed.request(serde_json::json!({"version": 2, "stop": true}));
+    old.join().unwrap();
+}
+
+/// Settings that no longer allow a connection stop the service an older
+/// syq left on it, as for any service, without logging in to its server.
+#[test]
+fn settings_that_drop_a_connection_stop_its_older_service_without_a_login() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let old = older_service(&installed, serde_json::json!([]));
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    let logged = fs::read_to_string(t.path("rsh.log")).unwrap();
+    let mut command = installed.command(
+        syq,
+        &[
+            "persist",
+            "receive",
+            "on",
+            "--connection",
+            "elsewhere",
+            "--pscope",
+            installed.scope.to_str().unwrap(),
+        ],
+    );
+    let output = command.env("FAKE_SSH_REFUSE", "1").run().unwrap();
+    // Connecting elsewhere fails, and only that is reported.
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("some connections are not ready: elsewhere: "),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(
+        !stderr_of(&output).contains("switching receiving through test-server"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert_eq!(
+        old.join().unwrap().last().unwrap(),
+        &serde_json::json!({"version": 2, "stop": true})
+    );
+    let logged_now = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(
+        !logged_now[logged.len()..].contains("test-server"),
+        "{}",
+        &logged_now[logged.len()..]
+    );
 }
 
 /// A service an older syq left running with a request waiting for approval
