@@ -1773,11 +1773,12 @@ fn a_coordinating_source_runs_the_signed_command_against_the_destinations_receiv
         max_entries: u64::MAX,
         max_delete: 5,
     };
-    let (arguments, _) = coordination_command(&coordinating(&route, Some(caps))).unwrap();
+    let (arguments, environment) = coordination_command(&coordinating(&route, Some(caps))).unwrap();
     assert!(
         arguments
             .iter()
             .any(|argument| argument == "--max-delete=5"),
         "{arguments:?}"
     );
+    assert!(environment.contains(&(MAX_DELETE_FROM_APPROVER, "1".to_owned())));
 }

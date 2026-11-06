@@ -1060,6 +1060,8 @@ pub(crate) const DIRECTIVE_STDIN: &str = "SYQ_INTERNAL_NATIVE_DIRECTIVE";
 /// coordinator puts its copy of the entry key there. An SSH command that
 /// keeps it has no identity, and fails.
 const ENTRY_KEY_PLACEHOLDER: &str = "IdentityFile=none";
+/// Set when a coordinator's `--max-delete` is the approving machine's limit.
+pub(crate) const MAX_DELETE_FROM_APPROVER: &str = "SYQ_INTERNAL_NATIVE_MAX_DELETE_FROM_APPROVER";
 /// The longest entry key a coordinator reads: a 16,384-bit RSA key.
 pub(crate) const MAX_ENTRY_KEY_BYTES: usize = 16 * 1024;
 
@@ -2462,6 +2464,11 @@ pub(crate) fn coordination_command(
             "SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST",
             endpoint_display(&srcs[0]),
         ));
+    }
+    if args.max_delete_from_approver {
+        // Its messages name the approving machine's limit, not an option
+        // the command did not give.
+        environment.push((MAX_DELETE_FROM_APPROVER, "1".to_owned()));
     }
     if let Some(width) = frame
         .progress_width

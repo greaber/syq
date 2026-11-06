@@ -187,10 +187,21 @@ def authorized_keys(host):
 
 
 def main():
+    config = Path.home()/".ssh/config"
+    original = config.read_bytes()
     roots = {}
     created_source_enrollment = False
     requester_config = None
     try:
+        # The requester is a separate account on this machine, without the
+        # laptop's keys.
+        config.write_bytes(original + b"\nHost requester\n    HostName 127.0.0.1\n    User longhome\n"
+                           b"    BatchMode yes\n    IdentityFile /home/syq/.ssh/id_ed25519\n"
+                           b"    IdentitiesOnly yes\n    StrictHostKeyChecking yes\n"
+                           b"    UserKnownHostsFile /home/syq/.ssh/known_hosts\n"
+                           b"    GlobalKnownHostsFile /dev/null\n    UpdateHostKeys no\n")
+        with (Path.home()/".ssh/known_hosts").open("a") as known_hosts:
+            known_hosts.write(run("ssh-keyscan", "-T", "5", "-t", "ed25519", "127.0.0.1"))
         for host in ("requester", "source", "destination"):
             roots[host] = remote(host, "mktemp -d /tmp/syq-between.XXXXXX").strip()
         a, b, c = (roots[host] for host in ("requester", "source", "destination"))
@@ -350,6 +361,7 @@ def main():
             remote("requester", "syq persist off")
         for host, root in roots.items():
             remote(host, "rm -rf -- " + shlex.quote(root))
+        config.write_bytes(original)
 
 
 if __name__ == "__main__":

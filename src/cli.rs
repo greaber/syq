@@ -3314,6 +3314,10 @@ fn apply_internal_native_direct(args: &mut Args) -> Result<()> {
         })
         .transpose()?;
     args.plan_source_host = utf8("SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST")?;
+    if args.delegated {
+        args.max_delete_from_approver |=
+            utf8(crate::remote_to_remote::MAX_DELETE_FROM_APPROVER)?.as_deref() == Some("1");
+    }
     args.requester_stdin = utf8(crate::remote_to_remote::REQUESTER_STDIN)?
         .map(|bytes| {
             bytes
