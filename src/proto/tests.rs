@@ -840,6 +840,119 @@ fn lz4_frames_enforce_handshake_and_message_limits_and_reject_corruption() {
 }
 
 #[test]
+fn lz4_frames_cannot_declare_more_than_their_block_holds() {
+    // The densest data LZ4 encodes still declares no more than its ratio.
+    for len in [0, 1, 13, 64 << 10, 16 << 20] {
+        let zeros = vec![0u8; len];
+        let compressed =
+            lz4::block::compress(&zeros, Some(lz4::block::CompressionMode::FAST(4)), true).unwrap();
+        assert_eq!(
+            crate::compression::decode_lz4(&compressed, MAX_FRAME)
+                .unwrap()
+                .len(),
+            len
+        );
+    }
+    // A one-byte block cannot declare 16 MiB; it is refused before the
+    // decoded size is allocated.
+    let mut body = (16u32 << 20).to_le_bytes().to_vec();
+    body.push(0);
+    let bytes = raw_frame(&body, crate::compression::LZ4);
+    assert!(FrameReader::new(bytes.as_slice())
+        .read_msg::<Response>()
+        .unwrap_err()
+        .to_string()
+        .contains("declares more data than its block can hold"));
+}
+
+fn charge<R: Read>(reader: &mut FrameReader<R>) {
+    reader.charge_expansion(crate::wire_budget::ExpansionCharge {
+        budget: std::sync::Arc::new(crate::wire_budget::ExpansionBudget::with_limit(
+            crate::wire_budget::EXPANSION_LIMIT,
+        )),
+        closed: Box::new(|| false),
+    });
+}
+
+#[test]
+fn charged_readers_hold_what_decompression_adds_with_each_message() {
+    let data = vec![0u8; 4 << 20];
+    let payload = postcard::to_stdvec(&block_message(data.clone())).unwrap();
+    let lz4 = raw_frame(
+        &lz4::block::compress(&payload, None, true).unwrap(),
+        crate::compression::LZ4,
+    );
+    let zstd = raw_frame(
+        &zstd::bulk::compress(&payload, 1).unwrap(),
+        crate::compression::ZSTD,
+    );
+    for (bytes, body) in [(&lz4, lz4.len()), (&zstd, zstd.len())] {
+        let body = body - local_preamble_len() - 5;
+        let mut reader = FrameReader::new(bytes.as_slice());
+        charge(&mut reader);
+        let message = reader.read_budgeted::<Response>().unwrap();
+        assert_eq!(message.hold.expansion_bytes(), Some(payload.len() - body));
+        assert!(
+            matches!(&message.value, Response::Block { data: received, .. } if *received == data)
+        );
+        // A reader that does not charge holds nothing beyond collections.
+        let message = FrameReader::new(bytes.as_slice())
+            .read_budgeted::<Response>()
+            .unwrap();
+        assert_eq!(message.hold.expansion_bytes(), None);
+    }
+    // Uncompressed frames add nothing to charge.
+    let raw = block_frame(data, false);
+    let mut reader = FrameReader::new(raw.as_slice());
+    charge(&mut reader);
+    let message = reader.read_budgeted::<Response>().unwrap();
+    assert_eq!(message.hold.expansion_bytes(), None);
+}
+
+/// A body that is not one frame of a declared size is charged as much as
+/// the limit allows while it decodes, then only what it decoded to.
+#[test]
+fn zstd_bodies_without_one_declared_size_keep_only_what_they_decode_to() {
+    let payload = postcard::to_stdvec(&block_message(vec![0; 64 << 10])).unwrap();
+    let middle = payload.len() / 2;
+    let mut concatenated = zstd::bulk::compress(&payload[..middle], 1).unwrap();
+    concatenated.extend(zstd::bulk::compress(&payload[middle..], 1).unwrap());
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+    encoder.write_all(&payload).unwrap();
+    let unknown = encoder.finish().unwrap();
+    for body in [concatenated, unknown] {
+        let bytes = raw_frame(&body, crate::compression::ZSTD);
+        let mut reader = FrameReader::new(bytes.as_slice());
+        charge(&mut reader);
+        let message = reader.read_budgeted::<Response>().unwrap();
+        assert_eq!(
+            message.hold.expansion_bytes(),
+            Some(payload.len() - body.len())
+        );
+        assert_eq!(postcard::to_stdvec(&message.value).unwrap(), payload);
+    }
+}
+
+/// Old-format (v0.1–v0.7) zstd frames are not decoded. Their decoders size
+/// a window from the frame, beyond the window limit the reader sets.
+#[test]
+fn legacy_zstd_frames_are_refused() {
+    let payload = postcard::to_stdvec(&Response::Err("legacy".into())).unwrap();
+    // A v0.7 frame: magic, a descriptor without a content size, a 128 MiB
+    // window, one raw block holding the payload, and the end block.
+    let mut body = 0xFD2F_B527u32.to_le_bytes().to_vec();
+    body.push(0);
+    body.push((27 - 10) << 3);
+    let len = payload.len();
+    body.extend([0x40 | (len >> 16) as u8, (len >> 8) as u8, len as u8]);
+    body.extend(&payload);
+    body.extend([0xC0, 0, 0]);
+    let bytes = raw_frame(&body, crate::compression::ZSTD);
+    let result = FrameReader::new(bytes.as_slice()).read_msg::<Response>();
+    assert!(result.is_err(), "a legacy zstd frame decoded: {result:?}");
+}
+
+#[test]
 fn compressed_frames_preserve_transport_write_and_flush_failures() {
     struct Broken(bool);
     impl Write for Broken {

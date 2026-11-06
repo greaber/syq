@@ -140,8 +140,9 @@ fn cancelled() -> io::Error {
 
 /// Observe peer shutdown without consuming protocol bytes or changing the
 /// socket's blocking mode (which is shared by its cloned descriptors).
-pub(crate) fn socket_closed(socket: &std::net::TcpStream) -> bool {
+pub(crate) fn socket_closed(socket: &impl std::os::fd::AsFd) -> bool {
     use std::os::fd::AsRawFd;
+    let socket = socket.as_fd();
     let mut fd = libc::pollfd {
         fd: socket.as_raw_fd(),
         events: 0,

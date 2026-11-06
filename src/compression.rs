@@ -146,7 +146,13 @@ impl Compressor {
     }
 }
 
-pub(crate) fn decode_lz4(body: &[u8], limit: usize) -> io::Result<Vec<u8>> {
+/// An LZ4 block decodes to at most this many bytes for each byte it holds:
+/// each further byte of a match length adds 255 to the match.
+const LZ4_MAX_RATIO: usize = 255;
+
+/// The decoded size an LZ4 frame declares, once it is known to fit `limit`
+/// and to be no more than the block could hold.
+pub(crate) fn lz4_decoded_size(body: &[u8], limit: usize) -> io::Result<usize> {
     let prefix = body
         .get(..4)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing lz4 size prefix"))?;
@@ -158,6 +164,17 @@ pub(crate) fn decode_lz4(body: &[u8], limit: usize) -> io::Result<Vec<u8>> {
             "decompressed frame exceeds limit",
         ));
     }
+    if size > (body.len() - prefix.len()).saturating_mul(LZ4_MAX_RATIO) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "lz4 frame declares more data than its block can hold",
+        ));
+    }
+    Ok(size)
+}
+
+pub(crate) fn decode_lz4(body: &[u8], limit: usize) -> io::Result<Vec<u8>> {
+    let size = lz4_decoded_size(body, limit)?;
     let mut output = Vec::new();
     output.try_reserve_exact(size).map_err(io::Error::other)?;
     output.resize(size, 0);

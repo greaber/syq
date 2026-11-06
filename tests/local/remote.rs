@@ -1856,12 +1856,14 @@ fn streaming_copies_local_trees_and_remote_ranges() {
             if route.starts_with("tcp") {
                 command.env("SYQ_TEST_REQUIRE_TCP", "1");
             }
+            // The host is this machine, so syq dials the loopback address
+            // it advertises.
             if route.ends_with("pull") {
-                command.args(["--from", "host"]);
+                command.args(["--from", "localhost"]);
             }
             command.args(["--srcs-in", &t.s("source")]);
             if route.ends_with("push") {
-                command.args(["--to", "host"]);
+                command.args(["--to", "localhost"]);
             }
             command
                 .args(["--into", &destination])
@@ -2049,12 +2051,14 @@ fn tuning_options_copy_remote_ranges_over_tcp_and_ssh() {
                 } else {
                     command.env("SYQ_TEST_REQUIRE_TCP", "1");
                 }
+                // The host is this machine, so syq dials the loopback
+                // address it advertises.
                 if pull {
-                    command.args(["--from", "host"]);
+                    command.args(["--from", "localhost"]);
                 }
                 command.arg(t.s("source"));
                 if !pull {
-                    command.args(["--to", "host"]);
+                    command.args(["--to", "localhost"]);
                 }
                 command
                     .args(["--as", &destination])
@@ -2123,7 +2127,17 @@ fn streaming_remote_scan_starts_after_transport_setup() {
                 "--no-progress",
             ])
             .arg(t.s("src/"))
-            .arg(format!("setup.invalid:{}", t.s("dst/")))
+            // A reachable host is this machine, so syq dials the loopback
+            // address it advertises.
+            .arg(format!(
+                "{}:{}",
+                if reachable {
+                    "localhost"
+                } else {
+                    "setup.invalid"
+                },
+                t.s("dst/")
+            ))
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("FAKE_RSH_LOG", t.path("rsh.log"))

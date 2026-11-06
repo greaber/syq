@@ -1981,6 +1981,9 @@ pub(crate) struct ReceiverHost {
     /// machine's: how ssh's messages name them, and the name the approving
     /// machine lists the host under.
     pub(crate) approving: Option<(&'static str, String)>,
+    /// Whether SSH reaches the host through a ProxyJump or ProxyCommand, so
+    /// that `hostname` is the host as the proxy sees it.
+    pub(crate) proxied: bool,
 }
 
 #[derive(Debug, Default)]
@@ -3145,8 +3148,14 @@ impl RemoteSpec {
                 "TCP listener advertised too many addresses (limit {MAX_ADVERTISED_TCP_ADDRESSES})"
             );
         }
+        let ssh_target = self.ssh_destination();
+        let reached_locally = ssh_target
+            .as_ref()
+            .is_some_and(|target| target.direct && names_this_machine(&target.hostname));
+        let ssh_target = ssh_target.map(|target| target.hostname);
         let mut candidates: Vec<TcpCandidate> = advertised
             .into_iter()
+            .filter(|(address, _)| dials_advertised_address(address, reached_locally))
             .map(|(address, speed_mbps)| TcpCandidate {
                 address,
                 speed_mbps,
@@ -3162,7 +3171,7 @@ impl RemoteSpec {
         // what we connected to. It goes after the LAN / fast-NIC addresses
         // (better when reachable) but before CGNAT / Tailscale ones, which
         // are overlay paths and must not win over the direct public address.
-        if let Some(h) = self.resolved_hostname() {
+        if let Some(h) = ssh_target {
             if !candidates.iter().any(|candidate| candidate.address == h) {
                 let at = candidates
                     .iter()
@@ -3244,26 +3253,46 @@ impl RemoteSpec {
     }
 
     /// The real host name behind an ssh config alias.
+    #[cfg(test)]
     pub(crate) fn resolved_hostname(&self) -> Option<String> {
+        self.ssh_destination()
+            .map(|destination| destination.hostname)
+    }
+
+    /// Where SSH reaches the host: its real name behind an ssh config alias,
+    /// and whether this machine connects to that name itself.
+    fn ssh_destination(&self) -> Option<SshDestination> {
         if let Some(host) = self
             .forwarded
             .as_ref()
             .and_then(|connection| connection.data_hostname())
         {
-            return Some(host.to_owned());
+            // The approving machine resolved this name for its own SSH.
+            return Some(SshDestination {
+                hostname: host.to_owned(),
+                direct: false,
+            });
         }
         if let Some(receiver) = &self.receiver_host {
-            return Some(receiver.hostname.clone());
+            return Some(SshDestination {
+                hostname: receiver.hostname.clone(),
+                direct: !receiver.proxied,
+            });
         }
         if !self.rsh[0].ends_with("ssh") {
-            return Some(self.host.clone());
+            return Some(SshDestination {
+                hostname: self.host.clone(),
+                direct: true,
+            });
         }
         let out = self.ssh_hostname_command().capture_output().ok()?;
         let text = String::from_utf8_lossy(&out.stdout);
-        text.lines()
-            .find_map(|l| l.strip_prefix("hostname "))
-            .map(|h| h.trim().to_string())
-            .or_else(|| Some(self.host.clone()))
+        parse_ssh_destination(&text).or_else(|| {
+            Some(SshDestination {
+                hostname: self.host.clone(),
+                direct: true,
+            })
+        })
     }
 
     /// Read the effective SSH configuration without opening a connection.
@@ -3451,6 +3480,75 @@ pub(crate) fn select_tcp_candidates(mut candidates: Vec<TcpCandidate>) -> Vec<Tc
 }
 
 const MAX_ADVERTISED_TCP_ADDRESSES: usize = 64;
+
+/// Whether this machine dials an address the remote host advertised for its
+/// data listener. Servers advertise IP literals; a name is not looked up on
+/// their behalf. Addresses that lead to no single remote machine
+/// (unspecified, multicast, broadcast), or only to this machine's own link
+/// (link-local), are not dialed. Neither is loopback, which leads to this
+/// machine itself, unless the host was reached on this machine
+/// (`names_this_machine`). The host's own SSH name is dialed separately.
+fn dials_advertised_address(address: &str, reached_locally: bool) -> bool {
+    let Ok(ip) = address.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    // An IPv4-mapped IPv6 address leads where its IPv4 address does.
+    let ip = ip.to_canonical();
+    if ip.is_unspecified() || ip.is_multicast() {
+        return false;
+    }
+    if ip.is_loopback() {
+        return reached_locally;
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => !v4.is_link_local() && !v4.is_broadcast(),
+        std::net::IpAddr::V6(v6) => !v6.is_unicast_link_local(),
+    }
+}
+
+/// Where SSH reaches a host (`RemoteSpec::ssh_destination`).
+#[derive(Debug, PartialEq, Eq)]
+struct SshDestination {
+    /// The host name SSH connects to.
+    hostname: String,
+    /// Whether this machine connects to `hostname` itself. Through a
+    /// ProxyJump or ProxyCommand, or for a name another machine resolved,
+    /// it names a host as the far side sees it.
+    direct: bool,
+}
+
+/// The destination `ssh -G` output describes.
+fn parse_ssh_destination(output: &str) -> Option<SshDestination> {
+    let value = |name: &str| {
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+            .map(str::trim)
+    };
+    let proxied = ["proxyjump", "proxycommand"]
+        .into_iter()
+        .any(|name| value(name).is_some_and(|value| value != "none"));
+    Some(SshDestination {
+        hostname: value("hostname")?.to_owned(),
+        direct: !proxied,
+    })
+}
+
+/// Whether an SSH host name names this machine: a loopback address, or
+/// `localhost`, which always leads to loopback.
+fn names_this_machine(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.to_canonical().is_loopback(),
+        Err(_) => {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            host == "localhost" || host.ends_with(".localhost")
+        }
+    }
+}
 const MAX_RESOLVED_TCP_ADDRESSES: usize = 128;
 
 /// How one connection attempt ended.

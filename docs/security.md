@@ -133,6 +133,11 @@ direct TCP connections. `--no-tcp-encryption` turns this off for TCP, so
 anyone on the network can read or alter the traffic, including its
 authentication token. Use it only on a network you trust.
 
+For TCP, a server lists addresses to connect to, and syq also tries the
+server's SSH address. Syq doesn't look up names a server lists, and doesn't
+connect to loopback, link-local, or multicast addresses it lists, except
+loopback when the server's SSH address is your own machine.
+
 ## Downloaded executables
 
 Syq uses a downloaded executable only if it matches a release manifest signed
@@ -243,9 +248,11 @@ HostA checks hostB's host key with its own SSH configuration, as its own `ssh`
 would. It also trusts the keys and host certificate authorities your laptop's
 known_hosts lists for hostB, and refuses keys marked `@revoked` there. Your
 laptop's `RevokedHostKeys` and `KnownHostsCommand` settings are not passed on;
-syq says so when it leaves them out. If your laptop trusts hostB only through a
-certificate authority and hostB presents a plain key, hostA treats hostB as
-unknown.
+syq says so when it leaves them out. If hostA's SSH configuration can't take
+your laptop's entries, hostA checks hostB without them and syq says so, unless
+they revoke a key: then syq refuses the copy. If your laptop trusts hostB only
+through a certificate authority and hostB presents a plain key, hostA treats
+hostB as unknown.
 
 When neither machine knows hostB, nobody can answer a prompt on hostA, so its
 default `StrictHostKeyChecking ask` works like `accept-new`: it accepts the key

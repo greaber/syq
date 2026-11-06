@@ -304,7 +304,9 @@ fn double_verbose_dry_run_reports_ipv6_arrival_address_as_reachable() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     write(&t.path("src"), b"v6");
-    let remote = format!("diagnostic.invalid:{}", t.s("dst"));
+    // The host is this machine, so syq dials the loopback address it
+    // advertises.
+    let remote = format!("localhost:{}", t.s("dst"));
 
     let out = compat_command()
         .arg("-e")

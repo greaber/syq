@@ -434,6 +434,164 @@ fn remote_vector_replies_must_match_request_counts() {
 }
 
 #[test]
+fn advertised_addresses_that_lead_nowhere_remote_are_not_dialed() {
+    for address in [
+        "192.0.2.10",
+        "10.1.2.3",
+        "192.168.1.20",
+        "100.64.0.1",
+        "2001:db8::1",
+        "fd00::1",
+    ] {
+        assert!(dials_advertised_address(address, false), "{address}");
+    }
+    for address in [
+        "127.0.0.1",
+        "127.1.2.3",
+        "::1",
+        "::ffff:127.0.0.1",
+        "0.0.0.0",
+        "::",
+        "169.254.169.254",
+        "fe80::1",
+        "224.0.0.1",
+        "ff02::1",
+        "255.255.255.255",
+        "::ffff:169.254.169.254",
+        // Names would be looked up for the remote host.
+        "localhost",
+        "internal.example",
+        "fe80::1%eth0",
+    ] {
+        assert!(!dials_advertised_address(address, false), "{address}");
+    }
+    // Loopback leads to the host itself when the host is this machine.
+    assert!(dials_advertised_address("127.0.0.1", true));
+    assert!(dials_advertised_address("::1", true));
+    assert!(!dials_advertised_address("169.254.169.254", true));
+    for host in [
+        "localhost",
+        "LOCALHOST.",
+        "db.localhost",
+        "127.0.0.1",
+        "::1",
+        "[::1]",
+    ] {
+        assert!(names_this_machine(host), "{host}");
+    }
+    for host in [
+        "backup.example.net",
+        "10.0.0.5",
+        "localhost.example.net",
+        "::ffff:10.0.0.5",
+    ] {
+        assert!(!names_this_machine(host), "{host}");
+    }
+}
+
+/// A remote host that advertises loopback leads this machine to dial
+/// itself; only the host's own name is tried.
+#[test]
+fn probes_skip_loopback_addresses_a_remote_host_advertises() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let mut spec = RemoteSpec::local_receiver(true);
+    spec.local_process = false;
+    spec.host = "remote.invalid".into();
+    let probed = spec
+        .probe_tcp_addresses(
+            vec![
+                ("127.0.0.1".into(), 0),
+                ("::ffff:127.0.0.1".into(), 0),
+                ("localhost".into(), 0),
+            ],
+            port,
+            TCP_PROBE_FLOOR,
+        )
+        .unwrap();
+    assert_eq!(
+        probed
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.address.as_str(), candidate.source))
+            .collect::<Vec<_>>(),
+        [("remote.invalid", DataAddressSource::SshTarget)]
+    );
+    assert!(listener.accept().is_err(), "a loopback address was dialed");
+    // Reached on this machine, its loopback address is the host's own.
+    spec.host = "localhost".into();
+    let probed = spec
+        .probe_tcp_addresses(vec![("127.0.0.1".into(), 0)], port, TCP_PROBE_CEILING)
+        .unwrap();
+    assert!(probed
+        .candidates
+        .iter()
+        .any(|candidate| candidate.address == "127.0.0.1" && candidate.reachable == Some(true)));
+    // Through a proxy, `localhost` is the far side's own machine.
+    let stand_in = crate::test_support::tempdir().unwrap();
+    for (config, local) in [
+        ("hostname localhost\nport 22\n", true),
+        (
+            "hostname localhost\nport 22\nproxyjump gw.example.net\n",
+            false,
+        ),
+        (
+            "hostname localhost\nport 22\nproxycommand nc %h %p\n",
+            false,
+        ),
+    ] {
+        let ssh = stand_in.path().join("ssh");
+        crate::test_support::write_executable(
+            &ssh,
+            format!("#!/bin/sh\nprintf '{config}'\n"),
+            0o700,
+        );
+        spec.rsh = vec![ssh.display().to_string()];
+        spec.host = "relay-alias".into();
+        let probed = spec
+            .probe_tcp_addresses(vec![("127.0.0.1".into(), 0)], port, TCP_PROBE_FLOOR)
+            .unwrap();
+        assert_eq!(
+            probed
+                .candidates
+                .iter()
+                .any(|candidate| candidate.source == DataAddressSource::RemoteInterface),
+            local,
+            "{config}"
+        );
+    }
+}
+
+#[test]
+fn ssh_destinations_say_when_a_proxy_reaches_the_host() {
+    assert_eq!(
+        parse_ssh_destination("user backup\nhostname 10.0.0.5\nport 22\n"),
+        Some(SshDestination {
+            hostname: "10.0.0.5".into(),
+            direct: true,
+        })
+    );
+    for proxy in ["proxyjump gw.example.net", "proxycommand nc %h %p"] {
+        assert_eq!(
+            parse_ssh_destination(&format!("hostname localhost\n{proxy}\nport 22\n")),
+            Some(SshDestination {
+                hostname: "localhost".into(),
+                direct: false,
+            })
+        );
+    }
+    for none in ["proxyjump none", "proxycommand none"] {
+        assert!(
+            parse_ssh_destination(&format!("hostname localhost\n{none}\n"))
+                .unwrap()
+                .direct
+        );
+    }
+    assert_eq!(parse_ssh_destination("port 22\n"), None);
+}
+
+#[test]
 fn excessive_probe_candidates_fail_before_resolution() {
     let mut candidates: Vec<_> = (0..MAX_ADVERTISED_TCP_ADDRESSES + 2)
         .map(|_| TcpCandidate {

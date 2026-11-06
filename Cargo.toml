@@ -54,7 +54,10 @@ regex = "1"
 time = { version = "0.3", features = ["parsing"] }
 blake3 = "1"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
-zstd = "0.14"
+# Without `legacy`: old-format frames size their own window, past the
+# limit the frame reader sets. Neither `arrays` nor dictionary building is
+# used.
+zstd = { version = "0.14", default-features = false }
 libc = "0.2"
 shell-words = "1"
 serde_bytes = "0.11"

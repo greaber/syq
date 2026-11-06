@@ -658,8 +658,10 @@ fn automatic_streaming_pull_preserves_average_bandwidth_pacing() {
                 EPHEMERAL_TCP_PORTS,
                 "--results",
                 &t.s("result.jsonl"),
+                // The host is this machine, so syq dials the loopback
+                // address it advertises.
                 "--from",
-                "host",
+                "localhost",
                 &t.s("source"),
                 "--as",
                 &t.s("destination"),
@@ -2234,7 +2236,9 @@ fn tuning_history_records_tcp_preflight_for_push_and_pull() {
         } else {
             command.arg(t.path("source"));
         }
-        command.args([if pull { "--from" } else { "--to" }, "host"]);
+        // The host is this machine, so syq dials the loopback address it
+        // advertises.
+        command.args([if pull { "--from" } else { "--to" }, "localhost"]);
         if descriptor && pull {
             command.args(["--as-fd", "1"]);
         } else {
@@ -2288,7 +2292,7 @@ fn tuning_history_records_tcp_preflight_for_push_and_pull() {
             .iter()
             .any(|c| c["selected"] == true && c["reachable"] == true));
         assert!(!probe.to_string().contains("127.0.0.1"));
-        assert_ne!(probe["endpoint"], "host");
+        assert_ne!(probe["endpoint"], "localhost");
     }
 }
 

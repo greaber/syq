@@ -7,6 +7,7 @@ fn read_stream_shrinks_before_the_next_read_and_fences_late_updates() {
         thread: None,
         tcp_socket: None,
         named_socket: None,
+        closed: Default::default(),
     };
     let send = |value| {
         tx.send(Ok(crate::wire_budget::Budgeted {
@@ -443,6 +444,271 @@ impl<R> Drop for ExitObserved<R> {
         self.dropped
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// A request that compresses to a small fraction of its size.
+fn compressed_request() -> Vec<u8> {
+    let request = Request::ListDir {
+        directory: vec![b'a'; 1 << 20],
+        prefix: Vec::new(),
+        limit: 1,
+        symlink_policy: OperatorSymlinkPolicy::Refuse,
+        confined_root: None,
+    };
+    let mut bytes = Vec::new();
+    FrameWriter::new(&mut bytes, true)
+        .write_msg(&request)
+        .unwrap();
+    assert!(bytes.len() < 64 << 10, "the request was not compressed");
+    bytes
+}
+
+/// A request as two zstd frames in one body: nothing tells the reader what
+/// it decodes to before it decodes it.
+fn concatenated_zstd_frame(request: &Request) -> Vec<u8> {
+    let payload = postcard::to_stdvec(request).unwrap();
+    let mut body = zstd::bulk::compress(&[], 1).unwrap();
+    body.extend(zstd::bulk::compress(&payload, 1).unwrap());
+    let mut frame = u32::try_from(body.len() + 1)
+        .unwrap()
+        .to_le_bytes()
+        .to_vec();
+    frame.push(crate::compression::ZSTD);
+    frame.extend(body);
+    frame
+}
+
+/// A request as one zstd frame that declares what it decodes to.
+fn zstd_frame(request: &Request) -> Vec<u8> {
+    let body = zstd::bulk::compress(&postcard::to_stdvec(request).unwrap(), 1).unwrap();
+    let mut frame = u32::try_from(body.len() + 1)
+        .unwrap()
+        .to_le_bytes()
+        .to_vec();
+    frame.push(crate::compression::ZSTD);
+    frame.extend(body);
+    frame
+}
+
+/// A reader charging a full private allowance, so its next compressed frame
+/// waits for room.
+fn waiting_reader(
+    tcp_socket: Option<TcpStream>,
+    named_socket: Option<std::os::unix::net::UnixStream>,
+    input: impl Read + Send + 'static,
+) -> (RequestReader, crate::wire_budget::Expansion) {
+    let budget = Arc::new(crate::wire_budget::ExpansionBudget::with_limit(1 << 20));
+    let full = crate::wire_budget::Expansion::reserve(&budget, 1 << 20, &|| false).unwrap();
+    let reader = RequestReader::spawn_charged(
+        FrameReader::new(input),
+        tcp_socket,
+        named_socket,
+        Default::default(),
+        None,
+        None,
+        budget,
+    )
+    .unwrap();
+    assert!(matches!(
+        reader
+            .rx
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_millis(300)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    (reader, full)
+}
+
+/// A frame waiting for room stops waiting when its peer hangs up, although
+/// the room it waits for is still held.
+#[test]
+fn a_frame_waiting_for_room_stops_when_its_peer_hangs_up() {
+    let (mut client, server) = tcp_test_pair();
+    client.write_all(&compressed_request()).unwrap();
+    let (reader, _full) = waiting_reader(
+        Some(server.try_clone().unwrap()),
+        None,
+        server.try_clone().unwrap(),
+    );
+    drop(client);
+    match reader
+        .rx
+        .as_ref()
+        .unwrap()
+        .recv_timeout(Duration::from_secs(5))
+    {
+        Ok(Err(error)) => assert_eq!(error.kind(), ErrorKind::ConnectionAborted, "{error}"),
+        other => panic!("the reader kept waiting after its peer hung up: {other:?}"),
+    }
+}
+
+/// The server closing a connection ends its reader's wait for room, so
+/// tearing the connection down does not wait for room to free.
+#[test]
+fn dropping_a_request_reader_ends_its_wait_for_room() {
+    let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+    client.write_all(&compressed_request()).unwrap();
+    let (reader, _full) = waiting_reader(None, Some(server.try_clone().unwrap()), server);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        drop(reader);
+        tx.send(()).unwrap();
+    });
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("dropping the reader waited for room");
+    // The peer stayed connected throughout.
+    drop(client);
+}
+
+/// A read stream lasts until its Stop arrives on the same connection. Its
+/// request must not keep decompression room that the Stop needs, or the two
+/// wait for each other.
+#[test]
+fn a_read_stream_does_not_hold_room_its_stop_needs() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let selected = crate::test_support::tempdir().unwrap();
+    let marker = selected.path().join("marker");
+    std::fs::write(&marker, b"marker").unwrap();
+    let descriptor_session = DescriptorSessionSlot::default();
+    let ticket = descriptor_session
+        .register(std::fs::File::open(selected.path()).unwrap())
+        .unwrap();
+    let selection = RegisteredPath::new(ticket.root_id(), Vec::new()).unwrap();
+    let source = RegisteredSourceRoot {
+        filesystem: None,
+        selection: selection.clone(),
+        ticket,
+        leaf_ticket: None,
+        expected_leaf: None,
+        allow_unconfined_paths: false,
+        directory_mode: None,
+    };
+    // Leave room for one frame of unknown decoded size, not two.
+    let _occupied = crate::wire_budget::Expansion::reserve(
+        &crate::wire_budget::ExpansionBudget::shared(),
+        crate::wire_budget::EXPANSION_LIMIT - MAX_FRAME - (1 << 20),
+        &|| false,
+    )
+    .unwrap();
+    let server = std::thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        serve(
+            socket.try_clone().unwrap(),
+            socket.try_clone().unwrap(),
+            false,
+            None,
+            None,
+            Some(socket),
+            ServeSession {
+                owns_process: false,
+                handshake_pending: None,
+                ssh_worker_ticket: None,
+                allow_tcp: true,
+                metadata_control: false,
+                loopback_only: false,
+                named_socket: None,
+                authority: None,
+                source_authority: None,
+                descriptor_session,
+            },
+        )
+    });
+    let mut socket = TcpStream::connect(address).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut writer = FrameWriter::new(socket.try_clone().unwrap(), false);
+    let mut reader = FrameReader::new(socket.try_clone().unwrap());
+    writer
+        .write_msg(&Request::Hello {
+            identity: crate::identity::build().to_string(),
+            compress: false,
+            debug: false,
+            token: Vec::new(),
+            role: ConnectionRole::SourceWorker {
+                roots: vec![source],
+                send_budget: None,
+            },
+        })
+        .unwrap();
+    assert!(matches!(
+        reader.read_msg::<Response>().unwrap(),
+        Response::HelloOk { .. }
+    ));
+    let stream = |path: Vec<u8>| {
+        Request::ReadStream(ReadStreamRequest {
+            path,
+            source: Some(selection.join(b"marker").unwrap()),
+            attempt: 0,
+            off: 0,
+            end: 6,
+            block: 512,
+        })
+    };
+    // A small request that decodes to no more than it arrived as, and one
+    // whose long, compressible path really expands: what it added stays
+    // charged after decoding unless the stream releases it.
+    for frame in [
+        concatenated_zstd_frame(&stream(Vec::new())),
+        zstd_frame(&stream(vec![b'a'; 6 << 20])),
+    ] {
+        socket.write_all(&frame).unwrap();
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::Ok
+        ));
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::Block { data, .. } if data == b"marker"
+        ));
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::ReadStreamDone
+        ));
+        socket
+            .write_all(&concatenated_zstd_frame(&Request::StopReadStream))
+            .unwrap();
+        // The socket's read deadline fails the test if the Stop waits.
+        writer
+            .write_msg(&Request::ReadRange {
+                path: Vec::new(),
+                source: Some(selection.join(b"marker").unwrap()),
+                attempt: 0,
+                off: 0,
+                len: 6,
+            })
+            .unwrap();
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::Block { data, .. } if data == b"marker"
+        ));
+    }
+    drop((writer, reader));
+    socket.shutdown(std::net::Shutdown::Both).unwrap();
+    server.join().unwrap().unwrap();
+}
+
+/// A peer's compressed requests hold what decompression added to them in
+/// the shared allowance while they are queued and served.
+#[test]
+fn queued_requests_hold_what_decompression_added() {
+    let bytes = compressed_request();
+    let reader = RequestReader::spawn(
+        FrameReader::new(std::io::Cursor::new(bytes)),
+        None,
+        None,
+        Default::default(),
+        None,
+        None,
+    )
+    .unwrap();
+    let queued = reader.recv().unwrap().unwrap();
+    assert!(queued
+        .hold
+        .expansion_bytes()
+        .is_some_and(|bytes| bytes > 900 << 10));
 }
 
 #[test]
@@ -938,6 +1204,59 @@ fn tcp_rejects_replayed_hello_with_high_connection_id_bits() {
             std::collections::HashSet::from([conn_id])
         );
     }
+}
+
+#[test]
+fn tcp_unauthenticated_connection_does_not_take_its_id() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let authority = Arc::new(crate::restricted::tests::tcp_test_authority(
+        temporary.path(),
+    ));
+    let key = vec![7; crate::tcp_records::KEY_LEN];
+    let token = b"claim-test";
+    let conn_id = 45u32;
+    let mut hello = Vec::new();
+    FrameWriter::new(
+        RecordWriter::new(&mut hello, Some(Cipher::new(&key, conn_id, 1))),
+        false,
+    )
+    .write_msg(&tcp_test_hello(token))
+    .unwrap();
+    let seen = std::sync::Mutex::new(std::collections::HashSet::new());
+    let serve = |stream| {
+        serve_tcp(
+            stream,
+            0,
+            Some(key.clone()),
+            token.to_vec(),
+            false,
+            false,
+            &seen,
+            Some(authority.clone()),
+            None,
+            DescriptorSessionSlot::default(),
+            None,
+            std::time::Instant::now() + Duration::from_secs(3),
+        )
+    };
+    // A peer without the key sends the id the client's next worker will use
+    // and keeps its connection open.
+    let (mut intruder, intruder_server) = tcp_test_pair();
+    intruder.write_all(&conn_id.to_be_bytes()).unwrap();
+    std::thread::scope(|scope| {
+        let pending = scope.spawn(|| serve(intruder_server));
+        // The server sends its preamble once it has accepted the id.
+        let mut preamble = [0u8; 4];
+        intruder.read_exact(&mut preamble).unwrap();
+        let (mut client, server) = tcp_test_pair();
+        client.write_all(&conn_id.to_be_bytes()).unwrap();
+        client.write_all(&hello).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        serve(server).unwrap();
+        assert!(seen.lock().unwrap().contains(&conn_id));
+        intruder.shutdown(std::net::Shutdown::Both).unwrap();
+        assert!(pending.join().unwrap().is_err());
+    });
 }
 
 #[test]

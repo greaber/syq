@@ -26,18 +26,61 @@ struct RequestReader {
     thread: Option<std::thread::JoinHandle<()>>,
     tcp_socket: Option<TcpStream>,
     named_socket: Option<std::os::unix::net::UnixStream>,
+    /// Ends the reader's wait for decompression memory once the server is
+    /// closing the connection.
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RequestReader {
     fn spawn<R: Read + Send + 'static>(
-        mut reader: FrameReader<R>,
+        reader: FrameReader<R>,
         tcp_socket: Option<TcpStream>,
         named_socket: Option<std::os::unix::net::UnixStream>,
         disconnected: Arc<std::sync::atomic::AtomicBool>,
         source_control: Option<Arc<crate::restricted::source::SourceAuthority>>,
         sweep: Option<SweepOnLoss>,
     ) -> std::io::Result<Self> {
+        Self::spawn_charged(
+            reader,
+            tcp_socket,
+            named_socket,
+            disconnected,
+            source_control,
+            sweep,
+            crate::wire_budget::ExpansionBudget::shared(),
+        )
+    }
+
+    fn spawn_charged<R: Read + Send + 'static>(
+        mut reader: FrameReader<R>,
+        tcp_socket: Option<TcpStream>,
+        named_socket: Option<std::os::unix::net::UnixStream>,
+        disconnected: Arc<std::sync::atomic::AtomicBool>,
+        source_control: Option<Arc<crate::restricted::source::SourceAuthority>>,
+        sweep: Option<SweepOnLoss>,
+        budget: Arc<crate::wire_budget::ExpansionBudget>,
+    ) -> std::io::Result<Self> {
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        // Queued requests hold what decompression added to them, so a peer
+        // cannot make them hold far more than it sent. A frame waiting for
+        // room stops waiting when the server closes the connection, or when
+        // the peer of a TCP or socket connection hangs up.
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peer: Option<std::os::fd::OwnedFd> = match (&tcp_socket, &named_socket) {
+            (Some(socket), _) => Some(socket.try_clone()?.into()),
+            (None, Some(socket)) => Some(socket.try_clone()?.into()),
+            (None, None) => None,
+        };
+        let closing = closed.clone();
+        reader.charge_expansion(crate::wire_budget::ExpansionCharge {
+            budget,
+            closed: Box::new(move || {
+                closing.load(std::sync::atomic::Ordering::Acquire)
+                    || peer
+                        .as_ref()
+                        .is_some_and(crate::bwlimit::transport::socket_closed)
+            }),
+        });
         let thread = std::thread::Builder::new().spawn(move || loop {
             let msg = reader.read_budgeted::<Request>();
             if let (Ok(request), Some(sweep)) = (&msg, &sweep) {
@@ -70,6 +113,7 @@ impl RequestReader {
             thread: Some(thread),
             tcp_socket,
             named_socket,
+            closed,
         })
     }
 
@@ -121,6 +165,8 @@ impl RequestReader {
 
 impl Drop for RequestReader {
     fn drop(&mut self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
         let joinable = self.tcp_socket.is_some() || self.named_socket.is_some();
         if let Some(socket) = &self.named_socket {
             let _ = socket.shutdown(std::net::Shutdown::Both);
@@ -1091,7 +1137,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
     w: W,
     over_ssh: bool,
     expect_token: Option<Vec<u8>>,
-    authed: Option<&std::sync::atomic::AtomicBool>,
+    connection_id: Option<&TcpConnectionId>,
     tcp_socket: Option<TcpStream>,
     session: ServeSession,
 ) -> Result<()> {
@@ -1160,10 +1206,11 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 }
             }
             // The token is the credential: once it matches, the peer is
-            // authenticated. Mark it now so a later failure (identity mismatch
-            // or a failed HelloOk write) can't free the connection id for replay.
-            if let Some(a) = authed {
-                a.store(true, std::sync::atomic::Ordering::SeqCst);
+            // authenticated. Claim its connection id now, and never free it,
+            // so a later failure (identity mismatch or a failed HelloOk write)
+            // can't make the id available to a replay.
+            if let Some(id) = connection_id {
+                id.claim()?;
             }
             // Only an authenticated data connection counts against the signed
             // grant's worker allowance. The control connection arrives over
@@ -1420,7 +1467,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
             Err(_) => break,
         };
         drop(waiting);
-        let (mut req, _request_hold) = queued.into_parts();
+        let (mut req, mut request_hold) = queued.into_parts();
         // A connection with a streamed patch open carries nothing else
         // until the patch ends; closing the connection abandons it.
         if (ops.patch_stream_open()
@@ -1581,6 +1628,10 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 w.write_msg(&response)?;
             }
             Request::ReadStream(mut stream) => {
+                // The stream lasts until the client's Stop, which arrives on
+                // this connection: holding this request's decompression room
+                // until then could leave that Stop waiting for it.
+                request_hold.release_expansion();
                 if !is_source_worker {
                     w.write_msg(&Response::Err(
                         "read stream requires a source worker".into(),
@@ -2309,15 +2360,19 @@ fn serve_tcp(
     handshake_reader.read_exact(&mut idbuf)?;
     let conn_id = u32::from_be_bytes(idbuf);
     let _ = id;
-    // Reject aliases before reserving the ID or emitting encrypted records.
+    // Reject aliases before emitting encrypted records.
     if conn_id > crate::tcp_records::CONNECTION_ID_MAX {
         bail!("TCP connection id {conn_id} exceeds nonce space");
     }
     // Each client connection id is single-use: a replayed record stream carries
-    // the original id (it must, to decrypt) and is rejected here.
-    if !seen.lock().unwrap().insert(conn_id) {
-        bail!("duplicate connection id {conn_id} (possible replay)");
-    }
+    // the original id (it must, to decrypt) and is rejected here, before the
+    // server encrypts anything under it. The id is claimed only once the
+    // Hello authenticates (`TcpConnectionId::claim`), so a peer without the
+    // key and token cannot take ids that the client's workers will use.
+    // Until then, connections sharing an id each send only the server's
+    // preamble, whose plaintext is the same for every connection.
+    let connection_id = TcpConnectionId { seen, id: conn_id };
+    connection_id.ensure_unclaimed()?;
     let (rc, wc) = match &key {
         Some(k) => (
             Some(Cipher::new(k, conn_id, 1)),
@@ -2326,7 +2381,6 @@ fn serve_tcp(
         None => (None, None),
     };
     let reader = RecordReader::new(handshake_reader, rc);
-    let authed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let output: Box<dyn Write + Send> = if let Some(budget) = pacing {
         let session = descriptor_session.clone();
         let socket = stream.try_clone()?;
@@ -2345,17 +2399,12 @@ fn serve_tcp(
         Box::new(stream.try_clone()?)
     };
     let writer = RecordWriter::new(output, wc);
-    // Free the id only if the connection NEVER authenticated, so an
-    // unauthenticated peer can't reserve ids. Once the token authenticated, the
-    // id is retained permanently even if a later request fails — otherwise an
-    // on-path attacker could corrupt an authenticated stream to free the id and
-    // then replay captured records under it.
-    let res = serve(
+    serve(
         reader,
         writer,
         false,
         Some(token),
-        Some(&authed),
+        Some(&connection_id),
         Some(stream.try_clone()?),
         ServeSession {
             owns_process: false,
@@ -2369,11 +2418,33 @@ fn serve_tcp(
             source_authority,
             descriptor_session,
         },
-    );
-    if res.is_err() && !authed.load(std::sync::atomic::Ordering::SeqCst) {
-        seen.lock().unwrap().remove(&conn_id);
+    )
+}
+
+/// A TCP data connection's id in its listener's replay set. An id is claimed
+/// once its connection authenticates and stays claimed while the listener is
+/// up, even if the connection later fails: otherwise an on-path attacker
+/// could corrupt an authenticated stream to free the id and then replay
+/// captured records under it.
+struct TcpConnectionId<'a> {
+    seen: &'a std::sync::Mutex<std::collections::HashSet<u32>>,
+    id: u32,
+}
+
+impl TcpConnectionId<'_> {
+    fn ensure_unclaimed(&self) -> Result<()> {
+        if self.seen.lock().unwrap().contains(&self.id) {
+            bail!("duplicate connection id {} (possible replay)", self.id);
+        }
+        Ok(())
     }
-    res
+
+    fn claim(&self) -> Result<()> {
+        if !self.seen.lock().unwrap().insert(self.id) {
+            bail!("duplicate connection id {} (possible replay)", self.id);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(debug_assertions)]
