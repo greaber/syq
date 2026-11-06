@@ -1219,8 +1219,15 @@ pub(crate) fn socket_is_ready(path: &Path) -> std::io::Result<bool> {
 pub(crate) fn mux_clients(control: &Path) -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
-        let table = std::fs::read("/proc/net/unix").ok()?;
-        Some(count_mux_clients(&table, control.as_os_str().as_bytes()))
+        // Read a line at a time: the table lists every Unix socket.
+        use std::io::BufRead as _;
+        let table = std::io::BufReader::new(std::fs::File::open("/proc/net/unix").ok()?);
+        let control = control.as_os_str().as_bytes();
+        let mut count = 0;
+        for line in table.split(b'\n') {
+            count += usize::from(mux_client_line(&line.ok()?, control));
+        }
+        Some(count)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1229,12 +1236,12 @@ pub(crate) fn mux_clients(control: &Path) -> Option<usize> {
     }
 }
 
-/// Count the accepted stream connections in a `/proc/net/unix` table
-/// whose address is `control`. OpenSSH binds its listener to `control`
+/// Whether a `/proc/net/unix` line is an accepted stream connection whose
+/// address is `control`. OpenSSH binds its listener to `control`
 /// followed by a dot and 16 random letters and digits, then renames it to
 /// `control`; a connection the listener accepts carries the bound address.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn count_mux_clients(table: &[u8], control: &[u8]) -> usize {
+fn mux_client_line(line: &[u8], control: &[u8]) -> bool {
     let bound_by_ssh = |path: &[u8]| {
         path == control
             || path.strip_prefix(control).is_some_and(|rest| {
@@ -1243,26 +1250,20 @@ fn count_mux_clients(table: &[u8], control: &[u8]) -> usize {
                     && rest[1..].iter().all(u8::is_ascii_alphanumeric)
             })
     };
-    table
-        .split(|byte| *byte == b'\n')
-        .skip(1)
-        .filter(|line| {
-            // Num RefCount Protocol Flags Type St Inode Path; the inode is
-            // padded with spaces, and the path follows one more space.
-            let mut rest = *line;
-            let mut fields = [&b""[..]; 7];
-            for field in &mut fields {
-                let start = rest.iter().position(|b| *b != b' ').unwrap_or(rest.len());
-                rest = &rest[start..];
-                let end = rest.iter().position(|b| *b == b' ').unwrap_or(rest.len());
-                *field = &rest[..end];
-                rest = &rest[end..];
-            }
-            let path = rest.strip_prefix(b" ").unwrap_or(rest);
-            // A connected stream socket (SS_CONNECTED).
-            fields[4] == b"0001" && fields[5] == b"03" && bound_by_ssh(path)
-        })
-        .count()
+    // Num RefCount Protocol Flags Type St Inode Path; the inode is padded
+    // with spaces, and the path follows one more space.
+    let mut rest = line;
+    let mut fields = [&b""[..]; 7];
+    for field in &mut fields {
+        let start = rest.iter().position(|b| *b != b' ').unwrap_or(rest.len());
+        rest = &rest[start..];
+        let end = rest.iter().position(|b| *b == b' ').unwrap_or(rest.len());
+        *field = &rest[..end];
+        rest = &rest[end..];
+    }
+    let path = rest.strip_prefix(b" ").unwrap_or(rest);
+    // A connected stream socket (SS_CONNECTED).
+    fields[4] == b"0001" && fields[5] == b"03" && bound_by_ssh(path)
 }
 
 #[derive(Serialize)]
@@ -1650,8 +1651,14 @@ mod tests {
 0000000000000000: 00000003 00000000 00000000 0002 03 77777 /run/s/cm-1
 0000000000000000: 00000003 00000000 00000000 0001 03 88888 /run/s/cm-1 x
 ";
-        assert_eq!(count_mux_clients(table, b"/run/s/cm-1"), 2);
-        assert_eq!(count_mux_clients(b"", b"/run/s/cm-1"), 0);
+        let count = |table: &[u8]| {
+            table
+                .split(|byte| *byte == b'\n')
+                .filter(|line| mux_client_line(line, b"/run/s/cm-1"))
+                .count()
+        };
+        assert_eq!(count(table), 2);
+        assert_eq!(count(b""), 0);
     }
 
     /// As OpenSSH does: bind a temporary name, link the control path to

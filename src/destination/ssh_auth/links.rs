@@ -34,8 +34,11 @@ pub(crate) enum LinkRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum LinkReply {
     Idle,
-    /// Something uses it, or the keeper cannot tell.
+    /// Something uses it.
     InUse,
+    /// The keeper cannot tell whether anything uses it, as where it cannot
+    /// count the sessions of its master.
+    Unknown,
     /// Nothing used it: it ends now.
     Closing,
 }
@@ -54,10 +57,12 @@ struct LinkState {
     report: Option<(Instant, LinkReply)>,
     /// A `Query` is wanted.
     query: bool,
-    /// A `CloseIfIdle` is wanted.
-    close: bool,
-    /// The answer to the last `CloseIfIdle`: whether it closed.
-    closed: Option<bool>,
+    /// A `CloseIfIdle` is wanted, for this close attempt.
+    close: Option<u64>,
+    /// The answer to a `CloseIfIdle`: its attempt, and whether it closed.
+    closed: Option<(u64, bool)>,
+    /// The link is gone: it closed, or its stream ended.
+    ended: bool,
 }
 
 struct Link {
@@ -77,25 +82,52 @@ impl Link {
 #[derive(Default)]
 pub(crate) struct AccountLinks {
     links: Mutex<Vec<std::sync::Arc<Link>>>,
+    /// Numbers close attempts, so that one never takes another's answer.
+    attempts: AtomicU64,
+}
+
+/// What the links said recently (`AccountLinks::counts`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LinkCounts {
+    /// Links open now.
+    pub(crate) open: usize,
+    /// Of those, the ones that said nothing uses them.
+    pub(crate) idle: usize,
+    /// Of those, the ones that said something does. The rest have not
+    /// said lately, or cannot tell.
+    pub(crate) in_use: usize,
 }
 
 impl AccountLinks {
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.links.lock().unwrap().len()
     }
 
-    /// How many of them said recently that nothing uses them. Asks again
-    /// those whose answer is getting old, so that calling this now and
-    /// then, as a service waiting to switch does, keeps the count current.
+    /// How many of them said recently that nothing uses them.
     pub(crate) fn idle(&self) -> usize {
+        self.counts().idle
+    }
+
+    /// What the links said recently. Asks again those whose answer is
+    /// getting old, so that calling this now and then, as a service
+    /// waiting to switch does, keeps the counts current.
+    pub(crate) fn counts(&self) -> LinkCounts {
         let now = Instant::now();
         let links = self.links.lock().unwrap();
-        let mut idle = 0;
+        let mut counts = LinkCounts {
+            open: links.len(),
+            ..LinkCounts::default()
+        };
         for link in links.iter() {
             let mut state = link.state.lock().unwrap();
             let age = state.report.map(|(at, _)| now.duration_since(at));
-            if matches!(state.report, Some((_, LinkReply::Idle))) && age < Some(FRESH) {
-                idle += 1;
+            if age < Some(FRESH) {
+                match state.report {
+                    Some((_, LinkReply::Idle)) => counts.idle += 1,
+                    Some((_, LinkReply::InUse)) => counts.in_use += 1,
+                    _ => {}
+                }
             }
             if age.is_none_or(|age| age >= REFRESH) && !state.query {
                 state.query = true;
@@ -103,33 +135,38 @@ impl AccountLinks {
                 link.wake();
             }
         }
-        idle
+        counts
     }
 
     /// Ask every connection to end if nothing uses it, and wait until
     /// `deadline` for their answers; whether all ended. Those in use stay.
     pub(crate) fn close_idle(&self, deadline: Instant) -> bool {
+        let attempt = self.attempts.fetch_add(1, Ordering::AcqRel) + 1;
         let links: Vec<_> = self.links.lock().unwrap().clone();
         for link in &links {
             let mut state = link.state.lock().unwrap();
-            state.close = true;
-            state.closed = None;
+            state.close = Some(attempt);
             drop(state);
             link.wake();
         }
         let mut all = true;
         for link in &links {
             let mut state = link.state.lock().unwrap();
-            while state.closed.is_none() {
+            let answered = |state: &LinkState| {
+                state.ended || state.closed.is_some_and(|(of, _)| of == attempt)
+            };
+            while !answered(&state) {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
                     break;
                 }
                 state = link.answered.wait_timeout(state, left).unwrap().0;
             }
-            if state.closed != Some(true) {
+            if !(state.ended || state.closed == Some((attempt, true))) {
                 // Not asked yet, or in use: it stays open.
-                state.close = false;
+                if state.close == Some(attempt) {
+                    state.close = None;
+                }
                 all = false;
             }
         }
@@ -161,7 +198,8 @@ impl AccountLinks {
                     .lock()
                     .unwrap()
                     .retain(|link| !std::sync::Arc::ptr_eq(link, &self.1));
-                // A close waiting for this link learns it did not answer.
+                // A close waiting for this link learns it is gone.
+                self.1.state.lock().unwrap().ended = true;
                 self.1.answered.notify_all();
             }
         }
@@ -171,17 +209,17 @@ impl AccountLinks {
             if asked.is_none() {
                 let request = {
                     let mut state = link.state.lock().unwrap();
-                    if std::mem::take(&mut state.close) {
-                        Some(LinkRequest::CloseIfIdle)
+                    if let Some(attempt) = state.close.take() {
+                        Some((LinkRequest::CloseIfIdle, attempt))
                     } else if std::mem::take(&mut state.query) {
-                        Some(LinkRequest::Query)
+                        Some((LinkRequest::Query, 0))
                     } else {
                         None
                     }
                 };
-                if let Some(request) = request {
+                if let Some((request, attempt)) = request {
                     crate::agent_broker::write_frame(stream, &encode(&request)?)?;
-                    asked = Some(request);
+                    asked = Some((request, attempt));
                 }
             }
             let mut descriptors = [
@@ -222,14 +260,14 @@ impl AccountLinks {
             let Some(frame) = crate::agent_broker::read_frame(stream)? else {
                 return Ok(());
             };
-            let Some(request) = asked.take() else {
+            let Some((request, attempt)) = asked.take() else {
                 bail!("unexpected message on an approved account connection");
             };
             let reply: LinkReply = decode(&frame)?;
             let mut state = link.state.lock().unwrap();
             state.report = Some((Instant::now(), reply));
             if request == LinkRequest::CloseIfIdle {
-                state.closed = Some(reply == LinkReply::Closing);
+                state.closed = Some((attempt, reply == LinkReply::Closing));
             }
             drop(state);
             link.answered.notify_all();
@@ -313,6 +351,41 @@ mod tests {
         keeper.join().unwrap();
         assert!(links.links.lock().unwrap().is_empty());
         assert_eq!(links.idle(), 0);
+    }
+
+    /// Only a recent answer that something uses it counts a connection as
+    /// in use: not one that has not answered yet, one that cannot tell,
+    /// nor an answer grown old.
+    #[test]
+    fn only_a_recent_answer_counts_a_connection_in_use() {
+        let links = std::sync::Arc::new(AccountLinks::default());
+        let (keeper, server, end) = serving(&links, vec![LinkReply::Unknown, LinkReply::InUse]);
+        wait_for(|| links.len() == 1);
+        let link = links.links.lock().unwrap()[0].clone();
+        // Not answered yet; the look asks it.
+        assert_eq!(
+            links.counts(),
+            LinkCounts {
+                open: 1,
+                idle: 0,
+                in_use: 0
+            }
+        );
+        wait_for(|| link.state.lock().unwrap().report.is_some());
+        assert_eq!(
+            link.state.lock().unwrap().report.unwrap().1,
+            LinkReply::Unknown
+        );
+        assert_eq!(links.counts().in_use, 0);
+        // An old answer is asked again, and counts once answered.
+        link.state.lock().unwrap().report = Some((Instant::now() - FRESH, LinkReply::Unknown));
+        links.counts();
+        wait_for(|| links.counts().in_use == 1);
+        link.state.lock().unwrap().report = Some((Instant::now() - FRESH, LinkReply::InUse));
+        assert_eq!(links.counts().in_use, 0);
+        end.shutdown(std::net::Shutdown::Both).unwrap();
+        keeper.join().unwrap();
+        server.join().unwrap().unwrap();
     }
 
     /// One in use stays open, and the close says not all ended.

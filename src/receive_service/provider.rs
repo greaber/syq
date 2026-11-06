@@ -487,6 +487,8 @@ struct Service {
     /// Refusing new requests while it ends idle account connections to
     /// switch builds (`stop_if_idle`).
     switching: AtomicBool,
+    /// Held by the one `stop_if_idle` running.
+    stop_attempt: Mutex<()>,
     /// The path the provider follows, and its switch to a new build.
     started_from: Option<String>,
     switch: Mutex<Option<super::switch::Report>>,
@@ -515,6 +517,7 @@ impl Service {
             account_relays: AtomicU64::new(0),
             account_links: Default::default(),
             switching: AtomicBool::new(false),
+            stop_attempt: Mutex::new(()),
             started_from,
             switch: Mutex::new(None),
         };
@@ -566,7 +569,7 @@ impl Service {
         );
         self.refresh()?;
         anyhow::ensure!(
-            !self.stop.load(Ordering::Acquire) && !self.switching.load(Ordering::Acquire),
+            !self.stop.load(Ordering::Acquire) && !self.switching.load(Ordering::SeqCst),
             "SSH authorization provider is stopping"
         );
         Ok(())
@@ -588,32 +591,57 @@ impl Service {
                 .sum::<usize>()
     }
     /// Stop if nothing is in progress (`busy`), after ending the account
-    /// connections nothing uses; whether it did. A request counted after
-    /// the check finds the provider stopping and is refused.
+    /// connections nothing uses; whether it did. One attempt runs at a
+    /// time; another meanwhile does not stop it. New requests are refused
+    /// from before the decision, and admitted again if it does not stop.
     fn stop_if_idle(&self) -> bool {
+        let Ok(_attempt) = self.stop_attempt.try_lock() else {
+            return false;
+        };
         {
-            let idle = self.account_links.idle();
-            let inner = self.inner.lock().unwrap();
-            let idle = self.requests.load(Ordering::SeqCst).saturating_sub(idle) == 0
-                && inner
-                    .profiles
-                    .values()
-                    .all(|profile| profile.approvals.snapshots().is_empty());
-            if !idle {
-                return false;
-            }
+            let _inner = self.inner.lock().unwrap();
             self.switching.store(true, Ordering::SeqCst);
         }
-        // They are re-established on their next use; one that turned out
-        // to be in use keeps the provider running.
-        let closed = self
-            .account_links
-            .close_idle(Instant::now() + ssh_auth::CLOSE_WAIT);
-        if closed {
+        let stopped = self.stop_admitted_if_idle();
+        if stopped {
             self.stop.store(true, Ordering::SeqCst);
         }
         self.switching.store(false, Ordering::SeqCst);
-        closed
+        stopped
+    }
+    /// With no request admitted any more, whether every one left is an
+    /// account connection nothing uses, and all of those ended.
+    fn stop_admitted_if_idle(&self) -> bool {
+        // A request admitted before counts here. Every link is a request,
+        // counted from before it registers until after it is gone, so the
+        // links can only be fewer than the requests read before them.
+        let requests = self.requests.load(Ordering::SeqCst);
+        let links = self.account_links.counts();
+        let pending = self
+            .inner
+            .lock()
+            .unwrap()
+            .profiles
+            .values()
+            .any(|profile| !profile.approvals.snapshots().is_empty());
+        if pending || requests != links.open || links.idle != links.open {
+            return false;
+        }
+        // They are re-established on their next use.
+        let deadline = Instant::now() + ssh_auth::CLOSE_WAIT;
+        if !self.account_links.close_idle(deadline) {
+            return false;
+        }
+        // Their requests end with them; a request refused meanwhile is
+        // counted for a moment too.
+        let deadline = deadline + Duration::from_millis(200);
+        while self.requests.load(Ordering::SeqCst) != 0 {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
     }
     fn close(&self) {
         self.stop.store(true, Ordering::Release);
@@ -624,7 +652,7 @@ impl Service {
         self.streams.shutdown_all();
     }
     fn snapshot(&self, decision_error: Option<String>) -> Snapshot {
-        let idle = self.account_links.idle();
+        let links = self.account_links.counts();
         let busy = self.busy();
         let inner = self.inner.lock().unwrap();
         Snapshot {
@@ -632,9 +660,9 @@ impl Service {
             pid: std::process::id(),
             busy: Some(busy),
             accounts: Some(
-                (self.account_relays.load(Ordering::Acquire) as usize).saturating_sub(idle),
+                (self.account_relays.load(Ordering::Acquire) as usize).saturating_sub(links.idle),
             ),
-            accounts_in_use: Some(self.account_links.len().saturating_sub(idle)),
+            accounts_in_use: Some(links.in_use),
             started_from: self.started_from.clone(),
             switch: self.switch.lock().unwrap().clone(),
             stopping: self.stop.load(Ordering::SeqCst),
@@ -856,7 +884,7 @@ impl Service {
     ) -> Result<(Ticket, Arc<Session>)> {
         let mut inner = self.inner.lock().unwrap();
         anyhow::ensure!(
-            !self.stop.load(Ordering::Acquire) && !self.switching.load(Ordering::Acquire),
+            !self.stop.load(Ordering::Acquire) && !self.switching.load(Ordering::SeqCst),
             "SSH authorization provider is stopping"
         );
         let index = inner.preferences.selected(selected)?;
@@ -1337,6 +1365,117 @@ mod tests {
         assert_eq!(ticket.profile, "second");
         assert_eq!(ticket.identity.user, "provider");
         assert!(service.open_identified(Some("missing"), identity).is_err());
+        service.close();
+    }
+
+    /// An approved account connection served by `service`, counted as the
+    /// request it is, whose keeper answers each request with `reply`.
+    fn account_link(
+        service: &Arc<Service>,
+        reply: impl Fn(ssh_auth::LinkRequest) -> ssh_auth::LinkReply + Send + 'static,
+    ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
+        let (mut ours, mut theirs) = UnixStream::pair().unwrap();
+        service.requests.fetch_add(1, Ordering::SeqCst);
+        let serving = service.clone();
+        let server = std::thread::spawn(move || {
+            let _counted = Counted(&serving.requests);
+            let _ = serving.account_links.serve(&mut ours, &|| false);
+        });
+        let keeper = std::thread::spawn(move || {
+            crate::agent_broker::read_frame(&mut theirs)
+                .unwrap()
+                .unwrap();
+            while let Ok(Some(frame)) = crate::agent_broker::read_frame(&mut theirs) {
+                let answer = reply(serde_json::from_slice(&frame).unwrap());
+                let frame = serde_json::to_vec(&answer).unwrap();
+                if crate::agent_broker::write_frame(&mut theirs, &frame).is_err() {
+                    return;
+                }
+            }
+        });
+        (server, keeper)
+    }
+    fn wait_until(what: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !what() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    /// Waits until the link has said it is idle.
+    fn reported_idle(service: &Service) {
+        wait_until(|| service.account_links.idle() == 1);
+    }
+
+    /// An idle account connection does not hide another request running:
+    /// the provider stops only once every request left is such a
+    /// connection, and then ends it.
+    #[test]
+    fn an_idle_account_connection_does_not_hide_another_request() {
+        let (_directory, domain, _) = fixture();
+        let service = Arc::new(Service::new(domain, None).unwrap());
+        let (server, keeper) = account_link(&service, |request| match request {
+            ssh_auth::LinkRequest::Query => ssh_auth::LinkReply::Idle,
+            ssh_auth::LinkRequest::CloseIfIdle => ssh_auth::LinkReply::Closing,
+        });
+        reported_idle(&service);
+        // Another request, say one authorizing a login.
+        service.requests.fetch_add(1, Ordering::SeqCst);
+        let other = Counted(&service.requests);
+        assert!(!service.stop_if_idle());
+        assert!(!service.stop.load(Ordering::SeqCst));
+        assert_eq!(service.account_links.len(), 1);
+        service.admit().unwrap();
+        drop(other);
+        assert!(service.stop_if_idle());
+        server.join().unwrap();
+        keeper.join().unwrap();
+        assert_eq!(service.requests.load(Ordering::SeqCst), 0);
+        service.close();
+    }
+
+    /// One stop attempt runs at a time. While it waits for an account
+    /// connection's answer, another neither stops the provider nor admits
+    /// requests again; an answer that comes too late ends that connection
+    /// but stops nothing, and requests are admitted again.
+    #[test]
+    fn stop_attempts_do_not_overlap() {
+        let (_directory, domain, _) = fixture();
+        let service = Arc::new(Service::new(domain, None).unwrap());
+        let (answer, answering) = std::sync::mpsc::channel::<()>();
+        let answering = Mutex::new(answering);
+        let (server, keeper) = account_link(&service, move |request| match request {
+            ssh_auth::LinkRequest::Query => ssh_auth::LinkReply::Idle,
+            ssh_auth::LinkRequest::CloseIfIdle => {
+                // Answer only when the test says so.
+                answering.lock().unwrap().recv().unwrap();
+                ssh_auth::LinkReply::Closing
+            }
+        });
+        reported_idle(&service);
+        let first = {
+            let service = service.clone();
+            std::thread::spawn(move || service.stop_if_idle())
+        };
+        wait_until(|| service.admit().is_err());
+        assert!(!service.stop_if_idle());
+        assert!(
+            service.admit().is_err(),
+            "the second attempt reopened admission"
+        );
+        // The first gives up waiting, and admits requests again.
+        assert!(!first.join().unwrap());
+        service.admit().unwrap();
+        service.requests.fetch_add(1, Ordering::SeqCst);
+        let admitted = Counted(&service.requests);
+        // The late answer ends the connection, and stops nothing.
+        answer.send(()).unwrap();
+        server.join().unwrap();
+        keeper.join().unwrap();
+        assert!(!service.stop.load(Ordering::SeqCst));
+        assert!(!service.stop_if_idle());
+        drop(admitted);
+        assert!(service.stop_if_idle());
         service.close();
     }
 

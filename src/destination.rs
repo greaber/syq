@@ -1829,18 +1829,22 @@ impl Activity {
         let requests = self.state.lock().unwrap().requests;
         requests + self.approved()
     }
-    /// Approved account connections open through this connection, and of
-    /// those, how many say whether anything uses them, and how many said
-    /// nothing does (`ssh_auth::AccountLinks`).
+    /// Approved account connections open through this connection, and
+    /// what those that say whether anything uses them said lately
+    /// (`ssh_auth::AccountLinks`).
     pub(crate) fn accounts(&self) -> Accounts {
         self.receiver
             .lock()
             .unwrap()
             .upgrade()
-            .map_or(Accounts::default(), |receiver| Accounts {
-                open: receiver.account_relays.load(Ordering::Acquire) as usize,
-                idle: receiver.account_links.idle(),
-                reporting: receiver.account_links.len(),
+            .map_or(Accounts::default(), |receiver| {
+                let links = receiver.account_links.counts();
+                Accounts {
+                    open: receiver.account_relays.load(Ordering::Acquire) as usize,
+                    reporting: links.open,
+                    idle: links.idle,
+                    in_use: links.in_use,
+                }
             })
     }
     fn approved(&self) -> usize {
@@ -1902,6 +1906,9 @@ pub(crate) struct Accounts {
     pub(crate) reporting: usize,
     /// Of those, the ones that said recently that nothing does.
     pub(crate) idle: usize,
+    /// Of those, the ones that said recently that something does. The
+    /// rest have not said lately, or cannot tell.
+    pub(crate) in_use: usize,
 }
 
 pub(crate) fn serve_background(

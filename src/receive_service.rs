@@ -1921,10 +1921,7 @@ fn busy(workers: &[ProfileWorker]) -> Busy {
             .saturating_sub(open),
         pending: workers.iter().map(|w| w.approvals.snapshots().len()).sum(),
         accounts: open.saturating_sub(idle),
-        accounts_in_use: accounts
-            .iter()
-            .map(|a| a.reporting.saturating_sub(a.idle))
-            .sum(),
+        accounts_in_use: accounts.iter().map(|a| a.in_use).sum(),
     }
 }
 /// Refuse new requests on every worker if all are idle, so the service can

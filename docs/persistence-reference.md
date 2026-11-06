@@ -250,8 +250,9 @@ approval is in progress, by themselves or when you next run syq. If receiving
 needs you to unlock or touch your SSH key, it waits until you next run a syq
 copy or ssh command in a terminal. An account connection you approved closes
 at the switch when nothing runs through it, and opens again the next time a
-command uses it; while a copy, shell, or other session runs through it, the
-switch waits for it to finish. A connection that can't tell whether it's in
+syq command uses it; export a `persist ssh-config` file again after that. While
+a copy, shell, or other session runs through it, the switch waits for it to
+finish. A connection that can't tell whether it's in
 use, such as one opened on macOS, keeps the old version until it closes.
 `syq persist status` says which connections the switch waits for and shows the
 command that switches at once and closes them. Session permissions (**Allow**)
