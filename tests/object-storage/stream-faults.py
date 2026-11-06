@@ -134,9 +134,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         assert not any(k.lower().startswith('x-amz-checksum') for k in self.headers), self.headers
         assert self.headers['x-amz-content-sha256'] == 'UNSIGNED-PAYLOAD'
         if 'Content-MD5' in self.headers:
-            assert CASE in ('object-lock', 'plain-http')
+            assert CASE in ('object-lock', 'plain-http', 'mapping-callbacks')
             assert self.headers['Content-MD5'] == base64.b64encode(hashlib.md5(data).digest()).decode()
-        elif CASE == 'plain-http':
+        elif CASE in ('plain-http', 'mapping-callbacks'):
             raise AssertionError('plain HTTP upload without Content-MD5')
         elif CASE == 'object-lock':
             with LOCK: STATE['rejected'] = STATE.get('rejected', 0) + 1
@@ -266,7 +266,7 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                AWS_EC2_METADATA_DISABLED='true', AWS_CONFIG_FILE=os.devnull,
                AWS_SHARED_CREDENTIALS_FILE=os.devnull, HOME=temp,
                # This server speaks plain HTTP; test the HTTPS upload behavior
-               # except in the plain-http case.
+               # except in the plain-http and SDK callback cases.
                SYQ_TEST_S3_TREAT_HTTP_AS_HTTPS='1')
     base = [SYQ, 'cp', '--s3-endpoint', f'http://127.0.0.1:{server.server_port}',
             '--s3-region', 'us-east-1', '--s3-retries=1', '--performance-tuning',
@@ -362,6 +362,8 @@ with tempfile.TemporaryDirectory(prefix='syq-stream-') as temp, Server(('127.0.0
                 assert STATE['published'] is None
             failure(run(base + ['--to', 's3://bucket', '--as-new', 'object'], input=b'stored', env=env))
         elif CASE == 'mapping-callbacks':
+            # Exercise real HTTP checksumming with debug and release binaries.
+            env.pop('SYQ_TEST_S3_TREAT_HTTP_AS_HTTPS')
             import syq
             sdk = syq.Client(executable=SYQ, env=env, timeout=15)
             options = dict(s3_endpoint=f'http://127.0.0.1:{server.server_port}', s3_region='us-east-1',
