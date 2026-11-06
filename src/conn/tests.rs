@@ -2814,8 +2814,11 @@ fn ssh_remote_shells_share_connections_unless_they_configure_sharing() {
         "ssh -o '\"ClearAllForwardings\" no'",
         "ssh -o 'Forward\"Agent\" yes'",
         "ssh -o '\"ForwardAgent\"=yes'",
-        // It reads a value without its quotes: `n o` is an agent's path.
+        // Any other quoted value is an agent's path, or an OpenSSH error.
         "ssh -o 'ForwardAgent \"n o\"'",
+        "ssh -o \"ForwardAgent \\\"n'o\\\"\"",
+        "ssh -o \"ForwardAgent='n\\\"o'\"",
+        "ssh -o \"ForwardAgent=n'o\"",
     ] {
         assert!(
             !shareable_ssh_options(&words(forwarding)).unwrap().persist,
@@ -2827,8 +2830,9 @@ fn ssh_remote_shells_share_connections_unless_they_configure_sharing() {
         "ssh -o ForwardAgent=no",
         "ssh -o 'ForwardAgent No'",
         "ssh -o ClearAllForwardings=yes",
-        // A quoted value means what it says.
+        // A plain word in one pair of quotes means what it says.
         "ssh -o 'ClearAllForwardings \"yes\"'",
+        "ssh -o \"ClearAllForwardings 'yes'\"",
         "ssh -o \"ForwardAgent='no'\"",
         "ssh -o Tunnel=no",
         "ssh -p 2222 -i Akey",

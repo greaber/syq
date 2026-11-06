@@ -106,12 +106,17 @@ pub(crate) fn shareable_ssh_options(rsh: &[String]) -> Option<SshSharing<'_>> {
                     {
                         return None;
                     }
-                    // OpenSSH removes quotes from a value. It reads a quoted
-                    // keyword too, as in `"ForwardAgent" yes`; rather than
-                    // repeat its rules, such an option counts as one that
-                    // may forward.
+                    // OpenSSH reads a quoted keyword, as in `"ForwardAgent"
+                    // yes`, and quoted values. Rather than repeat its rules,
+                    // a value counts as `no` or `yes` only as that word, alone
+                    // or in one pair of matching quotes, and an option with a
+                    // quoted keyword counts as one that may forward.
                     let quoted = name.contains('"');
-                    let setting = setting.replace(['"', '\''], "").to_ascii_lowercase();
+                    let setting = setting.to_ascii_lowercase();
+                    let setting = ['"', '\'']
+                        .iter()
+                        .find_map(|quote| setting.strip_prefix(*quote)?.strip_suffix(*quote))
+                        .unwrap_or(&setting);
                     let named = |option: &str| name.eq_ignore_ascii_case(option);
                     if quoted
                         || (named("LogLevel")
