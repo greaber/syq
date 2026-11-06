@@ -459,6 +459,8 @@ fn the_receiver_install_follows_the_binary_store_rules() {
     let other = other.path();
     let elsewhere = other.join("store-elsewhere");
     fs::create_dir(&elsewhere).unwrap();
+    // Not left to the umask: the store refuses a group-writable directory.
+    fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o700)).unwrap();
     fs::create_dir_all(other.join(".local/lib")).unwrap();
     symlink(
         &elsewhere,
@@ -1473,6 +1475,22 @@ fn the_copys_lookups_reuse_the_authoritys_directory_listings() {
     assert_eq!(
         authority.test_ops().settled_listings(),
         vec![b"destination".to_vec()]
+    );
+}
+
+#[test]
+fn a_missing_destination_parent_is_named_plainly() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let destination = temporary.path().join("missing/archive");
+    let error = ConfinedRoot::resolve(destination.as_os_str().as_bytes(), &[])
+        .err()
+        .unwrap();
+    assert_eq!(
+        format!("{error:#}"),
+        format!(
+            "{} does not exist; a restricted copy creates its destination but not the directories above it",
+            temporary.path().join("missing").display()
+        )
     );
 }
 
@@ -3525,7 +3543,7 @@ fn mapping_new_parents_have_final_modes_without_metadata_updates() {
         // umask and kernel setgid inheritance without changing global state.
         let expected = target.join("expected");
         std::fs::DirBuilder::new()
-            .mode(0o755)
+            .mode(0o777)
             .create(&expected)
             .unwrap();
         let parent = target.join("parent");

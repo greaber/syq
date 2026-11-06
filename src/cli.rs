@@ -2668,7 +2668,7 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
         let dst_remote = args.locations.last().is_some_and(|l| l.host.is_some());
         if !(src_remote && dst_remote) {
             bail!(
-                "--receiver-max-entries and --receiver-max-bytes address the command-restricted receiver; they apply only to direct remote-to-remote copies"
+                "--receiver-max-entries and --receiver-max-bytes limit a restricted copy between two servers; they do not apply to this copy"
             );
         }
     }

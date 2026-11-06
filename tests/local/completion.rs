@@ -2478,7 +2478,7 @@ fn approved_completion_respects_authorization_for_source_and_destination_paths()
         }
     }
     // Saved defaults and overrides also use the common path for other commands.
-    write(
+    write_private(
         &t.path("config/syq/auth-from.json"),
         br#"{"default":"ssh","hosts":{"backup":"@laptop"}}"#,
     );
@@ -2637,7 +2637,7 @@ fn ordinary_provider_completion_never_establishes_a_provider_or_native_fallback(
     let remote_path = format!("backup:{path}");
     for saved in [false, true] {
         if saved {
-            write(
+            write_private(
                 &t.path("config/syq/auth-from.json"),
                 br#"{"default":"helper@provider.example:2222"}"#,
             );
@@ -2794,7 +2794,7 @@ fn approved_completion_keeps_explicit_scope_and_remote_shell_meanings() {
     let t = Tmp::new();
     approved_completion_fixture(&t);
     let _master = approved_completion_master(&t, "laptop");
-    write(
+    write_private(
         &t.path("config/syq/auth-from.json"),
         br#"{"default":"@missing"}"#,
     );
@@ -2857,11 +2857,11 @@ fn approved_completion_uses_only_selected_domain_preferences_and_accounts() {
     let (global, _global_master) = approved_completion_master(&t, "laptop");
     let scope = ephemeral_scope(&t);
     let (scoped, _scoped_master) = approved_completion_master_in(&t, "laptop", Some(&scope));
-    write(
+    write_private(
         &t.path("config/syq/auth-from.json"),
         br#"{"default":"@missing"}"#,
     );
-    write(&scope.join("auth-from.json"), br#"{"default":"@laptop"}"#);
+    write_private(&scope.join("auth-from.json"), br#"{"default":"@laptop"}"#);
     let path = format!("{}/n", t.s("remote-home/data"));
     let remote_path = format!("backup:{path}");
     for (command, endpoint_flag) in [

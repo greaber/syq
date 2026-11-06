@@ -519,3 +519,75 @@ fn s3_mapping_group_must_be_given_to_a_downloaded_symlink() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn s3_map_checks_every_selector_before_writing() {
+    let temp = test_support::tempdir().unwrap();
+    let server = MapServer::new("ok");
+    let output = server
+        .command(
+            temp.path(),
+            &[
+                "map",
+                "--from",
+                "s3://bucket",
+                "--src",
+                "prefix/link",
+                "--src-non-dir",
+                "prefix/missing",
+            ],
+        )
+        .capture_output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        output.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("\"prefix/missing\" is missing"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Both selectors succeed together with one HEAD each, as before.
+    let server = MapServer::new("ok");
+    let output = server
+        .command(
+            temp.path(),
+            &[
+                "map",
+                "--from",
+                "s3://bucket",
+                "--src",
+                "prefix/link",
+                "--src-dir",
+                "prefix",
+            ],
+        )
+        .capture_output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{} {:?}",
+        String::from_utf8_lossy(&output.stderr),
+        server.requests.lock().unwrap()
+    );
+    let entries = records(&output);
+    assert_eq!(entries[0]["src"]["value"], "prefix/link", "{entries:?}");
+    assert!(entries.len() > 1, "{entries:?}");
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(
+        requests.iter().filter(|r| r.starts_with("HEAD ")).count(),
+        2,
+        "{requests:?}"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.contains("list-type=2"))
+            .count(),
+        2,
+        "{requests:?}"
+    );
+}

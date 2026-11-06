@@ -170,6 +170,50 @@ fn retention_removes_whole_old_runs_and_keeps_current_and_active() {
 }
 
 #[test]
+fn retention_shrinks_a_history_far_over_budget_and_returns_its_space() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    recorder(&path).finish(true, false, None, json!({}));
+    let db = open(&path).unwrap();
+    // About 2 MiB of finished runs, as a larger budget could have kept.
+    db.execute_batch(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<512)
+         INSERT INTO runs(day,updated_day,build,status,summary)
+         SELECT 0,0,'old','success',printf('%.4096c','x') FROM n;",
+    )
+    .unwrap();
+    let current = recorder(&path);
+    let current_id = current.0.lock().unwrap().id;
+    let budget = 256 << 10;
+    prune_within(&db, budget, current_id, Duration::from_secs(60)).unwrap();
+    let pages: i64 = db
+        .pragma_query_value(None, "page_count", |r| r.get(0))
+        .unwrap();
+    let free: i64 = db
+        .pragma_query_value(None, "freelist_count", |r| r.get(0))
+        .unwrap();
+    let page_size: i64 = db
+        .pragma_query_value(None, "page_size", |r| r.get(0))
+        .unwrap();
+    assert!(
+        (pages - free) * page_size <= budget as i64,
+        "{pages} {free}"
+    );
+    assert!(
+        free * page_size <= budget as i64,
+        "free space returned: {free}"
+    );
+    let (kept, oldest): (i64, i64) = db
+        .query_row("SELECT count(*), min(id) FROM runs", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert!(kept > 1 && kept < 100, "{kept}");
+    assert!(oldest > 1, "the oldest runs go first");
+    assert!(command::read_run(&db, current_id).is_ok());
+}
+
+#[test]
 fn lock_contention_keeps_samples_and_context_for_later_flush() {
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");

@@ -373,7 +373,7 @@ fn native_copy_cwd_may_escape_while_root_confines_component_resolution() {
         &t.s("root-escape"),
     ]);
     assert!(!escape.status.success());
-    assert!(stderr_of(&escape).contains("outside its confined root"));
+    assert!(stderr_of(&escape).contains("outside its --root directory"));
     assert!(!t.path("root-escape").exists());
 
     run_native_ok(&[
@@ -512,7 +512,7 @@ fn native_copy_follow_resolves_source_links_but_default_refuses_traversal() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("--follow for all directly supplied filesystem paths"),
+        stderr.contains("--follow for all the paths you give"),
         "{stderr}"
     );
     assert!(!t.path("never-created").exists());
@@ -588,7 +588,7 @@ fn native_directional_follow_keeps_source_destination_and_control_authority_sepa
     assert!(!control_refused.status.success());
     let stderr = stderr_of(&control_refused);
     assert!(
-        stderr.contains("--follow for all directly supplied filesystem paths"),
+        stderr.contains("--follow for all the paths you give"),
         "{stderr}"
     );
     assert!(!t.path("control-refused").exists());

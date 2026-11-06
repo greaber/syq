@@ -3213,3 +3213,33 @@ fn the_background_notice_names_what_keeps_running_and_how_to_stop_it() {
         "persistence keeps this running in the background: receiving through user@server. `syq persist off --pscope /run/scope` stops it."
     );
 }
+
+#[test]
+fn a_receiver_that_refused_the_copy_is_reported_once_without_retrying() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let script = temporary.path().join("ssh");
+    let log = temporary.path().join("attempts");
+    // The receiver prints its reason itself and exits before its preamble.
+    crate::test_support::write_executable(
+        &script,
+        format!(
+            "#!/bin/sh\necho attempt >> {log}\nexit {refused}\n",
+            log = shell_words::quote(log.to_str().unwrap()),
+            refused = crate::restricted::REFUSED_EXIT,
+        ),
+        0o700,
+    );
+    let mut spec = RemoteSpec::local_receiver(true);
+    spec.local_process = false;
+    spec.rsh = vec![script.to_string_lossy().into_owned()];
+    let error = spec
+        .connect_retried(false, true, ConnectionRole::Control, false, false, None)
+        .err()
+        .unwrap();
+    assert!(error.is::<crate::restricted::CopyRefused>(), "{error:#}");
+    let message = format!("{error:#}");
+    assert!(message.contains("refused the copy"), "{message}");
+    assert!(!message.contains("preamble"), "{message}");
+    assert!(!helper_needs_install(&error), "{message}");
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "attempt\n");
+}

@@ -111,7 +111,7 @@ pub(super) fn inside_protected(
     control: &ReceiverControlPath,
 ) -> anyhow::Error {
     anyhow!(
-        "command-restricted destination {}is the receiver's protected {} {} or lies inside it; choose another destination",
+        "restricted destination {}is the receiver's protected {} {} or lies inside it; choose another destination",
         destination.map_or(String::new(), |path| format!(
             "{} ",
             Path::new(OsStr::from_bytes(path)).display()
@@ -133,7 +133,7 @@ pub(super) fn holds_protected(
         |path| Path::new(OsStr::from_bytes(path)).display().to_string(),
     );
     anyhow!(
-        "command-restricted destination {destination} holds the receiver's protected {} {}, which this copy could change; copy into a subdirectory of {destination} instead",
+        "restricted destination {destination} holds the receiver's protected {} {}, which this copy could change; copy into a subdirectory of {destination} instead",
         control.label,
         Path::new(OsStr::from_bytes(&control.path)).display()
     )
@@ -472,12 +472,21 @@ impl ConfinedRoot {
     pub(super) fn resolve(destination: &[u8], protected: &[ReceiverControlPath]) -> Result<Self> {
         let destination = Path::new(OsStr::from_bytes(destination));
         let parent = requested_parent(destination);
-        let real = fs::canonicalize(parent).with_context(|| {
-            format!(
-                "resolve the directory {} the destination goes in",
+        let real = match fs::canonicalize(parent) {
+            Ok(real) => real,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
+                "{} does not exist; a restricted copy creates its destination but not the directories above it",
                 parent.display()
-            )
-        })?;
+            ),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "resolve the directory {} the destination goes in",
+                        parent.display()
+                    )
+                })
+            }
+        };
         // Only being a protected path or inside one matters here: the copy
         // writes beneath its destination, whose own check is in `new`.
         if let Some(control) = protected
@@ -3592,7 +3601,7 @@ impl RestrictedAuthority {
                 ..
             } => {
                 if source.is_some() {
-                    bail!("source references are not valid on a command-restricted destination");
+                    bail!("source references are not valid on a restricted destination");
                 }
                 if self.mapping.is_some() {
                     bail!("mapping grants do not authorize recursive destination scans");
@@ -3619,7 +3628,7 @@ impl RestrictedAuthority {
                 ..
             } => {
                 if sources.is_some() {
-                    bail!("source references are not valid on a command-restricted destination");
+                    bail!("source references are not valid on a restricted destination");
                 }
                 if *follow {
                     bail!("signed destination stat cannot follow symlinks");
@@ -3796,7 +3805,7 @@ impl RestrictedAuthority {
             }
             Request::FileHash { path, source } => {
                 if source.is_some() {
-                    bail!("source references are not valid on a command-restricted destination");
+                    bail!("source references are not valid on a restricted destination");
                 }
                 self.check_observation_path(path)?;
             }
@@ -3808,7 +3817,7 @@ impl RestrictedAuthority {
                 ..
             } => {
                 if source.is_some() {
-                    bail!("source references are not valid on a command-restricted destination");
+                    bail!("source references are not valid on a restricted destination");
                 }
                 self.check_hash_request(*block, *len)?;
                 self.check_observation_path(path)?;
@@ -4114,7 +4123,7 @@ impl RestrictedAuthority {
             | Request::StopReadStream
             | Request::ReadSmallBatch(_)
             | Request::ReadDifferingBatch { .. } => {
-                bail!("request is not valid on a command-restricted destination")
+                bail!("request is not valid on a restricted destination")
             }
             Request::PrepareSmallFiles(request) => self.authorize_small_copy(request, outcomes)?,
             // Held to its preparation in `authorize_stream`.
@@ -4122,7 +4131,7 @@ impl RestrictedAuthority {
             Request::ListDir { .. }
             | Request::ListDirDetails { .. }
             | Request::ListDirNoFollowFinal { .. } => {
-                bail!("directory completion is not valid on a command-restricted destination")
+                bail!("directory completion is not valid on a restricted destination")
             }
             Request::CheckOperatorDirectory { .. }
             | Request::CheckOperatorDirectoryAncestry { .. }
@@ -4134,10 +4143,10 @@ impl RestrictedAuthority {
                 bail!("destination-anchor management is not valid on a root-confined receiver")
             }
             Request::NativeMap(_) => {
-                bail!("mapping generation is not valid on a command-restricted destination")
+                bail!("mapping generation is not valid on a restricted destination")
             }
             Request::NativeRemove { .. } => {
-                bail!("native removal is not valid on a command-restricted destination")
+                bail!("native removal is not valid on a restricted destination")
             }
             Request::ConfigurePreservation {
                 selection,
@@ -4148,7 +4157,7 @@ impl RestrictedAuthority {
             } => {
                 // Every no-replace publication a grant sets is held.
                 if *unchecked_keep {
-                    bail!("a command-restricted receiver keeps existing files atomically");
+                    bail!("a restricted receiver keeps existing files atomically");
                 }
                 if *narrow_new_directories
                     || (*sparse && !self.extra_options.sparse)
@@ -4158,7 +4167,7 @@ impl RestrictedAuthority {
                 }
             }
             Request::DescriptorCopy(_) | Request::BindStream(_) => {
-                bail!("descriptor copies are not valid on a command-restricted receiver")
+                bail!("descriptor copies are not valid on a restricted receiver")
             }
             Request::Hello { .. } => bail!("unexpected second receiver handshake"),
             Request::DestinationResults { .. } | Request::FinishDestinationResults => {

@@ -288,15 +288,15 @@ fn validate_selector(path: &[u8], confined: bool) -> Result<()> {
 fn require_kind(kind: NativeRemoveKind, identity: Identity, label: &[u8]) -> Result<()> {
     match kind {
         NativeRemoveKind::Contents | NativeRemoveKind::Directory | NativeRemoveKind::Partials if identity.is_symlink() => bail!(
-            "selector {:?} must resolve to a directory; final symlinks are never followed, even with --follow-src or --follow; name the target directory explicitly",
+            "{:?} is a symlink, not a directory; --src-dir and --srcs-in never follow it, even with --follow-src or --follow; name the directory it points to",
             String::from_utf8_lossy(label)
         ),
         NativeRemoveKind::Contents | NativeRemoveKind::Directory | NativeRemoveKind::Partials if !identity.is_dir() => bail!(
-            "selector {:?} must resolve to a directory",
+            "{:?} is not a directory",
             String::from_utf8_lossy(label)
         ),
         NativeRemoveKind::File if identity.is_dir() => bail!(
-            "selector {:?} must resolve to a non-directory; use --src-dir to remove a tree or --srcs-in to remove its contents",
+            "{:?} is a directory; use --src-dir to remove it and its contents, or --srcs-in to empty it",
             String::from_utf8_lossy(label)
         ),
         _ => Ok(()),

@@ -487,6 +487,7 @@ pub(crate) fn ssh_authorization_failure(error: &anyhow::Error) -> Option<SshLogi
 fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     is_worker_initialization_error(error)
+        || error.is::<crate::restricted::CopyRefused>()
         || crate::destination::peer_bridge::is_setup_refusal(error)
         || error.is::<crate::destination::SshWorkersUnavailable>()
         || error.chain().any(|cause| cause.is::<OpenSshVersionError>())
@@ -1000,6 +1001,14 @@ impl RemoteConn {
                     if status.code() == Some(crate::restricted::SESSIONS_FULL_EXIT) {
                         return crate::restricted::SessionsFull(format!(
                             "{}: the receiver refused the connection while other connections were starting ({status})",
+                            self.label
+                        ))
+                        .into();
+                    }
+                    // An enrolled receiver that refused the copy printed why.
+                    if status.code() == Some(crate::restricted::REFUSED_EXIT) {
+                        return crate::restricted::CopyRefused(format!(
+                            "the receiver on {} refused the copy",
                             self.label
                         ))
                         .into();
@@ -3781,6 +3790,7 @@ fn receive_hello(mut conn: RemoteConn, worker: bool) -> Result<RemoteConn> {
             "{}: unexpected handshake response {other:?}; remote syq may be a different version",
             conn.label
         ),
+        Err(e) if e.is::<crate::restricted::CopyRefused>() => return Err(e),
         Err(e) => {
             return Err(e)
                 .with_context(|| format!("could not start the remote syq on {}", conn.label));

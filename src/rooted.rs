@@ -67,7 +67,7 @@ static NEXT_SWAP_NAME: AtomicU64 = AtomicU64::new(0);
 /// Set in `Root::root_profile` once the profile has been read.
 const PROFILE_KNOWN: u16 = 1 << 8;
 
-pub(crate) const OPERATOR_SYMLINK_FOLLOW_ADVICE: &str = "pass --follow-src for source paths, --follow-dst for destination paths, or --follow for all directly supplied filesystem paths";
+pub(crate) const OPERATOR_SYMLINK_FOLLOW_ADVICE: &str = "pass --follow-src for source paths, --follow-dst for destination paths, or --follow for all the paths you give";
 
 /// Stable identity of an opened root. Independent helper processes can reopen
 /// the configured path and require this identity before serving requests.

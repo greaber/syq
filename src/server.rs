@@ -646,7 +646,14 @@ fn record_handed_connection_for_test() {
 /// copy its verified directive allows. A worker's session is handed to the
 /// running copy it joins, which serves it.
 pub(crate) fn run_checker(enrollment: &str, generation: &str) -> Result<()> {
-    match crate::restricted::admit_session(enrollment, generation)? {
+    let session = crate::restricted::admit_session(enrollment, generation).map_err(|error| {
+        if crate::restricted::is_sessions_full(&error) {
+            error
+        } else {
+            crate::restricted::Refused(error).into()
+        }
+    })?;
+    match session {
         crate::restricted::Session::Worker => Ok(()),
         crate::restricted::Session::Copy(authority) => run_restricted(authority),
     }
@@ -1249,9 +1256,9 @@ fn serve<R: Read + Send + 'static, W: Write>(
     match &role {
         ConnectionRole::SourceWorker { .. } if authority.is_some() => {
             w.write_msg(&Response::Err(
-                "a command-restricted receiver does not accept caller-supplied source roots".into(),
+                "a restricted receiver does not accept caller-supplied source roots".into(),
             ))?;
-            bail!("command-restricted receiver rejected supplied source roots");
+            bail!("restricted receiver rejected supplied source roots");
         }
         ConnectionRole::SourceWorker { roots, send_budget } => {
             if let Some(ticket) = send_budget.as_ref().filter(|_| source_authority.is_none()) {
@@ -1273,18 +1280,18 @@ fn serve<R: Read + Send + 'static, W: Write>(
             if authority.is_some() && !copy_sources.is_empty() =>
         {
             w.write_msg(&Response::Err(
-                "a command-restricted receiver does not accept caller-supplied copy sources".into(),
+                "a restricted receiver does not accept caller-supplied copy sources".into(),
             ))?;
-            bail!("command-restricted receiver rejected supplied copy sources");
+            bail!("restricted receiver rejected supplied copy sources");
         }
         ConnectionRole::DestinationWorker {
             destination: Some(_),
             ..
         } if authority.is_some() => {
             w.write_msg(&Response::Err(
-                "a command-restricted destination derives its root from the signed grant".into(),
+                "a restricted destination derives its root from the signed grant".into(),
             ))?;
-            bail!("command-restricted receiver rejected a supplied destination root");
+            bail!("restricted receiver rejected a supplied destination root");
         }
         ConnectionRole::DestinationWorker {
             destination: None, ..
@@ -1921,7 +1928,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         Err(error) => Response::Err(format!("{error:#}")),
                     },
                     None => Response::Err(
-                        "destination results come only from a command-restricted receiver".into(),
+                        "destination results come only from a restricted receiver".into(),
                     ),
                 };
                 w.write_msg(&response)?;
@@ -1933,7 +1940,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         Err(error) => Response::Err(format!("{error:#}")),
                     },
                     None => Response::Err(
-                        "destination results come only from a command-restricted receiver".into(),
+                        "destination results come only from a restricted receiver".into(),
                     ),
                 };
                 w.write_msg(&response)?;
