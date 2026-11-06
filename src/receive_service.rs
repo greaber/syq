@@ -207,6 +207,10 @@ enum Action {
     /// as a provider following a new build asks (`switch`)
     #[command(name = "switch-provider", hide = true)]
     SwitchProvider,
+    /// Replace idle receiving services from other builds now, as
+    /// `syq --self-update` asks the build it installed (`switch_outdated_now`)
+    #[command(name = "switch-outdated", hide = true)]
+    SwitchOutdated,
     /// Wait until the receiving connection through HOST is ready
     Wait {
         /// SSH server whose receiving connection to wait for
@@ -1114,6 +1118,22 @@ pub(crate) fn switch_outdated_now(domain: &Domain) {
             }
             crate::persistence::SwitchClaim::Claimed { _lock, .. } => _lock,
         };
+        // Another switch may have run until the claim: decide on whoever
+        // owns the connection now.
+        let Ok(Some(state)) = running_status(&control, Retry::No, ANSWER_TIMEOUT) else {
+            continue;
+        };
+        if state.identity == crate::identity::build() {
+            continue;
+        }
+        let busy = busy_of(&state);
+        if !busy.idle() {
+            crate::output::diagnostic!(
+                "syq: {}",
+                busy_notice(&state.endpoint, &state.identity, &busy, false, &fix)
+            );
+            continue;
+        }
         crate::output::diagnostic!("syq: {}", switching_notice(&state, ""));
         let result = crate::persistence::connect_domain(
             domain,
@@ -1620,9 +1640,9 @@ pub(crate) enum Replace {
     /// other's services, and only once the new service could log in
     /// (`switch`).
     WhenIdle,
-    /// For the `persist` commands the user types (`switch_outdated_now`): at
-    /// once, in the foreground, when nothing is in progress; never one that
-    /// follows another installed syq file by itself.
+    /// For the `persist` commands the user types (`switch_outdated_now`): as
+    /// `WhenIdle`, but in the foreground, without the switch's own process
+    /// and records.
     IfIdle,
     /// For `persist connect` run by hand: at once, saying what that cuts off.
     Now,
@@ -1673,19 +1693,7 @@ fn replace_other(
             let busy = busy_of(state);
             Ok(other((!busy.idle()).then_some(busy)))
         }
-        Replace::IfIdle => {
-            if switch::follows_other_file(state.started_from.as_deref()) {
-                return Ok(other(None));
-            }
-            if stop_when_idle(control, state)? {
-                Ok(None)
-            } else {
-                let busy = running_status(control, Retry::No, ANSWER_TIMEOUT)?
-                    .map_or_else(|| busy_of(state), |state| busy_of(&state));
-                Ok(other(Some(busy)))
-            }
-        }
-        Replace::WhenIdle => {
+        Replace::IfIdle | Replace::WhenIdle => {
             if switch::follows_other_file(state.started_from.as_deref()) {
                 return Ok(other(None));
             }
@@ -1761,6 +1769,19 @@ fn stop_when_idle(control: &Path, state: &Status) -> Result<bool> {
     };
     let pid = if state.busy.is_none() {
         if !state.pending.is_empty() {
+            return Ok(false);
+        }
+        // The stop goes to whoever owns the control. Ask once more just
+        // before, so that a service that took it over since `state` was
+        // read, such as another switch's, is not stopped on that status.
+        let Some(now) = running_status(control, Retry::No, ANSWER_TIMEOUT)? else {
+            return Ok(true);
+        };
+        if now.identity != state.identity
+            || now.pid != state.pid
+            || now.busy.is_some()
+            || !now.pending.is_empty()
+        {
             return Ok(false);
         }
         // An older service has only an unconditional stop.
@@ -2869,6 +2890,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
     match command.action {
         Action::On(options) => configure(domain, options)?,
         Action::SwitchProvider => provider::switch_when_idle(domain)?,
+        Action::SwitchOutdated => switch_outdated_now(domain),
         Action::Pending {
             json,
             wait,
@@ -3853,10 +3875,17 @@ mod tests {
         assert!(!stop_when_idle(&control, &answer("other", busy, false)).unwrap());
         assert!(is_running(&control));
         // An older service cannot read the request; it is never sent one.
+        // It is asked once more, just before its stop, who owns the control.
         let (_root, old_control, old_lock) = locked_control();
         let old = stand_in(&old_control, old_lock, |_| answer("old", None, false));
         assert!(stop_when_idle(&old_control, &answer("old", None, false)).unwrap());
-        assert_eq!(old.join().unwrap(), [r#"{"version":2,"stop":true}"#]);
+        assert_eq!(
+            old.join().unwrap(),
+            [
+                r#"{"version":2,"stop":false}"#,
+                r#"{"version":2,"stop":true}"#
+            ]
+        );
         assert!(!is_running(&old_control));
         // The busy one was asked once and kept running.
         send(

@@ -85,7 +85,7 @@ pub(crate) fn login_rejection(stderr: &str) -> Option<&'static str> {
     }
 }
 
-fn classify(stderr: &[u8]) -> Option<Failure> {
+pub(super) fn classify(stderr: &[u8]) -> Option<Failure> {
     // Exit 255 also covers timeouts and configuration errors. Only recognized
     // failures that another machine may resolve permit fallback. OpenSSH
     // emits these diagnostics in English; suppressed/unrecognized diagnostics
@@ -153,6 +153,11 @@ mod tests {
             "debuguser@host: Permission denied (publickey).",
             "debug1: offering key\nuser@host: Permission denied (publickey,password).\n",
             "Received disconnect from 127.0.0.1 port 22:2: Too many authentication failures\nDisconnected from 127.0.0.1 port 22\n",
+            // OpenSSH 9.6 with an IdentityFile that is missing, and with an
+            // agent that refused to sign or held no keys.
+            "no such identity: /home/user/.ssh/id: No such file or directory\nuser@127.0.0.1: Permission denied (publickey).\n",
+            "sign_and_send_pubkey: signing failed for ED25519 \"/home/user/.ssh/id_ed25519\" from agent: agent refused operation\nuser@host: Permission denied (publickey).\n",
+            "Load key \"/home/user/.ssh/id_ed25519\": incorrect passphrase supplied to decrypt private key\nuser@host: Permission denied (publickey,password).\n",
         ] {
             assert_eq!(classify(diagnostic.as_bytes()), Some(Failure::Credentials), "{diagnostic}");
         }

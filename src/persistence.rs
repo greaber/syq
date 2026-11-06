@@ -611,14 +611,7 @@ fn connect_receiving(
     };
     let connection = match connected {
         Ok(connection) => connection,
-        Err(error)
-            if unattended
-                && matches!(
-                    crate::conn::ssh_authorization_failure(&error),
-                    Some(crate::conn::SshLoginFailure::Credentials)
-                        | Some(crate::conn::SshLoginFailure::HostKey)
-                ) =>
-        {
+        Err(error) if unattended && crate::conn::ssh_login_needs_user(&error) => {
             crate::receive_service::switch::defer_after_login(multiplexer.control_path());
             return Err(error.context(crate::receive_service::switch::LoginNeeded(remote.label())));
         }

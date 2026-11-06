@@ -128,13 +128,27 @@ pub fn self_update() -> Result<()> {
                 "syq {} is already the newest release",
                 release.version
             );
+            switch_receiving(&receipt.binary);
             return Ok(());
         }
         std::cmp::Ordering::Greater => {}
     }
     install_release(&release, &receipt_path, &mut receipt)?;
     crate::output::command_println!("updated syq to {}", release.version);
+    switch_receiving(&receipt.binary);
     Ok(())
+}
+
+/// Have the syq installed at `binary` replace the idle receiving services an
+/// older syq left running, which cannot follow an update by themselves, so
+/// that updating needs no other command. It says nothing when every service
+/// is current; a failure is its own to report, and leaves the update done.
+fn switch_receiving(binary: &Path) {
+    let _ = std::process::Command::new(binary)
+        .args(["persist", "receive", "switch-outdated"])
+        .env("SYQ_NO_UPDATE_CHECK", "1")
+        .stdin(std::process::Stdio::null())
+        .status();
 }
 
 /// Called by the generated installer after the verified binary has reached its

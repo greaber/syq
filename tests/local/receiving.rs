@@ -4394,6 +4394,196 @@ fn a_switch_without_a_terminal_that_needs_a_login_is_not_retried() {
     old.join().unwrap();
 }
 
+/// A `persist` command's switch logs in as the new receiving service will,
+/// apart from the live control connection, before it stops the old one:
+/// when that login fails, the old service keeps receiving.
+#[test]
+fn a_foreground_switch_that_cannot_log_in_leaves_the_old_service_receiving() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let old = older_service(&installed, serde_json::json!([]));
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    let mut command = installed.command(
+        syq,
+        &[
+            "persist",
+            "status",
+            "--pscope",
+            installed.scope.to_str().unwrap(),
+        ],
+    );
+    let shown = command.env("FAKE_SSH_REJECT_DIRECT", "1").run().unwrap();
+    assert_output_ok(&shown);
+    assert!(
+        stderr_of(&shown).contains("logging in to test-server needs you"),
+        "{}",
+        stderr_of(&shown)
+    );
+    let state = installed.request(serde_json::json!({"version": 2, "stop": false}));
+    assert_eq!(state["identity"], "v0.7.1");
+    installed.request(serde_json::json!({"version": 2, "stop": true}));
+    let requests = old.join().unwrap();
+    // Only the test's own stop.
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["stop"] == true)
+            .count(),
+        1,
+        "{requests:?}"
+    );
+}
+
+/// A `persist` command leaves a connection whose switch another command
+/// started, and never stops a service that took over the connection after
+/// it decided to switch: here this build's, busy, which replaced the old
+/// one just before the stop.
+#[test]
+fn a_foreground_switch_never_stops_a_service_that_took_over() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    let status = |mark: Option<&Path>| {
+        let mut command = installed.command(
+            syq,
+            &[
+                "persist",
+                "status",
+                "--pscope",
+                installed.scope.to_str().unwrap(),
+            ],
+        );
+        if let Some(mark) = mark {
+            command.env("FAKE_SSH_DIRECT_MARK", mark);
+        }
+        command.run().unwrap()
+    };
+
+    // Another switch holds the endpoint record's lock.
+    let (socket, lock) = retire_service(&installed);
+    let record = OpenOptions::new()
+        .read(true)
+        .open(format!("{}.json", installed.control().display()))
+        .unwrap();
+    assert_eq!(
+        unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&record),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        },
+        0
+    );
+    let mark = t.path("logged-in");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let served = {
+        let seen = seen.clone();
+        let socket = socket.clone();
+        let mark = mark.clone();
+        let build = this_build();
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let _lock = lock;
+            let mut requests = Vec::new();
+            let mut after_login = 0;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "{requests:?}");
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                if stream.set_nonblocking(false).is_err()
+                    || stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .is_err()
+                {
+                    continue;
+                }
+                let request = read_provider_frame(&mut stream);
+                // Once the command has logged in as the new service will,
+                // and asked once more, this build's service owns the
+                // connection, busy: between the command's last look and its
+                // stop.
+                let taken_over = mark.exists() && {
+                    after_login += 1;
+                    after_login > 1
+                };
+                let answer = if taken_over {
+                    serde_json::json!({
+                        "version": 2, "identity": build, "pid": 0,
+                        "endpoint": "test-server", "name": "",
+                        "connection": {"phase": "online", "error": null, "ssh_pid": null},
+                        "pending": [], "busy": {"requests": 1, "pending": 0, "accounts": 0},
+                        "stopping": false
+                    })
+                } else {
+                    serde_json::json!({
+                        "version": 2, "identity": "v0.7.1", "pid": 0,
+                        "endpoint": "test-server", "name": "",
+                        "connection": {"phase": "online", "error": null, "ssh_pid": null},
+                        "pending": []
+                    })
+                };
+                let stop = request["stop"] == true;
+                seen.lock().unwrap().push(request.clone());
+                requests.push(request);
+                write_provider_frame(&mut stream, answer);
+                if stop {
+                    fs::remove_file(&socket).unwrap();
+                    return requests;
+                }
+            }
+        })
+    };
+    let shown = status(None);
+    assert_output_ok(&shown);
+    assert!(
+        stderr_of(&shown).contains("a switch to this version is already under way"),
+        "{}",
+        stderr_of(&shown)
+    );
+    assert!(
+        !stderr_of(&shown).contains("Connecting"),
+        "{}",
+        stderr_of(&shown)
+    );
+    drop(record);
+
+    let shown = status(Some(&mark));
+    assert_output_ok(&shown);
+    assert!(mark.exists(), "{}", stderr_of(&shown));
+    // Nothing stopped the service that took over.
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .all(|request| request["stop"] != true),
+        "{:?}: {}",
+        seen.lock().unwrap(),
+        stderr_of(&shown)
+    );
+    installed.request(serde_json::json!({"version": 2, "stop": true}));
+    let requests = served.join().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["stop"] == true)
+            .count(),
+        1,
+        "{requests:?}"
+    );
+}
+
 /// Settings that no longer allow a connection stop the service an older
 /// syq left on it, as for any service, without logging in to its server.
 #[test]
