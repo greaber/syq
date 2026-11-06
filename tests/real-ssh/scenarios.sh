@@ -696,8 +696,8 @@ python3 /usr/local/libexec/syq-test-provider-ssh.py
 printf 'case: receiving switches to a new build once an approved account connection is idle\n'
 python3 /usr/local/libexec/syq-test-account-switch.py
 
-printf 'case: direct three-server copies use approved account connections\n'
-python3 /usr/local/libexec/syq-test-peer-bridge.py
+printf 'case: copies between two other servers run on the enrolled source\n'
+python3 /usr/local/libexec/syq-test-between-servers.py
 
 printf 'case: storage authorization through the return connection\n'
 python3 /usr/local/libexec/syq-test-storage-authorization.py
