@@ -4361,7 +4361,9 @@ fn a_switch_without_a_terminal_that_needs_a_login_is_not_retried() {
     installed.connect();
     let old = older_service(&installed, serde_json::json!([]));
     let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
-    let status = || {
+    // Earlier connections leave a pool that can still write to rsh.log;
+    // each status logs its own ssh commands apart.
+    let status = |log: &str| {
         let mut command = installed.command(
             syq,
             &[
@@ -4371,23 +4373,24 @@ fn a_switch_without_a_terminal_that_needs_a_login_is_not_retried() {
                 installed.scope.to_str().unwrap(),
             ],
         );
-        command.env("FAKE_SSH_REJECT", "1").run().unwrap()
+        command
+            .env("FAKE_SSH_REJECT", "1")
+            .env("FAKE_RSH_LOG", t.path(log))
+            .run()
+            .unwrap()
     };
-    let before = fs::read_to_string(t.path("rsh.log")).unwrap();
-    let shown = status();
+    let shown = status("first-rsh.log");
     assert_output_ok(&shown);
     assert!(
         stderr_of(&shown).contains("could not switch receiving through test-server"),
         "{}",
         stderr_of(&shown)
     );
-    let logged = fs::read_to_string(t.path("rsh.log")).unwrap();
+    let logged = fs::read_to_string(t.path("first-rsh.log")).unwrap();
     // ssh was told never to ask, and not to wait long for the server.
     assert!(
-        logged[before.len()..]
-            .contains("-o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=auto"),
-        "{}",
-        &logged[before.len()..]
+        logged.contains("-o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=auto"),
+        "{logged}"
     );
     assert!(
         String::from_utf8_lossy(&shown.stdout).contains("in a terminal"),
@@ -4403,14 +4406,17 @@ fn a_switch_without_a_terminal_that_needs_a_login_is_not_retried() {
     // The old service still receives, and the next status leaves it.
     let state = installed.request(serde_json::json!({"version": 2, "stop": false}));
     assert_eq!(state["identity"], "v0.7.1");
-    let again = status();
+    let again = status("again-rsh.log");
     assert_output_ok(&again);
     assert!(
         !stderr_of(&again).contains("switch"),
         "{}",
         stderr_of(&again)
     );
-    assert_eq!(fs::read_to_string(t.path("rsh.log")).unwrap(), logged);
+    assert_eq!(
+        fs::read_to_string(t.path("again-rsh.log")).unwrap_or_default(),
+        ""
+    );
     installed.request(serde_json::json!({"version": 2, "stop": true}));
     old.join().unwrap();
 }
@@ -5074,7 +5080,6 @@ fn settings_that_drop_a_connection_stop_its_older_service_without_a_login() {
     installed.connect();
     let old = older_service(&installed, serde_json::json!([]));
     let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
-    let logged = fs::read_to_string(t.path("rsh.log")).unwrap();
     let mut command = installed.command(
         syq,
         &[
@@ -5087,7 +5092,12 @@ fn settings_that_drop_a_connection_stop_its_older_service_without_a_login() {
             installed.scope.to_str().unwrap(),
         ],
     );
-    let output = command.env("FAKE_SSH_REFUSE", "1").run().unwrap();
+    // Earlier connections leave a pool that can still write to rsh.log.
+    let output = command
+        .env("FAKE_SSH_REFUSE", "1")
+        .env("FAKE_RSH_LOG", t.path("settings-rsh.log"))
+        .run()
+        .unwrap();
     // Connecting elsewhere fails, and only that is reported.
     assert!(!output.status.success());
     assert!(
@@ -5104,12 +5114,8 @@ fn settings_that_drop_a_connection_stop_its_older_service_without_a_login() {
         old.join().unwrap().last().unwrap(),
         &serde_json::json!({"version": 2, "stop": true})
     );
-    let logged_now = fs::read_to_string(t.path("rsh.log")).unwrap();
-    assert!(
-        !logged_now[logged.len()..].contains("test-server"),
-        "{}",
-        &logged_now[logged.len()..]
-    );
+    let logged = fs::read_to_string(t.path("settings-rsh.log")).unwrap_or_default();
+    assert!(!logged.contains("test-server"), "{logged}");
 }
 
 /// A service an older syq left running with a request waiting for approval

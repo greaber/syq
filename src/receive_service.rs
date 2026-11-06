@@ -1236,7 +1236,9 @@ fn restart_stale(domain: &Domain, control: &Path) {
     {
         return;
     }
-    drop(lock);
+    // In a terminal it runs here, under the claim; without one, the
+    // switch it runs takes the claim itself.
+    let _claim = interactive.then_some(lock);
     crate::output::diagnostic!(
         "syq: starting receiving through {endpoint} again, with this version of syq"
     );
@@ -2521,13 +2523,9 @@ fn reconnect_with_this_build(
         switch_command(domain, endpoint)
     })?;
     let now = running_status(control, Retry::No, ANSWER_TIMEOUT)?;
-    // Another build's service that a switch leaves running, as it said.
-    if !force
-        && status.success()
-        && now
-            .as_ref()
-            .is_some_and(|now| now.identity != crate::identity::build())
-    {
+    // A switch that ended well said what it left running, if anything, or
+    // left the connection to another switch under way.
+    if !force && status.success() {
         return Ok(());
     }
     let online = now.as_ref().is_some_and(|now| {
