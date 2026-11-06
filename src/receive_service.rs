@@ -1,6 +1,7 @@
 //! Background return connections owned by a persistence scope. Settings are
 //! durable; each endpoint's process and advertisement exist only while enabled.
 pub(crate) mod provider;
+mod successor;
 pub(crate) mod switch;
 
 use crate::persistence::Domain;
@@ -1872,14 +1873,17 @@ fn replace_other(
             if !busy.idle() {
                 return Ok(other(Some(busy)));
             }
-            // The new service logs in separately from the control connection
-            // this command used. Make sure it can before stopping a working
-            // one: a failure leaves the old service receiving.
-            check_login(control, remote)?;
+            // The new service logs in to the server, separately from the
+            // control connection this command used, before the old one
+            // stops, and keeps that login: a failure leaves the old service
+            // receiving. Dropped, it logs out again.
+            let spec = service_spec(remote);
+            let successor = successor::Successor::start(control, &spec, &remote.label())?;
             // That took a while: decide on what the service says now, such
             // as a request that began waiting for approval meanwhile.
             let Some(state) = running_status(control, Retry::No, ANSWER_TIMEOUT)? else {
-                return Ok(None);
+                successor.take_over(control, &spec)?;
+                return Ok(Some(Receiving::Started));
             };
             if state.identity == crate::identity::build() {
                 return Ok(Some(Receiving::Running));
@@ -1888,7 +1892,8 @@ fn replace_other(
                 return Ok(other(None));
             }
             if stop_when_idle(control, &state)? {
-                return Ok(None);
+                successor.take_over(control, &spec)?;
+                return Ok(Some(Receiving::Started));
             }
             // It did not stop: say why from what the service says now. One
             // that took over the control is looked at again by the caller.
@@ -1900,31 +1905,6 @@ fn replace_other(
             }
             Ok(other(Some(busy_of(&now))))
         }
-    }
-}
-
-/// Log in as the new receiving service will. A login that needs the user,
-/// including one that did not finish in time (`switch::login_check`), is
-/// `switch::LoginNeeded`.
-fn check_login(control: &Path, remote: &crate::conn::RemoteSpec) -> Result<()> {
-    let endpoint = crate::persistence::EndpointRecord {
-        user: remote.user.clone(),
-        host: remote.host.clone(),
-        port: remote.port,
-        ssh_options: Vec::new(),
-        ssh_options_directory: None,
-    };
-    let (deadline, in_this_group) = switch::login_check();
-    match crate::destination::check_receiving_login(&endpoint, deadline, in_this_group) {
-        Ok(()) => Ok(()),
-        Err((true, message)) => {
-            switch::defer_after_login(control);
-            Err(anyhow::anyhow!("{message}").context(switch::LoginNeeded(remote.label())))
-        }
-        Err((false, message)) => Err(anyhow::anyhow!(
-            "receiving could not log in to {}: {message}",
-            remote.label()
-        )),
     }
 }
 
@@ -2048,7 +2028,19 @@ fn ensure_inner(
             }
         }
     }
-    let spec = ServiceSpec {
+    let spec = service_spec(remote);
+    // Keep the connected endpoint even when no profile currently allows it:
+    // a later preference change can start receiving without another connect.
+    atomic_json(&suffixed(control, RECORD), &spec)?;
+    if !allowed {
+        return Ok(Receiving::Off);
+    }
+    spawn(control)?;
+    Ok(Receiving::Started)
+}
+/// What a service of this build receiving through `remote` runs.
+fn service_spec(remote: &crate::conn::RemoteSpec) -> ServiceSpec {
+    ServiceSpec {
         version: VERSION,
         identity: crate::identity::build().into(),
         endpoint: crate::persistence::EndpointRecord {
@@ -2059,15 +2051,7 @@ fn ensure_inner(
             ssh_options_directory: None,
         },
         program: remote.program_command(&[]),
-    };
-    // Keep the connected endpoint even when no profile currently allows it:
-    // a later preference change can start receiving without another connect.
-    atomic_json(&suffixed(control, RECORD), &spec)?;
-    if !allowed {
-        return Ok(Receiving::Off);
     }
-    spawn(control)?;
-    Ok(Receiving::Started)
 }
 /// A service process this call started. Its reaper drops the sender once the
 /// process has exited, which it does at once if another service owns the lock.
@@ -2187,7 +2171,14 @@ struct ProfileWorker {
     worker: Worker,
 }
 impl ProfileWorker {
-    fn new(domain: &Domain, config: Settings, spec: ServiceSpec) -> Self {
+    /// With `handover`, for a service that takes over from one a switch
+    /// replaces (`successor`).
+    fn new(
+        domain: &Domain,
+        config: Settings,
+        spec: ServiceSpec,
+        handover: Option<crate::destination::Handover>,
+    ) -> Self {
         let state = Arc::new(Mutex::new(ConnectionState::default()));
         let approvals = Arc::new(crate::receive_approval::Queue::new(domain.clone()));
         approvals.set_notifications(config.notifications);
@@ -2201,6 +2192,8 @@ impl ProfileWorker {
             config.clone(),
             activity.clone(),
         );
+        // A connection that ends before it logged in says so too.
+        let failed = handover.as_ref().map(|handover| handover.report.clone());
         let thread = std::thread::spawn(move || {
             let result = if !thread_config.cwd.is_dir() {
                 Err(anyhow::anyhow!(
@@ -2216,8 +2209,12 @@ impl ProfileWorker {
                     thread_state.clone(),
                     thread_approvals,
                     thread_activity,
+                    handover,
                 )
             };
+            if let (Err(error), Some(failed)) = (&result, failed) {
+                let _ = failed.send(Err((false, format!("{error:#}"))));
+            }
             if let Err(error) = &result {
                 let mut state = thread_state.lock().unwrap();
                 state.phase = "failed".into();
@@ -2363,7 +2360,12 @@ fn reconcile(
         .filter(|p| p.allows_server(&spec.endpoint.label()))
     {
         if !workers.iter().any(|w| w.config.name == profile.name) {
-            workers.push(ProfileWorker::new(domain, profile.clone(), spec.clone()));
+            workers.push(ProfileWorker::new(
+                domain,
+                profile.clone(),
+                spec.clone(),
+                None,
+            ));
         }
     }
 }
@@ -2703,7 +2705,26 @@ fn run(domain: &Domain, control: &Path, started_from: Option<PathBuf>) -> Result
     if scope.join(CLOSING).exists() || !preferences(domain)?.enabled() {
         return Ok(());
     }
-    let spec = read_spec(control)?;
+    serve(
+        domain,
+        control,
+        started_from,
+        read_spec(control)?,
+        Vec::new(),
+    )
+}
+
+/// Receive through the connection at `control` as `spec` says, once this
+/// process holds its lock, with `workers` already connecting
+/// (`successor`), until stopped.
+fn serve(
+    domain: &Domain,
+    control: &Path,
+    started_from: Option<PathBuf>,
+    spec: ServiceSpec,
+    mut workers: Vec<ProfileWorker>,
+) -> Result<()> {
+    let scope = control.parent().context("persistence scope missing")?;
     crate::process::running_receiving_connection(spec.endpoint.label(), domain.explicit_path());
     let scope_meta = fs::metadata(scope)?;
     let scope_identity = (scope_meta.dev(), scope_meta.ino());
@@ -2751,7 +2772,6 @@ fn run(domain: &Domain, control: &Path, started_from: Option<PathBuf>) -> Result
         })
     };
     let result = (|| {
-        let mut workers = Vec::<ProfileWorker>::new();
         let mut read = preferences_file();
         let mut config = preferences(domain)?;
         let mut last_check = Instant::now() - Duration::from_secs(1);
@@ -3189,6 +3209,18 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
             let domain =
                 Domain::select(Some(control.parent().context("persistence scope missing")?))?;
             run(&domain, control, argv.get(3).map(PathBuf::from))?;
+            Ok(0)
+        })()),
+        // As `--receive-service`, for one a switch starts to take over.
+        successor::ARG => Some((|| {
+            if !(3..=4).contains(&argv.len()) {
+                bail!("receive service needs its control path");
+            }
+            crate::fsops::reserve_startup_descriptors();
+            let control = Path::new(&argv[2]);
+            let domain =
+                Domain::select(Some(control.parent().context("persistence scope missing")?))?;
+            successor::run(&domain, control, argv.get(3).map(PathBuf::from))?;
             Ok(0)
         })()),
         _ => None,

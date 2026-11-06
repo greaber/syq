@@ -72,6 +72,15 @@ const REGISTRATION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PREFIX: &str = "named-v2:";
 const REQUEST_ROOT: &[u8] = b"/SYQ-RECEIVE";
 const RECONNECT_PENDING: i32 = 75;
+/// The registration option of a receiving connection that takes over from
+/// the service a switch replaces: wait for that service's registration to
+/// let go of the name rather than refuse it as taken. Only the build that
+/// asks for it runs it: a switch installs and runs its own helper.
+const TAKE_OVER: &str = "--take-over";
+/// How long such a registration waits for the name. The switch stops the
+/// replaced service within seconds of its login, and that service's
+/// registration ends with its connection.
+const TAKE_OVER_WAIT: Duration = Duration::from_secs(120);
 
 /// The first wait before a receiving connection whose login was rejected
 /// tries again, and the longest, which later waits double up to.
@@ -340,6 +349,9 @@ enum Reply {
     TcpProbed(Vec<crate::conn::TcpCandidate>),
     TcpCongestionRejected(String),
     Ready,
+    // From a registration that takes over a name (`--take-over`): logged
+    // in, waiting for the connection it replaces to let go of the name.
+    Waiting,
     Identity(identity::Proof),
     Approved(Approved),
     SendApproved(Box<send::SendApproved>),
@@ -1871,46 +1883,22 @@ fn ssh_command(endpoint: &crate::persistence::EndpointRecord) -> Command {
     }
     cmd
 }
-/// Log in to `endpoint` as a receiving connection does (`ssh_command`),
-/// without forwarding anything, to learn whether a new receiving service
-/// could before an old one is stopped for it, by `deadline`, keeping ssh in
-/// this process's group when `in_this_group`. On failure, whether the user
-/// is needed: the server rejected the login (`conn::login_rejection`), or
-/// ssh did not finish, as while it waits for a touch of a security key.
-/// Then what ssh said.
-pub(crate) fn check_receiving_login(
-    endpoint: &crate::persistence::EndpointRecord,
-    deadline: Instant,
-    in_this_group: bool,
-) -> std::result::Result<(), (bool, String)> {
-    let mut command = ssh_command(endpoint);
-    command.arg("--").arg(&endpoint.host).arg("true");
-    const LIMIT: usize = 64 * 1024;
-    let output = if in_this_group {
-        crate::process::capture_output_bounded_in_this_group(&mut command, deadline, LIMIT)
-    } else {
-        crate::process::capture_output_bounded(&mut command, deadline, &|| false, LIMIT)
-    }
-    .map_err(|error| {
-        if error.kind() == std::io::ErrorKind::TimedOut {
-            (true, crate::receive_service::switch::NO_ANSWER.to_owned())
-        } else {
-            (false, error.to_string())
-        }
-    })?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let message = stderr
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("ssh failed")
-        .to_owned();
-    Err((crate::conn::login_rejection(&stderr).is_some(), message))
+/// How the first login of a receiving connection that takes over from
+/// another service went: `Ok` once logged in to the server, otherwise
+/// whether the user is needed, as when the server rejected the login
+/// (`conn::login_rejection`), and what ssh said last.
+pub(crate) type LoginReport = std::result::Result<(), (bool, String)>;
+
+/// For a receiving connection of the service a switch starts to replace
+/// another (`receive_service::successor`). Until `released`, once the
+/// replaced service has stopped, the server keeps its registration waiting
+/// for that service to let go of the name instead of refusing it as taken
+/// (`--take-over`). `report` hears once how its first login went.
+pub(crate) struct Handover {
+    pub(crate) report: mpsc::Sender<LoginReport>,
+    pub(crate) released: Arc<AtomicBool>,
 }
+
 fn pin_receiving_source(
     command: &mut Command,
     policy: &crate::agent_broker::HostPolicy,
@@ -2127,6 +2115,7 @@ pub(crate) struct Accounts {
     pub(crate) in_use: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn serve_background(
     config: crate::receive_service::Settings,
     spec: crate::receive_service::ServiceSpec,
@@ -2136,9 +2125,14 @@ pub(crate) fn serve_background(
     state: Arc<Mutex<crate::receive_service::ConnectionState>>,
     approvals: Arc<crate::receive_approval::Queue>,
     activity: Arc<Activity>,
+    handover: Option<Handover>,
 ) -> Result<()> {
     #[cfg(test)]
     let (prompts, _requests) = mpsc::sync_channel(1);
+    let (mut report, released) = match handover {
+        Some(handover) => (Some(handover.report), Some(handover.released)),
+        None => (None, None),
+    };
     let mut tcp_peer = crate::conn::RemoteSpec::local_receiver(false);
     tcp_peer.local_process = false;
     tcp_peer.host = spec.endpoint.host.clone();
@@ -2218,11 +2212,17 @@ pub(crate) fn serve_background(
             let socket = format!("/tmp/syq-return-{}.sock", random_token()?);
             // The secret goes on standard input: other users on the server
             // can read a process's arguments.
-            let args = [
-                "--destination-register".into(),
+            let mut args = vec![
+                "--destination-register".to_owned(),
                 config.name.clone(),
                 socket.clone(),
             ];
+            if released
+                .as_ref()
+                .is_some_and(|released| !released.load(Ordering::Acquire))
+            {
+                args.push(TAKE_OVER.into());
+            }
             let mut command = ssh_command(&spec.endpoint);
             // Remembered permissions identify the actual locally selected source
             // account and its trusted host keys. Freeze that policy for this SSH
@@ -2282,10 +2282,16 @@ pub(crate) fn serve_background(
                 state.attempted = Some(Instant::now());
                 state.retry = None;
             }
-            let (ready, readiness) = mpsc::sync_channel(1);
+            // `Waiting` before `Ready` from a registration that takes over
+            // a name.
+            let (ready, readiness) = mpsc::sync_channel(2);
             let mut stdout = child.0.stdout.take().unwrap();
-            let reader = std::thread::spawn(move || {
-                let _ = ready.send(read_message::<Reply>(&mut stdout));
+            let reader = std::thread::spawn(move || loop {
+                let message = read_message::<Reply>(&mut stdout);
+                let waiting = matches!(message, Ok(Reply::Waiting));
+                if ready.send(message).is_err() || !waiting {
+                    break;
+                }
             });
             let mut stderr = child.0.stderr.take().unwrap();
             let errors = Arc::new(Mutex::new(Vec::new()));
@@ -2304,12 +2310,31 @@ pub(crate) fn serve_background(
             });
             let connected = Instant::now();
             let mut online = false;
+            let mut logged_in = false;
             while !stop.load(Ordering::Acquire) && child.0.try_wait()?.is_none() {
-                if matches!(readiness.try_recv(), Ok(Ok(Reply::Ready))) {
-                    online = true;
-                    state.lock().unwrap().phase = "online".into();
+                while let Ok(message) = readiness.try_recv() {
+                    match message {
+                        Ok(Reply::Ready) => {
+                            online = true;
+                            logged_in = true;
+                            state.lock().unwrap().phase = "online".into();
+                        }
+                        Ok(Reply::Waiting) => logged_in = true,
+                        _ => {}
+                    }
                 }
-                if !online && connected.elapsed() >= Duration::from_secs(30) {
+                if logged_in {
+                    if let Some(report) = report.take() {
+                        let _ = report.send(Ok(()));
+                    }
+                }
+                // A first login that takes over from another service is
+                // bounded by the switch instead, which counts one that does
+                // not finish as one that needs the user, as when ssh waits
+                // for a touch of a security key. Its server bounds the wait
+                // for the name.
+                if !logged_in && report.is_none() && connected.elapsed() >= Duration::from_secs(30)
+                {
                     break;
                 }
                 let _ = woken.recv_timeout(Duration::from_millis(50));
@@ -2330,6 +2355,16 @@ pub(crate) fn serve_background(
             } else {
                 error
             };
+            if let Some(report) = report.take() {
+                let last = error
+                    .lines()
+                    .rev()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .unwrap_or("ssh failed")
+                    .to_owned();
+                let _ = report.send(Err((crate::conn::login_rejection(&error).is_some(), last)));
+            }
             if exit
                 .and_then(|s| s.code())
                 .is_some_and(|code| (1..128).contains(&code) && code != RECONNECT_PENDING)
@@ -2422,8 +2457,14 @@ impl Drop for RegistrationGuard {
         }
     }
 }
-fn register(name: &str, socket: &Path, secret: &str, handshake_timeout: Duration) -> Result<i32> {
-    match register_inner(name, socket, secret, handshake_timeout) {
+fn register(
+    name: &str,
+    socket: &Path,
+    secret: &str,
+    handshake_timeout: Duration,
+    take_over: bool,
+) -> Result<i32> {
+    match register_inner(name, socket, secret, handshake_timeout, take_over) {
         Err(error)
             if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
                 matches!(
@@ -2454,6 +2495,7 @@ fn register_inner(
     socket: &Path,
     secret: &str,
     handshake_timeout: Duration,
+    take_over: bool,
 ) -> Result<i32> {
     validate_name(name)?;
     let metadata = fs::symlink_metadata(socket)?;
@@ -2488,7 +2530,14 @@ fn register_inner(
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(directory.join(format!("{name}.lock")))?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    if take_over {
+        // Logged in: the switch stops the service this one replaces only
+        // now, so that a failed login leaves that one receiving.
+        write_message(&mut std::io::stdout(), &Reply::Waiting)?;
+        if !name_released(&lock, libc::STDIN_FILENO, TAKE_OVER_WAIT)? {
+            return Ok(0);
+        }
+    } else if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         // A responsive holder is a duplicate, even when a copied home directory
         // gives both machines the same identity. Never replace a held lock.
         if read_registration(name).is_ok_and(|previous| {
@@ -2551,6 +2600,34 @@ fn register_inner(
         }
     }
     Ok(0)
+}
+/// Take the name's `lock` once the registration holding it ends, within
+/// `wait`, for a registration that takes over (`TAKE_OVER`); false when the
+/// laptop gave up first, closing this connection's `input`. One that waited
+/// too long is tried again by the laptop (`RECONNECT_PENDING`).
+fn name_released(lock: &fs::File, input: RawFd, wait: Duration) -> Result<bool> {
+    let deadline = Instant::now() + wait;
+    while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+                .context("the receiving name is still registered by another connection");
+        }
+        if crate::sys::readable_within(input, Duration::from_millis(100)) {
+            let mut byte = 0u8;
+            // SAFETY: one byte is read into a live local.
+            match unsafe { libc::read(input, (&mut byte as *mut u8).cast(), 1) } {
+                0 => return Ok(false),
+                count if count < 0 => {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(error.into());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(true)
 }
 /// The laptop sends the return connection's secret as the first line on
 /// standard input. Read only that line, unbuffered: the rest of the input
@@ -2699,7 +2776,8 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
     }
     match argv.get(1).and_then(|s| s.to_str())? {
         "--destination-register" => Some((|| {
-            if argv.len() != 4 {
+            let take_over = argv.get(4).is_some_and(|option| option == TAKE_OVER);
+            if argv.len() != 4 && !(argv.len() == 5 && take_over) {
                 bail!("invalid destination registration arguments");
             }
             crate::fsops::reserve_startup_descriptors();
@@ -2721,6 +2799,7 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
                 Path::new(&argv[3]),
                 &secret,
                 REGISTRATION_HANDSHAKE_TIMEOUT,
+                take_over,
             )
         })()),
         _ => forward::dispatch(argv),

@@ -670,6 +670,7 @@ impl ForwardChild {
                 }
                 Ok(
                     Reply::Ready
+                    | Reply::Waiting
                     | Reply::Identity(_)
                     | Reply::TcpProbed(_)
                     | Reply::TcpCongestionRejected(_)

@@ -258,6 +258,67 @@ fn registration_reads_only_its_secret_line_from_standard_input() {
     assert!(started.elapsed() < Duration::from_secs(5));
 }
 
+/// A registration that takes over a name waits for the one holding it to
+/// let go, as long as the laptop keeps its connection, and for a while.
+#[test]
+fn a_registration_that_takes_over_waits_for_the_name() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let path = dir.path().join("laptop.lock");
+    let open = || {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap()
+    };
+    let hold = || {
+        let held = open();
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        held
+    };
+
+    // Once the old registration ends, the new one has the name.
+    let held = hold();
+    let (_laptop, server) = UnixStream::pair().unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(held);
+    });
+    let lock = open();
+    let started = Instant::now();
+    assert!(name_released(&lock, server.as_raw_fd(), Duration::from_secs(10)).unwrap());
+    assert!(started.elapsed() >= Duration::from_millis(250));
+    release.join().unwrap();
+    assert_ne!(
+        unsafe { libc::flock(open().as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "the new registration holds the name"
+    );
+    drop(lock);
+
+    // A laptop that gives up ends the wait.
+    let held = hold();
+    let (laptop, server) = UnixStream::pair().unwrap();
+    drop(laptop);
+    assert!(!name_released(&open(), server.as_raw_fd(), Duration::from_secs(10)).unwrap());
+
+    // One that waits too long is tried again.
+    let (_laptop, server) = UnixStream::pair().unwrap();
+    let error = name_released(&open(), server.as_raw_fd(), Duration::from_millis(200)).unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::TimedOut)
+    );
+    drop(held);
+}
+
 #[test]
 fn registration_retries_socket_timeout_but_not_peer_rejection() {
     for reject in [false, true] {
@@ -293,7 +354,7 @@ fn registration_retries_socket_timeout_but_not_peer_rejection() {
         } else {
             Duration::from_millis(200)
         };
-        let result = register("laptop", &path, "test-credential", timeout);
+        let result = register("laptop", &path, "test-credential", timeout, false);
         let _ = stop.send(());
         peer.join().unwrap();
         if reject {

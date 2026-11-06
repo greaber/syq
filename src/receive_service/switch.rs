@@ -6,7 +6,9 @@
 //! path. Once the path holds another build and nothing is in progress, the
 //! service runs that build's own command to replace it, as `syq persist
 //! connect` does by hand: the new build installs its helper on the server,
-//! stops this service once it is still idle, and starts its own.
+//! starts its own service, which logs in to the server while this one still
+//! receives, then stops this service once it is still idle, and its own
+//! takes over that login (`successor`).
 //!
 //! Loops. The service a switch starts runs the file at its path, which is
 //! its baseline, so it switches again only once that file changes again. A
@@ -29,7 +31,7 @@
 //! approve an agent's request, at most every ten minutes
 //! (`receive_service::refresh_outdated`). Its status says so. A live
 //! control connection is no sign of the user: it can outlast them, and the
-//! switch's own login check does not use it. Other failures are tried again
+//! new service's login does not use it. Other failures are tried again
 //! with growing waits.
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -81,38 +83,35 @@ pub(crate) fn end_switch_at(before: impl FnOnce() + Send + 'static) {
 
 /// When this process, a switch, ends by itself (`end_switch_at`).
 static ENDS: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-/// How long a switch's login check may take.
-const LOGIN_CHECK: Duration = Duration::from_secs(60);
-/// The time a switch keeps after its login check, to say how it went.
-const LOGIN_CHECK_MARGIN: Duration = Duration::from_secs(2);
+/// How long the new service's login in a switch may take.
+const LOGIN: Duration = Duration::from_secs(60);
+/// The time a switch keeps after that login, to say how it went.
+const LOGIN_MARGIN: Duration = Duration::from_secs(2);
 
 /// Why a switch's login that ran out of time needs the user.
 pub(crate) const NO_ANSWER: &str =
     "ssh did not finish logging in by itself in time, as when it waits for a touch of your security key";
 
-/// When a login check must end, and whether it runs in this process's
-/// group. In a switch, it ends before the switch does: a check that ran out
-/// of time, as when ssh waits for a touch of a security key that nobody
-/// gave, then ends the switch as one that needs the user (`LoginNeeded`),
-/// which only a command at a terminal tries again, not as a failure the
-/// service would retry by itself, touching the key again. It also runs in
-/// the switch's group, which `end_switch_at` ends, so that nothing outlives
-/// the switch. `LoginWatch` bounds the switch's control connection's login
-/// the same way.
-pub(crate) fn login_check() -> (Instant, bool) {
+/// When the new service's login in a switch must end (`successor`). It ends
+/// before the switch does: a login that ran out of time, as when ssh waits
+/// for a touch of a security key that nobody gave, then ends the switch as
+/// one that needs the user (`LoginNeeded`), which only a command at a
+/// terminal tries again, not as a failure the service would retry by
+/// itself, touching the key again. `LoginWatch` bounds the switch's control
+/// connection's login the same way.
+pub(crate) fn login_deadline() -> Instant {
     let now = Instant::now();
     let Some(ends) = ENDS.get() else {
-        return (now + LOGIN_CHECK, false);
+        return now + LOGIN;
     };
-    let by = ends.checked_sub(LOGIN_CHECK_MARGIN).unwrap_or(now).max(now);
-    let leads_group = unsafe { libc::getpgrp() == libc::getpid() };
-    ((now + LOGIN_CHECK).min(by), leads_group)
+    let by = ends.checked_sub(LOGIN_MARGIN).unwrap_or(now).max(now);
+    (now + LOGIN).min(by)
 }
 
 /// Bounds, in a switch (`end_switch_at`), the login of its control
 /// connection to the server, which ssh makes when no connection is live,
 /// until dropped once that connection is made or has failed: if it has not
-/// finished by the deadline `login_check` gives, and the connection's
+/// finished by the deadline `login_deadline` gives, and the connection's
 /// control socket, which ssh opens once logged in, is still not there, the
 /// switch ends at once as one that needs the user (`LOGIN_NEEDED_EXIT`),
 /// with what it started in its process group. What follows the login, such
@@ -122,7 +121,7 @@ impl LoginWatch {
     pub(crate) fn start(control: &Path, server: String) -> Self {
         let done = std::sync::Arc::new(std::sync::Mutex::new(false));
         if ENDS.get().is_some() {
-            let (deadline, _) = login_check();
+            let deadline = login_deadline();
             let control = control.to_path_buf();
             let watched = done.clone();
             std::thread::spawn(move || {

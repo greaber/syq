@@ -3290,6 +3290,15 @@ case " $* " in
             echo 'syq@test-server: Permission denied (publickey).' >&2
             exit 255
         fi
+        # Accept only the first such login, as when a later one would need
+        # another touch of a security key that nobody gives.
+        if [ -n "${FAKE_SSH_DIRECT_ONCE:-}" ]; then
+            if [ -e "$FAKE_SSH_DIRECT_ONCE" ]; then
+                echo 'syq@test-server: Permission denied (publickey).' >&2
+                exit 255
+            fi
+            : > "$FAKE_SSH_DIRECT_ONCE"
+        fi
         if [ -n "${FAKE_SSH_DIRECT_MARK:-}" ]; then
             : > "$FAKE_SSH_DIRECT_MARK"
         fi
@@ -3878,6 +3887,79 @@ fn a_switch_that_cannot_log_in_leaves_the_old_service_receiving() {
             .iter()
             .all(|request| request == &serde_json::json!({"version": 2, "stop": false})),
         "{requests:?}"
+    );
+}
+
+/// A switch logs in to the server once, while the old service still
+/// receives: the new service it starts keeps that login and takes over the
+/// receiving name once the old one stops. A second login, which here would
+/// fail, as when it needs another touch of a security key, never happens,
+/// so receiving does not go down.
+#[test]
+fn a_switch_logs_in_once_and_the_new_service_keeps_that_login() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let old = other_service(
+        &installed,
+        serde_json::json!([]),
+        Some(serde_json::json!({"requests": 0, "pending": 0})),
+        None,
+    );
+    let log = t.path("rsh.log");
+    let before = fs::read_to_string(&log).unwrap().lines().count();
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    let switched = installed
+        .command(
+            syq,
+            &[
+                "persist",
+                "connect",
+                "test-server",
+                "--auth-from",
+                "ssh",
+                "--when-idle",
+                "--pscope",
+                installed.scope.to_str().unwrap(),
+            ],
+        )
+        .env("FAKE_SSH_DIRECT_ONCE", t.path("logged-in"))
+        .run()
+        .unwrap();
+    assert_output_ok(&switched);
+    assert!(
+        String::from_utf8_lossy(&switched.stdout).contains("test-server ready; receiving as @"),
+        "{switched:?}"
+    );
+    // The old service was asked to stop once idle, and stopped.
+    let requests = old.join().unwrap();
+    assert_eq!(
+        requests.last().unwrap()["stop_if_idle"],
+        true,
+        "{requests:?}"
+    );
+    let state = installed.request(serde_json::json!({"version": 2, "stop": false}));
+    assert_eq!(state["identity"], this_build(), "{state}");
+    assert_eq!(state["connection"]["phase"], "online", "{state}");
+    // Its one login of its own, separate from the control connection that
+    // installed the helper, is the receiving connection, which took over
+    // the name.
+    let logged = fs::read_to_string(&log).unwrap();
+    let logged: Vec<&str> = logged.lines().skip(before).collect();
+    let logins: Vec<&str> = logged
+        .iter()
+        .copied()
+        .filter(|line| line.contains("PermitLocalCommand=no") && line.contains("ControlPath=none"))
+        .collect();
+    assert_eq!(logins.len(), 1, "{logins:#?}");
+    assert!(logins[0].contains(" -R "), "{logins:#?}");
+    // The launcher's arguments end the remote command, a few lines on.
+    assert!(
+        logged
+            .iter()
+            .any(|line| line.contains("--destination-register") && line.contains("--take-over")),
+        "{logged:#?}"
     );
 }
 
