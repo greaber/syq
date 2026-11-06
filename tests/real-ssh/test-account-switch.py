@@ -65,6 +65,7 @@ other_build = run("syq-other-build", "--build-identity").strip()
 this_build = run("syq", "--build-identity").strip()
 root = Path("/tmp/syq-account-switch-receive")
 shell = None
+remote_scope = None
 try:
     BIN.mkdir(mode=0o755, exist_ok=True)
     root.mkdir(exist_ok=True)
@@ -154,6 +155,7 @@ try:
     assert shell.poll() is None, shell.communicate()
     source("test", "-d", "/proc/" + master)
     source("syq", "persist", "off", "--pscope", remote_scope)
+    remote_scope = None
     source("test", "!", "-d", "/proc/" + master)
     shell.communicate(timeout=30)
     shell = None
@@ -161,6 +163,9 @@ finally:
     if shell is not None and shell.poll() is None:
         os.killpg(shell.pid, signal.SIGTERM)
         shell.wait(timeout=5)
+    if remote_scope is not None:
+        subprocess.run(["ssh", "source", shlex.join(
+            ["env", NATIVE_PATH, "syq", "persist", "off", "--pscope", remote_scope])], timeout=60)
     subprocess.run(["ssh", "source", shlex.join(["env", NATIVE_PATH, "syq", "persist", "off"])],
                    timeout=60)
     subprocess.run(["syq", "persist", "off", "--pscope", scope], timeout=60)

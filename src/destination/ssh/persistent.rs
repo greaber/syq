@@ -1174,6 +1174,9 @@ fn keeper(startup: Startup) -> Result<()> {
         "SSH provider connection changed before account setup; retry the command"
     );
     let path = selected_index_path(&domain, &request.provider, &request.destination, selected)?;
+    // Released last, after the scope is removed and everything in it ended,
+    // which `persist off` relies on.
+    let mut draining_lock: Option<DrainingLock> = None;
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1222,6 +1225,7 @@ fn keeper(startup: Startup) -> Result<()> {
         }
         signals.wait(POLL)?;
     }
+    let mut lock = Some(lock);
     let approval_request = request.clone();
     let approval_domain = domain.clone();
     let shown_command = startup.command.clone();
@@ -1337,7 +1341,7 @@ fn keeper(startup: Startup) -> Result<()> {
     } else {
         None
     };
-    let mut daemon = (!domain.is_default()).then(|| DaemonMaster {
+    let mut daemon_master = (!domain.is_default()).then(|| DaemonMaster {
         record: &record,
         active: true,
     });
@@ -1421,17 +1425,16 @@ fn keeper(startup: Startup) -> Result<()> {
     // The record and its lock, until the master is ending: then a new
     // command opens a connection of its own beside it at once, while a
     // lock of its own keeps this keeper visible to `persist off`.
-    let mut published = Some((index, lock));
-    let mut draining_lock = None;
+    let mut index = Some(index);
     // An explicit-domain master runs as a daemon apart from its launcher.
     // Once it stops listening, its process is what still runs its sessions.
     let daemonized = !domain.is_default();
-    let daemon_pid = std::cell::Cell::new(None);
+    let daemon = std::cell::RefCell::new(None::<DrainingDaemon>);
     let use_count = || in_use(&record.control);
     let mut stop = || {
         if daemonized {
-            match master_pid(&record).and_then(|pid| Some((pid, process_start(pid)?))) {
-                Some(daemon) => daemon_pid.set(Some(daemon)),
+            match DrainingDaemon::of(&record) {
+                Some(found) => *daemon.borrow_mut() = Some(found),
                 // Without it, nothing could end the draining daemon.
                 None => return false,
             }
@@ -1453,9 +1456,9 @@ fn keeper(startup: Startup) -> Result<()> {
             // Polling with -O check would itself create mux channels and reset
             // OpenSSH's idle timer. Normal exit unlinks the control socket;
             // stopping it while draining does too, before its sessions end.
-            match daemon_pid.get() {
-                Some((pid, start)) if drain.closing => {
-                    if process_start(pid) != Some(start) {
+            match &*daemon.borrow() {
+                Some(daemon) if drain.closing => {
+                    if !daemon.running(Duration::ZERO) {
                         break;
                     }
                 }
@@ -1494,96 +1497,230 @@ fn keeper(startup: Startup) -> Result<()> {
         if drain.closing && !std::mem::replace(&mut drain.pool_stopped, true) {
             // A spare session would keep the master.
             let _ = pool.stop();
-            // Remove the record, then release its lock, keeping a lock of
-            // its own. Stopping persistence or this keeper still ends the
-            // master, and `persist off` waits for that.
-            draining_lock = DrainingLock::take(&close_request);
-            drop(published.take());
+            // Remove the record, then release its lock, once a lock of its
+            // own replaces it; without one, keep them. Stopping persistence
+            // or this keeper still ends the master, and `persist off` waits
+            // for that.
+            if let Some(taken) = DrainingLock::take(&close_request, &record.control) {
+                draining_lock.replace(taken);
+                drop(index.take());
+                drop(lock.take());
+            }
         }
         signals.wait(POLL)?;
     }
     let pool_result = pool.stop();
     let master_result = master.stop(libc::SIGTERM);
-    let daemon_result = daemon.as_mut().map_or(Ok(()), DaemonMaster::stop);
+    let daemon_result = daemon_master.as_mut().map_or(Ok(()), DaemonMaster::stop);
     // A daemon still draining sessions ends with this keeper.
-    if let Some(daemon) = daemon_pid.get().filter(|_| drain.closing) {
-        end_daemon(daemon);
-    }
-    drop(draining_lock);
+    let draining_result = daemon.take().map_or(Ok(()), |daemon| daemon.end());
     // A broken pool must not leave an approved login alive.
     master_result?;
     daemon_result?;
+    draining_result?;
     pool_result
 }
 
 /// The process of the OpenSSH master at `record`'s control socket, as it
-/// reports it.
+/// reports it within five seconds.
 fn master_pid(record: &Record) -> Option<u32> {
-    let output = master_command(record)
+    let mut child = master_command(record)
         .args(["-O", "check", "--", &record.endpoint.host])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn_guarded()
-        .ok()?
-        .wait_with_output()
         .ok()?;
-    if !output.status.success() {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let mut errors = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take()?, &mut errors).ok()?;
+    if !status.success() {
         return None;
     }
     // OpenSSH: "Master running (pid=N)".
-    let text = String::from_utf8_lossy(&output.stderr);
-    let pid = text.split("(pid=").nth(1)?.split(')').next()?;
+    let pid = errors.split("(pid=").nth(1)?.split(')').next()?;
     pid.parse().ok().filter(|pid| *pid > 1)
 }
 
 /// When process `pid` started, in clock ticks since boot; None once it is
-/// gone. OpenSSH renames its master's process as it goes, so its start is
-/// what tells it from a process that took its number since.
+/// gone or has exited, even before its parent reaps it. OpenSSH renames
+/// its master's process as it goes, so its start is what tells it from a
+/// process that took its number since.
 fn process_start(pid: u32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // pid (comm) state ppid ...: field 22 is the start time.
-    let fields = stat.rsplit_once(')')?.1;
-    fields.split_whitespace().nth(19)?.parse().ok()
+    let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+    if matches!(fields.next()?, "Z" | "X" | "x") {
+        return None;
+    }
+    fields.nth(18)?.parse().ok()
 }
 
-/// End the draining master, as stopping it ends any other.
-fn end_daemon((pid, start): (u32, u64)) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut signal = libc::SIGTERM;
-    while process_start(pid) == Some(start) {
-        unsafe { libc::kill(pid as libc::pid_t, signal) };
-        if Instant::now() >= deadline {
-            signal = libc::SIGKILL;
+/// A draining explicit-domain master: a daemon apart from its launcher,
+/// which runs its last sessions after its control socket is gone. Held by
+/// a process descriptor, so that a process that later takes its number is
+/// never signalled. Linux only, as is telling whether the master is in use
+/// (`persistence::mux_clients`); elsewhere no master drains.
+struct DrainingDaemon {
+    #[cfg(target_os = "linux")]
+    descriptor: OwnedFd,
+}
+impl DrainingDaemon {
+    /// The master at `record`'s control socket, as it is now.
+    fn of(record: &Record) -> Option<Self> {
+        Self::of_process(master_pid(record)?)
+    }
+
+    fn of_process(pid: u32) -> Option<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::FromRawFd as _;
+            let start = process_start(pid)?;
+            let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+            if descriptor < 0 {
+                return None;
+            }
+            let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor as libc::c_int) };
+            // Still the same process: the descriptor holds that one.
+            (process_start(pid) == Some(start)).then_some(Self { descriptor })
         }
-        std::thread::sleep(POLL);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            None
+        }
+    }
+
+    /// Whether it has not exited, waiting at most `timeout` for it to.
+    fn running(&self, timeout: Duration) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let mut descriptor = libc::pollfd {
+                fd: self.descriptor.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // Readable once it exited, reaped or not.
+            unsafe { libc::poll(&mut descriptor, 1, timeout.as_millis() as libc::c_int) == 0 }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = timeout;
+            false
+        }
+    }
+
+    /// End it, as stopping any other master does; an error if it outlives
+    /// a kill.
+    fn end(&self) -> Result<()> {
+        for (signal, wait) in [
+            (libc::SIGTERM, Duration::from_secs(5)),
+            (libc::SIGKILL, Duration::from_secs(5)),
+        ] {
+            if !self.running(Duration::ZERO) {
+                return Ok(());
+            }
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.descriptor.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = signal;
+            if !self.running(wait) {
+                return Ok(());
+            }
+        }
+        bail!("the draining SSH account connection did not end when killed")
+    }
+}
+impl Drop for DrainingDaemon {
+    fn drop(&mut self) {
+        let _ = self.end();
     }
 }
 
-/// Held by a keeper whose master is draining, after it gave up its record
-/// and its lock: an index lock file of its own, which `persist off` waits
-/// for as for any keeper's, and which no record uses. Like those, the file
-/// stays for the next keeper of the same account, so that none is removed
-/// while someone looks at it.
-struct DrainingLock {
+/// Held by a keeper whose master is draining, before it gives up its record
+/// and its lock: an index entry of its own, `<key>.draining`, which
+/// `persist off` waits for as for a keeper's lock and no record names.
+/// Its file goes with it; one a keeper left behind is removed by the next.
+pub(super) struct DrainingLock {
+    path: PathBuf,
     _file: File,
 }
+pub(super) const DRAINING: &str = "draining";
 impl DrainingLock {
-    /// Unless another draining keeper of this account holds it.
-    fn take(close_request: &Path) -> Option<Self> {
-        let record = close_request.file_stem()?.as_encoded_bytes();
-        let name = blake3::hash(&[b"syq-draining-account-v1\0", record].concat()).to_hex();
+    /// One of its own beside `close_request`, for the master at `control`.
+    fn take(close_request: &Path, control: &Path) -> Option<Self> {
+        let directory = close_request.parent()?;
+        Self::remove_leftovers(directory);
+        let name = blake3::hash(
+            &[
+                b"syq-draining-account-v1\0",
+                control.as_os_str().as_encoded_bytes(),
+            ]
+            .concat(),
+        )
+        .to_hex();
+        let path = directory.join(format!("{name}.{DRAINING}"));
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(false)
+            .create_new(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(close_request.with_file_name(format!("{name}.lock")))
+            .open(&path)
             .ok()?;
-        (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0)
-            .then_some(Self { _file: file })
+        let lock = Self { path, _file: file };
+        (unsafe { libc::flock(lock._file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0)
+            .then_some(lock)
+    }
+
+    /// Remove the entries of keepers that ended without removing theirs.
+    fn remove_leftovers(directory: &Path) {
+        let Ok(entries) = fs::read_dir(directory) else {
+            return;
+        };
+        for path in entries.flatten().map(|entry| entry.path()) {
+            if path
+                .extension()
+                .is_none_or(|extension| extension != DRAINING)
+            {
+                continue;
+            }
+            let Ok(file) = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                .open(&path)
+            else {
+                continue;
+            };
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+}
+impl Drop for DrainingLock {
+    fn drop(&mut self) {
+        // While still locked: anyone who opened it sees a running keeper.
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -1946,6 +2083,79 @@ mod tests {
             LinkReply::InUse
         );
         assert!(!drain.closing);
+    }
+
+    /// A draining master is ended through its process descriptor. One that
+    /// exited counts as ended even before its parent reaps it, and ending
+    /// it again is immediate.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_draining_master_ends_and_an_exited_one_counts_as_ended() {
+        let state = |pid: u32| {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            stat.rsplit_once(')')
+                .unwrap()
+                .1
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .to_owned()
+        };
+        // Exited, not yet reaped.
+        let mut exited = Command::new("sleep").arg("30").spawn().unwrap();
+        let daemon = DrainingDaemon::of_process(exited.id()).unwrap();
+        assert!(daemon.running(Duration::ZERO));
+        unsafe { libc::kill(exited.id() as libc::pid_t, libc::SIGKILL) };
+        assert!(!daemon.running(Duration::from_secs(10)));
+        assert_eq!(state(exited.id()), "Z");
+        assert_eq!(process_start(exited.id()), None);
+        assert!(DrainingDaemon::of_process(exited.id()).is_none());
+        let started = Instant::now();
+        daemon.end().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(daemon);
+        exited.wait().unwrap();
+        // Running: ending it stops it.
+        let mut running = Command::new("sleep").arg("30").spawn().unwrap();
+        let daemon = DrainingDaemon::of_process(running.id()).unwrap();
+        daemon.end().unwrap();
+        assert!(!running.wait().unwrap().success());
+    }
+
+    /// Each draining keeper holds an entry of its own, even for the same
+    /// account, which `persist off` waits for and which goes with it; one a
+    /// keeper left behind is removed by the next. Without the directory
+    /// there is none, and the keeper keeps its record and lock instead.
+    #[test]
+    fn each_draining_keeper_is_seen_until_it_ends() {
+        let root = crate::test_support::short_tempdir().unwrap();
+        let scope = root.path().join("scope");
+        crate::persistence::initialize_scope(&scope).unwrap();
+        let domain = Domain::select(Some(&scope)).unwrap();
+        let index = directory(&domain).unwrap();
+        let close = index.join(format!("{}.close", "0".repeat(64)));
+        let first = DrainingLock::take(&close, Path::new("/run/a/cm-1")).unwrap();
+        let second = DrainingLock::take(&close, Path::new("/run/b/cm-1")).unwrap();
+        assert_ne!(first.path, second.path);
+        assert_eq!(cleanup::keepers_running(&domain).unwrap(), 2);
+        let first_path = first.path.clone();
+        drop(first);
+        assert!(!first_path.exists());
+        assert_eq!(cleanup::keepers_running(&domain).unwrap(), 1);
+        // A keeper that ended without removing its entry.
+        let left = index.join(format!("{}.{DRAINING}", "1".repeat(64)));
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&left)
+            .unwrap();
+        let third = DrainingLock::take(&close, Path::new("/run/c/cm-1")).unwrap();
+        assert!(!left.exists());
+        assert!(second.path.exists());
+        drop((second, third));
+        assert_eq!(cleanup::keepers_running(&domain).unwrap(), 0);
+        assert!(DrainingLock::take(&root.path().join("gone/x.close"), Path::new("/c")).is_none());
     }
 
     /// A process's start tells it apart from one that takes its number

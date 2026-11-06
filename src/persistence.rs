@@ -1221,15 +1221,18 @@ pub(crate) fn mux_clients(control: &Path) -> Option<usize> {
     {
         // Read a line at a time: the table lists every Unix socket.
         use std::io::BufRead as _;
-        let table = std::io::BufReader::new(std::fs::File::open("/proc/net/unix").ok()?);
+        let mut table = std::io::BufReader::new(std::fs::File::open("/proc/net/unix").ok()?);
         let control = control.as_os_str().as_bytes();
         let (mut clients, mut listening) = (0, false);
-        for line in table.split(b'\n') {
-            match mux_socket(&line.ok()?, control) {
+        let mut line = Vec::new();
+        while table.read_until(b'\n', &mut line).ok()? > 0 {
+            let text = line.strip_suffix(b"\n").unwrap_or(&line);
+            match mux_socket(text, control) {
                 Some(MuxSocket::Client) => clients += 1,
                 Some(MuxSocket::Listener) => listening = true,
                 None => {}
             }
+            line.clear();
         }
         // A table that does not show the master listening, as in a sandbox
         // that hides it, says nothing about its clients either.
