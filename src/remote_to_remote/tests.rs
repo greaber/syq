@@ -1004,6 +1004,15 @@ fn the_coordinator_adds_only_what_its_own_configuration_needs() {
     ] {
         assert!(session.additions.contains(&option.to_owned()), "{option}");
     }
+    // A proxy means the host name is the host as the proxy sees it.
+    assert!(!connection.proxied);
+    for proxy in ["proxyjump gw.example.net", "proxycommand nc %h %p"] {
+        assert!(
+            ReceiverConnection::parse(&format!("{RECEIVER_CONFIG}{proxy}\n"))
+                .unwrap()
+                .proxied
+        );
+    }
     // An older ssh that reports none of them gets none of them.
     let old = ReceiverConnection::parse("hostname backup\nport 22\n").unwrap();
     assert!(old.additions.is_empty());

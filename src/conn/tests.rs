@@ -528,6 +528,67 @@ fn probes_skip_loopback_addresses_a_remote_host_advertises() {
         .candidates
         .iter()
         .any(|candidate| candidate.address == "127.0.0.1" && candidate.reachable == Some(true)));
+    // Through a proxy, `localhost` is the far side's own machine.
+    let stand_in = crate::test_support::tempdir().unwrap();
+    for (config, local) in [
+        ("hostname localhost\nport 22\n", true),
+        (
+            "hostname localhost\nport 22\nproxyjump gw.example.net\n",
+            false,
+        ),
+        (
+            "hostname localhost\nport 22\nproxycommand nc %h %p\n",
+            false,
+        ),
+    ] {
+        let ssh = stand_in.path().join("ssh");
+        crate::test_support::write_executable(
+            &ssh,
+            format!("#!/bin/sh\nprintf '{config}'\n"),
+            0o700,
+        );
+        spec.rsh = vec![ssh.display().to_string()];
+        spec.host = "relay-alias".into();
+        let probed = spec
+            .probe_tcp_addresses(vec![("127.0.0.1".into(), 0)], port, TCP_PROBE_FLOOR)
+            .unwrap();
+        assert_eq!(
+            probed
+                .candidates
+                .iter()
+                .any(|candidate| candidate.source == DataAddressSource::RemoteInterface),
+            local,
+            "{config}"
+        );
+    }
+}
+
+#[test]
+fn ssh_destinations_say_when_a_proxy_reaches_the_host() {
+    assert_eq!(
+        parse_ssh_destination("user backup\nhostname 10.0.0.5\nport 22\n"),
+        Some(SshDestination {
+            hostname: "10.0.0.5".into(),
+            direct: true,
+        })
+    );
+    for proxy in ["proxyjump gw.example.net", "proxycommand nc %h %p"] {
+        assert_eq!(
+            parse_ssh_destination(&format!("hostname localhost\n{proxy}\nport 22\n")),
+            Some(SshDestination {
+                hostname: "localhost".into(),
+                direct: false,
+            })
+        );
+    }
+    for none in ["proxyjump none", "proxycommand none"] {
+        assert!(
+            parse_ssh_destination(&format!("hostname localhost\n{none}\n"))
+                .unwrap()
+                .direct
+        );
+    }
+    assert_eq!(parse_ssh_destination("port 22\n"), None);
 }
 
 #[test]

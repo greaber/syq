@@ -856,6 +856,9 @@ pub(crate) struct ReceiverConnection {
     global: String,
     /// Whether the configuration sets a KnownHostsCommand of its own.
     known_hosts_command: bool,
+    /// Whether SSH reaches the destination through a ProxyJump or
+    /// ProxyCommand.
+    proxied: bool,
     /// Whether this ssh has KnownHostsCommand: OpenSSH 8.5, which also
     /// renamed PubkeyAcceptedKeyTypes.
     supports_known_hosts_command: bool,
@@ -1008,6 +1011,9 @@ impl ReceiverConnection {
             additions,
             global: value("globalknownhostsfile").unwrap_or("none").to_owned(),
             known_hosts_command: value("knownhostscommand").is_some_and(|value| value != "none"),
+            proxied: ["proxyjump", "proxycommand"]
+                .into_iter()
+                .any(|name| value(name).is_some_and(|value| value != "none")),
             supports_known_hosts_command: modern,
             accepted_algorithms: if modern {
                 "PubkeyAcceptedAlgorithms"
@@ -1304,6 +1310,7 @@ pub(crate) fn prepare_receiver_ssh_with(
         crate::conn::ReceiverHost {
             hostname: connection.hostname,
             approving,
+            proxied: connection.proxied,
         },
     ));
     let identity = command
