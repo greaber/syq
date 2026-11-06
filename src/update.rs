@@ -128,14 +128,17 @@ pub fn self_update() -> Result<()> {
                 "syq {} is already the newest release",
                 release.version
             );
-            switch_receiving(&receipt.binary);
+            // The image running now, never the receipt's spelling of it.
+            switch_receiving(&std::env::current_exe().context("locate the syq executable")?);
             return Ok(());
         }
         std::cmp::Ordering::Greater => {}
     }
-    install_release(&release, &receipt_path, &mut receipt)?;
+    let installed = install_release(&release, &receipt_path, &mut receipt)?;
     crate::output::command_println!("updated syq to {}", release.version);
-    switch_receiving(&receipt.binary);
+    // The file installation wrote, never the receipt's spelling of it, which
+    // may name another file by now.
+    switch_receiving(&installed);
     Ok(())
 }
 
@@ -874,7 +877,7 @@ fn install_release(
     release: &VerifiedRelease,
     receipt_path: &Path,
     receipt: &mut InstallReceipt,
-) -> Result<()> {
+) -> Result<PathBuf> {
     let target = Target::local().ok_or_else(|| {
         anyhow!(
             "standalone releases do not support {} {}",
@@ -915,7 +918,7 @@ fn install_release(
     sync_parent(parent)?;
     receipt.version = release.version.to_string();
     write_receipt(receipt_path, receipt)?;
-    Ok(())
+    Ok(executable)
 }
 
 fn release_downloads() -> Cow<'static, str> {

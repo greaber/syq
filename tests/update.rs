@@ -265,6 +265,44 @@ fn malformed_adjacent_receipt_names_its_path_and_shadows_legacy_receipt() {
     assert_eq!(fs::read(&adjacent).unwrap(), b"invalid JSON");
 }
 
+/// The receipt's spelling of the installed path can name another file by
+/// the time the update has installed: the switch that follows runs the file
+/// the update wrote. Here the receipt names a symlink, which the release's
+/// own program retargets while the update checks it.
+#[test]
+fn self_update_runs_the_installed_file_not_the_receipts_spelling_of_it() {
+    let release_version = next_release_version();
+    let elsewhere = TempDir::new();
+    let alias = elsewhere.path("alias");
+    let evil = elsewhere.path("evil");
+    let evil_ran = elsewhere.path("evil-ran");
+    let program = format!(
+        "#!/bin/sh\ncase \"$1\" in\n  --version) ln -sfn '{evil}' '{alias}'; echo 'syq {release_version}' ;;\n  --build-identity) echo 'v{release_version}' ;;\n  *) printf '%s\\n' \"$*\" >> \"$0.invocations\"; exit 2 ;;\nesac\n",
+        evil = evil.display(),
+        alias = alias.display(),
+    );
+    let fixture = UpdateFixture::with_program(&release_version, program.as_bytes());
+    fixture.register();
+    std::os::unix::fs::symlink(&fixture.installed, &alias).unwrap();
+    executable_support::write_executable(
+        &evil,
+        format!("#!/bin/sh\n: > '{}'\n", evil_ran.display()),
+        0o755,
+    );
+    let receipt_path = fixture.installed.with_file_name(".syq-install.json");
+    let mut receipt = fixture.receipt();
+    receipt["binary"] = alias.to_str().unwrap().into();
+    fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+
+    let update = fixture.command("--self-update");
+    assert_success(&update);
+    assert!(!evil_ran.exists(), "the receipt's spelling ran");
+    assert_eq!(
+        fs::read_to_string(fixture.installed.with_file_name("syq.invocations")).unwrap(),
+        "persist receive switch-outdated\n"
+    );
+}
+
 #[test]
 fn signed_self_update_replaces_only_the_receipted_copy() {
     let release_version = next_release_version();
