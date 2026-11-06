@@ -2361,7 +2361,7 @@ fn configure_profile(domain: &Domain, options: Configure) -> Result<Settings> {
         config.name = name;
     }
     if let Some(cwd) = options.cwd {
-        config.cwd = fs::canonicalize(cwd)?;
+        config.cwd = absolute_directory("--cwd", &cwd)?;
         anyhow::ensure!(config.cwd.is_dir(), "--cwd must name a directory");
         config.cwd_explicit = true;
     }
@@ -2369,7 +2369,7 @@ fn configure_profile(domain: &Domain, options: Configure) -> Result<Settings> {
         config.cwd_explicit = false;
     }
     if let Some(root) = options.root {
-        let root = fs::canonicalize(root)?;
+        let root = absolute_directory("--root", &root)?;
         anyhow::ensure!(root.is_dir(), "--root must name a directory");
         anyhow::ensure!(
             root.parent().is_some(),
@@ -2381,7 +2381,7 @@ fn configure_profile(domain: &Domain, options: Configure) -> Result<Settings> {
         config.root = None;
     }
     if let Some(root) = options.auto_approve_root {
-        let root = fs::canonicalize(root)?;
+        let root = absolute_directory("--auto-approve-root", &root)?;
         anyhow::ensure!(root.is_dir(), "--auto-approve-root must name a directory");
         config.auto_approve_root = Some(root);
     }
@@ -2425,6 +2425,14 @@ fn configure_profile(domain: &Domain, options: Configure) -> Result<Settings> {
     domain.enable()?;
     apply_preferences(domain, &preferences)?;
     Ok(config)
+}
+/// Save a directory option as the absolute path the receiver will enforce.
+/// The shell leaves `~` unexpanded after `--option=`, so expand it here.
+/// Symlinks are resolved: the receiver walks saved roots without following
+/// symlinks, so a root must name the directory itself.
+fn absolute_directory(option: &str, path: &Path) -> Result<PathBuf> {
+    let expanded = crate::fsops::resolve(path.as_os_str().as_bytes());
+    fs::canonicalize(&expanded).with_context(|| format!("{option} {}", path.display()))
 }
 fn configure(domain: &Domain, options: Configure) -> Result<()> {
     let connections = options.connection.clone();
