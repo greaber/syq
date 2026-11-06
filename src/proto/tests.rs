@@ -865,6 +865,15 @@ fn lz4_frames_cannot_declare_more_than_their_block_holds() {
         .contains("declares more data than its block can hold"));
 }
 
+fn charge<R: Read>(reader: &mut FrameReader<R>) {
+    reader.charge_expansion(crate::wire_budget::ExpansionCharge {
+        budget: std::sync::Arc::new(crate::wire_budget::ExpansionBudget::with_limit(
+            crate::wire_budget::EXPANSION_LIMIT,
+        )),
+        closed: Box::new(|| false),
+    });
+}
+
 #[test]
 fn charged_readers_hold_what_decompression_adds_with_each_message() {
     let data = vec![0u8; 4 << 20];
@@ -880,7 +889,7 @@ fn charged_readers_hold_what_decompression_adds_with_each_message() {
     for (bytes, body) in [(&lz4, lz4.len()), (&zstd, zstd.len())] {
         let body = body - local_preamble_len() - 5;
         let mut reader = FrameReader::new(bytes.as_slice());
-        reader.charge_expansion(Default::default());
+        charge(&mut reader);
         let message = reader.read_budgeted::<Response>().unwrap();
         assert_eq!(message.hold.expansion_bytes(), Some(payload.len() - body));
         assert!(
@@ -895,13 +904,15 @@ fn charged_readers_hold_what_decompression_adds_with_each_message() {
     // Uncompressed frames add nothing to charge.
     let raw = block_frame(data, false);
     let mut reader = FrameReader::new(raw.as_slice());
-    reader.charge_expansion(Default::default());
+    charge(&mut reader);
     let message = reader.read_budgeted::<Response>().unwrap();
     assert_eq!(message.hold.expansion_bytes(), None);
 }
 
+/// A body that is not one frame of a declared size is charged as much as
+/// the limit allows while it decodes, then only what it decoded to.
 #[test]
-fn zstd_bodies_without_one_declared_size_are_charged_up_to_the_limit() {
+fn zstd_bodies_without_one_declared_size_keep_only_what_they_decode_to() {
     let payload = postcard::to_stdvec(&block_message(vec![0; 64 << 10])).unwrap();
     let middle = payload.len() / 2;
     let mut concatenated = zstd::bulk::compress(&payload[..middle], 1).unwrap();
@@ -912,11 +923,11 @@ fn zstd_bodies_without_one_declared_size_are_charged_up_to_the_limit() {
     for body in [concatenated, unknown] {
         let bytes = raw_frame(&body, crate::compression::ZSTD);
         let mut reader = FrameReader::new(bytes.as_slice());
-        reader.charge_expansion(Default::default());
+        charge(&mut reader);
         let message = reader.read_budgeted::<Response>().unwrap();
         assert_eq!(
             message.hold.expansion_bytes(),
-            Some(MAX_FRAME - 1 - body.len())
+            Some(payload.len() - body.len())
         );
         assert_eq!(postcard::to_stdvec(&message.value).unwrap(), payload);
     }

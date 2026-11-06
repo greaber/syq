@@ -26,25 +26,61 @@ struct RequestReader {
     thread: Option<std::thread::JoinHandle<()>>,
     tcp_socket: Option<TcpStream>,
     named_socket: Option<std::os::unix::net::UnixStream>,
-    /// Ends the reader's wait for decompression memory once the connection
-    /// is being closed.
+    /// Ends the reader's wait for decompression memory once the server is
+    /// closing the connection.
     closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RequestReader {
     fn spawn<R: Read + Send + 'static>(
-        mut reader: FrameReader<R>,
+        reader: FrameReader<R>,
         tcp_socket: Option<TcpStream>,
         named_socket: Option<std::os::unix::net::UnixStream>,
         disconnected: Arc<std::sync::atomic::AtomicBool>,
         source_control: Option<Arc<crate::restricted::source::SourceAuthority>>,
         sweep: Option<SweepOnLoss>,
     ) -> std::io::Result<Self> {
+        Self::spawn_charged(
+            reader,
+            tcp_socket,
+            named_socket,
+            disconnected,
+            source_control,
+            sweep,
+            crate::wire_budget::ExpansionBudget::shared(),
+        )
+    }
+
+    fn spawn_charged<R: Read + Send + 'static>(
+        mut reader: FrameReader<R>,
+        tcp_socket: Option<TcpStream>,
+        named_socket: Option<std::os::unix::net::UnixStream>,
+        disconnected: Arc<std::sync::atomic::AtomicBool>,
+        source_control: Option<Arc<crate::restricted::source::SourceAuthority>>,
+        sweep: Option<SweepOnLoss>,
+        budget: Arc<crate::wire_budget::ExpansionBudget>,
+    ) -> std::io::Result<Self> {
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
         // Queued requests hold what decompression added to them, so a peer
-        // cannot make them hold far more than it sent.
+        // cannot make them hold far more than it sent. A frame waiting for
+        // room stops waiting when the server closes the connection, or when
+        // the peer of a TCP or socket connection hangs up.
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        reader.charge_expansion(closed.clone());
+        let peer: Option<std::os::fd::OwnedFd> = match (&tcp_socket, &named_socket) {
+            (Some(socket), _) => Some(socket.try_clone()?.into()),
+            (None, Some(socket)) => Some(socket.try_clone()?.into()),
+            (None, None) => None,
+        };
+        let closing = closed.clone();
+        reader.charge_expansion(crate::wire_budget::ExpansionCharge {
+            budget,
+            closed: Box::new(move || {
+                closing.load(std::sync::atomic::Ordering::Acquire)
+                    || peer
+                        .as_ref()
+                        .is_some_and(crate::bwlimit::transport::socket_closed)
+            }),
+        });
         let thread = std::thread::Builder::new().spawn(move || loop {
             let msg = reader.read_budgeted::<Request>();
             if let (Ok(request), Some(sweep)) = (&msg, &sweep) {
@@ -1431,7 +1467,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
             Err(_) => break,
         };
         drop(waiting);
-        let (mut req, _request_hold) = queued.into_parts();
+        let (mut req, mut request_hold) = queued.into_parts();
         // A connection with a streamed patch open carries nothing else
         // until the patch ends; closing the connection abandons it.
         if (ops.patch_stream_open()
@@ -1592,6 +1628,10 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 w.write_msg(&response)?;
             }
             Request::ReadStream(mut stream) => {
+                // The stream lasts until the client's Stop, which arrives on
+                // this connection: holding this request's decompression room
+                // until then could leave that Stop waiting for it.
+                request_hold.release_expansion();
                 if !is_source_worker {
                     w.write_msg(&Response::Err(
                         "read stream requires a source worker".into(),

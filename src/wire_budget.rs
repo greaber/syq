@@ -20,21 +20,21 @@ pub(crate) const EXPANSION_LIMIT: usize = 1 << 30;
 const EXPANSION_WAIT_CHECK: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
-struct ExpansionBudget {
+pub(crate) struct ExpansionBudget {
     used: Mutex<usize>,
     freed: Condvar,
     limit: usize,
 }
 
 impl ExpansionBudget {
-    fn shared() -> Arc<Self> {
+    pub(crate) fn shared() -> Arc<Self> {
         static BUDGET: OnceLock<Arc<ExpansionBudget>> = OnceLock::new();
         BUDGET
             .get_or_init(|| Arc::new(Self::with_limit(EXPANSION_LIMIT)))
             .clone()
     }
 
-    fn with_limit(limit: usize) -> Self {
+    pub(crate) fn with_limit(limit: usize) -> Self {
         Self {
             used: Mutex::new(0),
             freed: Condvar::new(),
@@ -55,16 +55,14 @@ impl Expansion {
     /// Wait until `bytes` fit, rather than fail: frames already held are
     /// being served and free their room as they finish. A reservation always
     /// fits when nothing else is held, so one frame larger than the limit
-    /// cannot wait forever. Give up once `closed` says the connection ended.
-    pub(crate) fn reserve(bytes: usize, closed: &dyn Fn() -> bool) -> io::Result<Self> {
-        Self::reserve_in(ExpansionBudget::shared(), bytes, closed)
-    }
-
-    fn reserve_in(
-        budget: Arc<ExpansionBudget>,
+    /// cannot wait forever. Give up once `closed` says the connection is
+    /// closing or its peer has hung up.
+    pub(crate) fn reserve(
+        budget: &Arc<ExpansionBudget>,
         bytes: usize,
         closed: &dyn Fn() -> bool,
     ) -> io::Result<Self> {
+        let budget = budget.clone();
         let mut used = budget.used.lock().unwrap();
         while *used > 0 && used.saturating_add(bytes) > budget.limit {
             if closed() {
@@ -83,6 +81,23 @@ impl Expansion {
         drop(used);
         Ok(Self { budget, bytes })
     }
+
+    /// Keep only `bytes` of the reservation, once a frame's decoded size is
+    /// known to need less than was reserved for it.
+    pub(crate) fn shrink_to(&mut self, bytes: usize) {
+        if bytes < self.bytes {
+            *self.budget.used.lock().unwrap() -= self.bytes - bytes;
+            self.bytes = bytes;
+            self.budget.freed.notify_all();
+        }
+    }
+}
+
+/// What a reader charges what decompression adds to: the allowance, and
+/// whether its connection is closing or its peer has hung up.
+pub(crate) struct ExpansionCharge {
+    pub(crate) budget: Arc<ExpansionBudget>,
+    pub(crate) closed: Box<dyn Fn() -> bool + Send>,
 }
 
 impl Drop for Expansion {
@@ -131,6 +146,12 @@ impl Hold {
     /// Keep a frame's decompression reservation until the message is dropped.
     pub(crate) fn keep(&mut self, expansion: Expansion) {
         self.expansion = Some(expansion);
+    }
+
+    /// Release the decompression reservation while keeping the message: for
+    /// a request whose handling outlives what decompression produced.
+    pub(crate) fn release_expansion(&mut self) {
+        self.expansion = None;
     }
 
     #[cfg(test)]
@@ -621,17 +642,17 @@ mod tests {
     fn expansion_waits_for_room_and_gives_up_when_the_connection_closes() {
         let budget = Arc::new(ExpansionBudget::with_limit(100));
         let open = || false;
-        let first = Expansion::reserve_in(budget.clone(), 60, &open).unwrap();
+        let first = Expansion::reserve(&budget, 60, &open).unwrap();
         // More than the limit fits when nothing else is held.
         let alone = Arc::new(ExpansionBudget::with_limit(100));
-        drop(Expansion::reserve_in(alone.clone(), 150, &open).unwrap());
+        drop(Expansion::reserve(&alone, 150, &open).unwrap());
         assert_eq!(*alone.used.lock().unwrap(), 0);
         // A second frame waits until the first is released.
         let (tx, rx) = std::sync::mpsc::channel();
         let waiting = {
             let budget = budget.clone();
             std::thread::spawn(move || {
-                let second = Expansion::reserve_in(budget, 60, &|| false).unwrap();
+                let second = Expansion::reserve(&budget, 60, &|| false).unwrap();
                 tx.send(()).unwrap();
                 second
             })
@@ -645,8 +666,25 @@ mod tests {
         let second = waiting.join().unwrap();
         assert_eq!(*budget.used.lock().unwrap(), 60);
         // A reader stops waiting once its connection has closed.
-        let error = Expansion::reserve_in(budget.clone(), 60, &|| true).unwrap_err();
+        let error = Expansion::reserve(&budget, 60, &|| true).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        // Shrinking a reservation hands the difference to a waiting reader.
+        let mut second = second;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiting = {
+            let budget = budget.clone();
+            std::thread::spawn(move || {
+                let third = Expansion::reserve(&budget, 50, &|| false).unwrap();
+                tx.send(()).unwrap();
+                third
+            })
+        };
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        second.shrink_to(10);
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("shrunk room was not handed on");
+        assert_eq!(*budget.used.lock().unwrap(), 60);
+        drop(waiting.join().unwrap());
         drop(second);
         assert_eq!(*budget.used.lock().unwrap(), 0);
     }

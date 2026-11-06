@@ -2534,9 +2534,8 @@ pub struct FrameReader<R: Read> {
     r: BufReader<R>,
     preamble_read: bool,
     limit: usize,
-    /// Set when what decompression adds is charged to the shared allowance
-    /// (`charge_expansion`): whether the connection has closed.
-    expansion: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Set when what decompression adds is charged (`charge_expansion`).
+    expansion: Option<crate::wire_budget::ExpansionCharge>,
 }
 
 impl<R: Read> FrameReader<R> {
@@ -2554,15 +2553,13 @@ impl<R: Read> FrameReader<R> {
         self.limit = limit.min(MAX_FRAME);
     }
 
-    /// Charge the bytes decompression adds to each frame to the process's
-    /// shared allowance before decompressing it, and keep them charged with
+    /// Charge the bytes decompression adds to each frame to an allowance
+    /// before decompressing it, and keep what it actually added charged with
     /// the decoded message. A frame that does not fit waits for room until
-    /// `closed` is set. Used where a peer's frames queue for this process.
-    pub(crate) fn charge_expansion(
-        &mut self,
-        closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) {
-        self.expansion = Some(closed);
+    /// the charge's `closed` says the connection is closing or its peer has
+    /// hung up. Used where a peer's frames queue for this process.
+    pub(crate) fn charge_expansion(&mut self, charge: crate::wire_budget::ExpansionCharge) {
+        self.expansion = Some(charge);
     }
 
     /// Room for what decompressing `body` into `decoded` bytes adds, when
@@ -2574,10 +2571,12 @@ impl<R: Read> FrameReader<R> {
     ) -> io::Result<Option<crate::wire_budget::Expansion>> {
         self.expansion
             .as_ref()
-            .map(|closed| {
-                crate::wire_budget::Expansion::reserve(decoded.saturating_sub(body.len()), &|| {
-                    closed.load(std::sync::atomic::Ordering::Acquire)
-                })
+            .map(|charge| {
+                crate::wire_budget::Expansion::reserve(
+                    &charge.budget,
+                    decoded.saturating_sub(body.len()),
+                    &*charge.closed,
+                )
             })
             .transpose()
     }
@@ -2714,6 +2713,7 @@ impl<R: Read> FrameReader<R> {
             .buffer(len - 1, flag[0] == 0 && T::recycle_frames());
         self.r.read_exact(&mut body)?;
         let mut expansion = None;
+        let body_len = body.len();
         let payload = if flag[0] == crate::compression::ZSTD {
             // Bound zstd's advertised window as well as its output. Level-1
             // frames from the released writer use windows below this ceiling.
@@ -2734,19 +2734,19 @@ impl<R: Read> FrameReader<R> {
                 Ok(Some(size)) => Some(size as usize),
                 _ => None,
             };
-            if let Some(size) = first {
-                output
-                    .try_reserve_exact(size.min(8 << 20))
-                    .map_err(io::Error::other)?;
-            }
             // A body of one frame decodes to the size it declares, which
             // the encoder always includes. Anything else is charged as much
-            // as the limit allows.
+            // as the limit allows until its decoded size is known.
             let declared = first.filter(|_| {
                 zstd::zstd_safe::find_frame_compressed_size(&body)
                     .is_ok_and(|len| len == body.len())
             });
             expansion = self.reserve_expansion(&body, declared.unwrap_or(self.limit - 1))?;
+            if let Some(size) = first {
+                output
+                    .try_reserve_exact(size.min(8 << 20))
+                    .map_err(io::Error::other)?;
+            }
             let mut chunk = [0u8; 16 << 10];
             loop {
                 let n = decoder.read(&mut chunk)?;
@@ -2779,7 +2779,9 @@ impl<R: Read> FrameReader<R> {
         };
         let payload_len = payload.len();
         let mut decoded = T::decode_frame(payload)?;
-        if let Some(expansion) = expansion {
+        if let Some(mut expansion) = expansion {
+            // Keep only what decompression actually added.
+            expansion.shrink_to(payload_len.saturating_sub(body_len));
             decoded.hold.keep(expansion);
         }
         if payload_len >= decoded.value.frame_limit() {
