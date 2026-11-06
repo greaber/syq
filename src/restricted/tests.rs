@@ -3103,6 +3103,7 @@ fn prepare_request(path: &Path) -> Request {
 
 fn finalize_request(path: &Path, condition: proto::TargetCondition) -> Request {
     Request::Finalize {
+        earlier_partials: false,
         expected_hash: None,
         path: path_bytes(path),
         inplace: false,
@@ -3838,6 +3839,196 @@ fn signed_skip_allows_seeding_and_retrying_a_new_file() {
     authority.settle(settlement, &response);
     assert_eq!(fs::read(&fresh).unwrap(), b"new");
     assert_eq!(fs::read(&candidate).unwrap(), b"new");
+}
+
+/// A publication the source says found earlier partials removes only the
+/// partials of the file it published that nothing writes: no other name,
+/// whatever the source claims, and nothing for a publication that fails.
+#[test]
+fn restricted_publication_removes_only_its_own_earlier_partials() {
+    // Whether or not the grant lets the copy delete: the cleanup is the
+    // ordinary copy's, not a deletion the grant controls.
+    for deletion in [
+        DeletionPolicy::Forbid,
+        DeletionPolicy::DeleteDestinationOnly,
+    ] {
+        publication_removes_only_its_own_earlier_partials(deletion);
+    }
+}
+
+fn publication_removes_only_its_own_earlier_partials(deletion: DeletionPolicy) {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(target.join("sub")).unwrap();
+    let fresh = target.join("fresh");
+    let kept = target.join("kept");
+    let candidate = target.join(".fresh.syq-tmp.abcdefghijklmnop");
+    let linked = target.join(".fresh.syq-tmp.bcdefghijklmnopq");
+    let kept_candidate = target.join(".kept.syq-tmp.abcdefghijklmnop");
+    let untouched = [
+        target.join("other"),
+        target.join(".other.syq-tmp.abcdefghijklmnop"),
+        target.join("sub/.fresh.syq-tmp.abcdefghijklmnop"),
+        target.join("link-of-partial"),
+        linked.clone(),
+        kept.clone(),
+        kept_candidate.clone(),
+    ];
+    for path in [
+        &candidate,
+        &kept_candidate,
+        &kept,
+        &untouched[0],
+        &untouched[1],
+        &untouched[2],
+    ] {
+        fs::write(path, b"old").unwrap();
+    }
+    fs::write(&linked, b"old").unwrap();
+    fs::hard_link(&linked, &untouched[3]).unwrap();
+    let mut authority = test_authority_with_existence(
+        &root,
+        deletion,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Skip,
+        DestinationPlacement::ExactPath,
+        RootExistence::Any,
+    )
+    .unwrap();
+    authority.copy.limits.max_entries = 64;
+    let mut ops = authority.test_ops();
+    let finalize = |path: &Path, inplace: bool| {
+        let mut request = finalize_request(path, proto::TargetCondition::Any);
+        if let Request::Finalize {
+            earlier_partials,
+            inplace: requested,
+            ..
+        } = &mut request
+        {
+            *earlier_partials = true;
+            *requested = inplace;
+        }
+        request
+    };
+
+    // A file the existing-object policy keeps is not published, and
+    // nothing beside it goes.
+    for path in [&kept, &fresh] {
+        let mut prepare = prepare_request(path);
+        let settlement = authority.authorize(&mut prepare, false).unwrap();
+        let response = ops.handle(&prepare);
+        authority.settle(settlement, &response);
+    }
+    let mut publish_kept = finalize(&kept, false);
+    let settlement = authority.authorize(&mut publish_kept, false).unwrap();
+    let response = ops.handle(&publish_kept);
+    assert!(
+        matches!(response, proto::Response::EndpointError(_)),
+        "{response:?}"
+    );
+    authority.settle(settlement, &response);
+    assert_eq!(fs::read(&kept_candidate).unwrap(), b"old");
+
+    // This grant writes no file in place, so the request is refused.
+    let mut in_place = finalize(&fresh, true);
+    assert!(authority.authorize(&mut in_place, false).is_err());
+    assert!(candidate.exists());
+
+    let mut seed = Request::SeedBasis {
+        final_ranges: None,
+        path: path_bytes(&fresh),
+        copy_id: [1; 16],
+        len: 3,
+        block: authority.copy.limits.hash_block_bytes,
+        attempt: 0,
+        clone_final: false,
+    };
+    let settlement = authority.authorize(&mut seed, false).unwrap();
+    let response = ops.handle(&seed);
+    authority.settle(settlement, &response);
+    let mut publish = finalize(&fresh, false);
+    let settlement = authority.authorize(&mut publish, false).unwrap();
+    let response = ops.handle(&publish);
+    authority.settle(settlement, &response);
+    assert_eq!(fs::read(&fresh).unwrap(), b"old");
+    #[cfg(target_os = "linux")]
+    let removable = crate::fsops::leases_trusted_on(&fs::File::open(&target).unwrap());
+    #[cfg(not(target_os = "linux"))]
+    let removable = false;
+    assert_eq!(candidate.exists(), !removable);
+    // The hard-linked name stays, so some remain either way.
+    assert!(
+        matches!(
+            response,
+            proto::Response::PublishedBesideEarlierPartials(None)
+        ),
+        "{response:?}"
+    );
+    for path in &untouched {
+        assert_eq!(fs::read(path).unwrap(), b"old", "{}", path.display());
+    }
+}
+
+/// A partial whose name may have been shortened to fit can be a longer
+/// file's: publishing the file its name starts with leaves it.
+#[test]
+fn restricted_publication_leaves_a_partial_whose_name_may_be_shortened() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let short = "n".repeat(229);
+    let fresh = target.join(&short);
+    let candidate = target.join(format!(".{short}.syq-tmp.abcdefghijklmnop"));
+    assert_eq!(candidate.file_name().unwrap().len(), 255);
+    fs::write(&candidate, b"old").unwrap();
+    let authority = existence_authority(
+        &root,
+        ExistingDestinationPolicy::Skip,
+        DestinationPlacement::ExactPath,
+        RootExistence::Any,
+    )
+    .unwrap();
+    let mut ops = authority.test_ops();
+    let mut prepare = prepare_request(&fresh);
+    let settlement = authority.authorize(&mut prepare, false).unwrap();
+    let response = ops.handle(&prepare);
+    assert!(matches!(&response, proto::Response::Prepared(prepared) if prepared.has_candidates));
+    authority.settle(settlement, &response);
+    let mut seed = Request::SeedBasis {
+        final_ranges: None,
+        path: path_bytes(&fresh),
+        copy_id: [1; 16],
+        len: 3,
+        block: authority.copy.limits.hash_block_bytes,
+        attempt: 0,
+        clone_final: false,
+    };
+    let settlement = authority.authorize(&mut seed, false).unwrap();
+    let response = ops.handle(&seed);
+    authority.settle(settlement, &response);
+    let mut publish = finalize_request(&fresh, proto::TargetCondition::Any);
+    if let Request::Finalize {
+        earlier_partials, ..
+    } = &mut publish
+    {
+        *earlier_partials = true;
+    }
+    let settlement = authority.authorize(&mut publish, false).unwrap();
+    let response = ops.handle(&publish);
+    authority.settle(settlement, &response);
+    assert!(
+        matches!(
+            response,
+            proto::Response::PublishedBesideEarlierPartials(None)
+        ),
+        "{response:?}"
+    );
+    assert_eq!(fs::read(&candidate).unwrap(), b"old");
 }
 
 #[test]
@@ -4988,6 +5179,7 @@ fn unfinished_in_place_files_are_reported_failed() {
         authority.settle(settlement, &proto::Response::Ok);
         if finished {
             let mut finalize = Request::Finalize {
+                earlier_partials: false,
                 expected_hash: None,
                 path: path_bytes(&image),
                 inplace: true,
@@ -5213,6 +5405,7 @@ fn in_place_final_step_honors_the_fingerprint_the_receiver_takes_after_the_write
             "{existing}: {written:?}"
         );
         let finalized = run(Request::Finalize {
+            earlier_partials: false,
             expected_hash: None,
             path: path_bytes(&image),
             inplace: true,
@@ -6276,6 +6469,7 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
         .authorize(&mut prepare("empty", 0), false)
         .unwrap();
     let mut publish_empty = Request::Finalize {
+        earlier_partials: false,
         expected_hash: None,
         path: root.join("target/empty").as_os_str().as_bytes().to_vec(),
         inplace: false,
@@ -6295,6 +6489,7 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
     authority.authorize(&mut publish_empty, false).unwrap();
     // A file this receiver does not hold for the grant cannot be published.
     let mut publish_foreign = Request::Finalize {
+        earlier_partials: false,
         expected_hash: None,
         path: root.join("target/foreign").as_os_str().as_bytes().to_vec(),
         inplace: false,
@@ -8775,6 +8970,7 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
                 data: data.into(),
             });
             receiver.send(Request::Finalize {
+                earlier_partials: false,
                 expected_hash: None,
                 path: path(name),
                 inplace,
@@ -8923,6 +9119,7 @@ fn only_an_ordinary_receiver_takes_a_senders_word_for_what_a_file_replaces() {
                 data: data.into(),
             });
             receiver.send(Request::Finalize {
+                earlier_partials: false,
                 expected_hash: None,
                 path: path("large"),
                 inplace: false,
@@ -9035,6 +9232,7 @@ fn both_receivers_write_only_files_they_created() {
         });
         assert_eq!(fs::read(target.join("existing")).unwrap(), b"old contents");
         receiver.send(Request::Finalize {
+            earlier_partials: false,
             expected_hash: None,
             path,
             inplace: true,
@@ -9158,6 +9356,7 @@ fn both_receivers_update_in_place_only_files_they_vouch_for() {
             data: data.clone().into(),
         };
         let finalize = |name: &str, inplace: bool| Request::Finalize {
+            earlier_partials: false,
             expected_hash: None,
             path: path(name),
             inplace,
@@ -9816,6 +10015,7 @@ fn both_receivers_restore_set_id_bits_after_writing_in_place() {
             data: data.clone().into(),
         });
         receiver.send(Request::Finalize {
+            earlier_partials: false,
             expected_hash: None,
             path,
             inplace: true,
@@ -9899,6 +10099,7 @@ fn both_receivers_limit_a_new_in_place_file_by_a_narrower_default_acl() {
             data: data.clone().into(),
         });
         receiver.send(Request::Finalize {
+            earlier_partials: false,
             expected_hash: None,
             path,
             inplace: true,

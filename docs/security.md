@@ -103,7 +103,9 @@ options only when you trust the source's settings.
 creates, only through files it created or opened itself. A symlink or hard
 link planted at a partial file's name is never followed or written into; syq
 replaces it with its own file. Syq resumes only from a partial file that is
-owned by the account running syq and has no other names, and only reads it. A
+owned by the account running syq and has no other names, and only reads it.
+Once it has published the file, it removes such a partial file when no program
+has it open for writing. A
 file swapped in during the copy gets none of the copy's
 data or metadata, and when syq detects the swap, it reports the file as failed
 instead of publishing it.
@@ -366,7 +368,11 @@ isolate them.
 Approving a copy permits the destination, overwrite policy, and limits of the
 command shown, and syq enforces them on every filesystem operation. Within
 those limits, the server can supply false contents, inspect destination
-entries during planning, and use disk space.
+entries during planning, and use disk space. Like any copy, it also removes
+syq's leftover partial files beside the files it writes, even when the copy
+may not otherwise delete; these are files named like
+`.FILENAME.syq-tmp.RANDOM` that are owned by you, have no other names, and that
+no program has open for writing.
 
 By default, copies start in your home directory and are not confined to it;
 `syq persist receive on --root DIRECTORY` confines them. Automatic approval

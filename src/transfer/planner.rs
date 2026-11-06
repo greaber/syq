@@ -1277,6 +1277,27 @@ impl Planner<'_> {
         if self.collision {
             return Ok(());
         }
+        if self.source_partials > 0 {
+            let mut payload = self
+                .progress
+                .partial_named_payload
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            payload.extend(
+                mapped
+                    .others
+                    .iter()
+                    .filter(|planned| {
+                        planned.e.kind == Kind::File
+                            && planned
+                                .dst
+                                .rsplit(|&byte| byte == b'/')
+                                .next()
+                                .is_some_and(|name| is_partial_name(OsStr::from_bytes(name)))
+                    })
+                    .map(|planned| planned.dst.clone()),
+            );
+        }
         self.inspect_destination_batch(&mut mapped)?;
         match &mut self.buffer {
             Some(buf) => buf.push(mapped),

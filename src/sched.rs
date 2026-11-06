@@ -139,6 +139,9 @@ pub struct Jobs {
     /// One bit for each job a worker has asked the destination to prepare
     /// (`first_preparation`).
     prepared: Vec<u64>,
+    /// One bit for each job whose first preparation found partials earlier
+    /// copies left for it (`found_earlier_partials`).
+    earlier_partials: Vec<u64>,
 }
 
 /// The device and inode of a destination file other names may share.
@@ -227,6 +230,24 @@ impl Jobs {
         let first = self.prepared[word] & bit == 0;
         self.prepared[word] |= bit;
         first
+    }
+
+    /// Record that job `idx`'s first preparation found partials earlier
+    /// copies left for it.
+    pub fn found_earlier_partials(&mut self, idx: usize) {
+        let (word, bit) = (idx / 64, 1u64 << (idx % 64));
+        if word >= self.earlier_partials.len() {
+            self.earlier_partials.resize(word + 1, 0);
+        }
+        self.earlier_partials[word] |= bit;
+    }
+
+    /// Whether job `idx`'s first preparation found partials earlier copies
+    /// left for it.
+    pub fn has_earlier_partials(&self, idx: usize) -> bool {
+        self.earlier_partials
+            .get(idx / 64)
+            .is_some_and(|word| word & (1u64 << (idx % 64)) != 0)
     }
 
     pub fn is_empty(&self) -> bool {

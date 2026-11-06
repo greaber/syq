@@ -1343,7 +1343,7 @@ fn automatic_ssh_restores_workers_for_a_single_file_partial() {
     assert_output_ok(&out);
     assert!(!stderr_of(&out).contains("connections remembered for this path"));
     assert_eq!(read(&t.path("dest/file")), content);
-    assert!(partial.exists());
+    assert_earlier_partial_removed_where_possible(&partial);
     let connected = fs::read_to_string(events)
         .unwrap()
         .lines()

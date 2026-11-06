@@ -296,9 +296,13 @@ Directories the first run created can keep temporary
 permissions; add `--copy-metadata=permissions,mtime` to the rerun to make them
 match the source.
 
-Partial files from an interrupted copy, and temporary files from one that was
-killed, can remain even after a successful rerun. Syq says how many files have
-them. To remove them:
+When a rerun finishes a file, it also removes the partial files that earlier
+copies left for it, as long as no other program has them open for writing. It
+can tell that only on Linux, on local filesystems such as ext4, XFS, Btrfs, ZFS
+and tmpfs. Elsewhere, such as on macOS or a network filesystem, or while
+another copy may still be writing them, it leaves them and says how many files
+have them. Temporary files from a copy that was killed can also remain beside
+files a local rerun copies whole. To remove leftovers:
 
 ```sh
 syq clean-partials --dry-run -v backup

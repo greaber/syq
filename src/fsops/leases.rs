@@ -118,13 +118,23 @@ mod linux {
         /// are disabled (`EINVAL`), or when no thread can be started to
         /// release broken leases.
         pub(in crate::fsops) fn take(file: &File) -> io::Result<Self> {
+            let poller = poller().ok_or_else(|| {
+                io::Error::other("no thread could be started to release broken leases")
+            })?;
+            let lease = Self::take_unwatched(file)?;
+            poller.watch(&lease.0);
+            Ok(lease)
+        }
+
+        /// Take a read lease that nothing releases when it is broken: an
+        /// open for writing waits until the holder releases or drops it, or
+        /// until the lease-break time has passed. For a step of a few system
+        /// calls, after which the holder releases it at once.
+        pub(in crate::fsops) fn take_unwatched(file: &File) -> io::Result<Self> {
             #[cfg(debug_assertions)]
             if std::env::var_os("SYQ_TEST_LEASES").is_some_and(|value| value == "refuse") {
                 return Err(io::Error::from_raw_os_error(libc::EACCES));
             }
-            let poller = poller().ok_or_else(|| {
-                io::Error::other("no thread could be started to release broken leases")
-            })?;
             let file = file.try_clone()?;
             let fd = file.as_raw_fd();
             // SAFETY: both calls only set fields of the open file behind a
@@ -135,12 +145,10 @@ mod linux {
             {
                 return Err(io::Error::last_os_error());
             }
-            let held = Arc::new(Held {
+            Ok(Self(Arc::new(Held {
                 file,
                 released: AtomicBool::new(false),
-            });
-            poller.watch(&held);
-            Ok(Self(held))
+            })))
         }
 
         /// The leased descriptor.

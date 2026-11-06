@@ -90,7 +90,10 @@ syq persist receive approve REQUEST_ID
 <a id="copy-permissions-and-limits"></a>
 
 By default, each copy can write at most 100 GiB and make at most one million
-changes, and it can't delete files. If you need to, change these and other
+changes, and it can't delete files, apart from syq's own leftover partial
+files beside the files it writes (see
+[Resume an interrupted copy](reference.md#resume-an-interrupted-copy)). If you
+need to, change these and other
 optional settings with `syq persist receive on` on your laptop:
 
 - `--max-bytes`, `--max-entries` and `--max-delete` change the limits; see

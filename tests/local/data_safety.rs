@@ -546,7 +546,8 @@ fn resume_accepts_pre_path_hash_partial_filename() {
         &t.s("dst"),
     ]);
     assert_eq!(read(&t.path("dst/file")), data);
-    assert_eq!(read(&partial), data);
+    // Once the file is published, the old partial goes as a current one does.
+    assert_earlier_partial_removed_where_possible(&partial);
     let records = fs::read_to_string(t.path("results")).unwrap();
     let result: serde_json::Value = serde_json::from_str(records.lines().last().unwrap()).unwrap();
     assert_eq!(result["bytes_transferred"], 0);

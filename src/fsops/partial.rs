@@ -527,6 +527,65 @@ impl FsOps {
             .collect()
     }
 
+    /// Once this copy has published `target`, remove the partials earlier
+    /// copies left for it that no copy is still writing, and return whether
+    /// any remain. A copy writes its partial only through the descriptor
+    /// that created it, held open for writing until publication (`stages`),
+    /// and never reopens a partial it no longer holds to write it. So a
+    /// partial that no process has open for writing is no longer any copy's
+    /// output, and is at most read as a donor, which works on through a
+    /// descriptor after its name is gone. On Linux a read lease shows that,
+    /// and only on the local filesystems where every write comes through
+    /// this kernel (`fs_caps::leases_show_writers`); a partial elsewhere, or
+    /// that another account owns, stays.
+    ///
+    /// A partial whose name may hold only the start of the name it was for
+    /// (`paths::partial_path_with_name_max`) stays too: it can be another,
+    /// longer-named file's.
+    pub(super) fn remove_earlier_partials(&mut self, target: &RootedTarget) -> bool {
+        let candidates = self.candidate_partials(target);
+        if candidates.is_empty() {
+            return false;
+        }
+        let shortened = may_be_shortened_partial(target);
+        let mut removed = Vec::new();
+        for candidate in &candidates {
+            let Ok(relative) = RelativePath::new(candidate) else {
+                continue;
+            };
+            if shortened(candidate) {
+                continue;
+            }
+            // A name that no longer holds a file counts as removed.
+            if remove_unwritten_partial(&target.root, &relative) {
+                removed.push(candidate);
+            }
+        }
+        let remain = candidates.len() > removed.len();
+        if !removed.is_empty() {
+            self.forget_partial_candidates(target, &removed);
+        }
+        remain
+    }
+
+    /// Drop `names` from the cached candidates of `target`'s directory.
+    fn forget_partial_candidates(&mut self, target: &RootedTarget, names: &[&PathBytes]) {
+        let Some((key, parent, basename)) = partial_directory(target) else {
+            return;
+        };
+        let Some(listed) = self
+            .partial_candidates
+            .get_mut(&key)
+            .and_then(|by_basename| by_basename.get_mut(&basename))
+        else {
+            return;
+        };
+        listed.retain(|name| {
+            let path = path_bytes(&parent.join(OsStr::from_bytes(name)));
+            !names.contains(&&path)
+        });
+    }
+
     fn set_copy_length(&self, file: &File, size: u64) -> io::Result<()> {
         if self.sparse {
             crate::sparse::set_len(file, size)
@@ -3895,6 +3954,7 @@ impl FsOps {
                 flags,
                 scanned,
                 condition,
+                earlier_partials,
             } => self
                 .finalize_expected(
                     expected_hash.as_ref(),
@@ -3906,7 +3966,18 @@ impl FsOps {
                     *scanned,
                     *condition,
                 )
-                .map(publication_response),
+                .map(|identity| {
+                    if *earlier_partials
+                        && !*inplace
+                        && self
+                            .destination_mutation_target(path)
+                            .is_ok_and(|target| self.remove_earlier_partials(&target))
+                    {
+                        Response::PublishedBesideEarlierPartials(identity)
+                    } else {
+                        publication_response(identity)
+                    }
+                }),
             Request::FileHash { path, source } => self.file_hash(path, source.as_ref()),
             Request::Canonicalize { path } => {
                 if self.destination_root.is_some() {
@@ -4362,6 +4433,103 @@ fn test_forced_mode() -> Option<u32> {
     u32::from_str_radix(value.to_str()?, 8)
         .ok()
         .map(|mode| mode & 0o777)
+}
+
+/// The directory whose partials `FsOps::candidate_partials` caches for
+/// `target`, that directory's path, and the name candidates are listed by.
+fn partial_directory(target: &RootedTarget) -> Option<(FileLocation, PathBuf, PathBytes)> {
+    let label = target.relative.to_path_buf();
+    let parent = label
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_path_buf();
+    let basename = label.file_name().unwrap_or_default().as_bytes().to_vec();
+    let relative = RelativePath::new(parent.as_os_str().as_bytes()).ok()?;
+    let key = FileLocation::Rooted {
+        root: target.root.identity(),
+        relative,
+    };
+    Some((key, parent, basename))
+}
+
+/// Whether a partial named `candidate`, found for `target`, may have had its
+/// name shortened to fit (`paths::partial_path_with_name_max`), so that the
+/// start of a longer name it was for reads as `target`'s. Such a name takes
+/// all of the room the writer had for it, but for at most the 3 bytes kept
+/// whole from a UTF-8 character. That room is the filesystem's limit for a
+/// name, 255 bytes on every filesystem whose partials are removed
+/// (`fs_caps::leases_show_writers`), or less when the destination's
+/// spelling uses most of `PATH_MAX`: what `target`'s spelling leaves is
+/// taken, and a partial named within 3 bytes of it may be shortened. A
+/// partial shortened under a longer spelling of its directory than
+/// `target`'s, one near `PATH_MAX` or since moved, is not recognized.
+fn may_be_shortened_partial(target: &RootedTarget) -> impl Fn(&[u8]) -> bool {
+    let parent = target
+        .label
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_path_buf();
+    let room = super::paths::path_component_budget(&parent, 255);
+    move |candidate: &[u8]| {
+        let name = candidate
+            .rsplit(|byte| *byte == b'/')
+            .next()
+            .unwrap_or(candidate);
+        name.len() + 3 >= room
+    }
+}
+
+/// Remove the partial at `relative` when no process has it open for writing,
+/// as `FsOps::remove_earlier_partials` explains, and return whether its name
+/// is now free. A partial that cannot be shown unwritten stays.
+///
+/// The lease is refused while anyone has the file open for writing, and is
+/// held until the name is removed: an open for writing that begins first is
+/// seen, as the lease's break, and the partial stays. One that begins after
+/// that check, as the name is removed, opens the removed file. Only a
+/// program that opens a partial by name to write it, which no current copy
+/// does, can do that.
+fn remove_unwritten_partial(root: &Root, relative: &RelativePath) -> bool {
+    let file = match root.open_regular_read(relative) {
+        Ok(file) => file,
+        Err(error) => return error_is_kind(&error, io::ErrorKind::NotFound),
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if !is_owned_partial(&metadata) {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if !super::fs_caps::leases_show_writers(&file) {
+            return false;
+        }
+        // Nothing releases this lease when it is broken: a writer's open
+        // waits for the release below.
+        let Ok(lease) = super::leases::ReadLease::take_unwatched(&file) else {
+            return false;
+        };
+        #[cfg(debug_assertions)]
+        if test_race_barrier(
+            "SYQ_TEST_EARLIER_PARTIAL_LEASED_READY_FILE",
+            "SYQ_TEST_EARLIER_PARTIAL_LEASED_CONTINUE_FILE",
+            "earlier partial leased",
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let removed = lease.intact()
+            && root.unlink_if_same_regular(relative, (metadata.dev(), metadata.ino()));
+        lease.release();
+        removed
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root;
+        false
+    }
 }
 
 /// Whether the open or create of the sidecar was refused because of what
