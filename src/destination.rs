@@ -1899,9 +1899,9 @@ pub(crate) enum Prepared {
     /// only once the service has taken over.
     Lost { needs_user: bool, error: String },
     /// It cannot start on this machine, as a newly started service could
-    /// not: its receiving directory is unavailable, the receiver's key cannot
-    /// be loaded, or its return socket cannot be made. Anything else that
-    /// stops it, such as failing to run ssh, is `Lost`.
+    /// not: its receiving directory is unavailable, or its return socket
+    /// cannot be made. Anything else that stops it is `Lost`: failing to run
+    /// ssh, or a receiver key that cannot be loaded, which every name shares.
     NotStarted,
 }
 
@@ -2176,7 +2176,9 @@ pub(crate) fn serve_background(
     if let Some(user) = &spec.endpoint.user {
         tcp_peer.rsh.extend(["-l".into(), user.clone()]);
     }
-    let identity_key = identity::load_key().inspect_err(not_started)?;
+    // Every name shares the receiver's key: one the new service cannot load
+    // would leave none receiving.
+    let identity_key = identity::load_key().inspect_err(lost)?;
     let secret = random_token().inspect_err(lost)?;
     let receiver = Arc::new(Receiver {
         tcp_peer,

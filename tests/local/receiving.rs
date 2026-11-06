@@ -4803,6 +4803,59 @@ fn a_new_service_that_cannot_run_ssh_does_not_take_over() {
     assert!(new.finish(false).success());
 }
 
+/// A new service that cannot load the receiver's key, which every
+/// receiving name shares, would receive as none of them: the switch leaves
+/// the old service receiving.
+#[test]
+fn a_new_service_that_cannot_load_the_receiver_key_does_not_take_over() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    assert_output_ok(&installed.persist(
+        syq,
+        &[
+            "receive",
+            "on",
+            "--name",
+            "laptop",
+            "--notify",
+            "off",
+            "--root",
+            &t.s("root"),
+            "--all-connections",
+        ],
+    ));
+    let keys = t.path("home/.syq-receiver-identity");
+    fs::create_dir_all(&keys).unwrap();
+    fs::set_permissions(&keys, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(keys.join("identity_ed25519"), b"not a key\n").unwrap();
+    fs::set_permissions(
+        keys.join("identity_ed25519"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let (control, spec) = handover_control(&installed);
+    let mut new = NewService::start(
+        &installed,
+        &control,
+        &spec,
+        None,
+        &t.path("no-server"),
+        |_| {},
+    );
+    let said: serde_json::Value = serde_json::from_str(&new.said()).unwrap();
+    assert_eq!(said["No"]["needs_user"], false, "{said}");
+    assert!(
+        said["No"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("receiver identity key"),
+        "{said}"
+    );
+    assert!(new.finish(false).success());
+}
+
 /// A request that begins waiting for approval while the new service logs
 /// in keeps an older service, which reports only such requests, running.
 #[test]
