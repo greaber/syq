@@ -1606,6 +1606,18 @@ fn a_destination_in_the_home_resolves_from_where_the_home_is() {
         confined.identity(),
         Root::open(&real_home.join("backup")).unwrap().identity()
     );
+    // So does the home itself.
+    let directly = ConfinedRoot::resolve(
+        home.join("archive").as_os_str().as_bytes(),
+        &[],
+        false,
+        Some((&home, &real_home)),
+    )
+    .unwrap();
+    assert_eq!(
+        directly.identity(),
+        Root::open(&real_home).unwrap().identity()
+    );
     // Without the home, the same path leads through a link.
     let error = ConfinedRoot::resolve(destination.as_os_str().as_bytes(), &[], false, None)
         .err()

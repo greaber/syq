@@ -504,6 +504,7 @@ impl ConfinedRoot {
             }
         } else {
             match home.and_then(|(named, real)| Some((parent.strip_prefix(named).ok()?, real))) {
+                Some((inside, home)) if inside.as_os_str().is_empty() => home.to_path_buf(),
                 Some((inside, home)) => home.join(inside),
                 None => parent.to_path_buf(),
             }
