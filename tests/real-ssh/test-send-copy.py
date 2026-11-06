@@ -138,13 +138,13 @@ for base in [["--root", "send-fixture/escape"], ["-C", "send-fixture/escape"], [
         _, text = copy([*base, *follow, "--src-non-dir", *named], "escaped", success=False)
         assert any(reason in text for reason in [
             "refusing to follow symlink", "outside its root",
-            "outside its confined root"]), (base, follow, text)
+            "outside its --root directory"]), (base, follow, text)
         run("ssh", "source", "test ! -e " + shlex.quote(server + "/escaped/secret"))
 
 print("case: the command's own --root still confines inside the receiving root", flush=True)
 _, text = copy(["--root", "send-fixture/sub", "--follow-src", "--src-non-dir", "sibling/config"],
                "sibling", success=False)
-assert "outside its confined root" in text, text
+assert "outside its --root directory" in text, text
 copy(["-C", "send-fixture/sub", "--follow-src", "--src-non-dir", "sibling/config"], "sibling")
 assert run("ssh", "source", "cat " + shlex.quote(server + "/sibling/config")) == "clusters: []\n"
 
