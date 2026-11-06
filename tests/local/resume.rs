@@ -306,12 +306,20 @@ fn a_writer_that_opens_the_partial_during_removal_keeps_it() {
     };
     // Once the open waits, the kernel lists the partial's lease as being
     // broken.
-    let inode = fs::metadata(&partial).unwrap().ino().to_string();
+    // `/proc/locks` names the file by device major and minor, in hex, and
+    // inode.
+    let status = fs::metadata(&partial).unwrap();
+    let dev = status.dev();
+    let (major, minor) = (
+        ((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0xfff),
+        ((dev >> 12) & 0xffff_ff00) | (dev & 0xff),
+    );
+    let file = format!("{major:02x}:{minor:02x}:{}", status.ino());
     let breaking = |line: &str| {
         let fields: Vec<&str> = line.split_whitespace().collect();
         fields.get(1) == Some(&"LEASE")
             && fields.get(2) == Some(&"BREAKING")
-            && fields.get(5).and_then(|device| device.rsplit(':').next()) == Some(inode.as_str())
+            && fields.get(5) == Some(&file.as_str())
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut next_progress = std::time::Instant::now() + std::time::Duration::from_secs(5);

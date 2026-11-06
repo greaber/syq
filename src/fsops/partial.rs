@@ -4460,7 +4460,9 @@ fn partial_directory(target: &RootedTarget) -> Option<(FileLocation, PathBuf, Pa
 /// name, 255 bytes on every filesystem whose partials are removed
 /// (`fs_caps::leases_show_writers`), or less when the destination's
 /// spelling uses most of `PATH_MAX`: what `target`'s spelling leaves is
-/// taken, and a partial named within 3 bytes of it may be shortened.
+/// taken, and a partial named within 3 bytes of it may be shortened. A
+/// partial shortened under a longer spelling of its directory than
+/// `target`'s, one near `PATH_MAX` or since moved, is not recognized.
 fn may_be_shortened_partial(target: &RootedTarget) -> impl Fn(&[u8]) -> bool {
     let parent = target
         .label
