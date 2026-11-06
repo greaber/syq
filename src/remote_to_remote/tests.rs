@@ -1349,8 +1349,7 @@ fn receiver_ssh_uses_the_entry_key_first_and_checks_host_keys_as_this_machine_do
     );
     args.rsh = Some(shell_words::join(&words));
     let error = prepare_receiver_ssh_with(&mut args, &revoking, entry_key.as_bytes())
-        .err()
-        .expect("a revocation that cannot be passed on refuses the copy");
+        .expect_err("a revocation that cannot be passed on refuses the copy");
     assert!(
         error
             .to_string()
