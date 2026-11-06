@@ -873,6 +873,29 @@ fn use_version_downloads_exact_release_and_reuses_it_offline() {
         .exists());
 }
 
+/// An access control list on the store that passes write access on to what
+/// is created there gives none to the store itself, but the release stored
+/// in it takes that access, so it is refused before it runs.
+#[test]
+#[cfg(target_os = "macos")]
+fn use_version_refuses_a_release_that_takes_an_acl_from_the_store() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    let store = fixture.stored("");
+    fs::create_dir_all(&store).unwrap();
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(Command::new("chmod")
+        .arg("+a")
+        .arg("everyone allow add_file,delete_child,file_inherit,directory_inherit,only_inherit")
+        .arg(&store)
+        .status()
+        .unwrap()
+        .success());
+    let output =
+        fixture.command_at_args(&fixture.installed, &["--use-version", "0.7.0", "--version"]);
+    assert_failure_contains(&output, "access control list");
+    assert!(output.stdout.is_empty(), "the stored release ran");
+}
+
 #[test]
 fn use_version_preserves_raw_arguments_environment_input_and_exit_status() {
     use std::os::unix::ffi::OsStringExt;

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import grp
 import gzip
 import hashlib
 import http.client
 import json
 import os
 import platform
+import pwd
 import stat
 import subprocess
 import tempfile
@@ -161,16 +163,34 @@ def _matches(path: Path, *, size: int, sha256: str) -> bool:
         return False
 
 
+def _private_group(gid: int, user: int) -> bool:
+    """Whether ``gid`` is the private group of account ``user``: its primary
+    group, named after it, with no other members, as made under a 002 umask
+    on systems that give every account a group of its own."""
+    try:
+        account = pwd.getpwuid(user)
+        group = grp.getgrgid(gid)
+    except KeyError:
+        return False
+    return (
+        gid == account.pw_gid
+        and group.gr_name == account.pw_name
+        and all(member == account.pw_name for member in group.gr_mem)
+    )
+
+
 def _private_install_dir(cache_root: Path, names: tuple[str, ...]) -> Path:
     """Create or check the directories from ``cache_root`` down to the
     install directory, so that no other account can replace the executable
     between its check and its use.
 
-    The cache root may be a symbolic link, and its group may write it, but it
-    must belong to this user or root, and only a sticky directory such as
-    ``/tmp`` may be writable by everyone. Each directory below must be a real
-    directory of this user's that group and others cannot write; one that an
-    older SDK created writable by its group is made private.
+    The cache root may be a symbolic link, but it must belong to this user or
+    root, and other accounts must not be able to replace what is in it: only
+    a sticky directory such as ``/tmp`` may be writable by them, and its
+    group may write it only when that is the user's own private group. Each
+    directory below must be a real directory of this user's that group and
+    others cannot write; one that an older SDK created writable by its group
+    is made private.
     """
     user = os.geteuid()
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
@@ -182,13 +202,24 @@ def _private_install_dir(cache_root: Path, names: tuple[str, ...]) -> Path:
         raise SyqInstallError(f"could not prepare syq SDK cache at {cache_root}") from error
     try:
         metadata = os.fstat(directory)
-        if metadata.st_uid not in (user, 0) or (
-            metadata.st_mode & 0o002 and not metadata.st_mode & stat.S_ISVTX
-        ):
+        if metadata.st_uid not in (user, 0):
             raise SyqInstallError(
-                f"the syq SDK cache {cache_root} must belong to you, and other "
-                "accounts may not write it"
+                f"the syq SDK cache {cache_root} belongs to another account; "
+                "use a cache directory of your own"
             )
+        if not metadata.st_mode & stat.S_ISVTX:
+            if metadata.st_mode & 0o002:
+                raise SyqInstallError(
+                    f"every account may write the syq SDK cache {cache_root}; "
+                    f"remove that permission (chmod o-w {cache_root}) or use "
+                    "another cache directory"
+                )
+            if metadata.st_mode & 0o020 and not _private_group(metadata.st_gid, user):
+                raise SyqInstallError(
+                    f"other members of its group may write the syq SDK cache "
+                    f"{cache_root}; remove their write permission (chmod g-w "
+                    f"{cache_root}) or use another cache directory"
+                )
         for name in names:
             path = path / name
             try:

@@ -213,6 +213,10 @@ else
     echo "syq: remote helper download needs curl or wget" >&2
     exit {remote_download_fallback_exit}
 fi
+if [ "$(printf ab | head -c 1 2>/dev/null)" != a ]; then
+    echo "syq: remote helper download needs head -c" >&2
+    exit {remote_download_fallback_exit}
+fi
 fetch() {{
     if [ "$downloader" = curl ]; then
         curl --fail --silent --show-error --location --connect-timeout 5 --max-time 30 --speed-limit 1024 --speed-time 10 --proto '=https' --proto-redir '=https' --output - "$1"

@@ -682,11 +682,18 @@ fn remote_download_write_failure_does_not_retry_with_upload() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     setup_release_bootstrap(&t);
+    // What writes the download answers the script's check, then fails to
+    // write, as on a full disk.
     executable(
-        &t.path("remote-bin/curl"),
+        &t.path("remote-bin/head"),
         br#"#!/bin/sh
-printf 'fetch\n' >> "$FAKE_CURL_LOG"
-exit 23
+if [ "$2" = 1 ]; then
+    printf a
+    exit 0
+fi
+cat > /dev/null
+echo "head: error writing: No space left on device" >&2
+exit 1
 "#,
     );
 

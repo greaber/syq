@@ -12,16 +12,26 @@ mod macos_xattrs;
 
 pub(crate) const MAX_INODE_METADATA: usize = 4 * 1024 * 1024;
 
+/// Whether `acl_lets_others_change` counts access given to a group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AclGroups {
+    /// Any account but this one counts.
+    Untrusted,
+    /// A group counts no more than group write in the mode does; only other
+    /// accounts and the group of every account count.
+    Trusted,
+}
+
 /// Whether an ACL lets an account other than this one change the file or
 /// directory at `path`, not following a final link, which its mode bits do
 /// not show on macOS. Linux ACLs show in the mode's group bits, so there
 /// this is always false.
-pub(crate) fn acl_lets_others_change(path: &std::path::Path) -> Result<bool> {
+pub(crate) fn acl_lets_others_change(path: &std::path::Path, groups: AclGroups) -> Result<bool> {
     #[cfg(target_os = "macos")]
-    return macos_acl::others_may_change(path);
+    return macos_acl::others_may_change(path, groups == AclGroups::Trusted);
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = path;
+        let _ = (path, groups);
         Ok(false)
     }
 }

@@ -364,13 +364,17 @@ fn follows_with_store(started_from: Option<&str>, store: Option<&Path>) -> Follo
         Follows::OtherFile
     }
 }
-/// Whether `path` is in the binary store at `store`, as spelled or resolved:
-/// the store may be a link to another disk.
+/// Whether `path` names a file in the binary store at `store`, as spelled or
+/// with its directory resolved: the store may be a link to another disk. A
+/// link elsewhere that leads into the store is not in it.
 fn in_store(path: &Path, store: &Path) -> bool {
+    let resolved = || {
+        let directory = std::fs::canonicalize(path.parent()?).ok()?;
+        Some(directory.join(path.file_name()?))
+    };
     path.starts_with(store)
-        || std::fs::canonicalize(store).is_ok_and(|store| {
-            std::fs::canonicalize(path).is_ok_and(|path| path.starts_with(store))
-        })
+        || std::fs::canonicalize(store)
+            .is_ok_and(|store| resolved().is_some_and(|path| path.starts_with(store)))
 }
 pub(crate) fn follows_other_file(started_from: Option<&str>) -> bool {
     follows(started_from) == Follows::OtherFile
@@ -393,18 +397,23 @@ pub(crate) fn check_runnable(path: &Path) -> Result<()> {
     use std::path::Component;
     let user = unsafe { libc::geteuid() };
     let trusted = |metadata: &std::fs::Metadata| metadata.uid() == user || metadata.uid() == 0;
-    // Whether every account may add entries to `directory`, after refusing
-    // it if one could replace them.
     // Whether an access control list lets other accounts change `path`,
-    // which mode bits do not show on macOS.
+    // which mode bits do not show on macOS. One for a group, such as the
+    // `admin` group of a Homebrew shared by several accounts, counts as
+    // group write does, unless it is the group of every account.
     let acl = |path: &Path| -> Result<()> {
         anyhow::ensure!(
-            !crate::inode_metadata::acl_lets_others_change(path)?,
+            !crate::inode_metadata::acl_lets_others_change(
+                path,
+                crate::inode_metadata::AclGroups::Trusted
+            )?,
             "{} has an access control list that lets other accounts change it",
             path.display()
         );
         Ok(())
     };
+    // Whether every account may add entries to `directory`, after refusing
+    // it if one could replace them.
     let directory = |directory: &Path| -> Result<bool> {
         let metadata = std::fs::metadata(directory)
             .with_context(|| format!("inspect {}", directory.display()))?;
@@ -1272,6 +1281,15 @@ mod tests {
             chmod(&["-N".as_ref(), changed.as_os_str()]);
             check_runnable(&path).unwrap();
         }
+        // An entry only for what is created there later changes nothing,
+        // and one for a group counts as group write: allowed here.
+        for entry in [
+            "everyone allow add_file,delete_child,file_inherit,directory_inherit,only_inherit",
+            "group:admin allow add_file,delete_child,file_inherit,directory_inherit",
+        ] {
+            chmod(&["+a".as_ref(), entry.as_ref(), bin.as_os_str()]);
+            check_runnable(&path).unwrap();
+        }
     }
 
     #[test]
@@ -1296,12 +1314,19 @@ mod tests {
             follows_with_store(Some(stored), Some(&link)),
             Follows::Nothing
         );
-        // An installed syq outside the store is still left alone.
+        // An installed syq outside the store is still left alone, and so is
+        // a link outside it that leads to a stored release.
         let installed = directory.path().join("bin/syq");
         std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
         script(&installed, "v99.0.0");
         assert_eq!(
             follows_with_store(Some(installed.to_str().unwrap()), Some(&store)),
+            Follows::OtherFile
+        );
+        let pinned = directory.path().join("bin/pinned");
+        std::os::unix::fs::symlink(stored, &pinned).unwrap();
+        assert_eq!(
+            follows_with_store(Some(pinned.to_str().unwrap()), Some(&store)),
             Follows::OtherFile
         );
     }

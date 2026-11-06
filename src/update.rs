@@ -512,7 +512,10 @@ pub(crate) fn stored_release(
             "is not a regular file"
         } else if metadata.mode() & 0o022 != 0 {
             "is writable by group or others"
-        } else if crate::inode_metadata::acl_lets_others_change(path)? {
+        } else if crate::inode_metadata::acl_lets_others_change(
+            path,
+            crate::inode_metadata::AclGroups::Untrusted,
+        )? {
             "has an access control list that lets others change it"
         } else {
             return Ok(true);
@@ -724,6 +727,12 @@ pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
     };
     let helper = helper_from_release(target, &release)?;
     let executable = stored_release_path(&store, &helper)?;
+    // What was just stored can have taken an access control list from the
+    // store's directories: check it as later runs will before running it.
+    if !crate::fsops::fixed_owners_and_modes(&store) {
+        stored_release(&store, &directory, &[MANIFEST_NAME, STORED_EXECUTABLE])
+            .with_context(|| format!("cannot start syq {version} from the binary store"))?;
+    }
     if stored.is_none() {
         verify_executable(&executable, &release)?;
         let temporary = TempFile::new(&directory, ".json")?;
@@ -959,8 +968,9 @@ fn install_release(
 }
 
 /// Lock `directory` until the returned file is dropped, waiting for
-/// another syq that holds it. Where the filesystem cannot lock, nothing is
-/// locked.
+/// another syq that holds it. Where the filesystem cannot lock a directory,
+/// as some network filesystems cannot, the update goes ahead unlocked, and
+/// says so.
 fn lock_directory(directory: &Path) -> Result<Option<File>> {
     use std::os::fd::AsRawFd;
     let file = File::open(directory).with_context(|| format!("open {}", directory.display()))?;
@@ -971,10 +981,20 @@ fn lock_directory(directory: &Path) -> Result<Option<File>> {
             Err(std::io::Error::last_os_error())
         }
     };
+    let failed = |error: std::io::Error| -> Result<Option<File>> {
+        if !locking_unsupported(&error) {
+            return Err(error).with_context(|| format!("lock {}", directory.display()));
+        }
+        crate::output::diagnostic!(
+            "syq: warning: cannot lock {} ({error}), so another syq update running at the same time could replace this one's result",
+            directory.display()
+        );
+        Ok(None)
+    };
     match lock(libc::LOCK_EX | libc::LOCK_NB) {
         Ok(()) => return Ok(Some(file)),
         Err(error) if error.raw_os_error() == Some(libc::EWOULDBLOCK) => {}
-        Err(_) => return Ok(None),
+        Err(error) => return failed(error),
     }
     crate::output::diagnostic!(
         "syq: waiting for another syq update in {} to finish",
@@ -984,9 +1004,25 @@ fn lock_directory(directory: &Path) -> Result<Option<File>> {
         match lock(libc::LOCK_EX) {
             Ok(()) => return Ok(Some(file)),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return Ok(None),
+            Err(error) => return failed(error),
         }
     }
+}
+
+/// Whether a failure to lock a directory means that its filesystem cannot
+/// lock one. NFS clients lock through a lock that needs a descriptor open
+/// for writing, which a directory cannot have, and fail with `EBADF`.
+fn locking_unsupported(error: &std::io::Error) -> bool {
+    error.raw_os_error().is_some_and(|code| {
+        [
+            libc::ENOLCK,
+            libc::EOPNOTSUPP,
+            libc::ENOTSUP,
+            libc::ENOSYS,
+            libc::EBADF,
+        ]
+        .contains(&code)
+    })
 }
 
 /// The version of the syq at `executable` now, if any. Unless another update
@@ -1897,6 +1933,35 @@ mod tests {
     }
 
     #[test]
+    fn updates_take_turns_with_the_install_directory_lock() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let held = lock_directory(dir.path()).unwrap();
+        assert!(held.is_some());
+        let path = dir.path().to_owned();
+        let (locked, waiting) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let lock = lock_directory(&path).unwrap();
+            locked.send(()).unwrap();
+            lock.is_some()
+        });
+        assert!(waiting.recv_timeout(Duration::from_millis(200)).is_err());
+        drop(held);
+        assert!(second.join().unwrap());
+        // Only a filesystem that cannot lock lets an update go ahead
+        // unlocked; any other failure stops it.
+        for code in [libc::ENOLCK, libc::EOPNOTSUPP, libc::EBADF] {
+            assert!(locking_unsupported(&std::io::Error::from_raw_os_error(
+                code
+            )));
+        }
+        for code in [libc::EIO, libc::EACCES, libc::EDEADLK] {
+            assert!(!locking_unsupported(&std::io::Error::from_raw_os_error(
+                code
+            )));
+        }
+    }
+
+    #[test]
     fn bounded_copies_fail_instead_of_truncating() {
         let mut output = Vec::new();
         assert_eq!(
@@ -2023,6 +2088,7 @@ mod tests {
         assert_eq!(check().unwrap(), StoredRelease::Complete);
         for (entry, path) in [
             ("everyone allow write", &executable),
+            ("group:staff allow write", &executable),
             ("everyone allow add_file,delete_child", &release),
         ] {
             chmod(&["+a".as_ref(), entry.as_ref(), path.as_os_str()]);
@@ -2031,6 +2097,14 @@ mod tests {
             chmod(&["-N".as_ref(), path.as_os_str()]);
             assert_eq!(check().unwrap(), StoredRelease::Complete);
         }
+        // An entry only for what is created later gives no access to the
+        // directories or to what they already hold.
+        let inherited =
+            "everyone allow add_file,delete_child,file_inherit,directory_inherit,only_inherit";
+        for directory in [&store, &release] {
+            chmod(&["+a".as_ref(), inherited.as_ref(), directory.as_os_str()]);
+        }
+        assert_eq!(check().unwrap(), StoredRelease::Complete);
     }
 
     #[test]

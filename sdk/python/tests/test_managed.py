@@ -150,15 +150,25 @@ class BootstrapTests(unittest.TestCase):
         with manifest_patch, target_patch, mock.patch.object(
             managed.urllib.request, "urlopen", download
         ):
-            # A cache root that every account can write, without the sticky
-            # bit, as another account could have made it.
-            self.cache.chmod(0o777)
-            with self.assertRaisesRegex(syq.SyqInstallError, "other accounts may not write"):
-                managed.managed_executable(cache_dir=self.cache)
-            # A sticky one such as /tmp is fine, as is one its group can write.
-            for mode in (0o1777, 0o770):
+            # A cache root that every account can write, or a group other
+            # than the user's own, without the sticky bit: it is refused, not
+            # changed.
+            for mode, private, refusal in [
+                (0o777, True, "chmod o-w"),
+                (0o770, False, "chmod g-w"),
+            ]:
                 self.cache.chmod(mode)
-                managed.managed_executable(cache_dir=self.cache)
+                with mock.patch.object(
+                    managed, "_private_group", return_value=private
+                ), self.assertRaisesRegex(syq.SyqInstallError, refusal):
+                    managed.managed_executable(cache_dir=self.cache)
+                self.assertEqual(self.cache.stat().st_mode & 0o7777, mode)
+            # The user's own private group may write it, and anyone may write
+            # a sticky one such as /tmp.
+            for mode, private in [(0o770, True), (0o1777, False), (0o1770, False), (0o755, False)]:
+                self.cache.chmod(mode)
+                with mock.patch.object(managed, "_private_group", return_value=private):
+                    managed.managed_executable(cache_dir=self.cache)
             self.cache.chmod(0o700)
             # A link in place of a directory below the root.
             python = self.cache / "syq" / "sdk" / "python"
@@ -168,6 +178,34 @@ class BootstrapTests(unittest.TestCase):
             with self.assertRaisesRegex(syq.SyqInstallError, "nobody else can write"):
                 managed.managed_executable(cache_dir=self.cache)
         self.assertEqual(download.call_count, 1)
+
+    def test_a_private_group_is_the_users_primary_group_named_after_it_alone(self) -> None:
+        account = mock.Mock(pw_name="alice", pw_gid=1000)
+        groups = {
+            1000: mock.Mock(gr_name="alice", gr_mem=[]),
+            1001: mock.Mock(gr_name="alice2", gr_mem=[]),
+            1002: mock.Mock(gr_name="staff", gr_mem=["alice"]),
+        }
+
+        def group(gid: int) -> mock.Mock:
+            return groups[gid]
+
+        with mock.patch.object(
+            managed.pwd, "getpwuid", return_value=account
+        ), mock.patch.object(managed.grp, "getgrgid", side_effect=group):
+            self.assertTrue(managed._private_group(1000, 501))
+            groups[1000].gr_mem = ["alice"]
+            self.assertTrue(managed._private_group(1000, 501))
+            groups[1000].gr_mem = ["alice", "bob"]
+            self.assertFalse(managed._private_group(1000, 501))
+            groups[1000].gr_mem = []
+            # Not the primary group, or named after someone else.
+            account.pw_gid = 1001
+            self.assertFalse(managed._private_group(1001, 501))
+            account.pw_gid = 1002
+            self.assertFalse(managed._private_group(1002, 501))
+            # A group with no entry.
+            self.assertFalse(managed._private_group(1003, 501))
 
     def test_directories_and_executable_others_could_change_are_not_trusted(self) -> None:
         manifest_patch, target_patch = self._patch_release()

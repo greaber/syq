@@ -387,10 +387,12 @@ pub(super) fn switch_when_idle(domain: &Domain) -> Result<()> {
     Ok(())
 }
 
-/// Replace an idle provider from another build that cannot follow updates
-/// by itself, as `receive_service::switch_outdated_now` does for receiving:
-/// one from before syq followed updates, or one a command run with
-/// `--use-version` started from a release in the binary store.
+/// Replace a provider from another build that cannot follow updates by
+/// itself, as `receive_service::switch_outdated_now` does for receiving:
+/// one a command run with `--use-version` started from a release in the
+/// binary store, replaced once idle, or one from before syq followed
+/// updates, which cannot say whether it is idle and is stopped at once,
+/// ending any request it is serving (`switch_when_idle`).
 pub(super) fn switch_outdated(domain: &Domain) -> Result<()> {
     let Some(state) = running(domain, ANSWER_TIMEOUT, || Control::Status)? else {
         return Ok(());
