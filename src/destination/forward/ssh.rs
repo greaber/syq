@@ -598,7 +598,11 @@ mod tests {
         let (mut request, _) = crate::destination::tests::request(&args);
         request.copy.options.compressed_transport = false;
         let request = constrain(request, &root.path().join("output"), 1024, 100, 0, false).unwrap();
-        let (authority, _) = crate::restricted::named_authority(root.path(), request).unwrap();
+        let (authority, _) = crate::restricted::named_authority(
+            &crate::restricted::Container::open(root.path()).unwrap(),
+            request,
+        )
+        .unwrap();
         let install_home = home.clone();
         // Replies can arrive before their handler threads finish. This test
         // exercises key scope, not the broker's admission limit.

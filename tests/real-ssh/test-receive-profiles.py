@@ -51,10 +51,11 @@ def wait_for(description, predicate, timeout=15):
     raise AssertionError(f"Timed out waiting for {description}: {last!r}; {state()}")
 
 
-def start_copy(name, target):
+def start_copy(name, target, *options):
     return subprocess.Popen(["ssh", "source", shlex.join([
         "syq", "cp", "/tmp/syq-real-ssh/return-source/message.txt", "--to", "@" + name,
-        "--as", target])], stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        "--as", target, *options])], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True)
 
 
 def pending(count):
@@ -154,7 +155,16 @@ with tempfile.TemporaryDirectory(prefix="syq-profiles-") as directory:
     finish(outside)
     assert (root / "approved-outside").read_bytes() == b"return\n"
     (inbox / "escape").symlink_to(root, target_is_directory=True)
-    escaped = start_copy("inbox", "escape/must-ask")
+    # As in any copy, a symlink above the destination stops the copy unless
+    # it passes --follow-dst, before anything is asked.
+    linked = start_copy("inbox", "escape/must-ask")
+    processes.append(linked)
+    out, err = linked.communicate(timeout=30)
+    assert linked.returncode != 0 and b'refusing to follow symlink "escape"' in err, (out, err)
+    assert json.loads(receive("pending", "--json").stdout) == []
+    # Followed, the link leads outside the automatic approval root, so the
+    # copy asks.
+    escaped = start_copy("inbox", "escape/must-ask", "--follow-dst")
     processes.append(escaped)
     receive("deny", pending(1)[0]["id"])
     finish(escaped, success=False)

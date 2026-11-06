@@ -317,22 +317,6 @@ impl Root {
         })
     }
 
-    /// Reopen a root for another process and reject path replacement.
-    pub(crate) fn open_verified(path: &Path, expected: RootIdentity) -> Result<Self> {
-        let root = Self::open(path)?;
-        if root.identity != expected {
-            bail!(
-                "confined root {} changed identity (expected {}:{}, found {}:{})",
-                path.display(),
-                expected.dev,
-                expected.ino,
-                root.identity.dev,
-                root.identity.ino
-            );
-        }
-        Ok(root)
-    }
-
     #[cfg(any(target_os = "linux", test))]
     fn mutation_permit(&self, path: &RelativePath) -> Result<directory_gate::Permit> {
         let (parents, _) = path.leaf()?;

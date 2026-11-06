@@ -66,7 +66,9 @@ syq exec --on @laptop --cwd work/project -- sh -c 'cargo build && ./target/debug
 
 Without `--cwd`, the command runs in the receiving profile's directory, which
 `syq persist receive status` shows. A relative `--cwd` is resolved from there,
-an absolute one is used as given, and `~` is not expanded. The command gets the
+an absolute one is used as given, and `~` is not expanded. The directory must
+already exist; the prompt shows it with symlinks and `..` resolved, and the
+command runs there. The command gets the
 environment of the receiving service on the laptop, including its `PATH`, not
 the server's; to change it, restart receiving from a terminal in the session you
 want. It has no terminal and no standard input.

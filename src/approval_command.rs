@@ -216,6 +216,12 @@ pub(crate) fn display_arg(arg: &[u8]) -> String {
     }
 }
 
+/// A name the server supplies, always quoted, with unusual bytes and control
+/// characters escaped, so that no name can read as a prompt's own text.
+pub(crate) fn quote_arg(arg: &[u8]) -> String {
+    format!("{:?}", OsStr::from_bytes(arg))
+}
+
 /// Displayed arguments, with customer-provided encryption keys in S3 headers
 /// replaced: prompts can persist in desktop notification history.
 pub(crate) fn display(command: &[Vec<u8>]) -> Vec<String> {

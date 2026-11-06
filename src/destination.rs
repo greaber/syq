@@ -934,7 +934,20 @@ fn rebase(path: &[u8], root: &Path) -> Result<Vec<u8>> {
 
 /// Resolve the operator's starting directory separately from containment. The
 /// final entry is not followed: replacing a symlink replaces the entry itself.
-fn resolve_destination(cwd: &Path, root: Option<&Path>, path: &[u8]) -> Result<(PathBuf, PathBuf)> {
+///
+/// As in a destination path an ordinary copy is given, a symlink in a
+/// directory above the destination stops the copy unless the command
+/// follows destination paths (`follow`). Relative paths start in `cwd`, and
+/// a path in the home directory, `home` as this account names it and where
+/// it really is, starts there: like the directory a login starts in, their
+/// own paths may lead through links.
+fn resolve_destination(
+    cwd: &Path,
+    root: Option<&Path>,
+    path: &[u8],
+    follow: bool,
+    home: Option<(&Path, &Path)>,
+) -> Result<(PathBuf, PathBuf)> {
     if path.len() > 4096 || path.contains(&0) {
         bail!("invalid receiving destination path");
     }
@@ -950,9 +963,21 @@ fn resolve_destination(cwd: &Path, root: Option<&Path>, path: &[u8]) -> Result<(
             .to_path_buf();
         return Ok((destination, container));
     }
-    let path = cwd.join(OsString::from_vec(path.to_vec()));
+    let requested = Path::new(std::ffi::OsStr::from_bytes(path));
+    // Where the walk starts, and the path from there.
+    let (mut destination, path) = match home
+        .filter(|_| !follow)
+        .and_then(|(named, real)| Some((real, requested.strip_prefix(named).ok()?)))
+    {
+        _ if follow => (PathBuf::new(), cwd.join(requested)),
+        _ if requested.is_relative() => (cwd.to_path_buf(), requested.to_path_buf()),
+        Some((home, inside)) => (home.to_path_buf(), inside.to_path_buf()),
+        None => (PathBuf::new(), requested.to_path_buf()),
+    };
     let components: Vec<_> = path.components().collect();
-    let mut destination = PathBuf::new();
+    // Without following, once a directory is missing so is what is below
+    // it, until `..` climbs back out.
+    let mut missing = false;
     for (index, component) in components.iter().enumerate() {
         use std::path::Component;
         match component {
@@ -960,10 +985,14 @@ fn resolve_destination(cwd: &Path, root: Option<&Path>, path: &[u8]) -> Result<(
             Component::CurDir => {}
             Component::ParentDir => {
                 destination.pop();
+                missing = false;
             }
             Component::Normal(name) => {
                 destination.push(name);
-                if index + 1 < components.len() {
+                if index + 1 == components.len() {
+                    continue;
+                }
+                if follow {
                     match fs::canonicalize(&destination) {
                         Ok(path) => {
                             if !path.is_dir() {
@@ -974,6 +1003,23 @@ fn resolve_destination(cwd: &Path, root: Option<&Path>, path: &[u8]) -> Result<(
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                         Err(e) => return Err(e.into()),
                     }
+                    continue;
+                }
+                if missing {
+                    continue;
+                }
+                match fs::symlink_metadata(&destination) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => bail!(
+                        "refusing to follow symlink {:?} in a path you gave; {}",
+                        name.to_string_lossy(),
+                        crate::rooted::OPERATOR_SYMLINK_FOLLOW_ADVICE
+                    ),
+                    Ok(metadata) if !metadata.is_dir() => {
+                        bail!("receiving path ancestor is not a directory")
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing = true,
+                    Err(e) => return Err(e.into()),
                 }
             }
             Component::Prefix(_) => unreachable!("Unix path"),
@@ -998,6 +1044,13 @@ fn resolve_destination(cwd: &Path, root: Option<&Path>, path: &[u8]) -> Result<(
         }
     }
     Ok((destination, container))
+}
+
+/// This account's home directory, as `HOME` names it and where it really is.
+pub(crate) fn home_directory() -> Option<(PathBuf, PathBuf)> {
+    let named = PathBuf::from(std::env::var_os("HOME")?);
+    let real = fs::canonicalize(&named).ok()?;
+    named.is_absolute().then_some((named, real))
 }
 
 /// Fit `request` within this machine's limits at `destination`, or refuse it.
@@ -1584,8 +1637,23 @@ impl Receiver {
                     )
                 })?;
                 crate::approval_command::check_copy(&command, &request, &self.name)?;
-                let (destination, mut container) =
-                    resolve_destination(&self.cwd, self.root.as_deref(), &request.destination)?;
+                // The command's own `--follow-dst` follows symlinks above
+                // the destination, as for any copy.
+                let follow =
+                    crate::approval_command::parse(&command)?.follows_native_destination_paths();
+                // Only a path resolved without following, outside a root,
+                // starts in the home.
+                let home = (self.root.is_none() && !follow)
+                    .then(home_directory)
+                    .flatten();
+                let (destination, mut container) = resolve_destination(
+                    &self.cwd,
+                    self.root.as_deref(),
+                    &request.destination,
+                    follow,
+                    home.as_ref()
+                        .map(|(named, real)| (named.as_path(), real.as_path())),
+                )?;
                 if self.root.as_ref() == Some(&destination)
                     && request.copy.policy.placement == DestinationPlacement::ExactPath
                 {
@@ -1633,6 +1701,10 @@ impl Receiver {
                         .context("automatic approval root must not be filesystem root")?
                         .to_path_buf();
                 }
+                // Every authority for this request works beneath the
+                // directory opened here, before the prompt: one whose name
+                // leads elsewhere by approval cannot redirect the copy.
+                let container = crate::restricted::Container::open(&container)?;
                 // Validate the complete operation before the local policy decision.
                 let (authority, approved) =
                     crate::restricted::named_authority(&container, request.clone())?;

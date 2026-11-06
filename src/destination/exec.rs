@@ -186,7 +186,19 @@ impl Receiver {
                 || self.generation.load(Ordering::Acquire) != generation
                 || requester_closed(&socket)
         };
-        let cwd = self.cwd.join(OsString::from_vec(request.cwd.clone()));
+        // The prompt shows the directory the command runs in, as this
+        // machine resolves the requested path now, symlinks and `..`
+        // included, and the command runs in that same directory.
+        let requested = self.cwd.join(OsString::from_vec(request.cwd.clone()));
+        let cwd = fs::canonicalize(&requested)
+            .ok()
+            .filter(|cwd| cwd.is_dir())
+            .with_context(|| {
+                format!(
+                    "the command's working directory {:?} is not a directory on the receiving machine",
+                    String::from_utf8_lossy(&request.cwd)
+                )
+            })?;
         // This is command authority, not the restricted copy executor. Root
         // and automatic download approval do not change a command's permission.
         self.approvals.request_command(
@@ -415,6 +427,67 @@ mod tests {
         );
         assert_eq!(stdout, b"finished\n");
         assert_eq!(stderr, b"diagnostic\n");
+    }
+
+    /// The prompt shows the real directory the requested one resolves to,
+    /// symlinks and `..` included, and the command runs there; a directory
+    /// that does not exist is refused before anything is asked.
+    #[test]
+    fn a_command_runs_in_the_directory_its_prompt_shows() {
+        let root = crate::test_support::tempdir().unwrap();
+        let base = root.path();
+        fs::create_dir_all(base.join("project/build")).unwrap();
+        fs::create_dir_all(base.join("elsewhere/inner")).unwrap();
+        fs::create_dir_all(base.join("elsewhere/build")).unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere/inner"), base.join("project/link"))
+            .unwrap();
+        let (_broker, receiver, registration, _) =
+            super::super::tests::broker(base, Approval::Always);
+        let mut command = request("printf done > marker");
+        command.cwd = b"project/./link/../build".to_vec();
+        let asking = registration.clone();
+        let task = std::thread::spawn(move || {
+            exchange(
+                &asking,
+                Message::Exec(command),
+                Duration::from_secs(5),
+                Some(Duration::from_secs(5)),
+            )
+        });
+        let summary = pending(&receiver);
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["cwd"], format!("{:?}", base.join("elsewhere/build")));
+        receiver
+            .approvals
+            .decide(&summary.id, true, Kind::Command)
+            .unwrap();
+        let (mut stream, reply) = task.join().unwrap().unwrap();
+        assert!(matches!(reply, Reply::Ready));
+        assert_eq!(
+            receive_output(&mut stream, &mut Vec::new(), &mut Vec::new()).unwrap(),
+            0
+        );
+        assert_eq!(
+            fs::read(base.join("elsewhere/build/marker")).unwrap(),
+            b"done"
+        );
+        assert!(!base.join("project/build/marker").exists());
+
+        let mut missing = request("printf done > marker");
+        missing.cwd = b"project/missing/../build".to_vec();
+        let error = exchange(
+            &registration,
+            Message::Exec(missing),
+            Duration::from_secs(5),
+            Some(Duration::from_secs(5)),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            format!("{error:#}").contains("is not a directory on the receiving machine"),
+            "{error:#}"
+        );
+        assert!(receiver.approvals.snapshots().is_empty());
     }
 
     #[test]

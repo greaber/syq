@@ -260,11 +260,36 @@ pub(crate) fn named_request(
     })
 }
 
+/// The directory a receiving machine's copy works beneath, opened once when
+/// the request arrives. Every authority made for the request, before and
+/// after its approval, uses this same directory, wherever its name leads
+/// by then.
+pub(crate) struct Container {
+    /// Where the directory was when it was opened, with symlinks resolved.
+    path: PathBuf,
+    directory: File,
+}
+
+impl Container {
+    /// Open the directory at `path`, its real location.
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOCTTY | libc::O_CLOEXEC)
+            .open(path)
+            .with_context(|| format!("open the receiving directory {}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            directory,
+        })
+    }
+}
+
 /// A fresh, in-memory authority made on the receiving machine after
 /// approval. It shares the restricted executor, but never reads or changes an
 /// enrollment, a record of used directives, or persistence preferences.
 pub(crate) fn named_authority(
-    root: &Path,
+    container: &Container,
     request: crate::destination::CopyRequest,
 ) -> Result<(
     std::sync::Arc<RestrictedAuthority>,
@@ -274,8 +299,6 @@ pub(crate) fn named_authority(
         bail!("copies a receiving machine approves do not follow destination symlinks");
     }
     let (_, home) = current_account()?;
-    let parent = root;
-    let metadata = fs::metadata(parent)?;
     let id = EnrollmentId::random();
     let request_id = RequestId::fresh(directive::now()?)?;
     let copy = request.copy;
@@ -288,12 +311,12 @@ pub(crate) fn named_authority(
     let executable = fs::canonicalize(std::env::current_exe()?)?;
     let home = fs::canonicalize(home)?;
     let protected = receiver_control_paths(&home, Some(&executable), ControlPaths::Here)?;
-    let confined = ConfinedRoot::opened(
-        parent,
-        RootIdentity {
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-        },
+    let confined = ConfinedRoot::held(
+        &container.path,
+        container
+            .directory
+            .try_clone()
+            .context("hold the receiving directory")?,
     )?;
     let approved = crate::destination::Approved {
         token: String::new(),

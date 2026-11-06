@@ -205,11 +205,48 @@ pub(super) fn server_receiving_state(
     vec![home.join(".syq-receiver-identity"), config, runtime]
 }
 
+/// The path this process's receiving service follows to notice updates
+/// (`receive_service::switch::Follower`), which it runs by itself when the
+/// file there changes.
+static FOLLOWED_PROGRAM: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Protect `path`, the syq a receiving service follows, from the copies
+/// this process receives, like the running executable's directory.
+pub(crate) fn protect_followed_program(path: &Path) {
+    let _ = FOLLOWED_PROGRAM.set(path.to_path_buf());
+}
+
+/// The directories holding `path` and, when it is a symlink, each name it
+/// leads through to the file, as named and where each really is:
+/// replacing any of these changes what a service following `path` runs.
+pub(super) fn program_directories(path: &Path) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    let mut current = path.to_path_buf();
+    // As many links as the kernel follows in one lookup.
+    for _ in 0..40 {
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        let real = fs::canonicalize(parent).ok();
+        for directory in std::iter::once(parent.to_path_buf()).chain(real) {
+            if !directories.contains(&directory) {
+                directories.push(directory);
+            }
+        }
+        match fs::read_link(&current) {
+            Ok(target) => current = parent.join(target),
+            Err(_) => break,
+        }
+    }
+    directories
+}
+
 /// The paths every receiver refuses to write, by name and by the identity
 /// each has in the session: the account's SSH configuration, syq's stored
 /// executables, enrollment state on both sides (including the directories
-/// released versions used), the receiving machine's approval state, and the
-/// directory of the running executable.
+/// released versions used), the receiving machine's approval state, the
+/// directory of the running executable, and the directories of the syq a
+/// receiving service follows.
 pub(super) fn receiver_control_paths(
     home: &Path,
     executable: Option<&Path>,
@@ -244,6 +281,15 @@ pub(super) fn receiver_control_paths(
                 .to_path_buf(),
             "receiver executable directory",
         ));
+    }
+    if machine == ControlPaths::Here {
+        if let Some(followed) = FOLLOWED_PROGRAM.get() {
+            protected.extend(
+                program_directories(followed)
+                    .into_iter()
+                    .map(|directory| (directory, "directory of the syq receiving runs")),
+            );
+        }
     }
     for directory in [
         ".syq-receive-v1",

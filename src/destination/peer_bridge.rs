@@ -314,8 +314,12 @@ impl Selection {
             args,
             crate::destination_results::ReceiptPolicy::for_recipient(recipient_public_key),
         )?;
-        let (child, approved) =
-            forward::peer_receiver(&peer_spec, request, Instant::now() + SETUP)?;
+        let (child, approved) = forward::peer_receiver(
+            &peer_spec,
+            request,
+            args.follows_native_destination_paths(),
+            Instant::now() + SETUP,
+        )?;
         let child = Arc::new(Mutex::new(Some(child)));
         let remaining = child.clone();
         let closed = Arc::new(AtomicBool::new(false));

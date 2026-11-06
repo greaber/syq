@@ -12,7 +12,7 @@ use crate::enrollment::{
     EnrollmentRoute, SshEndpoint,
 };
 use crate::proto::{self, Op, Request};
-use crate::rooted::{RelativePath, Root, RootIdentity, RootMetadata};
+use crate::rooted::{RelativePath, Root, RootMetadata};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};

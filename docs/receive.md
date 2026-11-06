@@ -122,7 +122,8 @@ Paths start in the same directory as downloads, and `~/` means your laptop's
 home directory; quote it (`'~/notes'`) so the server's shell leaves it alone.
 With `--root`, they must stay inside it: absolute paths, `~` and `..` are
 refused, and symlinks can't lead outside it. The prompt on your laptop shows
-the exact files the server asked for and that they will leave your laptop.
+the exact files the server asked for and that they will leave your laptop; a
+long list ends with how many more `syq persist receive pending` shows.
 Approving lets the server read just those files or directories for this one
 copy; nothing on your laptop is changed. Sending always asks, even with
 `--auto-approve-root`, which applies only to downloads.
