@@ -137,8 +137,8 @@ for base in [["--root", "send-fixture/escape"], ["-C", "send-fixture/escape"], [
         named = ["secret"] if base else ["send-fixture/escape/secret"]
         _, text = copy([*base, *follow, "--src-non-dir", *named], "escaped", success=False)
         assert any(reason in text for reason in [
-            "refusing symlink component", "outside its root",
-            "outside its confined root"]), (base, follow, text)
+            "refusing symlink component", "refusing to follow symlink",
+            "outside its root", "outside its confined root"]), (base, follow, text)
         run("ssh", "source", "test ! -e " + shlex.quote(server + "/escaped/secret"))
 
 print("case: the command's own --root still confines inside the receiving root", flush=True)
