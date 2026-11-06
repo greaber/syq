@@ -375,6 +375,10 @@ fn status_lists_a_closing_master_while_its_keeper_runs() {
     let snapshot = status(&domain).unwrap();
     assert_eq!(snapshot.rows.len(), 1);
     assert!(snapshot.rows[0].closing && !snapshot.rows[0].connected);
+    // Its keeper removed its scope and has yet to remove the record.
+    fs::remove_dir_all(record.control.parent().unwrap()).unwrap();
+    let snapshot = status(&domain).unwrap();
+    assert!(snapshot.rows.is_empty() && snapshot.errors.is_empty());
     drop(keeper);
     assert!(status(&domain).unwrap().rows.is_empty());
 }

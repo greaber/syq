@@ -775,7 +775,9 @@ pub(crate) fn status(domain: &Domain) -> Result<StatusSnapshot> {
             // keeper's lock says it still runs (`Drain`).
             let closing = !record.control.exists()
                 && keeper_lock_path(&path, &record.control).is_some_and(|lock| held(&lock));
-            if !closing && !record.control.exists() {
+            // A keeper ending removes its scope just before its record.
+            let scope_gone = record.control.parent().is_none_or(|scope| !scope.exists());
+            if (!closing && !record.control.exists()) || (closing && scope_gone) {
                 return Ok(None);
             }
             validate_record(domain, &record)?;
@@ -1225,8 +1227,6 @@ fn keeper(startup: Startup) -> Result<()> {
     // Released last, after the scope is removed and everything in it ended,
     // which `persist off` relies on (`keeper_lock_path`).
     let mut keeper_lock: Option<File> = None;
-    // The record of a closing master, removed before that lock is released.
-    let mut closing_record: Option<Index> = None;
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1335,6 +1335,9 @@ fn keeper(startup: Startup) -> Result<()> {
         .prefix("approved-")
         .tempdir_in(ensure_master_parent(&domain)?)?;
     crate::persistence::initialize_scope(scope.path())?;
+    // The record of a closing master, removed before the scope, and so
+    // before the keeper's lock: status never finds it without its scope.
+    let mut closing_record: Option<Index> = None;
     let endpoint = session.endpoint();
     let control = crate::persistence::prepare_endpoint(
         scope.path(),
