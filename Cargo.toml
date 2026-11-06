@@ -26,9 +26,9 @@ include = [
 [dependencies]
 bytes = "1"
 http-body = "1"
-aws-config = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "credentials-process", "sso"] }
+aws-config = { version = "1.13.0", default-features = false, features = ["rt-tokio", "default-https-client", "credentials-process", "sso"] }
 aws-runtime = { version = "1", default-features = false }
-aws-sdk-s3 = { version = "1.150.0", default-features = false, features = ["rt-tokio", "default-https-client"] }
+aws-sdk-s3 = { version = "1.157.0", default-features = false, features = ["rt-tokio", "default-https-client"] }
 aws-smithy-http-client = { version = "1", features = ["rustls-aws-lc"] }
 aws-smithy-runtime = { version = "1", default-features = false, features = ["client"] }
 aws-smithy-runtime-api = { version = "1.19.0", features = ["client"] }
@@ -115,7 +115,7 @@ cc = "1"
 tokio = { version = "1", features = ["test-util"] }
 libc = "0.2"
 serde_json = "1"
-jsonschema = { version = "0.58", default-features = false }
+jsonschema = { version = "0.60", default-features = false }
 
 # BLAKE3 uses C/NEON on ARM, unlike the x86 assembly backend. Keep it
 # optimized in debug/test builds so hashing does not dominate race-test waits.
