@@ -17,11 +17,18 @@ pub(super) struct HelperRequest {
     version: u16,
     identity: String,
     request: CopyRequest,
+    /// Whether the command follows symlinks in the destination path it
+    /// gives (`--follow-dst`), as an ordinary copy does. Without it, a
+    /// symlink above the destination stops the copy.
+    follow_dst: bool,
 }
 
+/// Start the receiver for `request` on the destination server, following
+/// symlinks above its destination when `follow_dst`.
 pub(super) fn peer_receiver(
     spec: &crate::conn::RemoteSpec,
     request: CopyRequest,
+    follow_dst: bool,
     deadline: Instant,
 ) -> Result<(ForwardChild, Approved)> {
     let (child, reply) = ForwardChild::over_spec(
@@ -31,6 +38,7 @@ pub(super) fn peer_receiver(
             version: HELPER_VERSION,
             identity: crate::identity::build().into(),
             request,
+            follow_dst,
         },
         deadline,
         &|| false,
@@ -1082,7 +1090,14 @@ impl<R: Read + AsRawFd> Read for HandshakeInput<R> {
     }
 }
 
-fn resolve_ssh_destination(home: &Path, path: &[u8]) -> Result<(PathBuf, PathBuf)> {
+/// Resolve `path` as an SSH login in the home directory would: `home` as
+/// `HOME` names it and where it really is. Symlinks above the destination
+/// are followed only when `follow` (`--follow-dst`).
+fn resolve_ssh_destination(
+    (named_home, home): (&Path, &Path),
+    path: &[u8],
+    follow: bool,
+) -> Result<(PathBuf, PathBuf)> {
     let relative;
     let path = if path == b"~" {
         b"."
@@ -1094,9 +1109,31 @@ fn resolve_ssh_destination(home: &Path, path: &[u8]) -> Result<(PathBuf, PathBuf
     } else {
         path
     };
-    // This receiver starts in the home and, holding no command, follows
-    // symlinks above the destination as it always has.
-    resolve_destination(home, None, path, true, None)
+    resolve_destination(home, None, path, follow, Some((named_home, home)))
+}
+
+/// Check `request` and set up the authority for its copy, starting in the
+/// home directory, `home` as `HOME` names it and where it really is.
+fn prepare_receiver(
+    request: HelperRequest,
+    home: (&Path, &Path),
+) -> Result<(Arc<crate::restricted::RestrictedAuthority>, Approved)> {
+    if request.version != HELPER_VERSION || request.identity != crate::identity::build() {
+        bail!("return helper build mismatch");
+    }
+    let (destination, container) =
+        resolve_ssh_destination(home, &request.request.destination, request.follow_dst)?;
+    let request = constrain(
+        request.request,
+        &destination,
+        crate::delegation::MAX_COPY_BYTES,
+        crate::delegation::MAX_ENTRIES,
+        // The laptop applied its own deletion limit, and refused a
+        // pruning dry run where pruning is off, before forwarding.
+        u64::MAX,
+        false,
+    )?;
+    crate::restricted::named_authority(&crate::restricted::Container::open(&container)?, request)
 }
 
 fn receive() -> Result<i32> {
@@ -1117,25 +1154,9 @@ fn receive() -> Result<i32> {
             },
             |input| input.deadline = started + super::LARGE_MESSAGE_TIMEOUT,
         )?;
-        if request.version != HELPER_VERSION || request.identity != crate::identity::build() {
-            bail!("return helper build mismatch");
-        }
-        let cwd = fs::canonicalize(std::env::var_os("HOME").context("HOME is unset")?)?;
-        let (destination, container) = resolve_ssh_destination(&cwd, &request.request.destination)?;
-        let request = constrain(
-            request.request,
-            &destination,
-            crate::delegation::MAX_COPY_BYTES,
-            crate::delegation::MAX_ENTRIES,
-            // The laptop applied its own deletion limit, and refused a
-            // pruning dry run where pruning is off, before forwarding.
-            u64::MAX,
-            false,
-        )?;
-        crate::restricted::named_authority(
-            &crate::restricted::Container::open(&container)?,
-            request,
-        )
+        let named_home = PathBuf::from(std::env::var_os("HOME").context("HOME is unset")?);
+        let home = fs::canonicalize(&named_home)?;
+        prepare_receiver(request, (&named_home, &home))
     })();
     let (authority, approved) = match setup {
         Ok(value) => value,
@@ -1514,23 +1535,17 @@ mod tests {
     fn ssh_destinations_expand_only_a_leading_home_tilde() {
         let root = crate::test_support::tempdir().unwrap();
         let home = fs::canonicalize(root.path()).unwrap();
-        for path in [b"~/archive".as_slice(), b"~//archive", b"archive"] {
-            assert_eq!(
-                resolve_ssh_destination(&home, path).unwrap().0,
-                home.join("archive")
-            );
-        }
-        assert_eq!(resolve_ssh_destination(&home, b"~").unwrap().0, home);
-        assert_eq!(
-            resolve_ssh_destination(&home, b"./~/archive").unwrap().0,
-            home.join("~/archive")
-        );
-        assert_eq!(
-            resolve_ssh_destination(&home, b"~someone/archive")
+        let resolved = |path: &[u8]| {
+            resolve_ssh_destination((&home, &home), path, false)
                 .unwrap()
-                .0,
-            home.join("~someone/archive")
-        );
+                .0
+        };
+        for path in [b"~/archive".as_slice(), b"~//archive", b"archive"] {
+            assert_eq!(resolved(path), home.join("archive"));
+        }
+        assert_eq!(resolved(b"~"), home);
+        assert_eq!(resolved(b"./~/archive"), home.join("~/archive"));
+        assert_eq!(resolved(b"~someone/archive"), home.join("~someone/archive"));
         // The shared named resolver still interprets paths relative to cwd.
         assert_eq!(
             resolve_destination(&home, None, b"~/archive", false, None)
@@ -1538,6 +1553,55 @@ mod tests {
                 .0,
             home.join("~/archive")
         );
+    }
+
+    /// A copy over an approved account connection treats a symlink above its
+    /// destination as an ordinary copy does: it stops the copy unless the
+    /// command passes `--follow-dst`, and then the copy goes where it leads.
+    #[test]
+    fn account_connection_receivers_follow_destination_links_only_when_asked() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let temp = fs::canonicalize(temp.path()).unwrap();
+        let home = temp.join("home");
+        let outside = temp.join("outside");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join("link")).unwrap();
+        let request = |destination: &str, follow_dst: bool| HelperRequest {
+            version: HELPER_VERSION,
+            identity: crate::identity::build().into(),
+            request: crate::destination::tests::request(&crate::destination::tests::args(
+                &temp.join("source"),
+                destination,
+            ))
+            .0,
+            follow_dst,
+        };
+        for destination in ["link/sub", "~/link/sub"] {
+            let error = prepare_receiver(request(destination, false), (&home, &home))
+                .err()
+                .unwrap();
+            assert!(
+                format!("{error:#}")
+                    .contains("refusing to follow symlink \"link\" in a path you gave"),
+                "{destination}: {error:#}"
+            );
+            let (_, approved) =
+                prepare_receiver(request(destination, true), (&home, &home)).unwrap();
+            assert_eq!(
+                approved.destination,
+                outside.join("sub").as_os_str().as_bytes()
+            );
+        }
+        // A destination in the home needs nothing more.
+        let (_, approved) = prepare_receiver(request("inbox", false), (&home, &home)).unwrap();
+        assert_eq!(
+            approved.destination,
+            home.join("inbox").as_os_str().as_bytes()
+        );
+        // The flag travels with the request.
+        let json = serde_json::to_value(request("inbox", true)).unwrap();
+        assert_eq!(json["follow_dst"], true);
     }
 
     #[test]
