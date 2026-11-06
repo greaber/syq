@@ -26,8 +26,10 @@ fn receiver_state(id: EnrollmentId) -> Result<(PathBuf, ReceiverEnrollment)> {
 const UNVERIFIED_SESSIONS: usize = crate::conn::MAX_CONCURRENT_CONNECTS;
 /// How long a session has to send its first frame.
 const ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
-/// The largest first frame a session may send.
-const MAX_ADMISSION_BYTES: usize = crate::directive::MAX_SIGNED_BYTES + 64;
+/// The largest first frame a session may send: a coordinating source's two
+/// directives and the destination's entry key.
+const MAX_ADMISSION_BYTES: usize =
+    2 * crate::directive::MAX_SIGNED_BYTES + crate::remote_to_remote::MAX_ENTRY_KEY_BYTES + 1024;
 
 /// The first frame of every session an entry key starts, before any other
 /// byte. The command a client asks sshd for is only data: the line's forced
@@ -38,6 +40,39 @@ pub(crate) enum Admission {
     Copy(Vec<u8>),
     /// Join a running copy as an SSH worker, with its ticket.
     Worker(String),
+    /// Run a copy from this account to another server's receiver, as the
+    /// copy's coordinator.
+    Coordinate(Box<Coordinate>),
+}
+
+/// A copy between two servers that this account's receiver coordinates.
+/// After the frame, the session's input carries the copy's mapping, if its
+/// directive names one, and then nothing more until the requester ends.
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Coordinate {
+    /// This enrollment's signed directive.
+    pub source: Vec<u8>,
+    /// The destination's signed directive, which its own receiver verifies.
+    pub destination: Vec<u8>,
+    /// The destination's entry key, which only starts its receiver.
+    pub entry_key: Vec<u8>,
+    /// Marks the lines of the coordinator's output that carry its results,
+    /// for the requester.
+    pub results_token: String,
+    /// The requester's terminal width, when it shows progress.
+    pub progress_width: Option<u16>,
+}
+
+impl Drop for Coordinate {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.entry_key);
+    }
+}
+
+impl fmt::Debug for Coordinate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Coordinate").finish_non_exhaustive()
+    }
 }
 
 impl Admission {
@@ -190,6 +225,21 @@ pub(crate) enum Session {
     /// This session's input and output were handed to the running copy its
     /// worker ticket names, which has served them.
     Worker,
+    /// Run the copy a verified directive for this account as a coordinating
+    /// source allows.
+    Coordinate(Box<Coordinating>),
+}
+
+/// A verified copy that this account's receiver coordinates.
+pub(crate) struct Coordinating {
+    /// The signed command, with the ignore rules it read from files.
+    pub args: crate::cli::Args,
+    pub peer: crate::directive::Peer,
+    /// The approving machine's limits.
+    pub caps: Option<crate::directive::Caps>,
+    /// The size and digest of the mapping the session's input carries.
+    pub mapping: Option<crate::mapping::Authorization>,
+    pub frame: Box<Coordinate>,
 }
 
 /// Admit a session of the forced command of syq's line,
@@ -233,7 +283,77 @@ pub(crate) fn admit_session(enrollment: &str, generation: &str) -> Result<Sessio
             &directive,
             slot,
         )?)),
+        Admission::Coordinate(frame) => Ok(Session::Coordinate(admit_coordinator(
+            &state,
+            &config,
+            (generation, crate::identity::build()),
+            frame,
+            slot,
+        )?)),
     }
+}
+
+/// Admit a coordinating source's directive, and the destination's directive
+/// presented with it: verified as [`admit`] verifies a destination's, and
+/// recorded as used only when the destination's is the one approved with
+/// it. The session's `slot` is released once it is verified.
+fn admit_coordinator(
+    state: &Path,
+    config: &ReceiverEnrollment,
+    (generation, build): (u64, &str),
+    frame: Box<Coordinate>,
+    slot: UnverifiedSlot,
+) -> Result<Box<Coordinating>> {
+    let observed_state = fs::symlink_metadata(state).context("inspect receiver enrollment")?;
+    let (_, home) = current_account()?;
+    if !crate::destination_results::relay::valid_token(&frame.results_token) {
+        bail!("invalid results token");
+    }
+    if frame.entry_key.len() > crate::remote_to_remote::MAX_ENTRY_KEY_BYTES {
+        bail!("the destination's entry key is too long");
+    }
+    crate::restricted::parse_entry_key(&frame.entry_key)?;
+    let destination = crate::directive::Signed::decode(&frame.destination)
+        .context("decode the destination's directive")?
+        .directive;
+    let (coordinating, verified) = verify_with(
+        state,
+        config,
+        (generation, build),
+        &frame.source,
+        |source| {
+            let mut args = crate::directive::coordination(source, &destination)?;
+            // The ignore rules the command read from files, which this
+            // machine cannot read.
+            args.ignore_lines = source.inputs.ignore.clone();
+            let crate::directive::Role::CoordinatingSource(peer) = &source.binding.role else {
+                unreachable!("coordination checks the role");
+            };
+            Ok((
+                args,
+                peer.clone(),
+                source.caps,
+                source.inputs.mapping.clone(),
+            ))
+        },
+    )?;
+    drop(slot);
+    let (args, peer, caps, mapping) = coordinating;
+    // Revocation and the copy's finish-by time end this receiver and the
+    // coordinator it runs, which stays in its process group.
+    active::watch(
+        &home,
+        state,
+        (observed_state.dev(), observed_state.ino()),
+        verified.execution_deadline,
+    )?;
+    Ok(Box::new(Coordinating {
+        args,
+        peer,
+        caps,
+        mapping,
+        frame,
+    }))
 }
 
 /// Admit a new copy's directive and set up its authority: refused by a
@@ -293,6 +413,19 @@ pub(super) fn verify(
     directive: &[u8],
     home: &Path,
 ) -> Result<((Grant, GrantConstraints), delegation::VerifiedDirective)> {
+    verify_with(state, config, (generation, build), directive, |directive| {
+        crate::directive::destination_rules(directive, home)
+    })
+}
+
+/// Verify a directive as [`verify`] does, deriving with `derive`.
+fn verify_with<T>(
+    state: &Path,
+    config: &ReceiverEnrollment,
+    (generation, build): (u64, &str),
+    directive: &[u8],
+    derive: impl FnOnce(&crate::directive::Directive) -> Result<T>,
+) -> Result<(T, delegation::VerifiedDirective)> {
     require_current_receiver(config, generation, build)?;
     let replay = delegation::ReplayStore::open(&state.join("replay")).with_context(|| {
         format!(
@@ -311,9 +444,7 @@ pub(super) fn verify(
         },
         clock_skew_seconds: CLOCK_SKEW_SECONDS,
     };
-    delegation::verify_and_redeem(directive, &context, &config.signer, &replay, |directive| {
-        crate::directive::destination_rules(directive, home)
-    })
+    delegation::verify_and_redeem(directive, &context, &config.signer, &replay, derive)
 }
 
 /// A connection started from an older line still runs the forced command it

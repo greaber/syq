@@ -102,6 +102,25 @@ impl std::fmt::Display for Requester {
 pub(crate) struct Remote<'a> {
     pub target: &'a str,
     pub enrollment: crate::restricted::EnrollmentState,
+    /// For a copy between two other servers, the source, which runs the
+    /// copy, and what approving it sets up there first.
+    pub source: Option<(&'a str, crate::restricted::EnrollmentState)>,
+}
+
+/// What approving a copy sets up on `target` before it starts, after the
+/// copy's own `permission`.
+fn setup_text(target: &str, enrollment: crate::restricted::EnrollmentState) -> String {
+    match enrollment {
+        crate::restricted::EnrollmentState::Missing => format!(
+            "Also sets up restricted copying on {target:?}: adds a key to its ~/.ssh/authorized_keys that can only start syq's receiver for copies you approve, and installs syq {} in ~/.local/lib/syq. Remove it with `syq receiver revoke`",
+            crate::identity::build()
+        ),
+        crate::restricted::EnrollmentState::Outdated => format!(
+            "Also updates restricted copying on {target:?}: installs syq {} in ~/.local/lib/syq and rewrites syq's line in its ~/.ssh/authorized_keys, whose key can only start syq's receiver for copies you approve",
+            crate::identity::build()
+        ),
+        crate::restricted::EnrollmentState::Ready => format!("Signs this copy with your SSH login key for {target:?}; the server keeps a key that can only start syq's receiver there"),
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -270,27 +289,34 @@ impl Summary {
             ),
             // Automatic approval of writes to this machine does not authorize
             // use of its SSH credentials on another host; say what that use is.
-            Some(Remote { target, enrollment }) => (
+            Some(Remote {
+                target,
+                enrollment,
+                source,
+            }) => (
                 format!(
                     "{:?} on {target:?} using your SSH access",
                     std::ffi::OsStr::from_bytes(&remote_path(&request.destination))
                 ),
-                match enrollment {
-                    crate::restricted::EnrollmentState::Missing => format!(
-                        "{permission}. Also sets up restricted copying on {target:?}: adds a key to its ~/.ssh/authorized_keys that can only start syq's receiver for copies you approve, and installs syq {} in ~/.local/lib/syq. Remove it with `syq receiver revoke`",
-                        crate::identity::build()
+                match source {
+                    None => format!("{permission}. {}", setup_text(target, enrollment)),
+                    // The source runs the copy with its own receiver, which
+                    // reads only what the command names there.
+                    Some((source, source_enrollment)) => format!(
+                        "{permission}. {source:?} runs the copy and sends the files the command names directly to {target:?}. {}. {}",
+                        setup_text(source, source_enrollment),
+                        setup_text(target, enrollment)
                     ),
-                    crate::restricted::EnrollmentState::Outdated => format!(
-                        "{permission}. Also updates restricted copying on {target:?}: installs syq {} in ~/.local/lib/syq and rewrites syq's line in its ~/.ssh/authorized_keys, whose key can only start syq's receiver for copies you approve",
-                        crate::identity::build()
-                    ),
-                    crate::restricted::EnrollmentState::Ready => format!("{permission}. Signs this copy with your SSH login key for {target:?}; the server keeps a key that can only start syq's receiver there"),
                 },
             ),
         };
         // Sources stay as the command wrote them, relative to `cwd` on the
         // server; only the destination is resolved, by this machine.
         let parsed = crate::approval_command::parse(command).ok();
+        // Files on another server are named with it.
+        let source_host = remote
+            .and_then(|remote| remote.source)
+            .map(|(host, _)| host);
         let sources = parsed
             .as_ref()
             .map(|args| {
@@ -298,7 +324,12 @@ impl Summary {
                 args.locations
                     .iter()
                     .take(count)
-                    .map(|location| crate::approval_command::quote_arg(&location.path))
+                    .map(|location| match source_host {
+                        None => crate::approval_command::quote_arg(&location.path),
+                        Some(host) => crate::approval_command::display_arg(
+                            &[host.as_bytes(), b":", location.path.as_slice()].concat(),
+                        ),
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -2254,6 +2285,7 @@ mod tests {
             Some(Remote {
                 target: "host-b",
                 enrollment: crate::restricted::EnrollmentState::Ready,
+                source: None,
             }),
         )
         .unwrap();
@@ -2334,6 +2366,7 @@ mod tests {
             Some(Remote {
                 target: "backup",
                 enrollment: crate::restricted::EnrollmentState::Ready,
+                source: None,
             }),
         )
         .unwrap();
@@ -2357,6 +2390,7 @@ mod tests {
             Some(Remote {
                 target: "backup",
                 enrollment: crate::restricted::EnrollmentState::Missing,
+                source: None,
             }),
         )
         .unwrap()
@@ -2374,6 +2408,7 @@ mod tests {
             Some(Remote {
                 target: "backup",
                 enrollment: crate::restricted::EnrollmentState::Outdated,
+                source: None,
             }),
         )
         .unwrap()
@@ -2499,6 +2534,7 @@ mod tests {
             Some(Remote {
                 target: "backup",
                 enrollment: crate::restricted::EnrollmentState::Ready,
+                source: None,
             }),
         )
         .unwrap();
@@ -2962,6 +2998,7 @@ mod tests {
             Some(Remote {
                 target: "backup",
                 enrollment: crate::restricted::EnrollmentState::Ready,
+                source: None,
             }),
         )
         .unwrap();

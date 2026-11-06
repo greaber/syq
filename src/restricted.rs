@@ -43,10 +43,8 @@ mod receiver;
 pub(crate) mod source;
 mod ssh;
 mod statefs;
-mod temporary_key;
 
 pub(crate) use keys::parse_entry_key;
-pub(crate) use temporary_key::TemporaryKey;
 
 pub(crate) use authority::*;
 use enroll::*;
@@ -192,17 +190,21 @@ pub(crate) struct PreparedTransfer {
     /// The entry key, which the coordinating server uses for every SSH
     /// connection to the receiver.
     pub(crate) entry_key: PrivateKey,
-    /// The destination as the directive's rules name it.
+    /// The destination as the directive's rules name it; empty for a
+    /// source.
     pub(crate) destination: Vec<u8>,
     /// The signed directive, base64url-encoded.
     pub(crate) directive: String,
     pub(crate) enrollment_id: EnrollmentId,
+    /// The enrollment's generation the directive is for.
+    pub(crate) generation: u64,
     /// The directive's nonce; the results must name it.
     pub(crate) request_id: RequestId,
     /// Verifier for the header of hostB's results.
     pub(crate) results_public_key: String,
-    /// This copy's recipient key for hostB's results, named in the directive.
-    pub(crate) recipient_secret: crate::destination_results::RecipientSecret,
+    /// This copy's recipient key for hostB's results, named in the
+    /// directive, when this machine made it.
+    pub(crate) recipient_secret: Option<crate::destination_results::RecipientSecret>,
     pub(crate) digest: [u8; 32],
 }
 

@@ -1925,11 +1925,7 @@ fn handle_tcp_setup_error(
             )
         });
     }
-    if args
-        .return_source
-        .as_ref()
-        .is_some_and(|source| !source.has_ssh())
-    {
+    if args.return_source.is_some() {
         sched.abort();
         progress.stop();
         return Err(error).context(

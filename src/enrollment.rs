@@ -199,35 +199,6 @@ impl AuthorizedKeyEntry {
         &self.line
     }
 
-    /// A temporary key can enter only one live copy's worker socket. Its
-    /// marker is separate from durable receiver enrollments.
-    pub(crate) fn copy_worker(
-        id: EnrollmentId,
-        receiver_path: &Path,
-        ticket: &str,
-        key: &EnrollmentPublicKey,
-    ) -> Result<Self> {
-        let receiver = safe_receiver_path(receiver_path)?;
-        if ticket.is_empty()
-            || !ticket
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
-        {
-            bail!("invalid copy worker admission");
-        }
-        let marker = format!("syq-copy-worker-{id}");
-        let command = format!("{receiver} --return-ssh-worker {ticket}");
-        let line = format!(
-            "restrict,command=\"{command}\" {} {} {marker}",
-            key.algorithm, key.blob
-        );
-        Ok(Self {
-            marker,
-            key: key.clone(),
-            line,
-        })
-    }
-
     pub fn marker(&self) -> String {
         self.marker.clone()
     }
@@ -261,101 +232,6 @@ pub enum AuthorizedKeysChange {
     Unchanged,
     Installed,
     Revoked,
-}
-
-/// Add one managed entry without replacing an existing entry or touching
-/// unrelated authorized_keys contents.
-pub fn install_authorized_key(
-    original: &[u8],
-    entry: &AuthorizedKeyEntry,
-) -> Result<(Vec<u8>, AuthorizedKeysChange)> {
-    let marker = entry.marker();
-    let mut exact = 0usize;
-    let mut marker_collision = false;
-    let mut key_collision = false;
-    for line in original.split(|byte| *byte == b'\n') {
-        if line == entry.line().as_bytes() {
-            exact += 1;
-            continue;
-        }
-        marker_collision |= last_ascii_token(line) == Some(marker.as_bytes());
-        key_collision |= line_contains_enrollment_key(line, &entry.key);
-    }
-    if exact > 1 {
-        bail!("authorized_keys contains duplicate entries for {}", marker);
-    }
-    if marker_collision {
-        bail!(
-            "authorized_keys already contains a different entry for {}",
-            marker
-        );
-    }
-    if key_collision {
-        bail!("enrollment key is already authorized by another authorized_keys line");
-    }
-    if exact == 1 {
-        return Ok((original.to_vec(), AuthorizedKeysChange::Unchanged));
-    }
-
-    let mut updated = original.to_vec();
-    if !updated.is_empty() && !updated.ends_with(b"\n") {
-        updated.push(b'\n');
-    }
-    updated.extend_from_slice(entry.line().as_bytes());
-    updated.push(b'\n');
-    Ok((updated, AuthorizedKeysChange::Installed))
-}
-
-/// Remove exactly one managed entry.  A missing entry is an idempotent
-/// no-op; collisions and duplicates fail instead of guessing which
-/// authorization to retain.
-pub fn revoke_authorized_key(
-    original: &[u8],
-    entry: &AuthorizedKeyEntry,
-) -> Result<(Vec<u8>, AuthorizedKeysChange)> {
-    let marker = entry.marker();
-    let mut found = 0usize;
-    let mut marker_collision = false;
-    let mut key_collision = false;
-    let mut updated = Vec::with_capacity(original.len());
-    for line in original.split_inclusive(|byte| *byte == b'\n') {
-        let without_newline = line.strip_suffix(b"\n").unwrap_or(line);
-        if without_newline == entry.line().as_bytes() {
-            found += 1;
-        } else if last_ascii_token(without_newline) == Some(marker.as_bytes()) {
-            marker_collision = true;
-            updated.extend_from_slice(line);
-        } else {
-            key_collision |= line_contains_enrollment_key(without_newline, &entry.key);
-            updated.extend_from_slice(line);
-        }
-    }
-    if found > 1 {
-        bail!("authorized_keys contains duplicate entries for {}", marker);
-    }
-    if marker_collision {
-        bail!(
-            "authorized_keys contains a different entry for {}; refusing revocation",
-            marker
-        );
-    }
-    if key_collision {
-        bail!(
-            "enrollment key is also authorized by another authorized_keys line; refusing revocation"
-        );
-    }
-    Ok((
-        if found == 0 {
-            original.to_vec()
-        } else {
-            updated
-        },
-        if found == 0 {
-            AuthorizedKeysChange::Unchanged
-        } else {
-            AuthorizedKeysChange::Revoked
-        },
-    ))
 }
 
 /// Whether `line` names `token` as one of its words.
@@ -453,11 +329,6 @@ pub(crate) fn remove_enrollment_line(
     } else {
         (updated, AuthorizedKeysChange::Revoked)
     })
-}
-
-fn last_ascii_token(line: &[u8]) -> Option<&[u8]> {
-    line.rsplit(|byte| byte.is_ascii_whitespace())
-        .find(|word| !word.is_empty())
 }
 
 fn line_contains_enrollment_key(line: &[u8], key: &EnrollmentPublicKey) -> bool {
@@ -775,11 +646,6 @@ mod tests {
         .unwrap()
     }
 
-    fn worker() -> AuthorizedKeyEntry {
-        AuthorizedKeyEntry::copy_worker(id(), Path::new("/opt/syq/receiver"), "ticket", &key())
-            .unwrap()
-    }
-
     fn enrollment_entry(generation: u64) -> AuthorizedKeyEntry {
         AuthorizedKeyEntry::enrollment(
             id(),
@@ -831,18 +697,6 @@ mod tests {
     }
 
     #[test]
-    fn copy_worker_accepts_installed_source_build_path() {
-        let entry = AuthorizedKeyEntry::copy_worker(
-            id(),
-            Path::new("/home/backup/.local/lib/syq/v0.7.1+dev.0123456789ab.dirty.0123abcd/linux-x86_64/syq"),
-            "ticket",
-            &key(),
-        )
-        .unwrap();
-        assert!(entry.line().starts_with("restrict,command=\"/home/backup/.local/lib/syq/v0.7.1+dev.0123456789ab.dirty.0123abcd/linux-x86_64/syq --return-ssh-worker ticket\""));
-    }
-
-    #[test]
     fn entry_rejects_shell_sensitive_receiver_paths() {
         let error = AuthorizedKeyEntry::enrollment(
             id(),
@@ -868,18 +722,6 @@ mod tests {
         ))
         .unwrap_err();
         assert!(error.to_string().contains("invalid enrollment public key"));
-    }
-
-    #[test]
-    fn install_is_idempotent_and_preserves_unrelated_lines() {
-        let entry = worker();
-        let original = b"# administrator \xff comment\nssh-ed25519 AAAA existing\n";
-        let (installed, change) = install_authorized_key(original, &entry).unwrap();
-        assert_eq!(change, AuthorizedKeysChange::Installed);
-        assert!(installed.starts_with(original));
-        let (again, change) = install_authorized_key(&installed, &entry).unwrap();
-        assert_eq!(change, AuthorizedKeysChange::Unchanged);
-        assert_eq!(again, installed);
     }
 
     #[test]
@@ -940,59 +782,6 @@ mod tests {
             remove_enrollment_line(&updated, id(), &key()).unwrap(),
             (updated.clone(), AuthorizedKeysChange::Unchanged)
         );
-    }
-
-    #[test]
-    fn install_refuses_to_replace_a_conflicting_managed_entry() {
-        let entry = worker();
-        let original = format!(
-            "restrict,command=\"evil\" ssh-ed25519 AAAA {}\n",
-            entry.marker()
-        );
-        assert!(install_authorized_key(original.as_bytes(), &entry)
-            .unwrap_err()
-            .to_string()
-            .contains("different entry"));
-    }
-
-    #[test]
-    fn install_and_revoke_refuse_any_other_authorization_for_the_enrollment_key() {
-        let enrollment_key = key();
-        let entry = worker();
-        let unrestricted = format!(
-            "{} {} administrator-key\n",
-            enrollment_key.algorithm, enrollment_key.blob
-        );
-        assert!(install_authorized_key(unrestricted.as_bytes(), &entry)
-            .unwrap_err()
-            .to_string()
-            .contains("already authorized"));
-        let duplicate_authority = format!("{}\n{unrestricted}", entry.line());
-        assert!(
-            revoke_authorized_key(duplicate_authority.as_bytes(), &entry)
-                .unwrap_err()
-                .to_string()
-                .contains("also authorized")
-        );
-    }
-
-    #[test]
-    fn revoke_removes_only_the_exact_managed_line() {
-        let entry = worker();
-        let original = format!("before\n{}\nafter\n", entry.line());
-        let (updated, change) = revoke_authorized_key(original.as_bytes(), &entry).unwrap();
-        assert_eq!(change, AuthorizedKeysChange::Revoked);
-        assert_eq!(updated, b"before\nafter\n");
-    }
-
-    #[test]
-    fn revoke_refuses_a_marker_collision() {
-        let entry = worker();
-        let original = format!("ssh-ed25519 AAAA administrator-key {}\n", entry.marker());
-        assert!(revoke_authorized_key(original.as_bytes(), &entry)
-            .unwrap_err()
-            .to_string()
-            .contains("different entry"));
     }
 
     #[test]

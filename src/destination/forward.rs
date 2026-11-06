@@ -1,53 +1,12 @@
-//! Copies from a server to another server that the receiving machine
-//! approves: it signs a directive for the destination's enrolled receiver,
-//! and the server connects to that receiver directly. The per-copy receiver
-//! that a copy between two other servers still uses lives here too.
-pub(super) mod ssh;
+//! Copies that a server starts to another server, or between two other
+//! servers, and that the receiving machine approves: it signs directives
+//! for the servers' enrolled receivers, and the servers connect to those
+//! receivers directly.
 use super::*;
-use std::fs::File;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::AtomicUsize;
 
-const HELPER_VERSION: u16 = 1;
 pub(super) const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct HelperRequest {
-    version: u16,
-    identity: String,
-    request: CopyRequest,
-    /// Whether the command follows symlinks in the destination path it
-    /// gives (`--follow-dst`), as an ordinary copy does. Without it, a
-    /// symlink above the destination stops the copy.
-    follow_dst: bool,
-}
-
-/// Start the receiver for `request` on the destination server, following
-/// symlinks above its destination when `follow_dst`.
-pub(super) fn peer_receiver(
-    spec: &crate::conn::RemoteSpec,
-    request: CopyRequest,
-    follow_dst: bool,
-    deadline: Instant,
-) -> Result<(ForwardChild, Approved)> {
-    let (child, reply) = ForwardChild::over_spec(
-        spec,
-        "--peer-receiver",
-        &HelperRequest {
-            version: HELPER_VERSION,
-            identity: crate::identity::build().into(),
-            request,
-            follow_dst,
-        },
-        deadline,
-        &|| false,
-    )?;
-    let Reply::Approved(approved) = reply else {
-        bail!("invalid peer receiver setup response")
-    };
-    Ok((child, approved))
-}
 
 pub(super) fn target_endpoint(target: &str) -> Result<crate::cli::NativeEndpoint> {
     if target.len() > 512 {
@@ -102,6 +61,26 @@ pub(super) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
     Ok(target)
 }
 
+/// The source and destination SSH endpoints of a copy between two servers
+/// that a receiving machine approves, as the command names them.
+pub(super) fn eligible_peer(args: &crate::cli::Args) -> Result<(String, String)> {
+    let (source, destination) = crate::directive::coordinated_endpoints(args)?;
+    let [source, target] = [source, destination].map(|location| {
+        let endpoint = crate::remote_to_remote::endpoint_arg(location, None, None);
+        target_endpoint(&endpoint).map(|_| endpoint)
+    });
+    Ok((source?, target?))
+}
+
+/// Whether `args` copies from one server to another.
+pub(crate) fn between_servers(args: &crate::cli::Args) -> bool {
+    args.locations
+        .split_last()
+        .is_some_and(|(destination, sources)| {
+            destination.is_remote() && sources.first().is_some_and(|source| source.is_remote())
+        })
+}
+
 pub(super) fn select(
     args: &mut crate::cli::Args,
     progress: Option<&crate::progress::Progress>,
@@ -115,6 +94,21 @@ pub(super) fn select(
         }
         _ => handoff::selected_name(handoff::Kind::Forward).map(str::to_owned),
     };
+    if between_servers(args) {
+        // A copy between two servers asks a receiving machine only when it
+        // was chosen for it: this machine's own SSH access runs it otherwise.
+        let Some(name) = explicit else {
+            return Ok(None);
+        };
+        let (_, target) = eligible_peer(args)?;
+        let registration = load_registration(&name)?;
+        return Ok(Some(handoff::Selection::new(
+            name,
+            registration,
+            handoff::Kind::Forward,
+            Some(target),
+        )));
+    }
     let target = match eligible_target(args) {
         Ok(target) => target,
         Err(_) if explicit.is_none() => return Ok(None),
@@ -187,12 +181,44 @@ pub(super) struct Issued {
     destination: Vec<u8>,
     /// This machine's deletion limit for the copy.
     max_delete: u64,
+    /// For a copy between two other servers, the source's receiver, which
+    /// runs the copy; the requester presents the destination's directive
+    /// and entry key to it.
+    coordinated: Option<Coordinated>,
+}
+
+/// The source's receiver of a copy between two other servers, which the
+/// requester logs in to, and what the requester checks the destination's
+/// results with.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Coordinated {
+    /// The source's signed directive, base64url-encoded.
+    directive: String,
+    entry_key: EntryKeyText,
+    /// The account the source's enrollment is for.
+    login: String,
+    /// What this machine's known_hosts files say about the source.
+    known_hosts: String,
+    known_hosts_left_out: Option<String>,
+    /// The destination's results: who signs them, for which enrollment,
+    /// request and directive.
+    results_public_key: String,
+    enrollment: crate::enrollment::EnrollmentId,
+    request: crate::delegation::RequestId,
+    digest: [u8; 32],
 }
 
 /// An entry key in OpenSSH form, wiped when dropped.
 #[derive(Serialize, Deserialize)]
 #[serde(transparent)]
 struct EntryKeyText(String);
+
+impl EntryKeyText {
+    fn of(key: &ssh_key::PrivateKey) -> Result<Self> {
+        Ok(Self(key.to_openssh(ssh_key::LineEnding::LF)?.to_string()))
+    }
+}
 
 impl Drop for EntryKeyText {
     fn drop(&mut self) {
@@ -208,6 +234,109 @@ impl std::fmt::Debug for Issued {
     }
 }
 
+/// Ask the receiving machine to approve a copy between two servers, then
+/// set up this machine's connection to the source's receiver, which runs
+/// the copy.
+fn prepare_coordinated(
+    args: &mut crate::cli::Args,
+    name: String,
+    registration: Registration,
+) -> Result<()> {
+    let (source, target) = eligible_peer(args)?;
+    let command = crate::approval_command::copy_command(args)?;
+    let inputs = crate::directive::Inputs {
+        ignore: args.ignore_lines.clone(),
+        mapping: crate::directive::mapping_authorization(args)?,
+    };
+    // This machine checks the destination's results itself, as it would
+    // for a copy between two servers it started with its own access.
+    let (secret, results_key) = crate::destination_results::generate_recipient()?;
+    super::notices::waiting(
+        &format!("@{name}"),
+        &format!("this copy from {source} to {target}"),
+    );
+    let (stream, reply) = exchange(
+        &registration,
+        Message::Forward(Box::new(ForwardRequest {
+            source: Some(source.clone()),
+            target: target.clone(),
+            command,
+            cwd: crate::approval_command::current_directory(),
+            inputs,
+            results_key: Some(results_key),
+        })),
+        REQUEST_TIMEOUT + SETUP_TIMEOUT + Duration::from_secs(10),
+        None,
+    )?;
+    // The copy needs nothing more from the receiving machine.
+    drop(stream);
+    let Reply::Directive(issued) = reply else {
+        bail!("unexpected remote copy approval response");
+    };
+    let Issued {
+        directive,
+        entry_key,
+        coordinated,
+        ..
+    } = *issued;
+    let coordinated = coordinated.context("unexpected remote copy approval response")?;
+    if args.verbose > 0 {
+        crate::output::diagnostic!(
+            "syq: remote copy approved; connecting to the source's restricted receiver"
+        );
+    }
+    if let Some(left_out) = coordinated
+        .known_hosts_left_out
+        .as_deref()
+        .filter(|_| !args.quiet)
+    {
+        crate::output::diagnostic!(
+            "syq: checking the source's host key without some of what the approving machine knows about it: {}",
+            left_out
+                .chars()
+                .filter(|character| !character.is_control())
+                .collect::<String>()
+        );
+    }
+    let decode = |text: &str| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(text)
+            .context("decode the copy's directive")
+    };
+    // This machine reaches the source's receiver as its own SSH
+    // configuration reaches the source its command named, as the account
+    // the approving machine enrolled, and checks its host key as its own
+    // `ssh` would, also accepting what the approving machine knows.
+    let endpoint = target_endpoint(&source)?;
+    let receiver = crate::remote_to_remote::ReceiverSsh::prepare(
+        &shell_words::split(&crate::remote_to_remote::receiver_rsh(endpoint.port))?,
+        (Some(&coordinated.login), endpoint.port, &endpoint.host),
+        &coordinated.known_hosts,
+        coordinated.entry_key.0.as_bytes(),
+        args.quiet,
+    )?;
+    args.coordinated_copy = Some(Arc::new(crate::remote_to_remote::CoordinatedCopy {
+        receiver,
+        login: coordinated.login.clone(),
+        host: endpoint.host,
+        source: decode(&coordinated.directive)?,
+        destination: decode(&directive)?,
+        destination_entry_key: zeroize::Zeroizing::new(entry_key.0.as_bytes().to_vec()),
+        results: Mutex::new(Some(crate::destination_results::Expectation {
+            public_key: coordinated.results_public_key,
+            binding: crate::destination_results::Binding {
+                enrollment_id: coordinated.enrollment,
+                request_id: coordinated.request,
+                grant_digest: coordinated.digest,
+            },
+            secret,
+            records: args.native_results.is_some() || args.native_results_fd.is_some(),
+        })),
+    }));
+    args.auth_from = crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name));
+    Ok(())
+}
+
 pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection) -> Result<()> {
     let handoff::Selection {
         name,
@@ -215,6 +344,9 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
         target,
         ..
     } = selection;
+    if between_servers(args) {
+        return prepare_coordinated(args, name, registration);
+    }
     let target = target.context("remote authorization target missing")?;
     // Refused with advice before anything is asked when an approval cannot
     // carry the command.
@@ -228,12 +360,14 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
     super::notices::waiting(&format!("@{name}"), &format!("this copy to {target}"));
     let (stream, reply) = exchange(
         &registration,
-        Message::Forward {
+        Message::Forward(Box::new(ForwardRequest {
+            source: None,
             target: target.clone(),
             command,
             cwd: crate::approval_command::current_directory(),
             inputs,
-        },
+            results_key: None,
+        })),
         REQUEST_TIMEOUT + SETUP_TIMEOUT + Duration::from_secs(10),
         None,
     )?;
@@ -300,20 +434,113 @@ impl Drop for Slot<'_> {
     }
 }
 
+/// A server's request to approve a copy to another server, which this
+/// machine approves with a directive for that server's enrolled receiver.
+/// The server sends what its command read from files.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ForwardRequest {
+    /// For a copy between two other servers, the source as the command
+    /// names it; otherwise the files are on the server that asks.
+    pub(super) source: Option<String>,
+    /// The destination as the command names it.
+    pub(super) target: String,
+    pub(super) command: Vec<Vec<u8>>,
+    pub(super) cwd: String,
+    pub(super) inputs: crate::directive::Inputs,
+    /// For a copy between two other servers, the requester's key for the
+    /// destination's results, which it checks.
+    pub(super) results_key: Option<[u8; 32]>,
+}
+
+/// An account this machine reaches with its own SSH, and what its records
+/// say about the account's enrollment.
+struct Account {
+    endpoint: crate::cli::NativeEndpoint,
+    target: String,
+    login: String,
+    enrollment: crate::restricted::EnrollmentState,
+}
+
+impl Account {
+    fn label(&self) -> String {
+        format!("{}@{}", self.login, self.endpoint.host)
+    }
+
+    /// The login this machine's SSH configuration gives `target`, and its
+    /// enrollment. Reading the configuration contacts no server.
+    fn find(target: &str, cancelled: &dyn Fn() -> bool) -> Result<Self> {
+        let endpoint = target_endpoint(target)?;
+        let login = ssh_login(target, Instant::now() + SETUP_TIMEOUT, cancelled)?;
+        let enrollment =
+            crate::restricted::local_enrollment_state(&endpoint.host, endpoint.port, &login)?;
+        Ok(Self {
+            endpoint,
+            target: target.to_owned(),
+            login,
+            enrollment,
+        })
+    }
+
+    /// A dry run never sets up or updates restricted copying.
+    fn ready_for_dry_run(&self) -> Result<()> {
+        let account = self.label();
+        match self.enrollment {
+            crate::restricted::EnrollmentState::Ready => Ok(()),
+            crate::restricted::EnrollmentState::Missing => bail!(
+                "a dry run does not set up restricted copying on {account}; the first real copy does, or run `syq receiver enroll {account}` on the receiving machine"
+            ),
+            crate::restricted::EnrollmentState::Outdated => bail!(
+                "a dry run does not update syq on {account} for this machine's build; the next real copy does, or run `syq receiver enroll {account}` on the receiving machine"
+            ),
+        }
+    }
+
+    /// The login enrollment uses and what this machine knows about the
+    /// account's host key, which the server dialing it adds to what it
+    /// knows.
+    fn policy(&self, cancelled: &dyn Fn() -> bool) -> Result<crate::agent_broker::HostPolicy> {
+        let policy = crate::agent_broker::resolve_known_policy_at_bounded(
+            "ssh",
+            self.endpoint.user.as_deref(),
+            &self.endpoint.host,
+            self.endpoint.port,
+            Instant::now() + SETUP_TIMEOUT,
+            &cancelled,
+        )?;
+        anyhow::ensure!(
+            policy.login_user == self.login,
+            "the SSH configuration for {:?} changed during approval",
+            self.target
+        );
+        Ok(policy)
+    }
+
+    fn setup(&self, policy: &crate::agent_broker::HostPolicy) -> SetupAccount {
+        SetupAccount {
+            host: self.endpoint.host.clone(),
+            port: self.endpoint.port,
+            login: self.login.clone(),
+            agent: policy.agent_socket().map(Path::to_path_buf),
+        }
+    }
+}
+
 impl Receiver {
-    /// Approve a server's copy to another server: show the command, then,
-    /// over this machine's own SSH, set up or refresh the destination
-    /// account's enrollment and sign a directive for its receiver. The
-    /// server connects to that receiver itself; this machine is not part of
+    /// Approve a server's copy to another server, or between two other
+    /// servers: show the command, then, over this machine's own SSH, set up
+    /// or refresh the accounts' enrollments and sign their directives. The
+    /// server connects to the receiver itself; this machine is not part of
     /// the copy after it replies.
-    pub(super) fn forward(
-        &self,
-        target: String,
-        command: Vec<Vec<u8>>,
-        cwd: String,
-        inputs: crate::directive::Inputs,
-        mut stream: TrackedStream,
-    ) -> Result<()> {
+    pub(super) fn forward(&self, request: ForwardRequest, mut stream: TrackedStream) -> Result<()> {
+        let ForwardRequest {
+            source,
+            target,
+            command,
+            cwd,
+            inputs,
+            results_key,
+        } = request;
         // The server waits this long for the reply, from when it asked: the
         // decision, then the setup. Cancellation ends the setup sooner when
         // the server goes.
@@ -321,12 +548,23 @@ impl Receiver {
         let request_lock = self.request_lock.try_lock().map_err(|_| {
             anyhow::anyhow!("another transfer is awaiting approval; retry after it is decided")
         })?;
-        let endpoint = target_endpoint(&target)?;
         crate::approval_command::check_authorizer(&command, &self.name)?;
         let args = crate::approval_command::parse(&command)?;
+        match &source {
+            None => anyhow::ensure!(
+                eligible_target(&args)? == target,
+                "the requesting command copies to a different server"
+            ),
+            Some(source) => anyhow::ensure!(
+                eligible_peer(&args)? == (source.clone(), target.clone()),
+                "the requesting command copies between different servers"
+            ),
+        }
+        // Only the server that starts a copy between two others checks the
+        // destination's results itself.
         anyhow::ensure!(
-            eligible_target(&args)? == target,
-            "the requesting command copies to a different server"
+            results_key.is_some() == source.is_some(),
+            "invalid request to approve a copy to another server"
         );
         let caps = crate::directive::Caps {
             max_bytes: self.max_bytes,
@@ -382,20 +620,15 @@ impl Receiver {
                 || self.generation.load(Ordering::Acquire) != generation
                 || requester_closed(&socket)
         };
-        // Reading this machine's SSH configuration contacts no server.
-        let login = ssh_login(&target, Instant::now() + SETUP_TIMEOUT, &cancelled)?;
-        let enrollment =
-            crate::restricted::local_enrollment_state(&endpoint.host, endpoint.port, &login)?;
-        let account = format!("{login}@{}", endpoint.host);
-        match enrollment {
-            _ if !args.dry_run => {}
-            crate::restricted::EnrollmentState::Ready => {}
-            crate::restricted::EnrollmentState::Missing => bail!(
-                "a dry run does not set up restricted copying on {account}; the first real copy does, or run `syq receiver enroll {account}` on the receiving machine"
-            ),
-            crate::restricted::EnrollmentState::Outdated => bail!(
-                "a dry run does not update syq on {account} for this machine's build; the next real copy does, or run `syq receiver enroll {account}` on the receiving machine"
-            ),
+        let destination = Account::find(&target, &cancelled)?;
+        let source = source
+            .as_deref()
+            .map(|source| Account::find(source, &cancelled))
+            .transpose()?;
+        if args.dry_run {
+            for account in source.iter().chain([&destination]) {
+                account.ready_for_dry_run()?;
+            }
         }
         // Automatic approval of writes to this machine does not authorize
         // use of its SSH credentials on another host.
@@ -405,7 +638,10 @@ impl Receiver {
             &cwd,
             crate::receive_approval::Remote {
                 target: &target,
-                enrollment,
+                enrollment: destination.enrollment,
+                source: source
+                    .as_ref()
+                    .map(|source| (source.target.as_str(), source.enrollment)),
             },
             &request,
             self.notifications,
@@ -414,20 +650,14 @@ impl Receiver {
         anyhow::ensure!(!cancelled(), "remote copy disconnected before setup");
         // This lock only serializes decisions, not enrollment.
         drop(request_lock);
-        // The login enrollment uses, and what this machine knows about the
-        // destination's key, which the server adds to what it knows.
-        let policy = crate::agent_broker::resolve_known_policy_at_bounded(
-            "ssh",
-            endpoint.user.as_deref(),
-            &endpoint.host,
-            endpoint.port,
-            Instant::now() + SETUP_TIMEOUT,
-            &cancelled,
-        )?;
-        anyhow::ensure!(
-            policy.login_user == login,
-            "the SSH configuration for {target:?} changed during approval"
-        );
+        let destination_policy = destination.policy(&cancelled)?;
+        let source_policy = source
+            .as_ref()
+            .map(|source| source.policy(&cancelled))
+            .transpose()?;
+        // The destination's known hosts go to the server that dials it: the
+        // source, in its signed directive, or the server that asked.
+        let destination_known_hosts = destination_policy.known_hosts_for_others()?;
         let mut setup = crate::process::self_command()?;
         setup.arg("--return-prepare");
         let prepared = prepare_in_child(
@@ -437,15 +667,19 @@ impl Receiver {
                 cwd,
                 inputs,
                 caps,
-                host: endpoint.host.clone(),
-                port: endpoint.port,
-                login: policy.login_user.clone(),
+                destination: destination.setup(&destination_policy),
+                source: source
+                    .as_ref()
+                    .zip(source_policy.as_ref())
+                    .map(|(source, policy)| {
+                        (source.setup(policy), destination_known_hosts.clone())
+                    }),
+                results_key,
                 via: (
                     self.server_user.clone(),
                     self.tcp_peer.host.clone(),
                     self.tcp_peer.port,
                 ),
-                agent: policy.agent_socket().map(Path::to_path_buf),
                 allow_enrollment: !args.dry_run,
             },
             // Setting restricted copying up can upload syq, which takes a
@@ -456,22 +690,38 @@ impl Receiver {
         )
         .with_context(|| format!("approve the copy to {target:?}"))?;
         anyhow::ensure!(!cancelled(), "remote copy disconnected before setup");
+        let coordinated = match (prepared.source, source_policy) {
+            (Some(signed), Some(policy)) => Some(Coordinated {
+                directive: signed.directive,
+                entry_key: signed.entry_key,
+                login: policy.login_user.clone(),
+                known_hosts: policy.known_hosts_for_others()?,
+                known_hosts_left_out: policy.left_out_kind().map(str::to_owned),
+                results_public_key: prepared.results.public_key,
+                enrollment: prepared.results.enrollment,
+                request: prepared.results.request,
+                digest: prepared.results.digest,
+            }),
+            (None, None) => None,
+            _ => bail!("the copy's setup did not sign its source's directive"),
+        };
         let issued = Issued {
             directive: prepared.directive,
             entry_key: prepared.entry_key,
-            login: policy.login_user.clone(),
-            known_hosts: policy.known_hosts_for_others()?,
+            login: destination_policy.login_user.clone(),
+            known_hosts: destination_known_hosts,
             // The configured value stays here: it can hold commands and paths.
-            known_hosts_left_out: policy.left_out_kind().map(str::to_owned),
+            known_hosts_left_out: destination_policy.left_out_kind().map(str::to_owned),
             destination: prepared.destination,
             max_delete,
+            coordinated,
         };
         write_message(&mut stream, &Reply::Directive(Box::new(issued)))
     }
 }
 
 /// What the receiving service's setup child needs to set up or refresh the
-/// destination's enrollment and sign an approved upload's directive.
+/// accounts' enrollments and sign an approved copy's directives.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Prepare {
@@ -479,30 +729,55 @@ struct Prepare {
     cwd: String,
     inputs: crate::directive::Inputs,
     caps: crate::directive::Caps,
-    host: String,
-    port: Option<u16>,
-    login: String,
+    destination: SetupAccount,
+    /// For a copy between two other servers, the source, which coordinates
+    /// it, and what this machine's known_hosts files say about the
+    /// destination, which its directive carries.
+    source: Option<(SetupAccount, String)>,
+    /// The requester's key for the destination's results, when it checks
+    /// them.
+    results_key: Option<[u8; 32]>,
     /// The server that asked, as this machine's receiving connection logs
     /// in to it: its user, if named, host and port.
     via: (Option<String>, String, Option<u16>),
-    agent: Option<PathBuf>,
     allow_enrollment: bool,
 }
 
+/// An account the setup child enrolls and signs a directive for.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetupAccount {
+    host: String,
+    port: Option<u16>,
+    login: String,
+    agent: Option<PathBuf>,
+}
+
+impl SetupAccount {
+    fn label(&self) -> String {
+        format!("{}@{}", self.login, self.host)
+    }
+}
+
 impl Prepare {
-    fn issue(&self) -> Result<crate::restricted::Issue<'_>> {
+    fn issue<'a>(
+        &'a self,
+        account: &'a SetupAccount,
+        peer: Option<crate::directive::Peer>,
+    ) -> Result<crate::restricted::Issue<'a>> {
         let (user, host, port) = &self.via;
         Ok(crate::restricted::Issue {
             command: self.command.clone(),
             cwd: self.cwd.clone(),
             inputs: self.inputs.clone(),
             caps: Some(self.caps),
-            host: &self.host,
-            port: self.port,
-            login: &self.login,
-            // The copy needs the server that asked to reach the
-            // destination's SSH port, so enrolling can go through it when
-            // this machine cannot reach the destination along its own SSH
+            host: &account.host,
+            port: account.port,
+            login: &account.login,
+            // The copy needs the server that asked to reach the account's
+            // SSH port, or the source to reach the destination's, which the
+            // server that asked reaches too. So enrolling can go through it
+            // when this machine cannot reach the account along its own SSH
             // configuration's route, as a copy started on this machine goes
             // through its source.
             jump: Some(crate::enrollment::SshEndpoint::from_host(
@@ -510,12 +785,52 @@ impl Prepare {
                 host,
                 *port,
             )?),
-            agent: self.agent.as_deref(),
+            agent: account.agent.as_deref(),
             allow_enrollment: self.allow_enrollment,
             // No terminal: never prompt. Where the SSH configuration
             // would ask about a host key nobody knows, accept it the first
             // time, as `accept-new` does.
             batch: true,
+            results_key: self.results_key,
+            peer,
+        })
+    }
+
+    /// Set up or refresh the enrollments and sign the directives: the
+    /// destination's first, which the source's names.
+    fn sign(&self) -> Result<Signed> {
+        let destination =
+            crate::restricted::prepare_transfer(self.issue(&self.destination, None)?)?;
+        let source = self
+            .source
+            .as_ref()
+            .map(|(account, known_hosts)| {
+                let peer = crate::directive::Peer {
+                    enrollment: destination.enrollment_id,
+                    generation: destination.generation,
+                    account: self.destination.login.clone(),
+                    request: destination.request_id,
+                    destination: destination.destination.clone(),
+                    known_hosts: known_hosts.clone(),
+                };
+                let source = crate::restricted::prepare_transfer(self.issue(account, Some(peer))?)?;
+                Ok::<_, anyhow::Error>(SignedSource {
+                    directive: source.directive,
+                    entry_key: EntryKeyText::of(&source.entry_key)?,
+                })
+            })
+            .transpose()?;
+        Ok(Signed {
+            directive: destination.directive,
+            entry_key: EntryKeyText::of(&destination.entry_key)?,
+            destination: destination.destination,
+            results: Results {
+                public_key: destination.results_public_key,
+                enrollment: destination.enrollment_id,
+                request: destination.request_id,
+                digest: destination.digest,
+            },
+            source,
         })
     }
 }
@@ -534,11 +849,30 @@ struct Signed {
     directive: String,
     entry_key: EntryKeyText,
     destination: Vec<u8>,
+    /// What the destination's results are checked with.
+    results: Results,
+    source: Option<SignedSource>,
 }
 
-/// Set up the enrollment and sign the directive in the setup child
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Results {
+    public_key: String,
+    enrollment: crate::enrollment::EnrollmentId,
+    request: crate::delegation::RequestId,
+    digest: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedSource {
+    directive: String,
+    entry_key: EntryKeyText,
+}
+
+/// Set up the enrollments and sign the directives in the setup child
 /// `command`, until `deadline` or until `cancelled`. Then the child ends
-/// with everything in its process group, its SSH login included, which
+/// with everything in its process group, its SSH logins included, which
 /// releases the enrollment lock and any wait for the SSH agent with it.
 fn prepare_in_child(
     command: Command,
@@ -577,10 +911,17 @@ fn prepare_in_child(
         Ok(Prepared::Signed(signed)) => Ok(signed),
         Ok(Prepared::Refused(error)) => Err(anyhow::anyhow!("{error}{output}")),
         Err(error) if Instant::now() >= deadline => {
-            let account = format!("{}@{}", request.login, request.host);
+            let accounts = request
+                .source
+                .iter()
+                .map(|(source, _)| source)
+                .chain([&request.destination])
+                .map(|account| format!("`syq receiver enroll {}`", account.label()))
+                .collect::<Vec<_>>()
+                .join(" and ");
             Err(error).with_context(|| {
                 format!(
-                    "the copy's setup did not finish while the server waited{output}. If it was setting up or updating restricted copying on {account}, run `syq receiver enroll {account}` on this machine, which has no time limit, then try the copy again"
+                    "the copy's setup did not finish while the server waited{output}. If it was setting up or updating restricted copying, run {accounts} on this machine, which has no time limit, then try the copy again"
                 )
             })
         }
@@ -590,25 +931,13 @@ fn prepare_in_child(
 }
 
 /// The receiving service's setup child (`--return-prepare`): set up or
-/// refresh the destination's enrollment and sign the directive. Its parent
-/// ends it, with its process group, at the setup deadline or when the
-/// requester goes.
+/// refresh the enrollments and sign the directives. Its parent ends it,
+/// with its process group, at the setup deadline or when the requester
+/// goes.
 fn prepare_setup() -> Result<i32> {
     let request: Prepare = read_message(&mut std::io::stdin().lock())?;
-    let reply = match request
-        .issue()
-        .and_then(crate::restricted::prepare_transfer)
-    {
-        Ok(prepared) => Prepared::Signed(Signed {
-            directive: prepared.directive,
-            entry_key: EntryKeyText(
-                prepared
-                    .entry_key
-                    .to_openssh(ssh_key::LineEnding::LF)?
-                    .to_string(),
-            ),
-            destination: prepared.destination,
-        }),
+    let reply = match request.sign() {
+        Ok(signed) => Prepared::Signed(signed),
         Err(error) => Prepared::Refused(format!("{error:#}")),
     };
     let mut output = std::io::stdout().lock();
@@ -713,121 +1042,9 @@ impl ForwardChild {
         }
         unreachable!("the second helper attempt returns its result")
     }
-    /// Reuse an already authorized account transport without another login.
-    pub(super) fn over_spec<T: Serialize>(
-        spec: &crate::conn::RemoteSpec,
-        operation: &str,
-        request: &T,
-        deadline: Instant,
-        cancelled: &impl Fn() -> bool,
-    ) -> Result<(Self, Reply)> {
-        let mut installed = false;
-        let mut reclaimed = false;
-        loop {
-            anyhow::ensure!(!cancelled(), "copy setup cancelled");
-            if Instant::now() >= deadline {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "copy setup deadline expired",
-                )
-                .into());
-            }
-            let mut child = Self::spawn_command(spec.helper_command(&[operation.into()]))?;
-            let reply = (|| {
-                write_message(
-                    &mut DeadlineIo {
-                        inner: child.child.stdin.as_mut().unwrap(),
-                        deadline,
-                        cancelled: Some(cancelled),
-                    },
-                    request,
-                )?;
-                read_message(&mut DeadlineIo {
-                    inner: child.child.stdout.as_mut().unwrap(),
-                    deadline,
-                    cancelled: Some(cancelled),
-                })
-            })();
-            match reply {
-                Ok(Reply::Error(error)) => {
-                    return Err(ssh::SetupRefusal(format!(
-                        "remote copy helper refused setup: {error}"
-                    ))
-                    .into());
-                }
-                Ok(Reply::RetryableError(error)) => {
-                    return Err(super::ssh_auth::RetryableSetupError(error).into());
-                }
-                Ok(reply) => return Ok((child, reply)),
-                Err(error) => {
-                    let status = child.wait_for_exit(deadline, cancelled);
-                    if !reclaimed
-                        && status
-                            .as_ref()
-                            .is_ok_and(|status| status.code() == Some(255))
-                        && spec.release_idle_helpers_after_startup_failure(status.as_ref().unwrap())
-                    {
-                        // The failed child has been closed. No copy data has
-                        // been admitted before this setup reply and Hello.
-                        reclaimed = true;
-                        continue;
-                    }
-                    if !installed
-                        && spec.bootstrap_helper
-                        && status
-                            .as_ref()
-                            .is_ok_and(|s| crate::remote_helper::needs_install(s.code()))
-                    {
-                        spec.install_helper()?;
-                        installed = true;
-                        continue;
-                    }
-                    let errors = child.errors();
-                    let error = if status.as_ref().is_ok_and(|s| s.code() == Some(255))
-                        && errors.contains("mux_client_request_session: session request failed:")
-                    {
-                        let error =
-                            super::ssh_auth::RetryableSetupError(format!("{error:#}")).into();
-                        if operation == "--return-ssh-setup" {
-                            anyhow::Error::context(error, "SSH session refused; destination sshd MaxSessions >= 2 is required beside the copy control session")
-                        } else {
-                            error
-                        }
-                    } else {
-                        error
-                    };
-                    return Err(error)
-                        .with_context(|| format!("approved account helper failed: {errors}"));
-                }
-            }
-        }
-    }
-
-    pub(super) fn spawn_streaming_command(mut command: Command) -> Result<Self> {
-        let child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .process_group(0)
-            .spawn_guarded()?;
-        Ok(Self {
-            child,
-            errors: Arc::new(Mutex::new(Vec::new())),
-            capture: None,
-            closed: false,
-        })
-    }
-
     pub(super) fn wait_for_exit(
         &mut self,
         deadline: Instant,
-        cancelled: &impl Fn() -> bool,
-    ) -> Result<std::process::ExitStatus> {
-        self.wait_until_exit(Some(deadline), cancelled)
-    }
-    pub(super) fn wait_until_exit(
-        &mut self,
-        deadline: Option<Instant>,
         cancelled: &impl Fn() -> bool,
     ) -> Result<std::process::ExitStatus> {
         loop {
@@ -856,7 +1073,7 @@ impl ForwardChild {
                 let _ = self.close();
                 bail!("return helper cancelled while waiting for its exit status");
             }
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if Instant::now() >= deadline {
                 let _ = self.close();
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -943,69 +1160,28 @@ fn pump(reader: &mut impl Read, writer: &mut impl Write) -> std::io::Result<u64>
 }
 
 pub(super) fn relay(
-    socket: UnixStream,
-    input: std::process::ChildStdin,
-    output: std::process::ChildStdout,
-    cancelled: impl Fn() -> bool,
-    child: &mut ForwardChild,
-) -> Result<()> {
-    relay_inner(socket, input, output, cancelled, child, false).map(|_| ())
-}
-
-/// Wait for the coordinator to release its control after peer EOF. Its final
-/// stdout may be slow without leaving any live destination authority behind.
-pub(super) fn relay_peer(
-    socket: UnixStream,
-    input: std::process::ChildStdin,
-    output: std::process::ChildStdout,
-    cancelled: impl Fn() -> bool,
-    child: &mut ForwardChild,
-) -> Result<bool> {
-    relay_inner(socket, input, output, cancelled, child, true)
-}
-
-fn relay_inner(
     mut socket: UnixStream,
     mut input: std::process::ChildStdin,
     mut output: std::process::ChildStdout,
     cancelled: impl Fn() -> bool,
     child: &mut ForwardChild,
-    wait_for_release: bool,
-) -> Result<bool> {
+) -> Result<()> {
     let mut writer = socket.try_clone()?;
     let shutdown = socket.try_clone()?;
     let (done, completions) = mpsc::channel();
     let sent = done.clone();
     let upload = std::thread::spawn(move || {
-        let _ = sent.send((true, pump(&mut socket, &mut input)));
+        let _ = sent.send(pump(&mut socket, &mut input));
     });
     let download = std::thread::spawn(move || {
-        let _ = done.send((false, pump(&mut output, &mut writer)));
+        let _ = done.send(pump(&mut output, &mut writer));
     });
-    let mut release_deadline = None;
     let result = loop {
         if cancelled() {
             break Err(anyhow::anyhow!("return connection stopped during copy"));
         }
-        if release_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            break Ok(false);
-        }
-        match completions.recv_timeout(Duration::from_millis(if wait_for_release {
-            10
-        } else {
-            100
-        })) {
-            Ok((true, result)) => break result.map(|_| true).map_err(Into::into),
-            Ok((false, result)) if !wait_for_release => {
-                break result.map(|_| false).map_err(Into::into)
-            }
-            Ok((false, _)) => {
-                // Do not shut the read side: only a natural upload EOF proves
-                // that B has released control, including on normal completion.
-                let _ = shutdown.shutdown(std::net::Shutdown::Write);
-                let _ = child.close();
-                release_deadline = Some(Instant::now() + Duration::from_secs(2));
-            }
+        match completions.recv_timeout(Duration::from_millis(100)) {
+            Ok(result) => break result.map(drop).map_err(Into::into),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(error) => break Err(error.into()),
         }
@@ -1091,104 +1267,6 @@ impl<R: Read + AsRawFd> Read for HandshakeInput<R> {
     }
 }
 
-/// Resolve `path` as an SSH login in the home directory would: `home` as
-/// `HOME` names it and where it really is. Symlinks above the destination
-/// are followed only when `follow` (`--follow-dst`).
-fn resolve_ssh_destination(
-    (named_home, home): (&Path, &Path),
-    path: &[u8],
-    follow: bool,
-) -> Result<(PathBuf, PathBuf)> {
-    let relative;
-    let path = if path == b"~" {
-        b"."
-    } else if let Some(rest) = path.strip_prefix(b"~/") {
-        // Keep even ~//path relative to the destination home. ./~/path still
-        // names a literal directory, and named receivers keep their cwd/root.
-        relative = [b"./".as_slice(), rest].concat();
-        &relative
-    } else {
-        path
-    };
-    resolve_destination(home, None, path, follow, Some((named_home, home)))
-}
-
-/// Check `request` and set up the authority for its copy, starting in the
-/// home directory, `home` as `HOME` names it and where it really is.
-fn prepare_receiver(
-    request: HelperRequest,
-    home: (&Path, &Path),
-) -> Result<(Arc<crate::restricted::RestrictedAuthority>, Approved)> {
-    if request.version != HELPER_VERSION || request.identity != crate::identity::build() {
-        bail!("return helper build mismatch");
-    }
-    let (destination, container) =
-        resolve_ssh_destination(home, &request.request.destination, request.follow_dst)?;
-    let request = constrain(
-        request.request,
-        &destination,
-        crate::delegation::MAX_COPY_BYTES,
-        crate::delegation::MAX_ENTRIES,
-        // The laptop applied its own deletion limit, and refused a
-        // pruning dry run where pruning is off, before forwarding.
-        u64::MAX,
-        false,
-    )?;
-    crate::restricted::named_authority(&crate::restricted::Container::open(&container)?, request)
-}
-
-fn receive() -> Result<i32> {
-    crate::fsops::reserve_startup_descriptors();
-    let fd = unsafe { libc::dup(libc::STDIN_FILENO) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let mut input = unsafe { File::from_raw_fd(fd) };
-    let setup = (|| {
-        crate::restricted::refuse_privileged_approved_receiver()?;
-        let started = Instant::now();
-        let request: HelperRequest = read_message_extending(
-            &mut DeadlineIo {
-                inner: &mut input,
-                deadline: started + Duration::from_secs(10),
-                cancelled: None,
-            },
-            |input| input.deadline = started + super::LARGE_MESSAGE_TIMEOUT,
-        )?;
-        let named_home = PathBuf::from(std::env::var_os("HOME").context("HOME is unset")?);
-        let home = fs::canonicalize(&named_home)?;
-        prepare_receiver(request, (&named_home, &home))
-    })();
-    let (authority, approved) = match setup {
-        Ok(value) => value,
-        Err(error) => {
-            write_message(&mut std::io::stdout(), &Reply::Error(format!("{error:#}")))?;
-            return Err(error);
-        }
-    };
-    let _lifetime = crate::server::ControlLifetime::watch(&input, authority.clone())?;
-    let workers = ssh::Server::start(authority.clone())?;
-    let mut approved = approved;
-    approved.token = workers.ticket()?;
-    write_message(&mut std::io::stdout(), &Reply::Approved(approved))?;
-    let pending = Arc::new(AtomicBool::new(true));
-    let result = crate::server::run_forwarded(
-        authority.clone(),
-        HandshakeInput::new(
-            input,
-            pending.clone(),
-            START_TIMEOUT,
-            Duration::from_secs(10),
-        ),
-        std::io::stdout().lock(),
-        pending,
-        true,
-    );
-    authority.close_control();
-    drop(workers);
-    result?;
-    Ok(0)
-}
 fn connect(target: &str, install: bool, operation: &str) -> Result<i32> {
     crate::fsops::reserve_startup_descriptors();
     let target =
@@ -1293,14 +1371,6 @@ fn read_ssh_configuration(
 
 pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
     match argv.get(1).and_then(|v| v.to_str())? {
-        "--peer-receiver" if argv.len() == 2 => Some(receive()),
-        "--return-ssh-setup" if argv.len() == 2 => Some(ssh::setup()),
-        "--return-ssh-worker" if argv.len() == 3 => Some(
-            argv[2]
-                .to_str()
-                .context("invalid copy worker admission")
-                .and_then(ssh::worker),
-        ),
         "--return-source-probe" | "--return-send-probe" if argv.len() == 2 => Some(Ok(0)),
         "--return-prepare" if argv.len() == 2 => Some(prepare_setup()),
         "--return-source" if argv.len() == 2 => Some(super::pull::receive()),
@@ -1338,11 +1408,15 @@ mod tests {
                 max_entries: 1,
                 max_delete: 0,
             },
-            host: "backup".into(),
-            port: None,
-            login: "alice".into(),
+            destination: SetupAccount {
+                host: "backup".into(),
+                port: None,
+                login: "alice".into(),
+                agent: None,
+            },
+            source: None,
+            results_key: None,
             via: (None, "server".into(), None),
-            agent: None,
             allow_enrollment: true,
         }
     }
@@ -1448,18 +1522,23 @@ mod tests {
     #[test]
     fn the_setup_child_enrolls_without_prompts_and_through_the_server_that_asked() {
         let request = prepare_request();
-        let issue = request.issue().unwrap();
+        let issue = request.issue(&request.destination, None).unwrap();
         assert!(issue.batch);
         assert_eq!(issue.caps, Some(request.caps));
         assert_eq!(issue.jump.unwrap().label(), "server");
         let mut named = prepare_request();
         named.via = (Some("alice".into()), "server".into(), Some(2222));
         assert_eq!(
-            named.issue().unwrap().jump.unwrap().label(),
+            named
+                .issue(&named.destination, None)
+                .unwrap()
+                .jump
+                .unwrap()
+                .label(),
             "alice@server:2222"
         );
         named.via = (None, "-oProxyCommand=evil".into(), None);
-        assert!(named.issue().is_err());
+        assert!(named.issue(&named.destination, None).is_err());
     }
 
     #[test]
@@ -1533,120 +1612,6 @@ mod tests {
     }
 
     #[test]
-    fn ssh_destinations_expand_only_a_leading_home_tilde() {
-        let root = crate::test_support::tempdir().unwrap();
-        let home = fs::canonicalize(root.path()).unwrap();
-        let resolved = |path: &[u8]| {
-            resolve_ssh_destination((&home, &home), path, false)
-                .unwrap()
-                .0
-        };
-        for path in [b"~/archive".as_slice(), b"~//archive", b"archive"] {
-            assert_eq!(resolved(path), home.join("archive"));
-        }
-        assert_eq!(resolved(b"~"), home);
-        assert_eq!(resolved(b"./~/archive"), home.join("~/archive"));
-        assert_eq!(resolved(b"~someone/archive"), home.join("~someone/archive"));
-        // The shared named resolver still interprets paths relative to cwd.
-        assert_eq!(
-            resolve_destination(&home, None, b"~/archive", false, None)
-                .unwrap()
-                .0,
-            home.join("~/archive")
-        );
-    }
-
-    /// A copy over an approved account connection treats a symlink above its
-    /// destination as an ordinary copy does: it stops the copy unless the
-    /// command passes `--follow-dst`, and then the copy goes where it leads.
-    #[test]
-    fn account_connection_receivers_follow_destination_links_only_when_asked() {
-        let temp = crate::test_support::tempdir().unwrap();
-        let temp = fs::canonicalize(temp.path()).unwrap();
-        let home = temp.join("home");
-        let outside = temp.join("outside");
-        fs::create_dir(&home).unwrap();
-        fs::create_dir(&outside).unwrap();
-        std::os::unix::fs::symlink(&outside, home.join("link")).unwrap();
-        let request = |destination: &str, follow_dst: bool| HelperRequest {
-            version: HELPER_VERSION,
-            identity: crate::identity::build().into(),
-            request: crate::destination::tests::request(&crate::destination::tests::args(
-                &temp.join("source"),
-                destination,
-            ))
-            .0,
-            follow_dst,
-        };
-        for destination in ["link/sub", "~/link/sub"] {
-            let error = prepare_receiver(request(destination, false), (&home, &home))
-                .err()
-                .unwrap();
-            assert!(
-                format!("{error:#}")
-                    .contains("refusing to follow symlink \"link\" in a path you gave"),
-                "{destination}: {error:#}"
-            );
-            let (_, approved) =
-                prepare_receiver(request(destination, true), (&home, &home)).unwrap();
-            assert_eq!(
-                approved.destination,
-                outside.join("sub").as_os_str().as_bytes()
-            );
-        }
-        // A destination in the home needs nothing more.
-        let (_, approved) = prepare_receiver(request("inbox", false), (&home, &home)).unwrap();
-        assert_eq!(
-            approved.destination,
-            home.join("inbox").as_os_str().as_bytes()
-        );
-        // The flag travels with the request.
-        let json = serde_json::to_value(request("inbox", true)).unwrap();
-        assert_eq!(json["follow_dst"], true);
-    }
-
-    #[test]
-    fn approved_setup_session_hint_only_follows_an_actual_session_refusal() {
-        for (message, operation, hint) in [
-            (
-                "mux_client_request_session: session request failed: Session open refused by peer",
-                "--return-ssh-setup",
-                true,
-            ),
-            (
-                "Permission denied (publickey).",
-                "--return-ssh-setup",
-                false,
-            ),
-            (
-                "mux_client_request_session: session request failed: Session open refused by peer",
-                "--peer-receiver",
-                false,
-            ),
-        ] {
-            let mut spec = crate::conn::RemoteSpec::local_receiver(false);
-            spec.local_process = false;
-            spec.rsh = vec![
-                "sh".into(),
-                "-c".into(),
-                format!("printf '%s' '{}' >&2; exit 255", message),
-            ];
-            let error = ForwardChild::over_spec(
-                &spec,
-                operation,
-                &"setup",
-                Instant::now() + Duration::from_secs(3),
-                &|| false,
-            )
-            .err()
-            .unwrap();
-            let detail = format!("{error:#}");
-            assert!(detail.contains(message), "{detail}");
-            assert_eq!(detail.contains("MaxSessions >= 2"), hint, "{detail}");
-        }
-    }
-
-    #[test]
     fn helper_exit_status_and_stderr_survive_group_cleanup() {
         let mut command = Command::new("sh");
         // A descendant keeps stderr open after the launcher has exited.
@@ -1699,88 +1664,24 @@ mod tests {
         assert_eq!(&response, b"hello");
     }
     #[test]
-    fn peer_relay_release_allows_slow_final_coordinator_output() {
-        let (mut client, server) = UnixStream::pair().unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        let mut command = Command::new("sh");
-        command.args(["-c", "printf done"]);
-        let mut peer = ForwardChild::spawn_command(command).unwrap();
-        let input = peer.child.stdin.take().unwrap();
-        let output = peer.child.stdout.take().unwrap();
-        let thread =
-            std::thread::spawn(move || relay_peer(server, input, output, || false, &mut peer));
-        let mut result = Vec::new();
-        client.read_to_end(&mut result).unwrap();
-        assert_eq!(result, b"done");
-        client.shutdown(std::net::Shutdown::Write).unwrap();
-        let released = thread.join().unwrap().unwrap();
-        assert!(released);
-        // The independently owned coordinator may still flush its final stdout.
-        // No fixed deadline applies after it released its peer control.
-        let mut command = Command::new("sh");
-        command.args(["-c", "sleep 2.2; printf final"]);
-        let mut coordinator = ForwardChild::spawn_command(command).unwrap();
-        let mut output = coordinator.child.stdout.take().unwrap();
-        assert!(coordinator
-            .wait_until_exit(None, &|| !released)
-            .unwrap()
-            .success());
-        result.clear();
-        output.read_to_end(&mut result).unwrap();
-        assert_eq!(result, b"final");
-    }
-
-    #[test]
-    fn peer_relay_loss_without_control_release_stops_the_coordinator() {
-        let (mut client, server) = UnixStream::pair().unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(4)))
-            .unwrap();
-        let mut command = Command::new("sh");
-        command.args(["-c", "exit 0"]);
-        let mut peer = ForwardChild::spawn_command(command).unwrap();
-        let input = peer.child.stdin.take().unwrap();
-        let output = peer.child.stdout.take().unwrap();
-        let started = Instant::now();
-        let thread =
-            std::thread::spawn(move || relay_peer(server, input, output, || false, &mut peer));
-        // read_exact retries EINTR from signal tests sharing this process.
-        assert_eq!(
-            client.read_exact(&mut [0]).unwrap_err().kind(),
-            std::io::ErrorKind::UnexpectedEof
-        );
-        // Keep B's read/upload side alive even though C disappeared.
-        assert!(!thread.join().unwrap().unwrap());
-        assert!(started.elapsed() < Duration::from_secs(4));
-        assert!(client.write_all(b"late").is_err());
-        let mut command = Command::new("sh");
-        command.args(["-c", "sleep 30"]);
-        let mut coordinator = ForwardChild::spawn_command(command).unwrap();
-        assert!(coordinator.wait_until_exit(None, &|| true).is_err());
-        assert!(coordinator.child.try_wait().unwrap().is_some());
-    }
-
-    #[test]
-    fn peer_relay_cancellation_wakes_both_blocked_pumps() {
+    fn relay_cancellation_wakes_both_blocked_pumps() {
         let (_client, server) = UnixStream::pair().unwrap();
         let mut command = Command::new("cat");
         command.arg("-");
-        let mut peer = ForwardChild::spawn_command(command).unwrap();
-        let input = peer.child.stdin.take().unwrap();
-        let output = peer.child.stdout.take().unwrap();
+        let mut child = ForwardChild::spawn_command(command).unwrap();
+        let input = child.child.stdin.take().unwrap();
+        let output = child.child.stdout.take().unwrap();
         let started = Instant::now();
-        assert!(relay_peer(
+        assert!(relay(
             server,
             input,
             output,
             || started.elapsed() >= Duration::from_millis(20),
-            &mut peer
+            &mut child
         )
         .is_err());
         assert!(started.elapsed() < Duration::from_secs(2));
-        assert!(peer.child.try_wait().unwrap().is_some());
+        assert!(child.child.try_wait().unwrap().is_some());
     }
 
     #[test]
@@ -1893,12 +1794,14 @@ mod tests {
         for (target, command, inputs) in cases {
             assert!(exchange(
                 &registration,
-                Message::Forward {
+                Message::Forward(Box::new(ForwardRequest {
+                    source: None,
                     target: target.into(),
                     command: command.clone(),
                     cwd: String::new(),
                     inputs,
-                },
+                    results_key: None,
+                })),
                 Duration::from_secs(2),
                 Some(Duration::from_secs(2))
             )
@@ -1917,12 +1820,14 @@ mod tests {
             let task = std::thread::spawn(move || {
                 exchange(
                     &registration,
-                    Message::Forward {
+                    Message::Forward(Box::new(ForwardRequest {
+                        source: None,
                         target: "backup".into(),
                         command,
                         cwd: "~/rt-bench".into(),
                         inputs: crate::directive::Inputs::default(),
-                    },
+                        results_key: None,
+                    })),
                     Duration::from_secs(3),
                     Some(Duration::from_secs(3)),
                 )

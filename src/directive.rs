@@ -88,10 +88,36 @@ pub(crate) struct Binding {
 }
 
 /// Which end of the copy the receiver is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Role {
     Destination,
+    /// The source of a copy between two servers that a third one started.
+    /// The source's own receiver coordinates it: it runs the command and
+    /// reaches `Peer`, the destination's receiver, itself.
+    CoordinatingSource(Peer),
 }
+
+/// The destination's receiver a coordinating source reaches, as the signing
+/// machine approved it for this copy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Peer {
+    pub enrollment: EnrollmentId,
+    pub generation: u64,
+    /// The destination's server account.
+    pub account: String,
+    /// The destination directive's request: the one directive this
+    /// source's may be presented with.
+    pub request: RequestId,
+    /// Where the destination's rules write there, as an absolute path.
+    pub destination: Vec<u8>,
+    /// What the signing machine's known_hosts files list for the
+    /// destination, which the source's SSH configuration adds to its own.
+    pub known_hosts: String,
+}
+
+/// The longest known_hosts text a coordinating source's directive carries.
+pub(crate) const MAX_KNOWN_HOSTS_BYTES: usize = 64 * 1024;
+const MAX_PEER_DESTINATION_BYTES: usize = 4096;
 
 /// What the command read from files, which a receiver cannot read. Ignore
 /// rules only narrow the copy. A mapping limits it to the entries it lists,
@@ -115,6 +141,16 @@ pub(crate) struct Caps {
 }
 
 impl Caps {
+    /// The most deletions the copy `args` states may make under these
+    /// limits, as [`Caps::apply`] leaves its rules.
+    pub(crate) fn command_deletion_ceiling(&self, args: &Args) -> u64 {
+        let entries = args
+            .receiver_max_entries
+            .unwrap_or(DEFAULT_MAX_ENTRIES)
+            .min(self.max_entries);
+        self.max_delete.min(entries)
+    }
+
     /// The most deletions `copy` may make under these limits: the
     /// approving machine's `--max-delete`, within the copy's entry limit.
     pub(crate) fn deletion_ceiling(&self, copy: &CopyOperation) -> u64 {
@@ -148,6 +184,23 @@ impl Directive {
         self.request_id.validate()?;
         self.binding.enrollment.validate()?;
         delegation::validate_identity("account", &self.binding.account)?;
+        if let Role::CoordinatingSource(peer) = &self.binding.role {
+            peer.enrollment.validate()?;
+            peer.request.validate()?;
+            delegation::validate_identity("destination account", &peer.account)?;
+            if peer.enrollment == self.binding.enrollment || peer.request == self.request_id {
+                bail!("a coordinating source's peer must be another receiver's directive");
+            }
+            if !peer.destination.starts_with(b"/")
+                || peer.destination.len() > MAX_PEER_DESTINATION_BYTES
+                || peer.destination.contains(&0)
+            {
+                bail!("the peer's destination is outside the supported range");
+            }
+            if peer.known_hosts.len() > MAX_KNOWN_HOSTS_BYTES || peer.known_hosts.contains('\0') {
+                bail!("the peer's known hosts are outside the supported range");
+            }
+        }
         for (name, value) in [
             ("issued-at", self.issued_at),
             ("not-before", self.not_before),
@@ -319,7 +372,10 @@ pub(crate) fn destination_rules(
     directive: &Directive,
     home: &Path,
 ) -> Result<(Grant, GrantConstraints)> {
-    let Role::Destination = directive.binding.role;
+    ensure!(
+        directive.binding.role == Role::Destination,
+        "the directive is not for a copy's destination"
+    );
     let args = crate::approval_command::parse(&directive.command)?;
     ensure!(
         args.interface == crate::cli::Interface::NativeCp && args.s3.is_none(),
@@ -373,6 +429,87 @@ pub(crate) fn destination_rules(
         },
         constraints,
     ))
+}
+
+/// The source and destination of `args` when it is a copy between two
+/// servers that the source's receiver can coordinate: one source account,
+/// another destination account, and none of the options that choose another
+/// route or connection.
+pub(crate) fn coordinated_endpoints(args: &Args) -> Result<(&Location, &Location)> {
+    ensure!(
+        args.interface == crate::cli::Interface::NativeCp && args.s3.is_none(),
+        "a copy between two servers must be a syq cp between file systems"
+    );
+    let (destination, sources) = args
+        .locations
+        .split_last()
+        .context("the command names no destination")?;
+    let source = sources.first().context("the command names no source")?;
+    let plain = |location: &Location| {
+        location.is_remote()
+            && location
+                .host
+                .as_deref()
+                .is_some_and(|host| !host.starts_with('@'))
+    };
+    ensure!(
+        plain(source) && plain(destination) && sources.iter().all(|s| s.same_host(source)),
+        "a copy between two servers needs its sources on one SSH server and its destination on another"
+    );
+    ensure!(
+        !source.same_host(destination),
+        "the source and destination of a copy between two servers must be different accounts"
+    );
+    ensure!(
+        args.rsh.is_none()
+            && args.syq_path.is_none()
+            && !args.no_bootstrap
+            && !args.detach
+            && !args.relay
+            && args.restricted_grant.is_none()
+            && args.peer_auth == crate::cli::PeerAuth::Restricted
+            && matches!(
+                args.coordinate_at,
+                crate::cli::CoordinateAt::Auto | crate::cli::CoordinateAt::Src
+            ),
+        "a copy between two servers approved by another machine runs on the source with the destination's restricted receiver; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --peer-auth or --coordinate-at local or dst"
+    );
+    validate_restricted_args(args)?;
+    Ok((source, destination))
+}
+
+/// The command a coordinating source's receiver runs for `source`, its own
+/// verified directive, when `destination` is the destination directive it
+/// was presented with. The destination's receiver verifies `destination`
+/// itself; this only checks that it is the one approved with `source`, for
+/// the same command.
+pub(crate) fn coordination(source: &Directive, destination: &Directive) -> Result<Args> {
+    let Role::CoordinatingSource(peer) = &source.binding.role else {
+        bail!("the directive is not for a source that coordinates its copy");
+    };
+    ensure!(
+        destination.binding.role == Role::Destination
+            && destination.binding.enrollment == peer.enrollment
+            && destination.binding.generation == peer.generation
+            && destination.binding.account == peer.account
+            && destination.request_id == peer.request,
+        "the destination's directive is not the one approved with this copy"
+    );
+    ensure!(
+        destination.build == source.build
+            && destination.command == source.command
+            && destination.cwd == source.cwd
+            && destination.inputs == source.inputs
+            && destination.caps == source.caps,
+        "the destination's directive approves a different copy"
+    );
+    let args = crate::approval_command::parse(&source.command)?;
+    coordinated_endpoints(&args)?;
+    ensure!(
+        args.native_mapping.is_some() == source.inputs.mapping.is_some(),
+        "the directive's mapping does not match its command"
+    );
+    Ok(args)
 }
 
 /// `path` as an absolute path on an account whose home is `home`: `~`,

@@ -1513,14 +1513,7 @@ fn the_coordinator_gets_the_entry_key_and_directive_only_on_its_input() {
     for (_, value) in &environment {
         assert!(!value.contains(&encoded) && !value.contains("PRIVATE KEY"));
     }
-    // A copy between two servers that hostX approved passes its marker.
-    let marker = crate::destination::peer_bridge::GRANT;
-    let (environment, input) = receiver_inputs(Some(marker), None).unwrap();
-    assert_eq!(
-        environment,
-        [("SYQ_INTERNAL_NATIVE_RESTRICTED_GRANT", marker.to_owned())]
-    );
-    assert!(input.is_none());
+    assert!(receiver_inputs(Some(&encoded), None).is_err());
     assert_eq!(receiver_inputs(None, None).unwrap(), (Vec::new(), None));
 }
 
