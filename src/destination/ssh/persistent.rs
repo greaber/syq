@@ -1419,10 +1419,25 @@ fn keeper(startup: Startup) -> Result<()> {
     // approving side.
     let mut drain = Drain::default();
     // The record and its lock, until the master is ending: then a new
-    // command opens a connection of its own beside it at once.
+    // command opens a connection of its own beside it at once, while a
+    // lock of its own keeps this keeper visible to `persist off`.
     let mut published = Some((index, lock));
+    let mut draining_lock = None;
+    // An explicit-domain master runs as a daemon apart from its launcher.
+    // Once it stops listening, its process is what still runs its sessions.
+    let daemonized = !domain.is_default();
+    let daemon_pid = std::cell::Cell::new(None);
     let use_count = || in_use(&record.control);
-    let mut stop = || stop_listening(&record).is_ok();
+    let mut stop = || {
+        if daemonized {
+            match master_pid(&record).and_then(|pid| Some((pid, process_start(pid)?))) {
+                Some(daemon) => daemon_pid.set(Some(daemon)),
+                // Without it, nothing could end the draining daemon.
+                None => return false,
+            }
+        }
+        stop_listening(&record).is_ok()
+    };
     loop {
         if domain.is_default() {
             if master.poll()?.is_some() {
@@ -1436,9 +1451,16 @@ fn keeper(startup: Startup) -> Result<()> {
                 );
             }
             // Polling with -O check would itself create mux channels and reset
-            // OpenSSH's idle timer. Normal exit unlinks the control socket.
-            if !record.control.exists() {
-                break;
+            // OpenSSH's idle timer. Normal exit unlinks the control socket;
+            // stopping it while draining does too, before its sessions end.
+            match daemon_pid.get() {
+                Some((pid, start)) if drain.closing => {
+                    if process_start(pid) != Some(start) {
+                        break;
+                    }
+                }
+                _ if !record.control.exists() => break,
+                _ => {}
             }
         }
         if signals.received.load(Ordering::Acquire) != 0
@@ -1458,6 +1480,12 @@ fn keeper(startup: Startup) -> Result<()> {
                     session.answer(reply)?;
                 }
             }
+        } else if linked == Some(true) {
+            // Still answer: the master no longer depends on the approving
+            // side, which then lets the link go.
+            if let Ok(Some(request)) = session.link_request() {
+                let _ = session.answer(drain.answer(request, &use_count, &mut stop));
+            }
         }
         if !drain.closing && close_request.exists() {
             let _ = fs::remove_file(&close_request);
@@ -1466,8 +1494,10 @@ fn keeper(startup: Startup) -> Result<()> {
         if drain.closing && !std::mem::replace(&mut drain.pool_stopped, true) {
             // A spare session would keep the master.
             let _ = pool.stop();
-            // Remove the record, then release its lock. Stopping persistence
-            // or this keeper still ends the master at once.
+            // Remove the record, then release its lock, keeping a lock of
+            // its own. Stopping persistence or this keeper still ends the
+            // master, and `persist off` waits for that.
+            draining_lock = DrainingLock::take(&close_request);
             drop(published.take());
         }
         signals.wait(POLL)?;
@@ -1475,15 +1505,100 @@ fn keeper(startup: Startup) -> Result<()> {
     let pool_result = pool.stop();
     let master_result = master.stop(libc::SIGTERM);
     let daemon_result = daemon.as_mut().map_or(Ok(()), DaemonMaster::stop);
+    // A daemon still draining sessions ends with this keeper.
+    if let Some(daemon) = daemon_pid.get().filter(|_| drain.closing) {
+        end_daemon(daemon);
+    }
+    drop(draining_lock);
     // A broken pool must not leave an approved login alive.
     master_result?;
     daemon_result?;
     pool_result
 }
 
+/// The process of the OpenSSH master at `record`'s control socket, as it
+/// reports it.
+fn master_pid(record: &Record) -> Option<u32> {
+    let output = master_command(record)
+        .args(["-O", "check", "--", &record.endpoint.host])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn_guarded()
+        .ok()?
+        .wait_with_output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // OpenSSH: "Master running (pid=N)".
+    let text = String::from_utf8_lossy(&output.stderr);
+    let pid = text.split("(pid=").nth(1)?.split(')').next()?;
+    pid.parse().ok().filter(|pid| *pid > 1)
+}
+
+/// When process `pid` started, in clock ticks since boot; None once it is
+/// gone. OpenSSH renames its master's process as it goes, so its start is
+/// what tells it from a process that took its number since.
+fn process_start(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // pid (comm) state ppid ...: field 22 is the start time.
+    let fields = stat.rsplit_once(')')?.1;
+    fields.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// End the draining master, as stopping it ends any other.
+fn end_daemon((pid, start): (u32, u64)) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut signal = libc::SIGTERM;
+    while process_start(pid) == Some(start) {
+        unsafe { libc::kill(pid as libc::pid_t, signal) };
+        if Instant::now() >= deadline {
+            signal = libc::SIGKILL;
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Held by a keeper whose master is draining, after it gave up its record
+/// and its lock: an index lock file of its own, which `persist off` waits
+/// for as for any keeper's, and which no record uses. Like those, the file
+/// stays for the next keeper of the same account, so that none is removed
+/// while someone looks at it.
+struct DrainingLock {
+    _file: File,
+}
+impl DrainingLock {
+    /// Unless another draining keeper of this account holds it.
+    fn take(close_request: &Path) -> Option<Self> {
+        let record = close_request.file_stem()?.as_encoded_bytes();
+        let name = blake3::hash(&[b"syq-draining-account-v1\0", record].concat()).to_hex();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(close_request.with_file_name(format!("{name}.lock")))
+            .ok()?;
+        (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0)
+            .then_some(Self { _file: file })
+    }
+}
+
 /// How many sessions use the master at `control`, apart from the session
 /// pool's spares; None when that cannot be told.
 fn in_use(control: &Path) -> Option<usize> {
+    // Tests stand in for a session that starts between the look and the
+    // stop.
+    #[cfg(debug_assertions)]
+    if let Some(sessions) = std::env::var("SYQ_TEST_ACCOUNT_SESSIONS")
+        .ok()
+        .and_then(|sessions| sessions.parse().ok())
+    {
+        return Some(sessions);
+    }
     crate::session_pool::sessions_in_use(control, Duration::from_millis(200))
 }
 
@@ -1766,10 +1881,6 @@ mod tests {
         fs::set_permissions(&index, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    /// A provider's connection is in use from an account request through
-    /// it until that ends: while it waits for approval or connects, its
-    /// keeper holds its record's lock with no record yet; once connected,
-    /// the record names the provider.
     /// A link's close and a newer command's close request can arrive
     /// together. Once the first stopped the master taking new sessions,
     /// the session that started meanwhile does not undo it, and nothing
@@ -1837,6 +1948,24 @@ mod tests {
         assert!(!drain.closing);
     }
 
+    /// A process's start tells it apart from one that takes its number
+    /// after it ends.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_is_known_by_its_start() {
+        let own = process_start(std::process::id());
+        assert!(own.is_some());
+        assert_eq!(process_start(std::process::id()), own);
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert_eq!(process_start(pid), None);
+    }
+
+    /// A provider's connection is in use from an account request through
+    /// it until that ends: while it waits for approval or connects, its
+    /// keeper holds its record's lock with no record yet; once connected,
+    /// the record names the provider.
     #[test]
     fn a_provider_is_in_use_from_an_account_request_until_it_ends() {
         let root = crate::test_support::short_tempdir().unwrap();
