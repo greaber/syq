@@ -24,14 +24,14 @@ impl Failure {
 
 /// What a finished connection's SSH diagnostics showed.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Diagnosis {
-    pub(super) failure: Option<Failure>,
+pub(crate) struct Diagnosis {
+    pub(crate) failure: Option<Failure>,
     /// Whether they mention the text `capture` was given.
-    pub(super) names_marker: bool,
+    pub(crate) names_marker: bool,
 }
 
 /// Pass `stderr` through live and report what it showed once it closes.
-pub(super) fn capture(
+pub(crate) fn capture(
     mut stderr: ChildStderr,
     marker: Option<&'static str>,
 ) -> std::io::Result<Receiver<Option<Diagnosis>>> {

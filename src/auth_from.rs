@@ -295,7 +295,9 @@ pub(crate) fn apply_copy(args: &mut crate::cli::Args) -> Result<()> {
         args.locations.last()
     } else if crate::destination::pull::eligible_target(args).is_ok() {
         args.locations.first()
-    } else if crate::destination::between_servers(args) {
+    } else if crate::destination::coordinated_targets(args).is_ok() {
+        // Only a copy that route can carry: with --rsh or another option it
+        // refuses, the server's own SSH runs the copy, as for an upload.
         args.auth_from = between_servers(args)?;
         return Ok(());
     } else {

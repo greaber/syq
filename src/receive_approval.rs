@@ -107,6 +107,22 @@ pub(crate) struct Remote<'a> {
     pub source: Option<(&'a str, crate::restricted::EnrollmentState)>,
 }
 
+/// `path`, a source the command names, as it is read: inside `base`, the
+/// command's -C or --root directory, unless it is absolute.
+fn source_path(base: Option<&[u8]>, path: &[u8]) -> Vec<u8> {
+    let Some(base) = base.filter(|_| !path.starts_with(b"/")) else {
+        return path.to_vec();
+    };
+    let mut relative = path;
+    while let Some(rest) = relative.strip_prefix(b"./") {
+        relative = rest;
+    }
+    if relative.is_empty() || relative == b"." {
+        return base.to_vec();
+    }
+    [base.strip_suffix(b"/").unwrap_or(base), b"/", relative].concat()
+}
+
 /// What approving a copy sets up on `target` before it starts, after the
 /// copy's own `permission`.
 fn setup_text(target: &str, enrollment: crate::restricted::EnrollmentState) -> String {
@@ -313,26 +329,57 @@ impl Summary {
         // Sources stay as the command wrote them, relative to `cwd` on the
         // server; only the destination is resolved, by this machine.
         let parsed = crate::approval_command::parse(command).ok();
-        // Files on another server are named with it.
-        let source_host = remote
+        // Files on another server are named with it, where the command reads
+        // them: from its -C or --root directory there.
+        let source_server = remote
             .and_then(|remote| remote.source)
-            .map(|(host, _)| host);
+            .and_then(|(source, _)| {
+                crate::cli::parse_native_endpoint(Some(source))
+                    .ok()
+                    .flatten()
+            });
         let sources = parsed
             .as_ref()
             .map(|args| {
                 let count = args.locations.len().saturating_sub(1);
+                let base = args
+                    .native_source_root
+                    .as_deref()
+                    .or(args.native_source_cwd.as_deref());
                 args.locations
                     .iter()
                     .take(count)
-                    .map(|location| match source_host {
+                    .map(|location| match &source_server {
                         None => crate::approval_command::quote_arg(&location.path),
-                        Some(host) => crate::approval_command::display_arg(
-                            &[host.as_bytes(), b":", location.path.as_slice()].concat(),
-                        ),
+                        Some(server) => {
+                            let label = match &server.user {
+                                Some(user) => format!("{user}@{}", server.host),
+                                None => server.host.clone(),
+                            };
+                            crate::approval_command::display_arg(
+                                &[label.as_bytes(), b":", &source_path(base, &location.path)]
+                                    .concat(),
+                            )
+                        }
                     })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let mut notes = copy_notes(request, remote.is_some());
+        if let Some(server) = &source_server {
+            if let Some(port) = server.port {
+                notes.push(format!("the source's SSH port is {port}"));
+            }
+            if parsed
+                .as_ref()
+                .is_some_and(|args| args.follows_native_source_paths())
+            {
+                notes.push(
+                    "follows symlinks in the sources, so it can send files outside the paths shown"
+                        .to_owned(),
+                );
+            }
+        }
         let prunes = parsed.as_ref().is_some_and(|args| args.delete);
         let target = match remote {
             None => local_path(&request.copy.destination),
@@ -359,7 +406,7 @@ impl Summary {
             },
             preposition: "to",
             target,
-            notes: copy_notes(request, remote.is_some()),
+            notes,
             sources_heading: "from",
             sources,
             details: Details::Copy {
@@ -2440,6 +2487,83 @@ mod tests {
             "{}",
             between.desktop_description(false)
         );
+        // Sources read from a -C or --root directory there show it; the
+        // port and followed symlinks get notes of their own.
+        let rooted = |source: &str, command: &[&str]| {
+            Summary::new(
+                &requester(),
+                &command
+                    .iter()
+                    .map(|arg| arg.as_bytes().to_vec())
+                    .collect::<Vec<_>>(),
+                "~",
+                &forwarded,
+                TIMEOUT,
+                Some(Remote {
+                    target: "backup",
+                    enrollment: crate::restricted::EnrollmentState::Ready,
+                    source: Some((source, crate::restricted::EnrollmentState::Ready)),
+                }),
+            )
+            .unwrap()
+            .desktop_description(false)
+        };
+        let desktop = rooted(
+            "reader@source:2222",
+            &[
+                "cp",
+                "--from",
+                "reader@source:2222",
+                "-C",
+                "/home/other",
+                "--srcs-in",
+                ".",
+                "--src",
+                "./a",
+                "--src",
+                "/etc/b",
+                "--to",
+                "backup",
+                "--into",
+                "out",
+            ],
+        );
+        for expected in [
+            "    reader@source:/home/other\n",
+            "    reader@source:/home/other/a\n",
+            "    reader@source:/etc/b\n",
+            "the source's SSH port is 2222",
+        ] {
+            assert!(desktop.contains(expected), "{expected}: {desktop}");
+        }
+        assert!(!desktop.contains("follows symlinks"), "{desktop}");
+        let desktop = rooted(
+            "reader@source",
+            &[
+                "cp",
+                "--from",
+                "reader@source",
+                "--root",
+                "/srv/",
+                "--follow-src",
+                "--src",
+                "data",
+                "--to",
+                "backup",
+                "--into",
+                "out",
+            ],
+        );
+        assert!(
+            desktop.contains("    reader@source:/srv/data\n"),
+            "{desktop}"
+        );
+        assert!(
+            desktop.contains("follows symlinks in the sources"),
+            "{desktop}"
+        );
+        assert!(!desktop.contains("SSH port"), "{desktop}");
+
         let details = between.details_description(str::to_owned);
         assert!(
             details.contains("May create and overwrite matching entries. \"reader@source\" runs the copy and sends the files the command names directly to \"backup\". Also sets up restricted copying on \"reader@source\": adds a key"),

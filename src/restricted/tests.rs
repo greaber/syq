@@ -1050,11 +1050,10 @@ fn a_coordinating_source_is_admitted_only_with_its_own_destination_directive() {
     assert_eq!(recorded(), 0);
 
     let valid = frame(valid_source.clone(), signed_destination(&destination));
-    let ((args, peer, caps, mapping), _) =
-        verify_coordination(&state, &config, receiver, &valid).unwrap();
+    let ((args, peer, caps), _) = verify_coordination(&state, &config, receiver, &valid).unwrap();
     assert_eq!(args.ignore_lines, ["*.tmp"]);
     assert_eq!(peer.destination, b"/home/backup/archive");
-    assert!(caps.is_none() && mapping.is_none());
+    assert!(caps.is_none());
     assert_ne!(recorded(), 0);
     let error = verify_coordination(&state, &config, receiver, &valid)
         .err()
@@ -2696,7 +2695,7 @@ fn a_session_reads_exactly_one_bounded_first_frame() {
     assert!(refused(&[0, 0, 0, 0], long).contains("unsupported length"));
     assert!(refused(&u32::MAX.to_be_bytes(), long).contains("unsupported length"));
     // An unknown kind, and trailing bytes inside the frame.
-    assert!(refused(&[0, 0, 0, 2, 2, 0], long).contains("decode"));
+    assert!(refused(&[0, 0, 0, 2, 3, 0], long).contains("decode"));
     let mut trailing = Admission::Worker("w".into()).frame().unwrap();
     trailing.push(0);
     trailing[3] += 1;

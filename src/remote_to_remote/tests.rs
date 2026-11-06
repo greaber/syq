@@ -1654,7 +1654,6 @@ fn coordinating(
             known_hosts: "host-c ssh-ed25519 AAAA\n".into(),
         },
         caps,
-        mapping: None,
         frame: Box::new(crate::restricted::Coordinate {
             source: vec![1; 10],
             destination: vec![2; 20],

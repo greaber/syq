@@ -89,6 +89,11 @@ pub(super) fn select(
         crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name)) => {
             Some(name.clone())
         }
+        crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Ssh { .. })
+            if between_servers(args) =>
+        {
+            bail!("a copy between two servers cannot use account access from an SSH provider; use --auth-from @NAME for a copy a receiving machine approves, or --coordinate-at local to copy through this machine with the provider's access");
+        }
         crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Ssh { .. }) => {
             bail!("this copy cannot use account authorization from an SSH provider; use a supported direct SSH copy or --auth-from @NAME for per-copy authorization");
         }
@@ -234,6 +239,36 @@ impl std::fmt::Debug for Issued {
     }
 }
 
+/// What the approving machine leaves out of the host-key checking it hands
+/// on for a copy between two servers: for the source, which this machine
+/// checks, and for the destination, which the source checks. Each omission
+/// names only the kind of setting, never its configured value.
+fn left_out_notices(
+    (source, source_left_out): (&str, Option<&str>),
+    (target, destination_left_out): (&str, Option<&str>),
+) -> Vec<String> {
+    let plain = |text: &str| {
+        text.chars()
+            .filter(|character| !character.is_control())
+            .collect::<String>()
+    };
+    source_left_out
+        .map(|left_out| {
+            format!(
+                "syq: checking {source}'s host key without some of what the approving machine knows about it: {}",
+                plain(left_out)
+            )
+        })
+        .into_iter()
+        .chain(destination_left_out.map(|left_out| {
+            format!(
+                "syq: {source} checks {target}'s host key without some of what the approving machine knows about it: {}",
+                plain(left_out)
+            )
+        }))
+        .collect()
+}
+
 /// Ask the receiving machine to approve a copy between two servers, then
 /// set up this machine's connection to the source's receiver, which runs
 /// the copy.
@@ -276,6 +311,7 @@ fn prepare_coordinated(
     let Issued {
         directive,
         entry_key,
+        known_hosts_left_out,
         coordinated,
         ..
     } = *issued;
@@ -285,18 +321,13 @@ fn prepare_coordinated(
             "syq: remote copy approved; connecting to the source's restricted receiver"
         );
     }
-    if let Some(left_out) = coordinated
-        .known_hosts_left_out
-        .as_deref()
-        .filter(|_| !args.quiet)
-    {
-        crate::output::diagnostic!(
-            "syq: checking the source's host key without some of what the approving machine knows about it: {}",
-            left_out
-                .chars()
-                .filter(|character| !character.is_control())
-                .collect::<String>()
-        );
+    if !args.quiet {
+        for notice in left_out_notices(
+            (&source, coordinated.known_hosts_left_out.as_deref()),
+            (&target, known_hosts_left_out.as_deref()),
+        ) {
+            crate::output::diagnostic!("{notice}");
+        }
     }
     let decode = |text: &str| {
         base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -774,12 +805,14 @@ impl Prepare {
             host: &account.host,
             port: account.port,
             login: &account.login,
-            // The copy needs the server that asked to reach the account's
-            // SSH port, or the source to reach the destination's, which the
-            // server that asked reaches too. So enrolling can go through it
-            // when this machine cannot reach the account along its own SSH
+            // Enrolling goes through the server that asked when this
+            // machine cannot reach the account along its own SSH
             // configuration's route, as a copy started on this machine goes
-            // through its source.
+            // through its source. An upload needs that server to reach the
+            // destination's SSH port anyway, and a copy between two other
+            // servers needs it to reach the source's; for the destination of
+            // such a copy, the hop works only if it reaches that too, as the
+            // docs say.
             jump: Some(crate::enrollment::SshEndpoint::from_host(
                 user.as_deref(),
                 host,
@@ -1952,6 +1985,33 @@ mod tests {
                 between_servers_command(&["--coordinate-at", "dst"]),
                 key,
             ),
+            // A mapping would choose which source files are read, unseen.
+            Message::Forward(Box::new(ForwardRequest {
+                source: Some("reader@source-host".into()),
+                target: "backup".into(),
+                command: [
+                    "cp",
+                    "--from",
+                    "reader@source-host",
+                    "--mapping",
+                    "map",
+                    "--to",
+                    "backup",
+                    "--into",
+                    "output",
+                ]
+                .map(|arg| arg.as_bytes().to_vec())
+                .to_vec(),
+                cwd: String::new(),
+                inputs: crate::directive::Inputs {
+                    ignore: Vec::new(),
+                    mapping: Some(crate::mapping::Authorization {
+                        bytes: 1,
+                        digest: [0; 32],
+                    }),
+                },
+                results_key: key,
+            })),
         ];
         for message in cases {
             assert!(exchange(
@@ -1964,6 +2024,30 @@ mod tests {
             assert!(receiver.approvals.snapshots().is_empty());
         }
         assert_eq!(receiver.forward_count.load(Ordering::Acquire), 0);
+    }
+
+    /// The approving machine says which of its host-key settings each
+    /// server's check goes without, naming which server checks, and nothing
+    /// for a check that has everything.
+    #[test]
+    fn omitted_host_key_settings_name_the_server_that_checks() {
+        assert!(left_out_notices(("hostB", None), ("hostC", None)).is_empty());
+        assert_eq!(
+            left_out_notices(("hostB", None), ("hostC", Some("KnownHostsCommand\n"))),
+            ["syq: hostB checks hostC's host key without some of what the approving machine knows about it: KnownHostsCommand"]
+        );
+        assert_eq!(
+            left_out_notices(("hostB", Some("RevokedHostKeys")), ("hostC", None)),
+            ["syq: checking hostB's host key without some of what the approving machine knows about it: RevokedHostKeys"]
+        );
+        assert_eq!(
+            left_out_notices(
+                ("hostB", Some("RevokedHostKeys")),
+                ("hostC", Some("KnownHostsCommand"))
+            )
+            .len(),
+            2
+        );
     }
 
     /// One prompt approves a copy between two other servers: it names both,

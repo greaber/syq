@@ -1090,9 +1090,10 @@ pub(crate) fn forward_target(args: &crate::cli::Args) -> Result<String> {
     forward::eligible_target(args)
 }
 
-/// Whether `args` copies from one server to another.
-pub(crate) fn between_servers(args: &crate::cli::Args) -> bool {
-    forward::between_servers(args)
+/// The source and destination of a copy between two servers that a
+/// receiving machine could approve.
+pub(crate) fn coordinated_targets(args: &crate::cli::Args) -> Result<(String, String)> {
+    forward::eligible_peer(args)
 }
 
 /// Plan deletions against the approving machine's own --max-delete, or the

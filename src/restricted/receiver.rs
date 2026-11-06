@@ -46,8 +46,8 @@ pub(crate) enum Admission {
 }
 
 /// A copy between two servers that this account's receiver coordinates.
-/// After the frame, the session's input carries the copy's mapping, if its
-/// directive names one, and then nothing more until the requester ends.
+/// After the frame, the session's input carries the requester's marker, and
+/// then nothing more until the requester ends.
 #[derive(PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Coordinate {
     /// This enrollment's signed directive.
@@ -77,8 +77,12 @@ impl fmt::Debug for Coordinate {
 
 impl Admission {
     /// The frame: a 4-byte big-endian length, then the postcard encoding.
+    /// A coordinating source's frame carries an entry key; the caller wipes
+    /// the frame, and the encoding is wiped here.
     pub(crate) fn frame(&self) -> Result<Vec<u8>> {
-        let body = postcard::to_stdvec(self).context("encode the admission frame")?;
+        let body = zeroize::Zeroizing::new(
+            postcard::to_stdvec(self).context("encode the admission frame")?,
+        );
         if body.len() > MAX_ADMISSION_BYTES {
             bail!("the admission frame exceeds its size limit");
         }
@@ -104,7 +108,8 @@ impl Admission {
         if length == 0 || length > MAX_ADMISSION_BYTES {
             bail!("the session's first frame has an unsupported length");
         }
-        let mut body = vec![0; length];
+        // It can carry an entry key, wiped once decoded.
+        let mut body = zeroize::Zeroizing::new(vec![0; length]);
         input
             .read_exact(&mut body)
             .context("read the session's first frame")?;
@@ -237,8 +242,6 @@ pub(crate) struct Coordinating {
     pub peer: crate::directive::Peer,
     /// The approving machine's limits.
     pub caps: Option<crate::directive::Caps>,
-    /// The size and digest of the mapping the session's input carries.
-    pub mapping: Option<crate::mapping::Authorization>,
     pub frame: Box<Coordinate>,
 }
 
@@ -308,7 +311,7 @@ fn admit_coordinator(
     let (_, home) = current_account()?;
     let (coordinating, verified) = verify_coordination(state, config, receiver, &frame)?;
     drop(slot);
-    let (args, peer, caps, mapping) = coordinating;
+    let (args, peer, caps) = coordinating;
     // Revocation and the copy's finish-by time end this receiver and the
     // coordinator it runs, which stays in its process group.
     active::watch(
@@ -321,18 +324,16 @@ fn admit_coordinator(
         args,
         peer,
         caps,
-        mapping,
         frame,
     }))
 }
 
 /// What a verified coordinating source's directive allows: its command, the
-/// destination's receiver, the approving machine's limits and the mapping.
+/// destination's receiver and the approving machine's limits.
 pub(super) type Coordination = (
     crate::cli::Args,
     crate::directive::Peer,
     Option<crate::directive::Caps>,
-    Option<crate::mapping::Authorization>,
 );
 
 /// Verify a coordinating source's `frame`: its own directive as [`verify`]
@@ -362,12 +363,7 @@ pub(super) fn verify_coordination(
         let crate::directive::Role::CoordinatingSource(peer) = &source.binding.role else {
             unreachable!("coordination checks the role");
         };
-        Ok((
-            args,
-            peer.clone(),
-            source.caps,
-            source.inputs.mapping.clone(),
-        ))
+        Ok((args, peer.clone(), source.caps))
     })
 }
 

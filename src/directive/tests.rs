@@ -322,7 +322,22 @@ fn a_coordinating_source_needs_a_copy_between_two_servers() {
         "--into",
         "archive",
     ];
-    assert!(refused(mapped).contains("mapping does not match"));
+    // The approving machine never sees a mapping, which would choose the
+    // files read on the source.
+    assert!(refused(mapped).contains("cannot use --mapping"));
+    // Nor can a directive carry one for a command without it.
+    let (destination, mut source) = pair(ROUTE_6);
+    let digest = Some(crate::mapping::Authorization {
+        bytes: 1,
+        digest: [0; 32],
+    });
+    source.inputs.mapping = digest.clone();
+    let mut destination = destination;
+    destination.inputs.mapping = digest;
+    assert!(coordination(&source, &destination)
+        .unwrap_err()
+        .to_string()
+        .contains("mapping does not match"));
     // Coordinating at the source is what the route does anyway.
     let (destination, source) = pair(&[ROUTE_6, &["--coordinate-at", "src"]].concat());
     coordination(&source, &destination).unwrap();

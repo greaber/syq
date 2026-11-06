@@ -1567,6 +1567,77 @@ fn auth_from_preferences_skip_native_ssh_and_explicit_flags_bypass_saved_state()
     assert!(!stderr_of(&output).contains("authorization choice"));
 }
 
+/// A saved choice selects a receiving machine for a copy between two
+/// servers only when that route can carry it: with a custom `--rsh`, even a
+/// damaged preferences file is left unread and the copy uses that command,
+/// while an explicit `--auth-from` with `--rsh` is refused.
+#[test]
+fn saved_choices_leave_a_custom_rsh_copy_between_servers_alone() {
+    let t = Tmp::new();
+    executable(&t.path("bin/ssh"), b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_7.4p1 >&2; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\necho 'Permission denied (publickey).' >&2\nexit 255\n");
+    let mut paths = vec![t.path("bin")];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let paths = std::env::join_paths(paths).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .env("PATH", &paths)
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .env_remove("SYQ_AUTH_FROM")
+            .current_dir(t.path(""))
+            .capture_output()
+            .unwrap()
+    };
+    let copy = [
+        "cp", "--from", "host-b", "data", "--to", "host-c", "--as", "copy",
+    ];
+    let with =
+        |extra: &[&'static str]| -> Vec<&str> { copy.iter().chain(extra).copied().collect() };
+    assert_output_ok(&run(&["persist", "auth-from", "@missing"]));
+    // Without --rsh the saved receiving machine approves the copy.
+    let output = run(&copy);
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("missing"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!t.path("ssh-used").exists());
+    // With it, the custom command runs the copy.
+    let output = run(&with(&["--rsh", "ssh"]));
+    assert!(!output.status.success());
+    assert!(t.path("ssh-used").exists(), "{}", stderr_of(&output));
+    assert!(
+        !stderr_of(&output).contains("missing")
+            && !stderr_of(&output).contains("cannot be combined"),
+        "{}",
+        stderr_of(&output)
+    );
+    fs::remove_file(t.path("ssh-used")).unwrap();
+    // A damaged preferences file does not stop it either.
+    write(&t.path("config/syq/auth-from.json"), b"future schema");
+    let output = run(&with(&["--rsh", "ssh"]));
+    assert!(t.path("ssh-used").exists(), "{}", stderr_of(&output));
+    assert!(
+        !stderr_of(&output).contains("pass --auth-from explicitly"),
+        "{}",
+        stderr_of(&output)
+    );
+    fs::remove_file(t.path("ssh-used")).unwrap();
+    // An explicit choice of a receiving machine cannot use --rsh.
+    let output = run(&with(&["--rsh", "ssh", "--auth-from", "@missing"]));
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("cannot be combined with --rsh"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!t.path("ssh-used").exists());
+}
+
 #[test]
 fn scoped_off_closes_native_connections_despite_damaged_account_state() {
     let t = Tmp::new();

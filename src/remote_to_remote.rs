@@ -2314,6 +2314,7 @@ fn run_coordinated(
         .take()
         .context("this copy's approval was already used")?;
     expectation.records = results.is_some();
+    // The frame holds the destination's entry key: wiped once sent.
     let frame = crate::restricted::Admission::Coordinate(Box::new(crate::restricted::Coordinate {
         source: copy.source.clone(),
         destination: copy.destination.clone(),
@@ -2323,55 +2324,93 @@ fn run_coordinated(
             .then(|| u16::try_from(crate::progress::term_width()).unwrap_or(u16::MAX)),
     }))
     .frame()?;
+    let frame = std::sync::Arc::new(zeroize::Zeroizing::new(frame));
     let (program, options) = copy
         .receiver
         .command
         .split_first()
         .context("receiver SSH command is empty")?;
-    let mut command = Command::new(program);
-    // The receiver's forced command runs whatever command is asked for.
-    command
-        .args(options)
-        .args(["-l", &copy.login, "--", &copy.host, "syq"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+    let source = &copy.host;
+    // How ssh names the approving machine's entries for the source, when
+    // they joined this machine's, and the approving machine's name for it.
+    let approving = copy.receiver.receiver_host.1.approving.as_ref();
     if !args.quiet {
-        crate::output::diagnostic!("syq: remote-to-remote: running on {}", copy.host);
+        crate::output::diagnostic!("syq: remote-to-remote: running on {source}");
     }
-    let mut child = command
-        .spawn_guarded()
-        .with_context(|| format!("spawn {program:?}"))?;
-    let mut input = child.stdin.take().context("receiver input missing")?;
-    let mapping = args.mapping_contents.clone();
-    // The coordinator reads the mapping after the frame, then follows this
-    // process until its input ends: keep it open until the copy is over.
-    let writer = std::thread::spawn(move || {
-        input.write_all(&frame)?;
-        if let Some(mapping) = mapping {
-            input.write_all(&mapping.contents)?;
-        }
-        // Without the marker the coordinator only stops following.
-        let _ = input.write_all(&[REQUESTER_MARKER]);
-        Ok::<_, std::io::Error>(input)
-    });
-    let relay = Relay::new(
+    let mut relay = Relay::new(
         &token,
         results,
         Some(expectation),
         (args.dry_run, args.delete),
     );
-    let relayed = relay_stdout(
-        child.stdout.take().context("receiver output missing")?,
-        relay,
-    );
-    let status = child.wait().context("wait for the source's receiver")?;
-    let written = writer
-        .join()
-        .map_err(|_| anyhow::anyhow!("receiver input writer panicked"))?;
-    drop(written);
-    let relay = relayed?;
-    let source = &copy.host;
+    // A receiver whose slots for starting sessions are all taken refuses the
+    // session before reading the frame, so the same frame can go again, as
+    // a coordinator retries such a worker.
+    let mut delay = std::time::Duration::from_millis(200);
+    let mut attempt = 0;
+    let status = loop {
+        attempt += 1;
+        let mut command = Command::new(program);
+        // The receiver's forced command runs whatever command is asked for.
+        command
+            .args(options)
+            .args(["-l", &copy.login, "--", source, "syq"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn_guarded()
+            .with_context(|| format!("spawn {program:?}"))?;
+        // ssh's and the coordinator's messages pass through as they come.
+        let diagnosis = crate::conn::ssh_auth::capture(
+            child.stderr.take().context("receiver errors missing")?,
+            approving.map(|(named, _)| *named),
+        )
+        .context("start SSH stderr reader")?;
+        let mut input = child.stdin.take().context("receiver input missing")?;
+        let sent = frame.clone();
+        // The coordinator follows this process until its input ends: keep
+        // it open until the copy is over.
+        let writer = std::thread::spawn(move || {
+            input.write_all(&sent)?;
+            // Without the marker the coordinator only stops following.
+            let _ = input.write_all(&[REQUESTER_MARKER]);
+            Ok::<_, std::io::Error>(input)
+        });
+        relay = relay_stdout(
+            child.stdout.take().context("receiver output missing")?,
+            relay,
+        )?;
+        let status = child.wait().context("wait for the source's receiver")?;
+        let written = writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("receiver input writer panicked"))?;
+        drop(written);
+        let diagnosis = diagnosis
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .ok()
+            .flatten();
+        if status.code() == Some(255) {
+            if let (Some((_, name)), Some(diagnosis)) = (approving, diagnosis) {
+                // ssh names the approving machine's entries with a label no
+                // file here has, and suggests fixing this machine's files.
+                if diagnosis.failure == Some(crate::conn::ssh_auth::Failure::HostKey)
+                    && diagnosis.names_marker
+                {
+                    crate::output::diagnostic!(
+                        "syq: the approving machine's known_hosts lists a different key for {source}; if that key is out of date, remove it there with `ssh-keygen -R {}`",
+                        shell_words::quote(name)
+                    );
+                }
+            }
+        }
+        if status.code() == Some(crate::restricted::SESSIONS_FULL_EXIT) && attempt < 6 {
+            std::thread::sleep(delay);
+            delay *= 2;
+            continue;
+        }
+        break status;
+    };
     let code = match status.code() {
         Some(0) => 0,
         // Defined transfer results; the coordinator's errors are already
@@ -2415,7 +2454,6 @@ pub(crate) fn coordination_command(
         args,
         peer,
         caps,
-        mapping,
         frame,
     } = coordinating;
     let mut args = args.clone();
@@ -2443,20 +2481,14 @@ pub(crate) fn coordination_command(
             // the command names.
             peer_connection_host: None,
             destination_path: Some(&peer.destination),
-            mapping: mapping.is_some(),
+            mapping: false,
         },
     )?;
     let mut environment = vec![
         (ENTRY_KEY_STDIN, frame.entry_key.len().to_string()),
         (DIRECTIVE_STDIN, frame.destination.len().to_string()),
         (RECEIVER_KNOWN_HOSTS, peer.known_hosts.clone()),
-        (
-            REQUESTER_STDIN,
-            mapping
-                .as_ref()
-                .map_or(0, |mapping| mapping.bytes)
-                .to_string(),
-        ),
+        (REQUESTER_STDIN, "0".to_owned()),
         (
             crate::destination_results::relay::TOKEN_ENV,
             frame.results_token.clone(),
@@ -2482,10 +2514,6 @@ pub(crate) fn coordination_command(
     Ok((arguments, environment))
 }
 
-/// How long the requester has to send the copy's mapping after its first
-/// frame.
-const COORDINATED_MAPPING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// Run, as this server's restricted receiver, the copy between two servers
 /// that a verified directive for this account allows: the coordinator for
 /// the signed command, as a copy started on the signing machine would run
@@ -2505,35 +2533,15 @@ pub(crate) fn coordinate(coordinating: crate::restricted::Coordinating) -> Resul
     }
     let (arguments, environment) = coordination_command(&coordinating)?;
     command.args(arguments).envs(environment);
-    let crate::restricted::Coordinating { mapping, frame, .. } = coordinating;
-    // The session's own input, unbuffered: the mapping, the requester's
-    // marker, and then its end when the requester goes.
+    let crate::restricted::Coordinating { frame, .. } = coordinating;
+    // The session's own input, unbuffered: the requester's marker, and then
+    // its end when the requester goes.
     let mut session = std::fs::File::from(
         std::io::stdin()
             .as_fd()
             .try_clone_to_owned()
             .context("take the requester's input")?,
     );
-    let manifest = mapping
-        .as_ref()
-        .map(|mapping| {
-            let length = usize::try_from(mapping.bytes).context("the mapping is too large")?;
-            let mut contents = vec![0; length];
-            crate::destination::DeadlineIo {
-                inner: &mut session,
-                deadline: std::time::Instant::now() + COORDINATED_MAPPING_TIMEOUT,
-                cancelled: None,
-            }
-            .read_exact(&mut contents)
-            .context("read the copy's mapping from the requester")?;
-            // The mapping chooses which files here are read.
-            anyhow::ensure!(
-                crate::mapping::Authorization::from_contents(&contents) == *mapping,
-                "the requester's mapping is not the one approved for this copy"
-            );
-            Ok::<_, anyhow::Error>(contents)
-        })
-        .transpose()?;
     // The coordinator stays in this receiver's process group, which
     // revocation and the copy's finish-by time end.
     let mut child = command
@@ -2552,9 +2560,6 @@ pub(crate) fn coordinate(coordinating: crate::restricted::Coordinating) -> Resul
             let sent = (|| {
                 input.write_all(&entry_key)?;
                 input.write_all(&destination)?;
-                if let Some(manifest) = manifest {
-                    input.write_all(&manifest)?;
-                }
                 input.write_all(&[REQUESTER_MARKER])
             })();
             drop(entry_key);

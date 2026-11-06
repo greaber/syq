@@ -474,6 +474,12 @@ pub(crate) fn coordinated_endpoints(args: &Args) -> Result<(&Location, &Location
             ),
         "a copy between two servers approved by another machine runs on the source with the destination's restricted receiver; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --peer-auth or --coordinate-at local or dst"
     );
+    // The approving machine never sees a mapping's contents, and on the
+    // source a mapping chooses which files are read.
+    ensure!(
+        args.native_mapping.is_none(),
+        "a copy between two servers approved by another machine cannot use --mapping: the approving machine cannot see which files on the source a mapping chooses"
+    );
     validate_restricted_args(args)?;
     Ok((source, destination))
 }
@@ -506,7 +512,7 @@ pub(crate) fn coordination(source: &Directive, destination: &Directive) -> Resul
     let args = crate::approval_command::parse(&source.command)?;
     coordinated_endpoints(&args)?;
     ensure!(
-        args.native_mapping.is_some() == source.inputs.mapping.is_some(),
+        source.inputs.mapping.is_none(),
         "the directive's mapping does not match its command"
     );
     Ok(args)
