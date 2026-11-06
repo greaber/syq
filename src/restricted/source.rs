@@ -40,6 +40,8 @@ pub(crate) struct SourcePolicy {
     pub send_rate: Option<u64>,
     pub limits: CopyLimits,
     pub deadline: Instant,
+    /// A directory the base must resolve beneath (`FsOps::set_source_outer_root`).
+    pub outer_root: Option<Vec<u8>>,
 }
 
 pub(crate) struct SourceTcpPolicy {
@@ -57,11 +59,22 @@ struct State {
     requested_bytes: u64,
     tcp_listener_started: bool,
     send_budget: Option<DescriptorTicket>,
+    /// Channels a receiving machine opened for this source, from before
+    /// their hello until they close (`open_channel`).
+    open_channels: u16,
 }
 
 pub(crate) struct SourceAuthority {
     policy: SourcePolicy,
     state: Mutex<State>,
+}
+
+/// One open channel to a source (`SourceAuthority::open_channel`).
+pub(crate) struct ChannelPermit(Arc<SourceAuthority>);
+impl Drop for ChannelPermit {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().open_channels -= 1;
+    }
 }
 
 /// Dropping the control permit revokes the whole authority. Already admitted
@@ -111,12 +124,53 @@ impl SourceAuthority {
                 requested_bytes: 0,
                 tcp_listener_started: false,
                 send_budget: None,
+                open_channels: 0,
             }),
         }))
     }
 
     pub(crate) fn close(&self) {
         self.state.lock().unwrap().open = false;
+    }
+
+    /// Admit the one TCP listener a receiving machine sets up by dialing the
+    /// coordinator, as `SourceConnection::authorize` admits `TcpListen`.
+    pub(crate) fn authorize_reverse_tcp(
+        &self,
+        ports: (u16, u16),
+        congestion_control: &Option<String>,
+    ) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        self.check_open(&state)?;
+        ensure!(state.control_admitted, "source control has not opened");
+        let tcp = self
+            .policy
+            .tcp
+            .as_ref()
+            .context("source TCP listener was not approved")?;
+        ensure!(
+            ports == (tcp.port_lo, tcp.port_hi) && *congestion_control == tcp.congestion_control,
+            "source TCP settings differ from approval"
+        );
+        ensure!(
+            !state.tcp_listener_started,
+            "approved source TCP listener already started"
+        );
+        state.tcp_listener_started = true;
+        Ok(())
+    }
+
+    /// Admit one channel before its hello, so that channels waiting to say
+    /// hello count against the approved connections too.
+    pub(crate) fn open_channel(self: &Arc<Self>) -> Result<ChannelPermit> {
+        let mut state = self.state.lock().unwrap();
+        self.check_open(&state)?;
+        ensure!(
+            state.open_channels < self.policy.limits.max_connections,
+            "source connection limit exceeded"
+        );
+        state.open_channels += 1;
+        Ok(ChannelPermit(Arc::clone(self)))
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -280,6 +334,7 @@ impl SourceConnection {
             .check_open(&self.authority.state.lock().unwrap())?;
         let policy = &self.authority.policy;
         ops.set_hash_policy(policy.hashing);
+        ops.set_source_outer_root(policy.outer_root.clone());
         let response = ops.handle_in_place(&mut Request::ConfigurePreservation {
             selection: policy.preservation,
             sparse: policy.sparse,
@@ -395,6 +450,7 @@ impl SourceConnection {
                     Request::ReadRange { .. }
                         | Request::ReadComparedRange { .. }
                         | Request::ReadSmallBatch(_)
+                        | Request::ReadDifferingBatch { .. }
                         | Request::ReadStream(_)
                 ),
             "source payload requires a direct data worker"
@@ -510,6 +566,21 @@ impl SourceConnection {
                 paths.push(source(reference)?);
             }
             Request::ReadSmallBatch(reads) => {
+                for read in reads {
+                    range(0, u64::from(read.len))?;
+                    bytes = bytes
+                        .checked_add(u64::from(read.len))
+                        .context("source byte count overflow")?;
+                    paths.push(source(&read.source)?);
+                }
+                ensure!(
+                    bytes <= crate::proto::MAX_READ_BYTES,
+                    "source batch exceeds frame limit"
+                );
+            }
+            // Grouped comparison of small files reads each whole file and
+            // returns at most its differing blocks; charge the whole length.
+            Request::ReadDifferingBatch { reads, .. } => {
                 for read in reads {
                     range(0, u64::from(read.len))?;
                     bytes = bytes

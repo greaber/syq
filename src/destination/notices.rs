@@ -166,18 +166,10 @@ pub(crate) fn connect_takes_server(name: &str, here: Option<&Here>) -> String {
     )
 }
 
-/// A copy from `@name`, which receiving machines do not serve.
-pub(crate) fn copy_from(name: &str, here: Option<&Here>) -> String {
-    format!(
-        "cannot copy from receiving machine @{name}: receiving machines accept copies sent to them (`syq cp PATH --to @{name}`) and commands (`syq exec --on @{name} -- COMMAND`).\nTo copy files from that machine to this server, run `syq cp PATH --to HOST` on it, where HOST is how it reaches this server{}.",
-        hint("this server", here)
-    )
-}
-
 /// `command` given `@name`, which only copies and commands can use.
 pub(crate) fn unsupported(command: &str, name: &str) -> String {
     format!(
-        "receiving machine @{name} cannot be used with {command}; receiving machines accept copies sent with `syq cp PATH --to @{name}` and commands run with `syq exec --on @{name} -- COMMAND`"
+        "receiving machine @{name} cannot be used with {command}; receiving machines take copies with `syq cp PATH --to @{name}` and `syq cp --from @{name} PATH`, and commands with `syq exec --on @{name} -- COMMAND`"
     )
 }
 
@@ -381,9 +373,6 @@ mod tests {
             connect_takes_server("master", here),
             "@master is a receiving name, not an SSH server: run `syq persist connect HOST` on the receiving machine itself (for example your laptop), where HOST is the SSH server it should connect to (this machine's hostname is j5 and its account is alice; your laptop may use another name for it)"
         );
-        assert!(copy_from("master", here).ends_with(&format!(
-            "run `syq cp PATH --to HOST` on it, where HOST is how it reaches this server {server}."
-        )));
         assert!(outdated("laptop", "syq ssh")
             .ends_with("update syq on that machine and run any syq command there"));
         assert!(reconnect("the registration for @laptop is invalid", here).ends_with(

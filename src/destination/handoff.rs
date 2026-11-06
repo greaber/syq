@@ -45,6 +45,7 @@ pub(super) enum Kind {
     Copy,
     Forward,
     Pull,
+    Send,
     Command,
     Ssh,
     SshPersistent,
@@ -148,7 +149,7 @@ pub(crate) fn enter(mut argv: Vec<OsString>) -> Result<Vec<OsString>> {
     }
     if matches!(
         guard.kind,
-        Kind::Copy | Kind::Forward | Kind::Pull | Kind::Account
+        Kind::Copy | Kind::Forward | Kind::Pull | Kind::Send | Kind::Account
     ) {
         if let Some(start) = inherited_start.and_then(|value| value.parse().ok()) {
             let _ = COPY_START.set(start);
@@ -163,7 +164,7 @@ pub(crate) fn enter(mut argv: Vec<OsString>) -> Result<Vec<OsString>> {
 
 fn accepts_command(kind: Kind, argv: &[OsString]) -> bool {
     match (kind, argv.first().and_then(|arg| arg.to_str())) {
-        (Kind::Copy | Kind::Forward | Kind::Pull, Some("cp"))
+        (Kind::Copy | Kind::Forward | Kind::Pull | Kind::Send, Some("cp"))
         | (Kind::Command, Some("exec"))
         | (Kind::Ssh, Some("ssh"))
         | (Kind::Account, Some("ssh" | "cp" | "rm" | "rsync" | "map" | "clean-partials")) => true,
@@ -258,6 +259,19 @@ pub(super) fn maybe_exec(selection: &Selection, quiet: bool) -> Result<()> {
             ));
         }
     }
+    if selection.kind == Kind::Send {
+        let supported = Command::new(program)
+            .arg("--return-send-probe")
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .capture_output()
+            .is_ok_and(|output| output.status.success());
+        if !supported {
+            bail!(super::notices::outdated(
+                &selection.name,
+                "copies from it to this server"
+            ));
+        }
+    }
     if selection.kind == Kind::Account {
         anyhow::ensure!(!ACCOUNT_PREFLIGHT_DONE.load(std::sync::atomic::Ordering::Acquire),
             "receiving connection changed after account preflight; retry the command to use its matching helper");
@@ -318,7 +332,7 @@ pub(crate) fn copy(
     }
     let selection = select_copy(args, Some(progress))?;
     if let Some(selection) = &selection {
-        if selection.kind != Kind::Pull
+        if !matches!(selection.kind, Kind::Pull | Kind::Send)
             && (args.hardlinks
                 || args.acls
                 || args.xattrs

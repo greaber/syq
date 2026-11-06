@@ -86,6 +86,7 @@ fn source_policy(path: &Path) -> SourcePolicy {
             max_deletions: 0,
         },
         deadline: Instant::now() + Duration::from_secs(30),
+        outer_root: None,
     }
 }
 
@@ -246,6 +247,51 @@ fn approved_source_control_and_worker_confine_reads_hashes_stats_and_mutation() 
     }
     assert_eq!(fs::read(&approved).unwrap(), b"approved");
     assert_eq!(fs::read(&secret).unwrap(), b"secret");
+    worker.shutdown();
+    server.control.shutdown();
+}
+
+/// Grouped comparison of small files reads only registered files, only on
+/// workers, and counts every compared byte against the approved total.
+#[test]
+fn approved_source_compares_small_files_in_batches_within_its_limits() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let approved = temporary.path().join("approved");
+    fs::write(&approved, b"approved").unwrap();
+    let mut policy = source_policy(&approved);
+    policy.limits.max_total_bytes = 12;
+    let register = registration(&policy);
+    let mut server = SourceServer::new(policy);
+    let roots = server.register(register);
+    let source = roots[0].selection.clone();
+    let batch = |source: &RegisteredPath| Request::ReadDifferingBatch {
+        block: MIN_HASH_BLOCK_BYTES,
+        reads: vec![DifferingRead {
+            path: b"/ignored".to_vec(),
+            source: Some(source.clone()),
+            attempt: 0,
+            len: 8,
+            expected: vec![crate::hashing::HashAlgorithm::Sha256.hash(b"different")],
+            compare_only: false,
+        }],
+    };
+    assert!(
+        matches!(server.control.request(batch(&source)), Response::Err(error) if error.contains("direct data worker"))
+    );
+    let (mut worker, _) = server.worker(ConnectionRole::SourceWorker {
+        roots,
+        send_budget: None,
+    });
+    assert!(matches!(
+        worker.request(batch(&source)),
+        Response::DifferingBlocks(blocks) if blocks.len() == 1 && blocks[0].is_ok()
+    ));
+    let sibling = RegisteredPath::new(source.root(), b"secret".to_vec()).unwrap();
+    assert!(matches!(worker.request(batch(&sibling)), Response::Err(_)));
+    // 8 of the 12 approved bytes are used; another 8 would pass the limit.
+    assert!(
+        matches!(worker.request(batch(&source)), Response::Err(error) if error.contains("total-byte limit"))
+    );
     worker.shutdown();
     server.control.shutdown();
 }

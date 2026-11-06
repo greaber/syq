@@ -334,6 +334,7 @@ requests of your machine:
 | Request | Approval on your machine |
 |---|---|
 | Send files to your machine | Required by default; `--auto-approve-root` permits unattended downloads confined to that directory |
+| Copy files from your machine | Always required |
 | Authorize one copy to or from another server | Always required |
 | Run a command on your machine | Always required |
 | Authorize an SSH login to another server account | Required unless this source and destination account pair has a session or remembered permission |
@@ -389,6 +390,24 @@ Another client cannot claim your receiving name: reconnecting under it needs
 your receiver's private key, which stays on your machine and grants no SSH
 login. The server account itself can still change its stored name
 assignments.
+
+<a id="sending-files-from-your-laptop"></a>
+
+### Sending files from your laptop
+
+A server can ask for files from your laptop with `syq cp --from @laptop`. The
+prompt lists the exact paths it would read and says that they will leave your
+laptop. Once approved, the server can list and read only those files and
+directory trees, with the symlink behavior the command chose, within the
+profile's byte and entry limits and, when the profile sets `--root`, only
+inside that root: symlinks can't lead out of it, and neither can a directory
+replaced while the copy runs. When the command follows symlinks, the prompt
+says so, since the files read may then be elsewhere than the paths shown. It
+cannot write, rename or remove anything on your laptop. As with copies between
+servers, the server can ask for hashes of approved files beyond the data
+limit. File data travels over your laptop's receiving connection, as downloads
+do, and reads stop when the copy ends or receiving stops.
+`--auto-approve-root` never applies: every request asks.
 
 <a id="authorizing-copies-to-another-server"></a>
 

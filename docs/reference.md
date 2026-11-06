@@ -82,9 +82,9 @@ can; if copies fall back to SSH, see
 
 Other routes use the same options:
 
-- `--to @NAME` sends files to your laptop from a server's shell; without the
-  `@`, `--to laptop` names an SSH server. See
-  [Use your laptop from a server](receive.md).
+- `--to @NAME` sends files to your laptop from a server's shell, and
+  `--from @NAME` copies files from it; without the `@`, `laptop` names an SSH
+  server. See [Use your laptop from a server](receive.md).
 - `--from s3://BUCKET` and `--to s3://BUCKET` copy to and from S3. See
   [Use S3 storage](object-storage.md).
 - `--from` and `--to` with two servers copy directly between them. See

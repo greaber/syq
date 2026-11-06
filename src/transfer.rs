@@ -553,6 +553,8 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
         None => Endpoint::local(),
         Some(h) => {
             let forwarded = args.return_source.clone();
+            // A receiving machine's files come over the route it approved.
+            let named_source = args.named_source.clone().filter(|_| h.starts_with('@'));
             let rsh = parse_rsh(&args.rsh)?;
             if loc.port.is_some() && args.rsh.is_some() && !rsh[0].ends_with("ssh") {
                 bail!(
@@ -582,7 +584,9 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                     }
                 }),
             };
-            let ssh_multiplexer = match sharing.filter(|_| forwarded.is_none()) {
+            let ssh_multiplexer = match sharing
+                .filter(|_| forwarded.is_none() && named_source.is_none())
+            {
                 None => None,
                 // A restricted grant keeps a private connection for this run.
                 Some(_) if args.restricted_grant.is_some() => {
@@ -643,10 +647,11 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 rsh,
                 syq_path: args.syq_path.clone(),
                 bootstrap_helper: forwarded.is_none()
+                    && named_source.is_none()
                     && args.restricted_grant.is_none()
                     && args.syq_path.is_none()
                     && !args.no_bootstrap,
-                restricted_grant: args.restricted_grant.clone(),
+                restricted_grant: named_source.or_else(|| args.restricted_grant.clone()),
                 helper_install: Default::default(),
                 ssh_multiplexer,
                 quiet: args.quiet,
