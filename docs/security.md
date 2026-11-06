@@ -155,12 +155,12 @@ the download cannot be verified.
 
 A release you select with `--use-version` is verified once, when syq stores it
 in `~/.local/lib/syq`. Later runs on your machine start it without hashing it
-again, but refuse it if its files or directories there are not yours or their
-permission bits let others write them. Anyone who can write the directories
-above the store can replace it, just as anyone who can write `~/.local/bin` can
-replace syq, so keep them writable only by you. On SSH servers, syq starts the
-stored helper without these checks, so keep `~/.local/lib/syq` there writable
-only by you too.
+again, but refuse it if its files or directories there are not yours, or if
+their permission bits or a macOS access control list let others change them.
+Anyone who can write the directories above the store can replace it, just as
+anyone who can write `~/.local/bin` can replace syq, so keep them writable only
+by you. On SSH servers, syq starts the stored helper without these checks, so
+keep `~/.local/lib/syq` there writable only by you too.
 
 Your first installation establishes this trust. The standalone installer
 checks the archive against a size and SHA-256 hash embedded in the script, but
@@ -224,11 +224,13 @@ The protection has four parts:
 An enrollment covers the whole account. Each signed command names its own
 destination, which can be anywhere the account can write except its SSH
 configuration and syq's own programs and state (see
-[Enrollment](remote-reference.md#enrollment)). The receiver does not follow
-symlinks below the destination. Because a copy can write a file that runs code
-as the account, such as a shell startup file, a signed copy is as strong as a
-login. That is acceptable because only your login key can sign one, and you
-choose each destination.
+[Enrollment](remote-reference.md#enrollment)). As in any copy, a symlink in
+the destination path stops the copy unless the command passes `--follow-dst`;
+links in the account's home directory's own path are fine. The receiver does
+not follow symlinks below the destination. Because a copy can write a file that
+runs code as the account, such as a shell startup file, a signed copy is as
+strong as a login. That is acceptable because only your login key can sign one,
+and you choose each destination.
 
 An enrollment outlives removing or revoking your login key on hostB; end it with
 `syq receiver revoke`. See
@@ -289,6 +291,10 @@ HostA can:
 - Ignore `--where` and `--copy-if`; hostB enforces only the destination, the
   write and deletion permissions, and the limits.
 - Stop the transfer or withhold hostB's reports, which fails the copy.
+- Have hostB remove syq's leftover partial files beside the files the copy
+  writes, as any copy does, even when the copy may not otherwise delete. These
+  are files named like `.FILENAME.syq-tmp.RANDOM` that the account owns, that
+  have no other names, and that no program has open for writing.
 
 HostA cannot:
 
@@ -352,9 +358,14 @@ domain. `syq persist receive off` turns it off but keeps SSH reuse.
 
 The prompt shows the server account and the requested command. For copies and
 authorizations, that is the syq command the server ran, including options from
-its environment variables. Your laptop derives what it enforces from that
-command and rejects a request that does not match it, but it cannot prove who
-typed the command. Approving a copy does not approve a later command.
+its environment variables. A desktop prompt puts where a request writes, and
+its warnings, before the files the command names, and lists only three of
+those, each in quotes; `syq persist receive pending` lists them all. Paths on
+your machine appear with `..` resolved, as syq uses them, except paths a
+request reads while following symlinks, which keep their spelling. Your laptop
+derives what it enforces from that command and rejects a request that does not
+match it, but it cannot prove who typed the command. Approving a copy does not
+approve a later command.
 
 The server also supplies the contents of the ignore files (`--ignore-from`)
 and mapping file (`--mapping`) that the command names, and your laptop does
@@ -393,6 +404,11 @@ for others, and give them any group you belong to. A copy with
 Choose an inbox whose contents are not automatically executed or loaded as
 trusted configuration.
 
+Copies to your laptop can't write your `~/.ssh`, or syq's own programs and
+state. These include the directory of the `syq` receiving was started from,
+such as Homebrew's `bin` directory, because receiving runs a new file there by
+itself after an update.
+
 Another client cannot claim your receiving name: reconnecting under it needs
 your receiver's private key, which stays on your machine and grants no SSH
 login. The server account itself can still change its stored name
@@ -404,7 +420,9 @@ assignments.
 
 A server can ask for files from your laptop with `syq cp --from @laptop`. The
 prompt lists the exact paths it would read and says that they will leave your
-laptop. Once approved, the server can list and read only those files and
+laptop. A desktop prompt lists paths outside the profile's directory and hidden
+ones first and says how many there are; `syq persist receive pending` lists
+them all. Once approved, the server can list and read only those files and
 directory trees, with the symlink behavior the command chose, within the
 profile's byte and entry limits and, when the profile sets `--root`, only
 inside that root: symlinks can't lead out of it, and neither can a directory

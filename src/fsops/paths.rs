@@ -135,7 +135,9 @@ pub(super) fn name_max_cached(
     limit
 }
 
-pub(super) fn lexical_absolute(path: &Path) -> PathBuf {
+/// `path` made absolute with `.` and `..` resolved by name, without looking
+/// at the filesystem: `/a/b/../c` is `/a/c`, and `..` at `/` stays at `/`.
+pub(crate) fn lexical_absolute(path: &Path) -> PathBuf {
     use std::path::Component;
     let path = if path.is_absolute() {
         path.to_path_buf()

@@ -358,3 +358,27 @@ fn concurrent_keeper_cleanup_is_closed_but_damaged_present_state_still_errors() 
     // away between off's existence check and its validation/open operation.
     assert!(!mark_closing(&domain, &record).unwrap());
 }
+
+/// A master that stopped listening to close has no socket, but while its
+/// keeper's lock is held, status still lists it, as closing.
+#[test]
+fn status_lists_a_closing_master_while_its_keeper_runs() {
+    let root = crate::test_support::short_tempdir().unwrap();
+    let domain = domain(root.path(), "a");
+    let record = new_record(&domain);
+    let index = directory(&domain).unwrap();
+    let path = index.join(format!("{}.json", "a".repeat(64)));
+    private_write(&path, &serde_json::to_vec(&record).unwrap());
+    // No socket and no keeper: nothing to list.
+    assert!(status(&domain).unwrap().rows.is_empty());
+    let keeper = take_keeper_lock(&path, &record.control).unwrap();
+    let snapshot = status(&domain).unwrap();
+    assert_eq!(snapshot.rows.len(), 1);
+    assert!(snapshot.rows[0].closing && !snapshot.rows[0].connected);
+    // Its keeper removed its scope and has yet to remove the record.
+    fs::remove_dir_all(record.control.parent().unwrap()).unwrap();
+    let snapshot = status(&domain).unwrap();
+    assert!(snapshot.rows.is_empty() && snapshot.errors.is_empty());
+    drop(keeper);
+    assert!(status(&domain).unwrap().rows.is_empty());
+}

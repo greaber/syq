@@ -1195,7 +1195,7 @@ fn root_identity_detects_path_replacement_but_open_root_stays_stable() {
     fs::create_dir(&selected).unwrap();
     fs::write(selected.join("new"), b"new").unwrap();
 
-    assert!(Root::open_verified(&selected, identity).is_err());
+    assert_ne!(Root::open(&selected).unwrap().identity(), identity);
     let mut old = root.open_regular_read(&relative(b"old")).unwrap();
     let mut bytes = Vec::new();
     old.read_to_end(&mut bytes).unwrap();

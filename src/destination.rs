@@ -934,7 +934,20 @@ fn rebase(path: &[u8], root: &Path) -> Result<Vec<u8>> {
 
 /// Resolve the operator's starting directory separately from containment. The
 /// final entry is not followed: replacing a symlink replaces the entry itself.
-fn resolve_destination(cwd: &Path, root: Option<&Path>, path: &[u8]) -> Result<(PathBuf, PathBuf)> {
+///
+/// As in a destination path an ordinary copy is given, a symlink in a
+/// directory above the destination stops the copy unless the command
+/// follows destination paths (`follow`). Relative paths start in `cwd`, and
+/// a path in the home directory, `home` as this account names it and where
+/// it really is, starts there: like the directory a login starts in, their
+/// own paths may lead through links.
+fn resolve_destination(
+    cwd: &Path,
+    root: Option<&Path>,
+    path: &[u8],
+    follow: bool,
+    home: Option<(&Path, &Path)>,
+) -> Result<(PathBuf, PathBuf)> {
     if path.len() > 4096 || path.contains(&0) {
         bail!("invalid receiving destination path");
     }
@@ -950,9 +963,21 @@ fn resolve_destination(cwd: &Path, root: Option<&Path>, path: &[u8]) -> Result<(
             .to_path_buf();
         return Ok((destination, container));
     }
-    let path = cwd.join(OsString::from_vec(path.to_vec()));
+    let requested = Path::new(std::ffi::OsStr::from_bytes(path));
+    // Where the walk starts, and the path from there.
+    let (mut destination, path) = match home
+        .filter(|_| !follow)
+        .and_then(|(named, real)| Some((real, requested.strip_prefix(named).ok()?)))
+    {
+        _ if follow => (PathBuf::new(), cwd.join(requested)),
+        _ if requested.is_relative() => (cwd.to_path_buf(), requested.to_path_buf()),
+        Some((home, inside)) => (home.to_path_buf(), inside.to_path_buf()),
+        None => (PathBuf::new(), requested.to_path_buf()),
+    };
     let components: Vec<_> = path.components().collect();
-    let mut destination = PathBuf::new();
+    // Without following, once a directory is missing so is what is below
+    // it, until `..` climbs back out.
+    let mut missing = false;
     for (index, component) in components.iter().enumerate() {
         use std::path::Component;
         match component {
@@ -960,10 +985,14 @@ fn resolve_destination(cwd: &Path, root: Option<&Path>, path: &[u8]) -> Result<(
             Component::CurDir => {}
             Component::ParentDir => {
                 destination.pop();
+                missing = false;
             }
             Component::Normal(name) => {
                 destination.push(name);
-                if index + 1 < components.len() {
+                if index + 1 == components.len() {
+                    continue;
+                }
+                if follow {
                     match fs::canonicalize(&destination) {
                         Ok(path) => {
                             if !path.is_dir() {
@@ -974,6 +1003,23 @@ fn resolve_destination(cwd: &Path, root: Option<&Path>, path: &[u8]) -> Result<(
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                         Err(e) => return Err(e.into()),
                     }
+                    continue;
+                }
+                if missing {
+                    continue;
+                }
+                match fs::symlink_metadata(&destination) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => bail!(
+                        "refusing to follow symlink {:?} in a path you gave; {}",
+                        name.to_string_lossy(),
+                        crate::rooted::OPERATOR_SYMLINK_FOLLOW_ADVICE
+                    ),
+                    Ok(metadata) if !metadata.is_dir() => {
+                        bail!("receiving path ancestor is not a directory")
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing = true,
+                    Err(e) => return Err(e.into()),
                 }
             }
             Component::Prefix(_) => unreachable!("Unix path"),
@@ -998,6 +1044,13 @@ fn resolve_destination(cwd: &Path, root: Option<&Path>, path: &[u8]) -> Result<(
         }
     }
     Ok((destination, container))
+}
+
+/// This account's home directory, as `HOME` names it and where it really is.
+pub(crate) fn home_directory() -> Option<(PathBuf, PathBuf)> {
+    let named = PathBuf::from(std::env::var_os("HOME")?);
+    let real = fs::canonicalize(&named).ok()?;
+    named.is_absolute().then_some((named, real))
 }
 
 /// Fit `request` within this machine's limits at `destination`, or refuse it.
@@ -1457,6 +1510,8 @@ struct Receiver {
     /// Approved account logins whose agent requests this connection relays
     /// now (`ssh_auth::AuthorizationContext::relaying`).
     account_relays: AtomicU64,
+    /// Of those, the ones that say whether anything uses them.
+    account_links: ssh_auth::AccountLinks,
     account_source: Mutex<std::result::Result<crate::receive_approval::AccountIdentity, String>>,
     account_sessions: Mutex<HashMap<String, u64>>,
     forward_count: std::sync::atomic::AtomicUsize,
@@ -1582,8 +1637,23 @@ impl Receiver {
                     )
                 })?;
                 crate::approval_command::check_copy(&command, &request, &self.name)?;
-                let (destination, mut container) =
-                    resolve_destination(&self.cwd, self.root.as_deref(), &request.destination)?;
+                // The command's own `--follow-dst` follows symlinks above
+                // the destination, as for any copy.
+                let follow =
+                    crate::approval_command::parse(&command)?.follows_native_destination_paths();
+                // Only a path resolved without following, outside a root,
+                // starts in the home.
+                let home = (self.root.is_none() && !follow)
+                    .then(home_directory)
+                    .flatten();
+                let (destination, mut container) = resolve_destination(
+                    &self.cwd,
+                    self.root.as_deref(),
+                    &request.destination,
+                    follow,
+                    home.as_ref()
+                        .map(|(named, real)| (named.as_path(), real.as_path())),
+                )?;
                 if self.root.as_ref() == Some(&destination)
                     && request.copy.policy.placement == DestinationPlacement::ExactPath
                 {
@@ -1631,6 +1701,10 @@ impl Receiver {
                         .context("automatic approval root must not be filesystem root")?
                         .to_path_buf();
                 }
+                // Every authority for this request works beneath the
+                // directory opened here, before the prompt: one whose name
+                // leads elsewhere by approval cannot redirect the copy.
+                let container = crate::restricted::Container::open(&container)?;
                 // Validate the complete operation before the local policy decision.
                 let (authority, approved) =
                     crate::restricted::named_authority(&container, request.clone())?;
@@ -1891,6 +1965,8 @@ fn pin_receiving_source(
 /// (`receive_service::switch`).
 pub(crate) struct Activity {
     state: Mutex<ActivityState>,
+    /// Notified when a tentative close is decided.
+    decided: std::sync::Condvar,
     receiver: Mutex<std::sync::Weak<Receiver>>,
     /// How long after its last request the connection counts as idle.
     quiet: Duration,
@@ -1899,6 +1975,7 @@ impl Default for Activity {
     fn default() -> Self {
         Self {
             state: Default::default(),
+            decided: Default::default(),
             receiver: Default::default(),
             quiet: crate::receive_service::switch::quiet(),
         }
@@ -1908,8 +1985,20 @@ impl Default for Activity {
 struct ActivityState {
     requests: usize,
     last: Option<Instant>,
-    closed: bool,
+    closed: Closed,
 }
+/// Whether the service closed the connection to switch builds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Closed {
+    #[default]
+    No,
+    /// While it ends idle account connections, which may turn out in use.
+    Tentatively,
+    Yes,
+}
+/// The longest a request waits for a tentative close to be decided, within
+/// the time the service takes to decide (`ssh_auth::CLOSE_WAIT`).
+const CLOSE_DECISION: Duration = Duration::from_secs(1);
 /// One request being handled, until dropped.
 struct Handling<'a>(&'a Activity);
 impl Drop for Handling<'_> {
@@ -1921,10 +2010,19 @@ impl Drop for Handling<'_> {
 }
 impl Activity {
     /// Count a request until the result is dropped; None once the service
-    /// has closed this connection to switch builds.
+    /// has closed this connection to switch builds. While it may still
+    /// stay open, wait for that to be decided.
     fn begin(&self) -> Option<Handling<'_>> {
+        let deadline = Instant::now() + CLOSE_DECISION;
         let mut state = self.state.lock().unwrap();
-        if state.closed {
+        while state.closed == Closed::Tentatively {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            state = self.decided.wait_timeout(state, left).unwrap().0;
+        }
+        if state.closed == Closed::Yes {
             return None;
         }
         state.requests += 1;
@@ -1938,15 +2036,22 @@ impl Activity {
         let requests = self.state.lock().unwrap().requests;
         requests + self.approved()
     }
-    /// Approved account connections open through this connection: logins
-    /// it authorized whose agent requests it still relays.
-    pub(crate) fn accounts(&self) -> usize {
+    /// Approved account connections open through this connection, and
+    /// what those that say whether anything uses them said lately
+    /// (`ssh_auth::AccountLinks`).
+    pub(crate) fn accounts(&self) -> Accounts {
         self.receiver
             .lock()
             .unwrap()
             .upgrade()
-            .map_or(0, |receiver| {
-                receiver.account_relays.load(Ordering::Acquire) as usize
+            .map_or(Accounts::default(), |receiver| {
+                let links = receiver.account_links.counts();
+                Accounts {
+                    open: receiver.account_relays.load(Ordering::Acquire) as usize,
+                    reporting: links.open,
+                    idle: links.idle,
+                    in_use: links.in_use,
+                }
             })
     }
     fn approved(&self) -> usize {
@@ -1965,7 +2070,8 @@ impl Activity {
             })
     }
     fn idle_locked(&self, state: &ActivityState) -> bool {
-        state.requests == 0
+        // An account connection nothing uses ends at the switch.
+        state.requests.saturating_sub(self.accounts().idle) == 0
             && state.last.is_none_or(|last| last.elapsed() >= self.quiet)
             && self.approved() == 0
     }
@@ -1975,19 +2081,50 @@ impl Activity {
         let state = self.state.lock().unwrap();
         self.idle_locked(&state)
     }
-    /// Refuse new requests if idle, so the service can stop to switch builds
-    /// without cutting one off; whether it did.
+    /// Hold new requests if idle, so the service can stop to switch builds
+    /// without cutting one off; whether it did. They wait until
+    /// `close` or `reopen` decides.
     pub(crate) fn close_if_idle(&self) -> bool {
         let mut state = self.state.lock().unwrap();
         if !self.idle_locked(&state) {
             return false;
         }
-        state.closed = true;
+        state.closed = Closed::Tentatively;
         true
     }
-    pub(crate) fn reopen(&self) {
-        self.state.lock().unwrap().closed = false;
+    /// After `close_if_idle`, refuse new requests for good.
+    pub(crate) fn close(&self) {
+        self.decide(Closed::Yes);
     }
+    pub(crate) fn reopen(&self) {
+        self.decide(Closed::No);
+    }
+    fn decide(&self, closed: Closed) {
+        self.state.lock().unwrap().closed = closed;
+        self.decided.notify_all();
+    }
+    /// After `close_if_idle`, ask the account connections nothing uses to
+    /// end (`ssh_auth::AccountLinks::ask_close`).
+    pub(crate) fn close_accounts(&self) -> Option<ssh_auth::Closing> {
+        self.receiver
+            .lock()
+            .unwrap()
+            .upgrade()
+            .map(|receiver| receiver.account_links.ask_close())
+    }
+}
+
+/// A service's approved account connections (`Activity::accounts`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Accounts {
+    pub(crate) open: usize,
+    /// Of those, the ones that say whether anything uses them.
+    pub(crate) reporting: usize,
+    /// Of those, the ones that said recently that nothing does.
+    pub(crate) idle: usize,
+    /// Of those, the ones that said recently that something does. The
+    /// rest have not said lately, or cannot tell.
+    pub(crate) in_use: usize,
 }
 
 pub(crate) fn serve_background(
@@ -2040,6 +2177,7 @@ pub(crate) fn serve_background(
         exec_count: AtomicU64::new(0),
         ssh_count: AtomicU64::new(0),
         account_relays: AtomicU64::new(0),
+        account_links: Default::default(),
         account_source: Mutex::new(Err("receiving SSH connection is not ready".into())),
         account_sessions: Mutex::new(HashMap::new()),
         forward_count: std::sync::atomic::AtomicUsize::new(0),

@@ -90,7 +90,7 @@ print("case: sending asks, even where receiving is approved automatically", flus
 run("syq", "persist", "receive", "on", "--auto-approve-root", str(receive_root), "--notify", "off")
 run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
 request, _ = copy(["send-fixture/.kube"], "denied", allow=False, success=False)
-assert request["paths"][0].startswith(str(fixture / ".kube") + " "), request
+assert request["paths"][0].startswith('"' + str(fixture / ".kube") + '" '), request
 run("ssh", "source", "test ! -e " + shlex.quote(server + "/denied/.kube"))
 
 for tcp in [True, False]:
@@ -120,7 +120,7 @@ run("ssh", "source", "printf '%s\\n' " + shlex.quote(json.dumps(
     {"src": {"encoding": "utf-8", "value": ".kube/config"}, "dst": {"encoding": "utf-8", "value": "renamed/config"}}))
     + " > " + shlex.quote(mapping))
 request, _ = copy(["--mapping", mapping, "-C", "send-fixture"], "mapped")
-assert request["paths"][0].startswith(str(fixture) + " "), request
+assert request["paths"][0].startswith('"' + str(fixture) + '" '), request
 assert run("ssh", "source", "cat " + shlex.quote(server + "/mapped/renamed/config")) \
     == "clusters: []\n"
 run("ssh", "source", "test ! -e " + shlex.quote(server + "/mapped/renamed/cache"))
@@ -157,7 +157,7 @@ cwd = Path(tempfile.mkdtemp(prefix="syq-send-cwd-"))
 run("syq", "persist", "receive", "on", "--no-root", "--cwd", str(cwd), "--notify", "off")
 run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
 request, _ = copy(["~/syq-send-token"], "home")
-assert request["paths"][0].startswith(str(token) + " "), request
+assert request["paths"][0].startswith('"' + str(token) + '" '), request
 assert run("ssh", "source", "cat " + shlex.quote(server + "/home/syq-send-token")) == "real\n"
 run("syq", "persist", "receive", "on", "--root", str(receive_root), "--auto-cwd", "--notify", "off")
 run("syq", "persist", "receive", "wait", "source", "--timeout", "30")

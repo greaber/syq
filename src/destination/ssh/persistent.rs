@@ -2,10 +2,12 @@
 use super::{foreground, local_config::LocalPlan, resolution, SessionRequest, Tty};
 use crate::auth_from::Provider;
 use crate::cli::{AuthFrom, NativeEndpoint};
+use crate::destination::ssh_auth::{LinkReply, LinkRequest};
 use crate::persistence::Domain;
 use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -624,6 +626,9 @@ pub(crate) struct Status {
     endpoint: NativeEndpoint,
     control: PathBuf,
     connected: bool,
+    /// Its master takes no new sessions and ends once those it has end,
+    /// as when a switch to another build closed it while one ran.
+    closing: bool,
 }
 #[derive(Default)]
 pub(crate) struct StatusSnapshot {
@@ -647,11 +652,29 @@ pub(crate) fn uses_provider(domain: &Domain, provider: &Provider) -> bool {
     let Ok(entries) = fs::read_dir(&directory) else {
         return true;
     };
-    let requested = entries.flatten().any(|entry| {
-        let lock = entry.path();
-        if lock.extension().is_none_or(|extension| extension != "lock") || !held(&lock) {
+    let paths: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+    // A keeper's own lock names its master's control socket, which its
+    // record names too (`keeper_lock_path`).
+    let keepers: HashMap<PathBuf, Provider> = paths
+        .iter()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .filter_map(|path| {
+            let record = read_record(path).ok()??;
+            Some((keeper_lock_path(path, &record.control)?, record.authorizer))
+        })
+        .collect();
+    let requested = paths.iter().any(|lock| {
+        if lock.extension().is_none_or(|extension| extension != "lock") || !held(lock) {
             return false;
         }
+        if let Some(authorizer) = keepers.get(lock) {
+            return authorizer == provider;
+        }
+        // Without a record of its own or its master's: waiting for
+        // approval, connecting, or draining.
         match read_record(&lock.with_extension("json")) {
             Ok(Some(record)) => record.authorizer == *provider,
             _ => true,
@@ -665,6 +688,50 @@ pub(crate) fn uses_provider(domain: &Domain, provider: &Provider) -> bool {
                 .any(|row| row.connected && row.authorizer == *provider)
         })
 }
+/// Ask the account connections `provider` authorized to end if nothing
+/// uses them, as when another syq build needs `provider`'s connection;
+/// the requests to withdraw once answered or given up on
+/// (`withdraw_close_requests`). Keepers from before syq could tell
+/// whether a connection is used ignore them.
+pub(crate) fn request_close_if_idle(domain: &Domain, provider: &Provider) -> Vec<PathBuf> {
+    let Ok(Some(directory)) = existing_directory(domain) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(&directory) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+                && held(&path.with_extension("lock"))
+                && read_record(path)
+                    .is_ok_and(|record| record.is_some_and(|record| record.authorizer == *provider))
+        })
+        .map(|path| path.with_extension("close"))
+        .filter(|request| {
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(request)
+                .is_ok()
+        })
+        .collect()
+}
+
+/// Remove close requests a keeper has not taken, so that none outlives
+/// the wait for it.
+pub(crate) fn withdraw_close_requests(requests: &[PathBuf]) {
+    for request in requests {
+        let _ = fs::remove_file(request);
+    }
+}
+
 /// Whether another process holds the lock on `path`. Looking takes a
 /// shared lock for a moment, which a keeper taking it then retries.
 fn held(path: &Path) -> bool {
@@ -704,17 +771,24 @@ pub(crate) fn status(domain: &Domain) -> Result<StatusSnapshot> {
             let Some(record) = read_record(&path)? else {
                 return Ok(None);
             };
-            if !record.control.exists() {
+            // A master that stopped listening has no socket, but its
+            // keeper's lock says it still runs (`Drain`).
+            let closing = !record.control.exists()
+                && keeper_lock_path(&path, &record.control).is_some_and(|lock| held(&lock));
+            // A keeper ending removes its scope just before its record.
+            let scope_gone = record.control.parent().is_none_or(|scope| !scope.exists());
+            if (!closing && !record.control.exists()) || (closing && scope_gone) {
                 return Ok(None);
             }
             validate_record(domain, &record)?;
-            let connected = live(&record);
+            let connected = !closing && live(&record);
             Ok(Some(Status {
                 authorizer: record.authorizer,
                 requested: record.requested,
                 endpoint: record.endpoint,
                 control: record.control,
                 connected,
+                closing,
             }))
         })();
         match result {
@@ -738,7 +812,13 @@ pub(crate) fn print_status(rows: &[Status]) {
             "  {} through {}  {} (reusable account access)\n    SSH control socket: {}",
             row.requested.host,
             row.authorizer,
-            if row.connected { "ready" } else { "inactive" },
+            if row.closing {
+                "closing"
+            } else if row.connected {
+                "ready"
+            } else {
+                "inactive"
+            },
             row.control.display()
         );
     }
@@ -1086,6 +1166,21 @@ fn start(domain: &Domain, request: SessionRequest, plan: resolution::Plan) -> Re
 }
 
 struct Index(PathBuf);
+fn path_of(index: &Option<Index>) -> PathBuf {
+    index
+        .as_ref()
+        .map(|index| index.0.clone())
+        .unwrap_or_default()
+}
+/// Write `record` at `path` in one step.
+fn write_record(path: &Path, record: &Record) -> Result<()> {
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(path.parent().context("record has no directory")?)?;
+    serde_json::to_writer(&mut temporary, record)?;
+    temporary.write_all(b"\n")?;
+    temporary.persist(path)?;
+    Ok(())
+}
 impl Drop for Index {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
@@ -1129,6 +1224,9 @@ fn keeper(startup: Startup) -> Result<()> {
         "SSH provider connection changed before account setup; retry the command"
     );
     let path = selected_index_path(&domain, &request.provider, &request.destination, selected)?;
+    // Released last, after the scope is removed and everything in it ended,
+    // which `persist off` relies on (`keeper_lock_path`).
+    let mut keeper_lock: Option<File> = None;
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1177,6 +1275,7 @@ fn keeper(startup: Startup) -> Result<()> {
         }
         signals.wait(POLL)?;
     }
+    let mut lock = Some(lock);
     let approval_request = request.clone();
     let approval_domain = domain.clone();
     let shown_command = startup.command.clone();
@@ -1206,7 +1305,7 @@ fn keeper(startup: Startup) -> Result<()> {
         })?;
     let approval_deadline = Instant::now() + Duration::from_secs(330);
     let mut reported_request = false;
-    let session = loop {
+    let mut session = loop {
         if signals.received.load(Ordering::Acquire) != 0 || !startup_open(&domain, &startup)? {
             bail!("persistent SSH setup cancelled before approval");
         }
@@ -1236,6 +1335,9 @@ fn keeper(startup: Startup) -> Result<()> {
         .prefix("approved-")
         .tempdir_in(ensure_master_parent(&domain)?)?;
     crate::persistence::initialize_scope(scope.path())?;
+    // The record of a closing master, removed before the scope, and so
+    // before the keeper's lock: status never finds it without its scope.
+    let mut closing_record: Option<Index> = None;
     let endpoint = session.endpoint();
     let control = crate::persistence::prepare_endpoint(
         scope.path(),
@@ -1244,6 +1346,7 @@ fn keeper(startup: Startup) -> Result<()> {
         endpoint.port,
         None,
     )?;
+    keeper_lock.replace(take_keeper_lock(&path, &control)?);
     let mut master = Command::new("ssh");
     master
         .args(local.options())
@@ -1340,7 +1443,11 @@ fn keeper(startup: Startup) -> Result<()> {
     serde_json::to_writer(&mut temporary, &record)?;
     temporary.write_all(b"\n")?;
     temporary.persist(&path)?;
-    let _index = Index(path);
+    // A newer syq asks this connection to end if nothing uses it
+    // (`request_close_if_idle`); not one made for an earlier keeper.
+    let close_request = path.with_extension("close");
+    let _ = fs::remove_file(&close_request);
+    let index = Index(path);
     super::super::write_message(
         &mut std::io::stdout().lock(),
         &Ok::<_, String>(format!(
@@ -1362,6 +1469,30 @@ fn keeper(startup: Startup) -> Result<()> {
                 .context("detach persistent SSH startup channel");
         }
     }
+    // Whether the approving side asks whether anything uses this
+    // connection (`ssh_auth::links`), once the login is done with the agent.
+    let mut linked = None;
+    // Ending because nothing used it: the master takes no new sessions and
+    // exits once those it has end, which no longer depends on the
+    // approving side.
+    let mut drain = Drain::default();
+    // The record and its lock, until the master is ending: then a new
+    // command opens a connection of its own beside it at once, while the
+    // keeper's own lock keeps it visible to `persist off`, and a record
+    // under that lock's name keeps it in status, as closing.
+    let mut index = Some(index);
+    // Only a default-domain master drains: this keeper is its parent and
+    // sees it exit. An explicit-domain master is a daemon apart from it.
+    let drains = domain.is_default();
+    let use_count = || in_use(&record.control);
+    let mut stop = || {
+        // A spare session would keep the master.
+        let _ = cleanup::stop_pool(&record.control);
+        stop_listening(&record).is_ok()
+    };
+    // Closing ends the loop once the master exits; until then, revoking
+    // the connection, by its approving side going away, a new generation,
+    // `persist off` or a signal, still ends the master at once.
     loop {
         if domain.is_default() {
             if master.poll()?.is_some() {
@@ -1387,6 +1518,45 @@ fn keeper(startup: Startup) -> Result<()> {
         {
             break;
         }
+        if drains {
+            if linked.is_none() {
+                linked = session.enter_link()?;
+            }
+            if linked == Some(true) {
+                if let Some(request) = session.link_request()? {
+                    let mut ended = || {
+                        let deadline = Instant::now() + Duration::from_millis(300);
+                        loop {
+                            if !matches!(master.poll(), Ok(None)) {
+                                return true;
+                            }
+                            if Instant::now() >= deadline {
+                                return false;
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    };
+                    let reply = drain.answer(request, &use_count, &mut stop, &mut ended);
+                    session.answer(reply)?;
+                }
+            }
+        }
+        if !drain.closing && drains && close_request.exists() {
+            let _ = fs::remove_file(&close_request);
+            drain.close_if_idle(&use_count, &mut stop);
+        }
+        if drain.closing && index.is_some() {
+            // Keep a record under the keeper lock's name, then remove the
+            // account's record and release its lock.
+            if let Some(path) = keeper_lock_path(&path_of(&index), &record.control) {
+                let path = path.with_extension("json");
+                if write_record(&path, &record).is_ok() {
+                    closing_record.replace(Index(path));
+                }
+            }
+            drop(index.take());
+            drop(lock.take());
+        }
         signals.wait(POLL)?;
     }
     let pool_result = pool.stop();
@@ -1396,6 +1566,141 @@ fn keeper(startup: Startup) -> Result<()> {
     master_result?;
     daemon_result?;
     pool_result
+}
+
+/// The lock a keeper holds for its whole life, beside the account index
+/// records, named for its master's control socket: `persist off` and the
+/// checks for connections in use see a keeper by it, including one whose
+/// master drains after it gave up its record (`Drain`). A 64-hex `.lock`,
+/// as every syq version counts keepers by.
+fn keeper_lock_path(record: &Path, control: &Path) -> Option<PathBuf> {
+    let name = blake3::hash(
+        &[
+            b"syq-account-keeper-v1\0",
+            control.as_os_str().as_encoded_bytes(),
+        ]
+        .concat(),
+    )
+    .to_hex();
+    Some(record.parent()?.join(format!("{name}.lock")))
+}
+
+fn take_keeper_lock(record: &Path, control: &Path) -> Result<File> {
+    let path = keeper_lock_path(record, control).context("SSH account index has no directory")?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .with_context(|| format!("create SSH account keeper lock {}", path.display()))?;
+    // No other keeper has this name, but someone counting keepers can hold
+    // it for a moment (`held`).
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "SSH account keeper lock {} is held",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(file)
+}
+
+/// How many sessions use the master at `control`, apart from the session
+/// pool's spares; None when that cannot be told.
+fn in_use(control: &Path) -> Option<usize> {
+    // Tests stand in for a session that starts between the look and the
+    // stop.
+    #[cfg(debug_assertions)]
+    if let Some(sessions) = std::env::var("SYQ_TEST_ACCOUNT_SESSIONS")
+        .ok()
+        .and_then(|sessions| sessions.parse().ok())
+    {
+        return Some(sessions);
+    }
+    crate::session_pool::sessions_in_use(control, Duration::from_millis(200))
+}
+
+/// Whether a keeper's master is ending because nothing used it. Once it
+/// is, it stays so, and nothing stops it again: the master takes no new
+/// sessions and exits once those it has end, even one that started between
+/// the look and the stop.
+#[derive(Default)]
+struct Drain {
+    closing: bool,
+}
+impl Drain {
+    /// Answer the approving side. `use_count` counts the sessions using
+    /// the master, None when it cannot; `stop` stops it taking new ones;
+    /// `ended` says whether the master has exited, waiting a moment.
+    /// It is closed only once its master exited: until then a session that
+    /// started between the look and the stop still runs, and the approving
+    /// side keeps the connection, whose end then still ends the master.
+    fn answer(
+        &mut self,
+        request: LinkRequest,
+        use_count: &dyn Fn() -> Option<usize>,
+        stop: &mut dyn FnMut() -> bool,
+        ended: &mut dyn FnMut() -> bool,
+    ) -> LinkReply {
+        if self.closing {
+            return if ended() {
+                LinkReply::Closing
+            } else {
+                LinkReply::InUse
+            };
+        }
+        // Counted once for both the decision and the answer.
+        let count = use_count();
+        if request == LinkRequest::CloseIfIdle && count == Some(0) && stop() {
+            self.closing = true;
+            return self.answer(request, &|| count, stop, ended);
+        }
+        match count {
+            Some(0) if request == LinkRequest::Query => LinkReply::Idle,
+            Some(_) => LinkReply::InUse,
+            None => LinkReply::Unknown,
+        }
+    }
+
+    /// If nothing uses the master, stop it taking new sessions; whether it
+    /// is ending, now or since earlier.
+    fn close_if_idle(
+        &mut self,
+        use_count: &dyn Fn() -> Option<usize>,
+        stop: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        if !self.closing && use_count() == Some(0) && stop() {
+            self.closing = true;
+        }
+        self.closing
+    }
+}
+
+fn stop_listening(record: &Record) -> Result<()> {
+    let mut child = master_command(record)
+        .args(["-O", "stop", "--", &record.endpoint.host])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn_guarded()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::ensure!(status.success(), "SSH master refused to stop ({status})");
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("SSH master did not answer a stop within 5 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 struct KeeperPool<'a> {
@@ -1609,6 +1914,94 @@ mod tests {
         fs::set_permissions(&index, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
+    /// A link's close and a newer command's close request can arrive
+    /// together. Once the first stopped the master taking new sessions,
+    /// the session that started meanwhile does not undo it, and nothing
+    /// stops the master again. The connection says it is closed only once
+    /// its master exited: until then it is in use, so that its approving
+    /// side keeps it, and revoking it still ends the master.
+    #[test]
+    fn a_master_ending_because_idle_stays_ending() {
+        let sessions = std::cell::Cell::new(0);
+        let stops = std::cell::Cell::new(0);
+        let exited = std::cell::Cell::new(false);
+        let use_count = || Some(sessions.get());
+        let mut stop = || {
+            stops.set(stops.get() + 1);
+            // A session starts between the look and the stop.
+            sessions.set(1);
+            true
+        };
+        let mut ended = || exited.get();
+        let mut drain = Drain::default();
+        assert_eq!(
+            drain.answer(LinkRequest::CloseIfIdle, &use_count, &mut stop, &mut ended),
+            LinkReply::InUse
+        );
+        assert!(drain.closing);
+        assert!(drain.close_if_idle(&use_count, &mut stop));
+        assert_eq!(stops.get(), 1);
+        assert_eq!(
+            drain.answer(LinkRequest::Query, &use_count, &mut stop, &mut ended),
+            LinkReply::InUse
+        );
+        // That session ended, and with it the master.
+        exited.set(true);
+        assert_eq!(
+            drain.answer(LinkRequest::CloseIfIdle, &use_count, &mut stop, &mut ended),
+            LinkReply::Closing
+        );
+        assert_eq!(stops.get(), 1);
+
+        // In use, or unknown: it says so and stays.
+        let mut drain = Drain::default();
+        assert_eq!(
+            drain.answer(LinkRequest::CloseIfIdle, &use_count, &mut stop, &mut ended),
+            LinkReply::InUse
+        );
+        let unknown = || None;
+        assert_eq!(
+            drain.answer(LinkRequest::Query, &unknown, &mut stop, &mut ended),
+            LinkReply::Unknown
+        );
+        assert_eq!(
+            drain.answer(LinkRequest::CloseIfIdle, &unknown, &mut stop, &mut ended),
+            LinkReply::Unknown
+        );
+        assert!(!drain.closing);
+        assert_eq!(stops.get(), 1);
+
+        // Idle, and the master exits at the stop: closed at once.
+        sessions.set(0);
+        let mut quiet_stop = || true;
+        assert_eq!(
+            drain.answer(LinkRequest::Query, &use_count, &mut quiet_stop, &mut ended),
+            LinkReply::Idle
+        );
+        assert_eq!(
+            drain.answer(
+                LinkRequest::CloseIfIdle,
+                &use_count,
+                &mut quiet_stop,
+                &mut ended
+            ),
+            LinkReply::Closing
+        );
+        // Idle, but the master would not stop: it stays.
+        let mut drain = Drain::default();
+        let mut refuse = || false;
+        assert_eq!(
+            drain.answer(
+                LinkRequest::CloseIfIdle,
+                &use_count,
+                &mut refuse,
+                &mut ended
+            ),
+            LinkReply::InUse
+        );
+        assert!(!drain.closing);
+    }
+
     /// A provider's connection is in use from an account request through
     /// it until that ends: while it waits for approval or connects, its
     /// keeper holds its record's lock with no record yet; once connected,
@@ -1671,9 +2064,44 @@ mod tests {
         serde_json::to_writer(&mut file, &record).unwrap();
         assert!(!uses_provider(&domain, &provider));
         assert!(uses_provider(&domain, &other));
-        // Ended: the lock is free.
+        // Asked to end if idle: only the connections of that provider,
+        // and the request is withdrawn after.
+        // Its keeper's own lock, named for its master, belongs to it too,
+        // and counts for no other provider.
+        // Taken while someone counting keepers holds it for a moment.
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(keeper_lock_path(&path, &record.control).unwrap())
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_SH) }, 0);
+        let releasing = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(probe);
+        });
+        let keeper = take_keeper_lock(&path, &record.control).unwrap();
+        releasing.join().unwrap();
+        assert!(!uses_provider(&domain, &provider));
+        assert!(uses_provider(&domain, &other));
+        assert!(request_close_if_idle(&domain, &provider).is_empty());
+        let requests = request_close_if_idle(&domain, &other);
+        assert_eq!(requests, [path.with_extension("close")]);
+        assert!(requests[0].exists());
+        withdraw_close_requests(&requests);
+        assert!(!requests[0].exists());
+        // Draining: the record and its lock are gone, and the keeper's own
+        // lock, whose provider is no longer known, counts for every one.
+        fs::remove_file(&path).unwrap();
         drop(lock);
+        assert!(uses_provider(&domain, &provider));
+        assert!(uses_provider(&domain, &other));
+        // Ended: the locks are free.
+        drop(keeper);
         assert!(!uses_provider(&domain, &other));
+        assert!(request_close_if_idle(&domain, &other).is_empty());
     }
 
     #[test]

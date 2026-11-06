@@ -243,8 +243,12 @@ Copies to a receiving name are refused while syq runs as root on the receiving
 machine. They cannot preserve hard links, ACLs, extended attributes, or access
 or birth times, and cannot use `--open-noatime` or `--sparse`; the other
 `--copy-metadata` options work as for any copy by an account other than root.
-They never follow a destination symlink, even with `--follow-dst`; name the
-link's target instead.
+
+As in any copy, a symlink in a directory above the destination stops the copy
+unless the command passes `--follow-dst`; links in your home directory's own
+path are fine. With `--root`, symlinks inside the root are never followed. A
+symlink at the destination itself is never followed, even with `--follow-dst`;
+name the link's target instead.
 
 ## Connection lifetime and waits
 
@@ -266,10 +270,16 @@ approval is in progress, by themselves or when you next run syq.
 it even when busy, which cuts off copies and approvals in progress. If
 receiving needs you to unlock or touch your SSH key, it waits until you next
 run a syq copy or ssh command, or `syq persist status`, in a terminal. An
-account connection you approved keeps the old version until that connection
-closes; `syq persist status` shows the command that switches at once and
-closes it. Session permissions (**Allow**) end at the switch, as at any
-reconnect.
+account connection you approved closes at the switch when nothing runs through
+it, along with any idle port forwards it holds. The next syq command that uses
+it opens it again, which asks for approval again unless you remembered it;
+export a `persist ssh-config` file again after that. While a copy, shell, or
+other session runs through it, the switch waits for it to finish. A connection
+that can't tell whether it's in use, such as one opened on macOS or in an
+isolated domain, keeps the old version until it closes. `syq persist status`
+says which connections the switch waits for and shows the command that
+switches at once and closes them. Session permissions (**Allow**) end at the
+switch, as at any reconnect.
 
 To wait in a script without starting a connection, run
 `syq persist receive wait server --timeout 30` on the laptop, or

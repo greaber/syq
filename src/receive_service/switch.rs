@@ -331,8 +331,9 @@ fn seen_at(path: &Path) -> Option<Seen> {
 /// process sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Follows {
-    /// Nothing: the service predates following updates, or its path is
-    /// gone. Commands replace it (`receive_service::refresh_outdated`).
+    /// Nothing: the service predates following updates, its path is gone,
+    /// or its path is a release in the binary store, which never changes.
+    /// Commands replace it (`receive_service::refresh_outdated`).
     Nothing,
     /// The file this process runs, so it switches to this build by itself.
     ThisFile,
@@ -341,14 +342,39 @@ pub(crate) enum Follows {
     OtherFile,
 }
 pub(crate) fn follows(started_from: Option<&str>) -> Follows {
-    let Some(file) = started_from.and_then(|path| file_at(Path::new(path))) else {
+    follows_with_store(started_from, crate::user_dirs::binary_store().as_deref())
+}
+/// `follows`, with the binary store at `store`.
+fn follows_with_store(started_from: Option<&str>, store: Option<&Path>) -> Follows {
+    let Some(path) = started_from.map(Path::new) else {
+        return Follows::Nothing;
+    };
+    let Some(file) = file_at(path) else {
         return Follows::Nothing;
     };
     if crate::process::running_image() == Some(file) {
         Follows::ThisFile
+    } else if store.is_some_and(|store| in_store(path, store)) {
+        // A command run with `--use-version` starts its services from the
+        // selected release in the store. That file never changes, so they
+        // would keep that release through every update of the installed
+        // syq; the installed syq replaces them instead.
+        Follows::Nothing
     } else {
         Follows::OtherFile
     }
+}
+/// Whether `path` names a file in the binary store at `store`, as spelled or
+/// with its directory resolved: the store may be a link to another disk. A
+/// link elsewhere that leads into the store is not in it.
+fn in_store(path: &Path, store: &Path) -> bool {
+    let resolved = || {
+        let directory = std::fs::canonicalize(path.parent()?).ok()?;
+        Some(directory.join(path.file_name()?))
+    };
+    path.starts_with(store)
+        || std::fs::canonicalize(store)
+            .is_ok_and(|store| resolved().is_some_and(|path| path.starts_with(store)))
 }
 pub(crate) fn follows_other_file(started_from: Option<&str>) -> bool {
     follows(started_from) == Follows::OtherFile
@@ -358,7 +384,8 @@ pub(crate) fn follows_other_file(started_from: Option<&str>) -> bool {
 /// there, or pointed the path at. Every directory resolving `path` passes
 /// through, including through each symbolic link on the way, must belong to
 /// this user or root and must not be writable by every account, as
-/// `remote_user_install` refuses such directories. So must the file, which
+/// `remote_user_install` refuses such directories, nor have a macOS access
+/// control list that lets other accounts change it. So must the file, which
 /// must also be executable. Group write is allowed: Homebrew's directories,
 /// and any directory made under a 002 umask, are group writable, and the
 /// user's own commands run syq from them anyway. A directory with the sticky
@@ -370,6 +397,24 @@ pub(crate) fn check_runnable(path: &Path) -> Result<()> {
     use std::path::Component;
     let user = unsafe { libc::geteuid() };
     let trusted = |metadata: &std::fs::Metadata| metadata.uid() == user || metadata.uid() == 0;
+    // Whether an access control list lets other accounts change `path`,
+    // which mode bits do not show on macOS. One for a group, such as the
+    // `admin` group of a Homebrew shared by several accounts, counts as
+    // group write does, unless it is the group of every account.
+    let acl = |path: &Path| -> Result<()> {
+        use crate::inode_metadata::{AclAccess, AclGroups};
+        match crate::inode_metadata::acl_lets_others_change(path, AclGroups::Trusted)? {
+            None => Ok(()),
+            Some(AclAccess::Own) => anyhow::bail!(
+                "{} has an access control list that lets other accounts change it",
+                path.display()
+            ),
+            Some(AclAccess::Inherited) => anyhow::bail!(
+                "{path} has an access control list that lets other accounts change it, which it inherited from a directory above it, so reinstalling syq there alone would not help; find that directory with `ls -le` and remove its inheritable entry with `chmod -N`, then remove the entry from {path} with `chmod -N` too",
+                path = path.display()
+            ),
+        }
+    };
     // Whether every account may add entries to `directory`, after refusing
     // it if one could replace them.
     let directory = |directory: &Path| -> Result<bool> {
@@ -381,6 +426,7 @@ pub(crate) fn check_runnable(path: &Path) -> Result<()> {
             "the directory {} must belong to you or root, and other accounts may not write it",
             directory.display()
         );
+        acl(directory)?;
         Ok(shared)
     };
     let absolute = if path.is_absolute() {
@@ -445,6 +491,7 @@ pub(crate) fn check_runnable(path: &Path) -> Result<()> {
                 "{} must belong to you or root, and other accounts may not write it",
                 entry.display()
             );
+            acl(&entry)?;
             return Ok(());
         }
         anyhow::ensure!(metadata.is_dir(), "{} is not a directory", entry.display());
@@ -1209,5 +1256,81 @@ mod tests {
         // One following the file this process runs.
         let running = std::env::current_exe().unwrap();
         assert_eq!(follows(Some(running.to_str().unwrap())), Follows::ThisFile);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_followed_file_that_an_acl_lets_others_change_will_not_run() {
+        let directory = crate::test_support::tempdir().unwrap();
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let path = bin.join("syq");
+        script(&path, "v99.0.0");
+        check_runnable(&path).unwrap();
+        let chmod = |arguments: &[&std::ffi::OsStr]| {
+            assert!(std::process::Command::new("chmod")
+                .args(arguments)
+                .status()
+                .unwrap()
+                .success());
+        };
+        for (entry, changed) in [
+            ("everyone allow write", &path),
+            ("everyone allow add_file", &bin),
+        ] {
+            chmod(&["+a".as_ref(), entry.as_ref(), changed.as_os_str()]);
+            let error = check_runnable(&path).unwrap_err().to_string();
+            assert!(error.contains("access control list"), "{entry}: {error}");
+            chmod(&["-N".as_ref(), changed.as_os_str()]);
+            check_runnable(&path).unwrap();
+        }
+        // An entry only for what is created there later changes nothing,
+        // and one for a group counts as group write: allowed here.
+        for entry in [
+            "everyone allow add_file,delete_child,file_inherit,directory_inherit,only_inherit",
+            "group:admin allow add_file,delete_child,file_inherit,directory_inherit",
+        ] {
+            chmod(&["+a".as_ref(), entry.as_ref(), bin.as_os_str()]);
+            check_runnable(&path).unwrap();
+        }
+    }
+
+    #[test]
+    fn commands_replace_services_that_follow_a_stored_release() {
+        // `--use-version` runs a release from the binary store; a service it
+        // starts follows that file, which no update ever changes.
+        let directory = crate::test_support::tempdir().unwrap();
+        let store = directory.path().join("home/.local/lib/syq");
+        let stored = store.join("v0.8.0/linux-x86_64/syq");
+        std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        script(&stored, "v0.8.0");
+        let stored = stored.to_str().unwrap();
+        assert_eq!(follows_with_store(Some(stored), None), Follows::OtherFile);
+        assert_eq!(
+            follows_with_store(Some(stored), Some(&store)),
+            Follows::Nothing
+        );
+        // Also when the store is reached through a link, as to another disk.
+        let link = directory.path().join("linked-store");
+        std::os::unix::fs::symlink(&store, &link).unwrap();
+        assert_eq!(
+            follows_with_store(Some(stored), Some(&link)),
+            Follows::Nothing
+        );
+        // An installed syq outside the store is still left alone, and so is
+        // a link outside it that leads to a stored release.
+        let installed = directory.path().join("bin/syq");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        script(&installed, "v99.0.0");
+        assert_eq!(
+            follows_with_store(Some(installed.to_str().unwrap()), Some(&store)),
+            Follows::OtherFile
+        );
+        let pinned = directory.path().join("bin/pinned");
+        std::os::unix::fs::symlink(stored, &pinned).unwrap();
+        assert_eq!(
+            follows_with_store(Some(pinned.to_str().unwrap()), Some(&store)),
+            Follows::OtherFile
+        );
     }
 }

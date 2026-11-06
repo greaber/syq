@@ -759,10 +759,14 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 case "$url" in
-    *.json) cp "$FAKE_REMOTE_RELEASE_MANIFEST" "$out" ;;
-    *.gz) cp "$FAKE_REMOTE_RELEASE_ARCHIVE" "$out" ;;
+    *.json) file=$FAKE_REMOTE_RELEASE_MANIFEST ;;
+    *.gz) file=$FAKE_REMOTE_RELEASE_ARCHIVE ;;
     *) exit 22 ;;
 esac
+if [ "$out" = - ]; then
+    exec cat "$file"
+fi
+cp "$file" "$out"
 "#,
     );
 }
