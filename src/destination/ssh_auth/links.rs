@@ -307,7 +307,7 @@ mod tests {
     use super::*;
 
     /// A keeper stand-in that answers each request with the next reply,
-    /// then waits for the other side to close.
+    /// then takes one more request, or the stream's end, and hangs up.
     fn keeper(mut stream: UnixStream, replies: Vec<LinkReply>) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             crate::agent_broker::write_frame(&mut stream, LINK).unwrap();
@@ -406,10 +406,13 @@ mod tests {
         links.counts();
         wait_for(|| links.counts().in_use == 1);
         link.state.lock().unwrap().report = Some((Instant::now() - FRESH, LinkReply::InUse));
+        // This look asks again. The keeper, out of answers, takes the
+        // question and hangs up, which ends the stream. Shutting down our
+        // end instead could race the server's write of that question.
         assert_eq!(links.counts().in_use, 0);
-        end.shutdown(std::net::Shutdown::Both).unwrap();
         keeper.join().unwrap();
         server.join().unwrap().unwrap();
+        drop(end);
     }
 
     /// A connection that ends while a close waits counts as ended at once,
