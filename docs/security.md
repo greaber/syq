@@ -103,7 +103,9 @@ options only when you trust the source's settings.
 creates, only through files it created or opened itself. A symlink or hard
 link planted at a partial file's name is never followed or written into; syq
 replaces it with its own file. Syq resumes only from a partial file that is
-owned by the account running syq and has no other names, and only reads it. A
+owned by the account running syq and has no other names, and only reads it.
+Once it has published the file, it removes such a partial file when no program
+has it open for writing. A
 file swapped in during the copy gets none of the copy's
 data or metadata, and when syq detects the swap, it reports the file as failed
 instead of publishing it.

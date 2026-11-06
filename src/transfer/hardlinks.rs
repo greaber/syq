@@ -623,6 +623,7 @@ impl Worker {
         let identity = match response {
             Response::Published { dev, ino } => Some((dev, ino)),
             Response::Ok => None,
+            Response::PublishedBesideEarlierPartials(identity) => identity,
             other => bail!("unexpected publication reply: {other:?}"),
         };
         self.record_hardlink_identity(idx, job, identity)

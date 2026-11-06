@@ -3019,6 +3019,12 @@ impl Worker {
         }
         let mut meta = self.opts.metadata_for(&job.rel_bytes, &job.entry);
         meta.mode = self.create_mode(&job);
+        let earlier_partials = self
+            .progress
+            .earlier_partials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&idx);
         let finalized = change_ok(
             self.dst.call(Request::Finalize {
                 expected_hash: self.opts.expected_hashes_for(&job),
@@ -3029,11 +3035,25 @@ impl Worker {
                 flags: self.publication_flags(&job),
                 scanned: job.scanned,
                 condition: job.target_condition,
+                earlier_partials,
             })?,
             "finalize destination",
         );
         match finalized {
-            Ok(response) => self.accept_hardlink_reply(idx, &job, response)?,
+            Ok(response) => {
+                // The receiver removed the partials earlier copies left for
+                // this file unless it says it kept some.
+                if earlier_partials
+                    && !matches!(response, Response::PublishedBesideEarlierPartials(_))
+                {
+                    self.progress
+                        .earlier_partials
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&idx);
+                }
+                self.accept_hardlink_reply(idx, &job, response)?
+            }
             Err(error) => {
                 // A condition the receiver found unmet changed nothing, and
                 // the receiver let its sidecar go.

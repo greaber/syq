@@ -112,8 +112,8 @@ fn local_default_and_off_preserve_partial_resume_without_reusing_final() {
         assert_output_ok(&out);
         assert_eq!(read(&t.path("dst")), source);
         assert_eq!(tuning_observed(&out)["range_requests"], 1);
-        assert_eq!(read(&partial), donor);
-        assert_eq!(partial_files(&t.0), vec![partial]);
+        assert_earlier_partial_removed_where_possible(&partial);
+        assert!(partial_files(&t.0).iter().all(|name| *name == partial));
     }
 }
 

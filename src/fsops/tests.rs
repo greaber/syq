@@ -9301,6 +9301,7 @@ fn writes_past_the_size_declared_for_a_file_are_refused() {
         );
         assert!(matches!(ops.handle(&write(0, b"four")), Response::Ok));
         let finalized = ops.handle(&Request::Finalize {
+            earlier_partials: false,
             expected_hash: None,
             path: path.clone(),
             inplace,

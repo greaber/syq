@@ -3103,6 +3103,7 @@ fn prepare_request(path: &Path) -> Request {
 
 fn finalize_request(path: &Path, condition: proto::TargetCondition) -> Request {
     Request::Finalize {
+        earlier_partials: false,
         expected_hash: None,
         path: path_bytes(path),
         inplace: false,
@@ -4988,6 +4989,7 @@ fn unfinished_in_place_files_are_reported_failed() {
         authority.settle(settlement, &proto::Response::Ok);
         if finished {
             let mut finalize = Request::Finalize {
+                earlier_partials: false,
                 expected_hash: None,
                 path: path_bytes(&image),
                 inplace: true,
@@ -5213,6 +5215,7 @@ fn in_place_final_step_honors_the_fingerprint_the_receiver_takes_after_the_write
             "{existing}: {written:?}"
         );
         let finalized = run(Request::Finalize {
+            earlier_partials: false,
             expected_hash: None,
             path: path_bytes(&image),
             inplace: true,
@@ -6276,6 +6279,7 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
         .authorize(&mut prepare("empty", 0), false)
         .unwrap();
     let mut publish_empty = Request::Finalize {
+        earlier_partials: false,
         expected_hash: None,
         path: root.join("target/empty").as_os_str().as_bytes().to_vec(),
         inplace: false,
@@ -6295,6 +6299,7 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
     authority.authorize(&mut publish_empty, false).unwrap();
     // A file this receiver does not hold for the grant cannot be published.
     let mut publish_foreign = Request::Finalize {
+        earlier_partials: false,
         expected_hash: None,
         path: root.join("target/foreign").as_os_str().as_bytes().to_vec(),
         inplace: false,
@@ -8775,6 +8780,7 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
                 data: data.into(),
             });
             receiver.send(Request::Finalize {
+                earlier_partials: false,
                 expected_hash: None,
                 path: path(name),
                 inplace,
@@ -8923,6 +8929,7 @@ fn only_an_ordinary_receiver_takes_a_senders_word_for_what_a_file_replaces() {
                 data: data.into(),
             });
             receiver.send(Request::Finalize {
+                earlier_partials: false,
                 expected_hash: None,
                 path: path("large"),
                 inplace: false,
@@ -9035,6 +9042,7 @@ fn both_receivers_write_only_files_they_created() {
         });
         assert_eq!(fs::read(target.join("existing")).unwrap(), b"old contents");
         receiver.send(Request::Finalize {
+            earlier_partials: false,
             expected_hash: None,
             path,
             inplace: true,
@@ -9158,6 +9166,7 @@ fn both_receivers_update_in_place_only_files_they_vouch_for() {
             data: data.clone().into(),
         };
         let finalize = |name: &str, inplace: bool| Request::Finalize {
+            earlier_partials: false,
             expected_hash: None,
             path: path(name),
             inplace,
@@ -9816,6 +9825,7 @@ fn both_receivers_restore_set_id_bits_after_writing_in_place() {
             data: data.clone().into(),
         });
         receiver.send(Request::Finalize {
+            earlier_partials: false,
             expected_hash: None,
             path,
             inplace: true,
@@ -9899,6 +9909,7 @@ fn both_receivers_limit_a_new_in_place_file_by_a_narrower_default_acl() {
             data: data.clone().into(),
         });
         receiver.send(Request::Finalize {
+            earlier_partials: false,
             expected_hash: None,
             path,
             inplace: true,
