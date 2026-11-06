@@ -1053,12 +1053,8 @@ fn held_by_another_user(path: &Path, uid: u32) -> Option<anyhow::Error> {
     if owner == uid {
         return None;
     }
-    let who = match crate::sys::user_name(owner) {
-        Some(name) => format!("user {name} (uid {owner})"),
-        None => format!("uid {owner}"),
-    };
     Some(anyhow::anyhow!(
-        "{} belongs to {who}, so syq cannot keep persistent connections there; ask that user or an administrator to remove it, or set XDG_RUNTIME_DIR to a short private directory of your own",
+        "{} belongs to another user (uid {owner}), so syq cannot keep persistent connections there; ask that user or an administrator to remove it, or set XDG_RUNTIME_DIR to a short private directory of your own",
         path.display()
     ))
 }
@@ -1727,10 +1723,10 @@ mod tests {
             }
             assert!(held_by_another_user(&path, owner).is_none());
             let message = held_by_another_user(&path, other).unwrap().to_string();
-            assert!(message.contains(&format!("uid {owner}")), "{message}");
-            if let Some(name) = crate::sys::user_name(owner) {
-                assert!(message.contains(&format!("user {name} ")), "{message}");
-            }
+            assert!(
+                message.contains(&format!("another user (uid {owner})")),
+                "{message}"
+            );
             assert!(message.contains("XDG_RUNTIME_DIR"), "{message}");
             if link {
                 std::fs::remove_file(&path).unwrap();

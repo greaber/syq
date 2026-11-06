@@ -2102,8 +2102,11 @@ pub(crate) fn serve_background(
                 let hosts = broker.socket_path().with_file_name("source-known-hosts");
                 pin_receiving_source(&mut command, &policy, &hosts)
             })();
-            *receiver.account_source.lock().unwrap() = source_identity.map_err(|error|
-                format!("cannot identify the requesting SSH account for account approval: {error:#}; trust this source's plain SSH host key on the laptop and reconnect"));
+            // The reason can name this machine's SSH settings, so it stays
+            // here; a server asking for account access is told only that its
+            // account could not be identified.
+            *receiver.account_source.lock().unwrap() =
+                source_identity.map_err(|error| format!("{error:#}"));
             if stop.load(Ordering::Acquire) {
                 break;
             }

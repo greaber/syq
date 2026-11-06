@@ -450,10 +450,20 @@ pub(crate) fn resolve_account_trust_bounded(
         deadline,
         cancelled,
     )
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "could not read its SSH settings for {trust_name}; run `ssh -G {trust_name}` there to see why"
-        )
+    .map_err(|error| {
+        // The requester chose these values, so repeating them reveals nothing.
+        let port = trust_port.map(|port| format!(" -p {port}")).unwrap_or_default();
+        let lookup = format!("ssh -G -l {login_user}{port} {trust_name}");
+        let timed_out = error.chain().any(|cause| {
+            cause
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::TimedOut)
+        });
+        if timed_out {
+            anyhow!("timed out reading its SSH settings for {trust_name}; run `{lookup}` there to see what is slow")
+        } else {
+            anyhow!("could not read its SSH settings for {trust_name}; run `{lookup}` there to see why")
+        }
     })?;
     policy.require_exact_host_keys_for_peer(trust_name)?;
     Ok(policy)

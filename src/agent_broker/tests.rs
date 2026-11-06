@@ -773,18 +773,19 @@ fn resolved_host_policy_uses_real_openssh_and_ssh_keygen() {
 fn account_trust_errors_leave_out_this_machines_configuration() {
     let temp = crate::test_support::tempdir().unwrap();
     let ssh = temp.path().join("ssh");
-    let resolve = || {
+    let resolve_within = |port, timeout| {
         let error = resolve_account_trust_bounded(
             ssh.to_str().unwrap(),
             "requester-user",
             "vault",
-            None,
-            Instant::now() + POLICY_TIMEOUT,
+            port,
+            Instant::now() + timeout,
             &|| false,
         )
         .expect_err("lookup should fail");
         format!("{error:#}")
     };
+    let resolve = || resolve_within(None, POLICY_TIMEOUT);
     // ssh's own message names a private configuration file.
     crate::test_support::write_executable(
         &ssh,
@@ -793,7 +794,13 @@ fn account_trust_errors_leave_out_this_machines_configuration() {
     );
     assert_eq!(
         resolve(),
-        "could not read its SSH settings for vault; run `ssh -G vault` there to see why"
+        "could not read its SSH settings for vault; run `ssh -G -l requester-user vault` there to see why"
+    );
+    // A lookup that runs out of time says so.
+    crate::test_support::write_executable(&ssh, "#!/bin/sh\nexec sleep 30\n", 0o700);
+    assert_eq!(
+        resolve_within(Some(2200), Duration::from_millis(200)),
+        "timed out reading its SSH settings for vault; run `ssh -G -l requester-user -p 2200 vault` there to see what is slow"
     );
 
     let known_hosts = temp.path().join("known_hosts");
