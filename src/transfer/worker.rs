@@ -3005,14 +3005,43 @@ impl Worker {
         }
     }
 
+    /// Whether this copy writes a source file named as a partial of the
+    /// file at `dst`, beside it.
+    fn writes_partial_named_payload_for(&self, dst: &[u8]) -> bool {
+        let payload = self
+            .progress
+            .partial_named_payload
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if payload.is_empty() {
+            return false;
+        }
+        let (parent, name) = match dst.iter().rposition(|&byte| byte == b'/') {
+            Some(at) => (&dst[..=at], &dst[at + 1..]),
+            None => (&dst[..0], dst),
+        };
+        let mut prefix = parent.to_vec();
+        prefix.push(b'.');
+        prefix.extend_from_slice(name);
+        prefix.extend_from_slice(crate::fsops::PARTIAL_MARKER.as_bytes());
+        payload
+            .iter()
+            .any(|path| path.starts_with(&prefix) && !path[prefix.len()..].contains(&b'/'))
+    }
+
     pub(super) fn finish_file(&mut self, idx: usize) -> Result<()> {
         if self.sched.is_failed(idx) || self.sched.is_aborted() {
             return Ok(());
         }
-        let (job, earlier_partials) = {
+        let (job, mut earlier_partials) = {
             let jobs = self.sched.jobs.lock().unwrap();
             (jobs.snapshot(idx), jobs.has_earlier_partials(idx))
         };
+        // A source file this copy writes beside it, named as one of its
+        // partials, is not an earlier copy's: the receiver then removes none.
+        if earlier_partials && self.writes_partial_named_payload_for(&job.dst) {
+            earlier_partials = false;
+        }
         if job.done.load(Relaxed) != job.entry.size {
             bail!("refusing to publish an incomplete file");
         }
