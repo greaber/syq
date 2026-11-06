@@ -1609,6 +1609,23 @@ if variant != 'permissions':
 PY_MODE_CHECK
 done
 
+# A new --into directory, like a new parent, gets 0777 limited by the
+# destination's umask (022 here), not the runner's (077), on both receivers.
+for mode_receiver in ordinary restricted; do
+    mode_root=/tmp/syq-real-ssh/modes-new-root-$mode_receiver
+    # shellcheck disable=SC2029
+    ssh destination "rm -rf $mode_root && mkdir $mode_root"
+    if [ "$mode_receiver" = ordinary ]; then
+        (umask 077; syq cp --no-progress --srcs-in /tmp/syq-real-ssh-mode-tree \
+            --to destination --into "$mode_root/new")
+    else
+        syq cp --no-progress --from source --srcs-in /tmp/syq-real-ssh/mode-tree \
+            --to destination --into "$mode_root/new"
+    fi
+    # shellcheck disable=SC2029
+    test "$(ssh destination "stat -c %a $mode_root/new")" = 755
+done
+
 printf 'case: ordinary and restricted receivers update the same files in place\n'
 # Under --in-place=update both receivers write a file of their own with one
 # name where it is, and replace one with another name and one more widely

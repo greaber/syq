@@ -1584,7 +1584,7 @@ impl Planner<'_> {
                     _ => self
                         .root_source_mode
                         .filter(|_| is_destination_root)
-                        .unwrap_or_else(|| operator_directory_mode(self.opts)),
+                        .unwrap_or(NEW_DIRECTORY_MODE),
                 };
                 let (selection, created) = create_operator_directory(self.dst, condition, mode)
                     .map_err(|error| new_root_refused(error, condition, &self.dst_root))
@@ -1607,7 +1607,7 @@ impl Planner<'_> {
                 let mode = if self.private_root.is_some() {
                     0o700
                 } else {
-                    self.root_source_mode.unwrap_or(0o755)
+                    self.root_source_mode.unwrap_or(NEW_DIRECTORY_MODE)
                 };
                 let created = mkdir_root(self.dst, &root, condition, mode)
                     .map_err(|error| new_root_refused(error, condition, &root))?;
@@ -2648,7 +2648,7 @@ impl Planner<'_> {
                         // After its group change it is open, with owner
                         // access, as creating it would have left it: from its
                         // source for `syq rsync`, which narrows it at the
-                        // end, and with the default mode for native cp.
+                        // end, and as `mkdir` would for native cp.
                         early.root_default = if opts.rsync_creation {
                             Some((entry.mode & 0o777) | 0o700)
                         } else {

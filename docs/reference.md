@@ -373,7 +373,9 @@ writes with other policies.
 By default, new and updated files get the source's modification time. New
 files also get the source's read, write and execute permissions, limited by
 the umask or the directory's default ACL; existing files and directories keep
-theirs. Files whose contents already match keep all their metadata, so if
+theirs. A new `--into` or `--as` directory, and any missing directory above it,
+gets the mode `mkdir` would give it: `0777` limited by the umask on the
+destination. Files whose contents already match keep all their metadata, so if
 their times differ, they can be read again on every run; add
 `--copy-metadata=mtime` (alias `times`) to make the times match.
 

@@ -4249,17 +4249,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // created with. Otherwise `syq rsync` creates it as rsync creates any
     // new directory: with its source's mode and owner access, which it
     // loses at the end if its source has none, so an interrupted copy
-    // leaves it as it ends. Native cp creates it with the default mode.
+    // leaves it as it ends. Native cp creates it as `mkdir` does.
     let contents_source = srcs.iter().position(Location::copies_contents).filter(|_| {
         create_root && dst_is_dir && args.files_from.is_none() && args.native_mapping.is_none()
     });
     let mut private_root = (contents_source.is_some()
         && opts.flags & (flags::MODE | flags::GROUP) != 0)
-        .then_some(if use_operator_anchor && opts.rsync_creation {
-            0o777
-        } else {
-            0o755
-        });
+        .then_some(NEW_DIRECTORY_MODE);
     // Registering the source root read its mode, so this takes no lookup.
     let root_source_mode = contents_source
         .filter(|_| private_root.is_none() && opts.rsync_creation)
@@ -4310,10 +4306,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             let (selection, created) = create_operator_directory(
                 &mut *dst_ctl,
                 condition,
-                private_root.filter(|_| dst_is_dir).map_or_else(
-                    || root_source_mode.unwrap_or_else(|| operator_directory_mode(&opts)),
-                    |_| 0o700,
-                ),
+                private_root
+                    .filter(|_| dst_is_dir)
+                    .map_or_else(|| root_source_mode.unwrap_or(NEW_DIRECTORY_MODE), |_| 0o700),
             )
             .map_err(|error| new_root_refused(error, condition, &dst_root))
             .map_err(|error| with_failure_hint(&opts, error))?;
@@ -4361,7 +4356,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             if private_root.is_some() {
                 0o700
             } else {
-                root_source_mode.unwrap_or(0o755)
+                root_source_mode.unwrap_or(NEW_DIRECTORY_MODE)
             },
         )
         .map_err(|error| new_root_refused(error, root_create_condition, &dst_root))?;
@@ -5821,13 +5816,10 @@ fn register_source_roots(
 
 /// The mode a missing destination directory is created with when nothing
 /// applies its metadata later.
-fn operator_directory_mode(opts: &Opts) -> u32 {
-    if opts.rsync_creation {
-        0o777
-    } else {
-        0o755
-    }
-}
+/// The mode a new destination directory is created with when no source
+/// mode applies: as `mkdir` and rsync create one, limited by the umask of
+/// the process that creates it.
+const NEW_DIRECTORY_MODE: u32 = 0o777;
 
 /// Whether the directory a copy goes into (an `--into` target, or the parent
 /// of an `--as` target) is widened for its owner when it lacks owner access:
