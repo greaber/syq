@@ -30,6 +30,7 @@ large = os.urandom(6 * 1024 * 1024)
 (fixture / "kube-link").symlink_to(".kube")
 outside = Path(tempfile.mkdtemp(prefix="syq-send-outside-"))
 (outside / "secret").write_bytes(b"secret")
+(fixture / "escape").symlink_to(outside)
 before = sorted(str(path.relative_to(fixture)) for path in fixture.rglob("*"))
 server = run("ssh", "source", "mktemp -d /tmp/syq-send-destination.XXXXXX").strip()
 
@@ -127,6 +128,30 @@ for path in [str(outside / "secret"), "../" + outside.name + "/secret"]:
     _, text = copy([path], "outside", success=False, prompt=False)
     assert "inside its receiving root" in text, text
 run("ssh", "source", "test ! -e " + shlex.quote(server + "/outside/secret"))
+
+print("case: symlinks can't lead reads out of the receiving root", flush=True)
+for base in [["--root", "send-fixture/escape"], ["-C", "send-fixture/escape"], []]:
+    for follow in [[], ["--follow-src"]]:
+        named = ["secret"] if base else ["send-fixture/escape/secret"]
+        _, text = copy([*base, *follow, "--src-non-dir", *named], "escaped", success=False)
+        run("ssh", "source", "test ! -e " + shlex.quote(server + "/escaped/secret"))
+
+print("case: ~/ paths read the laptop's home and show where", flush=True)
+token = Path.home() / "syq-send-token"
+token.write_bytes(b"real\n")
+cwd = Path(tempfile.mkdtemp(prefix="syq-send-cwd-"))
+(cwd / "~").mkdir()
+(cwd / "~" / "syq-send-token").write_bytes(b"decoy\n")
+run("syq", "persist", "receive", "on", "--no-root", "--cwd", str(cwd), "--notify", "off")
+run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
+request, _ = copy(["~/syq-send-token"], "home")
+assert request["paths"][0].startswith(str(token) + " "), request
+assert run("ssh", "source", "cat " + shlex.quote(server + "/home/syq-send-token")) == "real\n"
+run("syq", "persist", "receive", "on", "--root", str(receive_root), "--auto-cwd", "--notify", "off")
+run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
+_, text = copy(["~/syq-send-token"], "home-rooted", success=False, prompt=False)
+assert "inside its receiving root" in text and str(receive_root) not in text, text
+token.unlink()
 
 # Nothing changed on the laptop.
 assert sorted(str(path.relative_to(fixture)) for path in fixture.rglob("*")) == before

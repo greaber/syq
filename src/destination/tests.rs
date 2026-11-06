@@ -390,7 +390,7 @@ fn broker_with_max_delete(
 }
 
 /// The same, permitting up to `max_entries` changes per copy.
-fn broker_with_limits(
+pub(super) fn broker_with_limits(
     root: &Path,
     approval: Approval,
     max_delete: u64,

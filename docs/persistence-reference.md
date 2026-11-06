@@ -214,7 +214,8 @@ approved commands or copies you approve between servers.
 
 Copies from your laptop (`syq cp --from @laptop`) start in the same directory.
 The hard root confines them too: their paths must be relative and can't
-contain `..`. The automatic approval root never applies to them; they always
+start with `~` or contain `..`, and symlinks in them can't lead outside the
+root, even through the command's own `-C` or `--root`. The automatic approval root never applies to them; they always
 ask.
 
 <a id="copy-limits"></a>
@@ -227,7 +228,8 @@ directories created, metadata changes, and deletions. Change the limits with
 `syq persist receive on --max-bytes 20G --max-entries 100000`; the sender can
 only lower them. They apply per copy, so repeated copies can still fill the
 disk. The byte and entry limits also bound what one copy from your laptop
-may read.
+may read. For those copies, entries are what the copy lists, including those
+its filters then leave out.
 
 A pruning copy is refused until you set a positive `--max-delete`. After that, a
 pruning copy that plans more deletions than your `--max-delete` or

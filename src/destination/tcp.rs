@@ -167,13 +167,7 @@ impl Receiver {
                 .as_ref()
                 .context("reverse TCP was not set up")?
                 .clone();
-            // A source counts its workers when they say hello.
-            let permit = match &session.authority {
-                SessionAuthority::Receive(authority) => Some(
-                    crate::server::ConnectionPermit::acquire(Arc::clone(authority))?,
-                ),
-                SessionAuthority::Send { .. } => None,
-            };
+            let permit = session.authority.permit(false)?;
             let tracked = session.channels.track(channel.try_clone()?)?;
             (session.authority.clone(), info, permit, tracked)
         };

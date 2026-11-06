@@ -166,11 +166,10 @@ pub(crate) fn connect_takes_server(name: &str, here: Option<&Here>) -> String {
     )
 }
 
-/// A copy from `@name`, which receiving machines do not serve.
 /// `command` given `@name`, which only copies and commands can use.
 pub(crate) fn unsupported(command: &str, name: &str) -> String {
     format!(
-        "receiving machine @{name} cannot be used with {command}; receiving machines accept copies sent with `syq cp PATH --to @{name}` and commands run with `syq exec --on @{name} -- COMMAND`"
+        "receiving machine @{name} cannot be used with {command}; receiving machines take copies with `syq cp PATH --to @{name}` and `syq cp --from @{name} PATH`, and commands with `syq exec --on @{name} -- COMMAND`"
     )
 }
 

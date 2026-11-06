@@ -1206,8 +1206,9 @@ impl Queue {
     }
 
     /// Files this machine would send to the requesting server: `paths` are
-    /// the exact paths, each with what it may be, and `confined` the
-    /// directory reads stay inside, when they must.
+    /// the exact paths, each with what it may be, `confined` the directory
+    /// reads stay inside, when they must, and `follows_symlinks` whether
+    /// symlinks in those paths lead to what is read.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn request_send(
         &self,
@@ -1216,6 +1217,7 @@ impl Queue {
         cwd: &str,
         paths: &[(Vec<u8>, &'static str)],
         confined: Option<&[u8]>,
+        follows_symlinks: bool,
         limits: &crate::delegation::CopyLimits,
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
@@ -1230,7 +1232,12 @@ impl Queue {
                 )
             })
             .unwrap_or_default();
-        let permission = format!("These files leave this machine: {} may list and read them and receives their contents. Filters narrow the copy, not this read permission.{inside} Nothing on this machine is changed.", from.server);
+        let follows = if follows_symlinks {
+            " Symlinks in these paths are followed, so the files read may be elsewhere."
+        } else {
+            ""
+        };
+        let permission = format!("These files leave this machine: {} may list and read them and receives their contents. Filters narrow the copy, not this read permission.{follows}{inside} Nothing on this machine is changed.", from.server);
         let shown = |path: String, scope: &str| format!("{path} ({scope})");
         self.wait(
             Summary {

@@ -1349,7 +1349,25 @@ enum SessionAuthority {
         descriptors: crate::descriptor_broker::DescriptorSessionSlot,
     },
 }
+/// What one open channel of a copy holds against its approved connections.
+#[allow(dead_code)]
+enum ChannelPermit {
+    Receive(crate::server::ConnectionPermit),
+    Send(crate::restricted::source::ChannelPermit),
+}
+
 impl SessionAuthority {
+    /// Count one channel against the approved connections before its hello.
+    /// A copy's own control does not count against a receiver's workers.
+    fn permit(&self, control: bool) -> Result<Option<ChannelPermit>> {
+        Ok(match self {
+            Self::Receive(_) if control => None,
+            Self::Receive(authority) => Some(ChannelPermit::Receive(
+                crate::server::ConnectionPermit::acquire(Arc::clone(authority))?,
+            )),
+            Self::Send { authority, .. } => Some(ChannelPermit::Send(authority.open_channel()?)),
+        })
+    }
     #[cfg(test)]
     fn receiving(&self) -> Arc<crate::restricted::RestrictedAuthority> {
         match self {
@@ -1640,13 +1658,9 @@ impl Receiver {
                     } else if !session.opened {
                         bail!("transfer control channel has not opened");
                     }
-                    // A source counts its workers when they say hello.
-                    let permit = match &session.authority {
-                        SessionAuthority::Receive(authority) if !control => Some(
-                            crate::server::ConnectionPermit::acquire(Arc::clone(authority))?,
-                        ),
-                        _ => None,
-                    };
+                    // Channels waiting to say hello count against the
+                    // approved connections, as later workers do.
+                    let permit = session.authority.permit(control)?;
                     let channel = session.channels.track(stream.try_clone()?)?;
                     if control {
                         session.opened = true;
