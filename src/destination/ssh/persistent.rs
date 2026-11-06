@@ -1545,11 +1545,17 @@ fn take_keeper_lock(record: &Path, control: &Path) -> Result<File> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&path)
         .with_context(|| format!("create SSH account keeper lock {}", path.display()))?;
-    anyhow::ensure!(
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-        "SSH account keeper lock {} is held",
-        path.display()
-    );
+    // No other keeper has this name, but someone counting keepers can hold
+    // it for a moment (`held`).
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "SSH account keeper lock {} is held",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     Ok(file)
 }
 
@@ -1980,7 +1986,22 @@ mod tests {
         // and the request is withdrawn after.
         // Its keeper's own lock, named for its master, belongs to it too,
         // and counts for no other provider.
+        // Taken while someone counting keepers holds it for a moment.
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(keeper_lock_path(&path, &record.control).unwrap())
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_SH) }, 0);
+        let releasing = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(probe);
+        });
         let keeper = take_keeper_lock(&path, &record.control).unwrap();
+        releasing.join().unwrap();
         assert!(!uses_provider(&domain, &provider));
         assert!(uses_provider(&domain, &other));
         assert!(request_close_if_idle(&domain, &provider).is_empty());
