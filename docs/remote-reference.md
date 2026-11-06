@@ -205,9 +205,10 @@ The copy supports `--no-tcp` and `--results`, and your server checks
 [results from the destination](#results-from-the-destination). It does not
 support `--mapping`, whose contents your laptop never sees, `--coordinate-at
 dst`, `--detach`, `--rsh`, `--syq-path`, `--no-bootstrap`, other `--peer-auth`
-values, or `--no-tcp-encryption`, and neither login may be root. A saved
-choice does not apply to a copy with one of these options: your server's own
-SSH access runs it. [Restricted-copy limits](#limits-and-unsupported-options)
+values, or `--no-tcp-encryption`, and neither login may be root. As for an
+upload, a saved choice does not apply to a copy with one of these options:
+your server's own SSH access runs it. An explicit `--auth-from @NAME` with one
+of them is refused. [Restricted-copy limits](#limits-and-unsupported-options)
 apply. With `--coordinate-at local`, file data goes through your server
 instead, which then needs
 [account access](persistence-reference.md#account-access) to both servers.

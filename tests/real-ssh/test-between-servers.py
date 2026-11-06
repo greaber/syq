@@ -386,6 +386,12 @@ def main():
         print("case: a different key for the source that only the laptop lists is refused with advice", flush=True)
         known_hosts = Path.home()/".ssh/known_hosts"
         saved_known_hosts = known_hosts.read_bytes()
+        # The requester's known_hosts too, and whether ssh-keygen's backup of
+        # it existed.
+        requester_known_hosts = json.loads(remote("requester", "python3 -c " + shlex.quote(
+            "from pathlib import Path; import base64, json; p=Path.home()/'.ssh/known_hosts'; "
+            "print(json.dumps({'content': base64.b64encode(p.read_bytes()).decode() "
+            "if p.exists() else None, 'old': p.with_name('known_hosts.old').exists()}))")))
         try:
             # The requester forgets the source, and the laptop lists another
             # key for it. The laptop does not log in to the enrolled source.
@@ -403,6 +409,13 @@ def main():
             assert "remove it there with `ssh-keygen -R source`" in text, text
         finally:
             known_hosts.write_bytes(saved_known_hosts)
+            remote("requester", "python3 -c " + shlex.quote(
+                "from pathlib import Path; import base64, json, sys; "
+                "v=json.load(sys.stdin); p=Path.home()/'.ssh/known_hosts'; "
+                "p.write_bytes(base64.b64decode(v['content'])) if v['content'] is not None "
+                "else p.unlink(missing_ok=True); "
+                "v['old'] or p.with_name('known_hosts.old').unlink(missing_ok=True)"),
+                stdin=json.dumps(requester_known_hosts))
         remote("destination", "test ! -e " + shlex.quote(c + "/wrong-key"))
 
         print("case: the copy continues when the laptop stops receiving", flush=True)

@@ -108,9 +108,13 @@ pub(crate) struct Remote<'a> {
 }
 
 /// `path`, a source the command names, as it is read: inside `base`, the
-/// command's -C or --root directory, unless it is absolute.
+/// command's -C or --root directory, unless it is absolute or in the home
+/// directory. The source expands an exact `~` or a leading `~/` to its own
+/// home before looking at `base`, so those stay as written, in the source's
+/// home; `./~/x` is an ordinary relative path.
 fn source_path(base: Option<&[u8]>, path: &[u8]) -> Vec<u8> {
-    let Some(base) = base.filter(|_| !path.starts_with(b"/")) else {
+    let in_home = path == b"~" || path.starts_with(b"~/");
+    let Some(base) = base.filter(|_| !path.starts_with(b"/") && !in_home) else {
         return path.to_vec();
     };
     let mut relative = path;
@@ -2537,6 +2541,36 @@ mod tests {
             assert!(desktop.contains(expected), "{expected}: {desktop}");
         }
         assert!(!desktop.contains("follows symlinks"), "{desktop}");
+        // `~` and `~/...` are in the source's home whatever -C says, and
+        // stay unexpanded; `./~/...` is a directory named `~` under -C.
+        let desktop = rooted(
+            "reader@source",
+            &[
+                "cp",
+                "--from",
+                "reader@source",
+                "-C",
+                "/srv/public",
+                "--src",
+                "~",
+                "--src",
+                "~/private",
+                "--src",
+                "./~/private",
+                "--to",
+                "backup",
+                "--into",
+                "out",
+            ],
+        );
+        for expected in [
+            "    reader@source:~\n",
+            "    reader@source:~/private\n",
+            "    reader@source:/srv/public/~/private\n",
+        ] {
+            assert!(desktop.contains(expected), "{expected}: {desktop}");
+        }
+        assert!(!desktop.contains("/srv/public/~\n"), "{desktop}");
         let desktop = rooted(
             "reader@source",
             &[
