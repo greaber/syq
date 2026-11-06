@@ -225,11 +225,12 @@ fn join(directory: &Path, path: &[u8]) -> Vec<u8> {
 /// `cwd`, and with a `root`, every read stays inside it. There paths must be
 /// relative and cannot contain `..`, as for copies sent to this machine.
 ///
-/// Under a root, the base is always the root itself, confined, and the
-/// command's own `-C` or `--root` becomes a prefix of each selection. Reads
-/// then resolve every component beneath the root's descriptor, so neither a
-/// symlink nor a directory replaced during the copy leads outside it. The
-/// command's `--root` therefore confines no more tightly than this machine's.
+/// Under a root, the command's own `--root` stays the confined base, and
+/// reading resolves it beneath this machine's root (`SourcePolicy::outer_root`),
+/// so both confine. Otherwise the base is this machine's root, confined, and
+/// the command's `-C` becomes a prefix of each selection. Either way every
+/// component resolves beneath the root's descriptor, so neither a symlink
+/// nor a directory replaced during the copy leads outside it.
 fn resolve(cwd: &Path, root: Option<&Path>, request: &mut pull::PullRequest) -> Result<()> {
     let Some(root) = root else {
         request.base.path = Some(match request.base.path.take().map(expand_home) {
@@ -249,6 +250,13 @@ fn resolve(cwd: &Path, root: Option<&Path>, request: &mut pull::PullRequest) -> 
     if let Some(path) = &request.base.path {
         anyhow::ensure!(stays_inside(path), outside());
     }
+    for selection in &request.selections {
+        anyhow::ensure!(stays_inside(&selection.path), outside());
+    }
+    if request.base.confined {
+        request.base.path = Some(join(cwd, request.base.path.as_deref().unwrap_or_default()));
+        return Ok(());
+    }
     let start = join(cwd, request.base.path.as_deref().unwrap_or_default());
     let prefix = Path::new(std::ffi::OsStr::from_bytes(&start))
         .strip_prefix(root)
@@ -257,7 +265,6 @@ fn resolve(cwd: &Path, root: Option<&Path>, request: &mut pull::PullRequest) -> 
         .as_bytes()
         .to_vec();
     for selection in &mut request.selections {
-        anyhow::ensure!(stays_inside(&selection.path), outside());
         if !prefix.is_empty() {
             selection.path = [&prefix[..], b"/", &selection.path].concat();
         }
@@ -352,7 +359,12 @@ impl Receiver {
             cancelled,
         )?;
         // Start the authority's clock at approval, after a long prompt.
-        let authority = SourceAuthority::new(request.policy())?;
+        let mut policy = request.policy();
+        policy.outer_root = self
+            .root
+            .as_ref()
+            .map(|root| root.as_os_str().as_bytes().to_vec());
+        let authority = SourceAuthority::new(policy)?;
         let mut sessions = self.sessions.lock().unwrap();
         if cancelled() {
             bail!("copy disconnected before approval could be used");
@@ -761,6 +773,48 @@ mod tests {
         }
     }
 
+    /// The command's own `--root` still confines as it does for any copy:
+    /// with `--follow-src`, a symlink in it to a sibling inside the
+    /// receiving root is refused, while `-C` only says where paths start.
+    #[test]
+    fn the_commands_own_root_still_confines_inside_the_receiving_root() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let root = temp.path().join("laptop");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::create_dir_all(root.join("private")).unwrap();
+        fs::write(root.join("private/token"), b"private!").unwrap();
+        std::os::unix::fs::symlink("../private", root.join("sub/escape")).unwrap();
+        let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
+        for options in [
+            &[
+                "--root",
+                "sub",
+                "--follow-src",
+                "--src-non-dir",
+                "escape/token",
+            ][..],
+            &["--root", "sub", "--follow-src", "escape"],
+            &["--root", "sub", "--src-non-dir", "escape/token"],
+        ] {
+            assert!(
+                register(&receiver, &registration, options).is_err(),
+                "{options:?} left the command's --root"
+            );
+            receiver.sessions.lock().unwrap().clear();
+        }
+        let (control, roots) = register(
+            &receiver,
+            &registration,
+            &["-C", "sub", "--follow-src", "--src-non-dir", "escape/token"],
+        )
+        .unwrap();
+        let mut worker = worker(&registration, &control, &roots, &receiver);
+        assert!(matches!(
+            worker.call(read(&roots[0].selection)).unwrap(),
+            crate::proto::Response::Block { data, .. } if data == b"private!"
+        ));
+    }
+
     /// The receiving profile's byte and entry limits lower what the server
     /// asks for, the prompt shows the lowered limits, and reads obey them.
     #[test]
@@ -852,11 +906,15 @@ mod tests {
         );
         let request = resolved(&["-C", "sub", "notes"]).unwrap();
         assert_eq!(request.selections[0].path, b"work/sub/notes");
-        // The command's own --root resolves beneath this machine's, as -C.
+        // The command's own --root stays its base; reading resolves it
+        // beneath this machine's root.
         let request = resolved(&["--root", "sub", "notes"]).unwrap();
-        assert_eq!(request.base.path.as_deref(), Some(&b"/home/me/shared"[..]));
+        assert_eq!(
+            request.base.path.as_deref(),
+            Some(&b"/home/me/shared/work/sub"[..])
+        );
         assert!(request.base.confined);
-        assert_eq!(request.selections[0].path, b"work/sub/notes");
+        assert_eq!(request.selections[0].path, b"notes");
         for outside in [
             &["/etc/passwd"][..],
             &["../secret"],

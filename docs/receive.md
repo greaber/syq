@@ -3,8 +3,8 @@
 # Use your laptop from a server
 
 Receiving lets you work in a server's shell and still use your laptop: copy
-files to and from it, run commands on it, and let the server use your laptop's SSH or
-storage credentials with your approval. It runs over a
+files to and from it, run commands on it, and let the server use your laptop's
+SSH or storage credentials with your approval. It runs over a
 [persistent connection](persistence.md) that your laptop opens, so your laptop
 needs no SSH server, public address, or incoming network port.
 
@@ -116,12 +116,13 @@ syq cp --from @laptop notes/todo.md --as todo.md
 ```
 
 Paths start in the same directory as downloads, and `~/` means your laptop's
-home directory; quote it (`'~/notes'`) so the server's shell leaves it alone. With `--root`, they must stay inside it: absolute paths, `~`
-and `..` are refused, and symlinks can't lead outside it. The prompt on your
-laptop shows the exact files the server asked for and that they will leave
-your laptop. Approving lets the server read just those files or directories
-for this one copy; nothing on your laptop is changed. Sending always asks,
-even with `--auto-approve-root`, which applies only to downloads.
+home directory; quote it (`'~/notes'`) so the server's shell leaves it alone.
+With `--root`, they must stay inside it: absolute paths, `~` and `..` are
+refused, and symlinks can't lead outside it. The prompt on your laptop shows
+the exact files the server asked for and that they will leave your laptop.
+Approving lets the server read just those files or directories for this one
+copy; nothing on your laptop is changed. Sending always asks, even with
+`--auto-approve-root`, which applies only to downloads.
 
 ## Run commands on your laptop
 

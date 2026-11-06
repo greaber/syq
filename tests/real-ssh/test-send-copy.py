@@ -31,6 +31,8 @@ large = os.urandom(6 * 1024 * 1024)
 outside = Path(tempfile.mkdtemp(prefix="syq-send-outside-"))
 (outside / "secret").write_bytes(b"secret")
 (fixture / "escape").symlink_to(outside)
+(fixture / "sub").mkdir()
+(fixture / "sub" / "sibling").symlink_to("../.kube")
 before = sorted(str(path.relative_to(fixture)) for path in fixture.rglob("*"))
 server = run("ssh", "source", "mktemp -d /tmp/syq-send-destination.XXXXXX").strip()
 
@@ -134,7 +136,17 @@ for base in [["--root", "send-fixture/escape"], ["-C", "send-fixture/escape"], [
     for follow in [[], ["--follow-src"]]:
         named = ["secret"] if base else ["send-fixture/escape/secret"]
         _, text = copy([*base, *follow, "--src-non-dir", *named], "escaped", success=False)
+        assert any(reason in text for reason in [
+            "refusing symlink component", "outside its root",
+            "outside its confined root"]), (base, follow, text)
         run("ssh", "source", "test ! -e " + shlex.quote(server + "/escaped/secret"))
+
+print("case: the command's own --root still confines inside the receiving root", flush=True)
+_, text = copy(["--root", "send-fixture/sub", "--follow-src", "--src-non-dir", "sibling/config"],
+               "sibling", success=False)
+assert "outside its confined root" in text, text
+copy(["-C", "send-fixture/sub", "--follow-src", "--src-non-dir", "sibling/config"], "sibling")
+assert run("ssh", "source", "cat " + shlex.quote(server + "/sibling/config")) == "clusters: []\n"
 
 print("case: ~/ paths read the laptop's home and show where", flush=True)
 token = Path.home() / "syq-send-token"

@@ -170,6 +170,7 @@ impl PullRequest {
             send_rate: self.send_rate,
             limits: self.limits.clone(),
             deadline: Instant::now() + LIFETIME,
+            outer_root: None,
         }
     }
     /// Do not stat the source before approval. The native registration resolves

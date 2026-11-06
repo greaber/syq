@@ -213,10 +213,10 @@ asks, or is refused when it is also the hard root. Neither root restricts
 approved commands or copies you approve between servers.
 
 Copies from your laptop (`syq cp --from @laptop`) start in the same directory.
-The hard root confines them too: their paths must be relative and can't
-start with `~` or contain `..`, and symlinks in them can't lead outside the
-root, even through the command's own `-C` or `--root`. The automatic approval root never applies to them; they always
-ask.
+The hard root confines them too: their paths must be relative and can't start
+with `~` or contain `..`, and symlinks in them can't lead outside the root,
+even through the command's own `-C` or `--root`. The automatic approval root
+never applies to them; they always ask.
 
 <a id="copy-limits"></a>
 

@@ -40,6 +40,8 @@ pub(crate) struct SourcePolicy {
     pub send_rate: Option<u64>,
     pub limits: CopyLimits,
     pub deadline: Instant,
+    /// A directory the base must resolve beneath (`FsOps::set_source_outer_root`).
+    pub outer_root: Option<Vec<u8>>,
 }
 
 pub(crate) struct SourceTcpPolicy {
@@ -332,6 +334,7 @@ impl SourceConnection {
             .check_open(&self.authority.state.lock().unwrap())?;
         let policy = &self.authority.policy;
         ops.set_hash_policy(policy.hashing);
+        ops.set_source_outer_root(policy.outer_root.clone());
         let response = ops.handle_in_place(&mut Request::ConfigurePreservation {
             selection: policy.preservation,
             sparse: policy.sparse,
