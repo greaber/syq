@@ -84,8 +84,8 @@ pub(crate) fn shareable_ssh_options(rsh: &[String]) -> Option<SshSharing<'_>> {
         for (at, letter) in letters.bytes().enumerate() {
             match letter {
                 b'M' => return None,
-                // Debug output, or agent or port forwarding.
-                b'v' | b'A' | b'L' | b'R' | b'D' => persist = false,
+                // Debug output, or agent, port or tunnel forwarding.
+                b'v' | b'A' | b'L' | b'R' | b'D' | b'w' => persist = false,
                 _ => {}
             }
             if VALUED.contains(&letter) {
@@ -106,10 +106,20 @@ pub(crate) fn shareable_ssh_options(rsh: &[String]) -> Option<SshSharing<'_>> {
                     {
                         return None;
                     }
-                    let setting = setting.to_ascii_lowercase();
+                    // OpenSSH removes quotes from a value. It reads a quoted
+                    // keyword too, as in `"ForwardAgent" yes`; rather than
+                    // repeat its rules, such an option counts as one that
+                    // may forward.
+                    let quoted = name.contains('"');
+                    let setting = setting.replace(['"', '\''], "").to_ascii_lowercase();
                     let named = |option: &str| name.eq_ignore_ascii_case(option);
-                    if (named("LogLevel") && (setting.starts_with("debug") || setting == "verbose"))
-                        || (named("ForwardAgent") && setting != "no")
+                    if quoted
+                        || (named("LogLevel")
+                            && (setting.starts_with("debug") || setting == "verbose"))
+                        || (["ForwardAgent", "Tunnel"]
+                            .iter()
+                            .any(|option| named(option))
+                            && setting != "no")
                         || (named("ClearAllForwardings") && setting != "yes")
                         || ["LocalForward", "RemoteForward", "DynamicForward"]
                             .iter()

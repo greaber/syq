@@ -2790,7 +2790,8 @@ fn ssh_remote_shells_share_connections_unless_they_configure_sharing() {
             .persist
     );
     // A connection kept after the run forwards nothing, so a command that
-    // asks for agent or port forwarding gets it only within its own run.
+    // asks for agent, port or tunnel forwarding gets it only within its own
+    // run.
     for forwarding in [
         "ssh -A",
         "ssh -4AC",
@@ -2804,6 +2805,17 @@ fn ssh_remote_shells_share_connections_unless_they_configure_sharing() {
         "ssh -o 'RemoteForward 8080 localhost:80'",
         "ssh -o DynamicForward=1080",
         "ssh -o ClearAllForwardings=no",
+        "ssh -w 0:0",
+        "ssh -4w0",
+        "ssh -o Tunnel=yes",
+        "ssh -o 'Tunnel point-to-point'",
+        // OpenSSH reads quoted keywords, which count as forwarding here.
+        "ssh -o '\"ForwardAgent\" yes'",
+        "ssh -o '\"ClearAllForwardings\" no'",
+        "ssh -o 'Forward\"Agent\" yes'",
+        "ssh -o '\"ForwardAgent\"=yes'",
+        // It reads a value without its quotes: `n o` is an agent's path.
+        "ssh -o 'ForwardAgent \"n o\"'",
     ] {
         assert!(
             !shareable_ssh_options(&words(forwarding)).unwrap().persist,
@@ -2815,7 +2827,12 @@ fn ssh_remote_shells_share_connections_unless_they_configure_sharing() {
         "ssh -o ForwardAgent=no",
         "ssh -o 'ForwardAgent No'",
         "ssh -o ClearAllForwardings=yes",
+        // A quoted value means what it says.
+        "ssh -o 'ClearAllForwardings \"yes\"'",
+        "ssh -o \"ForwardAgent='no'\"",
+        "ssh -o Tunnel=no",
         "ssh -p 2222 -i Akey",
+        "ssh -o 'ProxyCommand ssh -W \"%h:%p\" gateway'",
     ] {
         assert!(
             shareable_ssh_options(&words(forwarding_nothing))
