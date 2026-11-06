@@ -1794,9 +1794,18 @@ mod tests {
         serde_json::to_writer(&mut file, &record).unwrap();
         assert!(!uses_provider(&domain, &provider));
         assert!(uses_provider(&domain, &other));
+        // Asked to end if idle: only the connections of that provider,
+        // and the request is withdrawn after.
+        assert!(request_close_if_idle(&domain, &provider).is_empty());
+        let requests = request_close_if_idle(&domain, &other);
+        assert_eq!(requests, [path.with_extension("close")]);
+        assert!(requests[0].exists());
+        withdraw_close_requests(&requests);
+        assert!(!requests[0].exists());
         // Ended: the lock is free.
         drop(lock);
         assert!(!uses_provider(&domain, &other));
+        assert!(request_close_if_idle(&domain, &other).is_empty());
     }
 
     #[test]
