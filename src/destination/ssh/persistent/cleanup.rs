@@ -79,23 +79,17 @@ pub(super) fn retire_record(path: &Path, control: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn keepers_running(domain: &Domain) -> Result<usize> {
+fn keepers_running(domain: &Domain) -> Result<usize> {
     let Some(index) = existing_directory(domain)? else {
         return Ok(0);
     };
     let mut running = 0;
     for entry in fs::read_dir(index)? {
         let path = entry?.path();
-        // A draining keeper's own entry counts like a keeper's lock
-        // (`DrainingLock`); it goes as that keeper ends.
-        let draining = index_name(&path, super::DRAINING);
-        if !index_name(&path, "lock") && !draining {
+        if !index_name(&path, "lock") {
             continue;
         }
-        let lock = match private_file(&path, 0, false) {
-            Err(error) if draining && not_found(&error) => continue,
-            lock => lock?,
-        };
+        let lock = private_file(&path, 0, false)?;
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() != std::io::ErrorKind::WouldBlock {
@@ -323,10 +317,7 @@ pub(crate) fn cleanup_domain(domain: &Domain) -> Result<()> {
                 record.control.parent().and_then(Path::parent) == Some(scope.as_path()),
                 "SSH account record belongs to another persistence scope"
             );
-        } else if index_name(&path, "lock")
-            || index_name(&path, "close")
-            || index_name(&path, super::DRAINING)
-        {
+        } else if index_name(&path, "lock") || index_name(&path, "close") {
             private_file(&path, 0, false)?;
         } else if path.file_name().is_some_and(|name| name == GENERATION) {
             read_generation(&path)?;

@@ -254,7 +254,8 @@ it holds. The next syq command that uses it opens it again, which asks for
 approval again unless you remembered it; export a `persist ssh-config` file
 again after that. While a copy, shell, or other session runs through it, the
 switch waits for it to finish. A connection that can't tell whether it's in
-use, such as one opened on macOS, keeps the old version until it closes.
+use, such as one opened on macOS or in an isolated domain, keeps the old
+version until it closes.
 `syq persist status` says which connections the switch waits for and shows the
 command that switches at once and closes them. Session permissions (**Allow**)
 end at the switch, as at any reconnect.

@@ -65,7 +65,6 @@ other_build = run("syq-other-build", "--build-identity").strip()
 this_build = run("syq", "--build-identity").strip()
 root = Path("/tmp/syq-account-switch-receive")
 shell = None
-remote_scope = None
 try:
     BIN.mkdir(mode=0o755, exist_ok=True)
     root.mkdir(exist_ok=True)
@@ -120,42 +119,51 @@ try:
     wait_for("the idle account connection to end", lambda: not accounts_on_source(), 20)
 
     # A session that starts between the look and the stop runs on while
-    # its master drains, and `persist off` still ends that master before it
-    # reports success. The keeper is told no session uses the master, as if
-    # this one started just after it looked.
-    remote_scope = source("syq", "persist", "on", "--ephemeral").strip()
-    args = ["env", NATIVE_PATH, "SYQ_TEST_ACCOUNT_SESSIONS=0", "syq", "persist", "connect",
-            "destination", "--auth-from", "@" + NAME, "--pscope", remote_scope]
-    connecting = subprocess.Popen(["ssh", "source", shlex.join(args)], stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, start_new_session=True)
-    (request,) = json.loads(run("syq", "persist", "receive", "pending", "--json", "--pscope", scope,
-                                "--wait", "--timeout", "15"))
-    run("syq", "persist", "receive", "approve", "--pscope", scope, request["id"])
-    stdout, stderr = connecting.communicate(timeout=30)
-    assert connecting.returncode == 0, (stdout, stderr)
-    command = ["env", NATIVE_PATH, "syq", "ssh", "--pscope", remote_scope, "--auth-from", "@" + NAME,
-               "destination", "--", "sleep 120"]
+    # its master drains; another command meanwhile opens a connection of its
+    # own beside it, and `persist off` still ends the draining master before
+    # it reports success. The keeper is told no session uses the master, as
+    # if this one started just after it looked.
+    def connect(*extra_env, command=("persist", "connect", "destination")):
+        args = ["env", NATIVE_PATH, *extra_env, "syq", *command]
+        if command[0] == "persist":
+            args += ["--auth-from", "@" + NAME]
+        process = subprocess.Popen(["ssh", "source", shlex.join(args)], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, start_new_session=True)
+        deadline = time.monotonic() + 30
+        while process.poll() is None and time.monotonic() < deadline:
+            # A new connection may need approval again.
+            for request in json.loads(run("syq", "persist", "receive", "pending", "--json",
+                                          "--pscope", scope)):
+                run("syq", "persist", "receive", "approve", "--pscope", scope, request["id"])
+            time.sleep(.2)
+        stdout, stderr = process.communicate(timeout=5)
+        assert process.returncode == 0, (stdout, stderr)
+
+    connect("SYQ_TEST_ACCOUNT_SESSIONS=0")
+    (row,) = accounts_on_source()
+    control = row["control"]
+    index = os.path.join(os.path.dirname(os.path.dirname(control)), "authorized-ssh-v1")
+    command = ["env", NATIVE_PATH, "syq", "ssh", "--auth-from", "@" + NAME, "destination", "--",
+               "sleep 120"]
     shell = subprocess.Popen(["ssh", "source", shlex.join(command)], stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, start_new_session=True)
     time.sleep(2)
-    # The master daemon, as OpenSSH reports it at its control socket.
-    check = subprocess.run(["ssh", "source", shlex.join([
-        "sh", "-c", 'for control in "$1"/approved-*/cm-*; do [ -S "$control" ] && '
-        'ssh -S "$control" -O check host; done', "sh", remote_scope])],
-        capture_output=True, text=True, timeout=40)
+    # The master, as OpenSSH reports it at its control socket.
+    check = subprocess.run(["ssh", "source", shlex.join(["ssh", "-S", control, "-O", "check", "host"])],
+                           capture_output=True, text=True, timeout=40)
     master = check.stderr.split("(pid=")[1].split(")")[0]
     # Ask the keeper, as a newer syq would, to end its connection if idle.
-    index = remote_scope + "/authorized-ssh-v1"
     source("sh", "-c", 'umask 077; for record in "$1"/*.json; do : > "${record%.json}.close"; done',
            "sh", index)
-    wait_for("the keeper to give up its record",
-             lambda: source("sh", "-c", 'ls "$1"', "sh", index).count(".json") == 0, 20)
+    wait_for("the keeper to give up its record", lambda: not accounts_on_source(), 20)
     time.sleep(1)
-    # The session and its master run on.
+    # The session and its master run on, and a new connection opens beside it.
     assert shell.poll() is None, shell.communicate()
     source("test", "-d", "/proc/" + master)
-    source("syq", "persist", "off", "--pscope", remote_scope)
-    remote_scope = None
+    connect()
+    assert len(accounts_on_source()) == 1
+    source("test", "-d", "/proc/" + master)
+    source("syq", "persist", "off")
     source("test", "!", "-d", "/proc/" + master)
     shell.communicate(timeout=30)
     shell = None
@@ -163,9 +171,6 @@ finally:
     if shell is not None and shell.poll() is None:
         os.killpg(shell.pid, signal.SIGTERM)
         shell.wait(timeout=5)
-    if remote_scope is not None:
-        subprocess.run(["ssh", "source", shlex.join(
-            ["env", NATIVE_PATH, "syq", "persist", "off", "--pscope", remote_scope])], timeout=60)
     subprocess.run(["ssh", "source", shlex.join(["env", NATIVE_PATH, "syq", "persist", "off"])],
                    timeout=60)
     subprocess.run(["syq", "persist", "off", "--pscope", scope], timeout=60)
