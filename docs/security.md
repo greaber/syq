@@ -150,12 +150,12 @@ the download cannot be verified.
 
 A release you select with `--use-version` is verified once, when syq stores it
 in `~/.local/lib/syq`. Later runs on your machine start it without hashing it
-again, but refuse it if its files or directories there are not yours or their
-permission bits let others write them. Anyone who can write the directories
-above the store can replace it, just as anyone who can write `~/.local/bin` can
-replace syq, so keep them writable only by you. On SSH servers, syq starts the
-stored helper without these checks, so keep `~/.local/lib/syq` there writable
-only by you too.
+again, but refuse it if its files or directories there are not yours, or if
+their permission bits or a macOS access control list let others change them.
+Anyone who can write the directories above the store can replace it, just as
+anyone who can write `~/.local/bin` can replace syq, so keep them writable only
+by you. On SSH servers, syq starts the stored helper without these checks, so
+keep `~/.local/lib/syq` there writable only by you too.
 
 Your first installation establishes this trust. The standalone installer
 checks the archive against a size and SHA-256 hash embedded in the script, but

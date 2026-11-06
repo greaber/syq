@@ -12,6 +12,44 @@ mod macos_xattrs;
 
 pub(crate) const MAX_INODE_METADATA: usize = 4 * 1024 * 1024;
 
+/// Whether `acl_lets_others_change` counts access given to a group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AclGroups {
+    /// Any account but this one counts.
+    Untrusted,
+    /// A group counts no more than group write in the mode does; only other
+    /// accounts and the group of every account count.
+    Trusted,
+}
+
+/// How an ACL lets other accounts change a file or directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) enum AclAccess {
+    /// Through an entry set on it.
+    Own,
+    /// Only through entries it inherited from a directory above it, which
+    /// a new file in its place would inherit too.
+    Inherited,
+}
+
+/// Whether, and how, an ACL lets an account other than this one change the
+/// file or directory at `path`, not following a final link, which its mode
+/// bits do not show on macOS. Linux ACLs show in the mode's group bits, so
+/// there this is always `None`.
+pub(crate) fn acl_lets_others_change(
+    path: &std::path::Path,
+    groups: AclGroups,
+) -> Result<Option<AclAccess>> {
+    #[cfg(target_os = "macos")]
+    return macos_acl::others_may_change(path, groups == AclGroups::Trusted);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (path, groups);
+        Ok(None)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Selection {
     pub acls: bool,

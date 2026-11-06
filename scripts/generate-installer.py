@@ -72,20 +72,31 @@ trap cleanup EXIT HUP INT TERM
 download="$work/$archive"
 program="$work/syq"
 
+if command -v curl >/dev/null 2>&1; then
+  downloader=curl
+elif command -v wget >/dev/null 2>&1; then
+  downloader=wget
+else
+  echo 'install.sh: downloading syq requires curl or wget' >&2
+  exit 1
+fi
 fetch() {
-  if command -v curl >/dev/null 2>&1; then
+  if [ "$downloader" = curl ]; then
     curl --fail --silent --show-error --location --retry 2 --connect-timeout 10 \
-      --proto '=https' --proto-redir '=https' --output "$2" "$1"
-  elif command -v wget >/dev/null 2>&1; then
-    wget --quiet --https-only --timeout=10 --tries=3 -O "$2" "$1"
+      --proto '=https' --proto-redir '=https' --output - "$1"
   else
-    echo 'install.sh: downloading syq requires curl or wget' >&2
-    return 1
+    wget --quiet --https-only --timeout=10 --tries=3 -O - "$1"
   fi
 }
 
-fetch "$base_url/$archive" "$download"
+# Keep at most one byte more than the archive, so that a larger download stops
+# early instead of filling the disk.
+fetch "$base_url/$archive" | head -c "$((expected_size + 1))" > "$download"
 actual_size=$(wc -c < "$download" | tr -d '[:space:]')
+[ "$actual_size" -le "$expected_size" ] || {
+  echo "install.sh: downloaded archive is larger than the expected $expected_size bytes" >&2
+  exit 1
+}
 [ "$actual_size" = "$expected_size" ] || {
   echo "install.sh: downloaded archive has size $actual_size, expected $expected_size" >&2
   exit 1

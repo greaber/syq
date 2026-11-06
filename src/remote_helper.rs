@@ -205,42 +205,51 @@ manifest="$tmp.json"
 {create_directory}
 cleanup() {{ rm -f "$tmp" "$archive" "$manifest"; }}
 trap cleanup EXIT HUP INT TERM
+if command -v curl >/dev/null 2>&1; then
+    downloader=curl
+elif command -v wget >/dev/null 2>&1; then
+    downloader=wget
+else
+    echo "syq: remote helper download needs curl or wget" >&2
+    exit {remote_download_fallback_exit}
+fi
+if [ "$(printf ab | head -c 1 2>/dev/null)" != a ]; then
+    echo "syq: remote helper download needs head -c" >&2
+    exit {remote_download_fallback_exit}
+fi
+fetch() {{
+    if [ "$downloader" = curl ]; then
+        curl --fail --silent --show-error --location --connect-timeout 5 --max-time 30 --speed-limit 1024 --speed-time 10 --proto '=https' --proto-redir '=https' --output - "$1"
+    else
+        wget -q --timeout=10 --tries=1 -O - "$1"
+    fi
+}}
 download() {{
     source=$1
     destination=$2
+    limit=$3
     if ! : > "$destination"; then
         echo "syq: cannot write the remote helper directory" >&2
         exit {install_failed_exit}
     fi
-    if command -v curl >/dev/null 2>&1; then
-        curl --fail --silent --show-error --location --connect-timeout 5 --max-time 30 --speed-limit 1024 --speed-time 10 --proto '=https' --proto-redir '=https' --output "$destination" "$source"
-        status=$?
-        if [ "$status" -ne 0 ]; then
-            if [ "$status" -eq 23 ]; then
-                echo "syq: remote helper download could not write its temporary file" >&2
-                exit {install_failed_exit}
-            fi
-            echo "syq: remote helper download with curl failed" >&2
-            exit {remote_download_fallback_exit}
-        fi
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q --timeout=10 --tries=1 -O "$destination" "$source"
-        status=$?
-        if [ "$status" -ne 0 ]; then
-            if [ "$status" -eq 3 ]; then
-                echo "syq: remote helper download could not write its temporary file" >&2
-                exit {install_failed_exit}
-            fi
-            echo "syq: remote helper download with wget failed" >&2
-            exit {remote_download_fallback_exit}
-        fi
-    else
-        echo "syq: remote helper download needs curl or wget" >&2
+    # Keep at most one byte more than the limit, so that a larger download
+    # stops early instead of filling the disk. The downloader's status comes
+    # back on descriptor 3; the pipeline's is the writer's.
+    if ! status=$({{ {{ fetch "$source"; echo "$?" >&3; }} | head -c "$((limit + 1))" > "$destination"; }} 3>&1); then
+        echo "syq: remote helper download could not write its temporary file" >&2
+        exit {install_failed_exit}
+    fi
+    if [ "$(($(wc -c < "$destination")))" -gt "$limit" ]; then
+        echo "syq: remote helper download is larger than expected" >&2
+        exit {remote_download_fallback_exit}
+    fi
+    if [ "$status" != 0 ]; then
+        echo "syq: remote helper download with $downloader failed" >&2
         exit {remote_download_fallback_exit}
     fi
 }}
-download {manifest_url} "$manifest"
-download {archive_url} "$archive"
+download {manifest_url} "$manifest" {max_manifest}
+download {archive_url} "$archive" {max_archive}
 if command -v sha256sum >/dev/null 2>&1; then
     if output=$(sha256sum "$archive" 2>/dev/null); then
         actual=${{output%%[[:space:]]*}}
@@ -332,8 +341,15 @@ trap - EXIT HUP INT TERM
         remote_download_integrity_exit = REMOTE_DOWNLOAD_INTEGRITY_EXIT,
         install_failed_exit = INSTALL_FAILED_EXIT,
         install_command = install_command(),
+        max_manifest = MAX_DOWNLOADED_MANIFEST,
+        max_archive = MAX_DOWNLOADED_ARCHIVE,
     )
 }
+
+/// The most a server keeps of each download before the client has checked
+/// it: a signed manifest is a few kilobytes, and an archive under 20 MiB.
+const MAX_DOWNLOADED_MANIFEST: u64 = 1024 * 1024;
+const MAX_DOWNLOADED_ARCHIVE: u64 = 128 * 1024 * 1024;
 
 /// Install a verified release asset or the client executable over authenticated SSH.
 /// This path deliberately needs no remote downloader, hasher, or decompressor.
@@ -523,6 +539,111 @@ mod tests {
         assert!(!script.contains(".sha256"));
         assert!(script.contains(helper_identity()));
         assert!(script.contains("--build-identity"));
+    }
+
+    /// Run the download script on this host with a fake `curl` that serves
+    /// `files` by name, or data without end for a name that is absent, and
+    /// with `decision` as the client's answer.
+    fn run_download(files: &[(&str, &[u8])], decision: &str) -> std::process::Output {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let root = crate::test_support::tempdir().unwrap();
+        let served = root.path().join("served");
+        std::fs::create_dir(&served).unwrap();
+        for (name, contents) in files {
+            std::fs::write(served.join(name), contents).unwrap();
+        }
+        let bin = root.path().join("bin");
+        crate::test_support::write_executable(
+            &bin.join("curl"),
+            format!(
+                "#!/bin/sh\nfor url; do :; done\nfile='{}'/\"${{url##*/}}\"\n\
+                 if [ -f \"$file\" ]; then exec cat \"$file\"; else exec yes; fi\n",
+                served.display()
+            ),
+            0o700,
+        );
+        let target = Target::from_uname("Linux", "x86_64").unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &download_script(target)])
+            .env("HOME", root.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_guarded()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(decision.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let directory = root
+            .path()
+            .join(".local/lib/syq")
+            .join(helper_identity())
+            .join(target.key);
+        assert_eq!(
+            std::fs::read_dir(directory).unwrap().count(),
+            0,
+            "the download left files behind"
+        );
+        output
+    }
+
+    #[test]
+    fn a_remote_download_without_end_stops_at_its_limit() {
+        // Neither file is served: the manifest download never ends.
+        let output = run_download(&[], "");
+        assert_eq!(
+            output.status.code(),
+            Some(REMOTE_DOWNLOAD_FALLBACK_EXIT),
+            "{output:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("larger than expected"),
+            "{output:?}"
+        );
+        // The manifest arrives, and the archive never ends.
+        let output = run_download(&[("syq-release-manifest.json", b"{}")], "");
+        assert_eq!(
+            output.status.code(),
+            Some(REMOTE_DOWNLOAD_FALLBACK_EXIT),
+            "{output:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("larger than expected"),
+            "{output:?}"
+        );
+    }
+
+    #[test]
+    fn a_complete_remote_download_is_reported_for_verification() {
+        let archive = b"archive bytes";
+        let output = run_download(
+            &[
+                ("syq-release-manifest.json", b"{\"signed\": true}"),
+                ("syq-linux-x86_64.gz", archive),
+            ],
+            "discard\n",
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(REMOTE_DOWNLOAD_INTEGRITY_EXIT),
+            "{output:?}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("syq-helper-manifest-data:{\"signed\": true}"));
+        let digest: String = <sha2::Sha256 as sha2::Digest>::digest(archive)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert!(
+            stdout.contains(&format!("syq-helper-sha256:{digest}")),
+            "{stdout}"
+        );
     }
 
     #[test]

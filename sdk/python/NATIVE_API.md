@@ -862,7 +862,12 @@ By default the SDK runs the syq installed with its wheel, without searching
 `Client(cache_dir=DIR)` instead downloads the matching syq on first use into
 `DIR/syq/sdk/python/v<version>/<target>/`, where `<target>` names the platform,
 such as `linux-x86_64`. It verifies the download against the release manifest
-in the package and checks it again before every use.
+in the package and checks it again before every use. `DIR` must belong to you
+or root. Other accounts may write it only if it is a sticky directory such as
+`/tmp`, except that your own private group may: your primary group, when it
+is named after you and has no other members. The SDK keeps the directories it
+creates in `DIR` private to you. It does not check macOS access control lists
+on them.
 `syq.managed_executable(cache_dir=None)` downloads ahead of time and returns the
 executable's path. Without `cache_dir`, `DIR` is `$XDG_CACHE_HOME` when that is
 an absolute path, and `~/.cache` otherwise.

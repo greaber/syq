@@ -1079,7 +1079,8 @@ fn outdated_controls(domain: &Domain) -> Vec<PathBuf> {
 /// `apply_preferences`), so that receiving follows an update at once rather
 /// than in the background: each idle service from another build that cannot
 /// follow its path by itself, or whose own switch failed or waits for a
-/// login, is replaced now, in the foreground. In a terminal SSH may ask for
+/// login, is replaced now, in the foreground, and so is an idle SSH
+/// authorization provider that cannot follow its path. In a terminal SSH may ask for
 /// the login; without one it never asks, and a login that needs the user
 /// is recorded as such, for a command in a terminal to try. A busy one keeps
 /// running, and the command says so. A failure is kept for status
@@ -1087,6 +1088,11 @@ fn outdated_controls(domain: &Domain) -> Vec<PathBuf> {
 pub(crate) fn switch_outdated_now(domain: &Domain) {
     if !domain.enabled().unwrap_or(false) {
         return;
+    }
+    if let Err(error) = provider::switch_outdated(domain) {
+        crate::output::diagnostic!(
+            "syq: could not switch the SSH authorization provider to this version: {error:#}"
+        );
     }
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr());
     for control in outdated_controls(domain) {

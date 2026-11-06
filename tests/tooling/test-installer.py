@@ -26,6 +26,15 @@ case "$1" in
   *) exit 2 ;;
 esac
 """
+# Each fake serves the release file a URL names, or with
+# SYQ_TEST_ENDLESS_DOWNLOAD set, data that never ends.
+FAKE_DOWNLOAD = """
+[ -z "${SYQ_TEST_ENDLESS_DOWNLOAD:-}" ] || exec yes
+if [ "$output" = - ]; then
+  exec cat "$SYQ_TEST_RELEASE_DIR/${url##*/}"
+fi
+cp "$SYQ_TEST_RELEASE_DIR/${url##*/}" "$output"
+"""
 FAKE_CURL = """#!/bin/sh
 output=
 url=
@@ -35,8 +44,7 @@ while [ "$#" -gt 0 ]; do
     *) url=$1; shift ;;
   esac
 done
-cp "$SYQ_TEST_RELEASE_DIR/${url##*/}" "$output"
-"""
+""" + FAKE_DOWNLOAD
 FAKE_WGET = """#!/bin/sh
 output=
 url=
@@ -47,8 +55,7 @@ while [ "$#" -gt 0 ]; do
     *) shift ;;
   esac
 done
-cp "$SYQ_TEST_RELEASE_DIR/${url##*/}" "$output"
-"""
+""" + FAKE_DOWNLOAD
 
 
 def sha256(path):
@@ -154,20 +161,26 @@ esac
                 self.assertEqual(self.run_program(install_dir / "syq", "--version"), "syq 0.1.0")
                 self.assertEqual(self.run_program(install_dir / "syq", "--test-target"), target)
 
-    def test_wget_only_download(self):
-        # Exercise the wget-only branch with a PATH containing every required utility
-        # except curl.
+    def wget_only_path(self):
+        """A PATH directory with every utility the installer and the fake
+        downloader use, and wget but not curl."""
         wgetbin = self.work / "wgetbin"
+        if wgetbin.exists():
+            return wgetbin
         wgetbin.mkdir()
         checksum_utility = next((candidate for candidate in ("sha256sum", "shasum", "openssl")
                                  if shutil.which(candidate)), None)
         self.assertIsNotNone(checksum_utility)
-        for utility in ["chmod", "cp", "gzip", "mkdir", "mktemp", "mv", "rm", "sed", "tr", "wc",
-                        checksum_utility]:
+        for utility in ["cat", "chmod", "cp", "gzip", "head", "mkdir", "mktemp", "mv", "rm", "sed",
+                        "tr", "wc", "yes", checksum_utility]:
             (wgetbin / utility).symlink_to(shutil.which(utility))
         shutil.copy(self.fakebin / "uname", wgetbin / "uname")
         executable(wgetbin / "wget", FAKE_WGET)
-        result = self.install(self.work / "install-wget", shell="/bin/sh", path=str(wgetbin))
+        return wgetbin
+
+    def test_wget_only_download(self):
+        result = self.install(self.work / "install-wget", shell="/bin/sh",
+                              path=str(self.wget_only_path()))
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertEqual(self.run_program(self.work / "install-wget/syq", "--test-target"),
                          "linux-x86_64")
@@ -205,16 +218,34 @@ esac
         self.expect_failure("destination is a directory",
                             ["sh", str(self.installer), "--bin-dir", str(destination)], self.env())
 
+    def test_an_endless_download_stops_after_the_archive_size(self):
+        for downloader, path in [("curl", None), ("wget", str(self.wget_only_path()))]:
+            with self.subTest(downloader=downloader):
+                install_dir = self.work / f"endless-{downloader}"
+                result = subprocess.run(
+                    ["/bin/sh", str(self.installer), "--bin-dir", str(install_dir)],
+                    env=self.env(path=path, SYQ_TEST_ENDLESS_DOWNLOAD="1"),
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("downloaded archive is larger than the expected", result.stdout)
+                self.assertFalse((install_dir / "syq").exists())
+
     def test_bad_downloads_keep_the_working_installation(self):
         install_dir = self.work / "install-linux-x86_64"
         self.assertEqual(self.install(install_dir).returncode, 0)
         installed_sha = sha256(install_dir / "syq")
         # A bad download must not alter a working installation.
-        with (self.release / "syq-linux-x86_64.gz").open("ab") as archive:
-            archive.write(b"tamper")
+        archive_path = self.release / "syq-linux-x86_64.gz"
+        archive = archive_path.read_bytes()
+        archive_path.write_bytes(archive + b"tamper")
+        self.expect_failure("downloaded archive is larger than the expected",
+                            ["sh", str(self.installer), "--bin-dir", str(install_dir)], self.env())
+        self.assertEqual(sha256(install_dir / "syq"), installed_sha)
+        archive_path.write_bytes(archive[:-1])
         self.expect_failure("downloaded archive has size",
                             ["sh", str(self.installer), "--bin-dir", str(install_dir)], self.env())
         self.assertEqual(sha256(install_dir / "syq"), installed_sha)
+        archive_path.write_bytes(archive)
 
         # Even correctly hashed content is rejected if its build identity does not
         # match the release metadata, again without replacing the installed binary.

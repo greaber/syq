@@ -1,9 +1,9 @@
 //! macOS ACLs use ordered UUID-based entries, independently of POSIX mode bits.
 //! Transfer explicit values and rebuild through the public ACL API; no native
 //! pointer or internal ACL structure crosses the wire.
-use super::{MacAce, MacAcl};
+use super::{AclAccess, MacAce, MacAcl};
 use anyhow::{ensure, Context, Result};
-use std::{ffi::c_void, fs::File, io, os::fd::AsRawFd, ptr};
+use std::{ffi::c_void, fs::File, io, os::fd::AsRawFd, path::Path, ptr};
 
 type Acl = *mut c_void;
 const EXTENDED: libc::c_int = 0x100;
@@ -25,6 +25,9 @@ unsafe extern "C" {
     ) -> libc::c_int;
     fn fchmodx_np(fd: libc::c_int, security: *mut c_void) -> libc::c_int;
     fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> Acl;
+    fn acl_get_link_np(path: *const libc::c_char, kind: libc::c_int) -> Acl;
+    fn mbr_uid_to_uuid(uid: libc::uid_t, uuid: *mut u8) -> libc::c_int;
+    fn mbr_uuid_to_id(uuid: *const u8, id: *mut libc::id_t, kind: *mut libc::c_int) -> libc::c_int;
     fn acl_set_fd_np(fd: libc::c_int, acl: Acl, kind: libc::c_int) -> libc::c_int;
     fn acl_init(count: libc::c_int) -> Acl;
     fn acl_free(object: *mut c_void) -> libc::c_int;
@@ -105,7 +108,77 @@ pub(super) fn read(file: &File) -> Result<MacAcl> {
         }
         return Err(error).context("read macOS ACL on held inode");
     }
-    let acl = OwnedAcl(raw);
+    entries(&OwnedAcl(raw))
+}
+
+/// Whether the ACL of the file or directory at `path`, not following a
+/// final link, allows an account other than this one to write it, add or
+/// remove its entries, delete it, or change its permissions or owner,
+/// whatever its mode bits say. An entry only for what is created in a
+/// directory later does not count: it gives no access to the directory
+/// itself, nor to what is already in it. With `trust_groups`, neither does
+/// one for a group other than that of every account.
+pub(super) fn others_may_change(path: &Path, trust_groups: bool) -> Result<Option<AclAccess>> {
+    use std::os::unix::ffi::OsStrExt;
+    const ALLOW: u32 = 1;
+    // Write data or add a file, delete, append or add a subdirectory,
+    // delete a child, write security, change owner (<sys/acl.h>).
+    const CHANGE: u64 = (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 12) | (1 << 13);
+    const ONLY_INHERIT: u32 = 1 << 8;
+    const INHERITED: u32 = 1 << 4;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("{} contains a NUL byte", path.display()))?;
+    let raw = unsafe { acl_get_link_np(name.as_ptr(), EXTENDED) };
+    if raw.is_null() {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(None);
+        }
+        return Err(error).with_context(|| format!("read the ACL of {}", path.display()));
+    }
+    let acl = entries(&OwnedAcl(raw))?;
+    let mut granted = acl
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.tag == ALLOW && entry.permissions & CHANGE != 0 && entry.flags & ONLY_INHERIT == 0
+        })
+        .peekable();
+    // Most ACLs grant no one such access; only then is this user's UUID
+    // worth looking up.
+    if granted.peek().is_none() {
+        return Ok(None);
+    }
+    let mut own = [0u8; 16];
+    let own = (unsafe { mbr_uid_to_uuid(libc::geteuid(), own.as_mut_ptr()) } == 0).then_some(own);
+    let mut access = None;
+    for entry in granted {
+        if Some(entry.principal) == own || (trust_groups && is_group(&entry.principal)) {
+            continue;
+        }
+        if entry.flags & INHERITED == 0 {
+            return Ok(Some(AclAccess::Own));
+        }
+        access = Some(AclAccess::Inherited);
+    }
+    Ok(access)
+}
+
+/// Whether `principal` names a group other than `everyone`, the group of
+/// every account (<membership.h>).
+fn is_group(principal: &[u8; 16]) -> bool {
+    const ID_TYPE_GID: libc::c_int = 1;
+    const EVERYONE: [u8; 16] = [
+        0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef, 0, 0, 0, 0x0c,
+    ];
+    let mut id: libc::id_t = 0;
+    let mut kind: libc::c_int = -1;
+    *principal != EVERYONE
+        && unsafe { mbr_uuid_to_id(principal.as_ptr(), &mut id, &mut kind) } == 0
+        && kind == ID_TYPE_GID
+}
+
+fn entries(acl: &OwnedAcl) -> Result<MacAcl> {
     let mut result = MacAcl {
         flags: get_flags(acl.0)?,
         entries: Vec::new(),
