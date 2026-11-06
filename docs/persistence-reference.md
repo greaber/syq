@@ -266,10 +266,16 @@ approval is in progress, by themselves or when you next run syq.
 it even when busy, which cuts off copies and approvals in progress. If
 receiving needs you to unlock or touch your SSH key, it waits until you next
 run a syq copy or ssh command, or `syq persist status`, in a terminal. An
-account connection you approved keeps the old version until that connection
-closes; `syq persist status` shows the command that switches at once and
-closes it. Session permissions (**Allow**) end at the switch, as at any
-reconnect.
+account connection you approved closes at the switch when nothing runs through
+it, along with any idle port forwards it holds. The next syq command that uses
+it opens it again, which asks for approval again unless you remembered it;
+export a `persist ssh-config` file again after that. While a copy, shell, or
+other session runs through it, the switch waits for it to finish. A connection
+that can't tell whether it's in use, such as one opened on macOS or in an
+isolated domain, keeps the old version until it closes. `syq persist status`
+says which connections the switch waits for and shows the command that
+switches at once and closes them. Session permissions (**Allow**) end at the
+switch, as at any reconnect.
 
 To wait in a script without starting a connection, run
 `syq persist receive wait server --timeout 30` on the laptop, or

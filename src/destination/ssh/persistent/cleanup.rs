@@ -317,7 +317,7 @@ pub(crate) fn cleanup_domain(domain: &Domain) -> Result<()> {
                 record.control.parent().and_then(Path::parent) == Some(scope.as_path()),
                 "SSH account record belongs to another persistence scope"
             );
-        } else if index_name(&path, "lock") {
+        } else if index_name(&path, "lock") || index_name(&path, "close") {
             private_file(&path, 0, false)?;
         } else if path.file_name().is_some_and(|name| name == GENERATION) {
             read_generation(&path)?;

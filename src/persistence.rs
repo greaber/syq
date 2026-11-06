@@ -1323,6 +1323,217 @@ pub(crate) fn socket_is_ready(path: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// How many clients are connected to the OpenSSH master listening at
+/// `control`: one for each session running through it, and for a moment
+/// each `-O` request. None where this cannot be told: everywhere but Linux,
+/// and where the kernel does not report its Unix sockets (`sock_diag`).
+/// Looking does not touch the master, so it neither counts itself nor
+/// resets the master's own idle timer.
+///
+/// The kernel reports each socket's address as it is, so another account's
+/// socket names cannot pose as rows of someone else's, as they could in the
+/// text of `/proc/net/unix`; and the file each is bound to, so one bound to
+/// the same name elsewhere, as in another mount namespace, does not count.
+pub(crate) fn mux_clients(control: &Path) -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let metadata = std::fs::symlink_metadata(control).ok()?;
+        let file = Bound {
+            major: libc::major(metadata.dev()),
+            minor: libc::minor(metadata.dev()),
+            inode: metadata.ino() as u32,
+        };
+        let control = control.as_os_str().as_bytes();
+        let (mut clients, mut listening) = (0, false);
+        unix_stream_sockets(|state, path, bound| {
+            match mux_socket(state, path, bound == Some(file), control) {
+                Some(MuxSocket::Client) => clients += 1,
+                Some(MuxSocket::Listener) => listening = true,
+                None => {}
+            }
+        })?;
+        // Without the master listening, its clients are not known either,
+        // as where the kernel shows another network namespace's sockets.
+        listening.then_some(clients)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = control;
+        None
+    }
+}
+
+/// The file a Unix socket is bound to, as `sock_diag` reports it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Bound {
+    major: u32,
+    minor: u32,
+    inode: u32,
+}
+
+/// A Unix stream socket's state as `sock_diag` reports it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const TCP_ESTABLISHED: u8 = 1;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const TCP_LISTEN: u8 = 10;
+
+/// Call `each` with the state and bound address of every connected or
+/// listening Unix stream socket, as the kernel's `sock_diag` lists them;
+/// None if it cannot.
+#[cfg(target_os = "linux")]
+fn unix_stream_sockets(mut each: impl FnMut(u8, &[u8], Option<Bound>)) -> Option<()> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    const NETLINK_SOCK_DIAG: libc::c_int = 4;
+    const SOCK_DIAG_BY_FAMILY: u16 = 20;
+    const UDIAG_SHOW_NAME: u32 = 1;
+    const UDIAG_SHOW_VFS: u32 = 2;
+    const UNIX_DIAG_VFS: u16 = 1;
+    const UNIX_DIAG_NAME: u16 = 0;
+    const NLMSG_HEADER: usize = 16;
+    const DIAG_MESSAGE: usize = 16;
+    let socket = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+            NETLINK_SOCK_DIAG,
+        )
+    };
+    if socket < 0 {
+        return None;
+    }
+    let socket = unsafe { OwnedFd::from_raw_fd(socket) };
+    // nlmsghdr, then unix_diag_req.
+    let mut request = Vec::with_capacity(NLMSG_HEADER + 24);
+    request.extend_from_slice(&40u32.to_ne_bytes());
+    request.extend_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+    request.extend_from_slice(&((libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16).to_ne_bytes());
+    request.extend_from_slice(&1u32.to_ne_bytes());
+    request.extend_from_slice(&0u32.to_ne_bytes());
+    request.extend_from_slice(&[libc::AF_UNIX as u8, 0, 0, 0]);
+    let states = (1u32 << TCP_ESTABLISHED) | (1u32 << TCP_LISTEN);
+    request.extend_from_slice(&states.to_ne_bytes());
+    request.extend_from_slice(&0u32.to_ne_bytes());
+    request.extend_from_slice(&(UDIAG_SHOW_NAME | UDIAG_SHOW_VFS).to_ne_bytes());
+    request.extend_from_slice(&[0; 8]);
+    let mut address: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    address.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    let sent = unsafe {
+        libc::sendto(
+            socket.as_raw_fd(),
+            request.as_ptr().cast(),
+            request.len(),
+            0,
+            (&address as *const libc::sockaddr_nl).cast(),
+            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if sent != request.len() as isize {
+        return None;
+    }
+    let timeout = libc::timeval {
+        tv_sec: 2,
+        tv_usec: 0,
+    };
+    unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&timeout as *const libc::timeval).cast(),
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let received = unsafe {
+            libc::recv(
+                socket.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0,
+            )
+        };
+        if received <= 0 {
+            return None;
+        }
+        let mut messages = &buffer[..received as usize];
+        while messages.len() >= NLMSG_HEADER {
+            let length = u32::from_ne_bytes(messages[0..4].try_into().ok()?) as usize;
+            let kind = u16::from_ne_bytes(messages[4..6].try_into().ok()?);
+            if length < NLMSG_HEADER || length > messages.len() {
+                return None;
+            }
+            match kind as libc::c_int {
+                libc::NLMSG_DONE => return Some(()),
+                libc::NLMSG_ERROR => return None,
+                _ => {}
+            }
+            let body = &messages[NLMSG_HEADER..length];
+            if body.len() >= DIAG_MESSAGE && body[1] == libc::SOCK_STREAM as u8 {
+                let state = body[2];
+                let (mut name, mut bound) = (None, None);
+                let mut attributes = &body[DIAG_MESSAGE..];
+                while attributes.len() >= 4 {
+                    let size = u16::from_ne_bytes([attributes[0], attributes[1]]) as usize;
+                    let kind = u16::from_ne_bytes([attributes[2], attributes[3]]);
+                    if size < 4 || size > attributes.len() {
+                        break;
+                    }
+                    let value = &attributes[4..size];
+                    if kind == UNIX_DIAG_NAME {
+                        // A path name ends at its first NUL, if any.
+                        name = Some(value.split(|byte| *byte == 0).next().unwrap_or(value));
+                    } else if kind == UNIX_DIAG_VFS && value.len() >= 8 {
+                        // unix_diag_vfs: inode, then the kernel's device
+                        // number, its major above its 20 minor bits.
+                        let inode = u32::from_ne_bytes(value[0..4].try_into().ok()?);
+                        let device = u32::from_ne_bytes(value[4..8].try_into().ok()?);
+                        bound = Some(Bound {
+                            major: device >> 20,
+                            minor: device & 0xfffff,
+                            inode,
+                        });
+                    }
+                    attributes = attributes.get((size + 3) & !3..).unwrap_or(&[]);
+                }
+                if let Some(name) = name {
+                    each(state, name, bound);
+                }
+            }
+            let aligned = (length + 3) & !3;
+            messages = messages.get(aligned..).unwrap_or(&[]);
+        }
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum MuxSocket {
+    Listener,
+    Client,
+}
+
+/// What a Unix stream socket in `state` bound to `path` is to the OpenSSH
+/// master at `control`: its listening socket, a connection it accepted, or
+/// neither. `at_control` says whether it is bound to the file at `control`. OpenSSH binds its listener to `control` followed by a dot and
+/// 16 random letters and digits, then renames it to `control`; a connection
+/// the listener accepts carries the bound address.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn mux_socket(state: u8, path: &[u8], at_control: bool, control: &[u8]) -> Option<MuxSocket> {
+    let named = path == control
+        || path.strip_prefix(control).is_some_and(|rest| {
+            rest.len() == 17 && rest[0] == b'.' && rest[1..].iter().all(u8::is_ascii_alphanumeric)
+        });
+    let bound_by_ssh = at_control && named;
+    match state {
+        _ if !bound_by_ssh => None,
+        TCP_LISTEN => Some(MuxSocket::Listener),
+        TCP_ESTABLISHED => Some(MuxSocket::Client),
+        _ => None,
+    }
+}
+
 #[derive(Serialize)]
 struct ConnectionStatus {
     endpoint: String,
@@ -1692,6 +1903,84 @@ pub(crate) fn command_for_help() -> clap::Command {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// Only connected sockets bound at the control path, or OpenSSH's
+    /// temporary name for it, are clients; its listener is the master; a
+    /// name that merely begins the same way is neither.
+    #[test]
+    fn mux_sockets_are_named_exactly_for_the_control_path() {
+        let control = b"/run/s/cm-1";
+        let socket = |state, path: &[u8]| mux_socket(state, path, true, control);
+        assert_eq!(socket(TCP_ESTABLISHED, control), Some(MuxSocket::Client));
+        assert_eq!(
+            socket(TCP_ESTABLISHED, b"/run/s/cm-1.AbCdEfGh01234567"),
+            Some(MuxSocket::Client)
+        );
+        assert_eq!(
+            socket(TCP_LISTEN, b"/run/s/cm-1.AbCdEfGh01234567"),
+            Some(MuxSocket::Listener)
+        );
+        for other in [
+            &b"/run/s/cm-1.pool"[..],
+            b"/run/s/cm-12",
+            b"/run/s/cm-1 x",
+            b"",
+        ] {
+            assert_eq!(socket(TCP_ESTABLISHED, other), None);
+        }
+        assert_eq!(socket(7, control), None);
+        // The same name bound to another file, as in another mount
+        // namespace, is neither.
+        assert_eq!(mux_socket(TCP_ESTABLISHED, control, false, control), None);
+        assert_eq!(mux_socket(TCP_LISTEN, control, false, control), None);
+        assert_eq!(
+            mux_socket(
+                TCP_ESTABLISHED,
+                b"/run/s/cm-1.AbCdEfGh01234567",
+                false,
+                control
+            ),
+            None
+        );
+    }
+
+    /// As OpenSSH does: bind a temporary name, link the control path to
+    /// it, and remove the temporary name. Each accepted client counts
+    /// until it ends.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mux_clients_counts_live_connections_to_an_openssh_style_listener() {
+        let directory = crate::test_support::short_tempdir().unwrap();
+        let control = directory.path().join("cm-test");
+        let temporary = directory.path().join("cm-test.Ab3dEfGh0123456z");
+        let listener = std::os::unix::net::UnixListener::bind(&temporary).unwrap();
+        std::fs::hard_link(&temporary, &control).unwrap();
+        std::fs::remove_file(&temporary).unwrap();
+        assert_eq!(mux_clients(&control), Some(0));
+        let first = std::os::unix::net::UnixStream::connect(&control).unwrap();
+        let _second = std::os::unix::net::UnixStream::connect(&control).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        let (_also, _) = listener.accept().unwrap();
+        assert_eq!(mux_clients(&control), Some(2));
+        drop((first, accepted));
+        assert_eq!(mux_clients(&control), Some(1));
+        // Another account's sockets whose names hold what would read as
+        // rows for this control path in /proc/net/unix count for nothing.
+        let mut posing = Vec::new();
+        for (index, state) in ["03", "03", "01"].into_iter().enumerate() {
+            let row = format!("p{index}\n0: 2 0 0 0001 {state} 9 {}", control.display());
+            let name = directory.path().join(row);
+            std::fs::create_dir_all(name.parent().unwrap()).unwrap();
+            let listener = std::os::unix::net::UnixListener::bind(&name).unwrap();
+            posing.push(std::os::unix::net::UnixStream::connect(&name).unwrap());
+            posing.push(listener.accept().unwrap().0);
+        }
+        assert_eq!(mux_clients(&control), Some(1));
+        // Without its listener, the kernel's list says nothing.
+        drop(listener);
+        assert_eq!(mux_clients(&control), None);
+        assert_eq!(mux_clients(&directory.path().join("cm-other")), None);
+    }
 
     #[test]
     fn closing_scope_removes_linked_preferences_without_removing_the_target() {

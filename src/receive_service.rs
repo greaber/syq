@@ -621,10 +621,16 @@ pub(crate) struct Busy {
     pub(crate) requests: usize,
     /// Requests waiting for approval.
     pub(crate) pending: usize,
-    /// Approved account connections open through it: each holds a request
-    /// for as long as it lives, whether or not anything runs through it.
+    /// Approved account connections open through it that keep it from
+    /// switching: each holds a request for as long as it lives. One that
+    /// says nothing uses it is not counted, since a switch ends it.
     #[serde(default)]
     pub(crate) accounts: usize,
+    /// Of those, the ones that say something uses them, so that they stop
+    /// counting once it ends. The rest cannot say, and count until they
+    /// close.
+    #[serde(default)]
+    pub(crate) accounts_in_use: usize,
 }
 impl Busy {
     pub(crate) fn idle(&self) -> bool {
@@ -634,9 +640,6 @@ impl Busy {
     /// requests waiting for approval". Account connections are named apart,
     /// `on` the server they were opened from when given.
     pub(crate) fn describe(&self, on: Option<&str>) -> String {
-        let count = |count: usize, what: &str| {
-            format!("{count} {what}{}", if count == 1 { "" } else { "s" })
-        };
         let mut parts = Vec::new();
         if self.requests > 0 {
             parts.push(format!("{} in progress", count(self.requests, "request")));
@@ -648,32 +651,47 @@ impl Busy {
             ));
         }
         if self.accounts > 0 {
-            parts.push(match on {
-                Some(server) => format!(
-                    "{} on {server}",
-                    count(self.accounts, "approved account connection")
-                ),
-                None => count(self.accounts, "approved account connection"),
-            });
+            parts.push(accounts_on(self.accounts, on));
         }
         parts.join(" and ")
     }
-    /// For a service with open account connections, which do not end by
-    /// themselves: that it waits for them, and what to run to switch now.
-    /// None without any.
+    /// For a service with open account connections that keep it: that it
+    /// waits for them, and what to run to switch now. None without any.
     pub(crate) fn accounts_note(&self, on: Option<&str>, fix: &str) -> Option<String> {
         (self.accounts > 0).then(|| {
+            let in_use = self.accounts_in_use.min(self.accounts);
+            let closing = self.accounts - in_use;
+            let waits = match (in_use, closing) {
+                (0, _) => format!("it waits for {} to close", accounts_on(closing, on)),
+                (_, 0) => format!(
+                    "it waits while {} {} in use",
+                    accounts_on(in_use, on),
+                    if in_use == 1 { "is" } else { "are" }
+                ),
+                _ => format!(
+                    "it waits while {} {} in use and for {closing} other{} to close",
+                    accounts_on(in_use, on),
+                    if in_use == 1 { "is" } else { "are" },
+                    if closing == 1 { "" } else { "s" }
+                ),
+            };
             format!(
-                "it waits for {} to close; `{fix}` switches now and closes {}",
-                Busy {
-                    requests: 0,
-                    pending: 0,
-                    ..*self
-                }
-                .describe(on),
+                "{waits}; `{fix}` switches now and closes {}",
                 if self.accounts == 1 { "it" } else { "them" }
             )
         })
+    }
+}
+fn count(count: usize, what: &str) -> String {
+    format!("{count} {what}{}", if count == 1 { "" } else { "s" })
+}
+fn accounts_on(accounts: usize, on: Option<&str>) -> String {
+    match on {
+        Some(server) => format!(
+            "{} on {server}",
+            count(accounts, "approved account connection")
+        ),
+        None => count(accounts, "approved account connection"),
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -922,10 +940,15 @@ pub(crate) fn busy_notice(
     } else {
         "once nothing is in progress, a syq command run here switches it to this version"
     };
-    let mut notice = format!(
-        "receiving through {endpoint} keeps running syq {build} for now, with {}; {then}",
-        busy.describe(Some(endpoint)),
-    );
+    // A request may have come and gone just as it was asked to stop.
+    let with = busy.describe(Some(endpoint));
+    let with = if with.is_empty() {
+        String::new()
+    } else {
+        format!(", with {with}")
+    };
+    let mut notice =
+        format!("receiving through {endpoint} keeps running syq {build} for now{with}; {then}");
     if busy.accounts > 0 {
         notice.push_str(&format!(
             "; `{fix}` switches now and closes the account connection{}",
@@ -1795,9 +1818,8 @@ pub(crate) enum Replace {
 /// updates reports only its requests waiting for approval.
 fn busy_of(state: &Status) -> Busy {
     state.busy.unwrap_or(Busy {
-        requests: 0,
         pending: state.pending.len(),
-        accounts: 0,
+        ..Busy::default()
     })
 }
 
@@ -2224,15 +2246,18 @@ impl ProfileWorker {
 }
 /// What these workers have in progress.
 fn busy(workers: &[ProfileWorker]) -> Busy {
-    let accounts = workers.iter().map(|w| w.activity.accounts()).sum();
+    let accounts: Vec<_> = workers.iter().map(|w| w.activity.accounts()).collect();
+    let open: usize = accounts.iter().map(|a| a.open).sum();
+    let idle: usize = accounts.iter().map(|a| a.idle).sum();
     Busy {
         requests: workers
             .iter()
             .map(|w| w.activity.requests())
             .sum::<usize>()
-            .saturating_sub(accounts),
+            .saturating_sub(open),
         pending: workers.iter().map(|w| w.approvals.snapshots().len()).sum(),
-        accounts,
+        accounts: open.saturating_sub(idle),
+        accounts_in_use: accounts.iter().map(|a| a.in_use).sum(),
     }
 }
 /// Refuse new requests on every worker if all are idle, so the service can
@@ -2249,8 +2274,27 @@ fn close_if_idle(workers: &[ProfileWorker]) -> bool {
             return false;
         }
     }
-    true
+    // End the account connections nothing uses, which are re-established
+    // on their next use; one that turned out to be in use keeps the service.
+    // Ask them all first, then wait for the answers together.
+    let deadline = Instant::now() + crate::destination::ssh_auth::CLOSE_WAIT;
+    let closing: Vec<_> = workers
+        .iter()
+        .filter_map(|worker| worker.activity.close_accounts())
+        .collect();
+    let closed = closing
+        .into_iter()
+        .fold(true, |closed, closing| closing.wait(deadline) && closed);
+    for worker in workers {
+        if closed {
+            worker.activity.close();
+        } else {
+            worker.activity.reopen();
+        }
+    }
+    closed
 }
+
 fn reconcile(
     domain: &Domain,
     workers: &mut Vec<ProfileWorker>,
@@ -4077,6 +4121,7 @@ mod tests {
             requests: 0,
             pending: 0,
             accounts: 1,
+            accounts_in_use: 0,
         };
         assert!(!accounts.idle());
         assert_eq!(
@@ -4087,6 +4132,7 @@ mod tests {
             requests: 1,
             pending: 0,
             accounts: 2,
+            accounts_in_use: 0,
         };
         let notice = busy_notice("server", "v0.8.0", &both, true, fix);
         assert_eq!(
@@ -4097,8 +4143,29 @@ mod tests {
             requests: 1,
             pending: 0,
             accounts: 0,
+            accounts_in_use: 0,
         };
         assert!(!busy_notice("server", "v0.8.0", &copies, true, fix).contains("account"));
+        // One that says it is in use stops counting once nothing uses it;
+        // one that cannot say counts until it closes.
+        let in_use = Busy {
+            accounts: 1,
+            accounts_in_use: 1,
+            ..Busy::default()
+        };
+        assert_eq!(
+            busy_notice("server", "v0.8.0", &in_use, true, fix),
+            "receiving through server keeps running syq v0.8.0: it waits while 1 approved account connection on server is in use; `syq persist connect server` switches now and closes it"
+        );
+        let mixed = Busy {
+            accounts: 3,
+            accounts_in_use: 2,
+            ..Busy::default()
+        };
+        assert_eq!(
+            mixed.accounts_note(None, fix).unwrap(),
+            "it waits while 2 approved account connections are in use and for 1 other to close; `syq persist connect server` switches now and closes them"
+        );
 
         // Status says the same while the switch waits.
         let started_from = std::env::current_exe().unwrap();
@@ -4198,6 +4265,7 @@ mod tests {
             requests: 1,
             pending: 0,
             accounts: 0,
+            accounts_in_use: 0,
         });
         let service = stand_in(&control, lock, move |_| answer("other", busy, false));
         assert!(!stop_when_idle(&control, &answer("other", busy, false)).unwrap());
@@ -4279,6 +4347,7 @@ mod tests {
                             requests: 1,
                             pending: 0,
                             accounts: 0,
+                            accounts_in_use: 0,
                         }),
                         false,
                     );

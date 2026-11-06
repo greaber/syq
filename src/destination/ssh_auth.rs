@@ -7,6 +7,9 @@ use crate::persistence::Domain;
 use crate::receive_approval::provider_accounts::{ProviderIdentity, ProviderLoginPermission};
 use crate::receive_approval::{AccountDecision, AccountIdentity, AccountPermission, Queue};
 
+mod links;
+pub(crate) use links::{AccountLinks, Closing, LinkReply, LinkRequest, CLOSE_WAIT};
+
 const HOST_ALIAS: &str = "syq-approved-peer";
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -239,6 +242,8 @@ pub(crate) struct AuthorizationContext<'a> {
     /// Approved logins whose agent requests are relayed now: an approved
     /// account connection's master holds one for as long as it lives.
     pub(crate) relaying: &'a AtomicU64,
+    /// Of those, the ones that say whether anything uses them.
+    pub(crate) links: &'a AccountLinks,
 }
 
 /// Public connection metadata, not an authorization grant. The provider must
@@ -328,6 +333,7 @@ impl ResolvedPolicy {
 /// including after OpenSSH closes its authentication-agent connection.
 pub(crate) struct Session {
     stream: UnixStream,
+    agent: Arc<AgentChannel>,
     _broker: PrivateBroker,
     endpoint: NativeEndpoint,
     peer: super::forward::ssh::Peer,
@@ -350,6 +356,58 @@ impl Session {
     pub(crate) fn cancelled(&self) -> bool {
         disconnected(&self.stream)
     }
+
+    /// Once the login no longer uses the agent, tell the approving side
+    /// that this connection answers whether anything uses it
+    /// (`links::LINK`); whether the approving side agreed. None while the
+    /// login may still ask the agent.
+    pub(crate) fn enter_link(&mut self) -> Result<Option<bool>> {
+        let unused = self.agent.stream.lock().unwrap().take().is_some();
+        if !unused && !self.agent.relayed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        // The relay is done, or never starts now: the stream is ours alone.
+        self.stream
+            .set_read_timeout(Some(Duration::from_secs(30)))?;
+        crate::agent_broker::write_frame(&mut self.stream, links::LINK)?;
+        let answer = crate::agent_broker::read_frame(&mut self.stream)?
+            .context("the approving side closed the account connection")?;
+        Ok(Some(answer == links::LINK))
+    }
+
+    /// A request from the approving side, once `enter_link` succeeded,
+    /// if one has arrived.
+    pub(crate) fn link_request(&mut self) -> Result<Option<LinkRequest>> {
+        let mut byte = 0u8;
+        let result = unsafe {
+            libc::recv(
+                self.stream.as_raw_fd(),
+                (&mut byte as *mut u8).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        // Nothing yet, or the end, which `cancelled` reports.
+        if result <= 0 {
+            return Ok(None);
+        }
+        let frame = crate::agent_broker::read_frame(&mut self.stream)?
+            .context("the approving side closed the account connection")?;
+        links::decode(&frame).map(Some)
+    }
+
+    pub(crate) fn answer(&mut self, reply: LinkReply) -> Result<()> {
+        crate::agent_broker::write_frame(&mut self.stream, &links::encode(&reply)?)?;
+        Ok(())
+    }
+}
+
+/// The authorization stream while OpenSSH's login may use it as its agent.
+struct AgentChannel {
+    /// Until the login first connects to the agent.
+    stream: Mutex<Option<UnixStream>>,
+    /// The login's agent connection closed.
+    relayed: AtomicBool,
 }
 
 fn disconnected(socket: &UnixStream) -> bool {
@@ -595,7 +653,11 @@ fn authorize_expected_inner(
     approved.validate()?;
     approved.check_expected(Some(expected))?;
     request.ssh_arguments(&approved.endpoint)?;
-    let channel = Mutex::new(Some(stream.try_clone()?));
+    let agent = Arc::new(AgentChannel {
+        stream: Mutex::new(Some(stream.try_clone()?)),
+        relayed: AtomicBool::new(false),
+    });
+    let channel = agent.clone();
     let broker = PrivateBroker::start_managed(
         PrivateBrokerConfig {
             directory_prefix: "syq-ssh-",
@@ -607,12 +669,13 @@ fn authorize_expected_inner(
             io_timeout: Duration::from_secs(120),
         },
         move |mut local, registry| {
-            let Some(remote) = channel.lock().unwrap().take() else {
+            let Some(remote) = channel.stream.lock().unwrap().take() else {
                 return;
             };
             if let Ok(mut remote) = registry.track(remote) {
                 let _ = crate::agent_broker::relay_frames(&mut local, &mut remote);
             }
+            channel.relayed.store(true, Ordering::Release);
         },
     )?;
     let known_hosts = broker.socket_path().with_file_name("known_hosts");
@@ -630,6 +693,7 @@ fn authorize_expected_inner(
     )?;
     Ok(Session {
         stream,
+        agent,
         _broker: broker,
         peer: approved.peer()?,
         endpoint: approved.endpoint,
@@ -1047,7 +1111,13 @@ fn authorize_and_relay_inner(
     write_message(&mut stream, &approved)?;
     context.relaying.fetch_add(1, Ordering::AcqRel);
     let _relaying = Slot(context.relaying);
-    crate::agent_broker::relay_frames(&mut stream, &mut upstream)
+    if !crate::agent_broker::relay_frames_until(&mut stream, &mut upstream, links::LINK)? {
+        return Ok(());
+    }
+    // The login is done: nothing signs for this stream any more.
+    drop(upstream);
+    drop(broker);
+    context.links.serve(&mut stream, cancelled)
 }
 
 impl Receiver {
@@ -1118,6 +1188,7 @@ impl Receiver {
             active_count: &self.ssh_count,
             session_grants: &self.account_sessions,
             relaying: &self.account_relays,
+            links: &self.account_links,
         };
         let (generation, _tracked) = {
             let _sessions = self.sessions.lock().unwrap();
@@ -1351,6 +1422,7 @@ mod tests {
                 active_count: &count,
                 session_grants: &grants,
                 relaying: &AtomicU64::new(0),
+                links: &AccountLinks::default(),
             };
             let request = Request::account(policy(1).endpoint, vec![], String::new(), None);
             let error =
@@ -1395,6 +1467,7 @@ mod tests {
             active_count: &count,
             session_grants: &grants,
             relaying: &relaying,
+            links: &AccountLinks::default(),
         };
         let resolved = policy(1);
         let permission = AccountApproval::new(

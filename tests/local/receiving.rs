@@ -3430,7 +3430,7 @@ fn a_receiving_service_switches_to_a_new_build_at_its_path_once_idle() {
     assert_eq!(state["started_from"], installed.syq.to_str().unwrap());
     assert_eq!(
         state["busy"],
-        serde_json::json!({"requests": 0, "pending": 0, "accounts": 0})
+        serde_json::json!({"requests": 0, "pending": 0, "accounts": 0, "accounts_in_use": 0})
     );
     assert!(state.get("switch").is_none(), "{state}");
 

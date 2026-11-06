@@ -464,6 +464,10 @@ impl Drop for OwnedRecord {
     }
 }
 
+/// How long a command waits for account connections it asked to end if
+/// nothing uses them (`persistent::request_close_if_idle`).
+const CLOSE_ANSWER: Duration = Duration::from_secs(3);
+
 /// What became of a keeper this build cannot use.
 #[derive(Debug, PartialEq, Eq)]
 enum OtherKeeper {
@@ -527,6 +531,16 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
             shell_words::quote(&scope.to_string_lossy())
         ));
     }
+    // Account connections asked to end if nothing uses them, and when;
+    // requests not taken are withdrawn however this ends.
+    struct Asked(Option<Instant>, Vec<PathBuf>);
+    impl Drop for Asked {
+        fn drop(&mut self) {
+            persistent::withdraw_close_requests(&self.1);
+        }
+    }
+    let mut asked = Asked(None, Vec::new());
+    let mut waiting_shown = false;
     while !try_lock(&lock)? {
         if let Some(record) = existing(domain, provider)? {
             return Ok(record);
@@ -534,24 +548,35 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
         // Look again now and then: the account connection may end.
         if other != OtherKeeper::Stopping && Instant::now() >= next_look {
             next_look = Instant::now() + Duration::from_secs(5);
-            let previous = std::mem::replace(
-                &mut other,
-                stop_other_build_keeper(domain, provider, || {
-                    persistent::uses_provider(domain, provider)
-                })?,
-            );
+            other = stop_other_build_keeper(domain, provider, || {
+                persistent::uses_provider(domain, provider)
+            })?;
             if let OtherKeeper::InUse { build } = &other {
-                let in_use = format!(
-                    "the connection to {} that syq {build} opened is still in use by an account connection, approved or waiting for approval, and serves only that version",
-                    provider.label()
-                );
-                // In the default domain such a connection does not end by
-                // itself; in an isolated one it closes once idle for a while.
-                if domain.is_default() {
-                    bail!("{in_use}; finish what uses it, or close both with `{off}`, then retry");
-                }
-                if !matches!(previous, OtherKeeper::InUse { .. }) {
-                    crate::output::diagnostic!("syq: waiting: {in_use}; `{off}` closes both");
+                // Those nothing uses end, and are opened again on their
+                // next use. Keepers that can tell answer within a second.
+                let at = *asked.0.get_or_insert_with(|| {
+                    asked.1 = persistent::request_close_if_idle(domain, provider);
+                    Instant::now()
+                });
+                if at.elapsed() < CLOSE_ANSWER {
+                    next_look = Instant::now() + Duration::from_millis(200);
+                } else {
+                    persistent::withdraw_close_requests(&std::mem::take(&mut asked.1));
+                    let in_use = format!(
+                        "the connection to {} that syq {build} opened is still in use by an account connection, approved or waiting for approval, and serves only that version",
+                        provider.label()
+                    );
+                    // In the default domain such a connection does not end
+                    // by itself; in an isolated one it closes once idle for
+                    // a while.
+                    if domain.is_default() {
+                        bail!(
+                            "{in_use}; finish what uses it, or close both with `{off}`, then retry"
+                        );
+                    }
+                    if !std::mem::replace(&mut waiting_shown, true) {
+                        crate::output::diagnostic!("syq: waiting: {in_use}; `{off}` closes both");
+                    }
                 }
             }
         }
