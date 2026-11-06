@@ -258,6 +258,89 @@ fn registration_reads_only_its_secret_line_from_standard_input() {
     assert!(started.elapsed() < Duration::from_secs(5));
 }
 
+/// A registration that takes over a name takes it only once the laptop
+/// says its service has taken over, and then as soon as the registration
+/// holding it lets go; it stops waiting when the laptop gives up, and after
+/// a while.
+#[test]
+fn a_registration_that_takes_over_waits_for_its_service_and_the_name() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let path = dir.path().join("laptop.lock");
+    let open = || {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap()
+    };
+    let free = || {
+        let probe = open();
+        unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    };
+    let hold = || {
+        let held = open();
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        held
+    };
+    let timed_out = |error: anyhow::Error| {
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::TimedOut),
+            "{error:#}"
+        );
+    };
+
+    // A free name is not taken before the laptop's word.
+    let (laptop, server) = UnixStream::pair().unwrap();
+    let lock = open();
+    timed_out(take_name(&lock, server.as_raw_fd(), Duration::from_millis(200)).unwrap_err());
+    assert!(free(), "taken before the laptop's word");
+    drop(laptop);
+    assert!(!take_name(&lock, server.as_raw_fd(), Duration::from_secs(10)).unwrap());
+    assert!(free());
+
+    // After it, the name is taken the moment the old registration ends.
+    let held = hold();
+    let (mut laptop, server) = UnixStream::pair().unwrap();
+    laptop.write_all(b"\n").unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        let releasing = Instant::now();
+        drop(held);
+        releasing
+    });
+    let lock = open();
+    assert!(take_name(&lock, server.as_raw_fd(), Duration::from_secs(10)).unwrap());
+    assert!(
+        Instant::now() >= release.join().unwrap(),
+        "taken while held"
+    );
+    assert!(!free(), "the new registration holds the name");
+    drop(lock);
+
+    // A laptop that gives up, or a name that stays taken, ends the wait.
+    let held = hold();
+    let (mut laptop, server) = UnixStream::pair().unwrap();
+    laptop.write_all(b"\n").unwrap();
+    let giving_up = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        drop(laptop);
+    });
+    assert!(!take_name(&open(), server.as_raw_fd(), Duration::from_secs(10)).unwrap());
+    giving_up.join().unwrap();
+    let (mut laptop, server) = UnixStream::pair().unwrap();
+    laptop.write_all(b"\n").unwrap();
+    timed_out(take_name(&open(), server.as_raw_fd(), Duration::from_millis(200)).unwrap_err());
+    drop(held);
+}
+
 #[test]
 fn registration_retries_socket_timeout_but_not_peer_rejection() {
     for reject in [false, true] {
@@ -293,7 +376,7 @@ fn registration_retries_socket_timeout_but_not_peer_rejection() {
         } else {
             Duration::from_millis(200)
         };
-        let result = register("laptop", &path, "test-credential", timeout);
+        let result = register("laptop", &path, "test-credential", timeout, false);
         let _ = stop.send(());
         peer.join().unwrap();
         if reject {

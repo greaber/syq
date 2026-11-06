@@ -582,7 +582,7 @@ fn connect_receiving(
         // rather than asks, as receiving's own reconnects do.
         // An unreachable server fails soon, as an ordinary failure, rather
         // than at the login's deadline as one that needs the user
-        // (`switch::LoginWatch`); as the login check does.
+        // (`switch::LoginWatch`); as the new service's login does.
         rsh: match login {
             Login::Ask => vec!["ssh".into()],
             Login::Bounded => vec!["ssh".into(), "-o".into(), "ConnectTimeout=10".into()],

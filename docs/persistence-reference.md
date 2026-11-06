@@ -261,7 +261,9 @@ In an isolated domain, idle SSH connections close after five to ten minutes;
 in the default domain they stay open. Syq installs no login service, so
 connect again after a reboot. After you update syq, receiving and the SSH
 authorization provider switch to the new version once no copy, command, or
-approval is in progress, by themselves or when you next run syq.
+approval is in progress, by themselves or when you next run syq. The new
+version of receiving logs in to the server before the old one stops and keeps
+that login, so a login that fails leaves the old version receiving.
 `syq persist status`, `syq persist on`, `syq persist connect`, and
 `syq persist receive status` switch idle receiving at once, logging in as
 `syq persist connect` does, but not with `--json`.
