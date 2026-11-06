@@ -133,6 +133,11 @@ direct TCP connections. `--no-tcp-encryption` turns this off for TCP, so
 anyone on the network can read or alter the traffic, including its
 authentication token. Use it only on a network you trust.
 
+For TCP, a server lists addresses to connect to, and syq also tries the
+server's SSH address. Syq doesn't look up names a server lists, and doesn't
+connect to loopback, link-local, or multicast addresses it lists, except
+loopback when the server's SSH address is your own machine.
+
 ## Downloaded executables
 
 Syq uses a downloaded executable only if it matches a release manifest signed

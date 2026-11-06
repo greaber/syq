@@ -3145,8 +3145,11 @@ impl RemoteSpec {
                 "TCP listener advertised too many addresses (limit {MAX_ADVERTISED_TCP_ADDRESSES})"
             );
         }
+        let ssh_target = self.resolved_hostname();
+        let reached_locally = ssh_target.as_deref().is_some_and(names_this_machine);
         let mut candidates: Vec<TcpCandidate> = advertised
             .into_iter()
+            .filter(|(address, _)| dials_advertised_address(address, reached_locally))
             .map(|(address, speed_mbps)| TcpCandidate {
                 address,
                 speed_mbps,
@@ -3162,7 +3165,7 @@ impl RemoteSpec {
         // what we connected to. It goes after the LAN / fast-NIC addresses
         // (better when reachable) but before CGNAT / Tailscale ones, which
         // are overlay paths and must not win over the direct public address.
-        if let Some(h) = self.resolved_hostname() {
+        if let Some(h) = ssh_target {
             if !candidates.iter().any(|candidate| candidate.address == h) {
                 let at = candidates
                     .iter()
@@ -3451,6 +3454,47 @@ pub(crate) fn select_tcp_candidates(mut candidates: Vec<TcpCandidate>) -> Vec<Tc
 }
 
 const MAX_ADVERTISED_TCP_ADDRESSES: usize = 64;
+
+/// Whether this machine dials an address the remote host advertised for its
+/// data listener. Servers advertise IP literals; a name is not looked up on
+/// their behalf. Addresses that lead to no single remote machine
+/// (unspecified, multicast, broadcast), or only to this machine's own link
+/// (link-local), are not dialed. Neither is loopback, which leads to this
+/// machine itself, unless the host was reached on this machine
+/// (`names_this_machine`). The host's own SSH name is dialed separately.
+fn dials_advertised_address(address: &str, reached_locally: bool) -> bool {
+    let Ok(ip) = address.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    // An IPv4-mapped IPv6 address leads where its IPv4 address does.
+    let ip = ip.to_canonical();
+    if ip.is_unspecified() || ip.is_multicast() {
+        return false;
+    }
+    if ip.is_loopback() {
+        return reached_locally;
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => !v4.is_link_local() && !v4.is_broadcast(),
+        std::net::IpAddr::V6(v6) => !v6.is_unicast_link_local(),
+    }
+}
+
+/// Whether an SSH host name names this machine: a loopback address, or
+/// `localhost`, which always leads to loopback.
+fn names_this_machine(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.to_canonical().is_loopback(),
+        Err(_) => {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            host == "localhost" || host.ends_with(".localhost")
+        }
+    }
+}
 const MAX_RESOLVED_TCP_ADDRESSES: usize = 128;
 
 /// How one connection attempt ended.
