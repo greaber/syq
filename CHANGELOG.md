@@ -4,7 +4,7 @@ User-facing changes are recorded here starting with the release after
 [0.5.2](https://github.com/greaber/syq/releases/tag/v0.5.2).
 Earlier releases have notes on [GitHub Releases](https://github.com/greaber/syq/releases).
 
-## Unreleased
+## 0.8.0 — 2026-11-06
 
 Changes since 0.7.1. Copies between servers now set up one enrollment per
 server account, authorized by your own SSH key. Copies can preserve hard
@@ -18,9 +18,8 @@ and network filesystems are much faster.
   enrollment per server account, and your own SSH login key signs each copy.
   Enrollments made by syq 0.7.1 and earlier are ignored and not listed; the
   first copy sets up a new one beside them, and an older syq can keep using
-  the old ones. Revoke them with the older syq before upgrading, or remove
-  them by hand as described in
-  [enrollments from older versions](docs/remote-reference.md#enrollments-from-older-versions).
+  the old ones. `syq receiver list` reports old enrollments and prints the
+  steps to remove them.
   `syq receiver enroll` now takes an account, `[USER@]HOST`, instead of
   `HOST:DESTINATION`.
 - **Enrollment needs a key login and an ordinary account.** The login to the
@@ -86,14 +85,17 @@ and network filesystems are much faster.
 - **Receiving machines:** after upgrading both machines, run
   `syq persist connect SERVER` on the receiving machine. It replaces the
   receiving connection from the older version and keeps your settings;
-  requests that were waiting for approval must be made again. See
-  [updating connections](docs/persistence-reference.md#updating-connections).
+  requests that were waiting for approval must be made again. Services started
+  by this release follow later executable updates once they are idle.
 - **Builds from source**, including `cargo install syq` and Python source
   builds, now report their development version, such as
   `0.7.1+dev.0123456789ab`, from `--version` and in results.
 
 ### Behavior changes
 
+- A symlink named as a `syq cp` source now stops the copy with an explanation.
+  Use `--follow-src` to copy its target or `--src-non-dir` to copy the link
+  itself. Links inside copied directories stay links.
 - `--auth-from auto`, the default, first tries the server's own SSH login. It
   asks a receiving machine for approval only when that login fails: the key is
   refused, the host key is not trusted, the name does not resolve, or the
@@ -167,6 +169,15 @@ and network filesystems are much faster.
   command to finish setting up SSH access.
 - A command that starts background connections or receiving says so once and
   names `syq persist off`.
+- Receiving services and SSH authorization providers follow updates to their
+  executable when idle, preserving their settings. Active copies and commands
+  finish first; a login that needs your SSH key waits for a terminal command.
+  `syq persist status` shows services waiting to switch and why.
+- Receiving approval prompts warn when mappings can set file permissions or
+  group ownership. Automatic approval allows these changes inside its root.
+- Unknown `@NAME` destinations report registered receiving names instead of
+  trying an invalid SSH login. Attempts to copy from a receiving name explain
+  that the copy must start on the receiving machine.
 
 ### Copying
 
@@ -254,6 +265,8 @@ and network filesystems are much faster.
 
 ### Fixes
 
+- A failed copy leaves its error as the final line instead of overwriting it
+  with a progress display.
 - A same-machine in-place copy could leave an existing file empty when its
   fallback write failed, for example on an rclone mount or a full disk.
 - Delayed write errors, such as a full NFS export, are reported before the file
