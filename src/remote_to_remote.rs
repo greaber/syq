@@ -1231,6 +1231,7 @@ pub(crate) fn prepare_receiver_ssh_with(
     let lookup = &connection.lookup;
     let mut approving = String::new();
     let mut approving_entries = 0;
+    let mut approving_revokes = false;
     let mut approving_name = None;
     for line in known_hosts.lines() {
         let (marker, rest) = match line.split_once(' ') {
@@ -1243,6 +1244,7 @@ pub(crate) fn prepare_receiver_ssh_with(
         approving_name.get_or_insert(name);
         let key = ssh_key::PublicKey::from_openssh(key).context("invalid receiver host key")?;
         if let Some(marker) = marker {
+            approving_revokes |= marker == "@revoked";
             approving.push_str(marker);
             approving.push(' ');
         }
@@ -1252,6 +1254,13 @@ pub(crate) fn prepare_receiver_ssh_with(
     // The approving machine's knowledge, when it has any, joins this
     // machine's without changing what this machine's configuration names.
     let union = approving_entries > 0 && connection.approving_keys() != ApprovingKeys::Omitted;
+    // Leaving out a key the approving machine revokes could let this machine
+    // trust it, so that is refused rather than noted.
+    anyhow::ensure!(
+        union || !approving_revokes,
+        "the machine that approved this copy revokes a host key for the destination, and this machine cannot check the destination's key against it: {}",
+        connection.omission_cause()
+    );
     if approving_entries > 0 && !union && !args.quiet {
         crate::output::diagnostic!(
             "syq: checking the destination's host key without what the approving machine knows about it: {}",

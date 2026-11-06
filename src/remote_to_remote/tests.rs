@@ -1338,6 +1338,35 @@ fn receiver_ssh_uses_the_entry_key_first_and_checks_host_keys_as_this_machine_do
     }));
     assert_eq!(args.receiver_host.take().unwrap().1.approving, None);
     drop(guard);
+    // Without them, a key the approving machine revokes could be trusted
+    // here, so the copy is refused.
+    let revoked =
+        ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ed25519)
+            .unwrap();
+    let revoking = format!(
+        "{known_hosts}@revoked backup-alias {}\n",
+        revoked.public_key().to_openssh().unwrap()
+    );
+    args.rsh = Some(shell_words::join(&words));
+    let error = prepare_receiver_ssh_with(&mut args, &revoking, entry_key.as_bytes())
+        .err()
+        .expect("a revocation that cannot be passed on refuses the copy");
+    assert!(
+        error
+            .to_string()
+            .contains("revokes a host key for the destination")
+            && error.to_string().contains("KnownHostsCommand of its own"),
+        "{error:#}"
+    );
+    // Where it can join, the revocation goes along.
+    args.rsh = Some(template.clone());
+    let guard = prepare_receiver_ssh_with(&mut args, &revoking, entry_key.as_bytes()).unwrap();
+    assert!(
+        std::fs::read_to_string(guard.path().join(APPROVING_KNOWN_HOSTS))
+            .unwrap()
+            .contains("@revoked [backup.example.net]:2222 ")
+    );
+    drop(guard);
 
     // An approving machine that knows nothing adds nothing.
     args.rsh = Some(template.clone());

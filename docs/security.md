@@ -241,9 +241,11 @@ HostA checks hostB's host key with its own SSH configuration, as its own `ssh`
 would. It also trusts the keys and host certificate authorities your laptop's
 known_hosts lists for hostB, and refuses keys marked `@revoked` there. Your
 laptop's `RevokedHostKeys` and `KnownHostsCommand` settings are not passed on;
-syq says so when it leaves them out. If your laptop trusts hostB only through a
-certificate authority and hostB presents a plain key, hostA treats hostB as
-unknown.
+syq says so when it leaves them out. If hostA's SSH configuration can't take
+your laptop's entries, hostA checks hostB without them and syq says so, unless
+they revoke a key: then syq refuses the copy. If your laptop trusts hostB only
+through a certificate authority and hostB presents a plain key, hostA treats
+hostB as unknown.
 
 When neither machine knows hostB, nobody can answer a prompt on hostA, so its
 default `StrictHostKeyChecking ask` works like `accept-new`: it accepts the key
