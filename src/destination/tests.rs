@@ -423,6 +423,23 @@ pub(super) fn broker_with_limits(
     Registration,
     mpsc::Receiver<Prompt>,
 ) {
+    broker_confined(root, approval, max_delete, max_entries, true)
+}
+
+/// A receiver starting in `root`, which is also its automatic approval root
+/// and, when `confined`, its hard root.
+fn broker_confined(
+    root: &Path,
+    approval: Approval,
+    max_delete: u64,
+    max_entries: u64,
+    confined: bool,
+) -> (
+    PrivateBroker,
+    Arc<Receiver>,
+    Registration,
+    mpsc::Receiver<Prompt>,
+) {
     let (prompts, requests) = mpsc::sync_channel(1);
     let receiver = Arc::new(Receiver {
         tcp_peer: crate::conn::RemoteSpec::local_receiver(false),
@@ -438,7 +455,7 @@ pub(super) fn broker_with_limits(
         approvals: Arc::new(crate::receive_approval::Queue::default()),
         generation: AtomicU64::new(0),
         cwd: root.into(),
-        root: Some(root.into()),
+        root: confined.then(|| root.into()),
         secret: random_token().unwrap(),
         max_bytes: 10_000_000,
         max_entries,
@@ -1528,35 +1545,168 @@ fn receiving_cwd_allows_other_paths_but_root_confines_them() {
     let outside = temp.join("outside");
     fs::create_dir(&outside).unwrap();
     std::os::unix::fs::symlink(&outside, cwd.join("link")).unwrap();
+    let resolved = |path: &[u8], follow: bool| {
+        resolve_destination(&cwd, None, path, follow, None).map(|(destination, _)| destination)
+    };
+    for follow in [false, true] {
+        assert_eq!(resolved(b"../file", follow).unwrap(), temp.join("file"));
+        assert_eq!(
+            resolved(outside.join("file").as_os_str().as_bytes(), follow).unwrap(),
+            outside.join("file")
+        );
+        // The final entry is never followed.
+        assert_eq!(resolved(b"link", follow).unwrap(), cwd.join("link"));
+        assert_eq!(
+            resolved(b"missing/deeper/file", follow).unwrap(),
+            cwd.join("missing/deeper/file")
+        );
+    }
+    // As in any copy, a symlink above the destination stops it unless the
+    // command follows destination paths.
+    for path in [&b"link/file"[..], b"link/../file", b"./link/sub/file"] {
+        let error = resolved(path, false).unwrap_err().to_string();
+        assert!(
+            error.starts_with("refusing to follow symlink \"link\" in a path you gave; ")
+                && error.contains("--follow-dst"),
+            "{error}"
+        );
+    }
+    let through = cwd.join("link/file");
+    assert!(resolved(through.as_os_str().as_bytes(), false).is_err());
+    assert_eq!(resolved(b"link/file", true).unwrap(), outside.join("file"));
+    assert_eq!(resolved(b"link/../file", true).unwrap(), temp.join("file"));
     assert_eq!(
-        resolve_destination(&cwd, None, b"../file").unwrap().0,
-        temp.join("file")
-    );
-    assert_eq!(
-        resolve_destination(&cwd, None, outside.join("file").as_os_str().as_bytes())
-            .unwrap()
-            .0,
+        resolved(through.as_os_str().as_bytes(), true).unwrap(),
         outside.join("file")
     );
+    assert!(resolve_destination(&cwd, Some(&cwd), b"../file", false, None).is_err());
+    assert!(resolve_destination(
+        &cwd,
+        Some(&cwd),
+        outside.as_os_str().as_bytes(),
+        false,
+        None
+    )
+    .is_err());
     assert_eq!(
-        resolve_destination(&cwd, None, b"link/file").unwrap().0,
-        outside.join("file")
-    );
-    assert_eq!(
-        resolve_destination(&cwd, None, b"link/../file").unwrap().0,
-        temp.join("file")
-    );
-    assert_eq!(
-        resolve_destination(&cwd, None, b"link").unwrap().0,
-        cwd.join("link")
-    );
-    assert!(resolve_destination(&cwd, Some(&cwd), b"../file").is_err());
-    assert!(resolve_destination(&cwd, Some(&cwd), outside.as_os_str().as_bytes()).is_err());
-    assert_eq!(
-        resolve_destination(&cwd, Some(&cwd), b"child/file")
+        resolve_destination(&cwd, Some(&cwd), b"child/file", false, None)
             .unwrap()
             .0,
         cwd.join("child/file")
+    );
+}
+
+/// A copy to the laptop refuses a symlink above its destination unless its
+/// command passes `--follow-dst`, as any copy does; then the destination is
+/// where the link leads, and the prompt says so.
+#[test]
+fn a_symlink_above_a_laptop_destination_needs_follow_dst() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let temp = fs::canonicalize(temp.path()).unwrap();
+    let cwd = temp.join("downloads");
+    fs::create_dir(&cwd).unwrap();
+    let outside = temp.join("outside");
+    fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, cwd.join("link")).unwrap();
+    let (_broker, receiver, registration, _) =
+        broker_confined(&cwd, Approval::Always, 0, 1000, false);
+    let command = |follow: bool| -> Vec<Vec<u8>> {
+        [
+            "cp", "--src", "source", "--to", "@laptop", "--into", "link/sub",
+        ]
+        .into_iter()
+        .chain(follow.then_some("--follow-dst"))
+        .chain(["--tcp-ports", "0-0", "--resource-limits", "workers=2"])
+        .map(|arg| arg.as_bytes().to_vec())
+        .collect()
+    };
+    let ask = |command: Vec<Vec<u8>>| {
+        let (request, _) = request(&crate::approval_command::parse(&command).unwrap());
+        let registration = registration.clone();
+        std::thread::spawn(move || {
+            exchange(
+                &registration,
+                Message::Request {
+                    cwd: String::new(),
+                    command,
+                    request: Box::new(request),
+                },
+                Duration::from_secs(10),
+                Some(Duration::from_secs(10)),
+            )
+        })
+    };
+    let error = ask(command(false)).join().unwrap().err().unwrap();
+    assert!(
+        format!("{error:#}").contains("refusing to follow symlink \"link\" in a path you gave"),
+        "{error:#}"
+    );
+    assert!(receiver.approvals.snapshots().is_empty());
+    // Following, the copy goes where the link leads, outside the automatic
+    // approval root, so it asks.
+    let task = ask(command(true));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let pending = loop {
+        if let Some(summary) = receiver.approvals.snapshots().first() {
+            break summary.clone();
+        }
+        assert!(Instant::now() < deadline, "the copy did not ask");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let destination = outside.join("sub");
+    assert_eq!(
+        serde_json::to_value(&pending).unwrap()["destination"],
+        format!("{destination:?}")
+    );
+    receiver
+        .approvals
+        .decide(&pending.id, true, crate::receive_approval::Kind::Copy)
+        .unwrap();
+    let (_, reply) = task.join().unwrap().unwrap();
+    let Reply::Approved(approved) = reply else {
+        panic!("no approval");
+    };
+    assert_eq!(approved.destination, destination.as_os_str().as_bytes());
+}
+
+/// A path in the home directory starts where the home really is, so links
+/// in the home's own path work; a link inside the home still stops the copy.
+#[test]
+fn receiving_destinations_in_the_home_start_where_it_is() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let temp = fs::canonicalize(temp.path()).unwrap();
+    let real_home = temp.join("var/home/me");
+    fs::create_dir_all(real_home.join("inbox")).unwrap();
+    std::os::unix::fs::symlink(temp.join("var/home"), temp.join("home")).unwrap();
+    let home = temp.join("home/me");
+    std::os::unix::fs::symlink(real_home.join("inbox"), real_home.join("linked")).unwrap();
+    let cwd = temp.join("downloads");
+    fs::create_dir(&cwd).unwrap();
+    let resolved = |path: &Path| {
+        resolve_destination(
+            &cwd,
+            None,
+            path.as_os_str().as_bytes(),
+            false,
+            Some((&home, &real_home)),
+        )
+    };
+    let (destination, container) = resolved(&home.join("inbox/file")).unwrap();
+    assert_eq!(destination, real_home.join("inbox/file"));
+    assert_eq!(container, real_home.join("inbox"));
+    let error = resolved(&home.join("linked/file")).unwrap_err().to_string();
+    assert!(
+        error.starts_with("refusing to follow symlink \"linked\""),
+        "{error}"
+    );
+    // Outside the home, the same link in its path stops the copy.
+    fs::create_dir(temp.join("var/home/other")).unwrap();
+    let error = resolved(&temp.join("home/other/file"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.starts_with("refusing to follow symlink \"home\""),
+        "{error}"
     );
 }
 #[test]

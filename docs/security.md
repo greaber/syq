@@ -284,6 +284,10 @@ HostA can:
 - Ignore `--where` and `--copy-if`; hostB enforces only the destination, the
   write and deletion permissions, and the limits.
 - Stop the transfer or withhold hostB's reports, which fails the copy.
+- Have hostB remove syq's leftover partial files beside the files the copy
+  writes, as any copy does, even when the copy may not otherwise delete. These
+  are files named like `.FILENAME.syq-tmp.RANDOM` that the account owns, that
+  have no other names, and that no program has open for writing.
 
 HostA cannot:
 

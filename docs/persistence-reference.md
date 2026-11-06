@@ -243,8 +243,12 @@ Copies to a receiving name are refused while syq runs as root on the receiving
 machine. They cannot preserve hard links, ACLs, extended attributes, or access
 or birth times, and cannot use `--open-noatime` or `--sparse`; the other
 `--copy-metadata` options work as for any copy by an account other than root.
-They never follow a destination symlink, even with `--follow-dst`; name the
-link's target instead.
+
+As in any copy, a symlink in a directory above the destination stops the copy
+unless the command passes `--follow-dst`; links in your home directory's own
+path are fine. With `--root`, symlinks inside the root are never followed. A
+symlink at the destination itself is never followed, even with `--follow-dst`;
+name the link's target instead.
 
 ## Connection lifetime and waits
 

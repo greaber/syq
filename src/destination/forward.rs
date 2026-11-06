@@ -1094,7 +1094,9 @@ fn resolve_ssh_destination(home: &Path, path: &[u8]) -> Result<(PathBuf, PathBuf
     } else {
         path
     };
-    resolve_destination(home, None, path)
+    // This receiver starts in the home and, holding no command, follows
+    // symlinks above the destination as it always has.
+    resolve_destination(home, None, path, true, None)
 }
 
 fn receive() -> Result<i32> {
@@ -1531,7 +1533,9 @@ mod tests {
         );
         // The shared named resolver still interprets paths relative to cwd.
         assert_eq!(
-            resolve_destination(&home, None, b"~/archive").unwrap().0,
+            resolve_destination(&home, None, b"~/archive", false, None)
+                .unwrap()
+                .0,
             home.join("~/archive")
         );
     }
