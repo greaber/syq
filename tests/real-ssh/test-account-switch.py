@@ -119,10 +119,11 @@ try:
     wait_for("the idle account connection to end", lambda: not accounts_on_source(), 20)
 
     # A session that starts between the look and the stop runs on while
-    # its master drains; another command meanwhile opens a connection of its
-    # own beside it, and `persist off` still ends the draining master before
-    # it reports success. The keeper is told no session uses the master, as
-    # if this one started just after it looked.
+    # its master drains, which status shows as closing; another command
+    # meanwhile opens a connection of its own beside it; and turning
+    # receiving off on the laptop still ends the draining master. The keeper
+    # is told no session uses the master, as if this one started just after
+    # it looked.
     def connect(*extra_env, command=("persist", "connect", "destination")):
         args = ["env", NATIVE_PATH, *extra_env, "syq", *command]
         if command[0] == "persist":
@@ -157,14 +158,18 @@ try:
            "sh", index)
     wait_for("the keeper to give up its record", lambda: not accounts_on_source(), 20)
     time.sleep(1)
+    rows = json.loads(source("syq", "persist", "status", "--json"))["authorized_ssh"]
+    assert [row["control"] for row in rows if row["closing"]] == [control], rows
     # The session and its master run on, and a new connection opens beside it.
     assert shell.poll() is None, shell.communicate()
     source("test", "-d", "/proc/" + master)
     connect()
     assert len(accounts_on_source()) == 1
     source("test", "-d", "/proc/" + master)
-    source("syq", "persist", "off")
-    source("test", "!", "-d", "/proc/" + master)
+    run("syq", "persist", "receive", "off", "--pscope", scope, "--name", NAME)
+    wait_for("revoking the connection to end the draining master",
+             lambda: subprocess.run(["ssh", "source", "test ! -d /proc/" + master],
+                                    timeout=40).returncode == 0, 20)
     shell.communicate(timeout=30)
     shell = None
 finally:

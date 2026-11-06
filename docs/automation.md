@@ -305,7 +305,8 @@ authorization provider when it runs another build or switches.
 
 `authorized_ssh` lists approved account connections, each with `authorizer`,
 `requested` (the original selection), `endpoint` (the resolved account and
-address), `control`, and `connected`; the two endpoint objects have `user`,
+address), `control`, `connected`, and `closing` (it takes no new sessions and
+ends once those running end, as after a switch to a new version); the two endpoint objects have `user`,
 `host`, and `port`. A return authorizer is its name as a string, and an SSH
 provider is an object whose `ssh` field holds the provider endpoint.
 `authorized_ssh_errors` lists account records that couldn't be read; the command

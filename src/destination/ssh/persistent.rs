@@ -626,6 +626,9 @@ pub(crate) struct Status {
     endpoint: NativeEndpoint,
     control: PathBuf,
     connected: bool,
+    /// Its master takes no new sessions and ends once those it has end,
+    /// as when a switch to another build closed it while one ran.
+    closing: bool,
 }
 #[derive(Default)]
 pub(crate) struct StatusSnapshot {
@@ -768,17 +771,22 @@ pub(crate) fn status(domain: &Domain) -> Result<StatusSnapshot> {
             let Some(record) = read_record(&path)? else {
                 return Ok(None);
             };
-            if !record.control.exists() {
+            // A master that stopped listening has no socket, but its
+            // keeper's lock says it still runs (`Drain`).
+            let closing = !record.control.exists()
+                && keeper_lock_path(&path, &record.control).is_some_and(|lock| held(&lock));
+            if !closing && !record.control.exists() {
                 return Ok(None);
             }
             validate_record(domain, &record)?;
-            let connected = live(&record);
+            let connected = !closing && live(&record);
             Ok(Some(Status {
                 authorizer: record.authorizer,
                 requested: record.requested,
                 endpoint: record.endpoint,
                 control: record.control,
                 connected,
+                closing,
             }))
         })();
         match result {
@@ -802,7 +810,13 @@ pub(crate) fn print_status(rows: &[Status]) {
             "  {} through {}  {} (reusable account access)\n    SSH control socket: {}",
             row.requested.host,
             row.authorizer,
-            if row.connected { "ready" } else { "inactive" },
+            if row.closing {
+                "closing"
+            } else if row.connected {
+                "ready"
+            } else {
+                "inactive"
+            },
             row.control.display()
         );
     }
@@ -1150,6 +1164,21 @@ fn start(domain: &Domain, request: SessionRequest, plan: resolution::Plan) -> Re
 }
 
 struct Index(PathBuf);
+fn path_of(index: &Option<Index>) -> PathBuf {
+    index
+        .as_ref()
+        .map(|index| index.0.clone())
+        .unwrap_or_default()
+}
+/// Write `record` at `path` in one step.
+fn write_record(path: &Path, record: &Record) -> Result<()> {
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(path.parent().context("record has no directory")?)?;
+    serde_json::to_writer(&mut temporary, record)?;
+    temporary.write_all(b"\n")?;
+    temporary.persist(path)?;
+    Ok(())
+}
 impl Drop for Index {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
@@ -1196,6 +1225,8 @@ fn keeper(startup: Startup) -> Result<()> {
     // Released last, after the scope is removed and everything in it ended,
     // which `persist off` relies on (`keeper_lock_path`).
     let mut keeper_lock: Option<File> = None;
+    // The record of a closing master, removed before that lock is released.
+    let mut closing_record: Option<Index> = None;
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1444,13 +1475,21 @@ fn keeper(startup: Startup) -> Result<()> {
     let mut drain = Drain::default();
     // The record and its lock, until the master is ending: then a new
     // command opens a connection of its own beside it at once, while the
-    // keeper's own lock keeps it visible to `persist off`.
+    // keeper's own lock keeps it visible to `persist off`, and a record
+    // under that lock's name keeps it in status, as closing.
     let mut index = Some(index);
     // Only a default-domain master drains: this keeper is its parent and
     // sees it exit. An explicit-domain master is a daemon apart from it.
     let drains = domain.is_default();
     let use_count = || in_use(&record.control);
-    let mut stop = || stop_listening(&record).is_ok();
+    let mut stop = || {
+        // A spare session would keep the master.
+        let _ = cleanup::stop_pool(&record.control);
+        stop_listening(&record).is_ok()
+    };
+    // Closing ends the loop once the master exits; until then, revoking
+    // the connection, by its approving side going away, a new generation,
+    // `persist off` or a signal, still ends the master at once.
     loop {
         if domain.is_default() {
             if master.poll()?.is_some() {
@@ -1470,39 +1509,48 @@ fn keeper(startup: Startup) -> Result<()> {
             }
         }
         if signals.received.load(Ordering::Acquire) != 0
-            || (!drain.closing && session.cancelled())
+            || session.cancelled()
             || !startup_open(&domain, &startup)?
             || scope.path().join(crate::receive_service::CLOSING).exists()
         {
             break;
         }
-        if !drain.closing && drains {
+        if drains {
             if linked.is_none() {
                 linked = session.enter_link()?;
             }
             if linked == Some(true) {
                 if let Some(request) = session.link_request()? {
-                    let reply = drain.answer(request, &use_count, &mut stop);
+                    let mut ended = || {
+                        let deadline = Instant::now() + Duration::from_millis(300);
+                        loop {
+                            if !matches!(master.poll(), Ok(None)) {
+                                return true;
+                            }
+                            if Instant::now() >= deadline {
+                                return false;
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    };
+                    let reply = drain.answer(request, &use_count, &mut stop, &mut ended);
                     session.answer(reply)?;
                 }
-            }
-        } else if linked == Some(true) {
-            // Still answer: the master no longer depends on the approving
-            // side, which then lets the link go.
-            if let Ok(Some(request)) = session.link_request() {
-                let _ = session.answer(drain.answer(request, &use_count, &mut stop));
             }
         }
         if !drain.closing && drains && close_request.exists() {
             let _ = fs::remove_file(&close_request);
             drain.close_if_idle(&use_count, &mut stop);
         }
-        if drain.closing && !std::mem::replace(&mut drain.pool_stopped, true) {
-            // A spare session would keep the master.
-            let _ = pool.stop();
-            // Remove the record, then release its lock; the keeper's own
-            // lock stays. Stopping persistence or this keeper still ends the
-            // master, and `persist off` waits for that.
+        if drain.closing && index.is_some() {
+            // Keep a record under the keeper lock's name, then remove the
+            // account's record and release its lock.
+            if let Some(path) = keeper_lock_path(&path_of(&index), &record.control) {
+                let path = path.with_extension("json");
+                if write_record(&path, &record).is_ok() {
+                    closing_record.replace(Index(path));
+                }
+            }
             drop(index.take());
             drop(lock.take());
         }
@@ -1581,25 +1629,32 @@ fn in_use(control: &Path) -> Option<usize> {
 #[derive(Default)]
 struct Drain {
     closing: bool,
-    pool_stopped: bool,
 }
 impl Drain {
     /// Answer the approving side. `use_count` counts the sessions using
-    /// the master, None when it cannot; `stop` stops it taking new ones.
+    /// the master, None when it cannot; `stop` stops it taking new ones;
+    /// `ended` says whether the master has exited, waiting a moment.
+    /// It is closed only once its master exited: until then a session that
+    /// started between the look and the stop still runs, and the approving
+    /// side keeps the connection, whose end then still ends the master.
     fn answer(
         &mut self,
         request: LinkRequest,
         use_count: &dyn Fn() -> Option<usize>,
         stop: &mut dyn FnMut() -> bool,
+        ended: &mut dyn FnMut() -> bool,
     ) -> LinkReply {
-        let used = match request {
-            LinkRequest::CloseIfIdle if self.close_if_idle(use_count, stop) => {
-                return LinkReply::Closing
-            }
-            _ if self.closing => return LinkReply::Closing,
-            _ => use_count(),
-        };
-        match used {
+        if request == LinkRequest::CloseIfIdle {
+            self.close_if_idle(use_count, stop);
+        }
+        if self.closing {
+            return if ended() {
+                LinkReply::Closing
+            } else {
+                LinkReply::InUse
+            };
+        }
+        match use_count() {
             Some(0) if request == LinkRequest::Query => LinkReply::Idle,
             Some(_) => LinkReply::InUse,
             None => LinkReply::Unknown,
@@ -1856,12 +1911,14 @@ mod tests {
     /// A link's close and a newer command's close request can arrive
     /// together. Once the first stopped the master taking new sessions,
     /// the session that started meanwhile does not undo it, and nothing
-    /// stops the master again: the keeper keeps ignoring the end of its
-    /// stream and lets that session finish.
+    /// stops the master again. The connection says it is closed only once
+    /// its master exited: until then it is in use, so that its approving
+    /// side keeps it, and revoking it still ends the master.
     #[test]
     fn a_master_ending_because_idle_stays_ending() {
         let sessions = std::cell::Cell::new(0);
         let stops = std::cell::Cell::new(0);
+        let exited = std::cell::Cell::new(false);
         let use_count = || Some(sessions.get());
         let mut stop = || {
             stops.set(stops.get() + 1);
@@ -1869,52 +1926,71 @@ mod tests {
             sessions.set(1);
             true
         };
+        let mut ended = || exited.get();
         let mut drain = Drain::default();
         assert_eq!(
-            drain.answer(LinkRequest::CloseIfIdle, &use_count, &mut stop),
-            LinkReply::Closing
+            drain.answer(LinkRequest::CloseIfIdle, &use_count, &mut stop, &mut ended),
+            LinkReply::InUse
         );
-        assert!(drain.close_if_idle(&use_count, &mut stop));
         assert!(drain.closing);
+        assert!(drain.close_if_idle(&use_count, &mut stop));
         assert_eq!(stops.get(), 1);
         assert_eq!(
-            drain.answer(LinkRequest::Query, &use_count, &mut stop),
+            drain.answer(LinkRequest::Query, &use_count, &mut stop, &mut ended),
+            LinkReply::InUse
+        );
+        // That session ended, and with it the master.
+        exited.set(true);
+        assert_eq!(
+            drain.answer(LinkRequest::CloseIfIdle, &use_count, &mut stop, &mut ended),
             LinkReply::Closing
         );
+        assert_eq!(stops.get(), 1);
 
         // In use, or unknown: it says so and stays.
         let mut drain = Drain::default();
         assert_eq!(
-            drain.answer(LinkRequest::CloseIfIdle, &use_count, &mut stop),
-            LinkReply::InUse
-        );
-        assert_eq!(
-            drain.answer(LinkRequest::Query, &use_count, &mut stop),
+            drain.answer(LinkRequest::CloseIfIdle, &use_count, &mut stop, &mut ended),
             LinkReply::InUse
         );
         let unknown = || None;
         assert_eq!(
-            drain.answer(LinkRequest::Query, &unknown, &mut stop),
+            drain.answer(LinkRequest::Query, &unknown, &mut stop, &mut ended),
             LinkReply::Unknown
         );
         assert_eq!(
-            drain.answer(LinkRequest::CloseIfIdle, &unknown, &mut stop),
+            drain.answer(LinkRequest::CloseIfIdle, &unknown, &mut stop, &mut ended),
             LinkReply::Unknown
         );
-        assert!(!drain.close_if_idle(&unknown, &mut stop));
         assert!(!drain.closing);
         assert_eq!(stops.get(), 1);
 
-        // Idle, but the master would not stop: it stays, in use as far as
-        // anyone can tell.
+        // Idle, and the master exits at the stop: closed at once.
         sessions.set(0);
-        let mut refuse = || false;
+        let mut quiet_stop = || true;
         assert_eq!(
-            drain.answer(LinkRequest::Query, &use_count, &mut refuse),
+            drain.answer(LinkRequest::Query, &use_count, &mut quiet_stop, &mut ended),
             LinkReply::Idle
         );
         assert_eq!(
-            drain.answer(LinkRequest::CloseIfIdle, &use_count, &mut refuse),
+            drain.answer(
+                LinkRequest::CloseIfIdle,
+                &use_count,
+                &mut quiet_stop,
+                &mut ended
+            ),
+            LinkReply::Closing
+        );
+        // Idle, but the master would not stop: it stays.
+        let mut drain = Drain::default();
+        let mut refuse = || false;
+        assert_eq!(
+            drain.answer(
+                LinkRequest::CloseIfIdle,
+                &use_count,
+                &mut refuse,
+                &mut ended
+            ),
             LinkReply::InUse
         );
         assert!(!drain.closing);
