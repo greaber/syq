@@ -4141,21 +4141,34 @@ fn a_receiving_name_that_cannot_start_here_does_not_hold_back_a_switch() {
     assert_eq!(state["identity"], this_build(), "{state}");
     let profiles = state["profiles"].as_array().unwrap();
     assert_eq!(profiles.len(), 2, "{state}");
-    for profile in profiles {
-        let connection = &profile["connection"];
-        if profile["settings"]["name"] == "elsewhere" {
-            assert_eq!(connection["phase"], "failed", "{state}");
-            assert!(
-                connection["error"]
-                    .as_str()
-                    .unwrap()
-                    .contains("receiving directory is unavailable"),
-                "{state}"
-            );
-        } else {
-            assert_eq!(connection["phase"], "online", "{state}");
-        }
-    }
+    let elsewhere = profiles
+        .iter()
+        .find(|profile| profile["settings"]["name"] == "elsewhere")
+        .unwrap();
+    assert_eq!(elsewhere["connection"]["phase"], "failed", "{state}");
+    assert!(
+        elsewhere["connection"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("receiving directory is unavailable"),
+        "{state}"
+    );
+    // The command says so as soon as the new service shows it; the other
+    // name, which kept its login, takes over its name meanwhile.
+    wait_for(
+        "the other name to receive",
+        std::time::Duration::from_secs(20),
+        || {
+            installed.request(serde_json::json!({"version": 2, "stop": false}))["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|profile| {
+                    profile["settings"]["name"] != "elsewhere"
+                        && profile["connection"]["phase"] == "online"
+                })
+        },
+    );
 }
 
 /// The control of a service started as a switch starts one, with `program`
