@@ -70,14 +70,44 @@ root = Path(v["root"])
 matches = list(root.glob("." + v["name"] + ".syq-tmp.*"))
 print(json.dumps(any(hashlib.sha256(p.open("rb").read(1 << 20)).hexdigest() == v["digest"] for p in matches)))
 ''',
-    "kill_requester": r'''
+    "signal_requester": r'''
 from pathlib import Path
 import os, signal
 pid = int(Path(v["pidfile"]).read_text())
 args = Path("/proc", str(pid), "cmdline").read_bytes().rstrip(b"\0").decode().split("\0")
 assert Path(args[0]).name == "syq" and args[1] == "cp", "PID is not the requesting syq copy"
-os.kill(pid, signal.SIGKILL)
+os.kill(pid, getattr(signal, v["signal"]))
 print("true")
+''',
+    "key_dirs": r'''
+from pathlib import Path
+import os, tempfile
+owned = []
+for p in Path(tempfile.gettempdir()).glob("syq-receiver-hosts-*"):
+    try:
+        if p.stat().st_uid == os.getuid():
+            owned.append(str(p))
+    except FileNotFoundError:
+        pass
+print(json.dumps(sorted(owned)))
+''',
+    "kill_receivers": r'''
+from pathlib import Path
+import os, signal
+killed = []
+for p in Path("/proc").iterdir():
+    if not p.name.isdigit():
+        continue
+    try:
+        args = p.joinpath("cmdline").read_bytes().rstrip(b"\0").decode().split("\0")
+        if (len(args) > 1 and Path(args[0]).name == "syq" and args[1] == "--restricted-receiver"
+                and p.stat().st_uid == os.getuid()):
+            os.kill(int(p.name), signal.SIGKILL)
+            killed.append(int(p.name))
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        pass
+assert killed, "the destination has no restricted receiver"
+print(json.dumps(killed))
 ''',
 }
 
@@ -235,10 +265,10 @@ def main():
 
         attempts = {}
 
-        def command(name, extra=(), source="data"):
+        def command(name, extra=(), source="data", auth=("--auth-from", "@laptop")):
             attempts[name] = attempts.get(name, 0) + 1
             argv = ["syq", "cp", "--from", "source", b + "/" + source, "--to", "destination",
-                    "--as", c + "/" + name, "--auth-from", "@laptop",
+                    "--as", c + "/" + name, *auth,
                     "--performance-tuning", "workers=2", "--no-progress",
                     "--results", f"{a}/{name}.{attempts[name]}.ndjson", *extra]
             script = ("test -z \"${SSH_AUTH_SOCK:-}\" && echo $$ > " + shlex.quote(a + "/pid")
@@ -264,6 +294,32 @@ def main():
 
         def partial(name, expected_prefix=prefix):
             return probe("destination", "partial", root=c, name=name, digest=expected_prefix)
+
+        def stopped(name, description, stop):
+            """Start a slow copy and stop it with `stop` once data arrives: the
+            source's receiver and the coordinator it runs both end, and
+            nothing is published."""
+            with running(command(name, ("--no-tcp", "--resource-limits", "bandwidth=512K"),
+                                 source="large")) as (process, output):
+                decide()
+                wait_for("copy data before " + description, lambda: partial(name))
+                coordinator = probe("source", "coordinator", destination=c + "/" + name)
+                assert len(coordinator) == 1, coordinator
+                owned = [[coordinator[0]["pid"], coordinator[0]["started"]],
+                         [coordinator[0]["parent"], coordinator[0]["parent_started"]]]
+                stop()
+                wait_for("the source's receiver and coordinator after " + description,
+                         lambda: probe("source", "exited", processes=owned), timeout=10)
+                finish(process, output, success=False)
+            remote("destination", "test ! -e " + shlex.quote(c + "/" + name))
+            assert pending() == []
+
+        # The private directories that hold the destination's entry key on
+        # the source go when its coordinator ends.
+        key_dirs = probe("source", "key_dirs")
+
+        def no_key_dirs():
+            return probe("source", "key_dirs") == key_dirs
 
         print("case: a dry run between two servers does not set restricted copying up", flush=True)
         with running(command("dry", ("--dry-run",))) as (process, output):
@@ -315,6 +371,39 @@ def main():
             finish(process, output)
         assert_copied("ssh")
         assert "syq-copy-worker" not in authorized_keys("destination")
+        wait_for("the source's entry key cleanup after completed copies", no_key_dirs)
+
+        print("case: a saved choice approves a copy between servers, and blocked TCP falls back to SSH", flush=True)
+        remote("requester", "syq persist auth-from @laptop --for source")
+        blocked = os.environ["SYQ_REAL_SSH_BLOCKED_TCP_PORT"]
+        with running(command("fallback", ("--tcp-ports", f"{blocked}-{blocked}"),
+                             auth=())) as (process, output):
+            decide()
+            finish(process, output)
+        assert_copied("fallback")
+        remote("requester", "syq persist auth-from --reset --for source")
+
+        print("case: a different key for the source that only the laptop lists is refused with advice", flush=True)
+        known_hosts = Path.home()/".ssh/known_hosts"
+        saved_known_hosts = known_hosts.read_bytes()
+        try:
+            # The requester forgets the source, and the laptop lists another
+            # key for it. The laptop does not log in to the enrolled source.
+            remote("requester", "ssh-keygen -R source >/dev/null 2>&1 || true")
+            run("ssh-keygen", "-R", "source", "-f", str(known_hosts))
+            with tempfile.TemporaryDirectory() as directory:
+                key = Path(directory)/"wrong"
+                run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key))
+                wrong = key.with_suffix(".pub").read_text().split()[:2]
+            with known_hosts.open("a") as entries:
+                entries.write("source " + " ".join(wrong) + "\n")
+            with running(command("wrong-key")) as (process, output):
+                decide()
+                text = finish(process, output, success=False)
+            assert "remove it there with `ssh-keygen -R source`" in text, text
+        finally:
+            known_hosts.write_bytes(saved_known_hosts)
+        remote("destination", "test ! -e " + shlex.quote(c + "/wrong-key"))
 
         print("case: the copy continues when the laptop stops receiving", flush=True)
         with running(command("laptop-gone", ("--no-tcp", "--resource-limits", "bandwidth=2M"),
@@ -327,28 +416,42 @@ def main():
         run("syq", "persist", "receive", "on", "--name", "laptop", "--notify", "off")
         run("syq", "persist", "receive", "wait", "requester", "--timeout", "30")
 
-        print("case: killing the requester stops the copy on the source", flush=True)
-        with running(command("crashed", ("--no-tcp", "--resource-limits", "bandwidth=512K"),
-                             source="large")) as (process, output):
-            decide()
-            wait_for("copy data before the requester is killed", lambda: partial("crashed"))
-            coordinator = probe("source", "coordinator", destination=c + "/crashed")
-            assert len(coordinator) == 1, coordinator
-            owned = [[coordinator[0]["pid"], coordinator[0]["started"]],
-                     [coordinator[0]["parent"], coordinator[0]["parent_started"]]]
-            assert probe("requester", "kill_requester", pidfile=a + "/pid")
-            wait_for("the source's receiver and coordinator after the requester was killed",
-                     lambda: probe("source", "exited", processes=owned), timeout=10)
-            finish(process, output, success=False)
-        remote("destination", "test ! -e " + shlex.quote(c + "/crashed"))
-        assert pending() == []
+        for signal_name in ("SIGTERM", "SIGKILL"):
+            print(f"case: {signal_name} to the requester stops the copy on the source", flush=True)
+            stopped("stopped-" + signal_name.lower(), "the requester is stopped",
+                    lambda: probe("requester", "signal_requester", pidfile=a + "/pid",
+                                  signal=signal_name))
+            wait_for("the source's entry key cleanup after the requester stopped", no_key_dirs)
         # A new approval copies it again.
-        with running(command("crashed", ("--no-tcp",), source="large")) as (process, output):
+        with running(command("stopped-sigkill", ("--no-tcp",), source="large")) as (process, output):
             decide()
             finish(process, output)
-        assert_copied("crashed", digest("source", b + "/large"))
+        assert_copied("stopped-sigkill", digest("source", b + "/large"))
+
+        print("case: losing the destination's receiver ends the copy on the source", flush=True)
+        stopped("destination-lost", "the destination's receiver is killed",
+                lambda: probe("destination", "kill_receivers"))
+        wait_for("the source's entry key cleanup after the destination was lost", no_key_dirs)
+
+        print("case: revoking the source's enrollment stops its receiver and coordinator", flush=True)
+        stopped("revoked", "the source's enrollment is revoked",
+                lambda: run("syq", "receiver", "revoke", enrollments()["syq@source"]))
+        assert "syq@source" not in enrollments()
+        assert "syq-enrollment:" not in authorized_keys("source")
+        # Revocation kills the coordinator, which leaves its private key
+        # directory behind; the key only starts the destination's receiver.
+        for leftover in set(probe("source", "key_dirs")) - set(key_dirs):
+            remote("source", "rm -rf -- " + shlex.quote(leftover))
+        # The next approval sets the source up again.
+        with running(command("re-enrolled")) as (process, output):
+            request = decide()
+            assert 'Also sets up restricted copying on "source"' in request["permission"], request
+            finish(process, output)
+        assert_copied("re-enrolled")
         print("Copies between two other servers passed", flush=True)
     finally:
+        if "requester" in roots:
+            remote("requester", "syq persist auth-from --reset --for source")
         if created_source_enrollment and "syq@source" in enrollments():
             run("syq", "receiver", "revoke", enrollments()["syq@source"])
         if requester_config is not None:
