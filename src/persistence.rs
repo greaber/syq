@@ -476,10 +476,32 @@ pub(crate) fn connect_domain(
     )?;
     multiplexer.defer_receiving();
     let mut _switching = None;
+    let control = multiplexer.control_path().to_path_buf();
+    use crate::receive_service::{record_attempt, Attempt};
+    // A switch runs where nobody waits for it: bound its time, with what it
+    // started, and keep how it went for status
+    // (`receive_service::record_attempt`).
+    let bound = || {
+        let timed_out = control.clone();
+        crate::receive_service::switch::end_switch_at(move || {
+            record_attempt(
+                &timed_out,
+                &Attempt::new("failed", Some(crate::receive_service::switch::timed_out())),
+            )
+        });
+    };
     if switching {
-        // One switch at a time per connection; others leave it to that one.
-        let Some(lock) = lock_endpoint_record(multiplexer.control_path())? else {
-            return Ok(());
+        // One switch at a time per connection. A switch to a new build
+        // leaves it to the other; a settings change, which must apply,
+        // waits for it, within its own time.
+        let lock = if when_idle {
+            let Some(lock) = lock_endpoint_record(&control)? else {
+                return Ok(());
+            };
+            lock
+        } else {
+            bound();
+            wait_endpoint_record(&control)?
         };
         _switching = Some(lock);
         // Leave a busy service, or one following another installed syq,
@@ -505,19 +527,10 @@ pub(crate) fn connect_domain(
             login,
         );
     }
-    // A switch runs in the background, where nobody waits for it: bound its
-    // time, with what it started, and keep how it went for status
-    // (`receive_service::record_attempt`).
-    let control = multiplexer.control_path().to_path_buf();
-    use crate::receive_service::{record_attempt, Attempt};
     record_attempt(&control, &Attempt::new("switching", None));
-    let timed_out = control.clone();
-    crate::receive_service::switch::end_switch_at(move || {
-        record_attempt(
-            &timed_out,
-            &Attempt::new("failed", Some(crate::receive_service::switch::timed_out())),
-        )
-    });
+    if when_idle {
+        bound();
+    }
     let result = connect_receiving(
         domain,
         multiplexer,
@@ -698,6 +711,27 @@ fn lock_endpoint_record(control: &Path) -> Result<Option<File>> {
         return Ok(None);
     }
     Err(error.into())
+}
+
+/// Take the endpoint record's lock as `lock_endpoint_record` does, waiting
+/// for another switch that holds it.
+fn wait_endpoint_record(control: &Path) -> Result<File> {
+    let mut path = control.as_os_str().to_owned();
+    path.push(".json");
+    let record = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .with_context(|| format!("open endpoint record {}", Path::new(&path).display()))?;
+    loop {
+        if unsafe { libc::flock(record.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(record);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error.into());
+        }
+    }
 }
 
 /// Keep commands from starting a switch for this connection for `wait`

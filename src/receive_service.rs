@@ -1067,8 +1067,13 @@ pub(crate) fn switch_outdated_now(domain: &Domain) {
     }
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr());
     for control in outdated_controls(domain) {
-        let Ok(Some(state)) = running_status(&control, Retry::No, ANSWER_TIMEOUT) else {
-            continue;
+        let state = match running_status(&control, Retry::No, ANSWER_TIMEOUT) {
+            Ok(Some(state)) => state,
+            Ok(None) => {
+                restart_stale(domain, &control);
+                continue;
+            }
+            Err(_) => continue,
         };
         if state.identity == crate::identity::build() {
             continue;
@@ -1203,6 +1208,50 @@ pub(crate) fn switch_outdated_now(domain: &Domain) {
                 );
                 crate::persistence::defer_switch_attempts(&control, SWITCH_ATTEMPT_INTERVAL);
             }
+        }
+    }
+}
+
+/// Start receiving again with this build through the connection at
+/// `control`, when an older syq started it and nothing runs it now
+/// (`stale_endpoint`), once in a while as for any switch.
+fn restart_stale(domain: &Domain, control: &Path) {
+    let Ok(config) = preferences(domain) else {
+        return;
+    };
+    let Some(endpoint) = stale_endpoint(domain, &config, control) else {
+        return;
+    };
+    let crate::persistence::SwitchClaim::Claimed { lock, due } =
+        crate::persistence::claim_switch_now(control)
+    else {
+        return;
+    };
+    let phase = last_attempt(control)
+        .filter(|attempt| attempt.build == crate::identity::build())
+        .map(|attempt| attempt.phase);
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    if skip_until_due(phase.as_deref(), due, interactive)
+        || (phase.as_deref() == Some("login") && !interactive)
+    {
+        return;
+    }
+    drop(lock);
+    crate::output::diagnostic!(
+        "syq: starting receiving through {endpoint} again, with this version of syq"
+    );
+    match reconnect_with_this_build(domain, control, &endpoint) {
+        Ok(()) => clear_attempt(control),
+        Err(error) => {
+            crate::output::diagnostic!(
+                "syq: could not start receiving through {endpoint}: {error:#}; `{}` tries again",
+                connect_command(&endpoint, domain.explicit_path())
+            );
+            if last_attempt(control).is_none_or(|attempt| attempt.build != crate::identity::build())
+            {
+                record_attempt(control, &Attempt::new("failed", Some(format!("{error:#}"))));
+            }
+            crate::persistence::defer_switch_attempts(control, SWITCH_ATTEMPT_INTERVAL);
         }
     }
 }
@@ -2328,42 +2377,48 @@ fn apply_preferences_reporting(
                 continue;
             }
             crate::output::diagnostic!("syq: {}", switching_notice(&state, ""));
-            let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr());
-            let replaced = if interactive {
-                crate::persistence::connect_domain(
-                    domain,
-                    &state.endpoint,
-                    None,
-                    false,
-                    Duration::from_secs(30),
-                    Replace::Now,
-                    crate::persistence::Login::Bounded,
-                )
-            } else {
-                // Without the user at hand, as a switch does, within its
-                // bounds on logging in and on its time.
-                run_switch(replace_now_command(domain, &state.endpoint)).and_then(|status| {
-                    let now = running_status(&control, Retry::No, ANSWER_TIMEOUT)?;
-                    match now {
-                        Some(now) if now.identity == crate::identity::build() => Ok(()),
-                        // What went wrong was said above, by the switch.
-                        _ if !status.success() => anyhow::bail!("see above"),
-                        Some(now) => anyhow::bail!("it still runs syq {}", now.identity),
-                        None => anyhow::bail!("no service runs there"),
-                    }
-                })
-            };
-            if let Err(error) = replaced {
+            if let Err(error) = reconnect_with_this_build(domain, &control, &state.endpoint) {
+                // What stopping it now cuts off, when it still runs.
+                let cut = running_status(&control, Retry::No, ANSWER_TIMEOUT)
+                    .ok()
+                    .flatten()
+                    .filter(|now| now.identity == state.identity)
+                    .map(|now| busy_of(&now))
+                    .filter(|busy| !busy.idle());
                 stop_inner(&control, false)?;
                 failures.push((
                     state.endpoint.clone(),
                     format!(
-                        "receiving through {} is off until it connects again ({error:#}); run `{}`",
+                        "receiving through {} is off until it connects again ({error:#}){}; run `{}`",
                         state.endpoint,
+                        cut.map(|busy| format!(
+                            "; stopping it cut off {}",
+                            busy.describe(Some(&state.endpoint))
+                        ))
+                        .unwrap_or_default(),
                         connect_command(&state.endpoint, domain.explicit_path())
                     ),
                 ));
                 continue;
+            }
+        }
+        // Receiving an older syq started, and another command stopped,
+        // starts again with this build where its connection still runs.
+        if !is_running(&control) && read_spec(&control).is_err() {
+            if let Some(endpoint) = stale_endpoint(domain, config, &control) {
+                crate::output::diagnostic!(
+                    "syq: starting receiving through {endpoint} again, with this version of syq"
+                );
+                if let Err(error) = reconnect_with_this_build(domain, &control, &endpoint) {
+                    failures.push((
+                        endpoint.clone(),
+                        format!(
+                            "receiving through {endpoint} is off until it connects again ({error:#}); run `{}`",
+                            connect_command(&endpoint, domain.explicit_path())
+                        ),
+                    ));
+                    continue;
+                }
             }
         }
         let mut started = None;
@@ -2418,6 +2473,82 @@ fn apply_preferences_reporting(
         }
     }
     Ok(failures)
+}
+
+/// Replace whatever runs receiving through `endpoint` with this build's
+/// service, at once, even when busy, and wait until it is online. In a
+/// terminal ssh may ask for the login; without one, as a switch does,
+/// within its bounds on logging in and on its time (`run_switch`).
+fn reconnect_with_this_build(domain: &Domain, control: &Path, endpoint: &str) -> Result<()> {
+    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        return crate::persistence::connect_domain(
+            domain,
+            endpoint,
+            None,
+            false,
+            Duration::from_secs(30),
+            Replace::Now,
+            crate::persistence::Login::Bounded,
+        );
+    }
+    let status = run_switch(replace_now_command(domain, endpoint))?;
+    let now = running_status(control, Retry::No, ANSWER_TIMEOUT)?;
+    let online = now.as_ref().is_some_and(|now| {
+        now.identity == crate::identity::build() && now.connection.phase == "online"
+    });
+    if status.success() || online {
+        anyhow::ensure!(
+            now.as_ref()
+                .is_some_and(|now| now.identity == crate::identity::build()),
+            "{}",
+            match &now {
+                Some(now) => format!("it still runs syq {}", now.identity),
+                None => "no service runs there".to_owned(),
+            }
+        );
+        return Ok(());
+    }
+    // What the switch recorded, when it ended without saying why, as at its
+    // time limit; otherwise it said so above.
+    match last_attempt(control).filter(|attempt| attempt.build == crate::identity::build()) {
+        Some(Attempt {
+            error: Some(error), ..
+        }) => anyhow::bail!("{error}"),
+        _ => match (
+            status.code(),
+            std::os::unix::process::ExitStatusExt::signal(&status),
+        ) {
+            (_, Some(signal)) => anyhow::bail!("the switch ended by signal {signal}"),
+            _ => anyhow::bail!("see above"),
+        },
+    }
+}
+
+/// The endpoint of a connection whose receiving an older syq started and
+/// that no service runs now, when receiving through it is on and its SSH
+/// connection is still open, as after the released `persist receive on`
+/// stopped it without starting its replacement.
+fn stale_endpoint(domain: &Domain, config: &Preferences, control: &Path) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Recorded {
+        identity: String,
+        endpoint: crate::persistence::EndpointRecord,
+    }
+    if !config.enabled() || !domain.enabled().unwrap_or(false) || is_running(control) {
+        return None;
+    }
+    let bytes = crate::delegation::read_private_regular(
+        &suffixed(control, RECORD),
+        "background receiving endpoint",
+        64 * 1024,
+    )
+    .ok()?;
+    let recorded: Recorded = serde_json::from_slice(&bytes).ok()?;
+    let endpoint = recorded.endpoint.label();
+    (recorded.identity != crate::identity::build()
+        && config.profiles.iter().any(|p| p.allows_server(&endpoint))
+        && crate::persistence::socket_is_ready(control).unwrap_or(false))
+    .then_some(endpoint)
 }
 
 /// The largest control request: a version, flags and one approval decision.

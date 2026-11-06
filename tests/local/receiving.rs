@@ -4725,6 +4725,224 @@ fn a_settings_change_without_a_terminal_replaces_a_busy_older_service() {
     );
 }
 
+/// Without a terminal, a settings change whose new receiving service cannot
+/// log in by itself, though the SSH connection works, reports that
+/// receiving is off rather than success.
+#[test]
+fn a_settings_change_reports_a_new_service_that_does_not_come_online() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let old = older_service(&installed, serde_json::json!([]));
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    let mut command = installed.command(
+        syq,
+        &[
+            "persist",
+            "receive",
+            "on",
+            "--pscope",
+            installed.scope.to_str().unwrap(),
+        ],
+    );
+    let output = command.env("FAKE_SSH_REJECT_DIRECT", "1").run().unwrap();
+    assert!(!output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stderr_of(&output)
+            .contains("receiving through test-server is off until it connects again ("),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(
+        !stderr_of(&output).contains("see above"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("Receiving is on"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    old.join().unwrap();
+}
+
+/// Without a terminal, a settings change waits for another switch of the
+/// same connection to end, then applies.
+#[test]
+fn a_settings_change_waits_for_a_switch_under_way() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let old = older_service(&installed, serde_json::json!([]));
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    let record = OpenOptions::new()
+        .read(true)
+        .open(format!("{}.json", installed.control().display()))
+        .unwrap();
+    assert_eq!(
+        unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&record),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        },
+        0
+    );
+    let released = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        drop(record);
+        std::time::Instant::now()
+    });
+    let output = installed.persist(syq, &["receive", "on"]);
+    let finished = std::time::Instant::now();
+    assert_output_ok(&output);
+    assert!(released.join().unwrap() <= finished);
+    old.join().unwrap();
+    assert_eq!(
+        installed.request(serde_json::json!({"version": 2, "stop": false}))["identity"],
+        this_build()
+    );
+}
+
+/// Receiving that an older syq started and another command stopped, as the
+/// released `persist receive on` did, starts again with this build when
+/// `persist on` or `persist receive on` runs, while its SSH connection is
+/// open.
+#[test]
+fn persist_commands_start_receiving_an_older_syq_left_stopped() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    // The SSH connection is open: the fake ssh keeps no control socket.
+    let _master = std::os::unix::net::UnixListener::bind(installed.control()).unwrap();
+    for command in [&["on"][..], &["receive", "on"]] {
+        let old = older_service(&installed, serde_json::json!([]));
+        installed.request(serde_json::json!({"version": 2, "stop": true}));
+        old.join().unwrap();
+        let output = installed.persist(syq, command);
+        assert_output_ok(&output);
+        assert!(
+            stderr_of(&output)
+                .contains("starting receiving through test-server again, with this version of syq"),
+            "{command:?}: {}",
+            stderr_of(&output)
+        );
+        assert_eq!(
+            installed.request(serde_json::json!({"version": 2, "stop": false}))["identity"],
+            this_build(),
+            "{command:?}"
+        );
+    }
+}
+
+/// The user's case: receiving runs a version from before syq followed
+/// updates, and `syq --self-update` alone switches it to the version it
+/// installs.
+#[test]
+fn self_update_alone_switches_receiving_an_older_syq_left_running() {
+    let t = Tmp::new();
+    let mut installed = Installed::new(&t);
+    let _ephemeral = ScopeOff(&t, installed.scope.clone());
+    // The default domain, which `--self-update` looks at.
+    let on = installed
+        .command(&installed.syq, &["persist", "on"])
+        .run()
+        .unwrap();
+    assert_output_ok(&on);
+    installed.scope = t
+        .runtime()
+        .join(format!("syq-persist-{}/global", unsafe { libc::geteuid() }));
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let old = older_service(&installed, serde_json::json!([]));
+
+    // A signed release whose program is this build, reporting the next
+    // version. It runs as a source build, which uploads itself as the
+    // server's helper, rather than as the release it reports.
+    let mut version = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+    version.patch += 1;
+    let target = helper_target();
+    let asset = format!("syq-{target}");
+    let program = format!(
+        "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'syq {version}' ;;\n  --build-identity) echo 'v{version}' ;;\n  *) exec env -u SYQ_TEST_RELEASE_BUILD -u SYQ_TEST_RELEASE_PUBLIC_KEY -u SYQ_TEST_FIXTURES '{}' \"$@\" ;;\nesac\n",
+        env!("CARGO_BIN_EXE_syq")
+    );
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(program.as_bytes()).unwrap();
+    let archive = encoder.finish().unwrap();
+    let fixtures = t.path("release");
+    fs::create_dir_all(&fixtures).unwrap();
+    fs::write(fixtures.join(format!("{asset}.gz")), &archive).unwrap();
+    let manifest = serde_json::json!({
+        "schema": 1,
+        "repository": "https://github.com/greaber/syq",
+        "version": version.to_string(),
+        "tag": format!("v{version}"),
+        "artifacts": {
+            (target): {
+                "binary": {"name": asset, "sha256": sha256_hex(program.as_bytes()), "size": program.len()},
+                "archive": {"name": format!("{asset}.gz"), "sha256": sha256_hex(&archive), "size": archive.len()}
+            }
+        },
+        "installer": {"name": "install.sh", "sha256": "1".repeat(64), "size": 1},
+        "homebrew_formula": {"name": "syq.rb", "sha256": "2".repeat(64), "size": 1},
+        "signature_scheme": "ed25519-jcs-v1"
+    });
+    let signing = SigningKey::from_bytes(&[23; 32]);
+    let canonical = serde_json_canonicalizer::to_vec(&manifest).unwrap();
+    let mut manifest = manifest;
+    manifest["signature"] = base64::engine::general_purpose::STANDARD
+        .encode(signing.sign(&canonical).to_bytes())
+        .into();
+    fs::write(
+        fixtures.join("syq-release-manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let key = base64::engine::general_purpose::STANDARD.encode(signing.verifying_key().to_bytes());
+    let update = |args: &[&str]| {
+        let mut command = installed.command(&installed.syq, args);
+        command
+            .env("SYQ_TEST_RELEASE_PUBLIC_KEY", &key)
+            .env("SYQ_TEST_RELEASE_BUILD", "1")
+            .env(
+                "SYQ_TEST_LATEST_DOWNLOADS",
+                "https://release.invalid/latest",
+            )
+            .env(
+                "SYQ_TEST_RELEASE_DOWNLOADS",
+                "https://release.invalid/download",
+            )
+            .env("SYQ_TEST_FIXTURES", &fixtures)
+            .env_remove("SYQ_NO_UPDATE_CHECK");
+        command.run().unwrap()
+    };
+    assert_output_ok(&update(&["--register-standalone-install"]));
+
+    let updated = update(&["--self-update"]);
+    assert_output_ok(&updated);
+    assert!(
+        String::from_utf8_lossy(&updated.stdout).contains(&format!("updated syq to {version}")),
+        "{}",
+        String::from_utf8_lossy(&updated.stdout)
+    );
+    assert!(
+        stderr_of(&updated)
+            .contains("switching receiving through test-server, which runs syq v0.7.1"),
+        "{}",
+        stderr_of(&updated)
+    );
+    old.join().unwrap();
+    assert_eq!(
+        installed.request(serde_json::json!({"version": 2, "stop": false}))["identity"],
+        this_build()
+    );
+}
+
 /// Settings that no longer allow a connection stop the service an older
 /// syq left on it, as for any service, without logging in to its server.
 #[test]
