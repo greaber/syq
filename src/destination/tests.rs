@@ -430,6 +430,7 @@ fn broker_with_limits(
         exec_count: AtomicU64::new(0),
         ssh_count: AtomicU64::new(0),
         account_relays: AtomicU64::new(0),
+        account_links: Default::default(),
         account_source: Mutex::new(Err("test source not configured".into())),
         account_sessions: Mutex::new(HashMap::new()),
         forward_count: std::sync::atomic::AtomicUsize::new(0),
@@ -2052,13 +2053,86 @@ fn open_account_connections_are_counted_apart() {
     let (_broker, receiver, _registration, _prompts) = broker(temporary.path(), Approval::Ask);
     let activity = Activity::default();
     *activity.receiver.lock().unwrap() = Arc::downgrade(&receiver);
-    assert_eq!(activity.accounts(), 0);
+    assert_eq!(activity.accounts().open, 0);
     // The relay runs within a request.
     let request = activity.begin().unwrap();
     receiver.account_relays.fetch_add(1, Ordering::AcqRel);
-    assert_eq!((activity.requests(), activity.accounts()), (1, 1));
+    assert_eq!((activity.requests(), activity.accounts().open), (1, 1));
     assert!(!activity.idle());
     receiver.account_relays.fetch_sub(1, Ordering::AcqRel);
     drop(request);
-    assert_eq!((activity.requests(), activity.accounts()), (0, 0));
+    assert_eq!((activity.requests(), activity.accounts().open), (0, 0));
+}
+
+/// An approved account connection that says nothing uses it does not keep
+/// the connection busy, and ends when the service stops to switch; one in
+/// use keeps it, as before.
+#[test]
+fn an_account_connection_nothing_uses_ends_at_a_switch() {
+    use ssh_auth::{LinkReply, LinkRequest};
+    for used in [false, true] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let (_broker, receiver, _registration, _prompts) = broker(temporary.path(), Approval::Ask);
+        let activity = Activity {
+            quiet: Duration::from_millis(200),
+            ..Default::default()
+        };
+        *activity.receiver.lock().unwrap() = Arc::downgrade(&receiver);
+        // The relay runs within a request, as the approved login's does.
+        let request = activity.begin().unwrap();
+        receiver.account_relays.fetch_add(1, Ordering::AcqRel);
+        let (mut ours, mut theirs) = UnixStream::pair().unwrap();
+        let end = ours.try_clone().unwrap();
+        let answers = Arc::new(AtomicUsize::new(0));
+        let answered = answers.clone();
+        let keeper = std::thread::spawn(move || {
+            let ack = crate::agent_broker::read_frame(&mut theirs)
+                .unwrap()
+                .unwrap();
+            assert!(ack.starts_with(b"\0"));
+            while let Ok(Some(frame)) = crate::agent_broker::read_frame(&mut theirs) {
+                let request: LinkRequest = serde_json::from_slice(&frame).unwrap();
+                let reply = match (request, used) {
+                    (_, true) => LinkReply::InUse,
+                    (LinkRequest::Query, false) => LinkReply::Idle,
+                    (LinkRequest::CloseIfIdle, false) => LinkReply::Closing,
+                };
+                crate::agent_broker::write_frame(&mut theirs, &serde_json::to_vec(&reply).unwrap())
+                    .unwrap();
+                answered.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+        let serving = receiver.clone();
+        let server = std::thread::spawn(move || {
+            let result = serving.account_links.serve(&mut ours, &|| false);
+            serving.account_relays.fetch_sub(1, Ordering::AcqRel);
+            result
+        });
+        // Asking how many are idle asks the connection.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while answers.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline);
+            activity.accounts();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // A copy's next step may still come for a moment after a request.
+        std::thread::sleep(Duration::from_millis(250));
+        let accounts = activity.accounts();
+        assert_eq!((accounts.open, accounts.reporting), (1, 1));
+        assert_eq!(accounts.idle, usize::from(!used));
+        assert_eq!(activity.idle(), !used);
+        assert_eq!(activity.close_if_idle(), !used);
+        if used {
+            assert!(!activity.close_accounts(Instant::now() + Duration::from_secs(5)));
+            assert_eq!(receiver.account_links.len(), 1);
+            end.shutdown(std::net::Shutdown::Both).unwrap();
+        } else {
+            assert!(activity.close_accounts(Instant::now() + Duration::from_secs(5)));
+        }
+        server.join().unwrap().unwrap();
+        drop(end);
+        keeper.join().unwrap();
+        drop(request);
+        assert_eq!(activity.accounts().open, 0);
+    }
 }

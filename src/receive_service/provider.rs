@@ -78,6 +78,7 @@ impl Snapshot {
             requests: busy.saturating_sub(accounts),
             pending: 0,
             accounts,
+            accounts_in_use: self.accounts_in_use.unwrap_or(0),
         })
     }
 }
@@ -92,9 +93,13 @@ pub(crate) struct Snapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) busy: Option<usize>,
     /// Of those, approved account connections open through it, which hold
-    /// a request for as long as they live.
+    /// a request for as long as they live (`super::Busy::accounts`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) accounts: Option<usize>,
+    /// Of those, the ones that say something uses them
+    /// (`super::Busy::accounts_in_use`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) accounts_in_use: Option<usize>,
     /// The path the provider follows to switch to a new build (`switch`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) started_from: Option<String>,
@@ -477,6 +482,11 @@ struct Service {
     /// Of those, approved account logins whose agent requests it relays: an
     /// approved account connection holds one for as long as it lives.
     account_relays: AtomicU64,
+    /// Of those, the ones that say whether anything uses them.
+    account_links: ssh_auth::AccountLinks,
+    /// Refusing new requests while it ends idle account connections to
+    /// switch builds (`stop_if_idle`).
+    switching: AtomicBool,
     /// The path the provider follows, and its switch to a new build.
     started_from: Option<String>,
     switch: Mutex<Option<super::switch::Report>>,
@@ -503,6 +513,8 @@ impl Service {
             }),
             requests: AtomicUsize::new(0),
             account_relays: AtomicU64::new(0),
+            account_links: Default::default(),
+            switching: AtomicBool::new(false),
             started_from,
             switch: Mutex::new(None),
         };
@@ -554,7 +566,7 @@ impl Service {
         );
         self.refresh()?;
         anyhow::ensure!(
-            !self.stop.load(Ordering::Acquire),
+            !self.stop.load(Ordering::Acquire) && !self.switching.load(Ordering::Acquire),
             "SSH authorization provider is stopping"
         );
         Ok(())
@@ -562,29 +574,46 @@ impl Service {
     /// Requests being handled and requests waiting for approval. Logins
     /// attached to the provider do not count: switching to another build
     /// ends them, and with them their session permissions (Allow), as any
-    /// reconnect does; the requester attaches again on its next use.
+    /// reconnect does; the requester attaches again on its next use. Nor
+    /// do account connections that say nothing uses them, which a switch
+    /// ends too (`stop_if_idle`).
     fn busy(&self) -> usize {
+        let idle = self.account_links.idle();
         let inner = self.inner.lock().unwrap();
-        self.requests.load(Ordering::SeqCst)
+        self.requests.load(Ordering::SeqCst).saturating_sub(idle)
             + inner
                 .profiles
                 .values()
                 .map(|profile| profile.approvals.snapshots().len())
                 .sum::<usize>()
     }
-    /// Stop if nothing is in progress (`busy`); whether it did. A request
-    /// counted after this check finds the provider stopping and is refused.
+    /// Stop if nothing is in progress (`busy`), after ending the account
+    /// connections nothing uses; whether it did. A request counted after
+    /// the check finds the provider stopping and is refused.
     fn stop_if_idle(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
-        let idle = self.requests.load(Ordering::SeqCst) == 0
-            && inner
-                .profiles
-                .values()
-                .all(|profile| profile.approvals.snapshots().is_empty());
-        if idle {
+        {
+            let idle = self.account_links.idle();
+            let inner = self.inner.lock().unwrap();
+            let idle = self.requests.load(Ordering::SeqCst).saturating_sub(idle) == 0
+                && inner
+                    .profiles
+                    .values()
+                    .all(|profile| profile.approvals.snapshots().is_empty());
+            if !idle {
+                return false;
+            }
+            self.switching.store(true, Ordering::SeqCst);
+        }
+        // They are re-established on their next use; one that turned out
+        // to be in use keeps the provider running.
+        let closed = self
+            .account_links
+            .close_idle(Instant::now() + ssh_auth::CLOSE_WAIT);
+        if closed {
             self.stop.store(true, Ordering::SeqCst);
         }
-        idle
+        self.switching.store(false, Ordering::SeqCst);
+        closed
     }
     fn close(&self) {
         self.stop.store(true, Ordering::Release);
@@ -595,13 +624,17 @@ impl Service {
         self.streams.shutdown_all();
     }
     fn snapshot(&self, decision_error: Option<String>) -> Snapshot {
+        let idle = self.account_links.idle();
         let busy = self.busy();
         let inner = self.inner.lock().unwrap();
         Snapshot {
             build: crate::identity::build().into(),
             pid: std::process::id(),
             busy: Some(busy),
-            accounts: Some(self.account_relays.load(Ordering::Acquire) as usize),
+            accounts: Some(
+                (self.account_relays.load(Ordering::Acquire) as usize).saturating_sub(idle),
+            ),
+            accounts_in_use: Some(self.account_links.len().saturating_sub(idle)),
             started_from: self.started_from.clone(),
             switch: self.switch.lock().unwrap().clone(),
             stopping: self.stop.load(Ordering::SeqCst),
@@ -766,6 +799,7 @@ impl Service {
                         active_count: &session.active_count,
                         session_grants: &session.grants,
                         relaying: &self.account_relays,
+                        links: &self.account_links,
                     };
                     match *operation {
                         SessionRequest::ResolveLocal(target) => {
@@ -822,7 +856,7 @@ impl Service {
     ) -> Result<(Ticket, Arc<Session>)> {
         let mut inner = self.inner.lock().unwrap();
         anyhow::ensure!(
-            !self.stop.load(Ordering::Acquire),
+            !self.stop.load(Ordering::Acquire) && !self.switching.load(Ordering::Acquire),
             "SSH authorization provider is stopping"
         );
         let index = inner.preferences.selected(selected)?;
@@ -2010,6 +2044,7 @@ mod tests {
                     decision_error: None,
                     busy: Some(busy),
                     accounts: None,
+                    accounts_in_use: None,
                     started_from: None,
                     switch: None,
                     stopping,
@@ -2110,6 +2145,7 @@ mod tests {
                     decision_error: None,
                     busy: None,
                     accounts: None,
+                    accounts_in_use: None,
                     started_from: None,
                     switch: None,
                     stopping: false,

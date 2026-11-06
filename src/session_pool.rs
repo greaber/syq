@@ -75,12 +75,18 @@ struct ClientRequest {
     program: Option<String>,
     #[serde(default)]
     exit: bool,
+    /// Ask how many spares the pool holds, without taking one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    spares: bool,
 }
 
 #[derive(Serialize, Deserialize)]
 struct PoolReply {
     status: String,
     identity: String,
+    /// The spares it holds, in answer to `ClientRequest::spares`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spares: Option<usize>,
 }
 
 pub(crate) fn socket_path(control: &Path) -> PathBuf {
@@ -201,6 +207,7 @@ pub(crate) fn take(control: &Path, program: &str) -> Option<PooledSession> {
         identity: crate::identity::build().to_string(),
         program: Some(program.to_string()),
         exit: false,
+        spares: false,
     };
     let mut line = serde_json::to_vec(&request).ok()?;
     line.push(b'\n');
@@ -225,6 +232,34 @@ pub(crate) fn take(control: &Path, program: &str) -> Option<PooledSession> {
         stdout,
         stderr,
     })
+}
+
+/// How many spare sessions the pool for `control` holds: each is a client
+/// of the master that nothing uses yet. Some(0) without a pool, and None
+/// when a running pool does not say within `timeout`, as while it opens
+/// a spare.
+pub(crate) fn spares(control: &Path, timeout: Duration) -> Option<usize> {
+    if !is_running(control) {
+        return Some(0);
+    }
+    let mut stream = UnixStream::connect(socket_path(control)).ok()?;
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    stream.set_write_timeout(Some(timeout)).ok()?;
+    let request = ClientRequest {
+        identity: crate::identity::build().to_string(),
+        program: None,
+        exit: false,
+        spares: true,
+    };
+    let mut line = serde_json::to_vec(&request).ok()?;
+    line.push(b'\n');
+    stream.write_all(&line).ok()?;
+    let (payload, descriptors) = receive_message(&stream, MAX_MESSAGE).ok()?;
+    if !descriptors.is_empty() {
+        return None;
+    }
+    let reply: PoolReply = serde_json::from_slice(&payload).ok()?;
+    (reply.status == "spares").then_some(reply.spares).flatten()
 }
 
 /// Ask a running pool to exit, wait for it, and remove its files. A pool
@@ -254,6 +289,7 @@ pub(crate) fn stop(control: &Path) -> Result<()> {
                     identity: crate::identity::build().to_string(),
                     program: None,
                     exit: true,
+                    spares: false,
                 };
                 let mut line = serde_json::to_vec(&request)?;
                 line.push(b'\n');
@@ -635,6 +671,10 @@ impl Pool {
             self.reply(&stream, "exiting", &[]);
             return Verdict::Exit;
         }
+        if request.spares {
+            self.reply_with(&stream, "spares", &[], Some(self.spares.len()));
+            return Verdict::Continue;
+        }
         if request.identity != crate::identity::build() {
             // A newer syq is in use; its next command starts its own pool.
             self.reply(&stream, "identity", &[]);
@@ -684,9 +724,20 @@ impl Pool {
     }
 
     fn reply(&self, stream: &UnixStream, status: &str, descriptors: &[i32]) -> bool {
+        self.reply_with(stream, status, descriptors, None)
+    }
+
+    fn reply_with(
+        &self,
+        stream: &UnixStream,
+        status: &str,
+        descriptors: &[i32],
+        spares: Option<usize>,
+    ) -> bool {
         let reply = PoolReply {
             status: status.to_string(),
             identity: crate::identity::build().to_string(),
+            spares,
         };
         let Ok(payload) = serde_json::to_vec(&reply) else {
             return false;
@@ -922,6 +973,73 @@ mod tests {
         assert!(!lock_path(&control).exists());
     }
 
+    /// A pool says how many spares it holds without handing one out, so
+    /// that a keeper can tell them from sessions in use.
+    #[test]
+    fn a_pool_says_how_many_spares_it_holds() {
+        let temporary = crate::test_support::short_tempdir().unwrap();
+        let control = temporary.path().join("cm-00112233aabbccdd");
+        assert_eq!(spares(&control, CLIENT_IO_TIMEOUT), Some(0));
+        let lock = PoolLock::new(&control, try_lock(&control, true).unwrap().unwrap()).unwrap();
+        let socket = socket_path(&control);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let [stdin, stdout, stderr] = [
+            child
+                .stdin
+                .take()
+                .map(|pipe| unsafe { File::from_raw_fd(pipe.into_raw_fd()) }),
+            child
+                .stdout
+                .take()
+                .map(|pipe| unsafe { File::from_raw_fd(pipe.into_raw_fd()) }),
+            child
+                .stderr
+                .take()
+                .map(|pipe| unsafe { File::from_raw_fd(pipe.into_raw_fd()) }),
+        ]
+        .map(Option::unwrap);
+        let mut pool = Pool {
+            endpoint: PoolEndpoint {
+                user: None,
+                host: "host.invalid".into(),
+                port: None,
+                program: "syq".into(),
+                ignore_ssh_config: true,
+            },
+            control: control.clone(),
+            bound_ino: fs::symlink_metadata(&socket).unwrap().ino(),
+            socket,
+            listener,
+            _lock: lock,
+            spares: vec![Spare {
+                child,
+                stdin,
+                stdout,
+                stderr,
+            }],
+            handed: Vec::new(),
+            last_handoff: Instant::now(),
+            last_failure: None,
+            idle: IDLE,
+        };
+        let asking = {
+            let control = control.clone();
+            std::thread::spawn(move || spares(&control, CLIENT_IO_TIMEOUT))
+        };
+        let (stream, _) = pool.listener.accept().unwrap();
+        assert!(matches!(pool.handle_client(stream), Verdict::Continue));
+        assert_eq!(asking.join().unwrap(), Some(1));
+        assert_eq!(pool.spares.len(), 1);
+        pool.shutdown();
+    }
+
     #[test]
     fn stop_waits_for_a_starting_pool_to_bind_its_socket() {
         let temporary = crate::test_support::tempdir().unwrap();
@@ -940,6 +1058,7 @@ mod tests {
                         let reply = serde_json::to_vec(&PoolReply {
                             status: "exiting".into(),
                             identity: crate::identity::build().to_string(),
+                            spares: None,
                         })
                         .unwrap();
                         send_message(stream.as_raw_fd(), &reply, &[]).unwrap();
@@ -996,6 +1115,7 @@ mod tests {
             let reply = serde_json::to_vec(&PoolReply {
                 status: "session".into(),
                 identity: crate::identity::build().to_string(),
+                spares: None,
             })
             .unwrap();
             send_message(

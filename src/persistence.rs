@@ -1211,6 +1211,60 @@ pub(crate) fn socket_is_ready(path: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// How many clients are connected to the OpenSSH master listening at
+/// `control`: one for each session running through it, and for a moment
+/// each `-O` request. None where this cannot be told, which is everywhere
+/// but Linux. Looking does not touch the master, so it neither counts
+/// itself nor resets the master's own idle timer.
+pub(crate) fn mux_clients(control: &Path) -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let table = std::fs::read("/proc/net/unix").ok()?;
+        Some(count_mux_clients(&table, control.as_os_str().as_bytes()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = control;
+        None
+    }
+}
+
+/// Count the accepted stream connections in a `/proc/net/unix` table
+/// whose address is `control`. OpenSSH binds its listener to `control`
+/// followed by a dot and 16 random letters and digits, then renames it to
+/// `control`; a connection the listener accepts carries the bound address.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn count_mux_clients(table: &[u8], control: &[u8]) -> usize {
+    let bound_by_ssh = |path: &[u8]| {
+        path == control
+            || path.strip_prefix(control).is_some_and(|rest| {
+                rest.len() == 17
+                    && rest[0] == b'.'
+                    && rest[1..].iter().all(u8::is_ascii_alphanumeric)
+            })
+    };
+    table
+        .split(|byte| *byte == b'\n')
+        .skip(1)
+        .filter(|line| {
+            // Num RefCount Protocol Flags Type St Inode Path; the inode is
+            // padded with spaces, and the path follows one more space.
+            let mut rest = *line;
+            let mut fields = [&b""[..]; 7];
+            for field in &mut fields {
+                let start = rest.iter().position(|b| *b != b' ').unwrap_or(rest.len());
+                rest = &rest[start..];
+                let end = rest.iter().position(|b| *b == b' ').unwrap_or(rest.len());
+                *field = &rest[..end];
+                rest = &rest[end..];
+            }
+            let path = rest.strip_prefix(b" ").unwrap_or(rest);
+            // A connected stream socket (SS_CONNECTED).
+            fields[4] == b"0001" && fields[5] == b"03" && bound_by_ssh(path)
+        })
+        .count()
+}
+
 #[derive(Serialize)]
 struct ConnectionStatus {
     endpoint: String,
@@ -1580,6 +1634,47 @@ pub(crate) fn command_for_help() -> clap::Command {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// Only the connections the listener at a control path accepted count:
+    /// not the listener, not other sockets, and not a path that merely
+    /// begins the same way.
+    #[test]
+    fn mux_clients_are_the_connections_accepted_at_the_control_path() {
+        let table = b"Num       RefCount Protocol Flags    Type St Inode Path
+0000000000000000: 00000002 00000000 00010000 0001 01 11111 /run/s/cm-1.AbCdEfGh01234567
+0000000000000000: 00000003 00000000 00000000 0001 03   222 /run/s/cm-1.AbCdEfGh01234567
+0000000000000000: 00000003 00000000 00000000 0001 03 33333 /run/s/cm-1
+0000000000000000: 00000003 00000000 00000000 0001 03 44444
+0000000000000000: 00000003 00000000 00000000 0001 03 55555 /run/s/cm-1.pool
+0000000000000000: 00000003 00000000 00000000 0001 03 66666 /run/s/cm-12
+0000000000000000: 00000003 00000000 00000000 0002 03 77777 /run/s/cm-1
+0000000000000000: 00000003 00000000 00000000 0001 03 88888 /run/s/cm-1 x
+";
+        assert_eq!(count_mux_clients(table, b"/run/s/cm-1"), 2);
+        assert_eq!(count_mux_clients(b"", b"/run/s/cm-1"), 0);
+    }
+
+    /// As OpenSSH does: bind a temporary name, link the control path to
+    /// it, and remove the temporary name. Each accepted client counts
+    /// until it ends.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mux_clients_counts_live_connections_to_an_openssh_style_listener() {
+        let directory = crate::test_support::short_tempdir().unwrap();
+        let control = directory.path().join("cm-test");
+        let temporary = directory.path().join("cm-test.Ab3dEfGh0123456z");
+        let listener = std::os::unix::net::UnixListener::bind(&temporary).unwrap();
+        std::fs::hard_link(&temporary, &control).unwrap();
+        std::fs::remove_file(&temporary).unwrap();
+        assert_eq!(mux_clients(&control), Some(0));
+        let first = std::os::unix::net::UnixStream::connect(&control).unwrap();
+        let _second = std::os::unix::net::UnixStream::connect(&control).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        let (_also, _) = listener.accept().unwrap();
+        assert_eq!(mux_clients(&control), Some(2));
+        drop((first, accepted));
+        assert_eq!(mux_clients(&control), Some(1));
+    }
 
     #[test]
     fn closing_scope_removes_linked_preferences_without_removing_the_target() {

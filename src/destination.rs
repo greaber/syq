@@ -1361,6 +1361,8 @@ struct Receiver {
     /// Approved account logins whose agent requests this connection relays
     /// now (`ssh_auth::AuthorizationContext::relaying`).
     account_relays: AtomicU64,
+    /// Of those, the ones that say whether anything uses them.
+    account_links: ssh_auth::AccountLinks,
     account_source: Mutex<std::result::Result<crate::receive_approval::AccountIdentity, String>>,
     account_sessions: Mutex<HashMap<String, u64>>,
     forward_count: std::sync::atomic::AtomicUsize,
@@ -1827,15 +1829,18 @@ impl Activity {
         let requests = self.state.lock().unwrap().requests;
         requests + self.approved()
     }
-    /// Approved account connections open through this connection: logins
-    /// it authorized whose agent requests it still relays.
-    pub(crate) fn accounts(&self) -> usize {
+    /// Approved account connections open through this connection, and of
+    /// those, how many say whether anything uses them, and how many said
+    /// nothing does (`ssh_auth::AccountLinks`).
+    pub(crate) fn accounts(&self) -> Accounts {
         self.receiver
             .lock()
             .unwrap()
             .upgrade()
-            .map_or(0, |receiver| {
-                receiver.account_relays.load(Ordering::Acquire) as usize
+            .map_or(Accounts::default(), |receiver| Accounts {
+                open: receiver.account_relays.load(Ordering::Acquire) as usize,
+                idle: receiver.account_links.idle(),
+                reporting: receiver.account_links.len(),
             })
     }
     fn approved(&self) -> usize {
@@ -1854,7 +1859,8 @@ impl Activity {
             })
     }
     fn idle_locked(&self, state: &ActivityState) -> bool {
-        state.requests == 0
+        // An account connection nothing uses ends at the switch.
+        state.requests.saturating_sub(self.accounts().idle) == 0
             && state.last.is_none_or(|last| last.elapsed() >= self.quiet)
             && self.approved() == 0
     }
@@ -1877,6 +1883,25 @@ impl Activity {
     pub(crate) fn reopen(&self) {
         self.state.lock().unwrap().closed = false;
     }
+    /// After `close_if_idle`, end the account connections nothing uses,
+    /// waiting until `deadline`; whether all ended.
+    pub(crate) fn close_accounts(&self, deadline: Instant) -> bool {
+        self.receiver
+            .lock()
+            .unwrap()
+            .upgrade()
+            .is_none_or(|receiver| receiver.account_links.close_idle(deadline))
+    }
+}
+
+/// A service's approved account connections (`Activity::accounts`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Accounts {
+    pub(crate) open: usize,
+    /// Of those, the ones that say whether anything uses them.
+    pub(crate) reporting: usize,
+    /// Of those, the ones that said recently that nothing does.
+    pub(crate) idle: usize,
 }
 
 pub(crate) fn serve_background(
@@ -1929,6 +1954,7 @@ pub(crate) fn serve_background(
         exec_count: AtomicU64::new(0),
         ssh_count: AtomicU64::new(0),
         account_relays: AtomicU64::new(0),
+        account_links: Default::default(),
         account_source: Mutex::new(Err("receiving SSH connection is not ready".into())),
         account_sessions: Mutex::new(HashMap::new()),
         forward_count: std::sync::atomic::AtomicUsize::new(0),

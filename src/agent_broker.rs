@@ -1322,6 +1322,24 @@ pub(crate) fn relay_frames(
     Ok(())
 }
 
+/// `relay_frames` until the requester sends `marker`, which no agent
+/// request can be; whether it did, rather than closing its stream.
+pub(crate) fn relay_frames_until(
+    downstream: &mut (impl Read + Write),
+    upstream: &mut (impl Read + Write),
+    marker: &[u8],
+) -> Result<bool> {
+    while let Some(request) = read_frame(downstream)? {
+        if request == marker {
+            return Ok(true);
+        }
+        write_frame(upstream, &request)?;
+        let response = read_frame(upstream)?.context("authorization service disconnected")?;
+        write_frame(downstream, &response)?;
+    }
+    Ok(false)
+}
+
 #[derive(Default)]
 struct BindState {
     bindings: Vec<SessionBind>,
