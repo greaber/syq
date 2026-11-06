@@ -103,7 +103,9 @@ options only when you trust the source's settings.
 creates, only through files it created or opened itself. A symlink or hard
 link planted at a partial file's name is never followed or written into; syq
 replaces it with its own file. Syq resumes only from a partial file that is
-owned by the account running syq and has no other names, and only reads it. A
+owned by the account running syq and has no other names, and only reads it.
+Once it has published the file, it removes such a partial file when no program
+has it open for writing. A
 file swapped in during the copy gets none of the copy's
 data or metadata, and when syq detects the swap, it reports the file as failed
 instead of publishing it.
@@ -332,6 +334,7 @@ requests of your machine:
 | Request | Approval on your machine |
 |---|---|
 | Send files to your machine | Required by default; `--auto-approve-root` permits unattended downloads confined to that directory |
+| Copy files from your machine | Always required |
 | Authorize one copy to or from another server | Always required |
 | Run a command on your machine | Always required |
 | Authorize an SSH login to another server account | Required unless this source and destination account pair has a session or remembered permission |
@@ -366,7 +369,11 @@ isolate them.
 Approving a copy permits the destination, overwrite policy, and limits of the
 command shown, and syq enforces them on every filesystem operation. Within
 those limits, the server can supply false contents, inspect destination
-entries during planning, and use disk space.
+entries during planning, and use disk space. Like any copy, it also removes
+syq's leftover partial files beside the files it writes, even when the copy
+may not otherwise delete; these are files named like
+`.FILENAME.syq-tmp.RANDOM` that are owned by you, have no other names, and that
+no program has open for writing.
 
 By default, copies start in your home directory and are not confined to it;
 `syq persist receive on --root DIRECTORY` confines them. Automatic approval
@@ -383,6 +390,24 @@ Another client cannot claim your receiving name: reconnecting under it needs
 your receiver's private key, which stays on your machine and grants no SSH
 login. The server account itself can still change its stored name
 assignments.
+
+<a id="sending-files-from-your-laptop"></a>
+
+### Sending files from your laptop
+
+A server can ask for files from your laptop with `syq cp --from @laptop`. The
+prompt lists the exact paths it would read and says that they will leave your
+laptop. Once approved, the server can list and read only those files and
+directory trees, with the symlink behavior the command chose, within the
+profile's byte and entry limits and, when the profile sets `--root`, only
+inside that root: symlinks can't lead out of it, and neither can a directory
+replaced while the copy runs. When the command follows symlinks, the prompt
+says so, since the files read may then be elsewhere than the paths shown. It
+cannot write, rename or remove anything on your laptop. As with copies between
+servers, the server can ask for hashes of approved files beyond the data
+limit. File data travels over your laptop's receiving connection, as downloads
+do, and reads stop when the copy ends or receiving stops.
+`--auto-approve-root` never applies: every request asks.
 
 <a id="authorizing-copies-to-another-server"></a>
 

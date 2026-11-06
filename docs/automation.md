@@ -333,6 +333,7 @@ depend on the request:
 | `ssh` | SSH account access through a receiving connection | `destination`, `permission`, `reusable`, optional `account` |
 | `provider_ssh` | SSH account access through an ordinary SSH provider login | `destination`, `permission`, `provider_account` |
 | `source` | Read selected source paths for a copy | `source`, `scopes`, `permission`, `max_bytes`, `max_entries` |
+| `send` | Send files from this machine to the requesting server | `paths`, `permission`, `max_bytes`, `max_entries` |
 | `storage` | Storage access | `description` |
 
 `warnings` lists what a copy lets the server do beyond copying plain files, as

@@ -128,13 +128,30 @@ pub fn self_update() -> Result<()> {
                 "syq {} is already the newest release",
                 release.version
             );
+            // The image running now, never the receipt's spelling of it.
+            switch_receiving(&std::env::current_exe().context("locate the syq executable")?);
             return Ok(());
         }
         std::cmp::Ordering::Greater => {}
     }
-    install_release(&release, &receipt_path, &mut receipt)?;
+    let installed = install_release(&release, &receipt_path, &mut receipt)?;
     crate::output::command_println!("updated syq to {}", release.version);
+    // The file installation wrote, never the receipt's spelling of it, which
+    // may name another file by now.
+    switch_receiving(&installed);
     Ok(())
+}
+
+/// Have the syq installed at `binary` replace the idle receiving services an
+/// older syq left running, which cannot follow an update by themselves, so
+/// that updating needs no other command. It says nothing when every service
+/// is current; a failure is its own to report, and leaves the update done.
+fn switch_receiving(binary: &Path) {
+    let _ = std::process::Command::new(binary)
+        .args(["persist", "receive", "switch-outdated"])
+        .env("SYQ_NO_UPDATE_CHECK", "1")
+        .stdin(std::process::Stdio::null())
+        .status();
 }
 
 /// Called by the generated installer after the verified binary has reached its
@@ -860,7 +877,7 @@ fn install_release(
     release: &VerifiedRelease,
     receipt_path: &Path,
     receipt: &mut InstallReceipt,
-) -> Result<()> {
+) -> Result<PathBuf> {
     let target = Target::local().ok_or_else(|| {
         anyhow!(
             "standalone releases do not support {} {}",
@@ -901,7 +918,7 @@ fn install_release(
     sync_parent(parent)?;
     receipt.version = release.version.to_string();
     write_receipt(receipt_path, receipt)?;
-    Ok(())
+    Ok(executable)
 }
 
 fn release_downloads() -> Cow<'static, str> {

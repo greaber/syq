@@ -871,6 +871,11 @@ impl Reader {
         Keys::export(|label, out| context.export(label, out))
     }
 
+    /// Whether the destination sent any of its results.
+    pub(crate) fn received_any(&self) -> bool {
+        self.keys.is_some()
+    }
+
     /// The destination's totals, once every frame through its end arrived
     /// exactly once.
     pub(crate) fn finish(&mut self) -> Result<Totals> {

@@ -1947,11 +1947,16 @@ impl Worker {
         // from this copy's own: one repeated after a dropped connection or a
         // source change can find the partial this copy made. A first
         // preparation whose reply was lost counts as finding none.
-        let first = self.sched.jobs.lock().unwrap().first_preparation(idx);
-        if first
-            && job.attempt == 0
-            && matches!(&sent, Ok(Response::Prepared(prepared)) if prepared.has_candidates)
-        {
+        let found = matches!(&sent, Ok(Response::Prepared(prepared)) if prepared.has_candidates);
+        let first = {
+            let mut jobs = self.sched.jobs.lock().unwrap();
+            let first = jobs.first_preparation(idx);
+            if first && job.attempt == 0 && found {
+                jobs.found_earlier_partials(idx);
+            }
+            first
+        };
+        if first && job.attempt == 0 && found {
             self.progress
                 .earlier_partials
                 .lock()
@@ -3000,11 +3005,43 @@ impl Worker {
         }
     }
 
+    /// Whether this copy writes a source file named as a partial of the
+    /// file at `dst`, beside it.
+    fn writes_partial_named_payload_for(&self, dst: &[u8]) -> bool {
+        let payload = self
+            .progress
+            .partial_named_payload
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if payload.is_empty() {
+            return false;
+        }
+        let (parent, name) = match dst.iter().rposition(|&byte| byte == b'/') {
+            Some(at) => (&dst[..=at], &dst[at + 1..]),
+            None => (&dst[..0], dst),
+        };
+        let mut prefix = parent.to_vec();
+        prefix.push(b'.');
+        prefix.extend_from_slice(name);
+        prefix.extend_from_slice(crate::fsops::PARTIAL_MARKER.as_bytes());
+        payload
+            .iter()
+            .any(|path| path.starts_with(&prefix) && !path[prefix.len()..].contains(&b'/'))
+    }
+
     pub(super) fn finish_file(&mut self, idx: usize) -> Result<()> {
         if self.sched.is_failed(idx) || self.sched.is_aborted() {
             return Ok(());
         }
-        let job = self.job(idx);
+        let (job, mut earlier_partials) = {
+            let jobs = self.sched.jobs.lock().unwrap();
+            (jobs.snapshot(idx), jobs.has_earlier_partials(idx))
+        };
+        // A source file this copy writes beside it, named as one of its
+        // partials, is not an earlier copy's: the receiver then removes none.
+        if earlier_partials && self.writes_partial_named_payload_for(&job.dst) {
+            earlier_partials = false;
+        }
         if job.done.load(Relaxed) != job.entry.size {
             bail!("refusing to publish an incomplete file");
         }
@@ -3029,11 +3066,25 @@ impl Worker {
                 flags: self.publication_flags(&job),
                 scanned: job.scanned,
                 condition: job.target_condition,
+                earlier_partials,
             })?,
             "finalize destination",
         );
         match finalized {
-            Ok(response) => self.accept_hardlink_reply(idx, &job, response)?,
+            Ok(response) => {
+                // The receiver removed the partials earlier copies left for
+                // this file unless it says it kept some.
+                if earlier_partials
+                    && !matches!(response, Response::PublishedBesideEarlierPartials(_))
+                {
+                    self.progress
+                        .earlier_partials
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&idx);
+                }
+                self.accept_hardlink_reply(idx, &job, response)?
+            }
             Err(error) => {
                 // A condition the receiver found unmet changed nothing, and
                 // the receiver let its sidecar go.

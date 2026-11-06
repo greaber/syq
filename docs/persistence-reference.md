@@ -202,7 +202,10 @@ independent settings:
 | `--root DIR` | Hard boundary for downloads, even with approval | `--no-root` |
 | `--auto-approve-root DIR` | Downloads confined here, including pruning up to `--max-delete`, skip approval, except with `--widen-dirs all` | `--no-auto-approve-root` |
 
-Each must be an existing directory, and neither root can be `/`. Without
+Each must be an existing directory, and neither root can be `/`. You can give
+a relative path or one starting with `~/`, including after `=` as in
+`--root=~/inbox`; syq saves the directory's absolute path with symlinks
+resolved, and `receive on` and `receive status` show it. Without
 `--cwd`, downloads start in the hard root if set, otherwise the automatic
 approval root if set, otherwise your home directory.
 
@@ -211,6 +214,12 @@ downloads outside the automatic approval root ask. Symlinks cannot extend
 automatic approval outside its root, and replacing that root directory itself
 asks, or is refused when it is also the hard root. Neither root restricts
 approved commands or copies you approve between servers.
+
+Copies from your laptop (`syq cp --from @laptop`) start in the same directory.
+The hard root confines them too: their paths must be relative and can't start
+with `~` or contain `..`, and symlinks in them can't lead outside the root,
+even through the command's own `-C` or `--root`. The automatic approval root
+never applies to them; they always ask.
 
 <a id="copy-limits"></a>
 
@@ -221,7 +230,9 @@ by default. Entries are the changes it makes, such as files written,
 directories created, metadata changes, and deletions. Change the limits with
 `syq persist receive on --max-bytes 20G --max-entries 100000`; the sender can
 only lower them. They apply per copy, so repeated copies can still fill the
-disk.
+disk. The byte and entry limits also bound what one copy from your laptop
+may read. For those copies, entries are what the copy lists, including those
+its filters then leave out.
 
 A pruning copy is refused until you set a positive `--max-delete`. After that, a
 pruning copy that plans more deletions than your `--max-delete` or
@@ -246,19 +257,25 @@ In an isolated domain, idle SSH connections close after five to ten minutes;
 in the default domain they stay open. Syq installs no login service, so
 connect again after a reboot. After you update syq, receiving and the SSH
 authorization provider switch to the new version once no copy, command, or
-approval is in progress, by themselves or when you next run syq. If receiving
-needs you to unlock or touch your SSH key, it waits until you next run a syq
-copy or ssh command in a terminal. An account connection you approved closes
-at the switch when nothing runs through it, along with any idle port forwards
-it holds. The next syq command that uses it opens it again, which asks for
-approval again unless you remembered it; export a `persist ssh-config` file
-again after that. While a copy, shell, or other session runs through it, the
-switch waits for it to finish. A connection that can't tell whether it's in
-use, such as one opened on macOS or in an isolated domain, keeps the old
-version until it closes.
-`syq persist status` says which connections the switch waits for and shows the
-command that switches at once and closes them. Session permissions (**Allow**)
-end at the switch, as at any reconnect.
+approval is in progress, by themselves or when you next run syq.
+`syq persist status`, `syq persist on`, `syq persist connect`, and
+`syq persist receive status` switch idle receiving at once, logging in as
+`syq persist connect` does, but not with `--json`.
+`syq persist status` says why receiving still runs an older version.
+`syq persist receive on`, `receive off NAME`, and `receive remove NAME` switch
+it even when busy, which cuts off copies and approvals in progress. If
+receiving needs you to unlock or touch your SSH key, it waits until you next
+run a syq copy or ssh command, or `syq persist status`, in a terminal. An
+account connection you approved closes at the switch when nothing runs through
+it, along with any idle port forwards it holds. The next syq command that uses
+it opens it again, which asks for approval again unless you remembered it;
+export a `persist ssh-config` file again after that. While a copy, shell, or
+other session runs through it, the switch waits for it to finish. A connection
+that can't tell whether it's in use, such as one opened on macOS or in an
+isolated domain, keeps the old version until it closes. `syq persist status`
+says which connections the switch waits for and shows the command that
+switches at once and closes them. Session permissions (**Allow**) end at the
+switch, as at any reconnect.
 
 To wait in a script without starting a connection, run
 `syq persist receive wait server --timeout 30` on the laptop, or

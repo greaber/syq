@@ -300,6 +300,7 @@ fn a_sidecar_with_a_short_name_serves_every_worker() {
     assert_eq!(fs::read(dir.path().join(&legacy)).unwrap(), b"new data");
     let mut publisher = setup();
     let reply = publisher.handle_in_place(&mut Request::Finalize {
+        earlier_partials: false,
         path,
         inplace: false,
         copy_id: [9; 16],

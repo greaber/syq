@@ -66,9 +66,13 @@ pub struct Progress {
     /// updated in place, by reason; planned ones in a dry run.
     pub in_place_refusals: InPlaceRefusals,
     /// The files whose destination held partial files from an earlier copy
-    /// when this copy first prepared them. This copy reads those partials
-    /// but leaves them, since another copy may still be writing one.
+    /// when this copy first prepared them, and which still do: the receiver
+    /// keeps a partial another copy may still be writing.
     pub(crate) earlier_partials: Mutex<std::collections::HashSet<usize>>,
+    /// The destination paths of source files this copy writes whose names
+    /// read as partial files. The receiver must not take them for earlier
+    /// copies' partials.
+    pub(crate) partial_named_payload: Mutex<std::collections::HashSet<Vec<u8>>>,
     /// Settled creations, mirrored here (like the deletion counters) so a
     /// fatal-error terminal record reports what the run actually did.
     pub directories_created: AtomicU64,
@@ -212,6 +216,7 @@ impl Progress {
             deletions_blocked: AtomicU64::new(0),
             in_place_refusals: Default::default(),
             earlier_partials: Default::default(),
+            partial_named_payload: Default::default(),
             directories_created: AtomicU64::new(0),
             symlinks_created: AtomicU64::new(0),
             specials_created: AtomicU64::new(0),

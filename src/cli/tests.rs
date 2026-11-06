@@ -1453,11 +1453,10 @@ fn receiving_names_are_refused_where_no_receiving_machine_can_serve() {
         (target.user.as_deref(), target.host.as_deref()),
         (None, Some("@laptop"))
     );
+    // A copy from a receiving machine comes to this machine.
     for words in [
         &["cp", ".kube", "--from", "@laptop"][..],
         &["cp", ".kube", "--from", "@laptop", "--into", "copy"],
-        &["cp", ".kube", "--from", "@laptop", "--to", "server"],
-        &["cp", ".kube", "--from", "@laptop", "--to", "@desk"],
         &[
             "cp",
             "--from",
@@ -1467,13 +1466,31 @@ fn receiving_names_are_refused_where_no_receiving_machine_can_serve() {
             "--into",
             "copy",
         ],
-        &["rsync", "@laptop:.kube", "copy/"],
+    ] {
+        let args = parse(words).unwrap();
+        assert_eq!(
+            args.locations[0].host.as_deref(),
+            Some("@laptop"),
+            "{words:?}"
+        );
+    }
+    for words in [
+        &["cp", ".kube", "--from", "@laptop", "--to", "server"][..],
+        &["cp", ".kube", "--from", "@laptop", "--to", "@desk"],
+    ] {
+        let message = error(words);
+        assert!(
+            message.starts_with("a copy from receiving machine @laptop goes to this machine"),
+            "{words:?}: {message}"
+        );
+    }
+    for words in [
+        &["rsync", "@laptop:.kube", "copy/"][..],
         &["rsync", "-a", "@laptop:", "copy/"],
     ] {
         let message = error(words);
         assert!(
-            message.starts_with("cannot copy from receiving machine @laptop:")
-                && message.contains("To copy files from that machine to this server, run `syq cp PATH --to HOST` on it"),
+            message.starts_with("receiving machine @laptop cannot be used with syq rsync; to copy from it, use `syq cp --from @laptop PATH`"),
             "{words:?}: {message}"
         );
     }

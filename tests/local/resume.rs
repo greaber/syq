@@ -105,10 +105,7 @@ fn resume_from_partial() {
     }
     let out = run_ok(&args);
     assert!(read(&t.path("dst/big.bin")) == data);
-    assert!(
-        partial.exists(),
-        "the candidate remains available to other copies"
-    );
+    assert_earlier_partial_removed_where_possible(&partial);
     assert_same_tree(&t.path("src/big.bin"), &t.path("dst/big.bin"));
     // Roughly half should have been reused.
     assert!(out.contains("unchanged"), "{out}");
@@ -132,11 +129,10 @@ fn retry_names_the_earlier_partials_it_leaves() {
         &dst,
     ];
     let partial = interrupted_partial(&args, &t.path("dst"));
-    {
-        let f = File::create(&partial).unwrap();
-        (&f).write_all(&data[..data.len() / 2]).unwrap();
-        f.set_len(data.len() as u64).unwrap();
-    }
+    // Another copy still has the partial open for writing.
+    let writer = File::create(&partial).unwrap();
+    (&writer).write_all(&data[..data.len() / 2]).unwrap();
+    writer.set_len(data.len() as u64).unwrap();
     let out = compat_command()
         .args(args)
         .arg("--no-progress")
@@ -144,8 +140,8 @@ fn retry_names_the_earlier_partials_it_leaves() {
         .unwrap();
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst/big.bin")), data);
-    // The earlier copy's partial stays for other copies, so the retry says
-    // so and how to remove it.
+    // The partial stays for the copy writing it, so the retry says so and
+    // how to remove it.
     assert!(partial.exists());
     let stderr = stderr_of(&out);
     assert!(
@@ -165,6 +161,242 @@ fn retry_names_the_earlier_partials_it_leaves() {
         .unwrap();
     assert_output_ok(&quiet);
     assert!(!stderr_of(&quiet).contains("clean-partials"), "{quiet:?}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn rerun_removes_the_partial_a_killed_copy_left() {
+    // Where leases cannot show writers, the partial stays and the rerun says
+    // how to remove it.
+    for untrusted in [false, true] {
+        let t = Tmp::new();
+        let data = prng(6 * 1024 * 1024 + 7, 19);
+        write(&t.path("src/big.bin"), &data);
+        fs::create_dir_all(t.path("dst")).unwrap();
+        let src = t.s("src/big.bin");
+        let dst = t.s("dst/");
+        let args = [
+            "--block-size",
+            "1M",
+            "--resource-limits",
+            "bandwidth=1G",
+            &src,
+            &dst,
+        ];
+        // The copy is killed once its partial is prepared.
+        let partial = interrupted_partial(&args, &t.path("dst"));
+        let mut rerun = compat_command();
+        rerun.args(args).arg("--no-progress");
+        if untrusted {
+            rerun.env("SYQ_TEST_LEASES", "unsupported");
+        }
+        let out = rerun.run().unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst/big.bin")), data);
+        if untrusted {
+            assert!(partial.exists());
+        } else {
+            assert_earlier_partial_removed_where_possible(&partial);
+        }
+        let stderr = stderr_of(&out);
+        assert_eq!(
+            stderr.contains("1 file had a partial file from an earlier copy"),
+            partial.exists(),
+            "{stderr}"
+        );
+    }
+}
+
+/// A partial whose name was shortened to fit reads as the partial of a file
+/// named by its start. Publishing that file leaves it: it can be the longer
+/// file's.
+#[cfg(debug_assertions)]
+#[test]
+fn a_shortened_partial_of_another_file_is_left_in_place() {
+    let t = Tmp::new();
+    let long = "n".repeat(240);
+    let data = prng(5 * 1024 * 1024, 31);
+    write(&t.path(&format!("src/{long}")), &data);
+    fs::create_dir_all(t.path("dst")).unwrap();
+    let source = t.s(&format!("src/{long}"));
+    let destination = t.s("dst/");
+    let args = [
+        "--block-size",
+        "1M",
+        "--resource-limits",
+        "bandwidth=1G",
+        &source,
+        &destination,
+    ];
+    let partial = interrupted_partial(&args, &t.path("dst"));
+    let name = partial.file_name().unwrap().as_encoded_bytes();
+    let start = name.len() - ".syq-tmp.".len() - 16;
+    let short = String::from_utf8(name[1..start].to_vec()).unwrap();
+    assert!(short.len() < long.len());
+
+    // Another file, named by the start of the long name, and an earlier
+    // copy's partial of its own whose name was shortened the same way.
+    let other = prng(3 * 1024 * 1024, 37);
+    write(&t.path(&format!("src/{short}")), &other);
+    let own = t.path(&format!("dst/.{short}.syq-tmp.abcdefghijklmnop"));
+    write(&own, &other[..1 << 20]);
+    let source = t.s(&format!("src/{short}"));
+    let out = compat_command()
+        .args([
+            "--block-size",
+            "1M",
+            "--resource-limits",
+            "bandwidth=1G",
+            &source,
+            &destination,
+        ])
+        .arg("--no-progress")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path(&format!("dst/{short}"))), other);
+    assert!(partial.exists(), "the long file's partial stays");
+    assert!(own.exists(), "a name that may be shortened stays");
+    assert!(
+        stderr_of(&out).contains("1 file had a partial file from an earlier copy"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+/// A program that opens the partial for writing once the rerun holds its
+/// lease keeps it: the rerun sees the open and leaves the partial.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn a_writer_that_opens_the_partial_during_removal_keeps_it() {
+    let t = Tmp::new();
+    if !earlier_partials_removable(&t.0) {
+        eprintln!("note: the test filesystem's leases are not trusted");
+        return;
+    }
+    let data = prng(4 * 1024 * 1024 + 9, 41);
+    write(&t.path("src"), &data);
+    let args = [
+        "--block-size",
+        "1M",
+        "--bwlimit=1G",
+        &t.s("src"),
+        &t.s("dst"),
+    ];
+    let partial = interrupted_partial(&args, &t.0);
+    let (ready, continuation) = (t.path("leased"), t.path("continue"));
+    let mut child = compat_command()
+        .args(args)
+        .arg("--no-progress")
+        .env("SYQ_TEST_EARLIER_PARTIAL_LEASED_READY_FILE", &ready)
+        .env(
+            "SYQ_TEST_EARLIER_PARTIAL_LEASED_CONTINUE_FILE",
+            &continuation,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "earlier partial leased");
+    // The open waits for the lease, which the rerun holds until it lets the
+    // removal go on.
+    let opener = {
+        let partial = partial.clone();
+        std::thread::spawn(move || hold_for_writing(&partial))
+    };
+    // Once the open waits, the kernel lists the partial's lease as being
+    // broken.
+    // `/proc/locks` names the file by device major and minor, in hex, and
+    // inode.
+    let status = fs::metadata(&partial).unwrap();
+    let dev = status.dev();
+    let (major, minor) = (
+        ((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0xfff),
+        ((dev >> 12) & 0xffff_ff00) | (dev & 0xff),
+    );
+    let file = format!("{major:02x}:{minor:02x}:{}", status.ino());
+    let breaking = |line: &str| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        fields.get(1) == Some(&"LEASE")
+            && fields.get(2) == Some(&"BREAKING")
+            && fields.get(5) == Some(&file.as_str())
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut next_progress = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let locks = fs::read_to_string("/proc/locks").unwrap();
+        if locks.lines().any(breaking) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline && !opener.is_finished(),
+            "the open never waited for the lease: {locks}"
+        );
+        if std::time::Instant::now() >= next_progress {
+            eprintln!("waiting for the open to wait for the lease");
+            next_progress += std::time::Duration::from_secs(5);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    release_confinement_barrier(&continuation);
+    let output = child.wait_with_output().unwrap();
+    let writer = opener.join().unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst")), data);
+    assert!(partial.exists());
+    assert_eq!(fs::metadata(&partial).unwrap().nlink(), 1);
+    assert_eq!(
+        writer.metadata().unwrap().ino(),
+        fs::metadata(&partial).unwrap().ino()
+    );
+    assert!(
+        stderr_of(&output).contains("1 file had a partial file from an earlier copy"),
+        "{}",
+        stderr_of(&output)
+    );
+}
+
+/// A rerun through a receiver started over SSH removes an earlier copy's
+/// partial as a local one does.
+#[cfg(debug_assertions)]
+#[test]
+fn remote_rerun_removes_the_partial_a_killed_copy_left() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    t.expose_remote_syq();
+    let data = prng(4 * 1024 * 1024 + 3, 23);
+    write(&t.path("src"), &data);
+    let partial = interrupted_partial(
+        &[
+            "--block-size",
+            "1M",
+            "--bwlimit=1G",
+            &t.s("src"),
+            &t.s("dst"),
+        ],
+        &t.0,
+    );
+    let out = remote_syq_command(
+        &t,
+        &rsh,
+        &[
+            "--syq-no-bootstrap",
+            "--block-size=1M",
+            &t.s("src"),
+            &format!("fake:{}", t.s("dst")),
+        ],
+    )
+    .run()
+    .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), data);
+    assert_earlier_partial_removed_where_possible(&partial);
+    let stderr = stderr_of(&out);
+    assert_eq!(
+        stderr.contains("from an earlier copy"),
+        partial.exists(),
+        "{stderr}"
+    );
 }
 
 #[cfg(debug_assertions)]
@@ -234,11 +466,8 @@ fn checksum_toggle_accepts_prior_partial_candidates() {
     ]);
 
     assert_eq!(read(&t.path("dst")), data);
-    assert!(
-        partial.exists(),
-        "changing -c must leave another invocation's partial alone"
-    );
-    assert_eq!(partial_files(&t.0), vec![partial]);
+    assert_earlier_partial_removed_where_possible(&partial);
+    assert!(partial_files(&t.0).iter().all(|name| *name == partial));
 }
 
 /// An existing file is replaced with `--in-place=new` too, so a digest that
@@ -318,10 +547,7 @@ fn hash_policy_expected_hash_covers_resumed_bytes_after_algorithm_change() {
         &t.s("results.ndjson"),
     ]);
     assert_eq!(read(&t.path("destination")), contents);
-    assert!(
-        partial.exists(),
-        "another invocation's partial remains untouched"
-    );
+    assert_earlier_partial_removed_where_possible(&partial);
     let records = fs::read_to_string(t.path("results.ndjson")).unwrap();
     let summary: serde_json::Value = serde_json::from_str(records.lines().last().unwrap()).unwrap();
     assert!(
@@ -396,10 +622,7 @@ fn streaming_and_default_copies_share_resume_partials() {
             &dst,
         ]);
         assert_eq!(read(&t.path("destination")), data);
-        assert!(
-            partial.exists(),
-            "switching mode must not consume a candidate"
-        );
+        assert_earlier_partial_removed_where_possible(&partial);
         assert!(
             out.contains("1 files (3.00 MiB, plus 3.00 MiB reused), 0 B unchanged (0 files)"),
             "{out}"
@@ -438,7 +661,7 @@ fn tuning_options_preserve_partial_identity_and_reused_hash_blocks() {
         &dst,
     ]);
     assert_eq!(read(&t.path("destination")), data);
-    assert!(partial.exists(), "overrides must not consume a candidate");
+    assert_earlier_partial_removed_where_possible(&partial);
     assert!(
         out.contains("1 files (3.00 MiB, plus 3.00 MiB reused), 0 B unchanged (0 files)"),
         "{out}"
@@ -825,7 +1048,7 @@ fn source_partials_are_copied_and_warned_about() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("they are treated as ordinary payload"),
+        stderr.contains("they are copied as ordinary files, but this or a later copy may remove them as leftover partial files"),
         "{stderr}"
     );
     assert!(
@@ -863,7 +1086,7 @@ fn source_partials_are_copied_and_warned_about() {
     assert_output_ok(&dry);
     let dry_stderr = String::from_utf8_lossy(&dry.stderr);
     assert!(
-        dry_stderr.contains("treated as ordinary payload"),
+        dry_stderr.contains("copied as ordinary files"),
         "{dry_stderr}"
     );
     assert!(!dry_stderr.to_ascii_lowercase().contains("copying"));
@@ -1290,6 +1513,8 @@ fn unreadable_interrupted_partials_are_left_alone() {
         let dst = t.s(&format!("out-{i}"));
         let args = ["-a", "--resource-limits", "bandwidth=1G", &src, &dst];
         let partial = interrupted_partial(&args, &t.0);
+        // Another copy still writes it.
+        let _writer = hold_for_writing(&partial);
         fs::set_permissions(&partial, fs::Permissions::from_mode(mode)).unwrap();
 
         run_ok(&args);
@@ -1334,6 +1559,8 @@ fn writable_interrupted_partial_is_left_unchanged() {
     let partial = interrupted_partial(&args, &t.0);
     write(&partial, &contents);
     fs::set_permissions(&partial, fs::Permissions::from_mode(0o644)).unwrap();
+    // Another copy still writes it.
+    let _writer = hold_for_writing(&partial);
     run_ok(&args);
     assert_eq!(read(&t.path("dst")), contents);
     assert_eq!(read(&partial), contents);
@@ -1515,7 +1742,7 @@ fn copy_local_disk_write_failure_keeps_old_destination_and_resumes_changed_sourc
     let observed = tuning_observed(&out);
     assert_eq!(observed["local_whole_files"], 0);
     assert!(observed["range_requests"].as_u64().unwrap() > 0);
-    assert_eq!(partial_files(&t.path("dst")), partials);
+    assert_earlier_partial_removed_where_possible(&partials[0]);
 }
 
 #[cfg(debug_assertions)]
@@ -2172,10 +2399,15 @@ fn resume_uses_the_private_stage_when_candidate_changes_or_disappears() {
             .start()
             .unwrap();
         wait_for_confinement_marker(&mut child, &ready, "private candidate stage");
+        // Another writer changes the candidate and keeps it open, so the
+        // copy leaves it in place.
+        let mut _writer = None;
         if remove {
             fs::remove_file(&candidate).unwrap();
         } else {
-            write(&candidate, &vec![b'b'; data.len()]);
+            let writer = hold_for_writing(&candidate);
+            (&writer).write_all(&vec![b'b'; data.len()]).unwrap();
+            _writer = Some(writer);
         }
         release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
@@ -2432,7 +2664,7 @@ fn resume_prefers_a_partial_to_the_old_destination_contents() {
         out.contains("1 files (2.00 MiB, plus 3.00 MiB reused), 0 B unchanged (0 files)"),
         "{out}"
     );
-    assert_eq!(partial_files(&t.0).len(), 1);
+    assert_earlier_partial_removed_where_possible(&t.path(".out.syq-tmp.abcdefghijklmnop"));
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]

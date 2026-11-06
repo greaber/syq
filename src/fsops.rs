@@ -906,6 +906,10 @@ pub struct FsOps {
     stream_worker: Option<crate::descriptor_copy::FileWorker>,
     stream_ticket: Option<crate::descriptor_broker::DescriptorTicket>,
     hash_policy: crate::hashing::HashPolicy,
+    /// A directory the source base must be resolved beneath, when a
+    /// receiving machine's root encloses the copy's own `--root`
+    /// (`set_source_outer_root`).
+    source_outer_root: Option<PathBytes>,
     /// Files this receiver created for a grant that keeps existing objects,
     /// the only files it then gives new names by hard link.
     owned: Option<Arc<owned::OwnedObjects>>,
@@ -1177,6 +1181,13 @@ impl FsOps {
         self.hash_policy = policy;
     }
 
+    /// Resolve later source bases beneath the absolute directory `root`,
+    /// following symlinks as the copy does but never out of `root`. The base
+    /// then confines selections as usual, so both stay boundaries.
+    pub(crate) fn set_source_outer_root(&mut self, root: Option<PathBytes>) {
+        self.source_outer_root = root;
+    }
+
     /// Serve the copy `scope` (`new_stage_scope`), in a process that serves
     /// several copies.
     pub(crate) fn set_stage_scope(&mut self, scope: u64) {
@@ -1226,6 +1237,7 @@ impl FsOps {
             stream_worker: None,
             stream_ticket: None,
             owned: None,
+            source_outer_root: None,
             hash_policy: crate::hashing::HashPolicy {
                 algorithm: crate::hashing::HashAlgorithm::Blake3,
                 transfer_integrity: true,
@@ -2134,21 +2146,52 @@ impl FsOps {
         let relative_resolver = if needs_base {
             let base_path = resolve(base.path.as_deref().unwrap_or(b"."));
             let mut base_hops = Vec::new();
-            let base_directory = match OperatorResolver::resolve_process(
-                base_path.as_os_str().as_bytes(),
-                symlink_policy,
-                OperatorFinalComponent::Directory,
-                false,
-                &mut base_hops,
-            )
-            .with_context(|| format!("resolve source base {}", base_path.display()))?
-            {
-                PinnedPath::Directory(directory) => directory.into_parts().0,
-                PinnedPath::Leaf(_) | PinnedPath::OpenFile(_) => {
-                    bail!("source base {} is not a directory", base_path.display())
+            let directory = |pinned: Result<PinnedPath>| -> Result<_> {
+                match pinned
+                    .with_context(|| format!("resolve source base {}", base_path.display()))?
+                {
+                    PinnedPath::Directory(directory) => Ok(directory.into_parts().0),
+                    PinnedPath::Leaf(_) | PinnedPath::OpenFile(_) => {
+                        bail!("source base {} is not a directory", base_path.display())
+                    }
+                    PinnedPath::Missing(_) => {
+                        unreachable!("source base resolution requires an existing directory")
+                    }
                 }
-                PinnedPath::Missing(_) => {
-                    unreachable!("source base resolution requires an existing directory")
+            };
+            let base_directory = match &self.source_outer_root {
+                None => directory(OperatorResolver::resolve_process(
+                    base_path.as_os_str().as_bytes(),
+                    symlink_policy,
+                    OperatorFinalComponent::Directory,
+                    false,
+                    &mut base_hops,
+                ))?,
+                Some(outer) => {
+                    let outer = Path::new(OsStr::from_bytes(outer));
+                    let inside = base_path.strip_prefix(outer).with_context(|| {
+                        format!("source base {} is outside its root", base_path.display())
+                    })?;
+                    let outer_directory = directory(OperatorResolver::resolve_process(
+                        outer.as_os_str().as_bytes(),
+                        OperatorSymlinkPolicy::Refuse,
+                        OperatorFinalComponent::Directory,
+                        false,
+                        &mut Vec::new(),
+                    ))?;
+                    if inside.as_os_str().is_empty() {
+                        outer_directory
+                    } else {
+                        directory(
+                            OperatorResolver::beneath(&outer_directory, true, symlink_policy)?
+                                .resolve(
+                                    inside.as_os_str().as_bytes(),
+                                    OperatorFinalComponent::Directory,
+                                    false,
+                                    &mut base_hops,
+                                ),
+                        )?
+                    }
                 }
             };
             Some(OperatorResolver::beneath(

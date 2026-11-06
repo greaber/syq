@@ -660,6 +660,9 @@ python3 /usr/local/libexec/syq-test-return-exec.py
 printf 'case: source copies authorized through the return connection\n'
 python3 /usr/local/libexec/syq-test-pull-copy.py
 
+printf 'case: servers copy files from the laptop it approves\n'
+python3 /usr/local/libexec/syq-test-send-copy.py
+
 printf 'case: direct SSH sessions authorized through the return connection\n'
 python3 /usr/local/libexec/syq-test-return-ssh.py
 
@@ -1218,6 +1221,36 @@ ssh destination 'test -d /tmp/syq-real-ssh/named-link/followed/link &&
     test "$(cat /tmp/syq-real-ssh/named-link/followed/link/file)" = "named link" &&
     test "$(readlink /tmp/syq-real-ssh/named-link/linked/link)" = real'
 
+printf 'case: a restricted destination reports a missing --into parent once\n'
+# The coordinator runs on the source server; the receiver refuses to create
+# the missing parent, and the runner should see that one reason.
+ssh source 'mkdir -p /tmp/syq-real-ssh && printf "x\n" >/tmp/syq-real-ssh/missing-parent.txt'
+ssh destination 'rm -rf /tmp/syq-real-ssh/missing-parent'
+for missing_mode in plain results; do
+    missing_args=
+    if [ "$missing_mode" = results ]; then
+        missing_args="--results /tmp/syq-real-ssh-missing-parent.ndjson"
+    fi
+    # shellcheck disable=SC2086
+    if missing_output=$(syq cp --no-progress $missing_args --from source \
+        /tmp/syq-real-ssh/missing-parent.txt \
+        --to destination --into /tmp/syq-real-ssh/missing-parent/sub 2>&1); then
+        echo 'a copy into a missing parent unexpectedly succeeded' >&2
+        exit 1
+    fi
+    case "$missing_output" in
+        *'wire preamble'*|*'incompatible'*|*'what landed'*)
+            printf '%s\n' "$missing_output" >&2; exit 1 ;;
+        *'missing-parent does not exist; a restricted copy creates its destination'*'refused the copy'*'sent no results through source'*) ;;
+        *) printf '%s\n' "$missing_output" >&2; exit 1 ;;
+    esac
+done
+case "$(tail -n 1 /tmp/syq-real-ssh-missing-parent.ndjson)" in
+    *'"status":"failed"'*) ;;
+    *) cat /tmp/syq-real-ssh-missing-parent.ndjson >&2; exit 1 ;;
+esac
+ssh destination 'test ! -e /tmp/syq-real-ssh/missing-parent'
+
 printf 'case: restricted copies accept --pscope\n'
 # --pscope selects which local connections are kept; the receiver's own
 # connection stays private to the copy.
@@ -1580,6 +1613,23 @@ if variant != 'permissions':
     for name, mode in expected.items():
         assert ordinary[name] == mode, (name, oct(ordinary[name]), oct(mode))
 PY_MODE_CHECK
+done
+
+# A new --into directory, like a new parent, gets 0777 limited by the
+# destination's umask (022 here), not the runner's (077), on both receivers.
+for mode_receiver in ordinary restricted; do
+    mode_root=/tmp/syq-real-ssh/modes-new-root-$mode_receiver
+    # shellcheck disable=SC2029
+    ssh destination "rm -rf $mode_root && mkdir $mode_root"
+    if [ "$mode_receiver" = ordinary ]; then
+        (umask 077; syq cp --no-progress --srcs-in /tmp/syq-real-ssh-mode-tree \
+            --to destination --into "$mode_root/new")
+    else
+        syq cp --no-progress --from source --srcs-in /tmp/syq-real-ssh/mode-tree \
+            --to destination --into "$mode_root/new"
+    fi
+    # shellcheck disable=SC2029
+    test "$(ssh destination "stat -c %a $mode_root/new")" = 755
 done
 
 printf 'case: ordinary and restricted receivers update the same files in place\n'

@@ -17,6 +17,8 @@ impl Domain {
         let Some(path) = path else {
             return Ok(Self::Global);
         };
+        // The shell leaves `~` unexpanded after `--pscope=`.
+        let path = &crate::fsops::resolve(path.as_os_str().as_encoded_bytes());
         super::validate_scope(path)?;
         let path = std::fs::canonicalize(path)
             .with_context(|| format!("resolve persistence scope {}", path.display()))?;

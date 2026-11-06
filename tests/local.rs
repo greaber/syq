@@ -242,6 +242,24 @@ fn write(p: &Path, data: &[u8]) {
     File::create(p).unwrap().write_all(data).unwrap();
 }
 
+/// Write a saved preferences file as syq does, not leaving its mode to the
+/// umask: syq refuses one that others in its group could change.
+fn write_private(p: &Path, data: &[u8]) {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(p)
+        .unwrap()
+        .write_all(data)
+        .unwrap();
+}
+
 fn read(p: &Path) -> Vec<u8> {
     let mut v = Vec::new();
     File::open(p).unwrap().read_to_end(&mut v).unwrap();
@@ -359,6 +377,54 @@ fn interrupted_partial_from(args: &[&str], dir: &Path, cwd: Option<&Path>) -> Pa
     let mut partials = partial_files(dir);
     assert_eq!(partials.len(), 1, "expected one prepared partial");
     partials.pop().unwrap()
+}
+
+/// Whether a rerun that publishes a file removes the partials earlier copies
+/// left for it in `dir`, once nothing has them open for writing: on Linux,
+/// where `dir` is on a filesystem whose read leases show every writer
+/// (`fs_caps::leases_show_writers`). Elsewhere they stay.
+fn earlier_partials_removable(dir: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+        let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+        // SAFETY: statfs writes only into the local structure.
+        assert_eq!(
+            unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) },
+            0
+        );
+        let kind = unsafe { stats.assume_init() }.f_type as u32;
+        matches!(
+            kind,
+            0xef53 | 0x5846_5342 | 0x9123_683e | 0x0102_1994 | 0x2fc1_2fc1
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dir;
+        false
+    }
+}
+
+/// Check what a rerun that published the file left of the partial an earlier
+/// copy left for it, which nothing had open for writing.
+#[cfg(debug_assertions)]
+fn assert_earlier_partial_removed_where_possible(partial: &Path) {
+    let removable = earlier_partials_removable(partial.parent().unwrap());
+    assert_eq!(
+        partial.exists(),
+        !removable,
+        "{}: removable here: {removable}",
+        partial.display()
+    );
+}
+
+/// Open `partial` for writing, as a copy still writing it holds it. A rerun
+/// leaves the partial in place while this is open.
+#[cfg(debug_assertions)]
+fn hold_for_writing(partial: &Path) -> File {
+    OpenOptions::new().write(true).open(partial).unwrap()
 }
 
 /// Write an executable fixture with mode 0755. See `executable_support` for

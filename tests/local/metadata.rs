@@ -2115,3 +2115,82 @@ fn final_directory_metadata_refuses_another_directory_put_in_place_of_an_existin
         .next()
         .is_none());
 }
+
+#[test]
+fn new_destination_directories_follow_the_umask() {
+    // Under umask 0002 a new --into directory and the missing directory
+    // above it are 775, as mkdir makes them: locally, on the private-root
+    // path that copies metadata after filling it, and on a remote receiver
+    // with its own umask. `syq rsync`, like rsync, gives a new destination
+    // its source's mode limited by the umask, and needs its parent to exist.
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"data");
+    fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o777)).unwrap();
+    let rsh = fake_rsh(&t);
+    let cases: [(&str, Vec<String>); 4] = [
+        ("cp", vec!["cp".into()]),
+        ("rsync", vec![]),
+        (
+            "private",
+            vec!["cp".into(), "--copy-metadata=ownership".into()],
+        ),
+        (
+            "remote",
+            vec![
+                "cp".into(),
+                "--rsh".into(),
+                rsh.to_string_lossy().into_owned(),
+                "--syq-path".into(),
+                env!("CARGO_BIN_EXE_syq").into(),
+            ],
+        ),
+    ];
+    for (name, prefix) in cases {
+        let parent = t.path(&format!("out-{name}"));
+        let root = parent.join("new");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .env("FAKE_REMOTE_HOME", &t.0)
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("FAKE_REMOTE_UMASK", "0002");
+        if name == "rsync" {
+            fs::create_dir(&parent).unwrap();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o775)).unwrap();
+            command.args(["rsync", "-r", "--no-progress"]);
+            command
+                .arg(t.path("src/"))
+                .arg(format!("{}/", root.display()));
+        } else {
+            command
+                .args(&prefix)
+                .arg("--no-progress")
+                .arg("--srcs-in")
+                .arg(t.path("src"));
+            if name == "remote" {
+                command.args(["--to", "fixture"]);
+            }
+            command.arg("--into").arg(&root);
+        }
+        unsafe {
+            command.pre_exec(|| {
+                libc::umask(0o002);
+                Ok(())
+            });
+        }
+        let output = command.run().unwrap();
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for directory in [&parent, &root] {
+            assert_eq!(
+                fs::metadata(directory).unwrap().mode() & 0o7777,
+                0o775,
+                "{name}: {}",
+                directory.display()
+            );
+        }
+        assert_eq!(read(&root.join("file")), b"data");
+    }
+}

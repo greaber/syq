@@ -431,13 +431,13 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
         input.validate_restricted_bounds()?;
     }
     if args.no_tcp_encryption {
-        bail!("command-restricted transfers require encrypted data connections");
+        bail!("restricted transfers require encrypted data connections");
     }
     if args.follows_native_destination_paths()
         && args.placement == Placement::Into
         && args.widen_dirs == crate::cli::WidenDirs::All
     {
-        bail!("--widen-dirs all cannot be combined with --follow-dst on a command-restricted destination");
+        bail!("--widen-dirs all cannot be combined with --follow-dst on a restricted destination");
     }
     // Range-check every ceiling here, before automatic enrollment can touch
     // the server, rather than leaving it to the receiver.
@@ -459,7 +459,7 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
     if args.connections_opt.is_some() && args.connections > usize::from(delegation::MAX_CONNECTIONS)
     {
         bail!(
-            "command-restricted transfers support at most {} connections",
+            "restricted transfers support at most {} connections",
             usize::from(delegation::MAX_CONNECTIONS)
         );
     }

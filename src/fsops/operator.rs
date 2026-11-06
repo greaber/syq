@@ -717,7 +717,7 @@ pub(super) fn resolve_operator_entry(
     };
     let raw = path.as_os_str().as_bytes();
     if raw.contains(&0) {
-        bail!("operator path contains NUL");
+        bail!("path contains NUL");
     }
     let mut hops = Vec::new();
     let selected = OperatorResolver::resolve_process(
@@ -773,7 +773,7 @@ pub(crate) fn open_operator_file_read(
     match selected {
         PinnedPath::Leaf(leaf) => leaf.open_read(),
         PinnedPath::OpenFile(file) => Ok(file),
-        PinnedPath::Directory(_) => bail!("operator path selects a directory, not a regular file"),
+        PinnedPath::Directory(_) => bail!("the path names a directory, not a regular file"),
         PinnedPath::Missing(_) => Err(io::Error::from_raw_os_error(libc::ENOENT).into()),
     }
 }

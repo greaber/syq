@@ -10,7 +10,6 @@ pub(crate) fn command_for_help() -> Command {
             .subcommand(
                 Command::new("list")
                     .about("List recent transfers, newest first")
-                    .long_about("List recent transfers, newest first. WORKERS is the worker count that older syq versions saved for later copies to start with; transfers recorded by this version show ?.")
                     .arg(
                     Arg::new("limit")
                         .long("limit")
@@ -76,11 +75,8 @@ pub(crate) fn run(args: &[std::ffi::OsString]) -> Result<i32> {
     let mut output = crate::output::command_stdout();
     match matches.subcommand() {
         Some(("list", args)) => {
-            writeln!(
-                output,
-                "ID\tDATE\tSTATUS\tSECONDS\tFILES\tBYTES\tWORKERS\tEVENTS"
-            )?;
-            let mut statement=db.prepare("SELECT id,day,status,summary,CASE WHEN eligible=1 THEN workers END,(SELECT count(*) FROM events WHERE run=runs.id) FROM runs ORDER BY id DESC LIMIT ?1")?;
+            writeln!(output, "ID\tDATE\tSTATUS\tSECONDS\tFILES\tBYTES\tEVENTS")?;
+            let mut statement=db.prepare("SELECT id,day,status,summary,(SELECT count(*) FROM events WHERE run=runs.id) FROM runs ORDER BY id DESC LIMIT ?1")?;
             let rows =
                 statement.query_map([args.get_one::<u32>("limit").copied().unwrap()], |r| {
                     Ok((
@@ -88,12 +84,11 @@ pub(crate) fn run(args: &[std::ffi::OsString]) -> Result<i32> {
                         r.get::<_, i64>(1)?,
                         r.get::<_, String>(2)?,
                         r.get::<_, Option<String>>(3)?,
-                        r.get::<_, Option<u32>>(4)?,
-                        r.get::<_, i64>(5)?,
+                        r.get::<_, i64>(4)?,
                     ))
                 })?;
             for row in rows {
-                let (id, day, status, summary, workers, events) = row?;
+                let (id, day, status, summary, events) = row?;
                 let summary: Value = summary
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or(Value::Null);
@@ -103,7 +98,7 @@ pub(crate) fn run(args: &[std::ffi::OsString]) -> Result<i32> {
                     .unwrap_or_else(|| "?".into());
                 writeln!(
                     output,
-                    "{id}\t{}\t{status}\t{seconds}\t{}\t{}\t{}\t{events}",
+                    "{id}\t{}\t{status}\t{seconds}\t{}\t{}\t{events}",
                     date(day),
                     summary["files"]
                         .as_u64()
@@ -113,7 +108,6 @@ pub(crate) fn run(args: &[std::ffi::OsString]) -> Result<i32> {
                         .as_u64()
                         .map(|v| v.to_string())
                         .unwrap_or_else(|| "?".into()),
-                    workers.map(|v| v.to_string()).unwrap_or_else(|| "?".into())
                 )?;
             }
         }
@@ -170,7 +164,8 @@ pub(crate) fn run(args: &[std::ffi::OsString]) -> Result<i32> {
         }
         Some(("clear", _)) => {
             db.execute("DELETE FROM runs", [])?;
-            db.execute_batch("PRAGMA incremental_vacuum;")?;
+            // Return the freed space; VACUUM's cost follows the kept data.
+            db.execute_batch("VACUUM;")?;
             writeln!(
                 output,
                 "Cleared tuning history. The legacy connection-count cache is unchanged."

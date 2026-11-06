@@ -1977,6 +1977,22 @@ fn tuning_history_records_short_copy_and_exports_interactive_timeline() {
     assert!(html.contains("<svg"));
     assert!(html.contains("final_partial"));
     assert!(!html.contains("__HISTORY_DATA__"));
+    let list = history_command(&t)
+        .args(["tuning-cache", "list"])
+        .run()
+        .unwrap();
+    assert_output_ok(&list);
+    let list = String::from_utf8(list.stdout).unwrap();
+    let mut lines = list.lines();
+    assert_eq!(
+        lines.next(),
+        Some("ID\tDATE\tSTATUS\tSECONDS\tFILES\tBYTES\tEVENTS")
+    );
+    let row: Vec<&str> = lines.next().unwrap().split('\t').collect();
+    assert_eq!(row.len(), 7, "{list}");
+    assert_eq!(row[0], id);
+    assert_eq!(row[2], "success");
+    assert_eq!(row[4], "32", "{list}");
     let cleared = history_command(&t)
         .args(["tuning-cache", "clear"])
         .run()

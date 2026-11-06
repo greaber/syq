@@ -646,7 +646,14 @@ fn record_handed_connection_for_test() {
 /// copy its verified directive allows. A worker's session is handed to the
 /// running copy it joins, which serves it.
 pub(crate) fn run_checker(enrollment: &str, generation: &str) -> Result<()> {
-    match crate::restricted::admit_session(enrollment, generation)? {
+    let session = crate::restricted::admit_session(enrollment, generation).map_err(|error| {
+        if crate::restricted::is_sessions_full(&error) {
+            error
+        } else {
+            crate::restricted::Refused(error).into()
+        }
+    })?;
+    match session {
         crate::restricted::Session::Worker => Ok(()),
         crate::restricted::Session::Copy(authority) => run_restricted(authority),
     }
@@ -867,6 +874,89 @@ pub(crate) fn run_named(
         authority.close_control();
     }
     result
+}
+
+/// An authenticated channel reading files a receiving machine approved for
+/// sending. Control and workers share `descriptor_session`, so workers can
+/// use only the roots control registered; closing control ends both.
+pub(crate) fn run_named_source(
+    r: crate::private_broker::TrackedStream,
+    w: std::os::unix::net::UnixStream,
+    authority: Arc<crate::restricted::source::SourceAuthority>,
+    descriptor_session: DescriptorSessionSlot,
+    control: bool,
+) -> Result<()> {
+    let socket = w.try_clone()?;
+    let timeout = socket
+        .read_timeout()?
+        .context("named handshake requires a timeout")?;
+    let reader = NamedHandshakeReader {
+        inner: r,
+        socket: socket.try_clone()?,
+        deadline: std::time::Instant::now() + timeout,
+    };
+    let result = serve(
+        reader,
+        w,
+        control,
+        None,
+        None,
+        None,
+        ServeSession {
+            owns_process: false,
+            handshake_pending: None,
+            ssh_worker_ticket: None,
+            allow_tcp: false,
+            metadata_control: false,
+            loopback_only: false,
+            named_socket: Some(socket),
+            authority: None,
+            source_authority: Some(Arc::clone(&authority)),
+            descriptor_session: descriptor_session.clone(),
+        },
+    );
+    if control {
+        authority.close();
+        descriptor_session.close();
+    }
+    result
+}
+
+/// A TCP worker the sending receiving machine dialed, admitted through its
+/// approved SSH channel, as `run_named_tcp` is for receiving.
+pub(crate) fn run_named_source_tcp(
+    stream: TcpStream,
+    channel: std::os::unix::net::UnixStream,
+    key: &[u8],
+    authority: Arc<crate::restricted::source::SourceAuthority>,
+    descriptor_session: DescriptorSessionSlot,
+) -> Result<()> {
+    let pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let reader = TcpHandshakeReader {
+        stream: stream.try_clone()?,
+        pending: pending.clone(),
+        deadline: std::time::Instant::now() + Duration::from_secs(10),
+    };
+    serve(
+        RecordReader::new(reader, Some(Cipher::new(key, 0, 1))),
+        RecordWriter::new(stream.try_clone()?, Some(Cipher::new(key, 0, 2))),
+        false,
+        Some(Vec::new()),
+        None,
+        Some(stream),
+        ServeSession {
+            owns_process: false,
+            handshake_pending: Some(pending),
+            ssh_worker_ticket: None,
+            allow_tcp: false,
+            metadata_control: false,
+            loopback_only: false,
+            named_socket: Some(channel),
+            authority: None,
+            source_authority: Some(authority),
+            descriptor_session,
+        },
+    )
 }
 
 /// One approved source control stream. The caller creates a fresh descriptor
@@ -1154,7 +1244,9 @@ fn serve<R: Read + Send + 'static, W: Write>(
     }
     let mut initial_sending_budget = match source_authority
         .as_ref()
-        .filter(|_| is_source_worker && tcp_socket.is_none())
+        // A worker the coordinator's TCP listener paces itself; one a
+        // receiving machine dialed (`named_socket`) has no such listener.
+        .filter(|_| is_source_worker && (tcp_socket.is_none() || named_socket.is_some()))
     {
         Some(source) => source
             .sending_budget(&descriptor_session)?
@@ -1164,9 +1256,9 @@ fn serve<R: Read + Send + 'static, W: Write>(
     match &role {
         ConnectionRole::SourceWorker { .. } if authority.is_some() => {
             w.write_msg(&Response::Err(
-                "a command-restricted receiver does not accept caller-supplied source roots".into(),
+                "a restricted receiver does not accept caller-supplied source roots".into(),
             ))?;
-            bail!("command-restricted receiver rejected supplied source roots");
+            bail!("restricted receiver rejected supplied source roots");
         }
         ConnectionRole::SourceWorker { roots, send_budget } => {
             if let Some(ticket) = send_budget.as_ref().filter(|_| source_authority.is_none()) {
@@ -1188,18 +1280,18 @@ fn serve<R: Read + Send + 'static, W: Write>(
             if authority.is_some() && !copy_sources.is_empty() =>
         {
             w.write_msg(&Response::Err(
-                "a command-restricted receiver does not accept caller-supplied copy sources".into(),
+                "a restricted receiver does not accept caller-supplied copy sources".into(),
             ))?;
-            bail!("command-restricted receiver rejected supplied copy sources");
+            bail!("restricted receiver rejected supplied copy sources");
         }
         ConnectionRole::DestinationWorker {
             destination: Some(_),
             ..
         } if authority.is_some() => {
             w.write_msg(&Response::Err(
-                "a command-restricted destination derives its root from the signed grant".into(),
+                "a restricted destination derives its root from the signed grant".into(),
             ))?;
-            bail!("command-restricted receiver rejected a supplied destination root");
+            bail!("restricted receiver rejected a supplied destination root");
         }
         ConnectionRole::DestinationWorker {
             destination: None, ..
@@ -1836,7 +1928,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         Err(error) => Response::Err(format!("{error:#}")),
                     },
                     None => Response::Err(
-                        "destination results come only from a command-restricted receiver".into(),
+                        "destination results come only from a restricted receiver".into(),
                     ),
                 };
                 w.write_msg(&response)?;
@@ -1848,7 +1940,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         Err(error) => Response::Err(format!("{error:#}")),
                     },
                     None => Response::Err(
-                        "destination results come only from a command-restricted receiver".into(),
+                        "destination results come only from a restricted receiver".into(),
                     ),
                 };
                 w.write_msg(&response)?;

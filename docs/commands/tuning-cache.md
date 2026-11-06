@@ -27,8 +27,8 @@ syq tuning-cache <COMMAND>
 
 ## syq tuning-cache list
 
-List recent transfers, newest first. The `WORKERS` column shows `?` for
-transfers recorded by this version; use `show` to see their worker counts.
+List recent transfers, newest first. Use `show` to see a transfer's worker
+counts.
 
 <!-- CLI: tuning-cache list -->
 ```text

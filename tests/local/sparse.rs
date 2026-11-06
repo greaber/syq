@@ -306,5 +306,7 @@ fn sparse_local_buffered_failure_resumes_from_partial_with_changed_source() {
         &t.s("dst/"),
     ]);
     assert_sparse_copy(&t.path("dst/file"), &data);
-    assert_eq!(partial_files(&t.path("dst")), partials);
+    for partial in &partials {
+        assert_earlier_partial_removed_where_possible(partial);
+    }
 }

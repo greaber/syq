@@ -369,7 +369,7 @@ fn medium_failure_keeps_old_destination_and_resumes_changed_source() {
     let observed = tuning_observed(&out);
     assert_eq!(observed["local_whole_files"], 0);
     assert!(observed["range_requests"].as_u64().unwrap() > 0);
-    assert_eq!(partial_files(&t.path("dst")), partials);
+    assert_earlier_partial_removed_where_possible(&partials[0]);
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -445,7 +445,7 @@ fn fresh_medium_failure_does_not_publish_and_changed_source_resumes() {
         .run()
         .unwrap();
     assert_output_ok(&resumed);
-    assert_eq!(partial_files(&t.path("dst")), partials);
+    assert_earlier_partial_removed_where_possible(&partials[0]);
     // Cleanup changes the containing directory's mtime. Check copied directory
     // metadata before cleanup, and compare each payload independently of donors.
     let source_dir = fs::metadata(t.path("src")).unwrap();

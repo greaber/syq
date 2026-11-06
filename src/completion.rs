@@ -1263,13 +1263,19 @@ fn complete_argument(
     let name = option_name(arg);
     let kind = value_completion(command, &name, meta).unwrap_or(ValueCompletion::None);
     let mut values = complete_value(command, &context.options, current, kind)?;
-    if matches!(
-        arg.get_id().as_str(),
-        "cwd" | "root" | "srcs_in" | "src_dir" | "src_dirs" | "into" | "into_new" | "into_existing"
-    ) {
+    if directories_only_id(arg.get_id().as_str()) {
         values.retain(|candidate| candidate.value.ends_with(b"/"));
     }
     Ok(values)
+}
+
+/// Copy options whose path completion also serves sources and destinations,
+/// but whose value must be a directory.
+fn directories_only_id(id: &str) -> bool {
+    matches!(
+        id,
+        "cwd" | "root" | "srcs_in" | "src_dir" | "src_dirs" | "into" | "into_new" | "into_existing"
+    )
 }
 
 fn native_copy_source_option(option: &[u8]) -> bool {
@@ -1370,9 +1376,11 @@ fn value_completion(
         "persist" => match option {
             b"--auth-from" => Some(ValueCompletion::AuthFrom),
             b"--name" => Some(ValueCompletion::ReceivingProfile),
-            b"--pscope" | b"--cwd" | b"-C" | b"--root" => Some(ValueCompletion::LocalPath {
-                directories_only: true,
-            }),
+            b"--pscope" | b"--cwd" | b"-C" | b"--root" | b"--auto-approve-root" => {
+                Some(ValueCompletion::LocalPath {
+                    directories_only: true,
+                })
+            }
             _ => None,
         },
         "receiver" => match option {
@@ -2471,19 +2479,39 @@ complete -F _syq_complete syq
 
 const ZSH_ADAPTER: &str = r#"#compdef syq
 _syq_complete() {
-    local record kind description
-    local -a values prefixes descriptions prefix_descriptions
+    local record kind description tilde=
+    local -a values prefixes descriptions prefix_descriptions arguments
+    # Send words with the shell's quoting removed, as Bash and fish do. The
+    # current word stops at the cursor; inside an open quote, PREFIX already
+    # has the quote removed.
+    arguments=("${(Q)words[@]}")
+    if [[ -n $compstate[quote] ]]; then
+        arguments[CURRENT]=$PREFIX
+    else
+        arguments[CURRENT]=${(Q)PREFIX}
+    fi
+    # compadd would quote a leading ~, also after --option=, so the shell or
+    # syq no longer expands it. Keep that ~ on the line and add only what
+    # follows it.
+    if [[ -z $compstate[quote] && $PREFIX == (|--[^=]#=)\~* ]]; then
+        tilde=${PREFIX%%/*}
+        compset -P "${(b)tilde}"
+    fi
     while IFS= read -r -d $'\0' record; do
         kind=${record[1]}
         IFS= read -r -d $'\0' description || break
+        record=${record[2,-1]}
+        if [[ -n $tilde && ${record[1,$#tilde]} == "$tilde" ]]; then
+            record=${record[$#tilde+1,-1]}
+        fi
         if [[ $kind == p ]]; then
-            prefixes+=("${record[2,-1]}")
+            prefixes+=("$record")
             prefix_descriptions+=("$description")
         else
-            values+=("${record[2,-1]}")
+            values+=("$record")
             descriptions+=("$description")
         fi
-    done < <(SYQ_COMPLETION_DETAILS=1 command syq completion __complete zsh "$((CURRENT - 1))" -- "${words[@]}")
+    done < <(SYQ_COMPLETION_DETAILS=1 command syq completion __complete zsh "$((CURRENT - 1))" -- "${arguments[@]}")
     (( ${#values} )) && compadd -l -d descriptions -- "${values[@]}"
     (( ${#prefixes} )) && compadd -l -d prefix_descriptions -S '' -- "${prefixes[@]}"
 }
@@ -2494,7 +2522,8 @@ const FISH_ADAPTER: &str = r#"# syq dynamic completion
 function __syq_complete
     set -l words (commandline -opc)
     set -l index (count $words)
-    set -l current (commandline -ct)
+    # Match what fish compares candidates with: the token without quoting.
+    set -l current (commandline -ct | string unescape)
     SYQ_COMPLETION_DETAILS=1 command syq completion __complete fish $index -- $words "$current" | string split0
 end
 complete -c syq -f -a '(__syq_complete)'

@@ -1232,6 +1232,9 @@ pub enum WireRequest<Data> {
         /// What the sender's scan found at `path`.
         scanned: ScannedDestination,
         condition: TargetCondition,
+        /// Preparing the file found partials earlier copies left for it:
+        /// once it is published, remove those nothing is writing.
+        earlier_partials: bool,
     },
     /// Verify and atomically publish a complete small-file batch in one frame.
     PutSmallBatch(Vec<SmallPut>),
@@ -1793,6 +1796,10 @@ pub enum Response {
         ino: u64,
     },
     PublishedBatch(Vec<std::result::Result<Option<(u64, u64)>, WireError>>),
+    /// A file Finalize published, with its identity when the request
+    /// asked for one, beside partials earlier copies left for it that the
+    /// receiver could not show unused and so kept.
+    PublishedBesideEarlierPartials(Option<(u64, u64)>),
     /// Non-final fragment of a rich-metadata stat response.
     StatsMore(Vec<Option<Entry>>),
     NativeMapData(Vec<u8>),

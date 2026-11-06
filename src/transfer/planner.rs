@@ -1277,6 +1277,27 @@ impl Planner<'_> {
         if self.collision {
             return Ok(());
         }
+        if self.source_partials > 0 {
+            let mut payload = self
+                .progress
+                .partial_named_payload
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            payload.extend(
+                mapped
+                    .others
+                    .iter()
+                    .filter(|planned| {
+                        planned.e.kind == Kind::File
+                            && planned
+                                .dst
+                                .rsplit(|&byte| byte == b'/')
+                                .next()
+                                .is_some_and(|name| is_partial_name(OsStr::from_bytes(name)))
+                    })
+                    .map(|planned| planned.dst.clone()),
+            );
+        }
         self.inspect_destination_batch(&mut mapped)?;
         match &mut self.buffer {
             Some(buf) => buf.push(mapped),
@@ -1446,8 +1467,12 @@ impl Planner<'_> {
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                 }
                 Claim::Weak => {
-                    // Symlink without -l, special without -D.
-                    if opts.verbose > 0 {
+                    // Symlink without -l, special without -D. Like rsync,
+                    // `syq rsync` says so on stdout unless -q.
+                    if !opts.quiet && opts.rsync_creation {
+                        self.progress
+                            .println(&format!("skipping non-regular file \"{rel}\""));
+                    } else if opts.verbose > 0 {
                         self.progress
                             .eprintln(&format!("skipping non-regular file \"{rel}\""));
                     }
@@ -1583,7 +1608,7 @@ impl Planner<'_> {
                     _ => self
                         .root_source_mode
                         .filter(|_| is_destination_root)
-                        .unwrap_or_else(|| operator_directory_mode(self.opts)),
+                        .unwrap_or(NEW_DIRECTORY_MODE),
                 };
                 let (selection, created) = create_operator_directory(self.dst, condition, mode)
                     .map_err(|error| new_root_refused(error, condition, &self.dst_root))
@@ -1606,7 +1631,7 @@ impl Planner<'_> {
                 let mode = if self.private_root.is_some() {
                     0o700
                 } else {
-                    self.root_source_mode.unwrap_or(0o755)
+                    self.root_source_mode.unwrap_or(NEW_DIRECTORY_MODE)
                 };
                 let created = mkdir_root(self.dst, &root, condition, mode)
                     .map_err(|error| new_root_refused(error, condition, &root))?;
@@ -2647,7 +2672,7 @@ impl Planner<'_> {
                         // After its group change it is open, with owner
                         // access, as creating it would have left it: from its
                         // source for `syq rsync`, which narrows it at the
-                        // end, and with the default mode for native cp.
+                        // end, and as `mkdir` would for native cp.
                         early.root_default = if opts.rsync_creation {
                             Some((entry.mode & 0o777) | 0o700)
                         } else {

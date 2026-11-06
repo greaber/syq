@@ -484,9 +484,40 @@ pub(crate) fn ssh_authorization_failure(error: &anyhow::Error) -> Option<SshLogi
     })
 }
 
+/// ssh rejected the login that probes a server's platform before
+/// installing the helper there. Kept apart from `SshConnectError`, so that
+/// authorization does not fall back to another machine on it.
+#[derive(Debug)]
+pub(crate) struct BootstrapLoginRejected(pub(crate) SshLoginFailure);
+impl std::fmt::Display for BootstrapLoginRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // ssh's own message, above it, says what failed.
+        f.write_str("ssh login failed")
+    }
+}
+impl std::error::Error for BootstrapLoginRejected {}
+
+/// Whether `error` shows that ssh rejected this machine's login or could
+/// not verify the server's host key, at any step of connecting: one that
+/// needs the user rather than one a later attempt may get past.
+pub(crate) fn ssh_login_needs_user(error: &anyhow::Error) -> bool {
+    let failure = ssh_authorization_failure(error).or_else(|| {
+        error.chain().find_map(|cause| {
+            cause
+                .downcast_ref::<BootstrapLoginRejected>()
+                .map(|rejected| rejected.0)
+        })
+    });
+    matches!(
+        failure,
+        Some(SshLoginFailure::Credentials | SshLoginFailure::HostKey)
+    )
+}
+
 fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     is_worker_initialization_error(error)
+        || error.is::<crate::restricted::CopyRefused>()
         || crate::destination::peer_bridge::is_setup_refusal(error)
         || error.is::<crate::destination::SshWorkersUnavailable>()
         || error.chain().any(|cause| cause.is::<OpenSshVersionError>())
@@ -1000,6 +1031,14 @@ impl RemoteConn {
                     if status.code() == Some(crate::restricted::SESSIONS_FULL_EXIT) {
                         return crate::restricted::SessionsFull(format!(
                             "{}: the receiver refused the connection while other connections were starting ({status})",
+                            self.label
+                        ))
+                        .into();
+                    }
+                    // An enrolled receiver that refused the copy printed why.
+                    if status.code() == Some(crate::restricted::REFUSED_EXIT) {
+                        return crate::restricted::CopyRefused(format!(
+                            "the receiver on {} refused the copy",
                             self.label
                         ))
                         .into();
@@ -3781,6 +3820,7 @@ fn receive_hello(mut conn: RemoteConn, worker: bool) -> Result<RemoteConn> {
             "{}: unexpected handshake response {other:?}; remote syq may be a different version",
             conn.label
         ),
+        Err(e) if e.is::<crate::restricted::CopyRefused>() => return Err(e),
         Err(e) => {
             return Err(e)
                 .with_context(|| format!("could not start the remote syq on {}", conn.label));

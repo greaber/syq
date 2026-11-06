@@ -70,6 +70,11 @@ pub(crate) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
 
 pub(crate) fn request(args: &crate::cli::Args) -> Result<PullRequest> {
     eligible_target(args)?;
+    source_request(args)
+}
+
+/// The read permission a copy's sources need, wherever they are.
+pub(super) fn source_request(args: &crate::cli::Args) -> Result<PullRequest> {
     let sources =
         crate::transfer::distinct_native_sources(&args.locations[..args.locations.len() - 1]);
     let (base, selections, symlink_policy) = crate::transfer::source_registration(&sources, args);
@@ -132,7 +137,7 @@ pub(crate) fn request(args: &crate::cli::Args) -> Result<PullRequest> {
 }
 
 impl PullRequest {
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             self.limits.max_total_bytes > 0
                 && self.limits.max_total_bytes <= crate::delegation::MAX_COPY_BYTES
@@ -147,7 +152,7 @@ impl PullRequest {
         SourceAuthority::new(self.policy())?;
         Ok(())
     }
-    fn policy(&self) -> SourcePolicy {
+    pub(super) fn policy(&self) -> SourcePolicy {
         SourcePolicy {
             base: self.base.clone(),
             selections: self.selections.clone(),
@@ -165,6 +170,7 @@ impl PullRequest {
             send_rate: self.send_rate,
             limits: self.limits.clone(),
             deadline: Instant::now() + LIFETIME,
+            outer_root: None,
         }
     }
     /// Do not stat the source before approval. The native registration resolves

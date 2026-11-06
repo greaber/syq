@@ -54,7 +54,8 @@ allows.
 
 ## The selected data route stays fixed
 
-TCP may fall back to SSH between the same endpoints, but a failure must never
+TCP may fall back to SSH between the same endpoints, saying so (see "Things
+just work, and impaired results are visible"), but a failure must never
 silently relay file data through the invoking or authorizing machine. Relaying
 requires an explicit route choice.
 
@@ -66,3 +67,26 @@ another machine, with that machine's bandwidth, cost, and exposure.
 An incomplete or truncated result must never look successful.
 
 Why: people rely on a destination that syq reports as complete.
+
+## Things just work, and impaired results are visible
+
+Syq works without setup, configuration or authentication that the task does
+not need. Asking the user's laptop for authorization is fine when that is the
+only way to get it, as with agent forwarding. When something that should work
+does not, such as a stale SSH agent socket, syq repairs it where it can rather
+than asking the user to.
+
+When syq has to take a worse path than usual, such as a slower route, a less
+direct one, or an approval that is normally unnecessary, it says so once and
+plainly, so the user knows something is wrong and can fix it.
+
+Syq follows the user's own tools rather than being stricter than them by
+default. For example, a connection that the user's ssh configuration would
+accept, including with `StrictHostKeyChecking accept-new`, is accepted. Weigh
+how often a check prevents a real attack against how often it breaks
+legitimate use: host-key mismatches from real man-in-the-middle attacks are
+very rare, while connectivity failures from strict host-key checking are
+common.
+
+Why: users who get degraded behavior without being told assume that is how
+syq is, and friction for unlikely threats costs more than it saves.

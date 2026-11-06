@@ -3,8 +3,8 @@
 # Use your laptop from a server
 
 Receiving lets you work in a server's shell and still use your laptop: copy
-files to it, run commands on it, and let the server use your laptop's SSH or
-storage credentials with your approval. It runs over a
+files to and from it, run commands on it, and let the server use your laptop's
+SSH or storage credentials with your approval. It runs over a
 [persistent connection](persistence.md) that your laptop opens, so your laptop
 needs no SSH server, public address, or incoming network port.
 
@@ -12,6 +12,7 @@ Start with [Set up receiving](#set-up-receiving). Each later section is a
 separate task, so read only the one you need:
 
 - [Copy files to your laptop](#copy-files-to-your-laptop).
+- [Copy files from your laptop](#copy-files-from-your-laptop).
 - [Run commands on your laptop](#run-commands-on-your-laptop).
 - [Authorize copies between servers](#authorize-copies-between-servers) when
   the server can't log in to the other server itself.
@@ -69,10 +70,6 @@ profile's starting directory (your home directory unless you set `--cwd`,
 `--root` or `--auto-approve-root`), or to a path you give with `--into` or
 `--as`, relative to that directory or absolute.
 
-Your laptop accepts copies and commands, but it can't be a copy source: to
-copy files from your laptop to the server, run `syq cp PATH --to server` on
-the laptop.
-
 Each copy waits for approval **on your laptop**. The prompt shows the server,
 what is copied where, and a warning for each option that lets the server do
 more than copy files, such as pruning or copying permissions. Choose
@@ -90,7 +87,10 @@ syq persist receive approve REQUEST_ID
 <a id="copy-permissions-and-limits"></a>
 
 By default, each copy can write at most 100 GiB and make at most one million
-changes, and it can't delete files. If you need to, change these and other
+changes, and it can't delete files, apart from syq's own leftover partial
+files beside the files it writes (see
+[Resume an interrupted copy](reference.md#resume-an-interrupted-copy)). If you
+need to, change these and other
 optional settings with `syq persist receive on` on your laptop:
 
 - `--max-bytes`, `--max-entries` and `--max-delete` change the limits; see
@@ -106,6 +106,26 @@ optional settings with `syq persist receive on` on your laptop:
 Changing any of these except `--notify` cancels active copies, commands and
 pending requests. Copies you approved between two servers keep running; see
 [Copying between servers](security.md#copying-between-servers) to stop them.
+
+<a id="copy-files-from-your-laptop"></a>
+
+## Copy files from your laptop
+
+On the server, name your laptop with `--from`:
+
+```sh
+syq cp --from @laptop .kube --into .
+syq cp --from @laptop notes/todo.md --as todo.md
+```
+
+Paths start in the same directory as downloads, and `~/` means your laptop's
+home directory; quote it (`'~/notes'`) so the server's shell leaves it alone.
+With `--root`, they must stay inside it: absolute paths, `~` and `..` are
+refused, and symlinks can't lead outside it. The prompt on your laptop shows
+the exact files the server asked for and that they will leave your laptop.
+Approving lets the server read just those files or directories for this one
+copy; nothing on your laptop is changed. Sending always asks, even with
+`--auto-approve-root`, which applies only to downloads.
 
 ## Run commands on your laptop
 

@@ -216,6 +216,10 @@ pub struct Args {
     pub(crate) direct_source: Option<Box<crate::conn::RemoteSpec>>,
     #[arg(skip)]
     pub(crate) return_source: Option<std::sync::Arc<crate::destination::ReturnConnection>>,
+    /// The route to a receiving machine that approved sending this copy's
+    /// sources (`destination::send`).
+    #[arg(skip)]
+    pub(crate) named_source: Option<String>,
     /// Local source work overlapped with the automatic authorization SSH attempt.
     #[arg(skip)]
     pub(crate) prepared_source: Option<std::sync::Arc<crate::transfer::PreparedSource>>,
@@ -1033,7 +1037,10 @@ impl Args {
         // Removing the tuner's default ceiling does not expand signed
         // receiver or approved source authority. Each endpoint still enforces
         // its particular grant; cached full-account SSH has no such ceiling.
-        if self.restricted_grant.is_some() || self.return_source.is_some() {
+        if self.restricted_grant.is_some()
+            || self.return_source.is_some()
+            || self.named_source.is_some()
+        {
             requested.min(usize::from(crate::delegation::MAX_CONNECTIONS))
         } else {
             requested
@@ -1120,21 +1127,21 @@ pub(crate) fn rsync_operator_symlink_policy(insecure_links: bool) -> OperatorSym
 }
 
 /// A leading `@NAME` is a receiving name, never an SSH login with an empty
-/// user name. Only a native copy's destination can use one; refuse every
-/// other position here, before anything can hand it to ssh.
+/// user name. Only a native copy can use one, as its destination or as the
+/// machine its sources are on; refuse every other use here, before anything
+/// can hand it to ssh.
 fn reject_receiving_names(command: &str, args: &Args) -> Result<()> {
     use crate::destination::notices;
-    let last = args.locations.len().saturating_sub(1);
-    for (index, location) in args.locations.iter().enumerate() {
+    for location in &args.locations {
         let Some(name) = location.host.as_deref().and_then(|h| h.strip_prefix('@')) else {
             continue;
         };
         if args.interface != Interface::NativeCp {
             bail!(notices::unsupported(&format!("syq {command}"), name));
         }
-        if index != last {
-            bail!(notices::copy_from(name, notices::here()));
-        }
+    }
+    if crate::destination::send::source_name(args).is_some() {
+        crate::destination::send::check_endpoints(args)?;
     }
     Ok(())
 }
@@ -1142,7 +1149,6 @@ fn reject_receiving_names(command: &str, args: &Args) -> Result<()> {
 /// `syq rsync` never uses receiving machines. Explain an `@NAME:PATH`
 /// operand instead of reading it as an SSH login with an empty user name.
 fn reject_rsync_receiving_names(paths: &[String]) -> Result<()> {
-    use crate::destination::notices;
     for (index, path) in paths.iter().enumerate() {
         let Some(name) = path
             .strip_prefix('@')
@@ -1155,7 +1161,7 @@ fn reject_rsync_receiving_names(paths: &[String]) -> Result<()> {
         if index > 0 && index == paths.len() - 1 {
             bail!("receiving machine @{name} cannot be used with syq rsync; to copy to it, use `syq cp SOURCE --to @{name}`, adding --into DIR or --as PATH to choose where");
         }
-        bail!(notices::copy_from(name, notices::here()));
+        bail!("receiving machine @{name} cannot be used with syq rsync; to copy from it, use `syq cp --from @{name} PATH`, adding --into DIR or --as PATH to choose where");
     }
     Ok(())
 }
@@ -1309,7 +1315,7 @@ struct NativeSourceArgs {
 
 #[derive(clap::Args, Debug)]
 struct NativeSelectionArgs {
-    /// Source endpoint ([USER@]HOST[:PORT] or s3://BUCKET); omitted means local
+    /// Source endpoint ([USER@]HOST[:PORT], receiving name (@NAME), or s3://BUCKET); omitted means local
     #[arg(long, value_name = "ENDPOINT")]
     from: Option<String>,
     #[command(flatten)]
@@ -2327,7 +2333,7 @@ fn parse_descriptor_copy(
         (None, None)
     };
     if endpoint.is_some_and(|e| e.starts_with('@')) {
-        bail!("descriptor copies require a local path, SSH host, or S3 bucket; named receiving destinations are not supported");
+        bail!("descriptor copies require a local path, SSH host, or S3 bucket; receiving machines (@NAME) are not supported");
     }
     let s3_endpoint = endpoint.filter(|s| s.starts_with("s3://"));
     let mut s3 = crate::s3::Options::parse(
@@ -2662,7 +2668,7 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
         let dst_remote = args.locations.last().is_some_and(|l| l.host.is_some());
         if !(src_remote && dst_remote) {
             bail!(
-                "--receiver-max-entries and --receiver-max-bytes address the command-restricted receiver; they apply only to direct remote-to-remote copies"
+                "--receiver-max-entries and --receiver-max-bytes limit a restricted copy between two servers; they do not apply to this copy"
             );
         }
     }

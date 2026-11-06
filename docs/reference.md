@@ -82,9 +82,9 @@ can; if copies fall back to SSH, see
 
 Other routes use the same options:
 
-- `--to @NAME` sends files to your laptop from a server's shell; without the
-  `@`, `--to laptop` names an SSH server. See
-  [Use your laptop from a server](receive.md).
+- `--to @NAME` sends files to your laptop from a server's shell, and
+  `--from @NAME` copies files from it; without the `@`, `laptop` names an SSH
+  server. See [Use your laptop from a server](receive.md).
 - `--from s3://BUCKET` and `--to s3://BUCKET` copy to and from S3. See
   [Use S3 storage](object-storage.md).
 - `--from` and `--to` with two servers copy directly between them. See
@@ -296,9 +296,13 @@ Directories the first run created can keep temporary
 permissions; add `--copy-metadata=permissions,mtime` to the rerun to make them
 match the source.
 
-Partial files from an interrupted copy, and temporary files from one that was
-killed, can remain even after a successful rerun. Syq says how many files have
-them. To remove them:
+When a rerun finishes a file, it also removes the partial files that earlier
+copies left for it, as long as no other program has them open for writing. It
+can tell that only on Linux, on local filesystems such as ext4, XFS, Btrfs, ZFS
+and tmpfs. Elsewhere, such as on macOS or a network filesystem, or while
+another copy may still be writing them, it leaves them and says how many files
+have them. Temporary files from a copy that was killed can also remain beside
+files a local rerun copies whole. To remove leftovers:
 
 ```sh
 syq clean-partials --dry-run -v backup
@@ -373,7 +377,9 @@ writes with other policies.
 By default, new and updated files get the source's modification time. New
 files also get the source's read, write and execute permissions, limited by
 the umask or the directory's default ACL; existing files and directories keep
-theirs. Files whose contents already match keep all their metadata, so if
+theirs. A new `--into` directory, and any missing directory above an `--into`
+or `--as` target, gets the mode `mkdir` would give it: `0777` limited by the
+umask on the destination. Files whose contents already match keep all their metadata, so if
 their times differ, they can be read again on every run; add
 `--copy-metadata=mtime` (alias `times`) to make the times match.
 

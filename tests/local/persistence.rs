@@ -553,6 +553,17 @@ fn persistence_policy_and_ephemeral_scopes_have_separate_lifecycles() {
         .unwrap();
     assert_output_ok(&scoped_status);
     assert!(String::from_utf8_lossy(&scoped_status.stdout).contains("connections: 0"));
+    // The shell leaves ~ after --pscope= alone.
+    let home_relative = format!(
+        "--pscope=~/{}",
+        scope.file_name().unwrap().to_str().unwrap()
+    );
+    let tilde_status = persistence_command(&t, &["status", &home_relative])
+        .env("HOME", scope.parent().unwrap())
+        .run()
+        .unwrap();
+    assert_output_ok(&tilde_status);
+    assert_eq!(tilde_status.stdout, scoped_status.stdout);
 
     let closed = persistence_command(&t, &["off", "--pscope", scope.to_str().unwrap()])
         .run()
@@ -1346,7 +1357,7 @@ fn auth_from_preferences_preserve_persistence_and_reset_individual_hosts() {
     // Unchanged persistence format from released v0.7.1. An older binary
     // ignores auth-from.json and can still read its own settings unchanged.
     let old = b"{\"enabled\":false}\n";
-    write(&t.path("config/syq/persistence.json"), old);
+    write_private(&t.path("config/syq/persistence.json"), old);
     let run = |args: &[&str]| persistence_command(&t, args).capture_output().unwrap();
     assert_output_ok(&run(&["auth-from", "@laptop"]));
     assert_output_ok(&run(&["auth-from", "ssh", "--for", "backup"]));

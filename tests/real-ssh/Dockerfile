@@ -103,6 +103,7 @@ COPY tests/real-ssh/test-receive-notifications.py /usr/local/libexec/syq-test-re
 
 COPY tests/real-ssh/test-forward-copy.py /usr/local/libexec/syq-test-forward-copy.py
 COPY tests/real-ssh/test-pull-copy.py /usr/local/libexec/syq-test-pull-copy.py
+COPY tests/real-ssh/test-send-copy.py /usr/local/libexec/syq-test-send-copy.py
 
 COPY tests/real-ssh/test-return-exec.py /usr/local/libexec/syq-test-return-exec.py
 COPY tests/real-ssh/test-return-ssh.py /usr/local/libexec/syq-test-return-ssh.py

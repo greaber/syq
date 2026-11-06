@@ -592,6 +592,48 @@ fn dry_run_does_not_apply_metadata_repairs() {
 }
 
 #[test]
+fn rsync_without_links_says_it_skips_symlinks() {
+    use std::os::unix::fs::symlink;
+    let t = Tmp::new();
+    write(&t.path("src/f"), b"data");
+    symlink("f", t.path("src/l")).unwrap();
+    symlink("src/f", t.path("LINK")).unwrap();
+    fs::create_dir(t.path("dst")).unwrap();
+
+    let named = syq(&["-r", &t.s("LINK"), &t.s("dst/")]);
+    assert!(named.status.success(), "{}", stderr_of(&named));
+    // rsync prints it on stdout, with its other informational lines.
+    let stdout = String::from_utf8_lossy(&named.stdout);
+    assert!(
+        stdout.contains("skipping non-regular file \"LINK\""),
+        "{stdout}"
+    );
+    assert!(
+        !stderr_of(&named).contains("skipping"),
+        "{}",
+        stderr_of(&named)
+    );
+    assert!(fs::symlink_metadata(t.path("dst/LINK")).is_err());
+
+    let tree = syq(&["-r", &t.s("src/"), &t.s("dst/")]);
+    assert!(tree.status.success(), "{}", stderr_of(&tree));
+    let stdout = String::from_utf8_lossy(&tree.stdout);
+    assert!(
+        stdout.contains("skipping non-regular file \"l\""),
+        "{stdout}"
+    );
+    assert_eq!(read(&t.path("dst/f")), b"data");
+
+    let quiet = syq(&["-rq", &t.s("LINK"), &t.s("dst/")]);
+    assert!(quiet.status.success(), "{}", stderr_of(&quiet));
+    assert!(
+        !stderr_of(&quiet).contains("skipping"),
+        "{}",
+        stderr_of(&quiet)
+    );
+}
+
+#[test]
 fn dry_run_rejects_bare_directory_into_existing_file() {
     let t = Tmp::new();
     write(&t.path("src/f"), b"source");

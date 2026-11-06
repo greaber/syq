@@ -358,7 +358,7 @@ fn pin_selection(
         PinnedPath::Leaf(leaf) => {
             if location.selection == SourceSelection::Contents && leaf.metadata().is_symlink() {
                 bail!(
-                    "--srcs-in {} encounters a last-component symlink; {OPERATOR_SYMLINK_FOLLOW_ADVICE}",
+                    "--srcs-in {} is a symlink; {OPERATOR_SYMLINK_FOLLOW_ADVICE}",
                     display(&location.path)
                 );
             }

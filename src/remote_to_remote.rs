@@ -397,15 +397,22 @@ fn settle(mut relay: Relay, settlement: Settlement<'_>) -> Result<i32> {
         }
         return Ok(coordinator_exit_code);
     };
+    let received = reader.received_any();
     let totals = match reader.finish() {
         Ok(totals) => totals,
         Err(error) => {
             let message = format!(
-                "the results of the command-restricted receiver on {dst_host}, relayed by {src_host}, could not be verified: {error:#}; what landed is unknown"
+                "the results of the restricted receiver on {dst_host}, relayed by {src_host}, could not be verified: {error:#}; what landed is unknown"
             );
             relay.error(&message, "integrity");
             fail_results(&relay, elapsed_ms);
-            bail!(message);
+            match unverified_results(received, coordinator_exit_code, src_host, dst_host) {
+                Some(line) => {
+                    crate::output::diagnostic!("syq: {line}");
+                    return Ok(1);
+                }
+                None => bail!(message),
+            }
         }
     };
     let status = if totals.failed > 0 {
@@ -465,6 +472,22 @@ fn settle(mut relay: Relay, settlement: Settlement<'_>) -> Result<i32> {
         );
     }
     Ok(coordinator_exit_code)
+}
+
+/// The short line the runner prints in place of the full integrity complaint
+/// when a restricted receiver's results could not be verified, or `None`
+/// for the full complaint. Only a receiver that sent nothing at all, in a run
+/// whose coordinator already failed (and said why, as when the receiver
+/// refused the copy), gets the short line; it is still the runner's own
+/// statement, so a failure stays visible whatever the relayed output says.
+fn unverified_results(
+    received: bool,
+    coordinator_exit_code: i32,
+    src_host: &str,
+    dst_host: &str,
+) -> Option<String> {
+    (!received && coordinator_exit_code != 0)
+        .then(|| format!("the receiver on {dst_host} sent no results through {src_host}"))
 }
 
 /// The run's final result through a restricted receiver: what changed comes
@@ -1572,7 +1595,7 @@ fn run_remote(
             })
             .transpose()
             .context(
-                "prepare command-restricted destination enrollment; use --peer-auth broker to explicitly request authentication-only confinement",
+                "prepare restricted destination enrollment; use --peer-auth broker to explicitly request authentication-only confinement",
             )?;
         if let Some(prepared) = prepared {
             // The coordinator gets the entry key on its input and uses it
@@ -1599,7 +1622,7 @@ fn run_remote(
             });
             if !args.quiet {
                 crate::output::diagnostic!(
-                    "syq: using command-restricted destination enrollment {}",
+                    "syq: using restricted destination enrollment {}",
                     prepared.enrollment_id
                 );
             }
@@ -1640,7 +1663,7 @@ fn run_remote(
         && restricted_grant.is_none()
     {
         bail!(
-            "--receiver-max-entries and --receiver-max-bytes address the command-restricted receiver, but this transfer does not use the enrolled receiver"
+            "--receiver-max-entries and --receiver-max-bytes limit a restricted copy, but this copy logs in to the destination normally rather than through its restricted receiver"
         );
     }
     let coordinator_target = endpoint_display(coordinator);
