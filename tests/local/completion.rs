@@ -436,6 +436,39 @@ done
 }
 
 #[test]
+fn receiving_directory_options_complete_any_spelling_of_a_local_directory() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("work/sub")).unwrap();
+    fs::create_dir(t.path("work/with space")).unwrap();
+    write(&t.path("work/notes.txt"), b"file");
+    fs::create_dir_all(t.path("home/Documents")).unwrap();
+    write(&t.path("home/Doc.txt"), b"file");
+    let work = t.s("work");
+    for option in ["--auto-approve-root", "--root", "--cwd", "-C"] {
+        let complete = |current: &str, expected: &[&str]| {
+            assert_completion_candidates(
+                &t,
+                &["syq", "persist", "receive", "on", option, current],
+                expected,
+            )
+        };
+        complete("work/", &["work/sub/", "work/with space/"]);
+        complete("work/w", &["work/with space/"]);
+        complete("./work/s", &["./work/sub/"]);
+        complete("work/sub/../w", &["work/sub/../with space/"]);
+        complete("~/Doc", &["~/Documents/"]);
+        complete("~", &["~/"]);
+        complete(&format!("{work}/n"), &[]);
+        complete(&format!("{work}/s"), &[&format!("{work}/sub/")]);
+    }
+    assert_completion_candidates(
+        &t,
+        &["syq", "persist", "receive", "on", "--auto-approve-root=~/D"],
+        &["--auto-approve-root=~/Documents/"],
+    );
+}
+
+#[test]
 fn completion_adapters_and_local_filename_candidates_are_shell_safe() {
     let t = Tmp::new();
     write(&t.path("alpha file"), b"file");
@@ -476,6 +509,17 @@ fn completion_adapters_and_local_filename_candidates_are_shell_safe() {
     assert!(
         zsh.contains("compadd -l -d prefix_descriptions -S '' --"),
         "{zsh}"
+    );
+    // zsh keeps the user's quoting in its words; syq gets them dequoted, and
+    // a leading ~ stays outside compadd's quoting so the shell expands it.
+    assert!(zsh.contains(r#"arguments=("${(Q)words[@]}")"#), "{zsh}");
+    assert!(zsh.contains(r#"compset -P "${(b)tilde}""#), "{zsh}");
+    let fish = completion_command(&t, &["fish"]).run().unwrap();
+    assert_output_ok(&fish);
+    let fish = String::from_utf8(fish.stdout).unwrap();
+    assert!(
+        fish.contains("set -l current (commandline -ct | string unescape)"),
+        "{fish}"
     );
 
     let registered = Command::new("bash")
@@ -544,6 +588,39 @@ printf '%s\n' "${COMPREPLY[@]}""#,
         .unwrap();
     assert_output_ok(&unicode);
     assert_eq!(unicode.stdout, "éalpha\n".as_bytes());
+
+    fs::create_dir_all(t.path("home/Documents")).unwrap();
+    let receiving_root = Command::new("bash")
+        .arg("-c")
+        .arg(
+            r#"eval "$("$SYQ" completion bash)"
+COMP_LINE='syq persist receive on --auto-approve-root ~/Doc'
+COMP_POINT=${#COMP_LINE}
+COMP_WORDS=(syq persist receive on --auto-approve-root '~/Doc')
+COMP_CWORD=5
+_syq_complete
+printf '%s\n' "${COMPREPLY[@]}""#,
+        )
+        .current_dir(t.path(""))
+        .env("SYQ", env!("CARGO_BIN_EXE_syq"))
+        .env("HOME", t.path("home"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.runtime())
+        .env(
+            "PATH",
+            format!(
+                "{}:/usr/bin:/bin",
+                Path::new(env!("CARGO_BIN_EXE_syq"))
+                    .parent()
+                    .unwrap()
+                    .display()
+            ),
+        )
+        .run()
+        .unwrap();
+    assert_output_ok(&receiving_root);
+    assert_eq!(receiving_root.stdout, b"~/Documents/\n");
 
     let prefix = t.s("al");
     let output = completion_command(&t, &["__complete", "bash", "2", "--", "syq", "cp", &prefix])

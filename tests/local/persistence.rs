@@ -553,6 +553,17 @@ fn persistence_policy_and_ephemeral_scopes_have_separate_lifecycles() {
         .unwrap();
     assert_output_ok(&scoped_status);
     assert!(String::from_utf8_lossy(&scoped_status.stdout).contains("connections: 0"));
+    // The shell leaves ~ after --pscope= alone.
+    let home_relative = format!(
+        "--pscope=~/{}",
+        scope.file_name().unwrap().to_str().unwrap()
+    );
+    let tilde_status = persistence_command(&t, &["status", &home_relative])
+        .env("HOME", scope.parent().unwrap())
+        .run()
+        .unwrap();
+    assert_output_ok(&tilde_status);
+    assert_eq!(tilde_status.stdout, scoped_status.stdout);
 
     let closed = persistence_command(&t, &["off", "--pscope", scope.to_str().unwrap()])
         .run()

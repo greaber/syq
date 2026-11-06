@@ -742,6 +742,43 @@ fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() 
     assert_eq!(status()["settings"]["notifications"], "off");
     assert_output_ok(&run(&["persist", "receive", "on", "--max-entries", "500"]));
     assert_eq!(status()["settings"]["auto_approve_root"], t.s("downloads"));
+    // The shell leaves ~ after --option= alone, and paths may be relative,
+    // reach through .., or name a symlink: each is saved as the directory's
+    // absolute path, which on also prints.
+    fs::create_dir(t.path("work")).unwrap();
+    std::os::unix::fs::symlink("downloads", t.path("link")).unwrap();
+    let in_work = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["persist", "receive", "on", "--root", "../downloads"])
+        .args(["--auto-approve-root=~/link/.", "--cwd", "../link"])
+        .env("HOME", t.path(""))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.runtime())
+        .env("SYQ_NO_UPDATE_CHECK", "1")
+        .current_dir(t.path("work"))
+        .capture_output()
+        .unwrap();
+    assert_output_ok(&in_work);
+    let printed = String::from_utf8(in_work.stdout).unwrap();
+    assert!(
+        printed.contains(&format!("auto-approve-root: {}\n", t.s("downloads"))),
+        "{printed}"
+    );
+    assert!(
+        printed.contains(&format!("root: {}\n", t.s("downloads"))),
+        "{printed}"
+    );
+    let saved = status();
+    for key in ["root", "auto_approve_root", "cwd"] {
+        assert_eq!(saved["settings"][key], t.s("downloads"), "{key}");
+    }
+    let missing = run(&["persist", "receive", "on", "--auto-approve-root=~/missing"]);
+    assert!(!missing.status.success());
+    assert!(
+        stderr_of(&missing).contains("--auto-approve-root ~/missing"),
+        "{}",
+        stderr_of(&missing)
+    );
+    assert_output_ok(&run(&["persist", "receive", "on", "--no-root"]));
     assert_output_ok(&run(&[
         "persist",
         "receive",

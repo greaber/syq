@@ -202,7 +202,10 @@ independent settings:
 | `--root DIR` | Hard boundary for downloads, even with approval | `--no-root` |
 | `--auto-approve-root DIR` | Downloads confined here, including pruning up to `--max-delete`, skip approval, except with `--widen-dirs all` | `--no-auto-approve-root` |
 
-Each must be an existing directory, and neither root can be `/`. Without
+Each must be an existing directory, and neither root can be `/`. You can give
+a relative path or one starting with `~`, including after `=` as in
+`--root=~/inbox`; syq saves the directory's absolute path with symlinks
+resolved, and `receive on` and `receive status` show it. Without
 `--cwd`, downloads start in the hard root if set, otherwise the automatic
 approval root if set, otherwise your home directory.
 

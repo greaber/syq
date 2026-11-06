@@ -274,6 +274,80 @@ fn root_and_option_candidates_come_from_public_command_metadata() {
     assert!(values(root_candidates(b"--help-a")).contains(&b"--help-all".to_vec()));
 }
 
+/// Every option that names a local file or directory completes paths, and a
+/// directory option completes only directories. The exceptions name paths on
+/// another machine.
+#[test]
+fn every_local_path_option_completes_paths_of_its_kind() {
+    fn visit(top: &str, meta: &clap::Command, checked: &mut usize) {
+        for arg in meta.get_arguments() {
+            if arg.is_hide_set() || arg.is_positional() || !arg.get_action().takes_values() {
+                continue;
+            }
+            let Some(value_name) = arg.get_value_names().and_then(|names| names.first()) else {
+                continue;
+            };
+            let value_name = value_name.as_str();
+            if !matches!(value_name, "DIR" | "FILE" | "PATH") {
+                continue;
+            }
+            let name = option_name(arg);
+            let remote = matches!(
+                (top, name.as_slice()),
+                (_, b"--syq-path") | ("rsync", b"--rsync-path") | ("exec", b"--cwd")
+            );
+            let kind = value_completion(top, &name, meta);
+            let label = format!(
+                "{top} {} {}",
+                meta.get_name(),
+                String::from_utf8_lossy(&name)
+            );
+            if remote {
+                assert!(matches!(kind, Some(ValueCompletion::None)), "{label}");
+                continue;
+            }
+            *checked += 1;
+            // A persistence scope is a directory printed by persist on --ephemeral.
+            let directory = value_name == "DIR" || name.ends_with(b"pscope");
+            match kind {
+                Some(ValueCompletion::LocalPath { directories_only }) => {
+                    assert_eq!(directories_only, directory, "{label} directories only")
+                }
+                Some(ValueCompletion::SourcePath { .. } | ValueCompletion::DestinationPath) => {
+                    assert_eq!(
+                        directories_only_id(arg.get_id().as_str()),
+                        directory,
+                        "{label} directories only"
+                    )
+                }
+                _ => panic!("{label} does not complete local paths"),
+            }
+        }
+        for child in meta.get_subcommands().filter(|child| !child.is_hide_set()) {
+            visit(top, child, checked);
+        }
+    }
+    let mut checked = 0;
+    for top in [
+        "cp",
+        "rm",
+        "clean-partials",
+        "map",
+        "rsync",
+        "persist",
+        "ssh",
+        "exec",
+        "receiver",
+        "completion",
+        "tuning-cache",
+    ] {
+        let mut meta = public_command(top).unwrap();
+        meta.build();
+        visit(top, &meta, &mut checked);
+    }
+    assert!(checked > 40, "only {checked} path options found");
+}
+
 #[test]
 fn native_option_looking_values_are_completed_as_options_unless_attached() {
     let options =

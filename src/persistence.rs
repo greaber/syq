@@ -161,8 +161,9 @@ impl EndpointRecord {
 pub(crate) fn completion_endpoints(explicit_scope: Option<&Path>) -> Result<Vec<EndpointRecord>> {
     let scope = match explicit_scope {
         Some(scope) => {
-            validate_scope(scope)?;
-            scope.to_path_buf()
+            let scope = crate::fsops::resolve(scope.as_os_str().as_bytes());
+            validate_scope(&scope)?;
+            scope
         }
         None if global_enabled()? => global_scope_path()?,
         None => return Ok(Vec::new()),
