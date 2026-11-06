@@ -328,20 +328,12 @@ fn every_local_path_option_completes_paths_of_its_kind() {
         }
     }
     let mut checked = 0;
-    for top in [
-        "cp",
-        "rm",
-        "clean-partials",
-        "map",
-        "rsync",
-        "persist",
-        "ssh",
-        "exec",
-        "receiver",
-        "completion",
-        "tuning-cache",
-    ] {
-        let mut meta = public_command(top).unwrap();
+    let root = crate::help::root();
+    let tops = root
+        .get_subcommands()
+        .filter(|child| !child.is_hide_set() && child.get_name() != "help");
+    for top in tops.map(|child| child.get_name()) {
+        let mut meta = public_command(top).unwrap_or_else(|| panic!("no metadata for {top}"));
         meta.build();
         visit(top, &meta, &mut checked);
     }
