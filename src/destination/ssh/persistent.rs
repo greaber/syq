@@ -1644,9 +1644,6 @@ impl Drain {
         stop: &mut dyn FnMut() -> bool,
         ended: &mut dyn FnMut() -> bool,
     ) -> LinkReply {
-        if request == LinkRequest::CloseIfIdle {
-            self.close_if_idle(use_count, stop);
-        }
         if self.closing {
             return if ended() {
                 LinkReply::Closing
@@ -1654,7 +1651,13 @@ impl Drain {
                 LinkReply::InUse
             };
         }
-        match use_count() {
+        // Counted once for both the decision and the answer.
+        let count = use_count();
+        if request == LinkRequest::CloseIfIdle && count == Some(0) && stop() {
+            self.closing = true;
+            return self.answer(request, &|| count, stop, ended);
+        }
+        match count {
             Some(0) if request == LinkRequest::Query => LinkReply::Idle,
             Some(_) => LinkReply::InUse,
             None => LinkReply::Unknown,

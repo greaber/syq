@@ -137,7 +137,7 @@ for base in [["--root", "send-fixture/escape"], ["-C", "send-fixture/escape"], [
         named = ["secret"] if base else ["send-fixture/escape/secret"]
         _, text = copy([*base, *follow, "--src-non-dir", *named], "escaped", success=False)
         assert any(reason in text for reason in [
-            "refusing symlink component", "outside its root",
+            "refusing to follow symlink", "outside its root",
             "outside its confined root"]), (base, follow, text)
         run("ssh", "source", "test ! -e " + shlex.quote(server + "/escaped/secret"))
 
