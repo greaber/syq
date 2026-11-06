@@ -1606,7 +1606,20 @@ fn a_destination_in_the_home_resolves_from_where_the_home_is() {
         confined.identity(),
         Root::open(&real_home.join("backup")).unwrap().identity()
     );
-    // So does the home itself.
+    // So does the home itself, as `--into ~` names it: its directory is
+    // where the home's parent really is, though a link leads there.
+    let home_itself = ConfinedRoot::resolve(
+        home.as_os_str().as_bytes(),
+        &[],
+        false,
+        Some((&home, &real_home)),
+    )
+    .unwrap();
+    assert_eq!(
+        home_itself.identity(),
+        Root::open(real_home.parent().unwrap()).unwrap().identity()
+    );
+    // And a destination directly in the home.
     let directly = ConfinedRoot::resolve(
         home.join("archive").as_os_str().as_bytes(),
         &[],

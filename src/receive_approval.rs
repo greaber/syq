@@ -600,6 +600,24 @@ fn quoted_local_path(path: &[u8]) -> String {
         std::env::var_os("HOME").as_deref(),
     ))
 }
+/// Whether `path` is outside `start`, the profile's directory, or leads
+/// there through `..`, and whether it is hidden: a name below where it
+/// leaves `start`'s path starts with a dot, as `.env` or `~/.ssh/key` does.
+fn notable_path(path: &[u8], start: &std::path::Path) -> (bool, bool) {
+    use std::path::Component;
+    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(path));
+    let common = path
+        .components()
+        .zip(start.components())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let below: Vec<_> = path.components().skip(common).collect();
+    let outside = common < start.components().count() || below.contains(&Component::ParentDir);
+    let hidden = below
+        .iter()
+        .any(|part| matches!(part, Component::Normal(name) if name.as_bytes().starts_with(b".")));
+    (outside, hidden)
+}
 /// A path on another server as its receiver takes it
 /// (`directive::normalize_absolute`), with that account's home shown as `~`:
 /// `~//data` is `/data`, and a relative path is in the home directory.
@@ -1298,9 +1316,10 @@ impl Queue {
     }
 
     /// Files this machine would send to the requesting server: `paths` are
-    /// the exact paths, each with what it may be, `confined` the directory
-    /// reads stay inside, when they must, and `follows_symlinks` whether
-    /// symlinks in those paths lead to what is read.
+    /// the exact paths, each with what it may be, `start` the profile's
+    /// directory, `confined` the directory reads stay inside, when they must,
+    /// and `follows_symlinks` whether symlinks in those paths lead to what
+    /// is read.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn request_send(
         &self,
@@ -1308,6 +1327,7 @@ impl Queue {
         command: &[Vec<u8>],
         cwd: &str,
         paths: &[(Vec<u8>, &'static str)],
+        start: &std::path::Path,
         confined: Option<&[u8]>,
         follows_symlinks: bool,
         limits: &crate::delegation::CopyLimits,
@@ -1331,6 +1351,34 @@ impl Queue {
         };
         let permission = format!("These files leave this machine: {} may list and read them and receives their contents. Filters narrow the copy, not this read permission.{follows}{inside} Nothing on this machine is changed.", from.server);
         let shown = |path: String, scope: &str| format!("{path} ({scope})");
+        // The desktop prompt lists only a few paths: those outside the
+        // profile's directory or hidden come first, and the notes count them.
+        let notable: Vec<_> = paths
+            .iter()
+            .map(|(path, _)| notable_path(path, start))
+            .collect();
+        let mut order: Vec<usize> = (0..paths.len()).collect();
+        order.sort_by_key(|&index| notable[index] == (false, false));
+        let mut notes = vec![permission.clone()];
+        let count = |which: fn(&(bool, bool)) -> bool| notable.iter().filter(|n| which(n)).count();
+        match count(|(outside, _)| *outside) {
+            0 => {}
+            1 => notes.push(format!(
+                "1 of these is outside {}",
+                local_path(start.as_os_str().as_bytes())
+            )),
+            outside => notes.push(format!(
+                "{outside} of these are outside {}",
+                local_path(start.as_os_str().as_bytes())
+            )),
+        }
+        match count(|(_, hidden)| *hidden) {
+            0 => {}
+            1 => notes.push("1 of these is a hidden file or in a hidden folder".to_owned()),
+            hidden => notes.push(format!(
+                "{hidden} of these are hidden files or in hidden folders"
+            )),
+        }
         self.wait(
             Summary {
                 id: id.iter().map(|b| format!("{b:02x}")).collect(),
@@ -1346,11 +1394,14 @@ impl Queue {
                 // files go to it.
                 preposition: "",
                 target: String::new(),
-                notes: vec![permission.clone()],
+                notes,
                 sources_heading: "",
-                sources: paths
+                sources: order
                     .iter()
-                    .map(|(path, scope)| shown(quoted_local_path(path), scope))
+                    .map(|&index| {
+                        let (path, scope) = &paths[index];
+                        shown(quoted_local_path(path), scope)
+                    })
                     .collect(),
                 details: Details::Send {
                     kind: SendKind::Send,
@@ -1442,7 +1493,9 @@ impl Queue {
         } else {
             format!("\nApproved object ACL headers: {:?}", request.acl)
         };
-        let description = format!("Bucket: {:?}\nEndpoint: {:?}\nCredential profile on this machine: {:?}\nPaths:\n{scopes}{source}{removal}{permanence}{acl}\nPermission: {}{}{}.\nRequested lifetime: {} seconds (credentials or provider policies may shorten it).\nIssued requests can be reused until expiry, even after this machine disconnects or receiving stops. Copy roots and aggregate limits do not apply. Source contents are not inspected.",
+        // What the request permits and its warnings come before the paths,
+        // which can be many.
+        let description = format!("Bucket: {:?}\nEndpoint: {:?}\nCredential profile on this machine: {:?}\nPermission: {}{}{}.{removal}{permanence}{acl}\nRequested lifetime: {} seconds (credentials or provider policies may shorten it).\nIssued requests can be reused until expiry, even after this machine disconnects or receiving stops. Copy roots and aggregate limits do not apply. Source contents are not inspected.\nPaths:\n{scopes}{source}",
             request.bucket, request.endpoint.as_deref().unwrap_or("configured AWS/S3 endpoint"), request.profile.as_deref().unwrap_or("default"),
             if request.upload { "read and upload" } else { "read" },
             if request.create_only { ", create-only writes" } else if request.upload { ", may overwrite" } else { "" },
@@ -2476,6 +2529,124 @@ mod tests {
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["command"][0], "syq");
     }
+    /// A send lists paths outside the profile's directory, or hidden, first
+    /// and counts them, so they show among the few a desktop prompt lists.
+    #[test]
+    fn send_prompts_lead_with_outside_and_hidden_paths() {
+        let start = std::path::Path::new("/home/me/project");
+        let paths: Vec<(Vec<u8>, &'static str)> = [
+            "/home/me/project/a",
+            "/home/me/project/b",
+            "/home/me/project/c",
+            "/home/me/project/d",
+            "/home/me/.ssh/id_ed25519",
+            "/etc/hosts",
+            "/home/me/project/.env",
+            "/home/me/project/link/../x",
+        ]
+        .iter()
+        .map(|path| (path.as_bytes().to_vec(), "a file or other non-directory"))
+        .collect();
+        assert_eq!(
+            notable_path(b"/home/me/project/sub/.cache/x", start),
+            (false, true)
+        );
+        assert_eq!(notable_path(b"/home/me/project", start), (false, false));
+        assert_eq!(notable_path(b"/home/me/projects/x", start), (true, false));
+        let queue = Arc::new(Queue::default());
+        let asking = Arc::clone(&queue);
+        let task = std::thread::spawn(move || {
+            asking.request_send(
+                &requester(),
+                &[],
+                "",
+                &paths,
+                start,
+                None,
+                true,
+                &crate::delegation::CopyLimits {
+                    max_entries: 10,
+                    max_total_bytes: 10,
+                    max_file_bytes: 10,
+                    hash_block_bytes: 4096,
+                    max_connections: 1,
+                    max_deletions: 0,
+                },
+                Notifications::Off,
+                || false,
+            )
+        });
+        wait_pending(&queue);
+        let summary = queue.snapshots().remove(0);
+        let desktop = summary.desktop_description(false);
+        assert!(
+            desktop.contains(
+                "\n\n3 of these are outside /home/me/project\n\n2 of these are hidden files or in hidden folders\n\n    \"/home/me/.ssh/id_ed25519\" (a file or other non-directory)\n\n    \"/etc/hosts\" (a file or other non-directory)\n\n    \"/home/me/project/.env\" (a file or other non-directory)\n\n    and 5 more, which syq persist receive pending lists"
+            ),
+            "{desktop}"
+        );
+        // `persist receive pending` keeps the request's order.
+        let Details::Send { paths, .. } = &summary.details else {
+            panic!("not a send");
+        };
+        assert!(paths[0].starts_with("\"/home/me/project/a\" "), "{paths:?}");
+        queue.decide(&summary.id, false, Kind::Send).unwrap();
+        assert!(task.join().unwrap().is_err());
+    }
+
+    /// `persist receive pending` shows what a storage request permits, and
+    /// its warnings, before its paths, which can be many.
+    #[test]
+    fn storage_details_put_what_is_permitted_before_the_paths() {
+        use crate::s3::authorization::{Removal, Request, Scope};
+        let request = Request {
+            bucket: "bucket".into(),
+            endpoint: None,
+            region: None,
+            profile: None,
+            scopes: (0..50)
+                .map(|index| Scope {
+                    key: format!("runs/{index}"),
+                    descendants: true,
+                })
+                .collect(),
+            source: None,
+            removal: Some(Removal::AllVersions),
+            acl: Default::default(),
+            upload: false,
+            delete: true,
+            create_only: false,
+            lifetime: 60,
+            headers: Default::default(),
+        };
+        let queue = Arc::new(Queue::default());
+        let asking = Arc::clone(&queue);
+        let task = std::thread::spawn(move || {
+            asking.request_storage(&requester(), &[], "", &request, Notifications::Off, || {
+                false
+            })
+        });
+        wait_pending(&queue);
+        let summary = queue.snapshots().remove(0);
+        let details = summary.details_description(str::to_owned);
+        let at = |text: &str| {
+            details
+                .find(text)
+                .unwrap_or_else(|| panic!("{text}: {details}"))
+        };
+        for fact in [
+            "Permission: read, may delete.",
+            "Selection: all versions",
+            "is permanent",
+            "Requested lifetime: 60 seconds",
+        ] {
+            assert!(at(fact) < at("Paths:\n"), "{fact}: {details}");
+        }
+        assert!(at("Paths:\n") < at("\"runs/49\""), "{details}");
+        queue.decide(&summary.id, false, Kind::Storage).unwrap();
+        assert!(task.join().unwrap().is_err());
+    }
+
     #[test]
     fn storage_prompts_name_the_operation_and_its_validity() {
         use crate::s3::authorization::{Removal, Request, Scope};

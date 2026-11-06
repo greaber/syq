@@ -503,9 +503,14 @@ impl ConfinedRoot {
                 }
             }
         } else {
-            match home.and_then(|(named, real)| Some((parent.strip_prefix(named).ok()?, real))) {
-                Some((inside, home)) if inside.as_os_str().is_empty() => home.to_path_buf(),
-                Some((inside, home)) => home.join(inside),
+            // A destination in the home, or the home itself, as `--into ~`
+            // names it: its directory, where the home really is.
+            match home.and_then(|(named, real)| Some((destination.strip_prefix(named).ok()?, real)))
+            {
+                Some((inside, home)) if inside.as_os_str().is_empty() => {
+                    requested_parent(home).to_path_buf()
+                }
+                Some((inside, home)) => requested_parent(&home.join(inside)).to_path_buf(),
                 None => parent.to_path_buf(),
             }
         };

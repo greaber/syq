@@ -1563,7 +1563,12 @@ fn receiving_cwd_allows_other_paths_but_root_confines_them() {
     }
     // As in any copy, a symlink above the destination stops it unless the
     // command follows destination paths.
-    for path in [&b"link/file"[..], b"link/../file", b"./link/sub/file"] {
+    for path in [
+        &b"link/file"[..],
+        b"link/../file",
+        b"./link/sub/file",
+        b"missing/../link/file",
+    ] {
         let error = resolved(path, false).unwrap_err().to_string();
         assert!(
             error.starts_with("refusing to follow symlink \"link\" in a path you gave; ")

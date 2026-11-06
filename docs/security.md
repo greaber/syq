@@ -220,12 +220,12 @@ An enrollment covers the whole account. Each signed command names its own
 destination, which can be anywhere the account can write except its SSH
 configuration and syq's own programs and state (see
 [Enrollment](remote-reference.md#enrollment)). As in any copy, a symlink in
-the destination path stops the copy unless the command passes `--follow-dst`,
-and the receiver does not follow symlinks below the destination. Because a copy
-can write a file that runs code
-as the account, such as a shell startup file, a signed copy is as strong as a
-login. That is acceptable because only your login key can sign one, and you
-choose each destination.
+the destination path stops the copy unless the command passes `--follow-dst`;
+links in the account's home directory's own path are fine. The receiver does
+not follow symlinks below the destination. Because a copy can write a file that
+runs code as the account, such as a shell startup file, a signed copy is as
+strong as a login. That is acceptable because only your login key can sign one,
+and you choose each destination.
 
 An enrollment outlives removing or revoking your login key on hostB; end it with
 `syq receiver revoke`. See
@@ -352,11 +352,13 @@ domain. `syq persist receive off` turns it off but keeps SSH reuse.
 The prompt shows the server account and the requested command. For copies and
 authorizations, that is the syq command the server ran, including options from
 its environment variables. A desktop prompt puts where a request writes, and
-its warnings, before the files the command names, and lists only the first
-three of those, each in quotes; `syq persist receive pending` lists them all.
-Paths on your machine appear with `..` resolved, as syq uses them. Your laptop derives what it enforces from that
-command and rejects a request that does not match it, but it cannot prove who
-typed the command. Approving a copy does not approve a later command.
+its warnings, before the files the command names, and lists only three of
+those, each in quotes; `syq persist receive pending` lists them all. Paths on
+your machine appear with `..` resolved, as syq uses them, except paths a
+request reads while following symlinks, which keep their spelling. Your laptop
+derives what it enforces from that command and rejects a request that does not
+match it, but it cannot prove who typed the command. Approving a copy does not
+approve a later command.
 
 The server also supplies the contents of the ignore files (`--ignore-from`)
 and mapping file (`--mapping`) that the command names, and your laptop does
@@ -411,8 +413,9 @@ assignments.
 
 A server can ask for files from your laptop with `syq cp --from @laptop`. The
 prompt lists the exact paths it would read and says that they will leave your
-laptop; a desktop prompt shows the first three, and
-`syq persist receive pending` lists them all. Once approved, the server can list and read only those files and
+laptop. A desktop prompt lists paths outside the profile's directory and hidden
+ones first and says how many there are; `syq persist receive pending` lists
+them all. Once approved, the server can list and read only those files and
 directory trees, with the symlink behavior the command chose, within the
 profile's byte and entry limits and, when the profile sets `--root`, only
 inside that root: symlinks can't lead out of it, and neither can a directory

@@ -115,9 +115,11 @@ def tests():
                 assert "&lt;b&gt;&amp;" in body and "<b>" not in body, body
                 assert "\\nFrom: fake" in body and "\nFrom: fake" not in body, body
                 assert "May create" not in body and "\nFrom: " not in body and "existing" not in body, body
-                # What is copied where, then the server's command; the server's
-                # directory comes first only when it does not fit the title.
-                assert 'wants to download\n\n    /tmp/syq-real-ssh/return-source/message.txt\n\nto\n\n    "/tmp/syq-real-ssh-receive/desktop-' in body, body
+                # Where the copy goes, then what, quoted, then the server's
+                # command; the server's directory comes first only when it
+                # does not fit the title.
+                assert 'wants to download to\n\n    "/tmp/syq-real-ssh-receive/desktop-' in body, body
+                assert '\n\nfrom\n\n    "/tmp/syq-real-ssh/return-source/message.txt"\n\nsyq cp ' in body, body
                 assert body.split("\n\n")[-1].startswith("syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as "), body
                 assert "Details" not in body and "Limits:" not in body and "not been inspected" not in body, body
                 assert actions == ["allow", "Allow once", "deny", "Deny"], actions
@@ -142,7 +144,7 @@ def tests():
         result = subprocess.run(["ssh", "source", command], timeout=20)
         assert result.returncode != 0
         assert destination.read_bytes() == b"keep this"
-        assert '\n\nto\n\n    /tmp/syq-real-ssh-receive/desktop-existing\n\nreplaces existing files\n\n' in observed[-1][2], observed[-1]
+        assert 'wants to download to\n\n    /tmp/syq-real-ssh-receive/desktop-existing\n\nreplaces existing files\n\nfrom\n\n    "/tmp/syq-real-ssh/return-source/message.txt"\n\n' in observed[-1][2], observed[-1]
         for choice in ["allow", "deny"]:
             marker = Path("/tmp/syq-real-ssh-receive") / ("exec-desktop-" + choice)
             command = shlex.join(["syq", "exec", "--on", "@laptop", "--", "touch", str(marker)])
@@ -152,8 +154,8 @@ def tests():
                 assert marker.exists() == (choice == "allow")
                 _, title, body, _, _ = observed[-1]
                 assert title.startswith("syq on "), title
-                assert "wants to run\n\n    touch /tmp/syq-real-ssh-receive/exec-desktop-" in body, body
-                assert "\n\nin\n\n    " in body, body
+                assert "wants to run in\n\n    " in body, body
+                assert '\n\nthe command\n\n    "touch" "/tmp/syq-real-ssh-receive/exec-desktop-' in body, body
                 assert body.split("\n\n")[-1].startswith("syq exec --on @laptop -- touch "), body
                 assert "Details" not in body and "Limits:" not in body and "Runs with" not in body, body
                 print(f"Command notification {choice}: passed", flush=True)

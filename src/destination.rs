@@ -948,7 +948,8 @@ fn resolve_destination(
         None => (PathBuf::new(), requested.to_path_buf()),
     };
     let components: Vec<_> = path.components().collect();
-    // Without following, once a directory is missing so is the rest.
+    // Without following, once a directory is missing so is what is below
+    // it, until `..` climbs back out.
     let mut missing = false;
     for (index, component) in components.iter().enumerate() {
         use std::path::Component;
@@ -957,6 +958,7 @@ fn resolve_destination(
             Component::CurDir => {}
             Component::ParentDir => {
                 destination.pop();
+                missing = false;
             }
             Component::Normal(name) => {
                 destination.push(name);
@@ -1610,7 +1612,11 @@ impl Receiver {
                 // the destination, as for any copy.
                 let follow =
                     crate::approval_command::parse(&command)?.follows_native_destination_paths();
-                let home = home_directory();
+                // Only a path resolved without following, outside a root,
+                // starts in the home.
+                let home = (self.root.is_none() && !follow)
+                    .then(home_directory)
+                    .flatten();
                 let (destination, mut container) = resolve_destination(
                     &self.cwd,
                     self.root.as_deref(),

@@ -277,9 +277,12 @@ fn resolve(cwd: &Path, root: Option<&Path>, request: &mut pull::PullRequest) -> 
 }
 
 /// The exact paths a resolved request reads, each with what it may be.
-/// `..` is resolved by name, as reading resolves it: past a directory the
-/// path names, not past where a symlink led (`OperatorResolver`).
+/// When reading follows no symlink on the way, a symlink there stops it, so
+/// `..` resolved by name is where reading goes. When it follows them, `..`
+/// can lead from where a link led, so the paths keep their spelling and the
+/// prompt says that links are followed.
 fn exact_paths(request: &pull::PullRequest) -> Vec<(Vec<u8>, &'static str)> {
+    let by_name = request.symlink_policy == crate::proto::OperatorSymlinkPolicy::Refuse;
     let base = request.base.path.as_deref().unwrap_or(b"/");
     request
         .selections
@@ -294,10 +297,13 @@ fn exact_paths(request: &pull::PullRequest) -> Vec<(Vec<u8>, &'static str)> {
                     &selection.path,
                 )
             };
-            let path =
+            let path = if by_name {
                 crate::fsops::lexical_absolute(Path::new(std::ffi::OsStr::from_bytes(&path)))
                     .into_os_string()
-                    .into_vec();
+                    .into_vec()
+            } else {
+                path
+            };
             let scope = match kind {
                 crate::cli::SourceSelection::File => "a file or other non-directory",
                 crate::cli::SourceSelection::Directory => "a directory and everything in it",
@@ -350,6 +356,7 @@ impl Receiver {
             &command,
             &cwd,
             &exact_paths(&request),
+            &self.cwd,
             request
                 .base
                 .confined
@@ -1007,6 +1014,66 @@ mod tests {
                 .collect::<Vec<_>>(),
             [token, [&home[..], b"/projects/notes"].concat()]
         );
+    }
+
+    /// Following symlinks, `..` can lead from where a link led, so the
+    /// prompt keeps the spelling, which names the file reading reaches,
+    /// rather than resolving `..` by name to another file.
+    #[test]
+    fn followed_paths_keep_their_spelling_and_name_what_is_read() {
+        use crate::rooted::{OperatorFinalComponent, OperatorResolver, PinnedPath};
+        use std::os::unix::fs::MetadataExt;
+        let temp = crate::test_support::tempdir().unwrap();
+        let base = temp.path();
+        let cwd = base.join("profile");
+        fs::create_dir_all(base.join("elsewhere/inner")).unwrap();
+        fs::create_dir(&cwd).unwrap();
+        fs::write(cwd.join("secret"), b"by name").unwrap();
+        fs::write(base.join("elsewhere/secret"), b"through the link").unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere/inner"), cwd.join("link")).unwrap();
+        let read = |options: &[&str]| {
+            let mut request =
+                super::request(&crate::approval_command::parse(&command(options)).unwrap())
+                    .unwrap();
+            resolve(&cwd, None, &mut request).unwrap();
+            let (shown, _) = exact_paths(&request).remove(0);
+            // What reading reaches: the selection beneath the base, with
+            // the request's own symlink policy.
+            let reached = OperatorResolver::resolve_process(
+                &[
+                    request.base.path.as_deref().unwrap(),
+                    b"/",
+                    &request.selections[0].path,
+                ]
+                .concat(),
+                request.symlink_policy,
+                OperatorFinalComponent::Entry {
+                    follow_symlink: false,
+                },
+                false,
+                &mut Vec::new(),
+            );
+            (shown, reached)
+        };
+        let (shown, reached) = read(&["--follow-src", "--src-non-dir", "link/../secret"]);
+        assert_eq!(shown, cwd.join("link/../secret").as_os_str().as_bytes());
+        let Ok(PinnedPath::Leaf(leaf)) = reached else {
+            panic!("reading did not reach a file");
+        };
+        let target = fs::metadata(base.join("elsewhere/secret")).unwrap();
+        assert_eq!(
+            (leaf.metadata().dev, leaf.metadata().ino),
+            (target.dev(), target.ino())
+        );
+        assert_eq!(
+            fs::read(Path::new(std::ffi::OsStr::from_bytes(&shown))).unwrap(),
+            b"through the link"
+        );
+        // Without following, the link stops reading, and the same spelling
+        // is shown resolved by name.
+        let (shown, reached) = read(&["--src-non-dir", "link/../secret"]);
+        assert_eq!(shown, cwd.join("secret").as_os_str().as_bytes());
+        assert!(reached.is_err());
     }
 
     #[test]
