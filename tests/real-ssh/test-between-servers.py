@@ -342,7 +342,7 @@ def main():
             finish(process, output, success=False)
         remote("destination", "test ! -e " + shlex.quote(c + "/crashed"))
         assert pending() == []
-        # A new approval resumes the copy.
+        # A new approval copies it again.
         with running(command("crashed", ("--no-tcp",), source="large")) as (process, output):
             decide()
             finish(process, output)

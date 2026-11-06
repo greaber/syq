@@ -199,10 +199,13 @@ command that started it ends.
 
 The copy supports `--no-tcp`, mappings, and `--results`, and your server
 checks [results from the destination](#results-from-the-destination). It
-does not support `--coordinate-at dst` or `local`, `--detach`, `--rsh`,
-`--syq-path`, `--no-bootstrap`, other `--peer-auth` values, or
-`--no-tcp-encryption`, and neither login may be root.
-[Restricted-copy limits](#limits-and-unsupported-options) apply.
+does not support `--coordinate-at dst`, `--detach`, `--rsh`, `--syq-path`,
+`--no-bootstrap`, other `--peer-auth` values, or `--no-tcp-encryption`, and
+neither login may be root.
+[Restricted-copy limits](#limits-and-unsupported-options) apply. With
+`--coordinate-at local`, file data goes through your server instead, which
+then needs [account access](persistence-reference.md#account-access) to both
+servers.
 
 Older versions of syq added lines with a comment starting `syq-copy-worker-`
 to the destination's `~/.ssh/authorized_keys` for these copies. They grant
