@@ -195,6 +195,70 @@ fn full_listen_queue_reports_busy_without_reconnect_advice() {
 }
 
 #[test]
+fn exchange_sends_nothing_to_a_socket_another_user_listens_on() {
+    let dir = crate::test_support::short_tempdir().unwrap();
+    let path = dir.path().join("r.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let peer = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut received = Vec::new();
+        let _ = stream.read_to_end(&mut received);
+        received
+    });
+    let registration = Registration {
+        version: REGISTRATION_VERSION,
+        identity: crate::identity::build().into(),
+        socket: path,
+        secret: "not-for-other-users".into(),
+        program: b"/test/syq".to_vec(),
+    };
+    EXCHANGE_UID.with(|uid| uid.set(Some(unsafe { libc::geteuid() }.wrapping_add(1))));
+    let result = exchange(&registration, Message::Ping, Duration::from_secs(5), None);
+    EXCHANGE_UID.with(|uid| uid.set(None));
+    let error = format!("{:#}", result.err().unwrap());
+    assert!(error.contains("another user"), "{error}");
+    assert!(error.contains("nothing was sent"), "{error}");
+    assert_eq!(peer.join().unwrap(), b"");
+}
+
+#[test]
+fn registration_reads_only_its_secret_line_from_standard_input() {
+    let (mut laptop, server) = UnixStream::pair().unwrap();
+    laptop.write_all(b"Abc-_09\nliveness").unwrap();
+    assert_eq!(
+        read_registration_secret(server.as_raw_fd(), Duration::from_secs(5)).unwrap(),
+        "Abc-_09"
+    );
+    // The rest of the input stays unread for the liveness loop.
+    let mut rest = [0; 8];
+    (&server).read_exact(&mut rest).unwrap();
+    assert_eq!(&rest, b"liveness");
+
+    for (input, kind) in [
+        (&b"\n"[..], std::io::ErrorKind::InvalidData),
+        (b"secret with spaces\n", std::io::ErrorKind::InvalidData),
+        (&[b'a'; 129], std::io::ErrorKind::InvalidData),
+        (b"partial", std::io::ErrorKind::UnexpectedEof),
+    ] {
+        let (mut laptop, server) = UnixStream::pair().unwrap();
+        laptop.write_all(input).unwrap();
+        drop(laptop);
+        let error =
+            read_registration_secret(server.as_raw_fd(), Duration::from_secs(5)).unwrap_err();
+        assert_eq!(error.kind(), kind, "{input:?}");
+    }
+    let (_laptop, server) = UnixStream::pair().unwrap();
+    let started = Instant::now();
+    let error =
+        read_registration_secret(server.as_raw_fd(), Duration::from_millis(100)).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
 fn registration_retries_socket_timeout_but_not_peer_rejection() {
     for reject in [false, true] {
         let dir = crate::test_support::tempdir().unwrap();

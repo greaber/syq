@@ -216,6 +216,8 @@ pub(crate) enum AuthorizationOrigin<'a> {
     Return {
         profile: &'a str,
         requester: &'a crate::receive_approval::Requester,
+        /// The server's account, or why this machine could not identify it.
+        /// The reason stays on this machine.
         source: &'a Mutex<std::result::Result<AccountIdentity, String>>,
     },
     Provider {
@@ -809,6 +811,9 @@ enum AccountApproval<'a> {
     Provider(ProviderLoginPermission),
 }
 
+/// What a server is told when this machine could not identify its account.
+const SOURCE_UNIDENTIFIED: &str = "could not identify this server's SSH account for account approval; make sure the receiving machine trusts this server's plain SSH host key, then reconnect from it";
+
 impl<'a> AccountApproval<'a> {
     fn new(origin: &AuthorizationOrigin<'a>, destination: AccountIdentity) -> Result<Self> {
         Ok(match origin {
@@ -820,7 +825,11 @@ impl<'a> AccountApproval<'a> {
                 requester,
                 permission: AccountPermission::new(
                     (*profile).into(),
-                    source.lock().unwrap().clone().map_err(anyhow::Error::msg)?,
+                    source
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .map_err(|_| anyhow::anyhow!(SOURCE_UNIDENTIFIED))?,
                     destination,
                 )?,
             },
@@ -1259,6 +1268,38 @@ mod tests {
         request.mode = Mode::Account;
         request.command = vec![vec![b'x'; 16 * 1024 + 1]];
         assert!(request.validate(&origin).is_err());
+    }
+
+    #[test]
+    fn why_the_source_account_is_unknown_stays_on_this_machine() {
+        let requester = crate::receive_approval::Requester {
+            server: "test-server".into(),
+            profile: "laptop".into(),
+        };
+        let reason = r#"KnownHostsCommand is configured as "/private/source-helper %h""#;
+        let source = Mutex::new(Err(reason.to_owned()));
+        let origin = AuthorizationOrigin::Return {
+            profile: "laptop",
+            requester: &requester,
+            source: &source,
+        };
+        let destination = AccountIdentity::new(
+            policy(1).endpoint,
+            vec![ssh_key::Fingerprint::Sha256([8; 32]).to_string()],
+        )
+        .unwrap();
+        let Err(error) = AccountApproval::new(&origin, destination) else {
+            panic!("an unidentified source account was approved");
+        };
+        // What the server receives in reply to its account request.
+        let mut wire = Vec::new();
+        reply_error(&mut wire, &error).unwrap();
+        let Reply::Error(message) = read_message(&mut wire.as_slice()).unwrap() else {
+            panic!("the refusal was not an error reply");
+        };
+        assert_eq!(message, SOURCE_UNIDENTIFIED);
+        assert!(!message.contains("/private/"), "{message}");
+        assert_eq!(source.lock().unwrap().as_ref().unwrap_err(), reason);
     }
 
     #[test]

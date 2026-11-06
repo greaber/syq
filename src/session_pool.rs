@@ -625,7 +625,7 @@ impl Pool {
 
     fn handle_client(&mut self, mut stream: UnixStream) -> Verdict {
         let _ = stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT));
-        if peer_uid(&stream).ok() != Some(unsafe { libc::geteuid() }) {
+        if crate::sys::peer_uid(&stream).ok() != Some(unsafe { libc::geteuid() }) {
             return Verdict::Continue;
         }
         let Some(request) = read_request(&mut stream) else {
@@ -762,39 +762,6 @@ fn read_request(stream: &mut UnixStream) -> Option<ClientRequest> {
         }
     }
     serde_json::from_slice(&line).ok()
-}
-
-#[cfg(target_os = "linux")]
-fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
-    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: the buffer and its length describe one ucred that the kernel
-    // fills for a connected Unix stream socket.
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut credentials as *mut libc::ucred).cast(),
-            &mut length,
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(credentials.uid)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
-    let mut uid: libc::uid_t = 0;
-    let mut gid: libc::gid_t = 0;
-    // SAFETY: getpeereid writes the peer's ids through the two pointers.
-    let result = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(uid)
 }
 
 #[cfg(test)]
