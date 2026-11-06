@@ -207,6 +207,139 @@ fn rerun_removes_the_partial_a_killed_copy_left() {
     }
 }
 
+/// A partial whose name was shortened to fit reads as the partial of a file
+/// named by its start. Publishing that file leaves it: it can be the longer
+/// file's.
+#[cfg(debug_assertions)]
+#[test]
+fn a_shortened_partial_of_another_file_is_left_in_place() {
+    let t = Tmp::new();
+    let long = "n".repeat(240);
+    let data = prng(5 * 1024 * 1024, 31);
+    write(&t.path(&format!("src/{long}")), &data);
+    fs::create_dir_all(t.path("dst")).unwrap();
+    let source = t.s(&format!("src/{long}"));
+    let destination = t.s("dst/");
+    let args = [
+        "--block-size",
+        "1M",
+        "--resource-limits",
+        "bandwidth=1G",
+        &source,
+        &destination,
+    ];
+    let partial = interrupted_partial(&args, &t.path("dst"));
+    let name = partial.file_name().unwrap().as_encoded_bytes();
+    let start = name.len() - ".syq-tmp.".len() - 16;
+    let short = String::from_utf8(name[1..start].to_vec()).unwrap();
+    assert!(short.len() < long.len());
+
+    // Another file, named by the start of the long name, and an earlier
+    // copy's partial of its own whose name was shortened the same way.
+    let other = prng(3 * 1024 * 1024, 37);
+    write(&t.path(&format!("src/{short}")), &other);
+    let own = t.path(&format!("dst/.{short}.syq-tmp.abcdefghijklmnop"));
+    write(&own, &other[..1 << 20]);
+    let source = t.s(&format!("src/{short}"));
+    let out = compat_command()
+        .args([
+            "--block-size",
+            "1M",
+            "--resource-limits",
+            "bandwidth=1G",
+            &source,
+            &destination,
+        ])
+        .arg("--no-progress")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path(&format!("dst/{short}"))), other);
+    assert!(partial.exists(), "the long file's partial stays");
+    assert!(own.exists(), "a name that may be shortened stays");
+    assert!(
+        stderr_of(&out).contains("1 file had a partial file from an earlier copy"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+/// A program that opens the partial for writing once the rerun holds its
+/// lease keeps it: the rerun sees the open and leaves the partial.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn a_writer_that_opens_the_partial_during_removal_keeps_it() {
+    let t = Tmp::new();
+    if !earlier_partials_removable(&t.0) {
+        eprintln!("note: the test filesystem's leases are not trusted");
+        return;
+    }
+    let data = prng(4 * 1024 * 1024 + 9, 41);
+    write(&t.path("src"), &data);
+    let args = [
+        "--block-size",
+        "1M",
+        "--bwlimit=1G",
+        &t.s("src"),
+        &t.s("dst"),
+    ];
+    let partial = interrupted_partial(&args, &t.0);
+    let (ready, continuation) = (t.path("leased"), t.path("continue"));
+    let mut child = compat_command()
+        .args(args)
+        .arg("--no-progress")
+        .env("SYQ_TEST_EARLIER_PARTIAL_LEASED_READY_FILE", &ready)
+        .env(
+            "SYQ_TEST_EARLIER_PARTIAL_LEASED_CONTINUE_FILE",
+            &continuation,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "earlier partial leased");
+    // The open waits for the lease, which the rerun holds until it lets the
+    // removal go on.
+    let opener = {
+        let partial = partial.clone();
+        std::thread::spawn(move || hold_for_writing(&partial))
+    };
+    // Once the open waits, the kernel lists the lease as being broken.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut next_progress = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let locks = fs::read_to_string("/proc/locks").unwrap();
+        if locks.lines().any(|line| line.contains("BREAKING")) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline && !opener.is_finished(),
+            "the open never waited for the lease: {locks}"
+        );
+        if std::time::Instant::now() >= next_progress {
+            eprintln!("waiting for the open to wait for the lease");
+            next_progress += std::time::Duration::from_secs(5);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    release_confinement_barrier(&continuation);
+    let output = child.wait_with_output().unwrap();
+    let writer = opener.join().unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst")), data);
+    assert!(partial.exists());
+    assert_eq!(fs::metadata(&partial).unwrap().nlink(), 1);
+    assert_eq!(
+        writer.metadata().unwrap().ino(),
+        fs::metadata(&partial).unwrap().ino()
+    );
+    assert!(
+        stderr_of(&output).contains("1 file had a partial file from an earlier copy"),
+        "{}",
+        stderr_of(&output)
+    );
+}
+
 /// A rerun through a receiver started over SSH removes an earlier copy's
 /// partial as a local one does.
 #[cfg(debug_assertions)]
@@ -899,7 +1032,7 @@ fn source_partials_are_copied_and_warned_about() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("they are treated as ordinary payload"),
+        stderr.contains("they are copied as ordinary files, but a later copy may remove them as leftover partial files"),
         "{stderr}"
     );
     assert!(
@@ -937,7 +1070,7 @@ fn source_partials_are_copied_and_warned_about() {
     assert_output_ok(&dry);
     let dry_stderr = String::from_utf8_lossy(&dry.stderr);
     assert!(
-        dry_stderr.contains("treated as ordinary payload"),
+        dry_stderr.contains("copied as ordinary files"),
         "{dry_stderr}"
     );
     assert!(!dry_stderr.to_ascii_lowercase().contains("copying"));

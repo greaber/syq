@@ -368,7 +368,11 @@ isolate them.
 Approving a copy permits the destination, overwrite policy, and limits of the
 command shown, and syq enforces them on every filesystem operation. Within
 those limits, the server can supply false contents, inspect destination
-entries during planning, and use disk space.
+entries during planning, and use disk space. Like any copy, it also removes
+syq's leftover partial files beside the files it writes, even when the copy
+may not otherwise delete; these are files named like
+`.FILENAME.syq-tmp.RANDOM` that are owned by you, have no other names, and that
+no program has open for writing.
 
 By default, copies start in your home directory and are not confined to it;
 `syq persist receive on --root DIRECTORY` confines them. Automatic approval

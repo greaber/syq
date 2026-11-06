@@ -3841,6 +3841,180 @@ fn signed_skip_allows_seeding_and_retrying_a_new_file() {
     assert_eq!(fs::read(&candidate).unwrap(), b"new");
 }
 
+/// A publication the source says found earlier partials removes only the
+/// partials of the file it published that nothing writes: no other name,
+/// whatever the source claims, and nothing for a publication that fails.
+#[test]
+fn restricted_publication_removes_only_its_own_earlier_partials() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(target.join("sub")).unwrap();
+    let fresh = target.join("fresh");
+    let kept = target.join("kept");
+    let candidate = target.join(".fresh.syq-tmp.abcdefghijklmnop");
+    let linked = target.join(".fresh.syq-tmp.bcdefghijklmnopq");
+    let kept_candidate = target.join(".kept.syq-tmp.abcdefghijklmnop");
+    let untouched = [
+        target.join("other"),
+        target.join(".other.syq-tmp.abcdefghijklmnop"),
+        target.join("sub/.fresh.syq-tmp.abcdefghijklmnop"),
+        target.join("link-of-partial"),
+        linked.clone(),
+        kept.clone(),
+        kept_candidate.clone(),
+    ];
+    for path in [
+        &candidate,
+        &kept_candidate,
+        &kept,
+        &untouched[0],
+        &untouched[1],
+        &untouched[2],
+    ] {
+        fs::write(path, b"old").unwrap();
+    }
+    fs::write(&linked, b"old").unwrap();
+    fs::hard_link(&linked, &untouched[3]).unwrap();
+    let mut authority = existence_authority(
+        &root,
+        ExistingDestinationPolicy::Skip,
+        DestinationPlacement::ExactPath,
+        RootExistence::Any,
+    )
+    .unwrap();
+    authority.copy.limits.max_entries = 64;
+    let mut ops = authority.test_ops();
+    let finalize = |path: &Path, inplace: bool| {
+        let mut request = finalize_request(path, proto::TargetCondition::Any);
+        if let Request::Finalize {
+            earlier_partials,
+            inplace: requested,
+            ..
+        } = &mut request
+        {
+            *earlier_partials = true;
+            *requested = inplace;
+        }
+        request
+    };
+
+    // A file the existing-object policy keeps is not published, and
+    // nothing beside it goes.
+    for path in [&kept, &fresh] {
+        let mut prepare = prepare_request(path);
+        let settlement = authority.authorize(&mut prepare, false).unwrap();
+        let response = ops.handle(&prepare);
+        authority.settle(settlement, &response);
+    }
+    let mut publish_kept = finalize(&kept, false);
+    let settlement = authority.authorize(&mut publish_kept, false).unwrap();
+    let response = ops.handle(&publish_kept);
+    assert!(
+        matches!(response, proto::Response::EndpointError(_)),
+        "{response:?}"
+    );
+    authority.settle(settlement, &response);
+    assert_eq!(fs::read(&kept_candidate).unwrap(), b"old");
+
+    // This grant writes no file in place, so the request is refused.
+    let mut in_place = finalize(&fresh, true);
+    assert!(authority.authorize(&mut in_place, false).is_err());
+    assert!(candidate.exists());
+
+    let mut seed = Request::SeedBasis {
+        final_ranges: None,
+        path: path_bytes(&fresh),
+        copy_id: [1; 16],
+        len: 3,
+        block: authority.copy.limits.hash_block_bytes,
+        attempt: 0,
+        clone_final: false,
+    };
+    let settlement = authority.authorize(&mut seed, false).unwrap();
+    let response = ops.handle(&seed);
+    authority.settle(settlement, &response);
+    let mut publish = finalize(&fresh, false);
+    let settlement = authority.authorize(&mut publish, false).unwrap();
+    let response = ops.handle(&publish);
+    authority.settle(settlement, &response);
+    assert_eq!(fs::read(&fresh).unwrap(), b"old");
+    #[cfg(target_os = "linux")]
+    let removable = crate::fsops::leases_trusted_on(&fs::File::open(&target).unwrap());
+    #[cfg(not(target_os = "linux"))]
+    let removable = false;
+    assert_eq!(candidate.exists(), !removable);
+    // The hard-linked name stays, so some remain either way.
+    assert!(
+        matches!(
+            response,
+            proto::Response::PublishedBesideEarlierPartials(None)
+        ),
+        "{response:?}"
+    );
+    for path in &untouched {
+        assert_eq!(fs::read(path).unwrap(), b"old", "{}", path.display());
+    }
+}
+
+/// A partial whose name may have been shortened to fit can be a longer
+/// file's: publishing the file its name starts with leaves it.
+#[test]
+fn restricted_publication_leaves_a_partial_whose_name_may_be_shortened() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let short = "n".repeat(229);
+    let fresh = target.join(&short);
+    let candidate = target.join(format!(".{short}.syq-tmp.abcdefghijklmnop"));
+    assert_eq!(candidate.file_name().unwrap().len(), 255);
+    fs::write(&candidate, b"old").unwrap();
+    let authority = existence_authority(
+        &root,
+        ExistingDestinationPolicy::Skip,
+        DestinationPlacement::ExactPath,
+        RootExistence::Any,
+    )
+    .unwrap();
+    let mut ops = authority.test_ops();
+    let mut prepare = prepare_request(&fresh);
+    let settlement = authority.authorize(&mut prepare, false).unwrap();
+    let response = ops.handle(&prepare);
+    assert!(matches!(&response, proto::Response::Prepared(prepared) if prepared.has_candidates));
+    authority.settle(settlement, &response);
+    let mut seed = Request::SeedBasis {
+        final_ranges: None,
+        path: path_bytes(&fresh),
+        copy_id: [1; 16],
+        len: 3,
+        block: authority.copy.limits.hash_block_bytes,
+        attempt: 0,
+        clone_final: false,
+    };
+    let settlement = authority.authorize(&mut seed, false).unwrap();
+    let response = ops.handle(&seed);
+    authority.settle(settlement, &response);
+    let mut publish = finalize_request(&fresh, proto::TargetCondition::Any);
+    if let Request::Finalize {
+        earlier_partials, ..
+    } = &mut publish
+    {
+        *earlier_partials = true;
+    }
+    let settlement = authority.authorize(&mut publish, false).unwrap();
+    let response = ops.handle(&publish);
+    authority.settle(settlement, &response);
+    assert!(
+        matches!(
+            response,
+            proto::Response::PublishedBesideEarlierPartials(None)
+        ),
+        "{response:?}"
+    );
+    assert_eq!(fs::read(&candidate).unwrap(), b"old");
+}
+
 #[test]
 fn signed_skip_policy_retains_preexisting_objects() {
     use proto::TargetCondition::{Absent, Any, Matches};

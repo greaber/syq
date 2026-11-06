@@ -1947,11 +1947,16 @@ impl Worker {
         // from this copy's own: one repeated after a dropped connection or a
         // source change can find the partial this copy made. A first
         // preparation whose reply was lost counts as finding none.
-        let first = self.sched.jobs.lock().unwrap().first_preparation(idx);
-        if first
-            && job.attempt == 0
-            && matches!(&sent, Ok(Response::Prepared(prepared)) if prepared.has_candidates)
-        {
+        let found = matches!(&sent, Ok(Response::Prepared(prepared)) if prepared.has_candidates);
+        let first = {
+            let mut jobs = self.sched.jobs.lock().unwrap();
+            let first = jobs.first_preparation(idx);
+            if first && job.attempt == 0 && found {
+                jobs.found_earlier_partials(idx);
+            }
+            first
+        };
+        if first && job.attempt == 0 && found {
             self.progress
                 .earlier_partials
                 .lock()
@@ -3004,7 +3009,10 @@ impl Worker {
         if self.sched.is_failed(idx) || self.sched.is_aborted() {
             return Ok(());
         }
-        let job = self.job(idx);
+        let (job, earlier_partials) = {
+            let jobs = self.sched.jobs.lock().unwrap();
+            (jobs.snapshot(idx), jobs.has_earlier_partials(idx))
+        };
         if job.done.load(Relaxed) != job.entry.size {
             bail!("refusing to publish an incomplete file");
         }
@@ -3019,12 +3027,6 @@ impl Worker {
         }
         let mut meta = self.opts.metadata_for(&job.rel_bytes, &job.entry);
         meta.mode = self.create_mode(&job);
-        let earlier_partials = self
-            .progress
-            .earlier_partials
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(&idx);
         let finalized = change_ok(
             self.dst.call(Request::Finalize {
                 expected_hash: self.opts.expected_hashes_for(&job),
