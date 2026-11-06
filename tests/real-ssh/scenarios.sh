@@ -1235,7 +1235,7 @@ for missing_mode in plain results; do
     case "$missing_output" in
         *'wire preamble'*|*'incompatible'*|*'what landed'*)
             printf '%s\n' "$missing_output" >&2; exit 1 ;;
-        *'missing-parent does not exist; a restricted copy creates its destination'*'refused the copy'*) ;;
+        *'missing-parent does not exist; a restricted copy creates its destination'*'refused the copy'*'sent no results through source'*) ;;
         *) printf '%s\n' "$missing_output" >&2; exit 1 ;;
     esac
 done

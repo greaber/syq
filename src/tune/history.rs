@@ -580,15 +580,17 @@ fn prune_within(db: &Connection, budget: u64, current: i64, time: Duration) -> R
         // incomplete ones, in batches sized from the estimated excess. A
         // history far over its budget, as after the budget shrank, then
         // shrinks over a few copies rather than slowing many.
-        let runs: i64 = db.query_row("SELECT count(*) FROM runs", [], |r| r.get(0))?;
-        let mut excess = i128::from(runs) * i128::from(size - budget) / i128::from(size);
+        // The estimate is redone after each batch, so batches stay sized
+        // when the oldest runs are smaller than average.
+        let mut runs: i64 = db.query_row("SELECT count(*) FROM runs", [], |r| r.get(0))?;
         loop {
+            let excess = i128::from(runs) * i128::from(size - budget) / i128::from(size);
             let batch = excess.clamp(1, PRUNE_BATCH) as i64;
             let deleted = db.execute(
                 "DELETE FROM runs WHERE id IN (SELECT id FROM runs WHERE id!=?1 AND (status!='incomplete' OR updated_day<?2) ORDER BY id LIMIT ?3)",
                 params![current, day().saturating_sub(2), batch],
             )?;
-            excess -= deleted as i128;
+            runs -= deleted as i64;
             (size, free) = used()?;
             if deleted == 0 || size <= budget || Instant::now() >= deadline {
                 break;

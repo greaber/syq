@@ -373,7 +373,7 @@ fn native_copy_cwd_may_escape_while_root_confines_component_resolution() {
         &t.s("root-escape"),
     ]);
     assert!(!escape.status.success());
-    assert!(stderr_of(&escape).contains("outside its confined root"));
+    assert!(stderr_of(&escape).contains("outside its --root directory"));
     assert!(!t.path("root-escape").exists());
 
     run_native_ok(&[

@@ -318,7 +318,7 @@ fn native_rm_root_uses_the_common_follow_policy_and_still_confines_selectors() {
             ]);
             assert!(!excursion.status.success());
             assert!(
-                stderr_of(&excursion).contains("outside its confined root"),
+                stderr_of(&excursion).contains("outside its --root directory"),
                 "{}",
                 stderr_of(&excursion)
             );

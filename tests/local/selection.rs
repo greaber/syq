@@ -602,8 +602,14 @@ fn rsync_without_links_says_it_skips_symlinks() {
 
     let named = syq(&["-r", &t.s("LINK"), &t.s("dst/")]);
     assert!(named.status.success(), "{}", stderr_of(&named));
+    // rsync prints it on stdout, with its other informational lines.
+    let stdout = String::from_utf8_lossy(&named.stdout);
     assert!(
-        stderr_of(&named).contains("skipping non-regular file \"LINK\""),
+        stdout.contains("skipping non-regular file \"LINK\""),
+        "{stdout}"
+    );
+    assert!(
+        !stderr_of(&named).contains("skipping"),
         "{}",
         stderr_of(&named)
     );
@@ -611,10 +617,10 @@ fn rsync_without_links_says_it_skips_symlinks() {
 
     let tree = syq(&["-r", &t.s("src/"), &t.s("dst/")]);
     assert!(tree.status.success(), "{}", stderr_of(&tree));
+    let stdout = String::from_utf8_lossy(&tree.stdout);
     assert!(
-        stderr_of(&tree).contains("skipping non-regular file \"l\""),
-        "{}",
-        stderr_of(&tree)
+        stdout.contains("skipping non-regular file \"l\""),
+        "{stdout}"
     );
     assert_eq!(read(&t.path("dst/f")), b"data");
 

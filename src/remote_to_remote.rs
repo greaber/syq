@@ -406,12 +406,13 @@ fn settle(mut relay: Relay, settlement: Settlement<'_>) -> Result<i32> {
             );
             relay.error(&message, "integrity");
             fail_results(&relay, elapsed_ms);
-            if !received && coordinator_exit_code != 0 {
-                // The copy failed before the receiver sent anything, as when
-                // it refused the copy; the coordinator already said why.
-                return Ok(1);
+            match unverified_results(received, coordinator_exit_code, src_host, dst_host) {
+                Some(line) => {
+                    crate::output::diagnostic!("syq: {line}");
+                    return Ok(1);
+                }
+                None => bail!(message),
             }
-            bail!(message);
         }
     };
     let status = if totals.failed > 0 {
@@ -471,6 +472,22 @@ fn settle(mut relay: Relay, settlement: Settlement<'_>) -> Result<i32> {
         );
     }
     Ok(coordinator_exit_code)
+}
+
+/// The short line the runner prints in place of the full integrity complaint
+/// when a restricted receiver's results could not be verified, or `None`
+/// for the full complaint. Only a receiver that sent nothing at all, in a run
+/// whose coordinator already failed (and said why, as when the receiver
+/// refused the copy), gets the short line; it is still the runner's own
+/// statement, so a failure stays visible whatever the relayed output says.
+fn unverified_results(
+    received: bool,
+    coordinator_exit_code: i32,
+    src_host: &str,
+    dst_host: &str,
+) -> Option<String> {
+    (!received && coordinator_exit_code != 0)
+        .then(|| format!("the receiver on {dst_host} sent no results through {src_host}"))
 }
 
 /// The run's final result through a restricted receiver: what changed comes

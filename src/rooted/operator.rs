@@ -63,7 +63,7 @@ impl PinnedLeaf {
     /// inode reuse until the newly opened descriptor has been checked.
     pub(crate) fn open_read(self) -> Result<File> {
         if self.metadata.is_dir() || self.metadata.is_symlink() {
-            bail!("operator path does not select a readable file");
+            bail!("the path does not name a readable file");
         }
         if self.metadata.is_fifo() {
             #[cfg(target_os = "linux")]
@@ -166,7 +166,7 @@ impl PinnedMissing {
         .context("create selected operator file")?;
         let metadata = file.metadata()?;
         if !metadata.is_file() {
-            bail!("created operator path is not a regular file");
+            bail!("the created path is not a regular file");
         }
         clear_nonblocking(&file).context("normalize selected operator file flags")?;
         Ok(file)
@@ -266,7 +266,7 @@ impl OperatorResolver {
         confined: bool,
         symlink_policy: OperatorSymlinkPolicy,
     ) -> Result<Self> {
-        let base = base.try_clone().context("duplicate operator path base")?;
+        let base = base.try_clone().context("duplicate the base directory")?;
         let base_identity = operator_directory_identity(&base)?;
         let base_is_process_root = operator_base_is_process_root(base_identity)?;
         Ok(Self {
@@ -314,7 +314,7 @@ impl OperatorResolver {
         search: &mut dyn FnMut(&File) -> Result<bool>,
     ) -> Result<PinnedPath> {
         if path.contains(&0) {
-            bail!("operator path contains NUL");
+            bail!("path contains NUL");
         }
         if self.relative_input && path.starts_with(b"/") {
             bail!("path beneath an opened operator base must be relative");
@@ -324,7 +324,7 @@ impl OperatorResolver {
             directory: self
                 .base
                 .try_clone()
-                .context("duplicate operator path base")?,
+                .context("duplicate the base directory")?,
             entry: None,
             resolved_relative: Some(Vec::new()),
         }];
@@ -373,11 +373,11 @@ impl OperatorResolver {
                     stack.pop();
                 } else if self.confined {
                     if !self.base_is_process_root {
-                        bail!("operator path resolves outside its confined root");
+                        bail!("the path leads outside its --root directory");
                     }
                 } else {
                     let directory = open_operator_directory_at(&stack[0].directory, b"..")
-                        .context("resolve operator path parent")?;
+                        .context("resolve the path's parent directory")?;
                     stack[0] = OperatorCursor {
                         resolved_relative: self.relative_if_base(&directory)?,
                         directory,
@@ -410,7 +410,7 @@ impl OperatorResolver {
                         components,
                     }));
                 }
-                Err(error) => return Err(error).context("inspect operator path component"),
+                Err(error) => return Err(error).context("inspect a path component"),
             };
             let final_name = components.is_empty();
             let follow_symlink = !final_name
@@ -490,7 +490,7 @@ impl OperatorResolver {
                                 }
                                 let metadata = root_metadata_from_std(&file.metadata()?)?;
                                 if metadata.is_dir() || metadata.is_symlink() {
-                                    bail!("operator path does not select a readable file");
+                                    bail!("the path does not name a readable file");
                                 }
                                 hops.push(OperatorSymlinkHop { component, target });
                                 return Ok(PinnedPath::OpenFile(file));
@@ -513,7 +513,7 @@ impl OperatorResolver {
                 });
                 if target.starts_with(b"/") {
                     if self.confined {
-                        bail!("operator path has an absolute symlink target outside its root");
+                        bail!("the path goes through a symlink to an absolute target outside its --root directory");
                     }
                     let directory = open_operator_start(true)?;
                     stack = vec![OperatorCursor {
@@ -580,7 +580,7 @@ impl OperatorResolver {
                 None
             } else {
                 let object = open_operator_metadata_at(current.directory.as_raw_fd(), &name)
-                    .context("pin operator path leaf")?;
+                    .context("open the path's last component")?;
                 require_operator_identity(
                     metadata,
                     root_metadata_from_std(&object.metadata()?)?,
@@ -728,7 +728,7 @@ pub(super) fn operator_components(path: &[u8]) -> VecDeque<Vec<u8>> {
 }
 
 pub(super) fn operator_component_cstring(component: &[u8]) -> Result<CString> {
-    CString::new(component).context("operator path component contains NUL")
+    CString::new(component).context("path component contains NUL")
 }
 
 pub(super) fn operator_directory_flags() -> libc::c_int {

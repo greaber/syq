@@ -5713,7 +5713,7 @@ fn check_operator_directory(
             symlink_policy,
             require_search,
         ))?,
-        "operator path",
+        &format!("check {}", display(path)),
     )? {
         Response::DirectorySelection(selection) => Ok(selection),
         other => bail!("unexpected response {other:?}"),
@@ -5814,8 +5814,6 @@ fn register_source_roots(
     }
 }
 
-/// The mode a missing destination directory is created with when nothing
-/// applies its metadata later.
 /// The mode a new destination directory is created with when no source
 /// mode applies: as `mkdir` and rsync create one, limited by the umask of
 /// the process that creates it.
@@ -5949,7 +5947,7 @@ fn prepare_existing_destination(
     let selection = conn.recv();
     let filesystem = conn.recv();
     let anchor = conn.recv();
-    let selection = match ok(selection?, "operator path")? {
+    let selection = match ok(selection?, "check the destination directory")? {
         Response::DirectorySelection(selection) => selection,
         other => bail!("unexpected response {other:?}"),
     };
@@ -5995,7 +5993,7 @@ fn check_missing_destination(
     // sessions must never keep an unread response from a preceding copy.
     let selection = conn.recv();
     let filesystem = conn.recv();
-    let selection = match ok(selection?, "operator path")? {
+    let selection = match ok(selection?, "check the destination directory")? {
         Response::DirectorySelection(selection) => selection,
         other => bail!("unexpected response {other:?}"),
     };

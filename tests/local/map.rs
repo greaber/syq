@@ -955,7 +955,7 @@ fn native_map_cwd_may_escape_while_root_confines_component_resolution() {
         &["--root", &t.s("base"), "--srcs-in", "../outside"],
     );
     assert!(!escape.status.success());
-    assert!(stderr_of(&escape).contains("outside its confined root"));
+    assert!(stderr_of(&escape).contains("outside its --root directory"));
 
     let absolute_escape = syq_map_in(
         &t.path(""),

@@ -49,45 +49,59 @@ pub(crate) fn run(args: &Args, options: &Options, out: &mut impl Write) -> Resul
             // status. The emitting pass reuses each check's HEAD, and the
             // first listing pages while they hold at most KEPT_ENTRIES in all,
             // so few selectors cost no extra requests and many stay bounded.
+            // Up to CHECKS selectors are checked at once, in order.
             const KEPT_ENTRIES: usize = 10_000;
+            const CHECKS: usize = 16;
+            let (checked_base, checked_client, bucket, checked_store) =
+                (&base, &client, &storage.bucket, &store);
+            let mut checks = stream::iter(&options.sources)
+                .map(|source| async move {
+                    let key = local::join(checked_base, &local::key_path(&source.path)?);
+                    let directory = matches!(
+                        source.selection,
+                        SourceSelection::Contents | SourceSelection::Directory
+                    );
+                    let exact = if key.is_empty() {
+                        None
+                    } else {
+                        client::head_output(checked_client, bucket, &key, None).await?
+                    };
+                    if let Some(output) = exact {
+                        if directory {
+                            bail!("S3 selector requires a prefix but an object exists at {key:?}");
+                        }
+                        return Ok(Checked::Object(Box::new(output)));
+                    }
+                    if source.selection == SourceSelection::File {
+                        bail!("S3 source object {key:?} is missing");
+                    }
+                    let prefix = if key.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{key}/")
+                    };
+                    let mut page = listing::engine::read(checked_store, &prefix, false, None).await?;
+                    while page.entries.is_empty() {
+                        let Some(token) = page.next.take() else {
+                            bail!("S3 source prefix {key:?} contains no objects");
+                        };
+                        page = listing::engine::read(checked_store, &prefix, false, Some(&token)).await?;
+                    }
+                    Ok::<_, anyhow::Error>(Checked::Prefix(prefix, Some(page)))
+                })
+                .buffered(CHECKS);
             let mut kept = 0;
             let mut checked = Vec::with_capacity(options.sources.len());
-            for source in &options.sources {
-                let key = local::join(&base, &local::key_path(&source.path)?);
-                let directory = matches!(
-                    source.selection,
-                    SourceSelection::Contents | SourceSelection::Directory
-                );
-                let exact = if key.is_empty() {
-                    None
-                } else {
-                    client::head_output(&client, &storage.bucket, &key, None).await?
-                };
-                if let Some(output) = exact {
-                    if directory {
-                        bail!("S3 selector requires a prefix but an object exists at {key:?}");
+            while let Some(check) = checks.try_next().await? {
+                checked.push(match check {
+                    Checked::Prefix(prefix, Some(page)) => {
+                        kept += page.entries.len();
+                        Checked::Prefix(prefix, (kept <= KEPT_ENTRIES).then_some(page))
                     }
-                    checked.push(Checked::Object(Box::new(output)));
-                    continue;
-                }
-                if source.selection == SourceSelection::File {
-                    bail!("S3 source object {key:?} is missing");
-                }
-                let prefix = if key.is_empty() {
-                    String::new()
-                } else {
-                    format!("{key}/")
-                };
-                let mut page = listing::engine::read(&store, &prefix, false, None).await?;
-                while page.entries.is_empty() {
-                    let Some(token) = page.next.take() else {
-                        bail!("S3 source prefix {key:?} contains no objects");
-                    };
-                    page = listing::engine::read(&store, &prefix, false, Some(&token)).await?;
-                }
-                kept += page.entries.len();
-                checked.push(Checked::Prefix(prefix, (kept <= KEPT_ENTRIES).then_some(page)));
+                    other => other,
+                });
             }
+            drop(checks);
             for ((source, destination), checked) in
                 options.sources.iter().zip(destinations).zip(checked)
             {

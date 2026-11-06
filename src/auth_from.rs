@@ -514,9 +514,6 @@ mod tests {
         let root = crate::test_support::tempdir().unwrap();
         let path = root.path().join("auth-from.json");
         write_private(&path, br#"{"default":"@laptop","hosts":{"other":"ssh"}}"#).unwrap();
-        // Not left to the umask: syq refuses a group-writable file.
-        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-            .unwrap();
         let provider = crate::cli::parse_auth_from("alice@provider:2222").unwrap();
         update(&path, Some("backup"), Some(&provider), true).unwrap();
         let config = read(&path).unwrap();

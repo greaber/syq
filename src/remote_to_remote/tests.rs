@@ -1590,3 +1590,17 @@ fn a_coordinator_command_fits_in_one_linux_argument() {
         "{error:#}"
     );
 }
+
+#[test]
+fn unverified_results_are_quiet_only_without_any_results_after_a_failure() {
+    // Nothing arrived and the coordinator failed: one short local line.
+    assert_eq!(
+        unverified_results(false, 1, "source", "destination").as_deref(),
+        Some("the receiver on destination sent no results through source")
+    );
+    // A coordinator that claims success without any results fails loudly.
+    assert_eq!(unverified_results(false, 0, "source", "destination"), None);
+    // Results that started but did not end are always the full complaint.
+    assert_eq!(unverified_results(true, 1, "source", "destination"), None);
+    assert_eq!(unverified_results(true, 0, "source", "destination"), None);
+}
