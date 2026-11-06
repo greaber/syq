@@ -186,7 +186,10 @@ impl Receiver {
                 || self.generation.load(Ordering::Acquire) != generation
                 || requester_closed(&socket)
         };
-        let cwd = self.cwd.join(OsString::from_vec(request.cwd.clone()));
+        // The directory the prompt shows is the one the command runs in:
+        // `..` resolved by name, not through a symlink before it.
+        let cwd =
+            crate::fsops::lexical_absolute(&self.cwd.join(OsString::from_vec(request.cwd.clone())));
         // This is command authority, not the restricted copy executor. Root
         // and automatic download approval do not change a command's permission.
         self.approvals.request_command(
@@ -415,6 +418,49 @@ mod tests {
         );
         assert_eq!(stdout, b"finished\n");
         assert_eq!(stderr, b"diagnostic\n");
+    }
+
+    /// The prompt shows `..` resolved by name, and the command runs there,
+    /// not where a symlink before the `..` leads.
+    #[test]
+    fn a_command_runs_in_the_directory_its_prompt_shows() {
+        let root = crate::test_support::tempdir().unwrap();
+        let base = root.path();
+        fs::create_dir_all(base.join("project/build")).unwrap();
+        fs::create_dir_all(base.join("elsewhere/inner")).unwrap();
+        fs::create_dir_all(base.join("elsewhere/build")).unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere/inner"), base.join("project/link"))
+            .unwrap();
+        let (_broker, receiver, registration, _) =
+            super::super::tests::broker(base, Approval::Always);
+        let mut command = request("printf done > marker");
+        command.cwd = b"project/./link/../build".to_vec();
+        let task = std::thread::spawn(move || {
+            exchange(
+                &registration,
+                Message::Exec(command),
+                Duration::from_secs(5),
+                Some(Duration::from_secs(5)),
+            )
+        });
+        let summary = pending(&receiver);
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["cwd"], format!("{:?}", base.join("project/build")));
+        receiver
+            .approvals
+            .decide(&summary.id, true, Kind::Command)
+            .unwrap();
+        let (mut stream, reply) = task.join().unwrap().unwrap();
+        assert!(matches!(reply, Reply::Ready));
+        assert_eq!(
+            receive_output(&mut stream, &mut Vec::new(), &mut Vec::new()).unwrap(),
+            0
+        );
+        assert_eq!(
+            fs::read(base.join("project/build/marker")).unwrap(),
+            b"done"
+        );
+        assert!(!base.join("elsewhere/build/marker").exists());
     }
 
     #[test]

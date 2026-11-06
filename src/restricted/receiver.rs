@@ -257,7 +257,12 @@ fn admit(
         verify(state, config, (generation, build), directive, &home)?;
     drop(slot);
     let results_key = load_results_key(state)?;
-    let root = ConfinedRoot::resolve(&grant.copy.destination, &protected)?;
+    let root = ConfinedRoot::resolve(
+        &grant.copy.destination,
+        &protected,
+        constraints.extra_options.follow_dst,
+        Some((&home, &canonical_home)),
+    )?;
     let authority = std::sync::Arc::new(RestrictedAuthority::new(
         root,
         grant,

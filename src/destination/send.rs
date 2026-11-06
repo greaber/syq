@@ -277,6 +277,8 @@ fn resolve(cwd: &Path, root: Option<&Path>, request: &mut pull::PullRequest) -> 
 }
 
 /// The exact paths a resolved request reads, each with what it may be.
+/// `..` is resolved by name, as reading resolves it: past a directory the
+/// path names, not past where a symlink led (`OperatorResolver`).
 fn exact_paths(request: &pull::PullRequest) -> Vec<(Vec<u8>, &'static str)> {
     let base = request.base.path.as_deref().unwrap_or(b"/");
     request
@@ -292,6 +294,10 @@ fn exact_paths(request: &pull::PullRequest) -> Vec<(Vec<u8>, &'static str)> {
                     &selection.path,
                 )
             };
+            let path =
+                crate::fsops::lexical_absolute(Path::new(std::ffi::OsStr::from_bytes(&path)))
+                    .into_os_string()
+                    .into_vec();
             let scope = match kind {
                 crate::cli::SourceSelection::File => "a file or other non-directory",
                 crate::cli::SourceSelection::Directory => "a directory and everything in it",
@@ -540,7 +546,10 @@ mod tests {
         assert_eq!(json["kind"], "send");
         let shown = root.join(".kube/config").display().to_string();
         assert!(
-            json["paths"][0].as_str().unwrap().starts_with(&shown),
+            json["paths"][0]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("{shown:?} (")),
             "{json}"
         );
         let description =
@@ -954,6 +963,26 @@ mod tests {
             [
                 b"/etc/hosts".to_vec(),
                 b"/home/me/shared/work/notes".to_vec()
+            ]
+        );
+        // The prompt shows `..` resolved, as reading resolves it: by name.
+        let mut request = super::request(
+            &crate::approval_command::parse(&command(&[
+                "project/docs/../../.aws/credentials",
+                "/srv/./data/../keys",
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        resolve(&cwd, None, &mut request).unwrap();
+        assert_eq!(
+            exact_paths(&request)
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect::<Vec<_>>(),
+            [
+                b"/home/me/shared/work/.aws/credentials".to_vec(),
+                b"/srv/keys".to_vec()
             ]
         );
         // Home directory paths are shown and read in this machine's home,

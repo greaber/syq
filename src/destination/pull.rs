@@ -188,7 +188,7 @@ impl PullRequest {
                 };
                 format!(
                     "{} ({scope})",
-                    crate::approval_command::display_arg(&selection.path)
+                    crate::approval_command::quote_arg(&selection.path)
                 )
             })
             .collect()
@@ -506,7 +506,7 @@ mod tests {
         );
         assert_eq!(
             plain.scopes(),
-            vec!["selected (directory tree or exact non-directory entry)"]
+            vec!["\"selected\" (directory tree or exact non-directory entry)"]
         );
         let args = crate::approval_command::parse(&command(&["--no-tcp"])).unwrap();
         assert!(eligible_target(&args)

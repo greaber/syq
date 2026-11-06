@@ -468,23 +468,44 @@ pub(crate) struct ConfinedRoot {
 impl ConfinedRoot {
     /// The signed destination's directory as the account itself resolves it
     /// now, refused when it is, or is inside, a protected path, by name or
-    /// by identity.
-    pub(super) fn resolve(destination: &[u8], protected: &[ReceiverControlPath]) -> Result<Self> {
+    /// by identity. As in a destination path an ordinary copy is given, a
+    /// symlink on the way stops the copy unless the grant follows them
+    /// (`follow_dst`); the account's own home directory, from `home` (as
+    /// the account names it, and where it really is), is where an SSH login
+    /// starts, so its own path may lead through links.
+    pub(super) fn resolve(
+        destination: &[u8],
+        protected: &[ReceiverControlPath],
+        follow_dst: bool,
+        home: Option<(&Path, &Path)>,
+    ) -> Result<Self> {
         let destination = Path::new(OsStr::from_bytes(destination));
         let parent = requested_parent(destination);
-        let real = match fs::canonicalize(parent) {
-            Ok(real) => real,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
+        let missing = || {
+            anyhow!(
                 "{} does not exist; a restricted copy creates its destination but not the directories above it",
                 parent.display()
-            ),
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "resolve the directory {} the destination goes in",
-                        parent.display()
-                    )
-                })
+            )
+        };
+        // Where the directory really is, a path naming no symlink, which
+        // the walk below then opens without following any.
+        let real = if follow_dst {
+            match fs::canonicalize(parent) {
+                Ok(real) => real,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(missing()),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "resolve the directory {} the destination goes in",
+                            parent.display()
+                        )
+                    })
+                }
+            }
+        } else {
+            match home.and_then(|(named, real)| Some((parent.strip_prefix(named).ok()?, real))) {
+                Some((inside, home)) => home.join(inside),
+                None => parent.to_path_buf(),
             }
         };
         // Only being a protected path or inside one matters here: the copy
@@ -495,12 +516,8 @@ impl ConfinedRoot {
         {
             return Err(inside_protected(None, control));
         }
-        let directory = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOCTTY | libc::O_CLOEXEC)
-            .open(&real)
-            .with_context(|| format!("open the destination's directory {}", real.display()))?;
-        reject_protected_ancestry(&directory, &real, protected)?;
+        let (directory, opened) = open_without_links(&real, missing)?;
+        reject_protected_ancestry(&opened, protected)?;
         Ok(Self {
             root: Root::from_directory(directory)?,
             named: parent.as_os_str().as_bytes().to_vec(),
@@ -509,58 +526,85 @@ impl ConfinedRoot {
     }
 
     #[cfg(test)]
-    pub(super) fn identity(&self) -> RootIdentity {
+    pub(super) fn identity(&self) -> crate::rooted::RootIdentity {
         self.root.identity()
     }
 
-    /// A directory this session already chose and checked, such as a
-    /// receiving machine's container.
-    pub(super) fn opened(path: &Path, expected: RootIdentity) -> Result<Self> {
+    /// A directory this session already opened at `path`, its real
+    /// location, such as a receiving machine's container.
+    pub(super) fn held(path: &Path, directory: File) -> Result<Self> {
         Ok(Self {
-            root: Root::open_verified(path, expected)?,
+            root: Root::from_directory(directory)?,
             named: path.as_os_str().as_bytes().to_vec(),
             real: path.as_os_str().as_bytes().to_vec(),
         })
     }
 }
 
+/// Open the absolute `path` one directory at a time from `/`, following no
+/// symlink, as an ordinary copy resolves a destination path it was given.
+/// Returns the directory and the identities of every directory from `/` down
+/// to it, as opened. `missing` is the error for a name that does not exist.
+fn open_without_links(
+    path: &Path,
+    missing: impl Fn() -> anyhow::Error,
+) -> Result<(File, Vec<(u64, u64)>)> {
+    let identity = |directory: &File| -> Result<(u64, u64)> {
+        let metadata = directory.metadata()?;
+        Ok((metadata.dev(), metadata.ino()))
+    };
+    let mut directory = File::open("/").context("open /")?;
+    let mut opened = vec![identity(&directory)?];
+    for component in path.components() {
+        let name = match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => continue,
+            std::path::Component::Normal(name) => name.as_bytes(),
+            _ => bail!("{} is not a plain absolute path", path.display()),
+        };
+        directory = match crate::rooted::open_operator_directory_at(&directory, name) {
+            Ok(next) => next,
+            Err(error) => {
+                let found = std::ffi::CString::new(name)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|name| Ok(crate::rooted::metadata_at(directory.as_raw_fd(), &name)?));
+                return Err(match found {
+                    Ok(metadata) if metadata.is_symlink() => anyhow!(
+                        "refusing to follow symlink {:?} in a path you gave; {}",
+                        String::from_utf8_lossy(name),
+                        crate::rooted::OPERATOR_SYMLINK_FOLLOW_ADVICE
+                    ),
+                    Err(found)
+                        if found.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                        }) =>
+                    {
+                        missing()
+                    }
+                    _ => error.context(format!(
+                        "open the destination's directory {}",
+                        path.display()
+                    )),
+                });
+            }
+        };
+        opened.push(identity(&directory)?);
+    }
+    Ok((directory, opened))
+}
+
 /// Refuse a directory that is a protected path or lies anywhere beneath
-/// one, by the identities of the directory, as opened, and of each directory
-/// above its real path, as the session finds them. Looking at the
-/// directories above needs no search permission on the directory itself.
+/// one: `opened` holds the identities of the directories from `/` down to
+/// it, as they were opened.
 fn reject_protected_ancestry(
-    directory: &File,
-    real: &Path,
+    opened: &[(u64, u64)],
     protected: &[ReceiverControlPath],
 ) -> Result<()> {
-    let identities: Vec<_> = protected
-        .iter()
-        .filter_map(|control| {
-            fs::metadata(Path::new(OsStr::from_bytes(&control.path)))
-                .ok()
-                .map(|metadata| ((metadata.dev(), metadata.ino()), control))
-        })
-        .collect();
-    let opened = directory.metadata()?;
-    let opened = (opened.dev(), opened.ino());
-    let named = fs::metadata(real)
-        .with_context(|| format!("inspect the destination's directory {}", real.display()))?;
-    if (named.dev(), named.ino()) != opened {
-        bail!(
-            "the destination's directory {} changed while it was opened",
-            real.display()
-        );
-    }
-    let mut ancestors = vec![opened];
-    for ancestor in real.ancestors().skip(1) {
-        let metadata =
-            fs::metadata(ancestor).with_context(|| format!("inspect {}", ancestor.display()))?;
-        ancestors.push((metadata.dev(), metadata.ino()));
-    }
-    if let Some((_, control)) = identities
-        .iter()
-        .find(|(identity, _)| ancestors.contains(identity))
-    {
+    if let Some(control) = protected.iter().find(|control| {
+        fs::metadata(Path::new(OsStr::from_bytes(&control.path)))
+            .is_ok_and(|metadata| opened.contains(&(metadata.dev(), metadata.ino())))
+    }) {
         return Err(inside_protected(None, control));
     }
     Ok(())
@@ -628,6 +672,12 @@ pub(crate) struct RestrictedAuthority {
 }
 
 impl RestrictedAuthority {
+    /// The directory every connection of the copy works beneath.
+    #[cfg(test)]
+    pub(crate) fn root_identity_for_test(&self) -> crate::rooted::RootIdentity {
+        self.root.identity()
+    }
+
     /// The files that may take new names by hard link, when the grant keeps
     /// existing objects and copies hard links: those this receiver created
     /// for the grant. Without hard links nothing is recorded.

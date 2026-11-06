@@ -350,6 +350,28 @@ pub(super) fn request(args: &Args) -> (CopyRequest, crate::destination_results::
         secret,
     )
 }
+/// Every authority for a request works beneath the directory opened when
+/// the request arrived: one that replaces that name during the prompt is
+/// not where the approved copy goes.
+#[test]
+fn a_request_keeps_the_receiving_directory_it_opened() {
+    let root = crate::test_support::tempdir().unwrap();
+    let container_path = root.path().join("container");
+    fs::create_dir(&container_path).unwrap();
+    let (request, _) = request(&args(&root.path().join("source"), "output"));
+    let request = constrain(request, &container_path.join("output"), 1024, 100, 0, false).unwrap();
+    let container = crate::restricted::Container::open(&container_path).unwrap();
+    let opened = crate::rooted::Root::open(&container_path)
+        .unwrap()
+        .identity();
+    let (before, _) = crate::restricted::named_authority(&container, request.clone()).unwrap();
+    fs::rename(&container_path, root.path().join("moved")).unwrap();
+    fs::create_dir(&container_path).unwrap();
+    let (after, _) = crate::restricted::named_authority(&container, request).unwrap();
+    assert_eq!(before.root_identity_for_test(), opened);
+    assert_eq!(after.root_identity_for_test(), opened);
+}
+
 #[test]
 fn named_destination_allows_128_workers_and_preserves_smaller_allowances() {
     let temporary = crate::test_support::tempdir().unwrap();

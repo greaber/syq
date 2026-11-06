@@ -1604,6 +1604,10 @@ impl Receiver {
                         .context("automatic approval root must not be filesystem root")?
                         .to_path_buf();
                 }
+                // Every authority for this request works beneath the
+                // directory opened here, before the prompt: one whose name
+                // leads elsewhere by approval cannot redirect the copy.
+                let container = crate::restricted::Container::open(&container)?;
                 // Validate the complete operation before the local policy decision.
                 let (authority, approved) =
                     crate::restricted::named_authority(&container, request.clone())?;

@@ -1149,7 +1149,7 @@ fn enrollment_state_names_no_device_or_inode_and_sessions_compare_none() {
     let session = || {
         let config = read_receiver_config(&state).unwrap().unwrap();
         require_current_receiver(&config, 1, crate::identity::build()).unwrap();
-        ConfinedRoot::resolve(destination.as_os_str().as_bytes(), &[]).unwrap()
+        ConfinedRoot::resolve(destination.as_os_str().as_bytes(), &[], false, None).unwrap()
     };
     let first = session().identity();
     fs::rename(&parent, home.join("unmounted")).unwrap();
@@ -1315,7 +1315,7 @@ fn receivers_refuse_protected_paths_beneath_a_recursive_destination_only() {
         let location = Location::parse(source).unwrap();
         let named = destination.as_os_str().as_bytes();
         let grant = copy_operation(&args, std::slice::from_ref(&location), named).unwrap();
-        ConfinedRoot::resolve(named, &protected).and_then(|confined| {
+        ConfinedRoot::resolve(named, &protected, false, None).and_then(|confined| {
             RestrictedAuthority::new(
                 confined,
                 test_grant(grant),
@@ -1351,8 +1351,9 @@ fn receivers_refuse_protected_paths_beneath_a_recursive_destination_only() {
 }
 
 /// Every path a copy may change is judged where it really is: through a
-/// symlink above the destination, and by the identity of a named entry
-/// that already exists, whatever name reaches it.
+/// symlink above the destination, which a grant that follows links reaches,
+/// and by the identity of a named entry that already exists, whatever name
+/// reaches it.
 #[test]
 fn named_entries_are_checked_where_they_really_are() {
     let temporary = crate::test_support::tempdir().unwrap();
@@ -1375,7 +1376,7 @@ fn named_entries_are_checked_where_they_really_are() {
         let location = Location::parse(source).unwrap();
         let named = destination.as_os_str().as_bytes();
         let grant = copy_operation(&args, std::slice::from_ref(&location), named).unwrap();
-        ConfinedRoot::resolve(named, protected).and_then(|confined| {
+        ConfinedRoot::resolve(named, protected, true, None).and_then(|confined| {
             RestrictedAuthority::new(
                 confined,
                 test_grant(grant),
@@ -1462,7 +1463,7 @@ fn the_copys_lookups_reuse_the_authoritys_directory_listings() {
     let grant = copy_operation(&args, &sources, named).unwrap();
     let protected = Vec::new();
     let authority = RestrictedAuthority::new(
-        ConfinedRoot::resolve(named, &protected).unwrap(),
+        ConfinedRoot::resolve(named, &protected, false, None).unwrap(),
         test_grant(grant),
         GrantConstraints::default(),
         [0; 32],
@@ -1482,7 +1483,7 @@ fn the_copys_lookups_reuse_the_authoritys_directory_listings() {
 fn a_missing_destination_parent_is_named_plainly() {
     let temporary = crate::test_support::tempdir().unwrap();
     let destination = temporary.path().join("missing/archive");
-    let error = ConfinedRoot::resolve(destination.as_os_str().as_bytes(), &[])
+    let error = ConfinedRoot::resolve(destination.as_os_str().as_bytes(), &[], false, None)
         .err()
         .unwrap();
     assert_eq!(
@@ -1504,17 +1505,17 @@ fn a_destination_is_resolved_afresh_by_every_copy() {
     fs::create_dir(&parent).unwrap();
     let destination = parent.join("archive");
     let named = destination.as_os_str().as_bytes();
-    let first = ConfinedRoot::resolve(named, &[]).unwrap();
+    let first = ConfinedRoot::resolve(named, &[], false, None).unwrap();
     let first_identity = first.identity();
     drop(first);
     fs::rename(&parent, temporary.path().join("unmounted")).unwrap();
     fs::create_dir(&parent).unwrap();
-    let second = ConfinedRoot::resolve(named, &[]).unwrap();
+    let second = ConfinedRoot::resolve(named, &[], false, None).unwrap();
     assert_ne!(second.identity(), first_identity);
     assert_eq!(second.identity(), Root::open(&parent).unwrap().identity());
 
-    // Through a link, the directory is where the link leads, and a
-    // protected directory is refused by identity whatever the names say.
+    // As in a destination path an ordinary copy is given, a link above the
+    // destination stops the copy unless the grant follows links.
     let protected_directory = temporary.path().join("protected");
     fs::create_dir_all(protected_directory.join("inside")).unwrap();
     let protected = vec![ReceiverControlPath {
@@ -1527,14 +1528,25 @@ fn a_destination_is_resolved_afresh_by_every_copy() {
     )
     .unwrap();
     let through_link = temporary.path().join("link/archive");
-    let error = ConfinedRoot::resolve(through_link.as_os_str().as_bytes(), &protected)
+    let error = ConfinedRoot::resolve(through_link.as_os_str().as_bytes(), &[], false, None)
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .to_string()
+            .starts_with("refusing to follow symlink \"link\" in a path you gave; "),
+        "{error:#}"
+    );
+    // Following, the directory is where the link leads, and a protected
+    // directory is refused by identity whatever the names say.
+    let error = ConfinedRoot::resolve(through_link.as_os_str().as_bytes(), &protected, true, None)
         .err()
         .unwrap();
     assert!(
         error.to_string().contains("test control directory"),
         "{error:#}"
     );
-    ConfinedRoot::resolve(named, &protected).unwrap();
+    ConfinedRoot::resolve(named, &protected, false, None).unwrap();
     // A directory above a protected one is fine: the copy writes only
     // beneath its destination.
     ConfinedRoot::resolve(
@@ -1547,6 +1559,8 @@ fn a_destination_is_resolved_afresh_by_every_copy() {
                 .to_vec(),
             label: "test control directory",
         }],
+        false,
+        None,
     )
     .unwrap();
     let error = ConfinedRoot::resolve(
@@ -1555,11 +1569,66 @@ fn a_destination_is_resolved_afresh_by_every_copy() {
             .as_os_str()
             .as_bytes(),
         &protected,
+        false,
+        None,
     )
     .err()
     .unwrap();
     assert!(
         error.to_string().contains("test control directory"),
+        "{error:#}"
+    );
+}
+
+/// The account's home is where an SSH login starts, so a destination in it
+/// resolves from where the home really is, even when the home's own path
+/// leads through a link; a link inside the home still stops the copy.
+#[test]
+fn a_destination_in_the_home_resolves_from_where_the_home_is() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let real_home = temporary.path().join("var/home/user");
+    fs::create_dir_all(real_home.join("backup")).unwrap();
+    symlink(
+        temporary.path().join("var/home"),
+        temporary.path().join("home"),
+    )
+    .unwrap();
+    let home = temporary.path().join("home/user");
+    let destination = home.join("backup/archive");
+    let confined = ConfinedRoot::resolve(
+        destination.as_os_str().as_bytes(),
+        &[],
+        false,
+        Some((&home, &real_home)),
+    )
+    .unwrap();
+    assert_eq!(
+        confined.identity(),
+        Root::open(&real_home.join("backup")).unwrap().identity()
+    );
+    // Without the home, the same path leads through a link.
+    let error = ConfinedRoot::resolve(destination.as_os_str().as_bytes(), &[], false, None)
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .to_string()
+            .starts_with("refusing to follow symlink \"home\""),
+        "{error:#}"
+    );
+    symlink(real_home.join("backup"), real_home.join("linked")).unwrap();
+    let error = ConfinedRoot::resolve(
+        home.join("linked/archive").as_os_str().as_bytes(),
+        &[],
+        false,
+        Some((&home, &real_home)),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        error
+            .to_string()
+            .starts_with("refusing to follow symlink \"linked\""),
         "{error:#}"
     );
 }
@@ -2135,9 +2204,8 @@ fn test_authority_with_options(
     results: Option<(PrivateKey, crate::destination_results::ReceiptPolicy)>,
     (extra_options, protected): (crate::delegation::ExtraCopyOptions, &[ReceiverControlPath]),
 ) -> Result<RestrictedAuthority> {
-    let identity = Root::open(root).unwrap().identity();
     let id = EnrollmentId::random();
-    let confined = ConfinedRoot::opened(root, identity)?;
+    let confined = ConfinedRoot::held(root, fs::File::open(root)?)?;
     let destination = root.join("target");
     if !filters.ignore.is_empty() && filters.destination_roots.is_empty() {
         filters.destination_roots = vec![destination.as_os_str().as_bytes().to_vec()];
@@ -11388,7 +11456,7 @@ fn follow_dst_compares_absolute_link_targets_with_the_real_directory() {
     )
     .unwrap();
     let authority = RestrictedAuthority::new(
-        ConfinedRoot::resolve(named.as_os_str().as_bytes(), &[]).unwrap(),
+        ConfinedRoot::resolve(named.as_os_str().as_bytes(), &[], true, None).unwrap(),
         test_grant(grant),
         GrantConstraints {
             extra_options: crate::delegation::ExtraCopyOptions {
@@ -11507,16 +11575,17 @@ fn follow_dst_copies_into_the_directory_a_destination_link_leads_to() {
     }
 }
 
-/// `--follow-dst` (or `--follow`) with `--into` is signed for the receiver
-/// to resolve; it cannot be combined with `--widen-dirs all`, whose
+/// `--follow-dst` (or `--follow`) is signed for the receiver to resolve;
+/// with `--into` it cannot be combined with `--widen-dirs all`, whose
 /// directories on the way to the destination a link would make ambiguous.
 #[test]
-fn follow_dst_is_signed_for_into_placements() {
+fn follow_dst_is_signed_for_the_receiver() {
     for (options, follow) in [
         (&["--into", "/backup"][..], false),
         (&["--into", "/backup", "--follow-dst"][..], true),
         (&["--into", "/backup", "--follow"][..], true),
-        (&["--as", "/backup", "--follow-dst"][..], false),
+        (&["--as", "/backup", "--follow-dst"][..], true),
+        (&["--as", "/backup"][..], false),
     ] {
         let mut argv: Vec<_> = ["cp", "--from", "host-a", "source", "--to", "host-b"]
             .map(std::ffi::OsString::from)

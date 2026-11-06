@@ -1130,7 +1130,10 @@ fn receive() -> Result<i32> {
             u64::MAX,
             false,
         )?;
-        crate::restricted::named_authority(&container, request)
+        crate::restricted::named_authority(
+            &crate::restricted::Container::open(&container)?,
+            request,
+        )
     })();
     let (authority, approved) = match setup {
         Ok(value) => value,
