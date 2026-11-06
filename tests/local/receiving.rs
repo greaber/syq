@@ -3053,6 +3053,16 @@ if [ -n "${FAKE_SSH_REJECT:-}" ] && [ "$1" != -V ]; then
     echo 'syq@test-server: Permission denied (publickey).' >&2
     exit 255
 fi
+# Wait, at the first session, until the test lets it go on.
+if [ -n "${FAKE_SSH_PAUSE:-}" ] && [ "$1" != -V ] && [ ! -e "$FAKE_SSH_PAUSE.paused" ]; then
+    case " $* " in
+        *" -O "*|*" -G "*) ;;
+        *)
+            : > "$FAKE_SSH_PAUSE.paused"
+            while [ ! -e "$FAKE_SSH_PAUSE.go" ]; do sleep 0.05; done
+            ;;
+    esac
+fi
 # Reject the first login, as a key that a later attempt finds unlocked.
 if [ -n "${FAKE_SSH_REJECT_ONCE:-}" ] && [ "$1" != -V ] && [ ! -e "$FAKE_SSH_REJECT_ONCE" ]; then
     case " $* " in
@@ -4839,9 +4849,120 @@ fn persist_commands_start_receiving_an_older_syq_left_stopped() {
     }
 }
 
-/// The user's case: receiving runs a version from before syq followed
-/// updates, and `syq --self-update` alone switches it to the version it
-/// installs.
+/// Starting receiving again where an older syq's service was stopped never
+/// stops a service that started meanwhile: here another build's, busy,
+/// which keeps running, and the command says so.
+#[test]
+fn restarting_stopped_receiving_leaves_a_busy_service_that_started_meanwhile() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    let _master = std::os::unix::net::UnixListener::bind(installed.control()).unwrap();
+    let old = older_service(&installed, serde_json::json!([]));
+    installed.request(serde_json::json!({"version": 2, "stop": true}));
+    old.join().unwrap();
+
+    let pause = t.path("pause");
+    let control = installed.control();
+    let successor = {
+        let pause = pause.clone();
+        std::thread::spawn(move || {
+            wait_for(
+                "the switch to log in",
+                std::time::Duration::from_secs(30),
+                || PathBuf::from(format!("{}.paused", pause.display())).exists(),
+            );
+            // Another build's service takes the connection, busy.
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(format!("{}.recv-lock", control.display()))
+                .unwrap();
+            assert_eq!(
+                unsafe {
+                    libc::flock(
+                        std::os::fd::AsRawFd::as_raw_fd(&lock),
+                        libc::LOCK_EX | libc::LOCK_NB,
+                    )
+                },
+                0
+            );
+            let socket = PathBuf::from(format!("{}.recv", control.display()));
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            fs::write(format!("{}.go", pause.display()), b"").unwrap();
+            let mut requests = Vec::new();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "{requests:?}");
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                if stream.set_nonblocking(false).is_err()
+                    || stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .is_err()
+                {
+                    continue;
+                }
+                let request = read_provider_frame(&mut stream);
+                let last = request.get("last") == Some(&serde_json::Value::Bool(true));
+                write_provider_frame(
+                    &mut stream,
+                    serde_json::json!({
+                        "version": 2, "identity": "v0.9.9-other", "pid": 0,
+                        "endpoint": "test-server", "name": "",
+                        "connection": {"phase": "online", "error": null, "ssh_pid": null},
+                        "pending": [], "busy": {"requests": 1, "pending": 0, "accounts": 0},
+                        "stopping": false
+                    }),
+                );
+                requests.push(request);
+                if last {
+                    fs::remove_file(&socket).unwrap();
+                    drop(lock);
+                    return requests;
+                }
+            }
+        })
+    };
+    let mut command = installed.command(
+        syq,
+        &[
+            "persist",
+            "status",
+            "--pscope",
+            installed.scope.to_str().unwrap(),
+        ],
+    );
+    let shown = command.env("FAKE_SSH_PAUSE", &pause).run().unwrap();
+    assert_output_ok(&shown);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&shown.stdout),
+        stderr_of(&shown)
+    );
+    assert!(said.contains("keeps running syq v0.9.9-other"), "{said}");
+    // Ends the stand-in.
+    installed.request(serde_json::json!({"version": 2, "stop": false, "last": true}));
+    let requests = successor.join().unwrap();
+    assert!(
+        requests.iter().all(|request| request["stop"] != true),
+        "{requests:?}"
+    );
+}
+
+/// Receiving runs a version from before syq followed updates, and
+/// `syq --self-update` alone switches it to the version it installs. The
+/// updater here is this build; an updater from before this change, such as
+/// 0.8.0's, does not run the switch.
 #[test]
 fn self_update_alone_switches_receiving_an_older_syq_left_running() {
     let t = Tmp::new();

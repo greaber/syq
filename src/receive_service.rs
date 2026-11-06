@@ -1240,8 +1240,17 @@ fn restart_stale(domain: &Domain, control: &Path) {
     crate::output::diagnostic!(
         "syq: starting receiving through {endpoint} again, with this version of syq"
     );
-    match reconnect_with_this_build(domain, control, &endpoint) {
-        Ok(()) => clear_attempt(control),
+    // Only once idle: a service may have started there meanwhile.
+    match reconnect_with_this_build(domain, control, &endpoint, false) {
+        Ok(()) => {
+            if running_status(control, Retry::No, ANSWER_TIMEOUT)
+                .ok()
+                .flatten()
+                .is_some_and(|now| now.identity == crate::identity::build())
+            {
+                clear_attempt(control);
+            }
+        }
         Err(error) => {
             crate::output::diagnostic!(
                 "syq: could not start receiving through {endpoint}: {error:#}; `{}` tries again",
@@ -1478,10 +1487,16 @@ fn start_switch(domain: &Domain, endpoint: &str) -> Result<()> {
 /// says: for a command without the user at hand, so that the switch's own
 /// bounds on logging in and on its time apply.
 fn run_switch(args: Vec<OsString>) -> Result<std::process::ExitStatus> {
+    Ok(run_switch_process(args)?.0)
+}
+/// As `run_switch`, also returning the switch's process ID, which its
+/// records name (`Attempt`).
+fn run_switch_process(args: Vec<OsString>) -> Result<(std::process::ExitStatus, u32)> {
     let mut command = switch_process(args)?;
     command.stdin(Stdio::null());
     let mut child = command.spawn_guarded()?;
-    Ok(switch::wait_and_end_group(&mut child)?)
+    let pid = child.id();
+    Ok((switch::wait_and_end_group(&mut child)?, pid))
 }
 
 /// `persist connect --when-idle` of this build with `args`, in a session of
@@ -2377,7 +2392,7 @@ fn apply_preferences_reporting(
                 continue;
             }
             crate::output::diagnostic!("syq: {}", switching_notice(&state, ""));
-            if let Err(error) = reconnect_with_this_build(domain, &control, &state.endpoint) {
+            if let Err(error) = reconnect_with_this_build(domain, &control, &state.endpoint, true) {
                 // What stopping it now cuts off, when it still runs.
                 let cut = running_status(&control, Retry::No, ANSWER_TIMEOUT)
                     .ok()
@@ -2409,7 +2424,8 @@ fn apply_preferences_reporting(
                 crate::output::diagnostic!(
                     "syq: starting receiving through {endpoint} again, with this version of syq"
                 );
-                if let Err(error) = reconnect_with_this_build(domain, &control, &endpoint) {
+                // A settings change, which must apply.
+                if let Err(error) = reconnect_with_this_build(domain, &control, &endpoint, true) {
                     failures.push((
                         endpoint.clone(),
                         format!(
@@ -2475,11 +2491,19 @@ fn apply_preferences_reporting(
     Ok(failures)
 }
 
-/// Replace whatever runs receiving through `endpoint` with this build's
-/// service, at once, even when busy, and wait until it is online. In a
+/// Start this build's receiving service through `endpoint` and wait until
+/// it is online. With `force`, as for a settings change, whatever runs
+/// there is replaced at once, even when busy; without, as for a switch, a
+/// service that started meanwhile is replaced only once idle, and one that
+/// follows another installed syq is left, which is no failure. In a
 /// terminal ssh may ask for the login; without one, as a switch does,
 /// within its bounds on logging in and on its time (`run_switch`).
-fn reconnect_with_this_build(domain: &Domain, control: &Path, endpoint: &str) -> Result<()> {
+fn reconnect_with_this_build(
+    domain: &Domain,
+    control: &Path,
+    endpoint: &str,
+    force: bool,
+) -> Result<()> {
     if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
         return crate::persistence::connect_domain(
             domain,
@@ -2487,12 +2511,25 @@ fn reconnect_with_this_build(domain: &Domain, control: &Path, endpoint: &str) ->
             None,
             false,
             Duration::from_secs(30),
-            Replace::Now,
+            if force { Replace::Now } else { Replace::IfIdle },
             crate::persistence::Login::Bounded,
         );
     }
-    let status = run_switch(replace_now_command(domain, endpoint))?;
+    let (status, pid) = run_switch_process(if force {
+        replace_now_command(domain, endpoint)
+    } else {
+        switch_command(domain, endpoint)
+    })?;
     let now = running_status(control, Retry::No, ANSWER_TIMEOUT)?;
+    // Another build's service that a switch leaves running, as it said.
+    if !force
+        && status.success()
+        && now
+            .as_ref()
+            .is_some_and(|now| now.identity != crate::identity::build())
+    {
+        return Ok(());
+    }
     let online = now.as_ref().is_some_and(|now| {
         now.identity == crate::identity::build() && now.connection.phase == "online"
     });
@@ -2508,9 +2545,10 @@ fn reconnect_with_this_build(domain: &Domain, control: &Path, endpoint: &str) ->
         );
         return Ok(());
     }
-    // What the switch recorded, when it ended without saying why, as at its
-    // time limit; otherwise it said so above.
-    match last_attempt(control).filter(|attempt| attempt.build == crate::identity::build()) {
+    // What this switch recorded, so that the summary stands on its own, as
+    // when it ended at its time limit without saying why; it also said so
+    // above.
+    match last_attempt(control).filter(|attempt| attempt.pid == pid) {
         Some(Attempt {
             error: Some(error), ..
         }) => anyhow::bail!("{error}"),
