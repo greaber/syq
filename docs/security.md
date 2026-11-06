@@ -491,6 +491,11 @@ the approved account and host keys; its agent is not forwarded, and the
 permission cannot reach another account or sign anything else. Custom proxy
 commands use the requesting machine's own authentication.
 
+To prepare a request, a server with a receiving connection can ask, without a
+prompt, which host keys your laptop trusts for any host name it chooses; the
+answer leaves out the commands, file paths, and other host names in your SSH
+configuration.
+
 Stopping receiving ends further authorization through that connection, and
 removing a remembered permission makes later logins ask again. Neither ends
 sessions already authenticated, undoes remote changes, stops detached

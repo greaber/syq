@@ -62,6 +62,36 @@ fn poll_readable(ready: &mut [libc::pollfd], timeout: std::time::Duration) {
     }
 }
 
+/// The account name for `uid`, when the system knows one, for messages.
+pub(crate) fn user_name(uid: u32) -> Option<String> {
+    let mut buffer = vec![0u8; 16 * 1024];
+    loop {
+        let mut record: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut found = std::ptr::null_mut();
+        // SAFETY: the record, buffer and result pointer are live locals of
+        // the sizes given.
+        let result = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut record,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut found,
+            )
+        };
+        if result == libc::ERANGE && buffer.len() < 1024 * 1024 {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        if result != 0 || found.is_null() || record.pw_name.is_null() {
+            return None;
+        }
+        // SAFETY: getpwuid_r succeeded, so pw_name points into buffer.
+        let name = unsafe { CStr::from_ptr(record.pw_name) };
+        return name.to_str().ok().map(str::to_owned);
+    }
+}
+
 /// The user ID of the process at the other end of a connected Unix stream
 /// socket: for a socket this process connected, whoever listens on it.
 #[cfg(target_os = "linux")]

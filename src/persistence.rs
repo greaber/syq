@@ -1039,8 +1039,28 @@ pub(crate) fn is_global_scope(scope: &Path) -> Result<bool> {
 pub(crate) fn ensure_runtime_parent() -> Result<PathBuf> {
     let path = runtime_parent_path();
     validate_openssh_control_path(&path)?;
-    secure_directory(&path, true, true)?;
+    if let Err(error) = secure_directory(&path, true, true) {
+        return Err(held_by_another_user(&path, unsafe { libc::geteuid() }).unwrap_or(error));
+    }
     Ok(path)
+}
+
+/// Without XDG_RUNTIME_DIR the runtime directory's name is predictable, so
+/// another user can create it first, as a directory or a link. Say who did
+/// and how to get around it.
+fn held_by_another_user(path: &Path, uid: u32) -> Option<anyhow::Error> {
+    let owner = std::fs::symlink_metadata(path).ok()?.uid();
+    if owner == uid {
+        return None;
+    }
+    let who = match crate::sys::user_name(owner) {
+        Some(name) => format!("user {name} (uid {owner})"),
+        None => format!("uid {owner}"),
+    };
+    Some(anyhow::anyhow!(
+        "{} belongs to {who}, so syq cannot keep persistent connections there; ask that user or an administrator to remove it, or set XDG_RUNTIME_DIR to a short private directory of your own",
+        path.display()
+    ))
 }
 
 fn ensure_global_scope() -> Result<PathBuf> {
@@ -1688,6 +1708,36 @@ mod tests {
         close_scope(&scope).unwrap();
         assert!(!scope.exists());
         assert_eq!(std::fs::read(&target).unwrap(), br#"{"default":"ssh"}"#);
+    }
+
+    #[test]
+    fn runtime_directory_held_by_another_user_names_them_and_the_way_out() {
+        let root = crate::test_support::short_tempdir().unwrap();
+        let path = root.path().join("syq-persist-test");
+        // The test's own files stand for another user's: `held_by_another_user`
+        // is asked on behalf of a different uid.
+        let owner = unsafe { libc::geteuid() };
+        let other = owner.wrapping_add(1);
+        assert!(held_by_another_user(&path, other).is_none());
+        for link in [false, true] {
+            if link {
+                std::os::unix::fs::symlink(root.path(), &path).unwrap();
+            } else {
+                std::fs::create_dir(&path).unwrap();
+            }
+            assert!(held_by_another_user(&path, owner).is_none());
+            let message = held_by_another_user(&path, other).unwrap().to_string();
+            assert!(message.contains(&format!("uid {owner}")), "{message}");
+            if let Some(name) = crate::sys::user_name(owner) {
+                assert!(message.contains(&format!("user {name} ")), "{message}");
+            }
+            assert!(message.contains("XDG_RUNTIME_DIR"), "{message}");
+            if link {
+                std::fs::remove_file(&path).unwrap();
+            } else {
+                std::fs::remove_dir(&path).unwrap();
+            }
+        }
     }
 
     #[test]
