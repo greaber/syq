@@ -150,6 +150,35 @@ impl std::error::Error for SessionsFull {}
 /// The exit status of a session refused for [`SessionsFull`].
 pub(crate) const SESSIONS_FULL_EXIT: i32 = 73;
 
+/// A copy the receiver refused before serving it, so it wrote nothing. The
+/// receiver prints the reason itself and exits with [`REFUSED_EXIT`].
+#[derive(Debug)]
+pub(crate) struct Refused(pub(crate) anyhow::Error);
+
+impl fmt::Display for Refused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// The exit status of a copy the receiver [`Refused`].
+pub(crate) const REFUSED_EXIT: i32 = 74;
+
+/// What the coordinator reports when the receiver exited with
+/// [`REFUSED_EXIT`]: the receiver's own message, already shown, says why.
+#[derive(Debug)]
+pub(crate) struct CopyRefused(pub(crate) String);
+
+impl fmt::Display for CopyRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CopyRefused {}
+
 pub(crate) fn is_sessions_full(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<SessionsFull>())
 }

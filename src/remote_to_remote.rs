@@ -397,14 +397,20 @@ fn settle(mut relay: Relay, settlement: Settlement<'_>) -> Result<i32> {
         }
         return Ok(coordinator_exit_code);
     };
+    let received = reader.received_any();
     let totals = match reader.finish() {
         Ok(totals) => totals,
         Err(error) => {
             let message = format!(
-                "the results of the command-restricted receiver on {dst_host}, relayed by {src_host}, could not be verified: {error:#}; what landed is unknown"
+                "the results of the restricted receiver on {dst_host}, relayed by {src_host}, could not be verified: {error:#}; what landed is unknown"
             );
             relay.error(&message, "integrity");
             fail_results(&relay, elapsed_ms);
+            if !received && coordinator_exit_code != 0 {
+                // The copy failed before the receiver sent anything, as when
+                // it refused the copy; the coordinator already said why.
+                return Ok(1);
+            }
             bail!(message);
         }
     };
@@ -1572,7 +1578,7 @@ fn run_remote(
             })
             .transpose()
             .context(
-                "prepare command-restricted destination enrollment; use --peer-auth broker to explicitly request authentication-only confinement",
+                "prepare restricted destination enrollment; use --peer-auth broker to explicitly request authentication-only confinement",
             )?;
         if let Some(prepared) = prepared {
             // The coordinator gets the entry key on its input and uses it
@@ -1599,7 +1605,7 @@ fn run_remote(
             });
             if !args.quiet {
                 crate::output::diagnostic!(
-                    "syq: using command-restricted destination enrollment {}",
+                    "syq: using restricted destination enrollment {}",
                     prepared.enrollment_id
                 );
             }
@@ -1640,7 +1646,7 @@ fn run_remote(
         && restricted_grant.is_none()
     {
         bail!(
-            "--receiver-max-entries and --receiver-max-bytes address the command-restricted receiver, but this transfer does not use the enrolled receiver"
+            "--receiver-max-entries and --receiver-max-bytes limit a restricted copy, but this copy logs in to the destination normally rather than through its restricted receiver"
         );
     }
     let coordinator_target = endpoint_display(coordinator);

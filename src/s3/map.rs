@@ -43,11 +43,21 @@ pub(crate) fn run(args: &Args, options: &Options, out: &mut impl Write) -> Resul
                 .any(|field| matches!(field, Field::Kind | Field::Mtime));
             let service_time = options.include.contains(&Field::S3LastModified)
                 || args.expressions.uses_source_s3_time();
-            for (source, destination) in options.sources.iter().zip(destinations) {
-                let source_path = local::key_path(&source.path)?;
-                let key = local::join(&base, &source_path);
-                let contents = source.selection == SourceSelection::Contents;
-                let directory = contents || source.selection == SourceSelection::Directory;
+            // Check every selector before writing anything: a mapping cut
+            // short by a later selector's error still reads as complete to
+            // `syq cp --mapping -` when the shell ignores the producer's
+            // status. The emitting pass reuses each check's HEAD, and the
+            // first listing pages while they hold at most KEPT_ENTRIES in all,
+            // so few selectors cost no extra requests and many stay bounded.
+            const KEPT_ENTRIES: usize = 10_000;
+            let mut kept = 0;
+            let mut checked = Vec::with_capacity(options.sources.len());
+            for source in &options.sources {
+                let key = local::join(&base, &local::key_path(&source.path)?);
+                let directory = matches!(
+                    source.selection,
+                    SourceSelection::Contents | SourceSelection::Directory
+                );
                 let exact = if key.is_empty() {
                     None
                 } else {
@@ -57,36 +67,7 @@ pub(crate) fn run(args: &Args, options: &Options, out: &mut impl Write) -> Resul
                     if directory {
                         bail!("S3 selector requires a prefix but an object exists at {key:?}");
                     }
-                    let size = u64::try_from(
-                        output
-                            .content_length()
-                            .context("S3 HEAD omitted Content-Length")?,
-                    )?;
-                    let object_time = output.last_modified().map(|time| (time.secs(), time.subsec_nanos()));
-                    let expression_path = crate::expression::source_path(&source.path, b"");
-                    let selected = args.expressions.selects_known(
-                        crate::expression::Facts::S3Listing {
-                            size,
-                            directory_marker: client::is_directory_marker(&key, size),
-                            last_modified: object_time,
-                        }, expression_path)?;
-                    if selected == Some(false) { continue; }
-                    let object = (details || selected.is_none())
-                        .then(|| client::from_head(&key, &output)).transpose()?;
-                    if selected.is_none() && !args.expressions.selects(
-                        &object.as_ref().expect("expression metadata").expression_file(), expression_path)? {
-                        continue;
-                    }
-                    emit(
-                        &mut emitter,
-                        &mut claims,
-                        &source.path,
-                        &destination,
-                        size,
-                        object.as_ref(),
-                        output.last_modified().map(|time| time.secs()),
-                        false,
-                    )?;
+                    checked.push(Checked::Object(Box::new(output)));
                     continue;
                 }
                 if source.selection == SourceSelection::File {
@@ -97,12 +78,65 @@ pub(crate) fn run(args: &Args, options: &Options, out: &mut impl Write) -> Resul
                 } else {
                     format!("{key}/")
                 };
-                let mut token = None;
-                let mut found = false;
+                let mut page = listing::engine::read(&store, &prefix, false, None).await?;
+                while page.entries.is_empty() {
+                    let Some(token) = page.next.take() else {
+                        bail!("S3 source prefix {key:?} contains no objects");
+                    };
+                    page = listing::engine::read(&store, &prefix, false, Some(&token)).await?;
+                }
+                kept += page.entries.len();
+                checked.push(Checked::Prefix(prefix, (kept <= KEPT_ENTRIES).then_some(page)));
+            }
+            for ((source, destination), checked) in
+                options.sources.iter().zip(destinations).zip(checked)
+            {
+                let source_path = local::key_path(&source.path)?;
+                let contents = source.selection == SourceSelection::Contents;
+                let (prefix, first) = match checked {
+                    Checked::Prefix(prefix, page) => (prefix, page),
+                    Checked::Object(output) => {
+                        let key = local::join(&base, &source_path);
+                        let size = u64::try_from(
+                            output
+                                .content_length()
+                                .context("S3 HEAD omitted Content-Length")?,
+                        )?;
+                        let object_time = output.last_modified().map(|time| (time.secs(), time.subsec_nanos()));
+                        let expression_path = crate::expression::source_path(&source.path, b"");
+                        let selected = args.expressions.selects_known(
+                            crate::expression::Facts::S3Listing {
+                                size,
+                                directory_marker: client::is_directory_marker(&key, size),
+                                last_modified: object_time,
+                            }, expression_path)?;
+                        if selected == Some(false) { continue; }
+                        let object = (details || selected.is_none())
+                            .then(|| client::from_head(&key, &output)).transpose()?;
+                        if selected.is_none() && !args.expressions.selects(
+                            &object.as_ref().expect("expression metadata").expression_file(), expression_path)? {
+                            continue;
+                        }
+                        emit(
+                            &mut emitter,
+                            &mut claims,
+                            &source.path,
+                            &destination,
+                            size,
+                            object.as_ref(),
+                            output.last_modified().map(|time| time.secs()),
+                            false,
+                        )?;
+                        continue;
+                    }
+                };
+                let mut next_page = first;
+                let mut token: Option<String> = None;
                 loop {
-                    let page =
-                        listing::engine::read(&store, &prefix, false, token.as_deref()).await?;
-                    found |= !page.entries.is_empty();
+                    let page = match next_page.take() {
+                        Some(page) => page,
+                        None => listing::engine::read(&store, &prefix, false, token.as_deref()).await?,
+                    };
                     for entry in &page.entries {
                         if entry.key.ends_with('/') && !client::is_directory_marker(&entry.key, entry.size) {
                             bail!("S3 object {:?} ends in '/' but is not a directory marker and cannot be represented as a mapping path", entry.key);
@@ -150,12 +184,16 @@ pub(crate) fn run(args: &Args, options: &Options, out: &mut impl Write) -> Resul
                         break;
                     }
                 }
-                if !found {
-                    bail!("S3 source prefix {key:?} contains no objects");
-                }
             }
             Ok(())
         })
+}
+
+/// What checking a selector found: the object it names, or its prefix and,
+/// when kept, the first nonempty listing page beneath it.
+enum Checked {
+    Object(Box<aws_sdk_s3::operation::head_object::HeadObjectOutput>),
+    Prefix(String, Option<listing::engine::Page>),
 }
 
 fn listed_time(entry: &Entry) -> Result<Option<(i64, u32)>> {

@@ -242,6 +242,24 @@ fn write(p: &Path, data: &[u8]) {
     File::create(p).unwrap().write_all(data).unwrap();
 }
 
+/// Write a saved preferences file as syq does, not leaving its mode to the
+/// umask: syq refuses one that others in its group could change.
+fn write_private(p: &Path, data: &[u8]) {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(p)
+        .unwrap()
+        .write_all(data)
+        .unwrap();
+}
+
 fn read(p: &Path) -> Vec<u8> {
     let mut v = Vec::new();
     File::open(p).unwrap().read_to_end(&mut v).unwrap();

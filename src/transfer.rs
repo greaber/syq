@@ -6207,13 +6207,13 @@ fn follow_container_symlink(
             None if allow_missing => return Ok((current_path, None)),
             None => {
                 bail!(
-                    "operator path {} resolves through a dangling symlink",
+                    "{} goes through a symlink whose target is missing",
                     display(path)
                 )
             }
         }
     }
-    bail!("too many symlink levels in operator path {}", display(path))
+    bail!("too many symlink levels in {}", display(path))
 }
 
 fn display(p: &[u8]) -> String {

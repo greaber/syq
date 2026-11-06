@@ -1346,7 +1346,7 @@ fn auth_from_preferences_preserve_persistence_and_reset_individual_hosts() {
     // Unchanged persistence format from released v0.7.1. An older binary
     // ignores auth-from.json and can still read its own settings unchanged.
     let old = b"{\"enabled\":false}\n";
-    write(&t.path("config/syq/persistence.json"), old);
+    write_private(&t.path("config/syq/persistence.json"), old);
     let run = |args: &[&str]| persistence_command(&t, args).capture_output().unwrap();
     assert_output_ok(&run(&["auth-from", "@laptop"]));
     assert_output_ok(&run(&["auth-from", "ssh", "--for", "backup"]));

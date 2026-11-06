@@ -1215,6 +1215,36 @@ ssh destination 'test -d /tmp/syq-real-ssh/named-link/followed/link &&
     test "$(cat /tmp/syq-real-ssh/named-link/followed/link/file)" = "named link" &&
     test "$(readlink /tmp/syq-real-ssh/named-link/linked/link)" = real'
 
+printf 'case: a restricted destination reports a missing --into parent once\n'
+# The coordinator runs on the source server; the receiver refuses to create
+# the missing parent, and the runner should see that one reason.
+ssh source 'mkdir -p /tmp/syq-real-ssh && printf "x\n" >/tmp/syq-real-ssh/missing-parent.txt'
+ssh destination 'rm -rf /tmp/syq-real-ssh/missing-parent'
+for missing_mode in plain results; do
+    missing_args=
+    if [ "$missing_mode" = results ]; then
+        missing_args="--results /tmp/syq-real-ssh-missing-parent.ndjson"
+    fi
+    # shellcheck disable=SC2086
+    if missing_output=$(syq cp --no-progress $missing_args --from source \
+        /tmp/syq-real-ssh/missing-parent.txt \
+        --to destination --into /tmp/syq-real-ssh/missing-parent/sub 2>&1); then
+        echo 'a copy into a missing parent unexpectedly succeeded' >&2
+        exit 1
+    fi
+    case "$missing_output" in
+        *'wire preamble'*|*'incompatible'*|*'what landed'*)
+            printf '%s\n' "$missing_output" >&2; exit 1 ;;
+        *'missing-parent does not exist; a restricted copy creates its destination'*'refused the copy'*) ;;
+        *) printf '%s\n' "$missing_output" >&2; exit 1 ;;
+    esac
+done
+case "$(tail -n 1 /tmp/syq-real-ssh-missing-parent.ndjson)" in
+    *'"status":"failed"'*) ;;
+    *) cat /tmp/syq-real-ssh-missing-parent.ndjson >&2; exit 1 ;;
+esac
+ssh destination 'test ! -e /tmp/syq-real-ssh/missing-parent'
+
 printf 'case: restricted copies accept --pscope\n'
 # --pscope selects which local connections are kept; the receiver's own
 # connection stays private to the copy.

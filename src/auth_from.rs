@@ -496,11 +496,27 @@ mod tests {
         }
     }
 
+    /// Write a preferences fixture as syq would, not leaving its mode to the
+    /// umask: syq refuses a group-writable file.
+    fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+        use std::io::Write;
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?
+            .write_all(contents.as_ref())
+    }
+
     #[test]
     fn ordinary_provider_preferences_round_trip_without_changing_return_defaults() {
         let root = crate::test_support::tempdir().unwrap();
         let path = root.path().join("auth-from.json");
-        std::fs::write(&path, br#"{"default":"@laptop","hosts":{"other":"ssh"}}"#).unwrap();
+        write_private(&path, br#"{"default":"@laptop","hosts":{"other":"ssh"}}"#).unwrap();
+        // Not left to the umask: syq refuses a group-writable file.
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
         let provider = crate::cli::parse_auth_from("alice@provider:2222").unwrap();
         update(&path, Some("backup"), Some(&provider), true).unwrap();
         let config = read(&path).unwrap();
@@ -593,7 +609,7 @@ mod tests {
             r#"{"version":null}"#,
             r#"{"version":"1"}"#,
         ] {
-            std::fs::write(&path, data).unwrap();
+            write_private(&path, data).unwrap();
             let errors = [
                 read(&path).err().unwrap(),
                 update(&path, None, Some(&AuthFrom::Auto), true)
@@ -618,7 +634,7 @@ mod tests {
         let path = root.path().join("auth-from.json");
         // The original unversioned format, unchanged by schema serialization.
         let original = r#"{"default":"@laptop","hosts":{"backup":"ssh"}}"#;
-        std::fs::write(&path, original).unwrap();
+        write_private(&path, original).unwrap();
         let config = read(&path).unwrap();
         assert_eq!(config.selected("backup").unwrap(), AuthFrom::Ssh);
         assert_eq!(
@@ -639,7 +655,7 @@ mod tests {
             r#"{"future":true}"#,
             r#"{"version":1,"future":{"values":[null,true,42,"text"],"nested":{"key":"value"}}}"#,
         ] {
-            std::fs::write(&path, original).unwrap();
+            write_private(&path, original).unwrap();
             let original: serde_json::Value = serde_json::from_str(original).unwrap();
             for (host, value) in [
                 (
@@ -728,7 +744,7 @@ mod tests {
             assert!(format!("{error:#}").contains("the target must exist"));
         }
         assert!(!target.exists());
-        std::fs::write(&target, b"{}").unwrap();
+        write_private(&target, b"{}").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o666)).unwrap();
         assert!(read(&path).is_err());
         assert!(update(&path, None, Some(&AuthFrom::Ssh), true).is_err());
@@ -740,7 +756,7 @@ mod tests {
     fn concurrent_updates_through_different_links_preserve_all_overrides() {
         let root = crate::test_support::tempdir().unwrap();
         let target = root.path().join("saved.json");
-        std::fs::write(&target, br#"{"version":1,"future":true}"#).unwrap();
+        write_private(&target, br#"{"version":1,"future":true}"#).unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
         let threads: Vec<_> = (0..8)
             .map(|index| {

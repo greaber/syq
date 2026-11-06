@@ -211,7 +211,7 @@ fn native_receiver_ceilings_apply_only_to_direct_remote_copies() {
         assert!(!out.status.success(), "{option}");
         assert!(
             String::from_utf8_lossy(&out.stderr)
-                .contains("apply only to direct remote-to-remote copies"),
+                .contains("limit a restricted copy between two servers"),
             "{option}: {}",
             String::from_utf8_lossy(&out.stderr)
         );

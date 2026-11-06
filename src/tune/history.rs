@@ -21,6 +21,10 @@ const FINISH_LOCK_WAIT: Duration = Duration::from_millis(100);
 /// How long opening history waits for another run's lock before this run
 /// goes without history.
 const OPEN_LOCK_WAIT: Duration = Duration::from_millis(100);
+/// About how long one copy spends deleting old runs from a history over its
+/// budget, and how many runs one statement deletes.
+const PRUNE_TIME: Duration = Duration::from_millis(20);
+const PRUNE_BATCH: i128 = 256;
 
 #[derive(Clone)]
 pub(crate) struct Recorder(Arc<Mutex<Writer>>);
@@ -554,21 +558,54 @@ impl Drop for Writer {
 }
 
 fn prune(db: &Connection, budget: u64, current: i64) -> Result<()> {
+    prune_within(db, budget, current, PRUNE_TIME)
+}
+
+/// `prune`, spending at most about `time` deleting old runs.
+fn prune_within(db: &Connection, budget: u64, current: i64, time: Duration) -> Result<()> {
+    let deadline = Instant::now() + time;
     let page_size: i64 = db.pragma_query_value(None, "page_size", |r| r.get(0))?;
-    // Stop as soon as enough space has been reclaimed, with bounded work per
-    // completion. The current run and recent incomplete runs are preserved.
-    for _ in 0..100 {
+    let budget = budget.min(i64::MAX as u64) as i64;
+    let used = || -> Result<(i64, i64)> {
         let pages: i64 = db.pragma_query_value(None, "page_count", |r| r.get(0))?;
         let free: i64 = db.pragma_query_value(None, "freelist_count", |r| r.get(0))?;
-        if pages.saturating_sub(free) * page_size <= budget.min(i64::MAX as u64) as i64 {
-            break;
-        }
-        let deleted = db.execute("DELETE FROM runs WHERE id IN (SELECT id FROM runs WHERE id!=?1 AND (status!='incomplete' OR updated_day<?2) ORDER BY id LIMIT 1)",params![current,day().saturating_sub(2)])?;
-        if deleted == 0 {
-            break;
+        Ok((
+            pages.saturating_sub(free).saturating_mul(page_size),
+            free.saturating_mul(page_size),
+        ))
+    };
+    let (mut size, mut free) = used()?;
+    if size > budget {
+        // Delete the oldest runs, keeping the current run and recent
+        // incomplete ones, in batches sized from the estimated excess. A
+        // history far over its budget, as after the budget shrank, then
+        // shrinks over a few copies rather than slowing many.
+        let runs: i64 = db.query_row("SELECT count(*) FROM runs", [], |r| r.get(0))?;
+        let mut excess = i128::from(runs) * i128::from(size - budget) / i128::from(size);
+        loop {
+            let batch = excess.clamp(1, PRUNE_BATCH) as i64;
+            let deleted = db.execute(
+                "DELETE FROM runs WHERE id IN (SELECT id FROM runs WHERE id!=?1 AND (status!='incomplete' OR updated_day<?2) ORDER BY id LIMIT ?3)",
+                params![current, day().saturating_sub(2), batch],
+            )?;
+            excess -= deleted as i128;
+            (size, free) = used()?;
+            if deleted == 0 || size <= budget || Instant::now() >= deadline {
+                break;
+            }
         }
     }
-    db.execute_batch("PRAGMA incremental_vacuum(256);")?;
+    if size <= budget && free > budget {
+        // Rebuilding costs time in proportion to the kept history, not to
+        // the free space, which a gradual reclaim would have to move
+        // around. This happens once after a large shrink.
+        db.execute_batch("VACUUM;")?;
+    } else if size <= budget {
+        // Each step of this pragma frees one page; run it to completion.
+        let mut vacuum = db.prepare("PRAGMA incremental_vacuum(256)")?;
+        let mut rows = vacuum.raw_query();
+        while rows.next()?.is_some() {}
+    }
     Ok(())
 }
 

@@ -1446,8 +1446,9 @@ impl Planner<'_> {
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                 }
                 Claim::Weak => {
-                    // Symlink without -l, special without -D.
-                    if opts.verbose > 0 {
+                    // Symlink without -l, special without -D. Like rsync,
+                    // `syq rsync` says so unless -q.
+                    if !opts.quiet && (opts.rsync_creation || opts.verbose > 0) {
                         self.progress
                             .eprintln(&format!("skipping non-regular file \"{rel}\""));
                     }

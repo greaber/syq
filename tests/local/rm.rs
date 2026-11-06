@@ -75,7 +75,7 @@ fn native_rm_directory_selector_rejects_a_selected_symlink_before_mutation() {
         "link",
     ]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("must resolve to a directory"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("is a symlink, not a directory"));
     assert_eq!(read(&t.path("victim")), b"keep");
     assert_eq!(read(&t.path("real/file")), b"keep");
     assert!(t.path("link").is_symlink());
@@ -91,8 +91,8 @@ fn native_rm_follow_preserves_final_symlink_identity() {
         for selector in ["--src-dir", "--srcs-in"] {
             let out = native_syq(&["rm", "--root", &t.s(""), follow, selector, "link"]);
             assert!(!out.status.success());
-            assert!(stderr_of(&out).contains("final symlinks are never followed"));
-            assert!(stderr_of(&out).contains("name the target directory explicitly"));
+            assert!(stderr_of(&out).contains("is a symlink, not a directory"));
+            assert!(stderr_of(&out).contains("name the directory it points to"));
             assert_eq!(read(&t.path("real/file")), b"keep");
             assert!(t.path("link").is_symlink());
         }
@@ -561,7 +561,7 @@ fn native_rm_contents_requires_a_directory() {
     let out = native_syq(&["rm", "--cwd", &t.s(""), "--srcs-in", "file"]);
     assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("must resolve to a directory"),
+        String::from_utf8_lossy(&out.stderr).contains("is not a directory"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );

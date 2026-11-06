@@ -458,7 +458,7 @@ impl OperatorResolver {
                 }
                 symlink_count += 1;
                 if symlink_count > 40 {
-                    bail!("too many symlink levels in operator path");
+                    bail!("too many symlink levels in a path you gave");
                 }
                 let object = open_operator_symlink_at(current.directory.as_raw_fd(), &name)?;
                 let target = if let Some(object) = object {
@@ -620,7 +620,7 @@ impl OperatorResolver {
         let euid = unsafe { libc::geteuid() };
         match self.symlink_policy {
             OperatorSymlinkPolicy::Refuse => bail!(
-                "refusing symlink component {:?} in operator path; {OPERATOR_SYMLINK_FOLLOW_ADVICE}",
+                "refusing to follow symlink {:?} in a path you gave; {OPERATOR_SYMLINK_FOLLOW_ADVICE}",
                 String::from_utf8_lossy(component),
             ),
             OperatorSymlinkPolicy::TrustedOwner

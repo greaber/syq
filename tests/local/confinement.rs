@@ -512,7 +512,7 @@ fn native_copy_follow_resolves_source_links_but_default_refuses_traversal() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("--follow for all directly supplied filesystem paths"),
+        stderr.contains("--follow for all the paths you give"),
         "{stderr}"
     );
     assert!(!t.path("never-created").exists());
@@ -588,7 +588,7 @@ fn native_directional_follow_keeps_source_destination_and_control_authority_sepa
     assert!(!control_refused.status.success());
     let stderr = stderr_of(&control_refused);
     assert!(
-        stderr.contains("--follow for all directly supplied filesystem paths"),
+        stderr.contains("--follow for all the paths you give"),
         "{stderr}"
     );
     assert!(!t.path("control-refused").exists());

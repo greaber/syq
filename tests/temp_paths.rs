@@ -67,7 +67,7 @@ fn symlinked_tmpdir_resolves_fixture_roots_only() {
     let refused_destination = temp.path().join("refused");
     let output = copy(&link.join("source"), &refused_destination);
     assert!(!output.status.success(), "{output:?}");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("refusing symlink component"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("refusing to follow symlink"));
     assert!(!refused_destination.exists());
 }
 
