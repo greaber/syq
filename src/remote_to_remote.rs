@@ -2402,12 +2402,15 @@ fn run_coordinated(
     )
 }
 
+/// Internal environment variables for a coordinator.
+pub(crate) type Environment = Vec<(&'static str, String)>;
+
 /// The arguments and environment of the coordinator a coordinating source's
 /// receiver runs for `coordinating`: what a copy started on the signing
 /// machine would run here, from the signed command alone.
 pub(crate) fn coordination_command(
     coordinating: &crate::restricted::Coordinating,
-) -> Result<(Vec<String>, Vec<(&'static str, String)>)> {
+) -> Result<(Vec<String>, Environment)> {
     let crate::restricted::Coordinating {
         args,
         peer,
