@@ -190,9 +190,13 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         } else {
             "ControlPersist=300"
         };
+        // This session may become the persistent master, which forwards
+        // nothing (`PERSISTENT_NO_FORWARDING`); a session through such a
+        // master could not forward the agent anyway.
         command
             .args(["-o", "ControlMaster=auto", "-o", persist, "-S"])
-            .arg(crate::persistence::openssh_control_path(control));
+            .arg(crate::persistence::openssh_control_path(control))
+            .args(crate::conn::PERSISTENT_NO_FORWARDING);
     }
     command.args(request.ssh_arguments(&request.destination)?);
     // Native auth executes once: a failing command must never run again through a laptop.

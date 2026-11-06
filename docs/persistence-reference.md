@@ -306,6 +306,10 @@ through one on your laptop, run
 `syq persist --pscope PATH receive on --name project --connection server` with
 a name not already connected to that server account.
 
+`--pscope` refuses an `--rsh` command that sets up its own connection sharing,
+turns on debug output, or asks for agent, port, or tunnel forwarding, because
+syq keeps no connection open for such a command.
+
 `persist off` on an isolated domain closes its connections and deletes its
 settings and remembered permissions; the path cannot be reused. On the default
 domain, it only closes connections. A domain does not isolate processes of the

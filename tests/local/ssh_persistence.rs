@@ -48,6 +48,55 @@ fn native_ssh_warns_and_runs_once_when_optional_persistence_settings_are_invalid
     assert_eq!(arguments, b"--\nhost\nexit 17\n");
 }
 
+/// The persistent connection outlives the session, and sshd would keep a
+/// forwarded agent usable on the server for as long as it lasts. Without
+/// persistence, `syq ssh` runs ssh as typed, with the SSH configuration's
+/// forwarding.
+#[test]
+fn native_ssh_forwards_nothing_only_through_a_persistent_connection() {
+    let temporary = setup();
+    let arguments = || fs::read_to_string(temporary.path("home/ssh-arguments")).unwrap();
+    let result = command(&temporary)
+        .args(["-t", "alice@host:2222", "--", "true"])
+        .run()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(17));
+    assert_eq!(arguments(), "-t\n-l\nalice\n-p\n2222\n--\nhost\ntrue\n");
+
+    assert_output_ok(&persistence_command(&temporary, &["on"]).run().unwrap());
+    let result = command(&temporary)
+        .args(["-t", "alice@host:2222", "--", "true"])
+        .run()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(17));
+    let arguments = arguments();
+    let words: Vec<&str> = arguments.lines().collect();
+    assert_eq!(
+        words[..4],
+        ["-o", "ControlMaster=auto", "-o", "ControlPersist=yes"],
+        "{arguments}"
+    );
+    assert_eq!(words[4], "-S", "{arguments}");
+    assert_eq!(
+        words[6..],
+        [
+            "-o",
+            "ForwardAgent=no",
+            "-o",
+            "ClearAllForwardings=yes",
+            "-t",
+            "-l",
+            "alice",
+            "-p",
+            "2222",
+            "--",
+            "host",
+            "true"
+        ],
+        "{arguments}"
+    );
+}
+
 #[test]
 fn native_ssh_endpoint_failure_falls_back_only_when_scope_was_omitted() {
     let temporary = setup();

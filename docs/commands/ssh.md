@@ -65,4 +65,7 @@ syq ssh --auth-from @laptop hostB -- "printf '%s\n' 'two words'"
 ```
 
 To run a program on your laptop instead, use [`syq exec`](exec.md). `syq ssh`
-has no port-forwarding options.
+has no port-forwarding options. With persistence on, its connection stays open
+after the session, so it forwards neither your SSH agent nor the port forwards
+in your SSH configuration; use plain `ssh -A` when you need your agent on the
+server.

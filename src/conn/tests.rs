@@ -2947,6 +2947,116 @@ fn ssh_remote_shells_share_connections_unless_they_configure_sharing() {
             .unwrap()
             .persist
     );
+    // A connection kept after the run forwards nothing, so a command that
+    // asks for agent, port or tunnel forwarding gets it only within its own
+    // run.
+    for forwarding in [
+        "ssh -A",
+        "ssh -4AC",
+        "ssh -L 8080:localhost:80",
+        "ssh -R8080:localhost:80",
+        "ssh -D 1080",
+        "ssh -o ForwardAgent=yes",
+        "ssh -o 'ForwardAgent /run/agent.sock'",
+        "ssh -oforwardagent=YES",
+        "ssh -o LocalForward=8080:localhost:80",
+        "ssh -o 'RemoteForward 8080 localhost:80'",
+        "ssh -o DynamicForward=1080",
+        "ssh -o ClearAllForwardings=no",
+        "ssh -w 0:0",
+        "ssh -4w0",
+        "ssh -o Tunnel=yes",
+        "ssh -o 'Tunnel point-to-point'",
+        // OpenSSH reads quoted keywords, which count as forwarding here.
+        "ssh -o '\"ForwardAgent\" yes'",
+        "ssh -o '\"ClearAllForwardings\" no'",
+        "ssh -o 'Forward\"Agent\" yes'",
+        "ssh -o '\"ForwardAgent\"=yes'",
+        // Any other quoted value is an agent's path, or an OpenSSH error.
+        "ssh -o 'ForwardAgent \"n o\"'",
+        "ssh -o \"ForwardAgent \\\"n'o\\\"\"",
+        "ssh -o \"ForwardAgent='n\\\"o'\"",
+        "ssh -o \"ForwardAgent=n'o\"",
+    ] {
+        assert!(
+            !shareable_ssh_options(&words(forwarding)).unwrap().persist,
+            "{forwarding}"
+        );
+    }
+    for forwarding_nothing in [
+        "ssh -a",
+        "ssh -o ForwardAgent=no",
+        "ssh -o 'ForwardAgent No'",
+        "ssh -o ClearAllForwardings=yes",
+        // A plain word in one pair of quotes means what it says.
+        "ssh -o 'ClearAllForwardings \"yes\"'",
+        "ssh -o \"ClearAllForwardings 'yes'\"",
+        "ssh -o \"ForwardAgent='no'\"",
+        "ssh -o Tunnel=no",
+        "ssh -p 2222 -i Akey",
+        "ssh -o 'ProxyCommand ssh -W \"%h:%p\" gateway'",
+    ] {
+        assert!(
+            shareable_ssh_options(&words(forwarding_nothing))
+                .unwrap()
+                .persist,
+            "{forwarding_nothing}"
+        );
+    }
+}
+
+#[test]
+fn only_connections_kept_after_the_command_forward_nothing() {
+    let directory = crate::test_support::short_tempdir().unwrap();
+    let base = directory.path().join("scope");
+    crate::persistence::initialize_scope(&base).unwrap();
+    let spec = |multiplexer: Option<SshMultiplexer>| {
+        let mut spec = RemoteSpec::local_receiver(false);
+        spec.local_process = false;
+        spec.rsh = vec!["ssh".into(), "-o".into(), "ServerAliveInterval=7".into()];
+        spec.ssh_multiplexer = multiplexer.map(std::sync::Arc::new);
+        spec
+    };
+    let args = |spec: &RemoteSpec, connection| {
+        spec.ssh_command(connection, false)
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    };
+    let forwards_nothing = |args: &[String]| {
+        args.windows(4)
+            .any(|words| words == ["-o", "ForwardAgent=no", "-o", "ClearAllForwardings=yes"])
+    };
+
+    // The master that persistence keeps, and a session that joins it: a
+    // forwarded agent would stay usable on the server until `persist off`.
+    let persistent = spec(Some(
+        SshMultiplexer::persistent(&base, None, "example", None, None).unwrap(),
+    ));
+    let control = args(&persistent, SshConnection::Control);
+    assert!(control.iter().any(|arg| arg == "ControlPersist=300"));
+    assert!(forwards_nothing(&control), "{control:?}");
+    // The command's own options still come first.
+    assert_eq!(&control[..2], ["-o", "ServerAliveInterval=7"]);
+    let joining = args(&persistent, SshConnection::Worker);
+    assert!(joining.iter().any(|arg| arg == "ControlMaster=no"));
+    assert!(forwards_nothing(&joining), "{joining:?}");
+
+    // Connections that end with the command follow the SSH configuration,
+    // as plain ssh does.
+    let independent = args(&persistent, SshConnection::Independent);
+    assert!(!forwards_nothing(&independent), "{independent:?}");
+    let per_run = spec(Some(SshMultiplexer::new().unwrap()));
+    for connection in [
+        SshConnection::Control,
+        SshConnection::Worker,
+        SshConnection::Independent,
+    ] {
+        let per_run = args(&per_run, connection);
+        assert!(!forwards_nothing(&per_run), "{per_run:?}");
+    }
+    let unshared = args(&spec(None), SshConnection::Control);
+    assert!(!forwards_nothing(&unshared), "{unshared:?}");
 }
 
 #[test]

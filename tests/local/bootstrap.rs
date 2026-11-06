@@ -852,6 +852,7 @@ fn persist_connect_prepares_helper_without_selecting_copy_data() {
     assert!(log.contains("ServerAliveInterval=15"), "{log}");
     assert!(log.contains("ServerAliveCountMax=3"), "{log}");
     assert!(log.contains("--server"), "{log}");
+    assert_persistent_masters_forward_nothing(&log);
     let status = persistence_command(&t, &["status", "--json"])
         .run()
         .unwrap();

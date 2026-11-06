@@ -223,7 +223,9 @@ fn rsh_ssh_options_keep_separate_persistent_connections() {
             env!("CARGO_BIN_EXE_syq"),
         ]);
         // A scope needs a command whose connections syq can persist.
-        if !rsh.is_some_and(|rsh| rsh.contains("Control") || rsh.contains("-v")) {
+        if !rsh
+            .is_some_and(|rsh| rsh.contains("Control") || rsh.contains("-v") || rsh.contains("-A"))
+        {
             command.arg("--pscope").arg(&scope);
         }
         if let Some(rsh) = rsh {
@@ -259,8 +261,10 @@ fn rsh_ssh_options_keep_separate_persistent_connections() {
     };
     let copy = |rsh: Option<&str>, destination: &str| copy_in("work", rsh, destination);
 
-    let (default, _) = copy(None, "default");
-    let (first, _) = copy(Some("-o ServerAliveInterval=7"), "first");
+    let (default, log) = copy(None, "default");
+    assert_persistent_masters_forward_nothing(&log);
+    let (first, log) = copy(Some("-o ServerAliveInterval=7"), "first");
+    assert_persistent_masters_forward_nothing(&log);
     let (again, _) = copy(Some("-o ServerAliveInterval=7"), "again");
     let (other, _) = copy(Some("-o ServerAliveInterval=9"), "other");
     for sockets in [&default, &first, &other] {
@@ -302,6 +306,30 @@ fn rsh_ssh_options_keep_separate_persistent_connections() {
         !verbose
             .iter()
             .any(|socket| socket.starts_with(scope.to_str().unwrap())),
+        "{log}"
+    );
+    // A kept connection forwards nothing, so one that forwards the agent is
+    // shared only within its own run, and follows the command's options.
+    let (forwarding, log) = copy(Some("-A -o ServerAliveInterval=7"), "forwarding");
+    assert_eq!(forwarding.len(), 1, "{log}");
+    assert!(
+        !forwarding
+            .iter()
+            .any(|socket| socket.starts_with(scope.to_str().unwrap())),
+        "{log}"
+    );
+    // The default connection's pool may log its own spares meanwhile.
+    let (checks, spares) = pool_lines(&log);
+    let own: Vec<&str> = log
+        .lines()
+        .filter(|line| !checks.contains(line) && !spares.contains(line))
+        .collect();
+    assert!(
+        own.iter().any(|line| line.contains("ControlPersist=no")),
+        "{log}"
+    );
+    assert!(
+        !own.iter().any(|line| line.contains("ForwardAgent=no")),
         "{log}"
     );
 
@@ -1271,6 +1299,7 @@ fn durable_and_ephemeral_policies_reach_implicit_ssh_connections() {
     assert!(log.contains("ControlMaster=auto"), "{log}");
     assert!(log.contains("ControlPersist=yes"), "{log}");
     assert!(log.contains(&format!("-S {global_scope}/cm-")), "{log}");
+    assert_persistent_masters_forward_nothing(&log);
     let status = persistence_command(&t, &["status"]).run().unwrap();
     assert_output_ok(&status);
     assert!(String::from_utf8_lossy(&status.stdout).contains("backup.example:2222"));
