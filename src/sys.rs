@@ -62,6 +62,42 @@ fn poll_readable(ready: &mut [libc::pollfd], timeout: std::time::Duration) {
     }
 }
 
+/// The user ID of the process at the other end of a connected Unix stream
+/// socket: for a socket this process connected, whoever listens on it.
+#[cfg(target_os = "linux")]
+pub(crate) fn peer_uid(stream: &std::os::unix::net::UnixStream) -> io::Result<u32> {
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: the buffer and its length describe one ucred that the kernel
+    // fills for a connected Unix stream socket.
+    let result = unsafe {
+        libc::getsockopt(
+            std::os::fd::AsRawFd::as_raw_fd(stream),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(credentials.uid)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn peer_uid(stream: &std::os::unix::net::UnixStream) -> io::Result<u32> {
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    // SAFETY: getpeereid writes the peer's ids through the two pointers.
+    let result =
+        unsafe { libc::getpeereid(std::os::fd::AsRawFd::as_raw_fd(stream), &mut uid, &mut gid) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(uid)
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) const MODE_TYPE_MASK: u32 = libc::S_IFMT;
 #[cfg(not(target_os = "linux"))]

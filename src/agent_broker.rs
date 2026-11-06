@@ -176,10 +176,26 @@ impl HostPolicy {
     /// Refuse a host this machine does not trust through exact plain keys,
     /// which binding agent signatures to the host needs.
     pub(crate) fn require_exact_host_keys(&self) -> Result<()> {
-        let host = &self.known_hosts_name;
         if let Some(unsupported) = &self.unsupported {
             bail!("{}", unsupported.broker_error());
         }
+        self.require_listed_host_keys(&self.known_hosts_name)
+    }
+
+    /// The same, for a reply to another machine that named the host
+    /// `requested`. It says what is missing without this machine's
+    /// configured values or the name its known_hosts files use.
+    pub(crate) fn require_exact_host_keys_for_peer(&self, requested: &str) -> Result<()> {
+        if let Some(unsupported) = &self.unsupported {
+            bail!(
+                "its SSH settings for {requested} cannot be reproduced exactly for account access: {}",
+                unsupported.kind()
+            );
+        }
+        self.require_listed_host_keys(requested)
+    }
+
+    fn require_listed_host_keys(&self, host: &str) -> Result<()> {
         if self.host_keys.is_empty() {
             if !self.authorities.is_empty() {
                 bail!(
@@ -413,6 +429,11 @@ fn agent_socket_from_config(
 /// The selected login account participates in provider Match rules. An
 /// explicitly written trust port is preserved, but the requester's resolved
 /// address and port never change this lookup.
+///
+/// The requester names the host and gets the errors back without asking
+/// anyone, so they name the host only as `trust_name` and leave out this
+/// machine's configured values and ssh's messages, which can hold commands,
+/// paths and other host names.
 pub(crate) fn resolve_account_trust_bounded(
     ssh_program: &str,
     login_user: &str,
@@ -421,7 +442,7 @@ pub(crate) fn resolve_account_trust_bounded(
     deadline: Instant,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<HostPolicy> {
-    resolve_host_policy_at_bounded(
+    let policy = resolve_known_policy_at_bounded(
         ssh_program,
         Some(login_user),
         trust_name,
@@ -429,6 +450,13 @@ pub(crate) fn resolve_account_trust_bounded(
         deadline,
         cancelled,
     )
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "could not read its SSH settings for {trust_name}; run `ssh -G {trust_name}` there to see why"
+        )
+    })?;
+    policy.require_exact_host_keys_for_peer(trust_name)?;
+    Ok(policy)
 }
 
 struct SshConfigurationInspection {
