@@ -1090,6 +1090,11 @@ pub(crate) fn forward_target(args: &crate::cli::Args) -> Result<String> {
     forward::eligible_target(args)
 }
 
+/// Whether `args` copies from one server to another.
+pub(crate) fn between_servers(args: &crate::cli::Args) -> bool {
+    forward::between_servers(args)
+}
+
 /// Plan deletions against the approving machine's own --max-delete, or the
 /// command's if lower, so that pruning stays all or nothing, and note when
 /// the machine's limit is the one in effect.

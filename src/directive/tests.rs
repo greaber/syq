@@ -137,10 +137,220 @@ fn unknown_variants_are_refused() {
         results_key: known.results_key,
     };
     let body = |role| postcard::to_stdvec(&future(role)).unwrap();
-    // The layout matches: role 0 is the destination.
+    // The layout matches: role 0 is the destination, 1 a coordinating
+    // source, with its peer.
     assert_eq!(body(0), postcard::to_stdvec(&known).unwrap());
     assert!(Signed::decode(&framed(&body(0), &armored(1))).is_ok());
-    assert!(Signed::decode(&framed(&body(1), &armored(1))).is_err());
+    assert!(Signed::decode(&framed(&body(2), &armored(1))).is_err());
+}
+
+const ROUTE_6: &[&str] = &[
+    "cp",
+    "--from",
+    "host-b",
+    "--srcs-in",
+    "data",
+    "--to",
+    "host-c",
+    "--into",
+    "archive",
+    "--auth-from",
+    "@laptop",
+];
+
+fn peer(destination: &Directive) -> Peer {
+    Peer {
+        enrollment: destination.binding.enrollment,
+        generation: destination.binding.generation,
+        account: destination.binding.account.clone(),
+        request: destination.request_id,
+        destination: b"/home/backup/archive".to_vec(),
+        known_hosts: "host-c ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n".into(),
+    }
+}
+
+/// The destination's directive and the source's, paired as the approving
+/// machine signs them.
+fn pair(args: &[&str]) -> (Directive, Directive) {
+    let destination = directive(args);
+    let mut source = directive(args);
+    source.binding.enrollment = EnrollmentId::test_v4(8);
+    source.binding.account = "reader".into();
+    source.binding.role = Role::CoordinatingSource(peer(&destination));
+    source.request_id = RequestId::test(10);
+    (destination, source)
+}
+
+#[test]
+fn a_coordinating_source_runs_only_the_destination_directive_approved_with_it() {
+    let (destination, source) = pair(ROUTE_6);
+    // It round-trips canonically with its peer.
+    let encoded = signed(&source);
+    assert_eq!(Signed::decode(&encoded).unwrap().directive, source);
+    let args = coordination(&source, &destination).unwrap();
+    assert_eq!(args.locations[0].host.as_deref(), Some("host-b"));
+    assert_eq!(args.locations[1].host.as_deref(), Some("host-c"));
+
+    type Change = Box<dyn Fn(&mut Directive)>;
+    let cases: Vec<(&str, Change)> = vec![
+        (
+            "another enrollment",
+            Box::new(|d| d.binding.enrollment = EnrollmentId::test_v4(9)),
+        ),
+        (
+            "another generation",
+            Box::new(|d| d.binding.generation += 1),
+        ),
+        (
+            "another account",
+            Box::new(|d| d.binding.account = "other".into()),
+        ),
+        (
+            "another request",
+            Box::new(|d| d.request_id = RequestId::test(11)),
+        ),
+        ("another build", Box::new(|d| d.build.push('x'))),
+        (
+            "another command",
+            Box::new(|d| d.command = command(&[ROUTE_6, &["--prune"]].concat())),
+        ),
+        ("another directory", Box::new(|d| d.cwd = "/".into())),
+        (
+            "other ignore rules",
+            Box::new(|d| d.inputs.ignore = vec!["*.tmp".into()]),
+        ),
+        (
+            "other limits",
+            Box::new(|d| {
+                d.caps = Some(Caps {
+                    max_bytes: 1,
+                    max_entries: 1,
+                    max_delete: 0,
+                })
+            }),
+        ),
+        (
+            "a source's role",
+            Box::new(|d| d.binding.role = Role::CoordinatingSource(peer(d))),
+        ),
+    ];
+    for (case, change) in cases {
+        let mut other = destination.clone();
+        change(&mut other);
+        assert!(coordination(&source, &other).is_err(), "{case}");
+    }
+    // A destination's directive does not coordinate, and a source's has no
+    // destination rules: neither passes as the other.
+    assert!(coordination(&destination, &destination)
+        .unwrap_err()
+        .to_string()
+        .contains("not for a source"));
+    assert!(destination_rules(&source, Path::new(HOME))
+        .unwrap_err()
+        .to_string()
+        .contains("not for a copy's destination"));
+}
+
+#[test]
+fn a_coordinating_source_needs_a_copy_between_two_servers() {
+    let refused = |args: &[&str]| {
+        let (destination, source) = pair(args);
+        coordination(&source, &destination).unwrap_err().to_string()
+    };
+    // The same account at both ends, files on the requester, or a receiving
+    // machine's name.
+    assert!(refused(&[
+        "cp",
+        "--from",
+        "host-b",
+        "--srcs-in",
+        "data",
+        "--to",
+        "host-b",
+        "--into",
+        "archive"
+    ])
+    .contains("different accounts"));
+    assert!(refused(&[
+        "cp",
+        "--srcs-in",
+        "data",
+        "--to",
+        "host-c",
+        "--into",
+        "archive"
+    ])
+    .contains("sources on one SSH server"));
+    assert!(refused(&[
+        "cp",
+        "--from",
+        "@laptop",
+        "--srcs-in",
+        "data",
+        "--to",
+        "host-c",
+        "--into",
+        "archive"
+    ])
+    .contains("sources on one SSH server"));
+    // Options that choose another route or connection.
+    for option in [
+        &["--rsh", "ssh -i key"][..],
+        &["--detach"],
+        &["--coordinate-at", "dst"],
+        &["--coordinate-at", "local"],
+        &["--peer-auth", "broker"],
+        &["--syq-path", "/tmp/syq"],
+    ] {
+        let message = refused(&[ROUTE_6, option].concat());
+        assert!(
+            message.contains("cannot be combined") || message.contains("--detach"),
+            "{option:?}: {message}"
+        );
+    }
+    assert!(refused(&[ROUTE_6, &["--no-tcp-encryption"]].concat())
+        .contains("encrypted data connections"));
+    // A mapping the command names must be the one approved with it.
+    let mapped = &[
+        "cp",
+        "--from",
+        "host-b",
+        "--mapping",
+        "map",
+        "--to",
+        "host-c",
+        "--into",
+        "archive",
+    ];
+    assert!(refused(mapped).contains("mapping does not match"));
+    // Coordinating at the source is what the route does anyway.
+    let (destination, source) = pair(&[ROUTE_6, &["--coordinate-at", "src"]].concat());
+    coordination(&source, &destination).unwrap();
+}
+
+#[test]
+fn a_coordinating_sources_peer_is_bounded() {
+    let (destination, source) = pair(ROUTE_6);
+    let refused = |change: &dyn Fn(&mut Peer)| {
+        let mut other = source.clone();
+        let Role::CoordinatingSource(peer) = &mut other.binding.role else {
+            unreachable!()
+        };
+        change(peer);
+        sign(&other, |_| Ok(armored(1))).unwrap_err().to_string()
+    };
+    assert!(
+        refused(&|peer| peer.enrollment = source.binding.enrollment).contains("another receiver's")
+    );
+    assert!(refused(&|peer| peer.request = source.request_id).contains("another receiver's"));
+    assert!(refused(&|peer| peer.destination = b"archive".to_vec()).contains("destination"));
+    assert!(refused(&|peer| peer.destination = b"/a\0b".to_vec()).contains("destination"));
+    assert!(
+        refused(&|peer| peer.known_hosts = "x".repeat(MAX_KNOWN_HOSTS_BYTES + 1))
+            .contains("known hosts")
+    );
+    assert!(refused(&|peer| peer.account = String::new()).contains("account"));
+    drop(destination);
 }
 
 #[test]

@@ -2418,6 +2418,38 @@ mod tests {
             "{outdated}"
         );
 
+        // A copy between two other servers names its files on the source,
+        // says that the source runs it, and sets up both ends.
+        let between = Summary::new(
+            &requester(),
+            &command,
+            "~/rt-bench",
+            &forwarded,
+            TIMEOUT,
+            Some(Remote {
+                target: "backup",
+                enrollment: crate::restricted::EnrollmentState::Ready,
+                source: Some(("reader@source", crate::restricted::EnrollmentState::Missing)),
+            }),
+        )
+        .unwrap();
+        assert!(
+            between
+                .desktop_description(false)
+                .contains("from\n\n    reader@source:rt-bench/dbg\n\n"),
+            "{}",
+            between.desktop_description(false)
+        );
+        let details = between.details_description(str::to_owned);
+        assert!(
+            details.contains("May create and overwrite matching entries. \"reader@source\" runs the copy and sends the files the command names directly to \"backup\". Also sets up restricted copying on \"reader@source\": adds a key"),
+            "{details}"
+        );
+        assert!(
+            details.contains("Signs this copy with your SSH login key for \"backup\""),
+            "{details}"
+        );
+
         // The server's directory is remote text: no line breaks or markup of
         // its own reach the prompt, and it never enters the title.
         let hostile = Summary::new(

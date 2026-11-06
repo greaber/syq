@@ -2240,10 +2240,7 @@ fn run_remote(
         // the results as failed.
         Some(c @ (1 | 23 | 25)) => Ok(c),
         Some(c) => {
-            if args.rsh.is_none()
-                && args.peer_auth == PeerAuth::Broker
-                && !same_host
-            {
+            if args.rsh.is_none() && args.peer_auth == PeerAuth::Broker && !same_host {
                 bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Use --peer-auth own-credentials with coordinator-host credentials, or explicitly accept full agent exposure with --peer-auth full-agent", peer_login_user.as_deref().unwrap_or("the peer user"), peer.host.as_deref().unwrap_or("the peer"))
             }
             bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); {coordinator_host} may not be able to reach the peer endpoint")
@@ -2362,7 +2359,10 @@ fn run_coordinated(
         Some(expectation),
         (args.dry_run, args.delete),
     );
-    let relayed = relay_stdout(child.stdout.take().context("receiver output missing")?, relay);
+    let relayed = relay_stdout(
+        child.stdout.take().context("receiver output missing")?,
+        relay,
+    );
     let status = child.wait().context("wait for the source's receiver")?;
     let written = writer
         .join()
@@ -2381,9 +2381,9 @@ fn run_coordinated(
         Some(crate::restricted::REFUSED_EXIT) => {
             bail!("the restricted receiver on {source} refused the copy")
         }
-        Some(255) => bail!(
-            "could not reach the restricted receiver on {source}; see the SSH error above"
-        ),
+        Some(255) => {
+            bail!("could not reach the restricted receiver on {source}; see the SSH error above")
+        }
         Some(code) => bail!("the copy on {source} failed (exit {code})"),
         None => bail!("the SSH connection to {source}'s restricted receiver was killed"),
     };
@@ -2400,27 +2400,20 @@ fn run_coordinated(
     )
 }
 
-/// How long the requester has to send the copy's mapping after its first
-/// frame.
-const COORDINATED_MAPPING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Run, as this server's restricted receiver, the copy between two servers
-/// that a verified directive for this account allows: the coordinator for
-/// the signed command, as a copy started on the signing machine would run
-/// here, which reaches the destination's receiver with its entry key, its
-/// directive and what the signing machine's known_hosts files list for it.
-/// The coordinator's output is the session's, and it follows the session:
-/// it stops when the requester's input ends. Returns its exit status.
-pub(crate) fn coordinate(coordinating: crate::restricted::Coordinating) -> Result<i32> {
-    use std::os::fd::AsFd;
-    use std::os::unix::process::ExitStatusExt as _;
+/// The arguments and environment of the coordinator a coordinating source's
+/// receiver runs for `coordinating`: what a copy started on the signing
+/// machine would run here, from the signed command alone.
+pub(crate) fn coordination_command(
+    coordinating: &crate::restricted::Coordinating,
+) -> Result<(Vec<String>, Vec<(&'static str, String)>)> {
     let crate::restricted::Coordinating {
-        mut args,
+        args,
         peer,
         caps,
         mapping,
         frame,
     } = coordinating;
+    let mut args = args.clone();
     // Deletions are planned against the approving machine's limit, so that
     // pruning stays all or nothing.
     if let Some(caps) = caps {
@@ -2448,35 +2441,61 @@ pub(crate) fn coordinate(coordinating: crate::restricted::Coordinating) -> Resul
             mapping: mapping.is_some(),
         },
     )?;
+    let mut environment = vec![
+        (ENTRY_KEY_STDIN, frame.entry_key.len().to_string()),
+        (DIRECTIVE_STDIN, frame.destination.len().to_string()),
+        (RECEIVER_KNOWN_HOSTS, peer.known_hosts.clone()),
+        (
+            REQUESTER_STDIN,
+            mapping
+                .as_ref()
+                .map_or(0, |mapping| mapping.bytes)
+                .to_string(),
+        ),
+        (
+            crate::destination_results::relay::TOKEN_ENV,
+            frame.results_token.clone(),
+        ),
+    ];
+    if args.dry_run {
+        environment.push((
+            "SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST",
+            endpoint_display(&srcs[0]),
+        ));
+    }
+    if let Some(width) = frame
+        .progress_width
+        .filter(|_| !args.no_progress && !args.quiet)
+    {
+        environment.push(("SYQ_INTERNAL_NATIVE_PROGRESS_WIDTH", width.to_string()));
+    }
+    Ok((arguments, environment))
+}
+
+/// How long the requester has to send the copy's mapping after its first
+/// frame.
+const COORDINATED_MAPPING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run, as this server's restricted receiver, the copy between two servers
+/// that a verified directive for this account allows: the coordinator for
+/// the signed command, as a copy started on the signing machine would run
+/// here, which reaches the destination's receiver with its entry key, its
+/// directive and what the signing machine's known_hosts files list for it.
+/// The coordinator's output is the session's, and it follows the session:
+/// it stops when the requester's input ends. Returns its exit status.
+pub(crate) fn coordinate(coordinating: crate::restricted::Coordinating) -> Result<i32> {
+    use std::os::fd::AsFd;
+    use std::os::unix::process::ExitStatusExt as _;
     let mut command = Command::new(std::env::current_exe().context("find this receiver")?);
-    command.args(&arguments);
     // Nothing in this account's environment changes the signed command.
     for (name, _) in std::env::vars_os() {
         if name.as_encoded_bytes().starts_with(b"SYQ_") {
             command.env_remove(name);
         }
     }
-    command
-        .env(ENTRY_KEY_STDIN, frame.entry_key.len().to_string())
-        .env(DIRECTIVE_STDIN, frame.destination.len().to_string())
-        .env(RECEIVER_KNOWN_HOSTS, &peer.known_hosts)
-        .env(
-            REQUESTER_STDIN,
-            mapping.as_ref().map_or(0, |mapping| mapping.bytes).to_string(),
-        )
-        .env(
-            crate::destination_results::relay::TOKEN_ENV,
-            &frame.results_token,
-        );
-    if args.dry_run {
-        command.env(
-            "SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST",
-            endpoint_display(&srcs[0]),
-        );
-    }
-    if let Some(width) = frame.progress_width.filter(|_| !args.no_progress && !args.quiet) {
-        command.env("SYQ_INTERNAL_NATIVE_PROGRESS_WIDTH", width.to_string());
-    }
+    let (arguments, environment) = coordination_command(&coordinating)?;
+    command.args(arguments).envs(environment);
+    let crate::restricted::Coordinating { mapping, frame, .. } = coordinating;
     // The session's own input, unbuffered: the mapping, the requester's
     // marker, and then its end when the requester goes.
     let mut session = std::fs::File::from(

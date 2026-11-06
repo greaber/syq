@@ -1634,3 +1634,150 @@ fn unverified_results_are_quiet_only_without_any_results_after_a_failure() {
     assert_eq!(unverified_results(true, 1, "source", "destination"), None);
     assert_eq!(unverified_results(true, 0, "source", "destination"), None);
 }
+
+/// What a coordinating source's receiver gets from the requester.
+fn coordinating(
+    command: &[&str],
+    caps: Option<crate::directive::Caps>,
+) -> crate::restricted::Coordinating {
+    let command: Vec<Vec<u8>> = command.iter().map(|arg| arg.as_bytes().to_vec()).collect();
+    let mut args = crate::approval_command::parse(&command).unwrap();
+    args.ignore_lines = vec!["*.tmp".into()];
+    crate::restricted::Coordinating {
+        args,
+        peer: crate::directive::Peer {
+            enrollment: crate::enrollment::EnrollmentId::random(),
+            generation: 3,
+            account: "backup".into(),
+            request: crate::delegation::RequestId::fresh(1_900_000_000).unwrap(),
+            destination: b"/home/backup/archive".to_vec(),
+            known_hosts: "host-c ssh-ed25519 AAAA\n".into(),
+        },
+        caps,
+        mapping: None,
+        frame: Box::new(crate::restricted::Coordinate {
+            source: vec![1; 10],
+            destination: vec![2; 20],
+            entry_key: vec![3; 30],
+            results_token: "a".repeat(32),
+            progress_width: Some(80),
+        }),
+    }
+}
+
+/// A coordinating source's receiver runs the coordinator a copy started on
+/// the signing machine would run here, from the signed command: reaching the
+/// destination's receiver as its enrolled account, at the destination its
+/// rules name, with its ignore rules, and relaying results only when the
+/// requester writes them. Nothing that only the requester uses reaches it.
+#[test]
+fn a_coordinating_source_runs_the_signed_command_against_the_destinations_receiver() {
+    let route = [
+        "cp",
+        "--from",
+        "host-b",
+        "--srcs-in",
+        "data",
+        "--src",
+        "more",
+        "--to",
+        "host-c:2222",
+        "--into",
+        "archive",
+        "--auth-from",
+        "@laptop",
+        "--results",
+        "copy.ndjson",
+        "-v",
+        "--prune",
+    ];
+    let (arguments, environment) = coordination_command(&coordinating(&route, None)).unwrap();
+    let value = |name: &str| {
+        environment
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.as_str())
+    };
+    assert_eq!(arguments[0], "cp");
+    for expected in [
+        "--delegated-operands-b64",
+        "--relay-results",
+        "--suppress-summary",
+        "--ignore=*.tmp",
+        "--prune",
+        "-v",
+    ] {
+        assert!(
+            arguments.iter().any(|argument| argument == expected),
+            "{expected}: {arguments:?}"
+        );
+    }
+    let after = |flag: &str| {
+        let index = arguments
+            .iter()
+            .position(|argument| argument == flag)
+            .unwrap();
+        arguments[index + 1].as_str()
+    };
+    assert_eq!(after("--to"), "backup@host-c:2222");
+    assert_eq!(after("--into"), delegated_operand(b"/home/backup/archive"));
+    assert_eq!(after("--srcs-in"), delegated_operand(b"data"));
+    assert_eq!(after("--src"), delegated_operand(b"more"));
+    assert_eq!(after("--rsh"), receiver_rsh(Some(2222)));
+    for local in ["--results", "--auth-from", "copy.ndjson", "@laptop"] {
+        assert!(
+            !arguments.iter().any(|argument| argument.contains(local)),
+            "{local}: {arguments:?}"
+        );
+    }
+    // The destination's entry key and directive follow on the input, with
+    // only their lengths here.
+    assert_eq!(value(ENTRY_KEY_STDIN), Some("30"));
+    assert_eq!(value(DIRECTIVE_STDIN), Some("20"));
+    assert_eq!(
+        value(RECEIVER_KNOWN_HOSTS),
+        Some("host-c ssh-ed25519 AAAA\n")
+    );
+    assert_eq!(value(REQUESTER_STDIN), Some("0"));
+    assert_eq!(
+        value(crate::destination_results::relay::TOKEN_ENV),
+        Some("a".repeat(32).as_str())
+    );
+    assert_eq!(value("SYQ_INTERNAL_NATIVE_PROGRESS_WIDTH"), Some("80"));
+
+    // Without results to write there is nothing to relay but the
+    // destination's own, and a quiet copy shows no progress.
+    let quiet = [
+        "cp",
+        "--from",
+        "host-b",
+        "--srcs-in",
+        "data",
+        "--to",
+        "host-c",
+        "--into",
+        "archive",
+        "-q",
+    ];
+    let (arguments, environment) = coordination_command(&coordinating(&quiet, None)).unwrap();
+    assert!(!arguments
+        .iter()
+        .any(|argument| argument == "--relay-results"));
+    assert!(!environment
+        .iter()
+        .any(|(key, _)| *key == "SYQ_INTERNAL_NATIVE_PROGRESS_WIDTH"));
+
+    // Pruning plans against the approving machine's limit.
+    let caps = crate::directive::Caps {
+        max_bytes: u64::MAX,
+        max_entries: u64::MAX,
+        max_delete: 5,
+    };
+    let (arguments, _) = coordination_command(&coordinating(&route, Some(caps))).unwrap();
+    assert!(
+        arguments
+            .iter()
+            .any(|argument| argument == "--max-delete=5"),
+        "{arguments:?}"
+    );
+}

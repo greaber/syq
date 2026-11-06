@@ -400,11 +400,7 @@ impl ResolvedPolicy {
     }
 
     pub(crate) fn peer(&self) -> Result<Peer> {
-        Peer::from_approved(
-            &self.endpoint,
-            &self.known_hosts,
-            &self.host_algorithms,
-        )
+        Peer::from_approved(&self.endpoint, &self.known_hosts, &self.host_algorithms)
     }
 
     fn check_expected(&self, expected: Option<&Self>) -> Result<()> {

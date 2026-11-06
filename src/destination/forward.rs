@@ -1872,6 +1872,150 @@ mod tests {
         }
     }
 
+    fn between_servers_command(extra: &[&str]) -> Vec<Vec<u8>> {
+        [
+            "cp",
+            "--from",
+            "reader@source-host",
+            "--srcs-in",
+            "data",
+            "--to",
+            "backup",
+            "--into",
+            "output",
+        ]
+        .iter()
+        .chain(extra)
+        .map(|arg| arg.as_bytes().to_vec())
+        .collect()
+    }
+
+    /// A copy between two other servers is refused before any prompt when
+    /// its request does not match its command, and only the server that
+    /// started it, which checks the destination's results, sends a key for
+    /// them.
+    #[test]
+    fn a_copy_between_servers_is_validated_before_approval() {
+        let root = crate::test_support::tempdir().unwrap();
+        let (_broker, receiver, registration, _) = broker(root.path(), Approval::Always);
+        let request = |source: Option<&str>, target: &str, command, results_key| {
+            Message::Forward(Box::new(ForwardRequest {
+                source: source.map(str::to_owned),
+                target: target.into(),
+                command,
+                cwd: String::new(),
+                inputs: crate::directive::Inputs::default(),
+                results_key,
+            }))
+        };
+        let key = Some([5; 32]);
+        let cases = [
+            // Another source or destination than the command's.
+            request(
+                Some("elsewhere"),
+                "backup",
+                between_servers_command(&[]),
+                key,
+            ),
+            request(
+                Some("reader@source-host"),
+                "elsewhere",
+                between_servers_command(&[]),
+                key,
+            ),
+            // No source, for a command that names one, and the reverse.
+            request(None, "backup", between_servers_command(&[]), None),
+            request(
+                Some("reader@source-host"),
+                "backup",
+                forward_command(root.path()),
+                key,
+            ),
+            // The results key only with a source, and always with one.
+            request(
+                Some("reader@source-host"),
+                "backup",
+                between_servers_command(&[]),
+                None,
+            ),
+            request(None, "backup", forward_command(root.path()), key),
+            // Options this route refuses.
+            request(
+                Some("reader@source-host"),
+                "backup",
+                between_servers_command(&["--detach"]),
+                key,
+            ),
+            request(
+                Some("reader@source-host"),
+                "backup",
+                between_servers_command(&["--coordinate-at", "dst"]),
+                key,
+            ),
+        ];
+        for message in cases {
+            assert!(exchange(
+                &registration,
+                message,
+                Duration::from_secs(2),
+                Some(Duration::from_secs(2))
+            )
+            .is_err());
+            assert!(receiver.approvals.snapshots().is_empty());
+        }
+        assert_eq!(receiver.forward_count.load(Ordering::Acquire), 0);
+    }
+
+    /// One prompt approves a copy between two other servers: it names both,
+    /// the files on the source, and that the source runs the copy.
+    #[test]
+    fn a_copy_between_servers_asks_once_naming_both() {
+        let root = crate::test_support::tempdir().unwrap();
+        let (_broker, receiver, registration, _) = broker(root.path(), Approval::Always);
+        let task = std::thread::spawn(move || {
+            exchange(
+                &registration,
+                Message::Forward(Box::new(ForwardRequest {
+                    source: Some("reader@source-host".into()),
+                    target: "backup".into(),
+                    command: between_servers_command(&[]),
+                    cwd: "~".into(),
+                    inputs: crate::directive::Inputs::default(),
+                    results_key: Some([5; 32]),
+                })),
+                Duration::from_secs(3),
+                Some(Duration::from_secs(3)),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let pending = loop {
+            if let Some(summary) = receiver.approvals.snapshots().first() {
+                break summary.clone();
+            }
+            if task.is_finished() {
+                panic!("request ended: {:?}", task.join().unwrap().err());
+            }
+            assert!(Instant::now() < deadline, "request did not become pending");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let description =
+            pending.description(&crate::persistence::Domain::default(), str::to_owned);
+        for expected in [
+            "\"~/output\" on \"backup\"",
+            "\"reader@source-host\" runs the copy",
+            "--from reader@source-host --srcs-in data",
+        ] {
+            assert!(description.contains(expected), "{expected}: {description}");
+        }
+        assert_eq!(receiver.approvals.snapshots().len(), 1);
+        receiver
+            .approvals
+            .decide(&pending.id, false, crate::receive_approval::Kind::Copy)
+            .unwrap();
+        assert!(task.join().unwrap().is_err());
+        assert!(receiver.approvals.snapshots().is_empty());
+    }
+
     #[test]
     fn setup_deadlines_cover_partial_frames_and_cancellation_is_not_retried() {
         let (mut reader, mut writer) = UnixStream::pair().unwrap();

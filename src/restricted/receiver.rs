@@ -300,43 +300,13 @@ pub(crate) fn admit_session(enrollment: &str, generation: &str) -> Result<Sessio
 fn admit_coordinator(
     state: &Path,
     config: &ReceiverEnrollment,
-    (generation, build): (u64, &str),
+    receiver: (u64, &str),
     frame: Box<Coordinate>,
     slot: UnverifiedSlot,
 ) -> Result<Box<Coordinating>> {
     let observed_state = fs::symlink_metadata(state).context("inspect receiver enrollment")?;
     let (_, home) = current_account()?;
-    if !crate::destination_results::relay::valid_token(&frame.results_token) {
-        bail!("invalid results token");
-    }
-    if frame.entry_key.len() > crate::remote_to_remote::MAX_ENTRY_KEY_BYTES {
-        bail!("the destination's entry key is too long");
-    }
-    crate::restricted::parse_entry_key(&frame.entry_key)?;
-    let destination = crate::directive::Signed::decode(&frame.destination)
-        .context("decode the destination's directive")?
-        .directive;
-    let (coordinating, verified) = verify_with(
-        state,
-        config,
-        (generation, build),
-        &frame.source,
-        |source| {
-            let mut args = crate::directive::coordination(source, &destination)?;
-            // The ignore rules the command read from files, which this
-            // machine cannot read.
-            args.ignore_lines = source.inputs.ignore.clone();
-            let crate::directive::Role::CoordinatingSource(peer) = &source.binding.role else {
-                unreachable!("coordination checks the role");
-            };
-            Ok((
-                args,
-                peer.clone(),
-                source.caps,
-                source.inputs.mapping.clone(),
-            ))
-        },
-    )?;
+    let (coordinating, verified) = verify_coordination(state, config, receiver, &frame)?;
     drop(slot);
     let (args, peer, caps, mapping) = coordinating;
     // Revocation and the copy's finish-by time end this receiver and the
@@ -354,6 +324,51 @@ fn admit_coordinator(
         mapping,
         frame,
     }))
+}
+
+/// What a verified coordinating source's directive allows: its command, the
+/// destination's receiver, the approving machine's limits and the mapping.
+pub(super) type Coordination = (
+    crate::cli::Args,
+    crate::directive::Peer,
+    Option<crate::directive::Caps>,
+    Option<crate::mapping::Authorization>,
+);
+
+/// Verify a coordinating source's `frame`: its own directive as [`verify`]
+/// verifies a destination's, recorded as used only when the destination's
+/// directive is the one approved with it.
+pub(super) fn verify_coordination(
+    state: &Path,
+    config: &ReceiverEnrollment,
+    receiver: (u64, &str),
+    frame: &Coordinate,
+) -> Result<(Coordination, delegation::VerifiedDirective)> {
+    if !crate::destination_results::relay::valid_token(&frame.results_token) {
+        bail!("invalid results token");
+    }
+    if frame.entry_key.len() > crate::remote_to_remote::MAX_ENTRY_KEY_BYTES {
+        bail!("the destination's entry key is too long");
+    }
+    crate::restricted::parse_entry_key(&frame.entry_key)?;
+    let destination = crate::directive::Signed::decode(&frame.destination)
+        .context("decode the destination's directive")?
+        .directive;
+    verify_with(state, config, receiver, &frame.source, |source| {
+        let mut args = crate::directive::coordination(source, &destination)?;
+        // The ignore rules the command read from files, which this machine
+        // cannot read.
+        args.ignore_lines = source.inputs.ignore.clone();
+        let crate::directive::Role::CoordinatingSource(peer) = &source.binding.role else {
+            unreachable!("coordination checks the role");
+        };
+        Ok((
+            args,
+            peer.clone(),
+            source.caps,
+            source.inputs.mapping.clone(),
+        ))
+    })
 }
 
 /// Admit a new copy's directive and set up its authority: refused by a

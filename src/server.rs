@@ -15,7 +15,6 @@ use std::time::Duration;
 use std::time::Instant;
 use subtle::ConstantTimeEq;
 
-
 mod interfaces;
 use interfaces::{local_addrs, BoundFamilies};
 
@@ -2569,4 +2568,3 @@ fn write_metadata_batches<W: std::io::Write, T>(
     }
     writer.write_msg(&last(batch))
 }
-
