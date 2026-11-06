@@ -87,21 +87,19 @@ When you're working in the source server's shell, you can start the copy
 there and have your laptop authorize it; see
 [Authorize copies between servers](receive.md#authorize-copies-between-servers).
 
-To copy between two other servers from a third one, first request reusable
-access to both accounts:
+To copy between two other servers from a third one, have your laptop approve
+the copy:
 
 ```sh
-syq persist connect hostB --auth-from @laptop
-syq persist connect hostC --auth-from @laptop
 syq cp --from hostB --srcs-in data --to hostC --into /archive --auth-from @laptop
 ```
 
-Approve each account on the laptop; this gives the requesting server
-[full access to both accounts](security.md#ssh-account-access). HostB gets
-permission only for this copy to hostC, and file data goes directly between
-them. Keep the copy and the laptop's receiving
-connection open until it finishes. HostB's SSH server must allow remote
-forwarding; see [Approved account copies](remote-reference.md#approved-account-copies)
+Your laptop asks once. The first copy sets up restricted copying on both
+servers, as a copy started on your laptop does. HostB then runs the copy and
+sends file data directly to hostC; the server you started it on gets no other
+access to either account. The copy stops if you interrupt the command, and it
+needs nothing more from your laptop once it starts. See
+[Copies between two other servers](remote-reference.md#copies-between-two-other-servers)
 for requirements.
 
 ## Other routes and authentication

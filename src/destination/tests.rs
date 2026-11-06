@@ -146,7 +146,6 @@ fn approved_source_uses_its_control_channel_without_a_native_ssh_pool() {
     assert!(!source.bootstrap_helper);
     assert!(approved.take_control().is_ok());
     assert!(approved.take_control().is_err());
-    assert!(approved.ssh_command().is_err());
 }
 
 #[cfg(target_os = "linux")]
@@ -1874,7 +1873,13 @@ fn initial_envelope_deadline_is_not_extended_by_partial_bytes() {
         }
     });
     let start = Instant::now();
-    assert!(read_socket_message::<Envelope>(&mut reader, Duration::from_millis(100)).is_err());
+    assert!(read_socket_framed::<Envelope>(
+        &mut reader,
+        Duration::from_millis(100),
+        MAX_MESSAGE,
+        "named destination message"
+    )
+    .is_err());
     assert!(start.elapsed() < Duration::from_secs(1));
     drop(reader);
     sender.join().unwrap();

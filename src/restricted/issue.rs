@@ -42,6 +42,12 @@ pub(crate) struct Issue<'a> {
     /// nobody knows, the login accepts it the first time, as `accept-new`
     /// does.
     pub batch: bool,
+    /// The initiator's key for the destination's results, when another
+    /// machine started the copy; otherwise this machine makes one.
+    pub results_key: Option<[u8; 32]>,
+    /// For the source of a copy between two servers, which coordinates it,
+    /// the destination's receiver it reaches; `None` for a destination.
+    pub peer: Option<directive::Peer>,
 }
 
 /// Sign a directive for a copy to an account with the user's login key,
@@ -61,17 +67,26 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
         agent: destination_agent,
         allow_enrollment,
         batch,
+        results_key,
+        peer,
     } = issue;
     let account = endpoint(destination_login, host, port)?.label();
-    let (recipient_secret, recipient_public_key) =
-        crate::destination_results::generate_recipient()?;
+    let (recipient_secret, recipient_public_key) = match results_key {
+        Some(key) => (None, key),
+        None => {
+            let (secret, public) = crate::destination_results::generate_recipient()?;
+            (Some(secret), public)
+        }
+    };
+    let is_destination = peer.is_none();
+    let role = peer.map_or(Role::Destination, Role::CoordinatingSource);
     let directive_for = |enrollment: EnrollmentId, generation: u64| {
         directive::issue(
             Binding {
                 enrollment,
                 generation,
                 account: destination_login.to_owned(),
-                role: Role::Destination,
+                role: role.clone(),
             },
             command.clone(),
             cwd.clone(),
@@ -80,7 +95,8 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
         )
     };
     // A destination the receiver would refuse is refused before anything
-    // is set up or refreshed on the server, from the same rules.
+    // is set up or refreshed on the server, from the same rules. A source
+    // runs its command as the account would.
     let check = |home: &Path, receiving: &[PathBuf]| {
         checked_destination(
             &directive_for(EnrollmentId::random(), 1)?,
@@ -95,13 +111,13 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
             destination_login,
             (jump.as_ref(), batch),
             refresh,
-            Some(&check),
+            is_destination.then_some(&check as &dyn Fn(&Path, &[PathBuf]) -> Result<()>),
         )
     };
     let found = load_local_enrollments()?.into_iter().find(|(metadata, _)| {
         metadata.host == host && metadata.port == port && metadata.target_login == destination_login
     });
-    if let Some((metadata, _)) = &found {
+    if let Some((metadata, _)) = found.as_ref().filter(|_| is_destination) {
         check(Path::new(&metadata.remote_home), &metadata.receiving_state)?;
     }
     let (metadata, directory, signer) = match found {
@@ -143,10 +159,14 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
     };
     let entry_key = load_entry_key(&directory)?;
     let directive = directive_for(metadata.id, metadata.generation)?;
-    let destination_path = checked_destination(
-        &directive,
-        (Path::new(&metadata.remote_home), &metadata.receiving_state),
-    )?;
+    let destination_path = if is_destination {
+        checked_destination(
+            &directive,
+            (Path::new(&metadata.remote_home), &metadata.receiving_state),
+        )?
+    } else {
+        Vec::new()
+    };
     let request_id = directive.request_id;
     let signed = directive::sign(&directive, |payload| {
         let signature = signer.sign(directive::NAMESPACE, payload)?;
@@ -168,6 +188,7 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
         destination: destination_path,
         directive: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signed),
         enrollment_id: metadata.id,
+        generation: metadata.generation,
     })
 }
 
@@ -211,13 +232,11 @@ pub(super) fn state_of(
 
 /// Whether `grant` is a signed directive for an enrolled receiver, whose
 /// sender paces network bytes as for an ordinary copy, rather than the
-/// marker of a route through a receiving machine. Connections that a
-/// receiving machine approves are not paced at the transport, so those
-/// requests carry the bandwidth limit and the receiver enforces it on file
-/// data.
+/// marker of a copy to a receiving machine. Connections that a receiving
+/// machine approves are not paced at the transport, so those requests carry
+/// the bandwidth limit and the receiver enforces it on file data.
 pub(crate) fn enrolled_grant(grant: &str) -> bool {
-    !(crate::destination::is_named(&Some(grant.to_owned()))
-        || grant == crate::destination::peer_bridge::GRANT)
+    !crate::destination::is_named(&Some(grant.to_owned()))
 }
 
 /// Build a request without trusting the source's eventual filesystem claims.

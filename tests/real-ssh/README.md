@@ -92,11 +92,7 @@ Approved-account uploads and downloads also run in this profile, with larger
 files and overlapping independent SSH data connections. The requester-config
 fixture disables idle helper prewarming only for its completion calls in this
 profile: a ready helper would occupy the sole session needed by its later shell
-commands. The peer-copy case prewarms both approved connections in both profiles:
-a TCP copy can reclaim idle helpers after a session refusal, while the default
-profile checks that TCP and SSH copies preserve the same helpers for completion.
-The peer-copy case also checks that the one-session destination refuses SSH
-worker setup with a session-limit diagnostic. Other workflows requiring
+commands. Other workflows requiring
 concurrent sessions run only in the default profile; those cases are listed in
 `max-sessions-1.skip`.
 
@@ -134,12 +130,12 @@ SSH authorization cases cover laptop return connections and ordinary SSH
 providers, requester-side aliases and identity selection, separate ProxyJump
 account approvals, and reuse by native `ssh`, `scp`, `sftp`, and `rsync`. They
 check command status and interruption, session and remembered approvals, scope
-isolation, and provider disconnects. Three-server cases check direct TCP/SSH
-data, restricted destination keys, receiver receipts, and process and private-key
-cleanup after requester or destination-connection loss. A TCP bridge needs one free session per endpoint;
-its SSH worker setup needs a second destination session. Idle prepared helpers
-are released only after a refused setup, before retrying it; successful setup
-preserves warm completion helpers and other active operations.
+isolation, and provider disconnects. The three-server case checks that one
+approval sets up the source's enrollment and copies between two other servers,
+that a dry run sets nothing up and a denial changes nothing, that the source's
+enrolled receiver runs the copy and sends TCP and SSH data directly to the
+destination's, that the requester checks the destination's results, that the
+copy outlives the laptop, and that killing the requester stops it on the source.
 
 Source-shell remote copies also cover cached helper reuse, bootstrap after a
 missing or unexecutable helper, a delayed approval relay before Hello, and

@@ -15,9 +15,6 @@ use std::time::Duration;
 use std::time::Instant;
 use subtle::ConstantTimeEq;
 
-mod control_lifetime;
-pub(crate) use control_lifetime::ControlLifetime;
-
 mod interfaces;
 use interfaces::{local_addrs, BoundFamilies};
 
@@ -691,7 +688,9 @@ fn record_handed_connection_for_test() {
 /// for every session an entry key starts: admit the session, then serve the
 /// copy its verified directive allows. A worker's session is handed to the
 /// running copy it joins, which serves it.
-pub(crate) fn run_checker(enrollment: &str, generation: &str) -> Result<()> {
+///
+/// Returns the exit status: a coordinating source's is its copy's.
+pub(crate) fn run_checker(enrollment: &str, generation: &str) -> Result<i32> {
     let session = crate::restricted::admit_session(enrollment, generation).map_err(|error| {
         if crate::restricted::is_sessions_full(&error) {
             error
@@ -700,8 +699,11 @@ pub(crate) fn run_checker(enrollment: &str, generation: &str) -> Result<()> {
         }
     })?;
     match session {
-        crate::restricted::Session::Worker => Ok(()),
-        crate::restricted::Session::Copy(authority) => run_restricted(authority),
+        crate::restricted::Session::Worker => Ok(0),
+        crate::restricted::Session::Copy(authority) => run_restricted(authority).map(|()| 0),
+        crate::restricted::Session::Coordinate(coordinating) => {
+            crate::remote_to_remote::coordinate(*coordinating)
+        }
     }
 }
 
@@ -761,46 +763,6 @@ fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Res
     authority.close_control();
     crate::process::termination::wait_if_terminating();
     client_gone_result(result, client_gone.load(Relaxed))
-}
-
-/// A relayed one-copy control. File payload uses direct TCP or SSH workers.
-/// `owns_process` marks a process that serves only this copy: it removes the
-/// copy's sidecars when interrupted or when the control is lost.
-pub(crate) fn run_forwarded<R: Read + Send + 'static, W: Write>(
-    authority: Arc<crate::restricted::RestrictedAuthority>,
-    input: R,
-    output: W,
-    pending: Arc<std::sync::atomic::AtomicBool>,
-    owns_process: bool,
-) -> Result<()> {
-    let _termination = owns_process.then(clean_up_on_termination).flatten();
-    let descriptor_session = DescriptorSessionSlot::default();
-    let result = serve(
-        input,
-        output,
-        true,
-        None,
-        None,
-        None,
-        ServeSession {
-            owns_process,
-            handshake_pending: Some(pending),
-            ssh_worker_ticket: None,
-            allow_tcp: true,
-            metadata_control: true,
-            loopback_only: false,
-            named_socket: None,
-            authority: Some(authority.clone()),
-            source_authority: None,
-            descriptor_session: descriptor_session.clone(),
-        },
-    );
-    descriptor_session.close();
-    authority.close_control();
-    if owns_process {
-        crate::process::termination::wait_if_terminating();
-    }
-    result
 }
 
 fn file_payload_request(request: &Request) -> bool {
@@ -2606,6 +2568,3 @@ fn write_metadata_batches<W: std::io::Write, T>(
     }
     writer.write_msg(&last(batch))
 }
-
-#[cfg(test)]
-mod peer_control_tests;

@@ -308,17 +308,13 @@ impl Cached {
     pub(crate) fn options(&self) -> Vec<OsString> {
         master_options(&self.0)
     }
-    /// Optional process-lifetime metadata; old account records remain usable.
-    pub(crate) fn peer(&self) -> Result<super::super::forward::ssh::Peer> {
-        read_peer(&self.0)
-    }
 }
 
 fn peer_path(record: &Record) -> std::path::PathBuf {
     record.control.with_extension("peer.json")
 }
 
-fn read_peer(record: &Record) -> Result<super::super::forward::ssh::Peer> {
+fn read_peer(record: &Record) -> Result<super::super::ssh_auth::Peer> {
     let file = OpenOptions::new().read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(peer_path(record))
@@ -331,7 +327,7 @@ fn read_peer(record: &Record) -> Result<super::super::forward::ssh::Peer> {
             && metadata.len() <= 128 * 1024,
         "approved SSH peer metadata must be a bounded owner-only file"
     );
-    let peer: super::super::forward::ssh::Peer = serde_json::from_reader(file)?;
+    let peer: super::super::ssh_auth::Peer = serde_json::from_reader(file)?;
     peer.validate_endpoint(&record.endpoint)?;
     Ok(peer)
 }
@@ -2375,7 +2371,7 @@ mod tests {
             "",
         )
         .unwrap();
-        let peer = super::super::super::forward::ssh::Peer::from_approved(
+        let peer = super::super::super::ssh_auth::Peer::from_approved(
             &record.endpoint,
             &format!(
                 "syq-approved-peer {}\n",

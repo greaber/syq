@@ -87,14 +87,6 @@ fn tcp_only_source_worker_failure_is_terminal_without_ssh_fallback() {
         !spec.tcp.lock().unwrap().as_ref().unwrap().failed,
         "TCP-only failure must not activate the SSH fallback state"
     );
-    let error = spec
-        .forwarded
-        .as_ref()
-        .unwrap()
-        .ssh_command()
-        .err()
-        .unwrap();
-    assert!(super::is_non_retryable_connect_error(&error));
 }
 
 #[test]

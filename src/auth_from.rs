@@ -295,6 +295,13 @@ pub(crate) fn apply_copy(args: &mut crate::cli::Args) -> Result<()> {
         args.locations.last()
     } else if crate::destination::pull::eligible_target(args).is_ok() {
         args.locations.first()
+    } else if crate::destination::coordinated_targets(args).is_ok() {
+        // The same rule as for an upload above: a saved choice applies only
+        // to a copy the approved route can carry. With --rsh or another
+        // option it refuses, the server's own SSH runs the copy; an explicit
+        // --auth-from with such an option is refused instead.
+        args.auth_from = between_servers(args)?;
+        return Ok(());
     } else {
         return Ok(());
     };
@@ -304,6 +311,35 @@ pub(crate) fn apply_copy(args: &mut crate::cli::Args) -> Result<()> {
     let domain = Domain::select(args.pscope.as_deref())?;
     args.auth_from = resolve(&domain, host, None)?;
     Ok(())
+}
+
+/// The saved choice for a copy between two servers: a receiving machine
+/// saved for either server approves it, unless the two choices disagree.
+fn between_servers(args: &crate::cli::Args) -> Result<AuthFrom> {
+    let domain = Domain::select(args.pscope.as_deref())?;
+    let (destination, sources) = args
+        .locations
+        .split_last()
+        .context("authorization endpoint missing")?;
+    let mut chosen = AuthFrom::Auto;
+    for location in [sources.first(), Some(destination)].into_iter().flatten() {
+        let Some(host) = location
+            .host
+            .as_deref()
+            .filter(|host| !host.starts_with('@'))
+        else {
+            continue;
+        };
+        match resolve(&domain, host, None)? {
+            AuthFrom::Auto | AuthFrom::Ssh => {}
+            choice if chosen == AuthFrom::Auto => chosen = choice,
+            choice if choice == chosen => {}
+            _ => bail!(
+                "the saved auth-from choices for this copy's source and destination differ; choose one with --auth-from"
+            ),
+        }
+    }
+    Ok(chosen)
 }
 
 fn update(

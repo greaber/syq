@@ -888,6 +888,179 @@ fn a_receiver_from_an_older_line_refuses_new_copies() {
     }
 }
 
+/// A coordinating source's receiver verifies its own directive as a
+/// destination's does, and records it only with the destination's directive
+/// approved with it, for the same command. Neither directive passes as the
+/// other's role.
+#[test]
+fn a_coordinating_source_is_admitted_only_with_its_own_destination_directive() {
+    use crate::directive::{Binding, Peer, Role};
+    let temporary = crate::test_support::tempdir().unwrap();
+    let state = temporary.path().join("state");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(state.join("replay"))
+        .unwrap();
+    let login = generate_test_key("login").unwrap();
+    let build = crate::identity::build();
+    let config = ReceiverEnrollment {
+        version: CONFIG_VERSION,
+        id: EnrollmentId::random(),
+        target_login: "reader".into(),
+        generation: 2,
+        release: build.into(),
+        receiver_path: "/home/reader/.local/lib/syq/v0.8.0/linux-x86_64/syq".into(),
+        entry_public_key: generate_test_key("entry")
+            .unwrap()
+            .public_key()
+            .to_openssh()
+            .unwrap(),
+        signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
+    };
+    let command = [
+        "cp",
+        "--from",
+        "host-b",
+        "--srcs-in",
+        "data",
+        "--to",
+        "host-c",
+        "--into",
+        "/archive",
+    ]
+    .map(|arg| arg.as_bytes().to_vec())
+    .to_vec();
+    let inputs = crate::directive::Inputs {
+        ignore: vec!["*.tmp".into()],
+        mapping: None,
+    };
+    let destination_enrollment = EnrollmentId::random();
+    let issue = |binding| {
+        crate::directive::issue(
+            binding,
+            command.clone(),
+            "~".into(),
+            (inputs.clone(), None),
+            [7; 32],
+        )
+        .unwrap()
+    };
+    let destination_binding = || Binding {
+        enrollment: destination_enrollment,
+        generation: 1,
+        account: "backup".into(),
+        role: Role::Destination,
+    };
+    let destination = issue(destination_binding());
+    let source = issue(Binding {
+        enrollment: config.id,
+        generation: 2,
+        account: "reader".into(),
+        role: Role::CoordinatingSource(Peer {
+            enrollment: destination_enrollment,
+            generation: 1,
+            account: "backup".into(),
+            request: destination.request_id,
+            destination: b"/home/backup/archive".to_vec(),
+            known_hosts: String::new(),
+        }),
+    });
+    // The destination's own login key signs its directive; this receiver
+    // does not check that signature.
+    let other = generate_test_key("other").unwrap();
+    let signed_destination = |directive: &crate::directive::Directive| {
+        sign_test_directive(directive, &other, crate::directive::NAMESPACE)
+    };
+    let entry_key = generate_test_key("destination entry")
+        .unwrap()
+        .to_openssh(ssh_key::LineEnding::LF)
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+    let frame = |source: Vec<u8>, destination: Vec<u8>| Coordinate {
+        source,
+        destination,
+        entry_key: entry_key.clone(),
+        results_token: "0".repeat(32),
+        progress_width: None,
+    };
+    let recorded = || fs::read_dir(state.join("replay")).unwrap().count();
+    let receiver = (2, build);
+    let valid_source = sign_test_directive(&source, &login, crate::directive::NAMESPACE);
+    // Another approval of the same command to the same destination.
+    let refused = [
+        (
+            frame(
+                valid_source.clone(),
+                signed_destination(&issue(destination_binding())),
+            ),
+            "not the one approved",
+        ),
+        // A destination directive presented as the source's.
+        (
+            frame(
+                sign_test_directive(
+                    &issue(Binding {
+                        enrollment: config.id,
+                        generation: 2,
+                        account: "reader".into(),
+                        role: Role::Destination,
+                    }),
+                    &login,
+                    crate::directive::NAMESPACE,
+                ),
+                signed_destination(&destination),
+            ),
+            "not for a source",
+        ),
+        // A frame whose token or entry key is not one.
+        (
+            {
+                let mut frame = frame(valid_source.clone(), signed_destination(&destination));
+                frame.results_token = "token".into();
+                frame
+            },
+            "results token",
+        ),
+        (
+            {
+                let mut frame = frame(valid_source.clone(), signed_destination(&destination));
+                frame.entry_key = b"not a key".to_vec();
+                frame
+            },
+            "entry key",
+        ),
+    ];
+    for (frame, expected) in refused {
+        let Err(error) = verify_coordination(&state, &config, receiver, &frame) else {
+            panic!("a coordinating source was admitted: {expected}");
+        };
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+        assert_eq!(recorded(), 0);
+    }
+    // The source's directive does not pass as a destination's copy.
+    let error = verify(&state, &config, receiver, &valid_source, temporary.path())
+        .err()
+        .unwrap();
+    assert!(
+        format!("{error:#}").contains("not for a copy's destination"),
+        "{error:#}"
+    );
+    assert_eq!(recorded(), 0);
+
+    let valid = frame(valid_source.clone(), signed_destination(&destination));
+    let ((args, peer, caps), _) = verify_coordination(&state, &config, receiver, &valid).unwrap();
+    assert_eq!(args.ignore_lines, ["*.tmp"]);
+    assert_eq!(peer.destination, b"/home/backup/archive");
+    assert!(caps.is_none());
+    assert_ne!(recorded(), 0);
+    let error = verify_coordination(&state, &config, receiver, &valid)
+        .err()
+        .unwrap();
+    assert!(format!("{error:#}").contains("already"), "{error:#}");
+}
+
 /// A receiver records a directive as used only after the build, the
 /// generation, the binding, the signature and the derivation of its rules
 /// are checked: a refused directive leaves the record of used directives as
@@ -2522,7 +2695,7 @@ fn a_session_reads_exactly_one_bounded_first_frame() {
     assert!(refused(&[0, 0, 0, 0], long).contains("unsupported length"));
     assert!(refused(&u32::MAX.to_be_bytes(), long).contains("unsupported length"));
     // An unknown kind, and trailing bytes inside the frame.
-    assert!(refused(&[0, 0, 0, 2, 2, 0], long).contains("decode"));
+    assert!(refused(&[0, 0, 0, 2, 3, 0], long).contains("decode"));
     let mut trailing = Admission::Worker("w".into()).frame().unwrap();
     trailing.push(0);
     trailing[3] += 1;
@@ -6951,7 +7124,6 @@ fn receivers_refuse_root_and_effective_capabilities() {
 fn only_enrolled_grants_leave_bandwidth_to_the_sender() {
     assert!(enrolled_grant("c2lnbmVkLWdyYW50"));
     assert!(!enrolled_grant("named-v2:route"));
-    assert!(!enrolled_grant(crate::destination::peer_bridge::GRANT));
 }
 
 #[test]
