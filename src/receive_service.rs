@@ -1801,7 +1801,7 @@ enum Receiving {
 pub(crate) enum Replace {
     /// For commands: never. The service switches by itself, or a switch a
     /// command starts in the background replaces it (`refresh_outdated`),
-    /// after checking that the new service can log in.
+    /// once the new service has logged in (`successor`).
     Leave,
     /// For the switches services and commands start: only once nothing is
     /// in progress, never one that follows another installed syq file by
@@ -1878,7 +1878,7 @@ fn replace_other(
             // stops, and keeps that login: a failure leaves the old service
             // receiving. Dropped, it logs out again.
             let spec = service_spec(remote);
-            let successor = successor::Successor::start(control, &spec, &remote.label())?;
+            let mut successor = successor::Successor::start(control, &spec, &remote.label())?;
             // That took a while: decide on what the service says now, such
             // as a request that began waiting for approval meanwhile.
             let Some(state) = running_status(control, Retry::No, ANSWER_TIMEOUT)? else {
@@ -1891,6 +1891,8 @@ fn replace_other(
             if switch::follows_other_file(state.started_from.as_deref()) {
                 return Ok(other(None));
             }
+            // A connection it lost meanwhile leaves the old one receiving.
+            successor.still_logged_in(control, &remote.label())?;
             if stop_when_idle(control, &state)? {
                 successor.take_over(control, &spec)?;
                 return Ok(Some(Receiving::Started));
@@ -2192,8 +2194,12 @@ impl ProfileWorker {
             config.clone(),
             activity.clone(),
         );
-        // A connection that ends before it logged in says so too.
-        let failed = handover.as_ref().map(|handover| handover.report.clone());
+        // A connection that fails for good while its service prepares to
+        // take over says so too: as lost once it started to connect, and
+        // otherwise as never started, which a switch does not wait for.
+        let failed = handover
+            .as_ref()
+            .map(|handover| (handover.id, handover.report.clone()));
         let thread = std::thread::spawn(move || {
             let result = if !thread_config.cwd.is_dir() {
                 Err(anyhow::anyhow!(
@@ -2212,8 +2218,19 @@ impl ProfileWorker {
                     handover,
                 )
             };
-            if let (Err(error), Some(failed)) = (&result, failed) {
-                let _ = failed.send(Err((false, format!("{error:#}"))));
+            if let (Err(error), Some((id, failed))) = (&result, failed) {
+                let started = thread_state.lock().unwrap().attempted.is_some();
+                let _ = failed.send((
+                    id,
+                    if started {
+                        crate::destination::Prepared::Lost {
+                            needs_user: false,
+                            error: format!("{error:#}"),
+                        }
+                    } else {
+                        crate::destination::Prepared::NotStarted
+                    },
+                ));
             }
             if let Err(error) = &result {
                 let mut state = thread_state.lock().unwrap();
@@ -2245,6 +2262,12 @@ impl ProfileWorker {
     }
     fn idle(&self) -> bool {
         self.approvals.snapshots().is_empty() && self.activity.idle()
+    }
+    /// End the connection thread's current wait at once.
+    fn wake(&self) {
+        if let Some(wake) = &self.worker.wake {
+            let _ = wake.send(());
+        }
     }
 }
 /// What these workers have in progress.
@@ -2705,17 +2728,22 @@ fn run(domain: &Domain, control: &Path, started_from: Option<PathBuf>) -> Result
     if scope.join(CLOSING).exists() || !preferences(domain)?.enabled() {
         return Ok(());
     }
-    serve(
-        domain,
-        control,
-        started_from,
-        read_spec(control)?,
-        Vec::new(),
-    )
+    let spec = read_spec(control)?;
+    protect_followed_program(started_from.as_deref());
+    serve(domain, control, started_from, spec, Vec::new())
+}
+
+/// Copies this service receives cannot change the file it runs after an
+/// update, from before any of its connections start.
+fn protect_followed_program(started_from: Option<&Path>) {
+    if let Some(path) = started_from {
+        crate::restricted::protect_followed_program(path);
+    }
 }
 
 /// Receive through the connection at `control` as `spec` says, once this
-/// process holds its lock, with `workers` already connecting
+/// process holds its lock and protects the file it follows
+/// (`protect_followed_program`), with `workers` already connecting
 /// (`successor`), until stopped.
 fn serve(
     domain: &Domain,
@@ -2751,11 +2779,6 @@ fn serve(
         }
         Ok(registrations)
     })?;
-    // Copies received here cannot change the file this service runs after
-    // an update.
-    if let Some(path) = &started_from {
-        crate::restricted::protect_followed_program(path);
-    }
     // Only a UTF-8 path can be reported in a status.
     let mut follower = started_from
         .filter(|path| path.to_str().is_some())

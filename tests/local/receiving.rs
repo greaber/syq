@@ -3306,6 +3306,18 @@ case " $* " in
 esac
 for argument in "$@"; do
     if [ "$argument" = -R ]; then
+        # A test's own server for receiving connections.
+        if [ -n "${FAKE_SSH_RECEIVING:-}" ]; then
+            exec "$FAKE_SSH_RECEIVING" "$@"
+        fi
+        # A registration that takes over says it logged in, then waits to be
+        # told to take the name, after the secret's line.
+        case " $* " in
+            *" --take-over"*)
+                printf '\000\000\000\011"Waiting"'
+                { read -r secret && read -r activation; } || exit 0
+                ;;
+        esac
         printf '\000\000\000\007"Ready"'
         exec sleep 600
     fi
@@ -3963,15 +3975,528 @@ fn a_switch_logs_in_once_and_the_new_service_keeps_that_login() {
     );
 }
 
-/// A request that begins waiting for approval while a switch checks its
-/// login keeps an older service, which reports only such requests, running.
+/// A switch whose new service loses a prepared connection before the
+/// switch stops the old service, here while another receiving name still
+/// logs in, leaves the old service receiving: the new one says so and
+/// exits, without logging in again for that name.
 #[test]
-fn a_request_waiting_for_approval_during_the_login_check_keeps_the_old_service() {
+fn a_new_service_that_loses_a_connection_before_taking_over_leaves_the_old_one() {
     let t = Tmp::new();
     let installed = Installed::new(&t);
     let _off = ScopeOff(&t, installed.scope.clone());
     installed.connect();
-    let checked = t.path("login-checked");
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    assert_output_ok(&installed.persist(
+        syq,
+        &[
+            "receive",
+            "on",
+            "--name",
+            "second",
+            "--notify",
+            "off",
+            "--root",
+            &t.s("root"),
+            "--all-connections",
+        ],
+    ));
+    let old = other_service(
+        &installed,
+        serde_json::json!([]),
+        Some(serde_json::json!({"requests": 0, "pending": 0})),
+        None,
+    );
+    // The first name's connection logs in, then drops, and its next login
+    // would be rejected; the second name is still logging in meanwhile.
+    let server = t.path("server");
+    executable(
+        &server,
+        br#"#!/bin/sh
+case "$*" in
+    *"--destination-register second "*)
+        sleep 3
+        printf '\000\000\000\011"Waiting"'
+        exec sleep 600
+        ;;
+esac
+if [ -e "$FAKE_LOST" ]; then
+    : > "$FAKE_LOST.again"
+    echo 'syq@test-server: Permission denied (publickey).' >&2
+    exit 255
+fi
+: > "$FAKE_LOST"
+printf '\000\000\000\011"Waiting"'
+sleep 0.3
+echo 'Connection to test-server closed by remote host.' >&2
+exit 255
+"#,
+    );
+    let lost = t.path("lost");
+    let switched = installed
+        .command(
+            syq,
+            &[
+                "persist",
+                "connect",
+                "test-server",
+                "--auth-from",
+                "ssh",
+                "--when-idle",
+                "--pscope",
+                installed.scope.to_str().unwrap(),
+            ],
+        )
+        .env("FAKE_SSH_RECEIVING", &server)
+        .env("FAKE_LOST", &lost)
+        .run()
+        .unwrap();
+    assert!(!switched.status.success(), "{switched:?}");
+    assert!(
+        stderr_of(&switched).contains("receiving could not connect to test-server")
+            && stderr_of(&switched).contains("closed by remote host"),
+        "{}",
+        stderr_of(&switched)
+    );
+    assert!(lost.exists(), "the first name did not log in");
+    assert!(
+        !t.path("lost.again").exists(),
+        "the first name logged in again"
+    );
+    // The old service was only asked for its status, and still answers.
+    let state = installed.request(serde_json::json!({"version": 2, "stop": false}));
+    assert_eq!(state["identity"], "v0.7.1");
+    installed.request(serde_json::json!({"version": 2, "stop": true}));
+    let requests = old.join().unwrap();
+    assert!(
+        requests[..requests.len() - 1]
+            .iter()
+            .all(|request| request == &serde_json::json!({"version": 2, "stop": false})),
+        "{requests:?}"
+    );
+}
+
+/// A receiving name that cannot start on this machine, here because its
+/// receiving directory is gone, does not hold back a switch, as it would not
+/// a newly started service: it fails in the new service, and the others
+/// switch.
+#[test]
+fn a_receiving_name_that_cannot_start_here_does_not_hold_back_a_switch() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    fs::create_dir(t.path("root/elsewhere")).unwrap();
+    assert_output_ok(&installed.persist(
+        syq,
+        &[
+            "receive",
+            "on",
+            "--name",
+            "elsewhere",
+            "--notify",
+            "off",
+            "--root",
+            &t.s("root"),
+            "--cwd",
+            &t.s("root/elsewhere"),
+            "--all-connections",
+        ],
+    ));
+    let old = other_service(
+        &installed,
+        serde_json::json!([]),
+        Some(serde_json::json!({"requests": 0, "pending": 0})),
+        None,
+    );
+    fs::remove_dir(t.path("root/elsewhere")).unwrap();
+    let switched = installed
+        .command(
+            syq,
+            &[
+                "persist",
+                "connect",
+                "test-server",
+                "--auth-from",
+                "ssh",
+                "--when-idle",
+                "--pscope",
+                installed.scope.to_str().unwrap(),
+            ],
+        )
+        .run()
+        .unwrap();
+    assert!(
+        !stderr_of(&switched).contains("could not log in")
+            && !stderr_of(&switched).contains("could not connect"),
+        "{switched:?}"
+    );
+    let requests = old.join().unwrap();
+    assert_eq!(
+        requests.last().unwrap()["stop_if_idle"],
+        true,
+        "{requests:?}"
+    );
+    let state = installed.request(serde_json::json!({"version": 2, "stop": false}));
+    assert_eq!(state["identity"], this_build(), "{state}");
+    let profiles = state["profiles"].as_array().unwrap();
+    assert_eq!(profiles.len(), 2, "{state}");
+    for profile in profiles {
+        let connection = &profile["connection"];
+        if profile["settings"]["name"] == "elsewhere" {
+            assert_eq!(connection["phase"], "failed", "{state}");
+            assert!(
+                connection["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("receiving directory is unavailable"),
+                "{state}"
+            );
+        } else {
+            assert_eq!(connection["phase"], "online", "{state}");
+        }
+    }
+}
+
+/// The control of a service started as a switch starts one, with `program`
+/// as the helper on the server, and that service's record.
+fn handover_control(installed: &Installed) -> (PathBuf, String) {
+    let control = installed.scope.join("handover");
+    let spec = serde_json::json!({
+        "version": 2, "identity": this_build(),
+        "endpoint": {
+            "user": null, "host": "test-server", "port": null,
+            "ssh_options": [], "ssh_options_directory": null
+        },
+        "program": env!("CARGO_BIN_EXE_syq")
+    })
+    .to_string();
+    let record = PathBuf::from(format!("{}.recv-json", control.display()));
+    fs::write(&record, &spec).unwrap();
+    fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
+    (control, spec)
+}
+
+/// A new service as a switch starts one (`--receive-successor`), its lines
+/// to the switch, and the server stand-in its receiving connections use.
+struct NewService {
+    child: std::process::Child,
+    lines: std::sync::mpsc::Receiver<String>,
+}
+
+impl NewService {
+    fn start(
+        installed: &Installed,
+        control: &Path,
+        spec: &str,
+        followed: Option<&Path>,
+        server: &Path,
+    ) -> NewService {
+        let mut args = vec!["--receive-successor", control.to_str().unwrap()];
+        if let Some(followed) = followed {
+            args.push(followed.to_str().unwrap());
+        }
+        let mut child = installed
+            .command(Path::new(env!("CARGO_BIN_EXE_syq")), &args)
+            .env("FAKE_SSH_RECEIVING", server)
+            .env("FAKE_RELAY_SOCKETS", installed.t.path("relay-sockets"))
+            .env("FAKE_BUILD", this_build())
+            .env("FAKE_SYQ", env!("CARGO_BIN_EXE_syq"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.as_mut().unwrap();
+        input.write_all(format!("{spec}\n").as_bytes()).unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let (said, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            while std::io::BufRead::read_line(&mut output, &mut line).is_ok_and(|n| n > 0) {
+                if said.send(line.trim_end().to_owned()).is_err() {
+                    break;
+                }
+                line.clear();
+            }
+        });
+        NewService { child, lines }
+    }
+
+    fn said(&self) -> String {
+        self.lines
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the new service said nothing")
+    }
+
+    /// Tell it to take over, or with `go` false to leave, and wait for it
+    /// to exit, as it does when it does not take over.
+    fn finish(&mut self, go: bool) -> std::process::ExitStatus {
+        let mut input = self.child.stdin.take().unwrap();
+        if go {
+            input.write_all(b"go\n").unwrap();
+        }
+        drop(input);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(std::time::Instant::now() < deadline, "it did not exit");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for NewService {
+    fn drop(&mut self) {
+        drop(self.child.stdin.take());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while matches!(self.child.try_wait(), Ok(None)) {
+            if std::time::Instant::now() >= deadline {
+                let _ = self.child.kill();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = self.child.wait();
+    }
+}
+
+/// Removes the return sockets the relaying server stand-in bound, which a
+/// connection that was killed leaves behind.
+struct RelaySockets(PathBuf);
+
+impl Drop for RelaySockets {
+    fn drop(&mut self) {
+        for socket in fs::read_to_string(&self.0).unwrap_or_default().lines() {
+            let _ = fs::remove_file(socket);
+        }
+    }
+}
+
+/// A server for receiving connections that runs their registrations on
+/// this machine, in test-server's account: it forwards the return socket
+/// (`-R`) itself, noting it in `FAKE_RELAY_SOCKETS`.
+fn relaying_server(t: &Tmp) -> PathBuf {
+    let path = t.path("relaying-server");
+    executable(
+        &path,
+        br#"#!/usr/bin/python3
+import os, select, shlex, socket, subprocess, sys, threading
+args = sys.argv[1:]
+remote, local = args[args.index('-R') + 1].split(':', 1)
+with open(os.environ['FAKE_RELAY_SOCKETS'], 'a') as log:
+    log.write(remote + '\n')
+server = socket.socket(socket.AF_UNIX)
+server.bind(remote)
+os.chmod(remote, 0o600)
+server.listen(16)
+def relay(a):
+    b = socket.socket(socket.AF_UNIX)
+    try:
+        b.connect(local)
+        while True:
+            for source in select.select([a, b], [], [])[0]:
+                data = source.recv(65536)
+                if not data:
+                    return
+                (b if source is a else a).sendall(data)
+    except OSError:
+        pass
+    finally:
+        a.close()
+        b.close()
+def accept():
+    while True:
+        connection = server.accept()[0]
+        threading.Thread(target=relay, args=(connection,), daemon=True).start()
+threading.Thread(target=accept, daemon=True).start()
+environment = dict(os.environ, HOME=os.environ['FAKE_REMOTE_HOME'])
+sys.exit(subprocess.call(shlex.split(args[-1]), env=environment))
+"#,
+    );
+    path
+}
+
+/// A new service told to take over finds that another service took the
+/// control first, as one a command starts when the old service stops. The
+/// server gives a new service's connection the name only once that service
+/// owns the control, so the other keeps receiving, and the new one leaves.
+#[test]
+fn a_new_service_takes_the_name_only_once_it_owns_the_control() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    let _sockets = RelaySockets(t.path("relay-sockets"));
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    assert_output_ok(&installed.persist(
+        syq,
+        &[
+            "receive",
+            "on",
+            "--name",
+            "laptop",
+            "--notify",
+            "off",
+            "--root",
+            &t.s("root"),
+            "--all-connections",
+        ],
+    ));
+    let (control, spec) = handover_control(&installed);
+    // The replaced service's registration holds the name.
+    let registry = t.path("remote-home/.syq-destinations-v3");
+    fs::create_dir(&registry).unwrap();
+    fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
+    let held = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(registry.join("laptop.lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&held),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        },
+        0
+    );
+    let server = relaying_server(&t);
+    let mut new = NewService::start(&installed, &control, &spec, None, &server);
+    assert_eq!(new.said(), r#""Yes""#);
+    drop(held);
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    assert!(
+        !registry.join("laptop.json").exists(),
+        "the name was taken before the new service took over"
+    );
+    // Another service takes the control first and receives as @laptop.
+    let mut other = installed
+        .command(syq, &["--receive-service", control.to_str().unwrap()])
+        .env("FAKE_SSH_RECEIVING", &server)
+        .env("FAKE_RELAY_SOCKETS", t.path("relay-sockets"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let phase = || installed.request(serde_json::json!({"version": 2, "stop": false}));
+    wait_for(
+        "the other service to receive",
+        std::time::Duration::from_secs(30),
+        || control.with_extension("recv").exists() && phase()["connection"]["phase"] == "online",
+    );
+    assert!(new.finish(true).success());
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let state = phase();
+    assert_eq!(state["connection"]["phase"], "online", "{state}");
+    let waited = installed
+        .command(
+            syq,
+            &[
+                "persist",
+                "destinations",
+                "wait",
+                "laptop",
+                "--timeout",
+                "5",
+            ],
+        )
+        .env("HOME", t.path("remote-home"))
+        .run()
+        .unwrap();
+    assert_output_ok(&waited);
+    installed.request(serde_json::json!({"version": 2, "stop": true}));
+    other.wait().unwrap();
+}
+
+/// A server can use a new service's return socket before that service
+/// takes over, so the file it follows is protected from copies from the
+/// start, as it is for a running service.
+#[test]
+fn a_new_service_protects_the_file_it_follows_before_it_takes_over() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    assert_output_ok(&installed.persist(
+        syq,
+        &[
+            "receive",
+            "on",
+            "--name",
+            "laptop",
+            "--notify",
+            "off",
+            "--root",
+            &t.s("root"),
+            "--auto-approve-root",
+            &t.s("root"),
+            "--all-connections",
+        ],
+    ));
+    fs::create_dir(t.path("root/bin")).unwrap();
+    let followed = t.path("root/bin/syq");
+    std::os::unix::fs::symlink(syq, &followed).unwrap();
+    let (control, spec) = handover_control(&installed);
+    // A server that registers the connection as soon as it logs in.
+    let server = t.path("registering-server");
+    executable(
+        &server,
+        br#"#!/usr/bin/python3
+import json, os, pathlib, struct, sys
+args = sys.argv[1:]
+broker = args[args.index('-R') + 1].split(':', 1)[1]
+secret = sys.stdin.readline().strip()
+registry = pathlib.Path(os.environ['FAKE_REMOTE_HOME']) / '.syq-destinations-v3'
+registry.mkdir(mode=0o700, exist_ok=True)
+record = registry / 'laptop.json'
+record.write_text(json.dumps({
+    'version': 3, 'identity': os.environ['FAKE_BUILD'], 'socket': broker,
+    'secret': secret, 'program': list(os.environ['FAKE_SYQ'].encode()),
+}))
+record.chmod(0o600)
+sys.stdout.buffer.write(struct.pack('>I', 9) + b'"Waiting"')
+sys.stdout.buffer.flush()
+sys.stdin.read()
+"#,
+    );
+    let mut new = NewService::start(&installed, &control, &spec, Some(&followed), &server);
+    assert_eq!(new.said(), r#""Yes""#);
+    write(&t.path("payload"), b"data");
+    let copied = installed
+        .command(
+            syq,
+            &[
+                "cp",
+                &t.s("payload"),
+                "--to",
+                "@laptop",
+                "--as",
+                "bin/payload",
+            ],
+        )
+        .env("HOME", t.path("remote-home"))
+        .run()
+        .unwrap();
+    assert!(!copied.status.success(), "{copied:?}");
+    assert!(stderr_of(&copied).contains("protected"), "{copied:?}");
+    assert!(!t.path("root/bin/payload").exists());
+    assert!(new.finish(false).success());
+}
+
+/// A request that begins waiting for approval while the new service logs
+/// in keeps an older service, which reports only such requests, running.
+#[test]
+fn a_request_waiting_for_approval_during_the_new_services_login_keeps_the_old_service() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let checked = t.path("logged-in");
     let old = other_service(
         &installed,
         serde_json::json!([{
@@ -4002,7 +4527,7 @@ fn a_request_waiting_for_approval_during_the_login_check_keeps_the_old_service()
         .run()
         .unwrap();
     assert_output_ok(&switched);
-    assert!(checked.exists(), "the login was not checked");
+    assert!(checked.exists(), "the new service did not log in");
     assert!(
         String::from_utf8_lossy(&switched.stdout)
             .contains("keeps running syq v0.7.1 for now, with 1 request waiting for approval"),
@@ -4422,9 +4947,8 @@ fn a_switch_whose_control_login_needs_the_user_waits_for_the_user() {
 /// A switch whose own login gets no answer in time, as when ssh waits for
 /// a touch of a security key that nobody gives, ends before its time is up,
 /// with that ssh, as one that needs the user: only a command at a terminal
-/// tries it again, so the key does not ask again unattended. Its ssh runs in
-/// the switch's process group, so that it ends with the switch whenever
-/// that ends.
+/// tries it again, so the key does not ask again unattended. Its ssh is the
+/// new service's, which ends it once its switch ends, whenever that ends.
 #[test]
 fn a_switch_whose_login_gets_no_answer_waits_for_the_user() {
     let t = Tmp::new();
@@ -4495,7 +5019,8 @@ fn a_switch_whose_login_gets_no_answer_waits_for_the_user() {
     assert_eq!(state["identity"], "v0.7.1");
 
     // Ending the switch's group, as its time limit or the service that
-    // started it does, ends its login with it.
+    // started it does, ends the new service's login with it: the new service
+    // sees its input end.
     let (mut second, ssh, child) = switch("60000");
     unsafe { libc::kill(-(second.id() as libc::pid_t), libc::SIGKILL) };
     second.wait().unwrap();

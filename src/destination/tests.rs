@@ -258,10 +258,12 @@ fn registration_reads_only_its_secret_line_from_standard_input() {
     assert!(started.elapsed() < Duration::from_secs(5));
 }
 
-/// A registration that takes over a name waits for the one holding it to
-/// let go, as long as the laptop keeps its connection, and for a while.
+/// A registration that takes over a name takes it only once the laptop
+/// says its service has taken over, and then as soon as the registration
+/// holding it lets go; it stops waiting when the laptop gives up, and after
+/// a while.
 #[test]
-fn a_registration_that_takes_over_waits_for_the_name() {
+fn a_registration_that_takes_over_waits_for_its_service_and_the_name() {
     let dir = crate::test_support::tempdir().unwrap();
     let path = dir.path().join("laptop.lock");
     let open = || {
@@ -273,6 +275,10 @@ fn a_registration_that_takes_over_waits_for_the_name() {
             .open(&path)
             .unwrap()
     };
+    let free = || {
+        let probe = open();
+        unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    };
     let hold = || {
         let held = open();
         assert_eq!(
@@ -281,41 +287,57 @@ fn a_registration_that_takes_over_waits_for_the_name() {
         );
         held
     };
+    let timed_out = |error: anyhow::Error| {
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::TimedOut),
+            "{error:#}"
+        );
+    };
 
-    // Once the old registration ends, the new one has the name.
+    // A free name is not taken before the laptop's word.
+    let (laptop, server) = UnixStream::pair().unwrap();
+    let lock = open();
+    timed_out(take_name(&lock, server.as_raw_fd(), Duration::from_millis(200)).unwrap_err());
+    assert!(free(), "taken before the laptop's word");
+    drop(laptop);
+    assert!(!take_name(&lock, server.as_raw_fd(), Duration::from_secs(10)).unwrap());
+    assert!(free());
+
+    // After it, the name is taken the moment the old registration ends.
     let held = hold();
-    let (_laptop, server) = UnixStream::pair().unwrap();
+    let (mut laptop, server) = UnixStream::pair().unwrap();
+    laptop.write_all(b"\n").unwrap();
     let release = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(300));
+        let releasing = Instant::now();
         drop(held);
+        releasing
     });
     let lock = open();
-    let started = Instant::now();
-    assert!(name_released(&lock, server.as_raw_fd(), Duration::from_secs(10)).unwrap());
-    assert!(started.elapsed() >= Duration::from_millis(250));
-    release.join().unwrap();
-    assert_ne!(
-        unsafe { libc::flock(open().as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-        0,
-        "the new registration holds the name"
+    assert!(take_name(&lock, server.as_raw_fd(), Duration::from_secs(10)).unwrap());
+    assert!(
+        Instant::now() >= release.join().unwrap(),
+        "taken while held"
     );
+    assert!(!free(), "the new registration holds the name");
     drop(lock);
 
-    // A laptop that gives up ends the wait.
+    // A laptop that gives up, or a name that stays taken, ends the wait.
     let held = hold();
-    let (laptop, server) = UnixStream::pair().unwrap();
-    drop(laptop);
-    assert!(!name_released(&open(), server.as_raw_fd(), Duration::from_secs(10)).unwrap());
-
-    // One that waits too long is tried again.
-    let (_laptop, server) = UnixStream::pair().unwrap();
-    let error = name_released(&open(), server.as_raw_fd(), Duration::from_millis(200)).unwrap_err();
-    assert_eq!(
-        error
-            .downcast_ref::<std::io::Error>()
-            .map(std::io::Error::kind),
-        Some(std::io::ErrorKind::TimedOut)
-    );
+    let (mut laptop, server) = UnixStream::pair().unwrap();
+    laptop.write_all(b"\n").unwrap();
+    let giving_up = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        drop(laptop);
+    });
+    assert!(!take_name(&open(), server.as_raw_fd(), Duration::from_secs(10)).unwrap());
+    giving_up.join().unwrap();
+    let (mut laptop, server) = UnixStream::pair().unwrap();
+    laptop.write_all(b"\n").unwrap();
+    timed_out(take_name(&open(), server.as_raw_fd(), Duration::from_millis(200)).unwrap_err());
     drop(held);
 }
 
