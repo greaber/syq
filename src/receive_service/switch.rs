@@ -402,15 +402,18 @@ pub(crate) fn check_runnable(path: &Path) -> Result<()> {
     // `admin` group of a Homebrew shared by several accounts, counts as
     // group write does, unless it is the group of every account.
     let acl = |path: &Path| -> Result<()> {
-        anyhow::ensure!(
-            !crate::inode_metadata::acl_lets_others_change(
-                path,
-                crate::inode_metadata::AclGroups::Trusted
-            )?,
-            "{} has an access control list that lets other accounts change it",
-            path.display()
-        );
-        Ok(())
+        use crate::inode_metadata::{AclAccess, AclGroups};
+        match crate::inode_metadata::acl_lets_others_change(path, AclGroups::Trusted)? {
+            None => Ok(()),
+            Some(AclAccess::Own) => anyhow::bail!(
+                "{} has an access control list that lets other accounts change it",
+                path.display()
+            ),
+            Some(AclAccess::Inherited) => anyhow::bail!(
+                "{path} has an access control list that lets other accounts change it, which it inherited from a directory above it, so reinstalling syq there alone would not help; find that directory with `ls -le` and remove its inheritable entry with `chmod -N`, then remove the entry from {path} with `chmod -N` too",
+                path = path.display()
+            ),
+        }
     };
     // Whether every account may add entries to `directory`, after refusing
     // it if one could replace them.

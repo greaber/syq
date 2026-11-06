@@ -512,13 +512,16 @@ pub(crate) fn stored_release(
             "is not a regular file"
         } else if metadata.mode() & 0o022 != 0 {
             "is writable by group or others"
-        } else if crate::inode_metadata::acl_lets_others_change(
-            path,
-            crate::inode_metadata::AclGroups::Untrusted,
-        )? {
-            "has an access control list that lets others change it"
         } else {
-            return Ok(true);
+            use crate::inode_metadata::{AclAccess, AclGroups};
+            match crate::inode_metadata::acl_lets_others_change(path, AclGroups::Untrusted)? {
+                None => return Ok(true),
+                Some(AclAccess::Own) => "has an access control list that lets others change it",
+                Some(AclAccess::Inherited) => bail!(
+                    "{path} has an access control list that lets others change it, which it inherited from a directory above it, so deleting it alone would not help: syq would store the release again with the same entry; find that directory with `ls -le` and remove its inheritable entry with `chmod -N`, then delete {path} and syq will install the release again",
+                    path = path.display()
+                ),
+            }
         };
         bail!(
             "{} must be a {kind} that you own and nobody else can write, but it {problem}; fix its permissions, or delete it and syq will install the release again",
@@ -2094,6 +2097,7 @@ mod tests {
             chmod(&["+a".as_ref(), entry.as_ref(), path.as_os_str()]);
             let error = check().unwrap_err().to_string();
             assert!(error.contains("access control list"), "{entry}: {error}");
+            assert!(!error.contains("inherited"), "{entry}: {error}");
             chmod(&["-N".as_ref(), path.as_os_str()]);
             assert_eq!(check().unwrap(), StoredRelease::Complete);
         }

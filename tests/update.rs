@@ -893,6 +893,9 @@ fn use_version_refuses_a_release_that_takes_an_acl_from_the_store() {
     let output =
         fixture.command_at_args(&fixture.installed, &["--use-version", "0.7.0", "--version"]);
     assert_failure_contains(&output, "access control list");
+    // Deleting it would only store it again with the same entry.
+    assert_failure_contains(&output, "inherited from a directory above it");
+    assert_failure_contains(&output, "chmod -N");
     assert!(output.stdout.is_empty(), "the stored release ran");
 }
 

@@ -1,7 +1,7 @@
 //! macOS ACLs use ordered UUID-based entries, independently of POSIX mode bits.
 //! Transfer explicit values and rebuild through the public ACL API; no native
 //! pointer or internal ACL structure crosses the wire.
-use super::{MacAce, MacAcl};
+use super::{AclAccess, MacAce, MacAcl};
 use anyhow::{ensure, Context, Result};
 use std::{ffi::c_void, fs::File, io, os::fd::AsRawFd, path::Path, ptr};
 
@@ -118,20 +118,21 @@ pub(super) fn read(file: &File) -> Result<MacAcl> {
 /// directory later does not count: it gives no access to the directory
 /// itself, nor to what is already in it. With `trust_groups`, neither does
 /// one for a group other than that of every account.
-pub(super) fn others_may_change(path: &Path, trust_groups: bool) -> Result<bool> {
+pub(super) fn others_may_change(path: &Path, trust_groups: bool) -> Result<Option<AclAccess>> {
     use std::os::unix::ffi::OsStrExt;
     const ALLOW: u32 = 1;
     // Write data or add a file, delete, append or add a subdirectory,
     // delete a child, write security, change owner (<sys/acl.h>).
     const CHANGE: u64 = (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 12) | (1 << 13);
     const ONLY_INHERIT: u32 = 1 << 8;
+    const INHERITED: u32 = 1 << 4;
     let name = std::ffi::CString::new(path.as_os_str().as_bytes())
         .with_context(|| format!("{} contains a NUL byte", path.display()))?;
     let raw = unsafe { acl_get_link_np(name.as_ptr(), EXTENDED) };
     if raw.is_null() {
         let error = io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::ENOENT) {
-            return Ok(false);
+            return Ok(None);
         }
         return Err(error).with_context(|| format!("read the ACL of {}", path.display()));
     }
@@ -146,12 +147,21 @@ pub(super) fn others_may_change(path: &Path, trust_groups: bool) -> Result<bool>
     // Most ACLs grant no one such access; only then is this user's UUID
     // worth looking up.
     if granted.peek().is_none() {
-        return Ok(false);
+        return Ok(None);
     }
     let mut own = [0u8; 16];
     let own = (unsafe { mbr_uid_to_uuid(libc::geteuid(), own.as_mut_ptr()) } == 0).then_some(own);
-    Ok(granted
-        .any(|entry| Some(entry.principal) != own && !(trust_groups && is_group(&entry.principal))))
+    let mut access = None;
+    for entry in granted {
+        if Some(entry.principal) == own || (trust_groups && is_group(&entry.principal)) {
+            continue;
+        }
+        if entry.flags & INHERITED == 0 {
+            return Ok(Some(AclAccess::Own));
+        }
+        access = Some(AclAccess::Inherited);
+    }
+    Ok(access)
 }
 
 /// Whether `principal` names a group other than `everyone`, the group of
