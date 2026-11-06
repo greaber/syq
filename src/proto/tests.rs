@@ -933,6 +933,25 @@ fn zstd_bodies_without_one_declared_size_keep_only_what_they_decode_to() {
     }
 }
 
+/// Old-format (v0.1–v0.7) zstd frames are not decoded. Their decoders size
+/// a window from the frame, beyond the window limit the reader sets.
+#[test]
+fn legacy_zstd_frames_are_refused() {
+    let payload = postcard::to_stdvec(&Response::Err("legacy".into())).unwrap();
+    // A v0.7 frame: magic, a descriptor without a content size, a 128 MiB
+    // window, one raw block holding the payload, and the end block.
+    let mut body = 0xFD2F_B527u32.to_le_bytes().to_vec();
+    body.push(0);
+    body.push((27 - 10) << 3);
+    let len = payload.len();
+    body.extend([0x40 | (len >> 16) as u8, (len >> 8) as u8, len as u8]);
+    body.extend(&payload);
+    body.extend([0xC0, 0, 0]);
+    let bytes = raw_frame(&body, crate::compression::ZSTD);
+    let result = FrameReader::new(bytes.as_slice()).read_msg::<Response>();
+    assert!(result.is_err(), "a legacy zstd frame decoded: {result:?}");
+}
+
 #[test]
 fn compressed_frames_preserve_transport_write_and_flush_failures() {
     struct Broken(bool);
