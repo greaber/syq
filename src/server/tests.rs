@@ -478,6 +478,18 @@ fn concatenated_zstd_frame(request: &Request) -> Vec<u8> {
     frame
 }
 
+/// A request as one zstd frame that declares what it decodes to.
+fn zstd_frame(request: &Request) -> Vec<u8> {
+    let body = zstd::bulk::compress(&postcard::to_stdvec(request).unwrap(), 1).unwrap();
+    let mut frame = u32::try_from(body.len() + 1)
+        .unwrap()
+        .to_le_bytes()
+        .to_vec();
+    frame.push(crate::compression::ZSTD);
+    frame.extend(body);
+    frame
+}
+
 /// A reader charging a full private allowance, so its next compressed frame
 /// waits for room.
 fn waiting_reader(
@@ -625,47 +637,54 @@ fn a_read_stream_does_not_hold_room_its_stop_needs() {
         reader.read_msg::<Response>().unwrap(),
         Response::HelloOk { .. }
     ));
-    socket
-        .write_all(&concatenated_zstd_frame(&Request::ReadStream(
-            ReadStreamRequest {
+    let stream = |path: Vec<u8>| {
+        Request::ReadStream(ReadStreamRequest {
+            path,
+            source: Some(selection.join(b"marker").unwrap()),
+            attempt: 0,
+            off: 0,
+            end: 6,
+            block: 512,
+        })
+    };
+    // A small request that decodes to no more than it arrived as, and one
+    // whose long, compressible path really expands: what it added stays
+    // charged after decoding unless the stream releases it.
+    for frame in [
+        concatenated_zstd_frame(&stream(Vec::new())),
+        zstd_frame(&stream(vec![b'a'; 6 << 20])),
+    ] {
+        socket.write_all(&frame).unwrap();
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::Ok
+        ));
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::Block { data, .. } if data == b"marker"
+        ));
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::ReadStreamDone
+        ));
+        socket
+            .write_all(&concatenated_zstd_frame(&Request::StopReadStream))
+            .unwrap();
+        // The socket's read deadline fails the test if the Stop waits.
+        writer
+            .write_msg(&Request::ReadRange {
                 path: Vec::new(),
                 source: Some(selection.join(b"marker").unwrap()),
                 attempt: 0,
                 off: 0,
-                end: 6,
-                block: 512,
-            },
-        )))
-        .unwrap();
-    assert!(matches!(
-        reader.read_msg::<Response>().unwrap(),
-        Response::Ok
-    ));
-    assert!(matches!(
-        reader.read_msg::<Response>().unwrap(),
-        Response::Block { data, .. } if data == b"marker"
-    ));
-    assert!(matches!(
-        reader.read_msg::<Response>().unwrap(),
-        Response::ReadStreamDone
-    ));
-    socket
-        .write_all(&concatenated_zstd_frame(&Request::StopReadStream))
-        .unwrap();
-    // The socket's read deadline fails the test if the Stop waits.
-    writer
-        .write_msg(&Request::ReadRange {
-            path: Vec::new(),
-            source: Some(selection.join(b"marker").unwrap()),
-            attempt: 0,
-            off: 0,
-            len: 6,
-        })
-        .unwrap();
-    assert!(matches!(
-        reader.read_msg::<Response>().unwrap(),
-        Response::Block { data, .. } if data == b"marker"
-    ));
+                len: 6,
+            })
+            .unwrap();
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::Block { data, .. } if data == b"marker"
+        ));
+    }
     drop((writer, reader));
     socket.shutdown(std::net::Shutdown::Both).unwrap();
     server.join().unwrap().unwrap();

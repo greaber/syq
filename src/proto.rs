@@ -2536,6 +2536,8 @@ pub struct FrameReader<R: Read> {
     limit: usize,
     /// Set when what decompression adds is charged (`charge_expansion`).
     expansion: Option<crate::wire_budget::ExpansionCharge>,
+    /// Kept for decoding single zstd frames, created on first use.
+    zstd: Option<zstd::bulk::Decompressor<'static>>,
 }
 
 impl<R: Read> FrameReader<R> {
@@ -2546,6 +2548,7 @@ impl<R: Read> FrameReader<R> {
             preamble_read: false,
             limit: MAX_FRAME,
             expansion: None,
+            zstd: None,
         }
     }
 
@@ -2676,6 +2679,57 @@ impl<R: Read> FrameReader<R> {
         self.read_frame().map(|message| (message, started_at))
     }
 
+    /// Decode one zstd frame of a declared size straight into one buffer of
+    /// that size. Decoding in one pass keeps no window beyond that buffer.
+    fn decode_zstd_frame(&mut self, body: &[u8], size: usize) -> io::Result<Vec<u8>> {
+        let mut output = Vec::new();
+        output.try_reserve_exact(size).map_err(io::Error::other)?;
+        let decoder = match &mut self.zstd {
+            Some(decoder) => decoder,
+            None => self.zstd.insert(zstd::bulk::Decompressor::new()?),
+        };
+        if decoder.decompress_to_buffer(body, &mut output)? != size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "zstd frame does not decode to its declared size",
+            ));
+        }
+        Ok(output)
+    }
+
+    /// Decode zstd frames whose decoded size is not declared up front, or
+    /// several frames in one body, bounding the output by this reader's limit.
+    fn decode_zstd_stream(&self, body: &[u8], first: Option<usize>) -> io::Result<Vec<u8>> {
+        // Bound zstd's advertised window as well as its output. Level-1
+        // frames from the released writer use windows below this ceiling.
+        let mut decoder = zstd::stream::read::Decoder::new(body)?;
+        decoder.window_log_max(23)?;
+        let mut output = Vec::new();
+        // The first frame's size, when it has one, is only a hint.
+        if let Some(size) = first {
+            output
+                .try_reserve_exact(size.min(8 << 20))
+                .map_err(io::Error::other)?;
+        }
+        let mut chunk = [0u8; 16 << 10];
+        loop {
+            let n = decoder.read(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            if output.len() + n >= self.limit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "decompressed frame exceeds limit",
+                ));
+            }
+            // Keep output capacity close to the bounded decoded length.
+            output.try_reserve_exact(n).map_err(io::Error::other)?;
+            output.extend_from_slice(&chunk[..n]);
+        }
+        Ok(output)
+    }
+
     fn read_frame<T: for<'de> Deserialize<'de> + SizeHint>(
         &mut self,
     ) -> io::Result<crate::wire_budget::Budgeted<T>> {
@@ -2715,15 +2769,6 @@ impl<R: Read> FrameReader<R> {
         let mut expansion = None;
         let body_len = body.len();
         let payload = if flag[0] == crate::compression::ZSTD {
-            // Bound zstd's advertised window as well as its output. Level-1
-            // frames from the released writer use windows below this ceiling.
-            let mut decoder = zstd::stream::read::Decoder::new(&body[..])?;
-            decoder.window_log_max(23)?;
-            let mut output = Vec::new();
-            // Bulk encoders include the decoded length. Reserve it once for
-            // ordinary frames instead of growing at every streaming read.
-            // This is only a hint: unknown sizes and concatenated frames still
-            // use the streaming decoder and its actual-output bound below.
             let first = match zstd::zstd_safe::get_frame_content_size(&body) {
                 Ok(Some(size)) if size >= self.limit as u64 => {
                     return Err(io::Error::new(
@@ -2742,34 +2787,11 @@ impl<R: Read> FrameReader<R> {
                     .is_ok_and(|len| len == body.len())
             });
             expansion = self.reserve_expansion(&body, declared.unwrap_or(self.limit - 1))?;
-            if let Some(size) = first {
-                output
-                    .try_reserve_exact(size.min(8 << 20))
-                    .map_err(io::Error::other)?;
+            match declared {
+                Some(size) => self.decode_zstd_frame(&body, size)?,
+                None => self.decode_zstd_stream(&body, first)?,
             }
-            let mut chunk = [0u8; 16 << 10];
-            loop {
-                let n = decoder.read(&mut chunk)?;
-                if n == 0 {
-                    break;
-                }
-                if output.len() + n >= self.limit {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "decompressed frame exceeds limit",
-                    ));
-                }
-                if declared.is_some_and(|size| output.len() + n > size) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "decompressed frame exceeds its declared size",
-                    ));
-                }
-                // Keep output capacity close to the bounded decoded length.
-                output.try_reserve_exact(n).map_err(io::Error::other)?;
-                output.extend_from_slice(&chunk[..n]);
-            }
-            output.into()
+            .into()
         } else if flag[0] == crate::compression::LZ4 {
             let size = crate::compression::lz4_decoded_size(&body, self.limit)?;
             expansion = self.reserve_expansion(&body, size)?;
