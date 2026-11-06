@@ -3846,6 +3846,17 @@ fn signed_skip_allows_seeding_and_retrying_a_new_file() {
 /// whatever the source claims, and nothing for a publication that fails.
 #[test]
 fn restricted_publication_removes_only_its_own_earlier_partials() {
+    // Whether or not the grant lets the copy delete: the cleanup is the
+    // ordinary copy's, not a deletion the grant controls.
+    for deletion in [
+        DeletionPolicy::Forbid,
+        DeletionPolicy::DeleteDestinationOnly,
+    ] {
+        publication_removes_only_its_own_earlier_partials(deletion);
+    }
+}
+
+fn publication_removes_only_its_own_earlier_partials(deletion: DeletionPolicy) {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     let target = root.join("target");
@@ -3876,8 +3887,13 @@ fn restricted_publication_removes_only_its_own_earlier_partials() {
     }
     fs::write(&linked, b"old").unwrap();
     fs::hard_link(&linked, &untouched[3]).unwrap();
-    let mut authority = existence_authority(
+    let mut authority = test_authority_with_existence(
         &root,
+        deletion,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
         ExistingDestinationPolicy::Skip,
         DestinationPlacement::ExactPath,
         RootExistence::Any,
