@@ -699,7 +699,7 @@ fn named_control_closure_revokes_connected_workers() {
         .get(&approved.token)
         .unwrap()
         .authority
-        .clone();
+        .receiving();
     drop(conn);
     let deadline = Instant::now() + Duration::from_secs(2);
     while !receiver.sessions.lock().unwrap().is_empty() && Instant::now() < deadline {
@@ -1565,7 +1565,7 @@ fn named_workers_refuse_mutations_before_transport_shutdown() {
         let approved = approve(&registration, command, request);
         let authority = receiver.sessions.lock().unwrap()[&approved.token]
             .authority
-            .clone();
+            .receiving();
         let mut spec = crate::conn::RemoteSpec::local_receiver(true);
         spec.restricted_grant = Some(route(registration, approved.token));
         let mut control = spec.connect_with(false, false).unwrap();

@@ -79,7 +79,7 @@ impl Receiver {
             if !session.opened {
                 bail!("transfer control channel has not opened");
             }
-            Arc::clone(&session.authority)
+            session.authority.clone()
         };
         if request.port == 0
             || (request.ports != (0, 0)
@@ -88,17 +88,24 @@ impl Receiver {
             bail!("reverse TCP port is outside the approved range");
         }
         // Reuse the approved transport constraints and one-listener allowance.
-        authority.authorize(
-            &mut crate::proto::Request::TcpListen {
-                send_rate: None,
-                key: Some(vec![0; crate::tcp_records::KEY_LEN]),
-                token: vec![0; 16],
-                port_lo: request.ports.0,
-                port_hi: request.ports.1,
-                congestion_control: request.congestion_control.clone(),
-            },
-            true,
-        )?;
+        match &authority {
+            SessionAuthority::Receive(authority) => authority
+                .authorize(
+                    &mut crate::proto::Request::TcpListen {
+                        send_rate: None,
+                        key: Some(vec![0; crate::tcp_records::KEY_LEN]),
+                        token: vec![0; 16],
+                        port_lo: request.ports.0,
+                        port_hi: request.ports.1,
+                        congestion_control: request.congestion_control.clone(),
+                    },
+                    true,
+                )
+                .map(drop)?,
+            SessionAuthority::Send { authority, .. } => {
+                authority.authorize_reverse_tcp(request.ports, &request.congestion_control)?
+            }
+        }
         // The coordinator measured the round trip between the two machines.
         let wait = Duration::from_millis(request.wait_ms)
             .clamp(crate::conn::TCP_PROBE_FLOOR, crate::conn::TCP_PROBE_CEILING);
@@ -135,7 +142,7 @@ impl Receiver {
         let session = sessions
             .get_mut(&request.token)
             .context("transfer ended during TCP setup")?;
-        if !authority.control_is_open() {
+        if !authority.is_open() {
             bail!("transfer control channel closed");
         }
         session.tcp = Some(info);
@@ -160,9 +167,15 @@ impl Receiver {
                 .as_ref()
                 .context("reverse TCP was not set up")?
                 .clone();
-            let permit = crate::server::ConnectionPermit::acquire(Arc::clone(&session.authority))?;
+            // A source counts its workers when they say hello.
+            let permit = match &session.authority {
+                SessionAuthority::Receive(authority) => Some(
+                    crate::server::ConnectionPermit::acquire(Arc::clone(authority))?,
+                ),
+                SessionAuthority::Send { .. } => None,
+            };
             let tracked = session.channels.track(channel.try_clone()?)?;
-            (Arc::clone(&session.authority), info, permit, tracked)
+            (session.authority.clone(), info, permit, tracked)
         };
         let mut socket = match info.connect_socket() {
             Ok(socket) => socket,
@@ -191,7 +204,21 @@ impl Receiver {
             let _ = watch_channel.read(&mut [0]);
             let _ = watch_socket.shutdown(Shutdown::Both);
         });
-        let result = crate::server::run_named_tcp(socket, serve_channel, &request.key, authority);
+        let result = match authority {
+            SessionAuthority::Receive(authority) => {
+                crate::server::run_named_tcp(socket, serve_channel, &request.key, authority)
+            }
+            SessionAuthority::Send {
+                authority,
+                descriptors,
+            } => crate::server::run_named_source_tcp(
+                socket,
+                serve_channel,
+                &request.key,
+                authority,
+                descriptors,
+            ),
+        };
         let _ = lifetime.shutdown(Shutdown::Both);
         let _ = watcher.join();
         result

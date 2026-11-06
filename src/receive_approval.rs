@@ -72,6 +72,7 @@ pub(crate) enum Kind {
     ProviderSsh,
     Storage,
     Source,
+    Send,
 }
 impl Kind {
     pub(crate) fn is_copy(&self) -> bool {
@@ -138,6 +139,15 @@ pub(crate) struct Summary {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum Details {
+    /// Files this machine sends to the requesting server.
+    Send {
+        kind: SendKind,
+        /// The exact paths on this machine, each with what it may be.
+        paths: Vec<String>,
+        permission: String,
+        max_bytes: u64,
+        max_entries: u64,
+    },
     Source {
         kind: SourceKind,
         source: String,
@@ -211,6 +221,11 @@ pub(crate) enum StorageKind {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SourceKind {
     Source,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SendKind {
+    Send,
 }
 impl Summary {
     fn new(
@@ -343,6 +358,7 @@ impl Summary {
     pub(crate) fn kind(&self) -> Kind {
         match self.details {
             Details::Source { .. } => Kind::Source,
+            Details::Send { .. } => Kind::Send,
             Details::Copy { .. } => Kind::Copy,
             Details::Command { .. } => Kind::Command,
             Details::Ssh { .. } => Kind::Ssh,
@@ -453,6 +469,7 @@ impl Summary {
         };
         let body = match &self.details {
             Details::Source { source, scopes, permission, max_bytes, max_entries, .. } => format!("{source}\n{}\n{permission}\nAt most {max_bytes} bytes and {max_entries} entries", scopes.join("\n")),
+            Details::Send { paths, permission, max_bytes, max_entries, .. } => format!("Files on this machine:\n{}\n{permission}\nAt most {max_bytes} bytes and {max_entries} entries", paths.iter().map(|path| format!("  {path}")).collect::<Vec<_>>().join("\n")),
             Details::Storage { description, .. } => description.clone(),
             Details::Ssh { destination, permission, .. }
             | Details::ProviderSsh { destination, permission, .. } => format!("{destination}\n{permission}"),
@@ -481,6 +498,7 @@ impl Summary {
     ) -> String {
         let question = match self.kind() {
             Kind::Source => "Allow these source reads once?",
+            Kind::Send => "Send these files to the server once?",
             Kind::Copy => "Allow this copy once?",
             Kind::Command => "Run this command once?",
             Kind::Ssh | Kind::ProviderSsh => "Allow access to this SSH account?",
@@ -1179,6 +1197,70 @@ impl Queue {
                     permission,
                     max_bytes: request.limits.max_total_bytes,
                     max_entries: request.limits.max_entries,
+                },
+            },
+            notifications,
+            TIMEOUT,
+            cancelled,
+        )
+    }
+
+    /// Files this machine would send to the requesting server: `paths` are
+    /// the exact paths, each with what it may be, and `confined` the
+    /// directory reads stay inside, when they must.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn request_send(
+        &self,
+        from: &Requester,
+        command: &[Vec<u8>],
+        cwd: &str,
+        paths: &[(Vec<u8>, &'static str)],
+        confined: Option<&[u8]>,
+        limits: &crate::delegation::CopyLimits,
+        notifications: Notifications,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<()> {
+        let mut id = [0; 16];
+        getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("approval ID: {e}"))?;
+        let inside = confined
+            .map(|root| {
+                format!(
+                    " Reads stay inside {}.",
+                    crate::approval_command::display_arg(root)
+                )
+            })
+            .unwrap_or_default();
+        let permission = format!("These files leave this machine: {} may list and read them and receives their contents. Filters narrow the copy, not this read permission.{inside} Nothing on this machine is changed.", from.server);
+        let shown = |path: String, scope: &str| format!("{path} ({scope})");
+        self.wait(
+            Summary {
+                id: id.iter().map(|b| format!("{b:02x}")).collect(),
+                from: format!("{:?}", from.to_string()),
+                server: from.server.clone(),
+                expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
+                    + TIMEOUT.as_secs(),
+                notification: "starting".into(),
+                command: crate::approval_command::display(command),
+                server_cwd: shown_directory(cwd),
+                verb: "wants files from this machine",
+                sources: paths
+                    .iter()
+                    .map(|(path, scope)| shown(local_path(path), scope))
+                    .collect(),
+                preposition: "sent to",
+                target: from.server.clone(),
+                notes: vec![permission.clone()],
+                details: Details::Send {
+                    kind: SendKind::Send,
+                    paths: paths
+                        .iter()
+                        .map(|(path, scope)| {
+                            shown(crate::approval_command::display_arg(path), scope)
+                        })
+                        .collect(),
+                    permission,
+                    max_bytes: limits.max_total_bytes,
+                    max_entries: limits.max_entries,
                 },
             },
             notifications,

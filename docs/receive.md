@@ -69,10 +69,6 @@ profile's starting directory (your home directory unless you set `--cwd`,
 `--root` or `--auto-approve-root`), or to a path you give with `--into` or
 `--as`, relative to that directory or absolute.
 
-Your laptop accepts copies and commands, but it can't be a copy source: to
-copy files from your laptop to the server, run `syq cp PATH --to server` on
-the laptop.
-
 Each copy waits for approval **on your laptop**. The prompt shows the server,
 what is copied where, and a warning for each option that lets the server do
 more than copy files, such as pruning or copying permissions. Choose
@@ -106,6 +102,24 @@ optional settings with `syq persist receive on` on your laptop:
 Changing any of these except `--notify` cancels active copies, commands and
 pending requests. Copies you approved between two servers keep running; see
 [Copying between servers](security.md#copying-between-servers) to stop them.
+
+<a id="copy-files-from-your-laptop"></a>
+
+## Copy files from your laptop
+
+On the server, name your laptop with `--from`:
+
+```sh
+syq cp --from @laptop .kube --into .
+syq cp --from @laptop notes/todo.md --as todo.md
+```
+
+Paths start in the same directory as downloads, and with `--root` they must
+stay inside it: absolute paths and `..` are refused. The prompt on your
+laptop shows the exact files the server asked for and that they will leave
+your laptop. Approving lets the server read just those files or directories
+for this one copy; nothing on your laptop is changed. Sending always asks,
+even with `--auto-approve-root`, which applies only to downloads.
 
 ## Run commands on your laptop
 

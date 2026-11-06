@@ -660,6 +660,9 @@ python3 /usr/local/libexec/syq-test-return-exec.py
 printf 'case: source copies authorized through the return connection\n'
 python3 /usr/local/libexec/syq-test-pull-copy.py
 
+printf 'case: servers copy files from the laptop it approves\n'
+python3 /usr/local/libexec/syq-test-send-copy.py
+
 printf 'case: direct SSH sessions authorized through the return connection\n'
 python3 /usr/local/libexec/syq-test-return-ssh.py
 

@@ -25,7 +25,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | Argument / option | Meaning |
 |---|---|
 | `--src-fd <FD>` | Read raw bytes from an inherited local descriptor (0 for stdin), instead of a source path |
-| `--from <ENDPOINT>` | Source endpoint ([USER@]HOST[:PORT] or s3://BUCKET); omitted means local |
+| `--from <ENDPOINT>` | Source endpoint ([USER@]HOST[:PORT], receiving name (@NAME), or s3://BUCKET); omitted means local |
 | `-C, --cwd <DIR>` | Resolve relative source paths from DIR |
 | `--root <DIR>` | Resolve source paths inside DIR and refuse any that lead outside it |
 | `--src <PATH>` | Select a named source object (repeatable) |

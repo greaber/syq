@@ -37,6 +37,7 @@ pub(crate) mod handoff;
 mod identity;
 pub(crate) mod peer_bridge;
 pub(crate) mod pull;
+pub(crate) mod send;
 pub(crate) mod ssh;
 pub(crate) mod ssh_auth;
 pub(crate) mod storage;
@@ -311,6 +312,12 @@ enum Message {
         cwd: String,
         request: Box<pull::PullRequest>,
     },
+    /// A copy of files on this machine to the requesting server.
+    Send {
+        command: Vec<Vec<u8>>,
+        cwd: String,
+        request: Box<pull::PullRequest>,
+    },
     /// A copy from the requesting server to another server, which this
     /// machine approves with a directive for that server's enrolled
     /// receiver. The server sends what its command read from files.
@@ -335,6 +342,7 @@ enum Reply {
     Ready,
     Identity(identity::Proof),
     Approved(Approved),
+    SendApproved(Box<send::SendApproved>),
     Error(String),
 }
 
@@ -1054,9 +1062,15 @@ fn select_copy(
 ) -> Result<Option<handoff::Selection>> {
     // Other operation interfaces select account authorization at their
     // transport boundary; native copies select it here before reading inputs.
-    if args.interface != crate::cli::Interface::NativeCp
-        || args.coordinate_at == crate::cli::CoordinateAt::Local
-    {
+    if args.interface != crate::cli::Interface::NativeCp {
+        return Ok(None);
+    }
+    // Files on a receiving machine: it approves the copy, whatever else
+    // this machine could use.
+    if let Some(selection) = send::select(args)? {
+        return Ok(Some(selection));
+    }
+    if args.coordinate_at == crate::cli::CoordinateAt::Local {
         return Ok(None);
     }
     if peer_bridge::configure(args)? {
@@ -1193,6 +1207,9 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     if selection.kind == handoff::Kind::Pull {
         return pull::prepare(args, selection);
     }
+    if selection.kind == handoff::Kind::Send {
+        return send::prepare(args, selection);
+    }
     if selection.kind == handoff::Kind::Forward {
         return forward::prepare(args, selection);
     }
@@ -1320,9 +1337,43 @@ fn decode_route(grant: &str) -> Result<Route> {
     )?)
 }
 
+/// What an approved copy may do here: write files it sends, or read files
+/// this machine sends.
+#[derive(Clone)]
+enum SessionAuthority {
+    Receive(Arc<crate::restricted::RestrictedAuthority>),
+    Send {
+        authority: Arc<crate::restricted::source::SourceAuthority>,
+        /// Shared by the copy's control and workers: workers can use only
+        /// the roots its control registered.
+        descriptors: crate::descriptor_broker::DescriptorSessionSlot,
+    },
+}
+impl SessionAuthority {
+    #[cfg(test)]
+    fn receiving(&self) -> Arc<crate::restricted::RestrictedAuthority> {
+        match self {
+            Self::Receive(authority) => Arc::clone(authority),
+            Self::Send { .. } => panic!("not a receiving session"),
+        }
+    }
+    fn close(&self) {
+        match self {
+            Self::Receive(authority) => authority.close_control(),
+            Self::Send { authority, .. } => authority.close(),
+        }
+    }
+    fn is_open(&self) -> bool {
+        match self {
+            Self::Receive(authority) => authority.control_is_open(),
+            Self::Send { authority, .. } => authority.is_open(),
+        }
+    }
+}
+
 struct Session {
     tcp: Option<crate::conn::TcpInfo>,
-    authority: Arc<crate::restricted::RestrictedAuthority>,
+    authority: SessionAuthority,
     issued: Instant,
     opened: bool,
     channels: Arc<crate::private_broker::ConnectionRegistry>,
@@ -1416,7 +1467,7 @@ impl Receiver {
         self.account_sessions.lock().unwrap().clear();
         self.active_streams.shutdown_all();
         for (_, session) in sessions.drain() {
-            session.authority.close_control();
+            session.authority.close();
             session.channels.shutdown_all();
         }
     }
@@ -1463,6 +1514,11 @@ impl Receiver {
                 cwd,
                 request,
             } => self.pull(target, command, cwd, *request, stream),
+            Message::Send {
+                command,
+                cwd,
+                request,
+            } => self.send(command, cwd, *request, stream),
             Message::Forward {
                 target,
                 command,
@@ -1560,7 +1616,7 @@ impl Receiver {
                     approved.token.clone(),
                     Session {
                         tcp: None,
-                        authority,
+                        authority: SessionAuthority::Receive(authority),
                         issued: Instant::now(),
                         opened: false,
                         channels: Arc::new(crate::private_broker::ConnectionRegistry::new(
@@ -1584,19 +1640,19 @@ impl Receiver {
                     } else if !session.opened {
                         bail!("transfer control channel has not opened");
                     }
-                    let permit = if control {
-                        None
-                    } else {
-                        Some(crate::server::ConnectionPermit::acquire(Arc::clone(
-                            &session.authority,
-                        ))?)
+                    // A source counts its workers when they say hello.
+                    let permit = match &session.authority {
+                        SessionAuthority::Receive(authority) if !control => Some(
+                            crate::server::ConnectionPermit::acquire(Arc::clone(authority))?,
+                        ),
+                        _ => None,
                     };
                     let channel = session.channels.track(stream.try_clone()?)?;
                     if control {
                         session.opened = true;
                     }
                     (
-                        Arc::clone(&session.authority),
+                        session.authority.clone(),
                         Arc::clone(&session.channels),
                         permit,
                         channel,
@@ -1608,12 +1664,26 @@ impl Receiver {
                     // Keep the bounded Hello deadline until the server has
                     // validated its complete handshake. Pending workers already
                     // consume their per-transfer connection allowance.
-                    crate::server::run_named(stream, writer, Arc::clone(&authority), control)
+                    match &authority {
+                        SessionAuthority::Receive(authority) => {
+                            crate::server::run_named(stream, writer, Arc::clone(authority), control)
+                        }
+                        SessionAuthority::Send {
+                            authority,
+                            descriptors,
+                        } => crate::server::run_named_source(
+                            stream,
+                            writer,
+                            Arc::clone(authority),
+                            descriptors.clone(),
+                            control,
+                        ),
+                    }
                 })();
                 if control {
                     // Opening consumes the token even if the reply fails. Do
                     // not leave an opened session occupying a slot forever.
-                    authority.close_control();
+                    authority.close();
                     channels.shutdown_all();
                     self.sessions.lock().unwrap().remove(&token);
                 }

@@ -665,7 +665,8 @@ impl ForwardChild {
                     | Reply::Identity(_)
                     | Reply::TcpProbed(_)
                     | Reply::TcpCongestionRejected(_)
-                    | Reply::Directive(_),
+                    | Reply::Directive(_)
+                    | Reply::SendApproved(_),
                 ) => {
                     bail!("invalid destination setup response")
                 }
@@ -1273,7 +1274,7 @@ pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
                 .context("invalid copy worker admission")
                 .and_then(ssh::worker),
         ),
-        "--return-source-probe" if argv.len() == 2 => Some(Ok(0)),
+        "--return-source-probe" | "--return-send-probe" if argv.len() == 2 => Some(Ok(0)),
         "--return-prepare" if argv.len() == 2 => Some(prepare_setup()),
         "--return-source" if argv.len() == 2 => Some(super::pull::receive()),
         "--return-connect" | "--return-connect-install" if argv.len() == 4 => Some(

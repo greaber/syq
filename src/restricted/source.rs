@@ -119,6 +119,33 @@ impl SourceAuthority {
         self.state.lock().unwrap().open = false;
     }
 
+    /// Admit the one TCP listener a receiving machine sets up by dialing the
+    /// coordinator, as `SourceConnection::authorize` admits `TcpListen`.
+    pub(crate) fn authorize_reverse_tcp(
+        &self,
+        ports: (u16, u16),
+        congestion_control: &Option<String>,
+    ) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        self.check_open(&state)?;
+        ensure!(state.control_admitted, "source control has not opened");
+        let tcp = self
+            .policy
+            .tcp
+            .as_ref()
+            .context("source TCP listener was not approved")?;
+        ensure!(
+            ports == (tcp.port_lo, tcp.port_hi) && *congestion_control == tcp.congestion_control,
+            "source TCP settings differ from approval"
+        );
+        ensure!(
+            !state.tcp_listener_started,
+            "approved source TCP listener already started"
+        );
+        state.tcp_listener_started = true;
+        Ok(())
+    }
+
     pub(crate) fn is_open(&self) -> bool {
         self.check_open(&self.state.lock().unwrap()).is_ok()
     }

@@ -1072,6 +1072,120 @@ fn receiver_destinations_require_sigil_and_never_fall_back() {
     );
 }
 
+/// `syq cp --from @NAME` asks that machine to send the named files, never
+/// using ssh, and says what to do when its syq predates sending.
+#[test]
+fn copies_from_a_receiving_machine_ask_it_and_explain_an_old_helper() {
+    use std::os::unix::net::UnixListener;
+    let t = Tmp::new();
+    executable_support::write_executable(
+        &t.path("bin/ssh"),
+        b"#!/bin/sh\n: > \"$SSH_MARKER\"\nexit 55\n",
+        0o700,
+    );
+    // A helper from before sending: it knows no capability probe.
+    executable_support::write_executable(&t.path("old-helper"), b"#!/bin/sh\nexit 2\n", 0o700);
+    let mut path = vec![t.path("bin")];
+    path.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(path).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .env("PATH", &path)
+            .env("SSH_MARKER", t.path("ssh-used"))
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .env_remove("SYQ_AUTH_FROM")
+            .current_dir(t.path(""))
+            .stdin(Stdio::null())
+            .capture_output()
+            .unwrap()
+    };
+    let identity = String::from_utf8(run(&["--build-identity"]).stdout).unwrap();
+    let registry = t.path(".syq-destinations-v3");
+    fs::create_dir(&registry).unwrap();
+    fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
+    let socket_path = t.path("return.sock");
+    let register = |identity: &str, program: &Path| {
+        let registration = serde_json::json!({"version":3,"identity":identity,
+            "socket":socket_path,"secret":"test","program":std::os::unix::ffi::OsStrExt::as_bytes(program.as_os_str())});
+        write(
+            &registry.join("laptop.json"),
+            &serde_json::to_vec(&registration).unwrap(),
+        );
+        fs::set_permissions(
+            registry.join("laptop.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    };
+
+    register("old-build", &t.path("old-helper"));
+    let old = run(&["cp", "--from", "@laptop", ".kube", "--into", "copy"]);
+    assert!(!old.status.success());
+    assert!(
+        stderr_of(&old).contains("the syq connected as @laptop does not support copies from it to this server; update syq on that machine and run any syq command there"),
+        "{}",
+        stderr_of(&old)
+    );
+
+    register(identity.trim(), Path::new(env!("CARGO_BIN_EXE_syq")));
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let responder = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => {
+                    socket.set_nonblocking(false).unwrap();
+                    break socket;
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(e) => panic!("return test connection: {e}"),
+            }
+        };
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut length = [0; 4];
+        socket.read_exact(&mut length).unwrap();
+        let mut request = vec![0; u32::from_be_bytes(length) as usize];
+        socket.read_exact(&mut request).unwrap();
+        let response =
+            serde_json::to_vec(&serde_json::json!({"Error":"sending denied by test policy"}))
+                .unwrap();
+        socket
+            .write_all(&(response.len() as u32).to_be_bytes())
+            .unwrap();
+        socket.write_all(&response).unwrap();
+        serde_json::from_slice::<serde_json::Value>(&request).unwrap()
+    });
+    let denied = run(&["cp", "--from", "@laptop", ".kube", "--into", "copy"]);
+    let request = responder.join().unwrap();
+    assert!(!denied.status.success());
+    assert!(
+        stderr_of(&denied).contains("sending denied by test policy"),
+        "{}",
+        stderr_of(&denied)
+    );
+    let send = &request["message"]["Send"];
+    assert_eq!(
+        send["request"]["selections"][0]["path"],
+        serde_json::json!(b".kube")
+    );
+    assert!(!t.path("copy").exists());
+    assert!(!t.path("ssh-used").exists(), "a copy from @laptop ran ssh");
+}
+
 /// A leading `@NAME` is a receiving name in every command, never an SSH login
 /// with an empty user name. An unknown name, or a command that cannot use a
 /// receiving machine, fails at once and says what to do, without running ssh.
@@ -1139,21 +1253,18 @@ fn unknown_receiving_names_never_reach_ssh_and_say_what_to_do() {
         );
         error
     };
-    let copy_from = [
-        "cannot copy from receiving machine @master",
-        "run `syq cp PATH --to HOST` on it, where HOST is how it reaches this server",
-    ];
-    for args in [
-        &["cp", ".kube", "--from", "@master"][..],
-        &["cp", ".kube", "--from", "@master", "--rsh", &rsh],
-        &["cp", ".kube", "--from", "@master", "--to", "server"],
-        &["rsync", "-e", &rsh, "@master:.kube", "copy/"],
-    ] {
-        let error = run(args);
-        for expected in copy_from {
-            assert!(error.contains(expected), "{args:?}: {error}");
-        }
-    }
+    let error = run(&["cp", ".kube", "--from", "@master", "--to", "server"]);
+    assert!(
+        error
+            .contains("a copy from receiving machine @master goes to this machine; leave out --to"),
+        "{error}"
+    );
+    let error = run(&["rsync", "-e", &rsh, "@master:.kube", "copy/"]);
+    assert!(
+        error.contains("receiving machine @master cannot be used with syq rsync")
+            && error.contains("`syq cp --from @master PATH`"),
+        "{error}"
+    );
     let error = run(&["rsync", "-e", &rsh, "source", "@master:copy"]);
     assert!(
         error.contains("receiving machine @master cannot be used with syq rsync")
@@ -1189,6 +1300,8 @@ fn unknown_receiving_names_never_reach_ssh_and_say_what_to_do() {
         for args in [
             &["cp", "source", "--to", "@master"][..],
             &["cp", "source", "--to", "@master", "--rsh", &rsh],
+            &["cp", ".kube", "--from", "@master"],
+            &["cp", ".kube", "--from", "@master", "--rsh", &rsh],
             &["exec", "--on", "@master", "--", "true"],
         ] {
             let error = run(args);
