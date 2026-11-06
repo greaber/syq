@@ -86,9 +86,10 @@ Restricted copies cannot use `--no-tcp-encryption`, `--detach`, or
 `--performance-tuning workers=N` above 128, and `syq rm` cannot go through the
 receiver; use a normal SSH login for those.
 
-With `--into`, `--follow-dst` follows a destination symlink only to a
-directory inside the destination's parent directory. `--widen-dirs all`
-widens nothing above that parent.
+As in any copy, a symlink in the destination path you give stops the copy
+unless you pass `--follow-dst`. Even then, with `--into`, a symlink at the
+destination itself is followed only to a directory inside the destination's
+parent directory. `--widen-dirs all` widens nothing above that parent.
 
 <a id="signed-results"></a>
 

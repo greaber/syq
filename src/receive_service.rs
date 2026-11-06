@@ -2680,6 +2680,11 @@ fn run(domain: &Domain, control: &Path, started_from: Option<PathBuf>) -> Result
         }
         Ok(registrations)
     })?;
+    // Copies received here cannot change the file this service runs after
+    // an update.
+    if let Some(path) = &started_from {
+        crate::restricted::protect_followed_program(path);
+    }
     // Only a UTF-8 path can be reported in a status.
     let mut follower = started_from
         .filter(|path| path.to_str().is_some())

@@ -2327,6 +2327,69 @@ fn restricted_destinations_cannot_overlap_receiver_control_paths() {
         assert!(error.to_string().contains(label), "{error}");
     }
 }
+/// A receiving service runs the syq it follows by itself after an update,
+/// so the copies it receives cannot change that file, or the files a link
+/// there leads to, as with Homebrew's `bin/syq`.
+#[test]
+fn receivers_protect_the_syq_a_receiving_service_follows() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let bin = temporary.path().join("bin");
+    let installed = temporary.path().join("Cellar/syq/1.0.0/bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&installed).unwrap();
+    fs::write(installed.join("syq"), b"").unwrap();
+    symlink("../Cellar/syq/1.0.0/bin/syq", bin.join("syq")).unwrap();
+    assert_eq!(
+        program_directories(&bin.join("syq")),
+        [
+            bin.clone(),
+            bin.join("../Cellar/syq/1.0.0/bin"),
+            installed.clone()
+        ]
+    );
+    let home = temporary.path().join("home");
+    let before = receiver_control_paths(&home, None, ControlPaths::Here).unwrap();
+    reject_control_plane_path(bin.join("syq").as_os_str().as_bytes(), &before).unwrap();
+    protect_followed_program(&bin.join("syq"));
+    let protected = receiver_control_paths(&home, None, ControlPaths::Here).unwrap();
+    for path in [bin.join("syq"), installed.join("syq"), bin.clone()] {
+        let error = reject_control_plane_path(path.as_os_str().as_bytes(), &protected)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("protected directory of the syq receiving runs"),
+            "{error}"
+        );
+    }
+    // Another server's paths do not include this machine's program.
+    let elsewhere = receiver_control_paths(&home, None, ControlPaths::Elsewhere(&[])).unwrap();
+    reject_control_plane_path(bin.join("syq").as_os_str().as_bytes(), &elsewhere).unwrap();
+    // An approved copy into that directory is refused by identity too,
+    // whatever name reaches it.
+    symlink(&bin, temporary.path().join("alias")).unwrap();
+    let error = test_authority_with_options(
+        &temporary.path().join("alias"),
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::ExactPath,
+        RootExistence::Any,
+        None,
+        (Default::default(), &protected),
+    )
+    .err()
+    .map(|error| format!("{error:#}"));
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|error| error.contains("directory of the syq receiving runs")),
+        "{error:?}"
+    );
+}
+
 #[test]
 fn enrolled_destinations_accept_any_bytes() {
     use std::os::unix::ffi::OsStrExt as _;
