@@ -623,11 +623,8 @@ pub(crate) struct Busy {
     /// Of those, the ones that say something uses them, so that they stop
     /// counting once it ends. The rest cannot say, and count until they
     /// close.
-    #[serde(default, skip_serializing_if = "none_in_use")]
+    #[serde(default)]
     pub(crate) accounts_in_use: usize,
-}
-fn none_in_use(value: &usize) -> bool {
-    *value == 0
 }
 impl Busy {
     pub(crate) fn idle(&self) -> bool {
@@ -937,10 +934,15 @@ pub(crate) fn busy_notice(
     } else {
         "once nothing is in progress, a syq command run here switches it to this version"
     };
-    let mut notice = format!(
-        "receiving through {endpoint} keeps running syq {build} for now, with {}; {then}",
-        busy.describe(Some(endpoint)),
-    );
+    // A request may have come and gone just as it was asked to stop.
+    let with = busy.describe(Some(endpoint));
+    let with = if with.is_empty() {
+        String::new()
+    } else {
+        format!(", with {with}")
+    };
+    let mut notice =
+        format!("receiving through {endpoint} keeps running syq {build} for now{with}; {then}");
     if busy.accounts > 0 {
         notice.push_str(&format!(
             "; `{fix}` switches now and closes the account connection{}",
@@ -1565,10 +1567,10 @@ fn replace_other(
             if switch::follows_other_file(state.started_from.as_deref()) {
                 return Ok(other(None));
             }
-            if stop_when_idle(control, &state)? {
-                Ok(None)
-            } else {
-                Ok(other(Some(busy_of(&state))))
+            match stop_when_idle(control, &state)? {
+                None => Ok(None),
+                // What it says keeps it now, which can be more than before.
+                Some(busy) => Ok(other(Some(busy))),
             }
         }
     }
@@ -1607,7 +1609,9 @@ fn check_login(control: &Path, remote: &crate::conn::RemoteSpec) -> Result<()> {
 /// Either way it then only waits for that process to exit. Another service
 /// may take the control meanwhile, and nothing is sent that could stop it;
 /// the caller looks again at whoever owns the control.
-fn stop_when_idle(control: &Path, state: &Status) -> Result<bool> {
+///
+/// None once it stopped; else what keeps it, as it says in answer.
+fn stop_when_idle(control: &Path, state: &Status) -> Result<Option<Busy>> {
     let request = |stop: bool| LocalRequest {
         version: VERSION,
         stop,
@@ -1618,19 +1622,19 @@ fn stop_when_idle(control: &Path, state: &Status) -> Result<bool> {
     };
     let pid = if state.busy.is_none() {
         if !state.pending.is_empty() {
-            return Ok(false);
+            return Ok(Some(busy_of(state)));
         }
         // An older service has only an unconditional stop.
         send(control, &request(true))?.pid
     } else {
         let answer = send(control, &request(false))?;
         if !answer.stopping {
-            return Ok(false);
+            return Ok(Some(busy_of(&answer)));
         }
         answer.pid
     };
     await_exit(control, pid)?;
-    Ok(true)
+    Ok(None)
 }
 
 /// Wait for service process `pid`, which is stopping, to give up the
@@ -1940,13 +1944,19 @@ fn close_if_idle(workers: &[ProfileWorker]) -> bool {
     }
     // End the account connections nothing uses, which are re-established
     // on their next use; one that turned out to be in use keeps the service.
+    // Ask them all first, then wait for the answers together.
     let deadline = Instant::now() + crate::destination::ssh_auth::CLOSE_WAIT;
-    let mut closed = true;
+    let closing: Vec<_> = workers
+        .iter()
+        .filter_map(|worker| worker.activity.close_accounts())
+        .collect();
+    let closed = closing
+        .into_iter()
+        .fold(true, |closed, closing| closing.wait(deadline) && closed);
     for worker in workers {
-        closed &= worker.activity.close_accounts(deadline);
-    }
-    if !closed {
-        for worker in workers {
+        if closed {
+            worker.activity.close();
+        } else {
             worker.activity.reopen();
         }
     }
@@ -3700,12 +3710,16 @@ mod tests {
             accounts_in_use: 0,
         });
         let service = stand_in(&control, lock, move |_| answer("other", busy, false));
-        assert!(!stop_when_idle(&control, &answer("other", busy, false)).unwrap());
+        assert!(stop_when_idle(&control, &answer("other", busy, false))
+            .unwrap()
+            .is_some());
         assert!(is_running(&control));
         // An older service cannot read the request; it is never sent one.
         let (_root, old_control, old_lock) = locked_control();
         let old = stand_in(&old_control, old_lock, |_| answer("old", None, false));
-        assert!(stop_when_idle(&old_control, &answer("old", None, false)).unwrap());
+        assert!(stop_when_idle(&old_control, &answer("old", None, false))
+            .unwrap()
+            .is_none());
         assert_eq!(old.join().unwrap(), [r#"{"version":2,"stop":true}"#]);
         assert!(!is_running(&old_control));
         // The busy one was asked once and kept running.
@@ -3736,7 +3750,11 @@ mod tests {
         });
         // Its answer to stop_if_idle says it stops, and nothing else is
         // sent while it goes.
-        assert!(stop_when_idle(&control, &answer("other", Some(Busy::default()), false)).unwrap());
+        assert!(
+            stop_when_idle(&control, &answer("other", Some(Busy::default()), false))
+                .unwrap()
+                .is_none()
+        );
         assert!(!is_running(&control));
         assert_eq!(
             service.join().unwrap(),
@@ -3783,7 +3801,7 @@ mod tests {
         );
         let mut state = answer("other", Some(Busy::default()), false);
         state.pid = 1111;
-        assert!(stop_when_idle(&control, &state).unwrap());
+        assert!(stop_when_idle(&control, &state).unwrap().is_none());
         old.join().unwrap();
         // The next owner still runs, and was only asked for its status.
         assert!(is_running(&control));

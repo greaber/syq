@@ -8,7 +8,7 @@ use crate::receive_approval::provider_accounts::{ProviderIdentity, ProviderLogin
 use crate::receive_approval::{AccountDecision, AccountIdentity, AccountPermission, Queue};
 
 mod links;
-pub(crate) use links::{AccountLinks, LinkReply, LinkRequest, CLOSE_WAIT};
+pub(crate) use links::{AccountLinks, Closing, LinkReply, LinkRequest, CLOSE_WAIT};
 
 const HOST_ALIAS: &str = "syq-approved-peer";
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);

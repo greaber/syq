@@ -57,6 +57,8 @@ struct LinkState {
     report: Option<(Instant, LinkReply)>,
     /// A `Query` is wanted.
     query: bool,
+    /// A `Query` awaits its answer.
+    asking: bool,
     /// A `CloseIfIdle` is wanted, for this close attempt.
     close: Option<u64>,
     /// The answer to a `CloseIfIdle`: its attempt, and whether it closed.
@@ -98,6 +100,41 @@ pub(crate) struct LinkCounts {
     pub(crate) in_use: usize,
 }
 
+/// A close attempt (`AccountLinks::ask_close`).
+pub(crate) struct Closing {
+    attempt: u64,
+    links: Vec<std::sync::Arc<Link>>,
+}
+impl Closing {
+    /// Wait until `deadline` for the answers; whether all ended. Those in
+    /// use stay.
+    pub(crate) fn wait(self, deadline: Instant) -> bool {
+        let attempt = self.attempt;
+        let mut all = true;
+        for link in &self.links {
+            let mut state = link.state.lock().unwrap();
+            let answered = |state: &LinkState| {
+                state.ended || state.closed.is_some_and(|(of, _)| of == attempt)
+            };
+            while !answered(&state) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                state = link.answered.wait_timeout(state, left).unwrap().0;
+            }
+            if !(state.ended || state.closed == Some((attempt, true))) {
+                // Not asked yet, or in use: it stays open.
+                if state.close == Some(attempt) {
+                    state.close = None;
+                }
+                all = false;
+            }
+        }
+        all
+    }
+}
+
 impl AccountLinks {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
@@ -129,7 +166,7 @@ impl AccountLinks {
                     _ => {}
                 }
             }
-            if age.is_none_or(|age| age >= REFRESH) && !state.query {
+            if age.is_none_or(|age| age >= REFRESH) && !state.query && !state.asking {
                 state.query = true;
                 drop(state);
                 link.wake();
@@ -141,36 +178,19 @@ impl AccountLinks {
     /// Ask every connection to end if nothing uses it, and wait until
     /// `deadline` for their answers; whether all ended. Those in use stay.
     pub(crate) fn close_idle(&self, deadline: Instant) -> bool {
+        self.ask_close().wait(deadline)
+    }
+
+    /// Ask every connection to end if nothing uses it; `Closing::wait`
+    /// waits for their answers.
+    pub(crate) fn ask_close(&self) -> Closing {
         let attempt = self.attempts.fetch_add(1, Ordering::AcqRel) + 1;
         let links: Vec<_> = self.links.lock().unwrap().clone();
         for link in &links {
-            let mut state = link.state.lock().unwrap();
-            state.close = Some(attempt);
-            drop(state);
+            link.state.lock().unwrap().close = Some(attempt);
             link.wake();
         }
-        let mut all = true;
-        for link in &links {
-            let mut state = link.state.lock().unwrap();
-            let answered = |state: &LinkState| {
-                state.ended || state.closed.is_some_and(|(of, _)| of == attempt)
-            };
-            while !answered(&state) {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    break;
-                }
-                state = link.answered.wait_timeout(state, left).unwrap().0;
-            }
-            if !(state.ended || state.closed == Some((attempt, true))) {
-                // Not asked yet, or in use: it stays open.
-                if state.close == Some(attempt) {
-                    state.close = None;
-                }
-                all = false;
-            }
-        }
-        all
+        Closing { attempt, links }
     }
 
     /// Answer the keeper's `LINK`, then serve its connection until it ends,
@@ -212,6 +232,7 @@ impl AccountLinks {
                     if let Some(attempt) = state.close.take() {
                         Some((LinkRequest::CloseIfIdle, attempt))
                     } else if std::mem::take(&mut state.query) {
+                        state.asking = true;
                         Some((LinkRequest::Query, 0))
                     } else {
                         None
@@ -266,6 +287,9 @@ impl AccountLinks {
             let reply: LinkReply = decode(&frame)?;
             let mut state = link.state.lock().unwrap();
             state.report = Some((Instant::now(), reply));
+            if request == LinkRequest::Query {
+                state.asking = false;
+            }
             if request == LinkRequest::CloseIfIdle {
                 state.closed = Some((attempt, reply == LinkReply::Closing));
             }

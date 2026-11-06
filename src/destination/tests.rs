@@ -2039,6 +2039,7 @@ fn a_receiving_connection_is_idle_only_after_its_requests_and_a_quiet_while() {
     std::thread::sleep(Duration::from_millis(250));
     assert!(activity.idle());
     assert!(activity.close_if_idle());
+    activity.close();
     assert!(activity.begin().is_none());
     activity.reopen();
     assert!(activity.begin().is_some());
@@ -2122,17 +2123,49 @@ fn an_account_connection_nothing_uses_ends_at_a_switch() {
         assert_eq!(accounts.idle, usize::from(!used));
         assert_eq!(activity.idle(), !used);
         assert_eq!(activity.close_if_idle(), !used);
+        let close = || {
+            activity
+                .close_accounts()
+                .unwrap()
+                .wait(Instant::now() + Duration::from_secs(5))
+        };
         if used {
-            assert!(!activity.close_accounts(Instant::now() + Duration::from_secs(5)));
+            assert!(!close());
             assert_eq!(receiver.account_links.len(), 1);
             end.shutdown(std::net::Shutdown::Both).unwrap();
         } else {
-            assert!(activity.close_accounts(Instant::now() + Duration::from_secs(5)));
+            assert!(close());
         }
         server.join().unwrap().unwrap();
         drop(end);
         keeper.join().unwrap();
         drop(request);
         assert_eq!(activity.accounts().open, 0);
+    }
+}
+
+/// A request that arrives while the service tentatively closes the
+/// connection waits for the decision: it goes ahead if the connection
+/// stays open, and is refused only once it closes for good.
+#[test]
+fn a_request_during_a_tentative_close_waits_for_the_decision() {
+    for stays_open in [true, false] {
+        let activity = Arc::new(Activity {
+            quiet: Duration::ZERO,
+            ..Default::default()
+        });
+        assert!(activity.close_if_idle());
+        let asking = {
+            let activity = activity.clone();
+            std::thread::spawn(move || activity.begin().is_some())
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!asking.is_finished());
+        if stays_open {
+            activity.reopen();
+        } else {
+            activity.close();
+        }
+        assert_eq!(asking.join().unwrap(), stays_open);
     }
 }

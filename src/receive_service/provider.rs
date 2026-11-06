@@ -489,6 +489,8 @@ struct Service {
     switching: AtomicBool,
     /// Held by the one `stop_if_idle` running.
     stop_attempt: Mutex<()>,
+    /// Notified when `stop_if_idle` decides; `admit` waits for that.
+    switch_decided: (Mutex<()>, std::sync::Condvar),
     /// The path the provider follows, and its switch to a new build.
     started_from: Option<String>,
     switch: Mutex<Option<super::switch::Report>>,
@@ -518,6 +520,7 @@ impl Service {
             account_links: Default::default(),
             switching: AtomicBool::new(false),
             stop_attempt: Mutex::new(()),
+            switch_decided: Default::default(),
             started_from,
             switch: Mutex::new(None),
         };
@@ -568,8 +571,18 @@ impl Service {
             "provider persistence domain ended; run syq persist receive on locally"
         );
         self.refresh()?;
+        // While a stop is tentative, wait for it to be decided.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut decided = self.switch_decided.0.lock().unwrap();
+        while self.switching.load(Ordering::SeqCst) && !self.stop.load(Ordering::SeqCst) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            decided = self.switch_decided.1.wait_timeout(decided, left).unwrap().0;
+        }
         anyhow::ensure!(
-            !self.stop.load(Ordering::Acquire) && !self.switching.load(Ordering::SeqCst),
+            !self.stop.load(Ordering::SeqCst) && !self.switching.load(Ordering::SeqCst),
             "SSH authorization provider is stopping"
         );
         Ok(())
@@ -581,9 +594,11 @@ impl Service {
     /// do account connections that say nothing uses them, which a switch
     /// ends too (`stop_if_idle`).
     fn busy(&self) -> usize {
+        // Links can only be fewer than the requests read before them.
+        let requests = self.requests.load(Ordering::SeqCst);
         let idle = self.account_links.idle();
         let inner = self.inner.lock().unwrap();
-        self.requests.load(Ordering::SeqCst).saturating_sub(idle)
+        requests.saturating_sub(idle)
             + inner
                 .profiles
                 .values()
@@ -592,8 +607,8 @@ impl Service {
     }
     /// Stop if nothing is in progress (`busy`), after ending the account
     /// connections nothing uses; whether it did. One attempt runs at a
-    /// time; another meanwhile does not stop it. New requests are refused
-    /// from before the decision, and admitted again if it does not stop.
+    /// time; another meanwhile does not stop it. New requests wait from
+    /// before the decision, and are admitted if it does not stop.
     fn stop_if_idle(&self) -> bool {
         let Ok(_attempt) = self.stop_attempt.try_lock() else {
             return false;
@@ -603,10 +618,14 @@ impl Service {
             self.switching.store(true, Ordering::SeqCst);
         }
         let stopped = self.stop_admitted_if_idle();
-        if stopped {
-            self.stop.store(true, Ordering::SeqCst);
+        {
+            let _decided = self.switch_decided.0.lock().unwrap();
+            if stopped {
+                self.stop.store(true, Ordering::SeqCst);
+            }
+            self.switching.store(false, Ordering::SeqCst);
         }
-        self.switching.store(false, Ordering::SeqCst);
+        self.switch_decided.1.notify_all();
         stopped
     }
     /// With no request admitted any more, whether every one left is an
@@ -1373,8 +1392,13 @@ mod tests {
     fn account_link(
         service: &Arc<Service>,
         reply: impl Fn(ssh_auth::LinkRequest) -> ssh_auth::LinkReply + Send + 'static,
-    ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::thread::JoinHandle<()>,
+        UnixStream,
+    ) {
         let (mut ours, mut theirs) = UnixStream::pair().unwrap();
+        let end = ours.try_clone().unwrap();
         service.requests.fetch_add(1, Ordering::SeqCst);
         let serving = service.clone();
         let server = std::thread::spawn(move || {
@@ -1393,7 +1417,7 @@ mod tests {
                 }
             }
         });
-        (server, keeper)
+        (server, keeper, end)
     }
     fn wait_until(what: impl Fn() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1414,7 +1438,7 @@ mod tests {
     fn an_idle_account_connection_does_not_hide_another_request() {
         let (_directory, domain, _) = fixture();
         let service = Arc::new(Service::new(domain, None).unwrap());
-        let (server, keeper) = account_link(&service, |request| match request {
+        let (server, keeper, end) = account_link(&service, |request| match request {
             ssh_auth::LinkRequest::Query => ssh_auth::LinkReply::Idle,
             ssh_auth::LinkRequest::CloseIfIdle => ssh_auth::LinkReply::Closing,
         });
@@ -1428,23 +1452,71 @@ mod tests {
         service.admit().unwrap();
         drop(other);
         assert!(service.stop_if_idle());
+        assert!(service.admit().is_err());
         server.join().unwrap();
+        drop(end);
         keeper.join().unwrap();
         assert_eq!(service.requests.load(Ordering::SeqCst), 0);
         service.close();
     }
 
+    /// Status counts an account connection that says it is idle as not
+    /// keeping the provider; one in use, or one that cannot tell, keeps it,
+    /// and only the first counts as in use.
+    #[test]
+    fn status_tells_idle_used_and_unknown_account_connections_apart() {
+        for (reply, accounts, in_use) in [
+            (ssh_auth::LinkReply::Idle, 0, 0),
+            (ssh_auth::LinkReply::InUse, 1, 1),
+            (ssh_auth::LinkReply::Unknown, 1, 0),
+        ] {
+            let (_directory, domain, _) = fixture();
+            let service = Arc::new(Service::new(domain, None).unwrap());
+            // Its relay, which the link continues.
+            service.account_relays.fetch_add(1, Ordering::SeqCst);
+            let (server, keeper, end) = account_link(&service, move |request| match request {
+                ssh_auth::LinkRequest::CloseIfIdle if reply == ssh_auth::LinkReply::Idle => {
+                    ssh_auth::LinkReply::Closing
+                }
+                _ => reply,
+            });
+            wait_until(|| {
+                let links = service.account_links.counts();
+                links.open == 1
+                    && links.idle + links.in_use
+                        == usize::from(reply != ssh_auth::LinkReply::Unknown)
+                    && (reply != ssh_auth::LinkReply::Unknown || {
+                        std::thread::sleep(Duration::from_millis(100));
+                        true
+                    })
+            });
+            let snapshot = service.snapshot(None);
+            assert_eq!(
+                (snapshot.accounts, snapshot.accounts_in_use),
+                (Some(accounts), Some(in_use)),
+                "{reply:?}"
+            );
+            let busy = snapshot.busy().unwrap();
+            assert_eq!((busy.accounts, busy.accounts_in_use), (accounts, in_use));
+            assert_eq!(service.stop_if_idle(), accounts == 0);
+            drop(end.shutdown(std::net::Shutdown::Both));
+            server.join().unwrap();
+            keeper.join().unwrap();
+        }
+    }
+
     /// One stop attempt runs at a time. While it waits for an account
     /// connection's answer, another neither stops the provider nor admits
-    /// requests again; an answer that comes too late ends that connection
-    /// but stops nothing, and requests are admitted again.
+    /// requests again, and a new request waits; an answer that comes too
+    /// late ends that connection but stops nothing, and the request goes
+    /// ahead.
     #[test]
     fn stop_attempts_do_not_overlap() {
         let (_directory, domain, _) = fixture();
         let service = Arc::new(Service::new(domain, None).unwrap());
         let (answer, answering) = std::sync::mpsc::channel::<()>();
         let answering = Mutex::new(answering);
-        let (server, keeper) = account_link(&service, move |request| match request {
+        let (server, keeper, end) = account_link(&service, move |request| match request {
             ssh_auth::LinkRequest::Query => ssh_auth::LinkReply::Idle,
             ssh_auth::LinkRequest::CloseIfIdle => {
                 // Answer only when the test says so.
@@ -1457,20 +1529,27 @@ mod tests {
             let service = service.clone();
             std::thread::spawn(move || service.stop_if_idle())
         };
-        wait_until(|| service.admit().is_err());
+        wait_until(|| service.switching.load(Ordering::SeqCst));
+        // A request meanwhile waits for the decision.
+        let waiting = {
+            let service = service.clone();
+            std::thread::spawn(move || service.admit().is_ok())
+        };
         assert!(!service.stop_if_idle());
         assert!(
-            service.admit().is_err(),
+            service.switching.load(Ordering::SeqCst),
             "the second attempt reopened admission"
         );
-        // The first gives up waiting, and admits requests again.
+        // The first gives up waiting, and the request goes ahead.
         assert!(!first.join().unwrap());
+        assert!(waiting.join().unwrap());
         service.admit().unwrap();
         service.requests.fetch_add(1, Ordering::SeqCst);
         let admitted = Counted(&service.requests);
         // The late answer ends the connection, and stops nothing.
         answer.send(()).unwrap();
         server.join().unwrap();
+        drop(end);
         keeper.join().unwrap();
         assert!(!service.stop.load(Ordering::SeqCst));
         assert!(!service.stop_if_idle());

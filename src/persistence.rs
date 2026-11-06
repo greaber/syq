@@ -1223,11 +1223,17 @@ pub(crate) fn mux_clients(control: &Path) -> Option<usize> {
         use std::io::BufRead as _;
         let table = std::io::BufReader::new(std::fs::File::open("/proc/net/unix").ok()?);
         let control = control.as_os_str().as_bytes();
-        let mut count = 0;
+        let (mut clients, mut listening) = (0, false);
         for line in table.split(b'\n') {
-            count += usize::from(mux_client_line(&line.ok()?, control));
+            match mux_socket(&line.ok()?, control) {
+                Some(MuxSocket::Client) => clients += 1,
+                Some(MuxSocket::Listener) => listening = true,
+                None => {}
+            }
         }
-        Some(count)
+        // A table that does not show the master listening, as in a sandbox
+        // that hides it, says nothing about its clients either.
+        listening.then_some(clients)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1236,12 +1242,20 @@ pub(crate) fn mux_clients(control: &Path) -> Option<usize> {
     }
 }
 
-/// Whether a `/proc/net/unix` line is an accepted stream connection whose
-/// address is `control`. OpenSSH binds its listener to `control`
-/// followed by a dot and 16 random letters and digits, then renames it to
-/// `control`; a connection the listener accepts carries the bound address.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn mux_client_line(line: &[u8], control: &[u8]) -> bool {
+#[derive(Debug, PartialEq, Eq)]
+enum MuxSocket {
+    Listener,
+    Client,
+}
+
+/// What a `/proc/net/unix` line says about the OpenSSH master at
+/// `control`: its listening socket, a connection it accepted, or neither.
+/// OpenSSH binds its listener to `control` followed by a dot and 16 random
+/// letters and digits, then renames it to `control`; a connection the
+/// listener accepts carries the bound address.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn mux_socket(line: &[u8], control: &[u8]) -> Option<MuxSocket> {
     let bound_by_ssh = |path: &[u8]| {
         path == control
             || path.strip_prefix(control).is_some_and(|rest| {
@@ -1262,8 +1276,16 @@ fn mux_client_line(line: &[u8], control: &[u8]) -> bool {
         rest = &rest[end..];
     }
     let path = rest.strip_prefix(b" ").unwrap_or(rest);
-    // A connected stream socket (SS_CONNECTED).
-    fields[4] == b"0001" && fields[5] == b"03" && bound_by_ssh(path)
+    if fields[4] != b"0001" || !bound_by_ssh(path) {
+        return None;
+    }
+    match fields[5] {
+        // Unconnected, accepting connections (__SO_ACCEPTCON).
+        b"01" if fields[3] == b"00010000" => Some(MuxSocket::Listener),
+        // Connected (SS_CONNECTED).
+        b"03" => Some(MuxSocket::Client),
+        _ => None,
+    }
 }
 
 #[derive(Serialize)]
@@ -1636,9 +1658,9 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    /// Only the connections the listener at a control path accepted count:
-    /// not the listener, not other sockets, and not a path that merely
-    /// begins the same way.
+    /// Only the connections the listener at a control path accepted count
+    /// as clients: not the listener, not other sockets, and not a path
+    /// that merely begins the same way.
     #[test]
     fn mux_clients_are_the_connections_accepted_at_the_control_path() {
         let table = b"Num       RefCount Protocol Flags    Type St Inode Path
@@ -1651,14 +1673,14 @@ mod tests {
 0000000000000000: 00000003 00000000 00000000 0002 03 77777 /run/s/cm-1
 0000000000000000: 00000003 00000000 00000000 0001 03 88888 /run/s/cm-1 x
 ";
-        let count = |table: &[u8]| {
+        let count = |kind: MuxSocket| {
             table
                 .split(|byte| *byte == b'\n')
-                .filter(|line| mux_client_line(line, b"/run/s/cm-1"))
+                .filter(|line| mux_socket(line, b"/run/s/cm-1").as_ref() == Some(&kind))
                 .count()
         };
-        assert_eq!(count(table), 2);
-        assert_eq!(count(b""), 0);
+        assert_eq!(count(MuxSocket::Client), 2);
+        assert_eq!(count(MuxSocket::Listener), 1);
     }
 
     /// As OpenSSH does: bind a temporary name, link the control path to
@@ -1681,6 +1703,10 @@ mod tests {
         assert_eq!(mux_clients(&control), Some(2));
         drop((first, accepted));
         assert_eq!(mux_clients(&control), Some(1));
+        // Without its listener, the table says nothing.
+        drop(listener);
+        assert_eq!(mux_clients(&control), None);
+        assert_eq!(mux_clients(&directory.path().join("cm-other")), None);
     }
 
     #[test]

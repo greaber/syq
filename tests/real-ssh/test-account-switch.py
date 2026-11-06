@@ -18,6 +18,8 @@ import time
 NATIVE_PATH = "PATH=/usr/bin:/bin:/usr/local/bin"
 BIN = Path("/tmp/syq-account-switch-bin")
 OLD = BIN / "syq"
+# Its own name: the suite's shared receiver is `laptop`.
+NAME = "switching-laptop"
 FAST = {"SYQ_TEST_SWITCH_CHECK_MS": "200", "SYQ_TEST_SWITCH_QUIET_MS": "1000"}
 
 
@@ -66,13 +68,13 @@ try:
     BIN.mkdir(mode=0o755, exist_ok=True)
     root.mkdir(exist_ok=True)
     shutil.copy2("/usr/local/bin/syq-other-build", OLD)
-    run(str(OLD), "persist", "receive", "on", "--pscope", scope, "--name", "laptop", "--notify", "off",
+    run(str(OLD), "persist", "receive", "on", "--pscope", scope, "--name", NAME, "--notify", "off",
         "--root", str(root), "--all-connections", env=FAST)
     run(str(OLD), "persist", "connect", "source", "--pscope", scope, env=FAST)
     assert receiving(scope)["identity"] == other_build
 
     # The server opens an approved account connection through the laptop.
-    args = ["env", NATIVE_PATH, "syq", "persist", "connect", "destination", "--auth-from", "@laptop"]
+    args = ["env", NATIVE_PATH, "syq", "persist", "connect", "destination", "--auth-from", "@" + NAME]
     connecting = subprocess.Popen(["ssh", "source", shlex.join(args)], stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, start_new_session=True)
     (request,) = json.loads(run(str(OLD), "persist", "receive", "pending", "--json", "--pscope", scope,
@@ -84,7 +86,7 @@ try:
     assert len(accounts_on_source()) == 1
 
     # A shell runs through it while syq is updated at the followed path.
-    command = ["env", NATIVE_PATH, "syq", "ssh", "--auth-from", "@laptop", "destination", "--",
+    command = ["env", NATIVE_PATH, "syq", "ssh", "--auth-from", "@" + NAME, "destination", "--",
                "sleep 8; echo done"]
     shell = subprocess.Popen(["ssh", "source", shlex.join(command)], stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, start_new_session=True)

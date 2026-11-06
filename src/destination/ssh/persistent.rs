@@ -1389,7 +1389,7 @@ fn keeper(startup: Startup) -> Result<()> {
     // (`request_close_if_idle`); not one made for an earlier keeper.
     let close_request = path.with_extension("close");
     let _ = fs::remove_file(&close_request);
-    let _index = Index(path);
+    let index = Index(path);
     super::super::write_message(
         &mut std::io::stdout().lock(),
         &Ok::<_, String>(format!(
@@ -1418,6 +1418,9 @@ fn keeper(startup: Startup) -> Result<()> {
     // exits once those it has end, which no longer depends on the
     // approving side.
     let mut drain = Drain::default();
+    // The record and its lock, until the master is ending: then a new
+    // command opens a connection of its own beside it at once.
+    let mut published = Some((index, lock));
     let use_count = || in_use(&record.control);
     let mut stop = || stop_listening(&record).is_ok();
     loop {
@@ -1456,13 +1459,16 @@ fn keeper(startup: Startup) -> Result<()> {
                 }
             }
         }
-        if close_request.exists() {
+        if !drain.closing && close_request.exists() {
             let _ = fs::remove_file(&close_request);
             drain.close_if_idle(&use_count, &mut stop);
         }
         if drain.closing && !std::mem::replace(&mut drain.pool_stopped, true) {
             // A spare session would keep the master.
             let _ = pool.stop();
+            // Remove the record, then release its lock. Stopping persistence
+            // or this keeper still ends the master at once.
+            drop(published.take());
         }
         signals.wait(POLL)?;
     }
@@ -1478,12 +1484,7 @@ fn keeper(startup: Startup) -> Result<()> {
 /// How many sessions use the master at `control`, apart from the session
 /// pool's spares; None when that cannot be told.
 fn in_use(control: &Path) -> Option<usize> {
-    let clients = crate::persistence::mux_clients(control)?;
-    if clients == 0 {
-        return Some(0);
-    }
-    let spares = crate::session_pool::spares(control, Duration::from_millis(200))?;
-    Some(clients.saturating_sub(spares))
+    crate::session_pool::sessions_in_use(control, Duration::from_millis(200))
 }
 
 /// Whether a keeper's master is ending because nothing used it. Once it

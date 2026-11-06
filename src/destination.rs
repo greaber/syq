@@ -1782,6 +1782,8 @@ fn pin_receiving_source(
 /// (`receive_service::switch`).
 pub(crate) struct Activity {
     state: Mutex<ActivityState>,
+    /// Notified when a tentative close is decided.
+    decided: std::sync::Condvar,
     receiver: Mutex<std::sync::Weak<Receiver>>,
     /// How long after its last request the connection counts as idle.
     quiet: Duration,
@@ -1790,6 +1792,7 @@ impl Default for Activity {
     fn default() -> Self {
         Self {
             state: Default::default(),
+            decided: Default::default(),
             receiver: Default::default(),
             quiet: crate::receive_service::switch::quiet(),
         }
@@ -1799,8 +1802,20 @@ impl Default for Activity {
 struct ActivityState {
     requests: usize,
     last: Option<Instant>,
-    closed: bool,
+    closed: Closed,
 }
+/// Whether the service closed the connection to switch builds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Closed {
+    #[default]
+    No,
+    /// While it ends idle account connections, which may turn out in use.
+    Tentatively,
+    Yes,
+}
+/// The longest a request waits for a tentative close to be decided, within
+/// the time the service takes to decide (`ssh_auth::CLOSE_WAIT`).
+const CLOSE_DECISION: Duration = Duration::from_secs(1);
 /// One request being handled, until dropped.
 struct Handling<'a>(&'a Activity);
 impl Drop for Handling<'_> {
@@ -1812,10 +1827,19 @@ impl Drop for Handling<'_> {
 }
 impl Activity {
     /// Count a request until the result is dropped; None once the service
-    /// has closed this connection to switch builds.
+    /// has closed this connection to switch builds. While it may still
+    /// stay open, wait for that to be decided.
     fn begin(&self) -> Option<Handling<'_>> {
+        let deadline = Instant::now() + CLOSE_DECISION;
         let mut state = self.state.lock().unwrap();
-        if state.closed {
+        while state.closed == Closed::Tentatively {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            state = self.decided.wait_timeout(state, left).unwrap().0;
+        }
+        if state.closed == Closed::Yes {
             return None;
         }
         state.requests += 1;
@@ -1874,27 +1898,36 @@ impl Activity {
         let state = self.state.lock().unwrap();
         self.idle_locked(&state)
     }
-    /// Refuse new requests if idle, so the service can stop to switch builds
-    /// without cutting one off; whether it did.
+    /// Hold new requests if idle, so the service can stop to switch builds
+    /// without cutting one off; whether it did. They wait until
+    /// `close` or `reopen` decides.
     pub(crate) fn close_if_idle(&self) -> bool {
         let mut state = self.state.lock().unwrap();
         if !self.idle_locked(&state) {
             return false;
         }
-        state.closed = true;
+        state.closed = Closed::Tentatively;
         true
     }
-    pub(crate) fn reopen(&self) {
-        self.state.lock().unwrap().closed = false;
+    /// After `close_if_idle`, refuse new requests for good.
+    pub(crate) fn close(&self) {
+        self.decide(Closed::Yes);
     }
-    /// After `close_if_idle`, end the account connections nothing uses,
-    /// waiting until `deadline`; whether all ended.
-    pub(crate) fn close_accounts(&self, deadline: Instant) -> bool {
+    pub(crate) fn reopen(&self) {
+        self.decide(Closed::No);
+    }
+    fn decide(&self, closed: Closed) {
+        self.state.lock().unwrap().closed = closed;
+        self.decided.notify_all();
+    }
+    /// After `close_if_idle`, ask the account connections nothing uses to
+    /// end (`ssh_auth::AccountLinks::ask_close`).
+    pub(crate) fn close_accounts(&self) -> Option<ssh_auth::Closing> {
         self.receiver
             .lock()
             .unwrap()
             .upgrade()
-            .is_none_or(|receiver| receiver.account_links.close_idle(deadline))
+            .map(|receiver| receiver.account_links.ask_close())
     }
 }
 
