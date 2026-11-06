@@ -207,6 +207,12 @@ enum Action {
     /// as a provider following a new build asks (`switch`)
     #[command(name = "switch-provider", hide = true)]
     SwitchProvider,
+    /// Replace idle receiving services from other builds now, as
+    /// `syq --self-update` asks the build it installed (`switch_outdated_now`)
+    // Older updaters run this on the release they install, so it keeps
+    // this name and takes no arguments.
+    #[command(name = "switch-outdated", hide = true)]
+    SwitchOutdated,
     /// Wait until the receiving connection through HOST is ready
     Wait {
         /// SSH server whose receiving connection to wait for
@@ -947,33 +953,10 @@ pub(crate) fn refresh_outdated(domain: &Domain, quiet: bool) {
     if !domain.enabled().unwrap_or(false) {
         return;
     }
-    let scope = domain.runtime_path();
-    let Ok(entries) = fs::read_dir(&scope) else {
-        return;
-    };
-    /// Only the build; other fields are the service's own.
-    #[derive(Deserialize)]
-    struct Recorded {
-        identity: String,
-    }
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr());
     let mut notices = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(key) = name.as_bytes().strip_suffix(RECORD) else {
-            continue;
-        };
-        let control = scope.join(std::ffi::OsStr::from_bytes(key));
-        let outdated = crate::delegation::read_private_regular(
-            &entry.path(),
-            "background receiving endpoint",
-            64 * 1024,
-        )
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Recorded>(&bytes).ok())
-        .is_some_and(|recorded| recorded.identity != crate::identity::build());
-        if !outdated || !crate::persistence::claim_switch_attempt(&control, SWITCH_ATTEMPT_INTERVAL)
-        {
+    for control in outdated_controls(domain) {
+        if !crate::persistence::claim_switch_attempt(&control, SWITCH_ATTEMPT_INTERVAL) {
             continue;
         }
         let Some(state) = status_by(&control, Instant::now() + refresh_answer()) else {
@@ -1011,10 +994,9 @@ pub(crate) fn refresh_outdated(domain: &Domain, quiet: bool) {
                     state.endpoint
                 )
             } else if state.busy.is_none() {
-                // An older service cannot say whether a copy is in progress.
                 format!(
-                    "switching receiving through {}, which runs syq {}, to this version of syq in the background (a copy in progress through it would be interrupted); `syq persist status` shows how it goes",
-                    state.endpoint, state.identity
+                    "{}; `syq persist status` shows how it goes",
+                    switching_notice(&state, " in the background")
                 )
             } else {
                 format!(
@@ -1033,6 +1015,290 @@ pub(crate) fn refresh_outdated(domain: &Domain, quiet: bool) {
             crate::output::diagnostic!("syq: {notice}");
         }
     }
+}
+
+/// The connections whose receiving service, by its record, runs another
+/// build than this command: one directory and each service's small record,
+/// without contacting any service.
+fn outdated_controls(domain: &Domain) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(domain.runtime_path()) else {
+        return Vec::new();
+    };
+    /// Only the build; other fields are the service's own.
+    #[derive(Deserialize)]
+    struct Recorded {
+        identity: String,
+    }
+    let mut controls = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(key) = name.as_bytes().strip_suffix(RECORD) else {
+            continue;
+        };
+        let outdated = crate::delegation::read_private_regular(
+            &entry.path(),
+            "background receiving endpoint",
+            64 * 1024,
+        )
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Recorded>(&bytes).ok())
+        .is_some_and(|recorded| recorded.identity != crate::identity::build());
+        if outdated {
+            controls.push(domain.runtime_path().join(std::ffi::OsStr::from_bytes(key)));
+        }
+    }
+    controls.sort();
+    controls
+}
+
+/// Run by the `persist` commands the user types (`persist on`, `connect`,
+/// `status` and `receive status`; `receive on` replaces them through
+/// `apply_preferences`), so that receiving follows an update at once rather
+/// than in the background: each idle service from another build that cannot
+/// follow its path by itself, or whose own switch failed or waits for a
+/// login, is replaced now, in the foreground. In a terminal SSH may ask for
+/// the login; without one it never asks, and a login that needs the user
+/// is recorded as such, for a command in a terminal to try. A busy one keeps
+/// running, and the command says so. A failure is kept for status
+/// (`record_attempt`), and keeps commands from trying again for a while.
+pub(crate) fn switch_outdated_now(domain: &Domain) {
+    if !domain.enabled().unwrap_or(false) {
+        return;
+    }
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    for control in outdated_controls(domain) {
+        let state = match running_status(&control, Retry::No, ANSWER_TIMEOUT) {
+            Ok(Some(state)) => state,
+            Ok(None) => {
+                restart_stale(domain, &control);
+                continue;
+            }
+            Err(_) => continue,
+        };
+        if state.identity == crate::identity::build() {
+            continue;
+        }
+        let phase = switch_report(&control, &state).map(|report| report.phase);
+        match switch::follows(state.started_from.as_deref()) {
+            switch::Follows::OtherFile => continue,
+            // It switches by itself, unless its switch failed.
+            switch::Follows::ThisFile if !matches!(phase.as_deref(), Some("failed" | "login")) => {
+                continue
+            }
+            _ => {}
+        }
+        // A login that needed the user is worth trying again only with the
+        // user at hand.
+        if phase.as_deref() == Some("login") && !interactive {
+            continue;
+        }
+        let fix = connect_command(&state.endpoint, domain.explicit_path());
+        let busy = busy_of(&state);
+        if !busy.idle() {
+            crate::output::diagnostic!(
+                "syq: {}",
+                busy_notice(&state.endpoint, &state.identity, &busy, false, &fix)
+            );
+            continue;
+        }
+        // One switch at a time per connection, and after one failed, not
+        // another for a while (`claim_switch_attempt`): each failed login
+        // is one on the server, and an unreachable one takes seconds.
+        let claim = match crate::persistence::claim_switch_now(&control) {
+            crate::persistence::SwitchClaim::Underway => {
+                crate::output::diagnostic!(
+                    "syq: receiving through {} runs syq {}; a switch to this version is already under way",
+                    state.endpoint,
+                    state.identity
+                );
+                continue;
+            }
+            crate::persistence::SwitchClaim::Unavailable(error) => {
+                crate::output::diagnostic!(
+                    "syq: cannot switch receiving through {}: {error:#}",
+                    state.endpoint
+                );
+                continue;
+            }
+            crate::persistence::SwitchClaim::Claimed { due, .. }
+                if skip_until_due(phase.as_deref(), due, interactive) =>
+            {
+                crate::output::diagnostic!(
+                    "syq: receiving through {} still runs syq {}, since switching it failed moments ago; `{fix}` tries again now",
+                    state.endpoint,
+                    state.identity
+                );
+                continue;
+            }
+            crate::persistence::SwitchClaim::Claimed { lock, .. } => lock,
+        };
+        // Another switch may have run until the claim: decide on whoever
+        // owns the connection now.
+        let Ok(Some(state)) = running_status(&control, Retry::No, ANSWER_TIMEOUT) else {
+            continue;
+        };
+        if state.identity == crate::identity::build() {
+            continue;
+        }
+        let busy = busy_of(&state);
+        if !busy.idle() {
+            crate::output::diagnostic!(
+                "syq: {}",
+                busy_notice(&state.endpoint, &state.identity, &busy, false, &fix)
+            );
+            continue;
+        }
+        crate::output::diagnostic!("syq: {}", switching_notice(&state, ""));
+        if !interactive {
+            // Without the user at hand, as a switch a command starts in the
+            // background, with its bounds on logging in and on its time
+            // (`switch`), and its records; that takes the claim itself.
+            drop(claim);
+            match run_switch(switch_command(domain, &state.endpoint)) {
+                Ok(status) if status.success() => {}
+                Ok(status) => {
+                    if status.code() != Some(switch::LOGIN_NEEDED_EXIT) {
+                        crate::persistence::defer_switch_attempts(
+                            &control,
+                            SWITCH_ATTEMPT_INTERVAL,
+                        );
+                    }
+                    crate::output::diagnostic!(
+                        "syq: could not switch receiving through {}; `syq persist status` says why, and `{fix}` tries again",
+                        state.endpoint
+                    );
+                }
+                Err(error) => {
+                    crate::output::diagnostic!(
+                        "syq: could not switch receiving through {}: {error:#}",
+                        state.endpoint
+                    );
+                }
+            }
+            continue;
+        }
+        let result = crate::persistence::connect_domain(
+            domain,
+            &state.endpoint,
+            None,
+            false,
+            Duration::from_secs(30),
+            Replace::IfIdle,
+            crate::persistence::Login::Bounded,
+        );
+        let switched = running_status(&control, Retry::No, ANSWER_TIMEOUT)
+            .ok()
+            .flatten()
+            .is_some_and(|state| state.identity == crate::identity::build());
+        match result {
+            Ok(()) if switched => clear_attempt(&control),
+            Ok(()) => {}
+            Err(error) => {
+                let login = error.downcast_ref::<switch::LoginNeeded>().is_some();
+                crate::output::diagnostic!(
+                    "syq: could not switch receiving through {}: {error:#}; `{fix}` tries again",
+                    state.endpoint
+                );
+                record_attempt(
+                    &control,
+                    &Attempt::new(
+                        if login { "login" } else { "failed" },
+                        Some(format!("{error:#}")),
+                    ),
+                );
+                crate::persistence::defer_switch_attempts(&control, SWITCH_ATTEMPT_INTERVAL);
+            }
+        }
+    }
+}
+
+/// Start receiving again with this build through the connection at
+/// `control`, when an older syq started it and nothing runs it now
+/// (`stale_endpoint`), once in a while as for any switch.
+fn restart_stale(domain: &Domain, control: &Path) {
+    let Ok(config) = preferences(domain) else {
+        return;
+    };
+    let Some(endpoint) = stale_endpoint(domain, &config, control) else {
+        return;
+    };
+    let crate::persistence::SwitchClaim::Claimed { lock, due } =
+        crate::persistence::claim_switch_now(control)
+    else {
+        return;
+    };
+    let phase = last_attempt(control)
+        .filter(|attempt| attempt.build == crate::identity::build())
+        .map(|attempt| attempt.phase);
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    if skip_until_due(phase.as_deref(), due, interactive)
+        || (phase.as_deref() == Some("login") && !interactive)
+    {
+        return;
+    }
+    // In a terminal it runs here, under the claim; without one, the
+    // switch it runs takes the claim itself.
+    let _claim = interactive.then_some(lock);
+    crate::output::diagnostic!(
+        "syq: starting receiving through {endpoint} again, with this version of syq"
+    );
+    // Only once idle: a service may have started there meanwhile.
+    match reconnect_with_this_build(domain, control, &endpoint, false) {
+        Ok(()) => {
+            if running_status(control, Retry::No, ANSWER_TIMEOUT)
+                .ok()
+                .flatten()
+                .is_some_and(|now| now.identity == crate::identity::build())
+            {
+                clear_attempt(control);
+            }
+        }
+        Err(error) => {
+            crate::output::diagnostic!(
+                "syq: could not start receiving through {endpoint}: {error:#}; `{}` tries again",
+                connect_command(&endpoint, domain.explicit_path())
+            );
+            if last_attempt(control).is_none_or(|attempt| attempt.build != crate::identity::build())
+            {
+                record_attempt(control, &Attempt::new("failed", Some(format!("{error:#}"))));
+            }
+            crate::persistence::defer_switch_attempts(control, SWITCH_ATTEMPT_INTERVAL);
+        }
+    }
+}
+
+/// Whether a `persist` command leaves a connection whose last switch, in
+/// `phase`, failed, until the next attempt is `due`. A login that needed
+/// the user is tried at once by a command in a terminal, as status says,
+/// whatever a background switch deferred.
+fn skip_until_due(phase: Option<&str>, due: bool, interactive: bool) -> bool {
+    !due && match phase {
+        Some("failed") => true,
+        Some("login") => !interactive,
+        _ => false,
+    }
+}
+
+/// What a command says as it starts to replace the service `state`
+/// describes with this build, `how` (such as " in the background"). An
+/// older service cannot say whether a copy is in progress.
+fn switching_notice(state: &Status, how: &str) -> String {
+    format!(
+        "switching receiving through {}, which runs syq {}, to this version of syq{how}{}{}",
+        state.endpoint,
+        state.identity,
+        if state.busy.is_none() {
+            " (a copy in progress through it would be interrupted)"
+        } else {
+            ""
+        },
+        // It logs in as the new service will, and may need a key's touch.
+        if how.is_empty() {
+            "; if your security key blinks, touch it"
+        } else {
+            ""
+        }
+    )
 }
 
 /// How long a command waits for a stale service's status. A healthy one
@@ -1207,18 +1473,46 @@ const SWITCH_ATTEMPT_INTERVAL: Duration = Duration::from_secs(60);
 /// detached and without prompts: it reports a login that needs the user in
 /// its status rather than asking.
 fn start_switch(domain: &Domain, endpoint: &str) -> Result<()> {
+    let mut command = switch_process(switch_command(domain, endpoint))?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command.spawn_guarded()?;
+    std::thread::spawn(move || {
+        let _ = switch::wait_and_end_group(&mut child);
+    });
+    Ok(())
+}
+
+/// Run the switch `start_switch` starts, and wait for it, saying what it
+/// says: for a command without the user at hand, so that the switch's own
+/// bounds on logging in and on its time apply.
+fn run_switch(args: Vec<OsString>) -> Result<std::process::ExitStatus> {
+    Ok(run_switch_process(args)?.0)
+}
+/// As `run_switch`, also returning the switch's process ID, which its
+/// records name (`Attempt`).
+fn run_switch_process(args: Vec<OsString>) -> Result<(std::process::ExitStatus, u32)> {
+    let mut command = switch_process(args)?;
+    command.stdin(Stdio::null());
+    let mut child = command.spawn_guarded()?;
+    let pid = child.id();
+    Ok((switch::wait_and_end_group(&mut child)?, pid))
+}
+
+/// `persist connect --when-idle` of this build with `args`, in a session of
+/// its own and without prompts.
+fn switch_process(args: Vec<OsString>) -> Result<std::process::Command> {
     let mut command = match crate::process::started_from() {
         Some(path) => std::process::Command::new(path),
         None => crate::process::self_command()?,
     };
     command
-        .args(switch_command(domain, endpoint))
+        .args(args)
         .env("SYQ_NO_UPDATE_CHECK", "1")
         .env(switch::STARTED_BY_COMMAND, "1")
-        .env("SSH_ASKPASS_REQUIRE", "never")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .env("SSH_ASKPASS_REQUIRE", "never");
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() < 0 {
@@ -1227,11 +1521,7 @@ fn start_switch(domain: &Domain, endpoint: &str) -> Result<()> {
             Ok(())
         });
     }
-    let mut child = command.spawn_guarded()?;
-    std::thread::spawn(move || {
-        let _ = switch::wait_and_end_group(&mut child);
-    });
-    Ok(())
+    Ok(command)
 }
 
 /// Whether a switch to this build should leave the service at `control`
@@ -1355,7 +1645,8 @@ pub(crate) struct NamedConnection {
 pub(crate) fn connection_status(control: &Path) -> Option<ReceivingStatus> {
     status(control, false).ok().map(|s| ReceivingStatus {
         switch: switch_report(control, &s),
-        busy: s.busy,
+        // An older service reports only its requests waiting for approval.
+        busy: Some(busy_of(&s)),
         build: s.identity,
         started_from: s.started_from,
         name: s.name,
@@ -1385,8 +1676,31 @@ pub(crate) fn build_note(
     commands_switch: bool,
 ) -> Option<String> {
     let mut note = Vec::new();
+    // What keeps a service from switching when it waits until idle.
+    let waits_for_idle = match switch {
+        Some(switch) => switch.phase == "waiting",
+        None => match switch::follows(started_from) {
+            switch::Follows::ThisFile => true,
+            switch::Follows::Nothing => commands_switch,
+            switch::Follows::OtherFile => false,
+        },
+    };
     if build != crate::identity::build() {
-        note.push(format!("runs syq {build}"));
+        // Why it has not switched yet: what is in progress. Account
+        // connections are named below, with what switches at once.
+        note.push(
+            match busy.filter(|busy| waits_for_idle && (busy.requests > 0 || busy.pending > 0)) {
+                Some(busy) => format!(
+                    "runs syq {build} for now, with {}",
+                    Busy {
+                        accounts: 0,
+                        ..*busy
+                    }
+                    .describe(on)
+                ),
+                None => format!("runs syq {build}"),
+            },
+        );
         if switch.is_none() {
             note.push(match switch::follows(started_from) {
                 switch::Follows::OtherFile => format!(
@@ -1410,14 +1724,6 @@ pub(crate) fn build_note(
     }
     // What waiting for idle waits for, when that is an open account
     // connection, which does not end by itself.
-    let waits_for_idle = match switch {
-        Some(switch) => switch.phase == "waiting",
-        None => match switch::follows(started_from) {
-            switch::Follows::ThisFile => true,
-            switch::Follows::Nothing => commands_switch,
-            switch::Follows::OtherFile => false,
-        },
-    };
     if build != crate::identity::build() && waits_for_idle {
         if let Some(accounts) = busy.and_then(|busy| busy.accounts_note(on, fix)) {
             note.push(accounts);
@@ -1473,8 +1779,16 @@ pub(crate) enum Replace {
     /// other's services, and only once the new service could log in
     /// (`switch`).
     WhenIdle,
+    /// For the `persist` commands the user types (`switch_outdated_now`): as
+    /// `WhenIdle`, but in the foreground, without the switch's own process
+    /// and records.
+    IfIdle,
     /// For `persist connect` run by hand: at once, saying what that cuts off.
     Now,
+    /// For a settings change without a terminal: as `Now`, but run as a
+    /// switch is, one at a time, within its bounds on logging in and on its
+    /// time (`run_switch`).
+    NowBounded,
 }
 
 /// What a status says is in progress. A service from before syq followed
@@ -1505,7 +1819,7 @@ fn replace_other(
         })
     };
     match replace {
-        Replace::Now => {
+        Replace::Now | Replace::NowBounded => {
             let busy = busy_of(state);
             if !busy.idle() {
                 crate::output::diagnostic!(
@@ -1522,7 +1836,7 @@ fn replace_other(
             let busy = busy_of(state);
             Ok(other((!busy.idle()).then_some(busy)))
         }
-        Replace::WhenIdle => {
+        Replace::IfIdle | Replace::WhenIdle => {
             if switch::follows_other_file(state.started_from.as_deref()) {
                 return Ok(other(None));
             }
@@ -1546,10 +1860,17 @@ fn replace_other(
                 return Ok(other(None));
             }
             if stop_when_idle(control, &state)? {
-                Ok(None)
-            } else {
-                Ok(other(Some(busy_of(&state))))
+                return Ok(None);
             }
+            // It did not stop: say why from what the service says now. One
+            // that took over the control is looked at again by the caller.
+            let Some(now) = running_status(control, Retry::No, ANSWER_TIMEOUT)? else {
+                return Ok(None);
+            };
+            if now.identity != state.identity || now.pid != state.pid {
+                return Ok(None);
+            }
+            Ok(other(Some(busy_of(&now))))
         }
     }
 }
@@ -1598,6 +1919,19 @@ fn stop_when_idle(control: &Path, state: &Status) -> Result<bool> {
     };
     let pid = if state.busy.is_none() {
         if !state.pending.is_empty() {
+            return Ok(false);
+        }
+        // The stop goes to whoever owns the control. Ask once more just
+        // before, so that a service that took it over since `state` was
+        // read, such as another switch's, is not stopped on that status.
+        let Some(now) = running_status(control, Retry::No, ANSWER_TIMEOUT)? else {
+            return Ok(true);
+        };
+        if now.identity != state.identity
+            || now.pid != state.pid
+            || now.busy.is_some()
+            || !now.pending.is_empty()
+        {
             return Ok(false);
         }
         // An older service has only an unconditional stop.
@@ -2004,7 +2338,28 @@ fn aggregate(profiles: &[ProfileStatus]) -> (String, ConnectionState) {
 }
 // Wait until each live supervisor has revoked changed/removed profiles. Healthy
 // workers remain in the same process, preserving streams and pending approvals.
+/// Apply `config` to the running services; an error if a service from
+/// another build could not be replaced (`apply_preferences_reporting`).
 fn apply_preferences(domain: &Domain, config: &Preferences) -> Result<()> {
+    let failures = apply_preferences_reporting(domain, config)?;
+    anyhow::ensure!(
+        failures.is_empty(),
+        "{}",
+        failures
+            .into_iter()
+            .map(|(_, failure)| failure)
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    Ok(())
+}
+/// Apply `config` to the running services. Returns the endpoints whose
+/// service from another build could not be replaced, and is stopped, each
+/// with what to say.
+fn apply_preferences_reporting(
+    domain: &Domain,
+    config: &Preferences,
+) -> Result<Vec<(String, String)>> {
     if config.enabled() {
         // A provider from another build may not read these settings, and a
         // profile turned off must still lose access. Replace it with one from
@@ -2017,15 +2372,72 @@ fn apply_preferences(domain: &Domain, config: &Preferences) -> Result<()> {
     } else {
         provider::stop(domain)?;
     }
+    let mut failures = Vec::new();
     for control in all_controls(domain)? {
         if !config.enabled() {
             stop_inner(&control, false)?;
             continue;
         }
-        if running_status(&control, Retry::No, ANSWER_TIMEOUT)?
-            .is_some_and(|state| state.identity != crate::identity::build())
+        // A service from another build may not read these settings. Replace
+        // it with one of this build where a profile still allows its server,
+        // which needs this build's helper there, so connect again; stop it
+        // where none does, or where connecting fails.
+        if let Some(state) = running_status(&control, Retry::No, ANSWER_TIMEOUT)?
+            .filter(|state| state.identity != crate::identity::build())
         {
-            stop_inner(&control, false)?;
+            if !config
+                .profiles
+                .iter()
+                .any(|profile| profile.allows_server(&state.endpoint))
+            {
+                stop_inner(&control, false)?;
+                continue;
+            }
+            crate::output::diagnostic!("syq: {}", switching_notice(&state, ""));
+            if let Err(error) = reconnect_with_this_build(domain, &control, &state.endpoint, true) {
+                // What stopping it now cuts off, when it still runs.
+                let cut = running_status(&control, Retry::No, ANSWER_TIMEOUT)
+                    .ok()
+                    .flatten()
+                    .filter(|now| now.identity == state.identity)
+                    .map(|now| busy_of(&now))
+                    .filter(|busy| !busy.idle());
+                stop_inner(&control, false)?;
+                failures.push((
+                    state.endpoint.clone(),
+                    format!(
+                        "receiving through {} is off until it connects again ({error:#}){}; run `{}`",
+                        state.endpoint,
+                        cut.map(|busy| format!(
+                            "; stopping it cut off {}",
+                            busy.describe(Some(&state.endpoint))
+                        ))
+                        .unwrap_or_default(),
+                        connect_command(&state.endpoint, domain.explicit_path())
+                    ),
+                ));
+                continue;
+            }
+        }
+        // Receiving an older syq started, and another command stopped,
+        // starts again with this build where its connection still runs.
+        if !is_running(&control) && read_spec(&control).is_err() {
+            if let Some(endpoint) = stale_endpoint(domain, config, &control) {
+                crate::output::diagnostic!(
+                    "syq: starting receiving through {endpoint} again, with this version of syq"
+                );
+                // A settings change, which must apply.
+                if let Err(error) = reconnect_with_this_build(domain, &control, &endpoint, true) {
+                    failures.push((
+                        endpoint.clone(),
+                        format!(
+                            "receiving through {endpoint} is off until it connects again ({error:#}); run `{}`",
+                            connect_command(&endpoint, domain.explicit_path())
+                        ),
+                    ));
+                    continue;
+                }
+            }
         }
         let mut started = None;
         if !is_running(&control)
@@ -2078,7 +2490,101 @@ fn apply_preferences(domain: &Domain, config: &Preferences) -> Result<()> {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    Ok(())
+    Ok(failures)
+}
+
+/// Start this build's receiving service through `endpoint` and wait until
+/// it is online. With `force`, as for a settings change, whatever runs
+/// there is replaced at once, even when busy; without, as for a switch, a
+/// service that started meanwhile is replaced only once idle, and one that
+/// follows another installed syq is left, which is no failure. In a
+/// terminal ssh may ask for the login; without one, as a switch does,
+/// within its bounds on logging in and on its time (`run_switch`).
+fn reconnect_with_this_build(
+    domain: &Domain,
+    control: &Path,
+    endpoint: &str,
+    force: bool,
+) -> Result<()> {
+    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        return crate::persistence::connect_domain(
+            domain,
+            endpoint,
+            None,
+            false,
+            Duration::from_secs(30),
+            if force { Replace::Now } else { Replace::IfIdle },
+            crate::persistence::Login::Bounded,
+        );
+    }
+    let (status, pid) = run_switch_process(if force {
+        replace_now_command(domain, endpoint)
+    } else {
+        switch_command(domain, endpoint)
+    })?;
+    let now = running_status(control, Retry::No, ANSWER_TIMEOUT)?;
+    // A switch that ended well said what it left running, if anything, or
+    // left the connection to another switch under way.
+    if !force && status.success() {
+        return Ok(());
+    }
+    let online = now.as_ref().is_some_and(|now| {
+        now.identity == crate::identity::build() && now.connection.phase == "online"
+    });
+    if status.success() || online {
+        anyhow::ensure!(
+            now.as_ref()
+                .is_some_and(|now| now.identity == crate::identity::build()),
+            "{}",
+            match &now {
+                Some(now) => format!("it still runs syq {}", now.identity),
+                None => "no service runs there".to_owned(),
+            }
+        );
+        return Ok(());
+    }
+    // What this switch recorded, so that the summary stands on its own, as
+    // when it ended at its time limit without saying why; it also said so
+    // above.
+    match last_attempt(control).filter(|attempt| attempt.pid == pid) {
+        Some(Attempt {
+            error: Some(error), ..
+        }) => anyhow::bail!("{error}"),
+        _ => match (
+            status.code(),
+            std::os::unix::process::ExitStatusExt::signal(&status),
+        ) {
+            (_, Some(signal)) => anyhow::bail!("the switch ended by signal {signal}"),
+            _ => anyhow::bail!("see above"),
+        },
+    }
+}
+
+/// The endpoint of a connection whose receiving an older syq started and
+/// that no service runs now, when receiving through it is on and its SSH
+/// connection is still open, as after the released `persist receive on`
+/// stopped it without starting its replacement.
+fn stale_endpoint(domain: &Domain, config: &Preferences, control: &Path) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Recorded {
+        identity: String,
+        endpoint: crate::persistence::EndpointRecord,
+    }
+    if !config.enabled() || !domain.enabled().unwrap_or(false) || is_running(control) {
+        return None;
+    }
+    let bytes = crate::delegation::read_private_regular(
+        &suffixed(control, RECORD),
+        "background receiving endpoint",
+        64 * 1024,
+    )
+    .ok()?;
+    let recorded: Recorded = serde_json::from_slice(&bytes).ok()?;
+    let endpoint = recorded.endpoint.label();
+    (recorded.identity != crate::identity::build()
+        && config.profiles.iter().any(|p| p.allows_server(&endpoint))
+        && crate::persistence::socket_is_ready(control).unwrap_or(false))
+    .then_some(endpoint)
 }
 
 /// The largest control request: a version, flags and one approval decision.
@@ -2108,6 +2614,20 @@ fn switch_command(domain: &Domain, endpoint: &str) -> Vec<OsString> {
         .map(OsString::from)
         .collect();
     args.push(WHEN_IDLE.into());
+    if let Some(scope) = domain.explicit_path() {
+        args.extend([OsString::from("--pscope"), scope.into()]);
+    }
+    args
+}
+/// As `switch_command`, replacing the service at once even when busy
+/// (`Replace::NowBounded`).
+fn replace_now_command(domain: &Domain, endpoint: &str) -> Vec<OsString> {
+    let mut args: Vec<OsString> = ["persist", "connect", endpoint, "--auth-from", "ssh"]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    args.push(WHEN_IDLE.into());
+    args.push("--replace-now".into());
     if let Some(scope) = domain.explicit_path() {
         args.extend([OsString::from("--pscope"), scope.into()]);
     }
@@ -2321,7 +2841,13 @@ fn statuses(domain: &Domain) -> Result<Vec<Status>> {
         })
         .collect())
 }
-fn configure_profile(domain: &Domain, options: Configure) -> Result<Settings> {
+/// Save the profile `options` select and apply it. Returns its settings and
+/// the endpoints whose service from another build could not be replaced
+/// (`apply_preferences_reporting`).
+fn configure_profile(
+    domain: &Domain,
+    options: Configure,
+) -> Result<(Settings, Vec<(String, String)>)> {
     // Refuse before saving: a receiving name never names a server to connect to.
     if let Some(name) = options
         .connection
@@ -2423,8 +2949,8 @@ fn configure_profile(domain: &Domain, options: Configure) -> Result<Settings> {
     }
     drop(_lock);
     domain.enable()?;
-    apply_preferences(domain, &preferences)?;
-    Ok(config)
+    let failures = apply_preferences_reporting(domain, &preferences)?;
+    Ok((config, failures))
 }
 /// Save a directory option as the absolute path the receiver will enforce.
 /// The shell leaves `~` unexpanded after `--option=`, so expand it here.
@@ -2436,25 +2962,31 @@ fn absolute_directory(option: &str, path: &Path) -> Result<PathBuf> {
 }
 fn configure(domain: &Domain, options: Configure) -> Result<()> {
     let connections = options.connection.clone();
-    let config = configure_profile(domain, options)?;
+    let (config, mut failures) = configure_profile(domain, options)?;
     provider::ensure(domain)?;
-    let mut failures = Vec::new();
     for endpoint in &connections {
-        if let Err(error) = crate::persistence::connect_domain(
+        match crate::persistence::connect_domain(
             domain,
             endpoint,
             None,
             false,
             Duration::from_secs(30),
             Replace::Now,
+            crate::persistence::Login::Ask,
         ) {
-            failures.push(format!("{endpoint}: {error:#}"));
+            // A connection made here replaces one that failed above.
+            Ok(()) => failures.retain(|(failed, _)| failed != endpoint),
+            Err(error) => failures.push((endpoint.clone(), format!("{endpoint}: {error:#}"))),
         }
     }
     if !failures.is_empty() {
         bail!(
             "receiving settings saved, but some connections are not ready: {}",
-            failures.join("; ")
+            failures
+                .into_iter()
+                .map(|(_, failure)| failure)
+                .collect::<Vec<_>>()
+                .join("; ")
         );
     }
     crate::output::command_human_stdout!("Receiving is on: {}", config.name);
@@ -2673,6 +3205,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
     match command.action {
         Action::On(options) => configure(domain, options)?,
         Action::SwitchProvider => provider::switch_when_idle(domain)?,
+        Action::SwitchOutdated => switch_outdated_now(domain),
         Action::Pending {
             json,
             wait,
@@ -2767,6 +3300,10 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
             crate::output::command_human_stdout!("Removed receiving profile {name}");
         }
         Action::Status { json, name } => {
+            // Scripts asking for structured status never wait for a login.
+            if !json {
+                switch_outdated_now(domain);
+            }
             let config = preferences(domain)?;
             if let Some(name) = name.as_deref() {
                 config.selected(Some(name))?;
@@ -2847,7 +3384,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                         &state.identity,
                         state.started_from.as_deref(),
                         state.switch.as_ref(),
-                        state.busy.as_ref(),
+                        Some(&busy_of(&state)),
                         Some(&state.endpoint),
                         &connect_command(&state.endpoint, domain.explicit_path()),
                         true,
@@ -3228,7 +3765,8 @@ mod tests {
                 ..Default::default()
             },
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert_eq!(notified.revision, before.revision);
         let changed = configure_profile(
             &first,
@@ -3237,7 +3775,8 @@ mod tests {
                 ..Default::default()
             },
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert_eq!(changed.revision, before.revision + 1);
         let first_bytes = fs::read(config_path(&first).unwrap()).unwrap();
         configure_profile(
@@ -3636,6 +4175,19 @@ mod tests {
         assert!(!note.is_some_and(|note| note.contains("account")));
     }
 
+    /// A failed switch waits until the next attempt is due; one that needed
+    /// a login waits only for a command without a terminal.
+    #[test]
+    fn a_command_in_a_terminal_retries_a_login_at_once() {
+        assert!(skip_until_due(Some("failed"), false, true));
+        assert!(skip_until_due(Some("failed"), false, false));
+        assert!(!skip_until_due(Some("failed"), true, true));
+        assert!(!skip_until_due(Some("login"), false, true));
+        assert!(skip_until_due(Some("login"), false, false));
+        assert!(!skip_until_due(None, false, false));
+        assert!(!skip_until_due(Some("waiting"), false, false));
+    }
+
     /// A service that reports what it has in progress decides itself
     /// whether it is idle enough to stop; one from before syq followed
     /// updates is stopped unless it has requests waiting for approval.
@@ -3651,10 +4203,17 @@ mod tests {
         assert!(!stop_when_idle(&control, &answer("other", busy, false)).unwrap());
         assert!(is_running(&control));
         // An older service cannot read the request; it is never sent one.
+        // It is asked once more, just before its stop, who owns the control.
         let (_root, old_control, old_lock) = locked_control();
         let old = stand_in(&old_control, old_lock, |_| answer("old", None, false));
         assert!(stop_when_idle(&old_control, &answer("old", None, false)).unwrap());
-        assert_eq!(old.join().unwrap(), [r#"{"version":2,"stop":true}"#]);
+        assert_eq!(
+            old.join().unwrap(),
+            [
+                r#"{"version":2,"stop":false}"#,
+                r#"{"version":2,"stop":true}"#
+            ]
+        );
         assert!(!is_running(&old_control));
         // The busy one was asked once and kept running.
         send(

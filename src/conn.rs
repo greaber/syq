@@ -484,6 +484,36 @@ pub(crate) fn ssh_authorization_failure(error: &anyhow::Error) -> Option<SshLogi
     })
 }
 
+/// ssh rejected the login that probes a server's platform before
+/// installing the helper there. Kept apart from `SshConnectError`, so that
+/// authorization does not fall back to another machine on it.
+#[derive(Debug)]
+pub(crate) struct BootstrapLoginRejected(pub(crate) SshLoginFailure);
+impl std::fmt::Display for BootstrapLoginRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // ssh's own message, above it, says what failed.
+        f.write_str("ssh login failed")
+    }
+}
+impl std::error::Error for BootstrapLoginRejected {}
+
+/// Whether `error` shows that ssh rejected this machine's login or could
+/// not verify the server's host key, at any step of connecting: one that
+/// needs the user rather than one a later attempt may get past.
+pub(crate) fn ssh_login_needs_user(error: &anyhow::Error) -> bool {
+    let failure = ssh_authorization_failure(error).or_else(|| {
+        error.chain().find_map(|cause| {
+            cause
+                .downcast_ref::<BootstrapLoginRejected>()
+                .map(|rejected| rejected.0)
+        })
+    });
+    matches!(
+        failure,
+        Some(SshLoginFailure::Credentials | SshLoginFailure::HostKey)
+    )
+}
+
 fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     is_worker_initialization_error(error)

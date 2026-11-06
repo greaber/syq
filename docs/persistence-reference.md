@@ -257,12 +257,19 @@ In an isolated domain, idle SSH connections close after five to ten minutes;
 in the default domain they stay open. Syq installs no login service, so
 connect again after a reboot. After you update syq, receiving and the SSH
 authorization provider switch to the new version once no copy, command, or
-approval is in progress, by themselves or when you next run syq. If receiving
-needs you to unlock or touch your SSH key, it waits until you next run a syq
-copy or ssh command in a terminal. An account connection you approved keeps
-the old version until that connection closes; `syq persist status` shows the
-command that switches at once and closes it. Session permissions (**Allow**)
-end at the switch, as at any reconnect.
+approval is in progress, by themselves or when you next run syq.
+`syq persist status`, `syq persist on`, `syq persist connect`, and
+`syq persist receive status` switch idle receiving at once, logging in as
+`syq persist connect` does, but not with `--json`.
+`syq persist status` says why receiving still runs an older version.
+`syq persist receive on`, `receive off NAME`, and `receive remove NAME` switch
+it even when busy, which cuts off copies and approvals in progress. If
+receiving needs you to unlock or touch your SSH key, it waits until you next
+run a syq copy or ssh command, or `syq persist status`, in a terminal. An
+account connection you approved keeps the old version until that connection
+closes; `syq persist status` shows the command that switches at once and
+closes it. Session permissions (**Allow**) end at the switch, as at any
+reconnect.
 
 To wait in a script without starting a connection, run
 `syq persist receive wait server --timeout 30` on the laptop, or

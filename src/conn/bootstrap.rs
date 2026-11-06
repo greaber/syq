@@ -46,12 +46,20 @@ impl RemoteSpec {
         let out = run_captured(&mut cmd, None)
             .with_context(|| format!("probe platform on {}", self.label()))?;
         if !out.status.success() {
-            bail!(
+            let message = format!(
                 "could not detect the platform on {} ({}){}",
                 self.label(),
                 out.status,
                 output_suffix(&out.stderr.bytes)
             );
+            // ssh's own failure: say when it rejected the login.
+            if let Some(failure) = (out.status.code() == Some(255))
+                .then(|| ssh_auth::classify(&out.stderr.bytes))
+                .flatten()
+            {
+                return Err(anyhow::Error::new(BootstrapLoginRejected(failure)).context(message));
+            }
+            bail!(message);
         }
         if out.stdout.truncated {
             bail!(
