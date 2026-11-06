@@ -71,6 +71,10 @@ enum PersistAction {
         /// idle, as a switch to a new build does (`receive_service::switch`)
         #[arg(long, hide = true)]
         when_idle: bool,
+        /// With --when-idle: replace it at once, even when busy, as a
+        /// settings change does (`receive_service::Replace::NowBounded`)
+        #[arg(long, hide = true, requires = "when_idle")]
+        replace_now: bool,
     },
     /// Keep SSH connections open for later syq commands
     On {
@@ -209,6 +213,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
             no_bootstrap,
             timeout,
             when_idle,
+            replace_now,
         } => {
             let endpoint =
                 crate::cli::parse_native_endpoint(Some(&host))?.context("SSH endpoint missing")?;
@@ -249,10 +254,10 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                     syq_path,
                     no_bootstrap,
                     Duration::from_secs(timeout),
-                    if when_idle {
-                        crate::receive_service::Replace::WhenIdle
-                    } else {
-                        crate::receive_service::Replace::Now
+                    match (when_idle, replace_now) {
+                        (true, true) => crate::receive_service::Replace::NowBounded,
+                        (true, false) => crate::receive_service::Replace::WhenIdle,
+                        (false, _) => crate::receive_service::Replace::Now,
                     },
                     if when_idle {
                         Login::Unattended
@@ -450,8 +455,10 @@ pub(crate) fn connect_domain(
     reject_receiving_name(&endpoint.host)?;
     let was_enabled = domain.enabled()?;
     let when_idle = replace == crate::receive_service::Replace::WhenIdle;
+    // Run as a switch to a new build is: one at a time, bounded, recorded.
+    let switching = when_idle || replace == crate::receive_service::Replace::NowBounded;
     // A switch to a new build never turns persistence back on.
-    if when_idle && !was_enabled {
+    if switching && !was_enabled {
         return Ok(());
     }
     let scope = domain.enable()?;
@@ -469,7 +476,7 @@ pub(crate) fn connect_domain(
     )?;
     multiplexer.defer_receiving();
     let mut _switching = None;
-    if when_idle {
+    if switching {
         // One switch at a time per connection; others leave it to that one.
         let Some(lock) = lock_endpoint_record(multiplexer.control_path())? else {
             return Ok(());
@@ -477,13 +484,16 @@ pub(crate) fn connect_domain(
         _switching = Some(lock);
         // Leave a busy service, or one following another installed syq,
         // before logging in to the server for nothing.
-        if let Some(ready) = crate::receive_service::keeps_running(multiplexer.control_path()) {
+        if let Some(ready) = when_idle
+            .then(|| crate::receive_service::keeps_running(multiplexer.control_path()))
+            .flatten()
+        {
             report_ready(domain, &endpoint_label(&endpoint), ready);
             return Ok(());
         }
     }
     let multiplexer = Arc::new(multiplexer);
-    if !when_idle {
+    if !switching {
         return connect_receiving(
             domain,
             multiplexer,

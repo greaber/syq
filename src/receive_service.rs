@@ -1149,7 +1149,7 @@ pub(crate) fn switch_outdated_now(domain: &Domain) {
             // background, with its bounds on logging in and on its time
             // (`switch`), and its records; that takes the claim itself.
             drop(claim);
-            match run_switch(domain, &state.endpoint) {
+            match run_switch(switch_command(domain, &state.endpoint)) {
                 Ok(status) if status.success() => {}
                 Ok(status) => {
                     if status.code() != Some(switch::LOGIN_NEEDED_EXIT) {
@@ -1413,7 +1413,7 @@ const SWITCH_ATTEMPT_INTERVAL: Duration = Duration::from_secs(60);
 /// detached and without prompts: it reports a login that needs the user in
 /// its status rather than asking.
 fn start_switch(domain: &Domain, endpoint: &str) -> Result<()> {
-    let mut command = switch_process(domain, endpoint)?;
+    let mut command = switch_process(switch_command(domain, endpoint))?;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1428,22 +1428,22 @@ fn start_switch(domain: &Domain, endpoint: &str) -> Result<()> {
 /// Run the switch `start_switch` starts, and wait for it, saying what it
 /// says: for a command without the user at hand, so that the switch's own
 /// bounds on logging in and on its time apply.
-fn run_switch(domain: &Domain, endpoint: &str) -> Result<std::process::ExitStatus> {
-    let mut command = switch_process(domain, endpoint)?;
+fn run_switch(args: Vec<OsString>) -> Result<std::process::ExitStatus> {
+    let mut command = switch_process(args)?;
     command.stdin(Stdio::null());
     let mut child = command.spawn_guarded()?;
     Ok(switch::wait_and_end_group(&mut child)?)
 }
 
-/// `persist connect --when-idle` of this build for `endpoint`, in a session
-/// of its own and without prompts.
-fn switch_process(domain: &Domain, endpoint: &str) -> Result<std::process::Command> {
+/// `persist connect --when-idle` of this build with `args`, in a session of
+/// its own and without prompts.
+fn switch_process(args: Vec<OsString>) -> Result<std::process::Command> {
     let mut command = match crate::process::started_from() {
         Some(path) => std::process::Command::new(path),
         None => crate::process::self_command()?,
     };
     command
-        .args(switch_command(domain, endpoint))
+        .args(args)
         .env("SYQ_NO_UPDATE_CHECK", "1")
         .env(switch::STARTED_BY_COMMAND, "1")
         .env("SSH_ASKPASS_REQUIRE", "never");
@@ -1719,6 +1719,10 @@ pub(crate) enum Replace {
     IfIdle,
     /// For `persist connect` run by hand: at once, saying what that cuts off.
     Now,
+    /// For a settings change without a terminal: as `Now`, but run as a
+    /// switch is, one at a time, within its bounds on logging in and on its
+    /// time (`run_switch`).
+    NowBounded,
 }
 
 /// What a status says is in progress. A service from before syq followed
@@ -1749,7 +1753,7 @@ fn replace_other(
         })
     };
     match replace {
-        Replace::Now => {
+        Replace::Now | Replace::NowBounded => {
             let busy = busy_of(state);
             if !busy.idle() {
                 crate::output::diagnostic!(
@@ -2337,20 +2341,16 @@ fn apply_preferences_reporting(
                 )
             } else {
                 // Without the user at hand, as a switch does, within its
-                // bounds on logging in; it leaves a busy service running.
-                run_switch(domain, &state.endpoint).and_then(|status| {
-                    anyhow::ensure!(
-                        running_status(&control, Retry::No, ANSWER_TIMEOUT)?
-                            .is_some_and(|now| now.identity == crate::identity::build()),
-                        "{}",
-                        if status.success() {
-                            "it was busy, and only a command in a terminal replaces a busy one"
-                                .to_owned()
-                        } else {
-                            "`syq persist status` says why".to_owned()
-                        }
-                    );
-                    Ok(())
+                // bounds on logging in and on its time.
+                run_switch(replace_now_command(domain, &state.endpoint)).and_then(|status| {
+                    let now = running_status(&control, Retry::No, ANSWER_TIMEOUT)?;
+                    match now {
+                        Some(now) if now.identity == crate::identity::build() => Ok(()),
+                        // What went wrong was said above, by the switch.
+                        _ if !status.success() => anyhow::bail!("see above"),
+                        Some(now) => anyhow::bail!("it still runs syq {}", now.identity),
+                        None => anyhow::bail!("no service runs there"),
+                    }
                 })
             };
             if let Err(error) = replaced {
@@ -2447,6 +2447,20 @@ fn switch_command(domain: &Domain, endpoint: &str) -> Vec<OsString> {
         .map(OsString::from)
         .collect();
     args.push(WHEN_IDLE.into());
+    if let Some(scope) = domain.explicit_path() {
+        args.extend([OsString::from("--pscope"), scope.into()]);
+    }
+    args
+}
+/// As `switch_command`, replacing the service at once even when busy
+/// (`Replace::NowBounded`).
+fn replace_now_command(domain: &Domain, endpoint: &str) -> Vec<OsString> {
+    let mut args: Vec<OsString> = ["persist", "connect", endpoint, "--auth-from", "ssh"]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    args.push(WHEN_IDLE.into());
+    args.push("--replace-now".into());
     if let Some(scope) = domain.explicit_path() {
         args.extend([OsString::from("--pscope"), scope.into()]);
     }

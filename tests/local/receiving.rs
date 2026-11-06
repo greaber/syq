@@ -4688,6 +4688,43 @@ fn a_requested_connection_replaces_a_failed_switch_of_it() {
     );
 }
 
+/// A settings change replaces a busy service an older syq left running even
+/// without a terminal, as in one, saying what that cuts off.
+#[test]
+fn a_settings_change_without_a_terminal_replaces_a_busy_older_service() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let old = older_service(
+        &installed,
+        serde_json::json!([{
+            "id": "0123456789abcdef0123456789abcdef", "from": "test-server",
+            "expires_at": 4102444800u64, "notification": "none",
+            "destination": "/inbox", "permission": "write", "max_bytes": 1,
+            "max_entries": 1, "max_delete": 0, "preserve_permissions": false
+        }]),
+    );
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    let output = installed.persist(syq, &["receive", "on"]);
+    assert_output_ok(&output);
+    assert!(
+        stderr_of(&output).contains("cuts off 1 request waiting for approval"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("test-server ready"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    old.join().unwrap();
+    assert_eq!(
+        installed.request(serde_json::json!({"version": 2, "stop": false}))["identity"],
+        this_build()
+    );
+}
+
 /// Settings that no longer allow a connection stop the service an older
 /// syq left on it, as for any service, without logging in to its server.
 #[test]
