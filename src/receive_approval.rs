@@ -603,9 +603,17 @@ fn quoted_local_path(path: &[u8]) -> String {
 /// Whether `path` is outside `start`, the profile's directory, or leads
 /// there through `..`, and whether it is hidden: a name below where it
 /// leaves `start`'s path starts with a dot, as `.env` or `~/.ssh/key` does.
-fn notable_path(path: &[u8], start: &std::path::Path) -> (bool, bool) {
+/// A path in the home, `home` as `HOME` names it and where it really is, is
+/// compared where the home really is, as `start` is.
+fn notable_path(
+    path: &[u8],
+    start: &std::path::Path,
+    home: Option<(&std::path::Path, &std::path::Path)>,
+) -> (bool, bool) {
     use std::path::Component;
     let path = std::path::Path::new(std::ffi::OsStr::from_bytes(path));
+    let really = home.and_then(|(named, real)| Some(real.join(path.strip_prefix(named).ok()?)));
+    let path = really.as_deref().unwrap_or(path);
     let common = path
         .components()
         .zip(start.components())
@@ -1353,24 +1361,32 @@ impl Queue {
         let shown = |path: String, scope: &str| format!("{path} ({scope})");
         // The desktop prompt lists only a few paths: those outside the
         // profile's directory or hidden come first, and the notes count them.
+        // `~/` paths name the home as `HOME` does, the directory where it
+        // really is.
+        let home = crate::destination::home_directory();
+        let home = home
+            .as_ref()
+            .map(|(named, real)| (named.as_path(), real.as_path()));
         let notable: Vec<_> = paths
             .iter()
-            .map(|(path, _)| notable_path(path, start))
+            .map(|(path, _)| notable_path(path, start, home))
             .collect();
+        // The directory as `HOME` names it, so the note reads `~/...`.
+        let start_shown = local_path(
+            home.and_then(|(named, real)| Some(named.join(start.strip_prefix(real).ok()?)))
+                .as_deref()
+                .unwrap_or(start)
+                .as_os_str()
+                .as_bytes(),
+        );
         let mut order: Vec<usize> = (0..paths.len()).collect();
         order.sort_by_key(|&index| notable[index] == (false, false));
         let mut notes = vec![permission.clone()];
         let count = |which: fn(&(bool, bool)) -> bool| notable.iter().filter(|n| which(n)).count();
         match count(|(outside, _)| *outside) {
             0 => {}
-            1 => notes.push(format!(
-                "1 of these is outside {}",
-                local_path(start.as_os_str().as_bytes())
-            )),
-            outside => notes.push(format!(
-                "{outside} of these are outside {}",
-                local_path(start.as_os_str().as_bytes())
-            )),
+            1 => notes.push(format!("1 of these is outside {start_shown}")),
+            outside => notes.push(format!("{outside} of these are outside {start_shown}")),
         }
         match count(|(_, hidden)| *hidden) {
             0 => {}
@@ -2548,11 +2564,36 @@ mod tests {
         .map(|path| (path.as_bytes().to_vec(), "a file or other non-directory"))
         .collect();
         assert_eq!(
-            notable_path(b"/home/me/project/sub/.cache/x", start),
+            notable_path(b"/home/me/project/sub/.cache/x", start, None),
             (false, true)
         );
-        assert_eq!(notable_path(b"/home/me/project", start), (false, false));
-        assert_eq!(notable_path(b"/home/me/projects/x", start), (true, false));
+        assert_eq!(
+            notable_path(b"/home/me/project", start, None),
+            (false, false)
+        );
+        assert_eq!(
+            notable_path(b"/home/me/projects/x", start, None),
+            (true, false)
+        );
+        // A `HOME` that leads through a link names the same directories as
+        // the profile's directory, which is saved where it really is.
+        let real_start = std::path::Path::new("/var/home/me/project");
+        let home = Some((
+            std::path::Path::new("/home/me"),
+            std::path::Path::new("/var/home/me"),
+        ));
+        assert_eq!(
+            notable_path(b"/home/me/project/a", real_start, home),
+            (false, false)
+        );
+        assert_eq!(
+            notable_path(b"/home/me/.ssh/id_ed25519", real_start, home),
+            (true, true)
+        );
+        assert_eq!(
+            notable_path(b"/var/home/me/project/a", real_start, home),
+            (false, false)
+        );
         let queue = Arc::new(Queue::default());
         let asking = Arc::clone(&queue);
         let task = std::thread::spawn(move || {

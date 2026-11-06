@@ -1020,7 +1020,7 @@ fn resolve_destination(
 }
 
 /// This account's home directory, as `HOME` names it and where it really is.
-fn home_directory() -> Option<(PathBuf, PathBuf)> {
+pub(crate) fn home_directory() -> Option<(PathBuf, PathBuf)> {
     let named = PathBuf::from(std::env::var_os("HOME")?);
     let real = fs::canonicalize(&named).ok()?;
     named.is_absolute().then_some((named, real))

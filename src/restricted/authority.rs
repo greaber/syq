@@ -504,13 +504,24 @@ impl ConfinedRoot {
             }
         } else {
             // A destination in the home, or the home itself, as `--into ~`
-            // names it: its directory, where the home really is.
-            match home.and_then(|(named, real)| Some((destination.strip_prefix(named).ok()?, real)))
-            {
-                Some((inside, home)) if inside.as_os_str().is_empty() => {
+            // names it: its directory, where the home really is. The copy
+            // names the home itself by its last name in that directory, so
+            // a home that is a link to another name cannot be named so.
+            match home.and_then(|(named, real)| {
+                Some((destination.strip_prefix(named).ok()?, named, real))
+            }) {
+                Some((inside, named, home)) if inside.as_os_str().is_empty() => {
+                    if named.file_name() != home.file_name() {
+                        bail!(
+                            "the home directory {} leads to {}; name {} as the destination instead",
+                            named.display(),
+                            home.display(),
+                            home.display()
+                        );
+                    }
                     requested_parent(home).to_path_buf()
                 }
-                Some((inside, home)) => requested_parent(&home.join(inside)).to_path_buf(),
+                Some((inside, _, home)) => requested_parent(&home.join(inside)).to_path_buf(),
                 None => parent.to_path_buf(),
             }
         };

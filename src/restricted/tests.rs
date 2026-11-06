@@ -1619,6 +1619,42 @@ fn a_destination_in_the_home_resolves_from_where_the_home_is() {
         home_itself.identity(),
         Root::open(real_home.parent().unwrap()).unwrap().identity()
     );
+    // A home that is itself a link to another name cannot be named as the
+    // destination: the copy would name a directory beside the home.
+    fs::create_dir_all(temporary.path().join("data/u-home/backup")).unwrap();
+    symlink(
+        temporary.path().join("data/u-home"),
+        temporary.path().join("var/home/u"),
+    )
+    .unwrap();
+    let linked_home = temporary.path().join("home/u");
+    let renamed = temporary.path().join("data/u-home");
+    let error = ConfinedRoot::resolve(
+        linked_home.as_os_str().as_bytes(),
+        &[],
+        false,
+        Some((&linked_home, &renamed)),
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(
+        error.contains(&format!("name {} as the destination", renamed.display())),
+        "{error}"
+    );
+    assert!(!temporary.path().join("data/u").exists());
+    // Inside it, paths keep their names.
+    let inside = ConfinedRoot::resolve(
+        linked_home.join("backup/archive").as_os_str().as_bytes(),
+        &[],
+        false,
+        Some((&linked_home, &renamed)),
+    )
+    .unwrap();
+    assert_eq!(
+        inside.identity(),
+        Root::open(&renamed.join("backup")).unwrap().identity()
+    );
     // And a destination directly in the home.
     let directly = ConfinedRoot::resolve(
         home.join("archive").as_os_str().as_bytes(),
