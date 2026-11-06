@@ -304,12 +304,20 @@ fn a_writer_that_opens_the_partial_during_removal_keeps_it() {
         let partial = partial.clone();
         std::thread::spawn(move || hold_for_writing(&partial))
     };
-    // Once the open waits, the kernel lists the lease as being broken.
+    // Once the open waits, the kernel lists the partial's lease as being
+    // broken.
+    let inode = fs::metadata(&partial).unwrap().ino().to_string();
+    let breaking = |line: &str| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        fields.get(1) == Some(&"LEASE")
+            && fields.get(2) == Some(&"BREAKING")
+            && fields.get(5).and_then(|device| device.rsplit(':').next()) == Some(inode.as_str())
+    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut next_progress = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let locks = fs::read_to_string("/proc/locks").unwrap();
-        if locks.lines().any(|line| line.contains("BREAKING")) {
+        if locks.lines().any(breaking) {
             break;
         }
         assert!(
@@ -1032,7 +1040,7 @@ fn source_partials_are_copied_and_warned_about() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("they are copied as ordinary files, but a later copy may remove them as leftover partial files"),
+        stderr.contains("they are copied as ordinary files, but this or a later copy may remove them as leftover partial files"),
         "{stderr}"
     );
     assert!(

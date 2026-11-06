@@ -4949,10 +4949,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         let count = st.source_partials;
         progress.warning(
             &format!(
-                "source contains {count} recognizable SYQ partial path{}; {} copied as ordinary files, but a later copy may remove {} as leftover partial files",
+                "source contains {count} recognizable SYQ partial path{}; {}",
                 if count == 1 { "" } else { "s" },
-                if count == 1 { "it is" } else { "they are" },
-                if count == 1 { "it" } else { "them" }
+                if count == 1 {
+                    "it is copied as an ordinary file, but this or a later copy may remove it as a leftover partial file"
+                } else {
+                    "they are copied as ordinary files, but this or a later copy may remove them as leftover partial files"
+                }
             ),
         );
     }
