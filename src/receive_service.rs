@@ -947,33 +947,10 @@ pub(crate) fn refresh_outdated(domain: &Domain, quiet: bool) {
     if !domain.enabled().unwrap_or(false) {
         return;
     }
-    let scope = domain.runtime_path();
-    let Ok(entries) = fs::read_dir(&scope) else {
-        return;
-    };
-    /// Only the build; other fields are the service's own.
-    #[derive(Deserialize)]
-    struct Recorded {
-        identity: String,
-    }
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr());
     let mut notices = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(key) = name.as_bytes().strip_suffix(RECORD) else {
-            continue;
-        };
-        let control = scope.join(std::ffi::OsStr::from_bytes(key));
-        let outdated = crate::delegation::read_private_regular(
-            &entry.path(),
-            "background receiving endpoint",
-            64 * 1024,
-        )
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Recorded>(&bytes).ok())
-        .is_some_and(|recorded| recorded.identity != crate::identity::build());
-        if !outdated || !crate::persistence::claim_switch_attempt(&control, SWITCH_ATTEMPT_INTERVAL)
-        {
+    for control in outdated_controls(domain) {
+        if !crate::persistence::claim_switch_attempt(&control, SWITCH_ATTEMPT_INTERVAL) {
             continue;
         }
         let Some(state) = status_by(&control, Instant::now() + refresh_answer()) else {
@@ -1031,6 +1008,110 @@ pub(crate) fn refresh_outdated(domain: &Domain, quiet: bool) {
     if !quiet {
         for notice in notices {
             crate::output::diagnostic!("syq: {notice}");
+        }
+    }
+}
+
+/// The connections whose receiving service, by its record, runs another
+/// build than this command: one directory and each service's small record,
+/// without contacting any service.
+fn outdated_controls(domain: &Domain) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(domain.runtime_path()) else {
+        return Vec::new();
+    };
+    /// Only the build; other fields are the service's own.
+    #[derive(Deserialize)]
+    struct Recorded {
+        identity: String,
+    }
+    let mut controls = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(key) = name.as_bytes().strip_suffix(RECORD) else {
+            continue;
+        };
+        let outdated = crate::delegation::read_private_regular(
+            &entry.path(),
+            "background receiving endpoint",
+            64 * 1024,
+        )
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Recorded>(&bytes).ok())
+        .is_some_and(|recorded| recorded.identity != crate::identity::build());
+        if outdated {
+            controls.push(domain.runtime_path().join(std::ffi::OsStr::from_bytes(key)));
+        }
+    }
+    controls.sort();
+    controls
+}
+
+/// Run by the `persist` commands the user types (`persist on`, `connect`,
+/// `status`, `receive on` and `receive status`), so that receiving follows
+/// an update at once rather than in the background: each idle service from
+/// another build that cannot follow its path by itself, or whose own switch
+/// failed or waits for a login, is replaced now, in the foreground, where
+/// SSH can ask for the login. A busy one keeps running, and the command
+/// says so. A failure is kept for status (`record_attempt`).
+pub(crate) fn switch_outdated_now(domain: &Domain) {
+    if !domain.enabled().unwrap_or(false) {
+        return;
+    }
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    for control in outdated_controls(domain) {
+        let Ok(Some(state)) = running_status(&control, Retry::No, ANSWER_TIMEOUT) else {
+            continue;
+        };
+        if state.identity == crate::identity::build() {
+            continue;
+        }
+        let phase = switch_report(&control, &state).map(|report| report.phase);
+        match switch::follows(state.started_from.as_deref()) {
+            switch::Follows::OtherFile => continue,
+            // It switches by itself, unless its switch failed.
+            switch::Follows::ThisFile if !matches!(phase.as_deref(), Some("failed" | "login")) => {
+                continue
+            }
+            _ => {}
+        }
+        // A login that needed the user is worth trying again only with the
+        // user at hand.
+        if phase.as_deref() == Some("login") && !interactive {
+            continue;
+        }
+        let fix = connect_command(&state.endpoint, domain.explicit_path());
+        let busy = busy_of(&state);
+        if !busy.idle() {
+            crate::output::diagnostic!(
+                "syq: {}",
+                busy_notice(&state.endpoint, &state.identity, &busy, false, &fix)
+            );
+            continue;
+        }
+        crate::output::diagnostic!(
+            "syq: switching receiving through {}, which runs syq {}, to this version of syq",
+            state.endpoint,
+            state.identity
+        );
+        match crate::persistence::connect_domain(
+            domain,
+            &state.endpoint,
+            None,
+            false,
+            Duration::from_secs(30),
+            Replace::IfIdle,
+        ) {
+            Ok(()) => clear_attempt(&control),
+            Err(error) => {
+                crate::output::diagnostic!(
+                    "syq: could not switch receiving through {}: {error:#}; `{fix}` tries again",
+                    state.endpoint
+                );
+                record_attempt(
+                    &control,
+                    &Attempt::new("failed", Some(format!("{error:#}"))),
+                );
+            }
         }
     }
 }
@@ -1355,7 +1436,8 @@ pub(crate) struct NamedConnection {
 pub(crate) fn connection_status(control: &Path) -> Option<ReceivingStatus> {
     status(control, false).ok().map(|s| ReceivingStatus {
         switch: switch_report(control, &s),
-        busy: s.busy,
+        // An older service reports only its requests waiting for approval.
+        busy: Some(busy_of(&s)),
         build: s.identity,
         started_from: s.started_from,
         name: s.name,
@@ -1386,7 +1468,21 @@ pub(crate) fn build_note(
 ) -> Option<String> {
     let mut note = Vec::new();
     if build != crate::identity::build() {
-        note.push(format!("runs syq {build}"));
+        // Why it has not switched yet: what is in progress. Account
+        // connections are named below, with what switches at once.
+        note.push(
+            match busy.filter(|busy| busy.requests > 0 || busy.pending > 0) {
+                Some(busy) => format!(
+                    "runs syq {build} for now, with {}",
+                    Busy {
+                        accounts: 0,
+                        ..*busy
+                    }
+                    .describe(on)
+                ),
+                None => format!("runs syq {build}"),
+            },
+        );
         if switch.is_none() {
             note.push(match switch::follows(started_from) {
                 switch::Follows::OtherFile => format!(
@@ -1473,6 +1569,10 @@ pub(crate) enum Replace {
     /// other's services, and only once the new service could log in
     /// (`switch`).
     WhenIdle,
+    /// For the `persist` commands the user types (`switch_outdated_now`): at
+    /// once, in the foreground, when nothing is in progress; never one that
+    /// follows another installed syq file by itself.
+    IfIdle,
     /// For `persist connect` run by hand: at once, saying what that cuts off.
     Now,
 }
@@ -1521,6 +1621,18 @@ fn replace_other(
         Replace::Leave => {
             let busy = busy_of(state);
             Ok(other((!busy.idle()).then_some(busy)))
+        }
+        Replace::IfIdle => {
+            if switch::follows_other_file(state.started_from.as_deref()) {
+                return Ok(other(None));
+            }
+            if stop_when_idle(control, state)? {
+                Ok(None)
+            } else {
+                let busy = running_status(control, Retry::No, ANSWER_TIMEOUT)?
+                    .map_or_else(|| busy_of(state), |state| busy_of(&state));
+                Ok(other(Some(busy)))
+            }
         }
         Replace::WhenIdle => {
             if switch::follows_other_file(state.started_from.as_deref()) {
@@ -2017,15 +2129,39 @@ fn apply_preferences(domain: &Domain, config: &Preferences) -> Result<()> {
     } else {
         provider::stop(domain)?;
     }
+    let mut failures = Vec::new();
     for control in all_controls(domain)? {
         if !config.enabled() {
             stop_inner(&control, false)?;
             continue;
         }
-        if running_status(&control, Retry::No, ANSWER_TIMEOUT)?
-            .is_some_and(|state| state.identity != crate::identity::build())
+        // A service from another build may not read these settings. Replace
+        // it with one of this build, which needs this build's helper on the
+        // server, so connect again; if that fails, stop it all the same.
+        if let Some(state) = running_status(&control, Retry::No, ANSWER_TIMEOUT)?
+            .filter(|state| state.identity != crate::identity::build())
         {
-            stop_inner(&control, false)?;
+            crate::output::diagnostic!(
+                "syq: switching receiving through {}, which runs syq {}, to this version of syq",
+                state.endpoint,
+                state.identity
+            );
+            if let Err(error) = crate::persistence::connect_domain(
+                domain,
+                &state.endpoint,
+                None,
+                false,
+                Duration::from_secs(30),
+                Replace::Now,
+            ) {
+                stop_inner(&control, false)?;
+                failures.push(format!(
+                    "{}: {error:#}; run `{}`",
+                    state.endpoint,
+                    connect_command(&state.endpoint, domain.explicit_path())
+                ));
+                continue;
+            }
         }
         let mut started = None;
         if !is_running(&control)
@@ -2078,6 +2214,11 @@ fn apply_preferences(domain: &Domain, config: &Preferences) -> Result<()> {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+    anyhow::ensure!(
+        failures.is_empty(),
+        "receiving through these connections is off until they connect again: {}",
+        failures.join("; ")
+    );
     Ok(())
 }
 
@@ -2759,6 +2900,10 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
             crate::output::command_human_stdout!("Removed receiving profile {name}");
         }
         Action::Status { json, name } => {
+            // Scripts asking for structured status never wait for a login.
+            if !json {
+                switch_outdated_now(domain);
+            }
             let config = preferences(domain)?;
             if let Some(name) = name.as_deref() {
                 config.selected(Some(name))?;

@@ -297,7 +297,7 @@ impl Report {
             "waiting" => format!("switches to {to} once idle"),
             "switching" => format!("switching to {to}"),
             "login" => format!(
-                "switches to {to} when you next run a syq copy or ssh command in a terminal, since it could not log in by itself ({})",
+                "switches to {to} when you next run a syq copy, ssh, or persist command in a terminal, since it could not log in by itself ({})",
                 self.error.as_deref().unwrap_or("login failed")
             ),
             _ => format!(
@@ -1011,7 +1011,7 @@ mod tests {
         assert_eq!(report.phase, "login");
         assert!(
             report.describe().starts_with(
-                "switches to syq v99.0.0 when you next run a syq copy or ssh command in a terminal"
+                "switches to syq v99.0.0 when you next run a syq copy, ssh, or persist command in a terminal"
             ),
             "{}",
             report.describe()

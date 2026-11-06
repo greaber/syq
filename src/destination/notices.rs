@@ -32,11 +32,33 @@ pub(super) fn waiting_for_earlier(who: &str, what: &str) {
 /// version than this command, so the command runs with the helper that
 /// connection installed here. A receiving machine switches its connection to
 /// a newer syq by itself once one is installed there and nothing is in
-/// progress (`receive_service::switch`).
+/// progress (`receive_service::switch`); a connection from before syq
+/// followed updates switches when the user next runs syq there. For an older
+/// one, say what does it at once on that machine.
 pub(super) fn other_build(name: &str, build: &str) {
-    crate::output::diagnostic!(
-        "syq: @{name} is connected with syq {build}, so this command runs as syq {build}"
-    );
+    crate::output::diagnostic!("syq: {}", other_build_message(name, build));
+}
+fn other_build_message(name: &str, build: &str) -> String {
+    let mut message =
+        format!("@{name} is connected with syq {build}, so this command runs as syq {build}");
+    if older_than_this(build) {
+        message.push_str(&format!(
+            "; to use syq {} instead, update syq on that machine if needed and run `syq persist status` there",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    message
+}
+/// Whether release build `build`, such as `v0.7.1`, is older than this one.
+/// False for a build whose version is unknown.
+fn older_than_this(build: &str) -> bool {
+    let Ok(this) = semver::Version::parse(env!("CARGO_PKG_VERSION")) else {
+        return false;
+    };
+    build
+        .strip_prefix('v')
+        .and_then(|version| semver::Version::parse(version).ok())
+        .is_some_and(|other| other.cmp_precedence(&this).is_lt())
 }
 
 /// This machine's hostname and login name. Someone at a receiving machine
@@ -329,6 +351,33 @@ fn classify(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A receiving machine still connected with an older syq is told how to
+    /// switch it; a newer one, or one of unknown version, is only named.
+    #[test]
+    fn an_older_receiving_connection_says_how_to_switch_it() {
+        let older = other_build_message("laptop", "v0.0.1");
+        assert!(
+            older.starts_with(
+                "@laptop is connected with syq v0.0.1, so this command runs as syq v0.0.1; to use syq "
+            ),
+            "{older}"
+        );
+        assert!(
+            older.ends_with(
+                " instead, update syq on that machine if needed and run `syq persist status` there"
+            ),
+            "{older}"
+        );
+        for build in [
+            "v999.0.0",
+            "0.0.1",
+            "v0.0.1+dev.0123456789ab.extra-garbage!",
+        ] {
+            let message = other_build_message("laptop", build);
+            assert!(!message.contains("persist status"), "{build}: {message}");
+        }
+    }
 
     /// Each message says which machine runs the fix and what it names, so
     /// an agent on the server knows to ask the person at the laptop.

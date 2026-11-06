@@ -3597,7 +3597,7 @@ fn a_switch_that_cannot_log_in_leaves_the_old_service_receiving() {
     let shown = installed.persist(syq, &["status"]);
     assert!(
         String::from_utf8_lossy(&shown.stdout)
-            .contains("when you next run a syq copy or ssh command in a terminal"),
+            .contains("when you next run a syq copy, ssh, or persist command in a terminal"),
         "{}",
         String::from_utf8_lossy(&shown.stdout)
     );
@@ -4268,6 +4268,66 @@ fn commands_replace_an_idle_service_an_older_syq_left_running() {
     assert_eq!(read(&installed.scope.join("receive.json")), settings);
 }
 
+/// After an update, the `persist` commands the user types replace an idle
+/// service that an older syq left running at once, in the foreground, and
+/// say so: `persist receive on` used to stop it without starting this
+/// build's, and `persist on` and `persist status` left it running.
+#[test]
+fn persist_commands_replace_an_idle_older_service_at_once() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
+    let socket = PathBuf::from(format!("{}.recv", installed.control().display()));
+    for command in [
+        &["status"][..],
+        &["on"],
+        &["receive", "on"],
+        &["receive", "status"],
+    ] {
+        let old = older_service(&installed, serde_json::json!([]));
+        let output = installed.persist(syq, command);
+        assert_output_ok(&output);
+        assert!(
+            stderr_of(&output).contains(
+                "switching receiving through test-server, which runs syq v0.7.1, to this version of syq\n"
+            ),
+            "{command:?}: {}",
+            stderr_of(&output)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("test-server ready; receiving as @"),
+            "{command:?}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        // An older service has only an unconditional stop.
+        assert_eq!(
+            old.join().unwrap().last().unwrap(),
+            &serde_json::json!({"version": 2, "stop": true}),
+            "{command:?}"
+        );
+        // This build receives when the command returns.
+        assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
+        assert_eq!(
+            installed.request(serde_json::json!({"version": 2, "stop": false}))["identity"],
+            this_build(),
+            "{command:?}"
+        );
+    }
+    // Structured status, which scripts poll, never logs in.
+    let old = older_service(&installed, serde_json::json!([]));
+    let output = installed.persist(syq, &["status", "--json"]);
+    assert_output_ok(&output);
+    assert!(
+        !stderr_of(&output).contains("switching"),
+        "{}",
+        stderr_of(&output)
+    );
+    installed.request(serde_json::json!({"version": 2, "stop": true}));
+    old.join().unwrap();
+}
+
 /// A service an older syq left running with a request waiting for approval
 /// keeps running: a command leaves it, and a switch says why it waits.
 /// `persist connect` run by hand replaces it at once and says what that
@@ -4323,6 +4383,23 @@ fn a_busy_service_is_replaced_only_by_hand_saying_what_that_cuts_off() {
     assert_eq!(
         String::from_utf8_lossy(&waiting.stdout),
         "receiving through test-server keeps running syq v0.7.1 for now, with 1 request waiting for approval; once nothing is in progress, a syq command run here switches it to this version\n"
+    );
+    // Status leaves it too, and says why it has not switched.
+    let shown = installed.persist(syq, &["status"]);
+    assert_output_ok(&shown);
+    assert!(
+        String::from_utf8_lossy(&shown.stdout).contains(
+            "receiving runs syq v0.7.1 for now, with 1 request waiting for approval; a syq command run here switches it to this version once idle"
+        ),
+        "{}",
+        String::from_utf8_lossy(&shown.stdout)
+    );
+    assert!(
+        stderr_of(&shown).contains(
+            "receiving through test-server keeps running syq v0.7.1 for now, with 1 request waiting for approval"
+        ),
+        "{}",
+        stderr_of(&shown)
     );
 
     let replaced = installed.persist(

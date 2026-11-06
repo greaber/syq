@@ -269,6 +269,10 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                     }
                 }
                 connected?;
+                // Other connections from before an update follow too.
+                if !when_idle {
+                    crate::receive_service::switch_outdated_now(&domain);
+                }
             }
         }
         PersistAction::On { ephemeral: true } => {
@@ -282,6 +286,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
             let scope = domain.enable()?;
             crate::output::command_human_stdout!("SSH connection persistence is on");
             crate::output::command_human_stdout!("scope: {}", scope.display());
+            crate::receive_service::switch_outdated_now(&domain);
         }
         PersistAction::Off {} => {
             if domain.is_default() {
@@ -319,6 +324,10 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
             crate::output::command_human_stdout!("SSH connection persistence is off");
         }
         PersistAction::Status { json } => {
+            // Scripts asking for structured status never wait for a login.
+            if !json {
+                crate::receive_service::switch_outdated_now(&domain);
+            }
             let enabled = domain.enabled()?;
             if !json {
                 crate::output::command_human_stdout!(
