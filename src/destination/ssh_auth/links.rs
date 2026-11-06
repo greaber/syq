@@ -412,6 +412,23 @@ mod tests {
         server.join().unwrap().unwrap();
     }
 
+    /// A connection that ends while a close waits counts as ended at once,
+    /// rather than as one that did not answer in time.
+    #[test]
+    fn a_connection_that_ends_during_a_close_counts_as_ended() {
+        let links = std::sync::Arc::new(AccountLinks::default());
+        // Its keeper ends instead of answering.
+        let (keeper, server, end) = serving(&links, Vec::new());
+        wait_for(|| links.len() == 1);
+        let closing = links.ask_close();
+        keeper.join().unwrap();
+        drop(end);
+        let started = Instant::now();
+        assert!(closing.wait(Instant::now() + Duration::from_secs(10)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        server.join().unwrap().unwrap();
+    }
+
     /// One in use stays open, and the close says not all ended.
     #[test]
     fn a_connection_in_use_stays_open() {
