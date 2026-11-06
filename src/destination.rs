@@ -1898,8 +1898,10 @@ pub(crate) enum Prepared {
     /// (`conn::login_rejection`), and what ssh said last. It connects again
     /// only once the service has taken over.
     Lost { needs_user: bool, error: String },
-    /// It never started to connect, for a reason on this machine, such as a
-    /// receiving directory that is unavailable.
+    /// It cannot start on this machine, as a newly started service could
+    /// not: its receiving directory is unavailable, the receiver's key cannot
+    /// be loaded, or its return socket cannot be made. Anything else that
+    /// stops it, such as failing to run ssh, is `Lost`.
     NotStarted,
 }
 
@@ -2155,6 +2157,17 @@ pub(crate) fn serve_background(
             let _ = handover.report.send((handover.id, prepared));
         }
     };
+    // While its service prepares to take over, a connection that ends for
+    // good says so: the switch then leaves the replaced service receiving.
+    let lost = |error: &anyhow::Error| {
+        if preparing() {
+            report(Prepared::Lost {
+                needs_user: false,
+                error: format!("{error:#}"),
+            });
+        }
+    };
+    let not_started = |_: &anyhow::Error| report(Prepared::NotStarted);
     let mut tcp_peer = crate::conn::RemoteSpec::local_receiver(false);
     tcp_peer.local_process = false;
     tcp_peer.host = spec.endpoint.host.clone();
@@ -2163,11 +2176,13 @@ pub(crate) fn serve_background(
     if let Some(user) = &spec.endpoint.user {
         tcp_peer.rsh.extend(["-l".into(), user.clone()]);
     }
+    let identity_key = identity::load_key().inspect_err(not_started)?;
+    let secret = random_token().inspect_err(lost)?;
     let receiver = Arc::new(Receiver {
         tcp_peer,
         server_user: spec.endpoint.user.clone(),
         name: config.name.clone(),
-        identity_key: identity::load_key()?,
+        identity_key,
         requester: crate::receive_approval::Requester {
             server: spec.endpoint.label(),
             profile: config.name.clone(),
@@ -2178,7 +2193,7 @@ pub(crate) fn serve_background(
         generation: AtomicU64::new(0),
         cwd: config.cwd.clone(),
         root: config.root.clone(),
-        secret: random_token()?,
+        secret,
         max_bytes: config.max_bytes,
         max_entries: config.max_entries,
         max_delete: config.max_delete,
@@ -2226,7 +2241,8 @@ pub(crate) fn serve_background(
                 }
             }
         },
-    )?;
+    )
+    .inspect_err(not_started)?;
     let result = (|| {
         let mut delay = Duration::from_secs(1);
         let mut login_delay = login_retry_first();
@@ -2474,7 +2490,8 @@ pub(crate) fn serve_background(
             }
         }
         Ok(())
-    })();
+    })()
+    .inspect_err(lost);
     receiver.revoke_all();
     drop(broker);
     result

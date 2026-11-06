@@ -1882,7 +1882,7 @@ fn replace_other(
             // That took a while: decide on what the service says now, such
             // as a request that began waiting for approval meanwhile.
             let Some(state) = running_status(control, Retry::No, ANSWER_TIMEOUT)? else {
-                successor.take_over(control, &spec)?;
+                successor.take_over()?;
                 return Ok(Some(Receiving::Started));
             };
             if state.identity == crate::identity::build() {
@@ -1894,7 +1894,7 @@ fn replace_other(
             // A connection it lost meanwhile leaves the old one receiving.
             successor.still_logged_in(control, &remote.label())?;
             if stop_when_idle(control, &state)? {
-                successor.take_over(control, &spec)?;
+                successor.take_over()?;
                 return Ok(Some(Receiving::Started));
             }
             // It did not stop: say why from what the service says now. One
@@ -2194,14 +2194,14 @@ impl ProfileWorker {
             config.clone(),
             activity.clone(),
         );
-        // A connection that fails for good while its service prepares to
-        // take over says so too: as lost once it started to connect, and
-        // otherwise as never started, which a switch does not wait for.
-        let failed = handover
-            .as_ref()
-            .map(|handover| (handover.id, handover.report.clone()));
         let thread = std::thread::spawn(move || {
             let result = if !thread_config.cwd.is_dir() {
+                // A switch does not wait for it (`Prepared::NotStarted`).
+                if let Some(handover) = &handover {
+                    let _ = handover
+                        .report
+                        .send((handover.id, crate::destination::Prepared::NotStarted));
+                }
                 Err(anyhow::anyhow!(
                     "receiving directory is unavailable: {}",
                     thread_config.cwd.display()
@@ -2218,20 +2218,6 @@ impl ProfileWorker {
                     handover,
                 )
             };
-            if let (Err(error), Some((id, failed))) = (&result, failed) {
-                let started = thread_state.lock().unwrap().attempted.is_some();
-                let _ = failed.send((
-                    id,
-                    if started {
-                        crate::destination::Prepared::Lost {
-                            needs_user: false,
-                            error: format!("{error:#}"),
-                        }
-                    } else {
-                        crate::destination::Prepared::NotStarted
-                    },
-                ));
-            }
             if let Err(error) = &result {
                 let mut state = thread_state.lock().unwrap();
                 state.phase = "failed".into();

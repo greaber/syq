@@ -4,16 +4,17 @@
 //! service still receives, and the server proves each new connection the
 //! receiver and then holds it (`destination::TAKE_OVER`). Only once every
 //! login worked does the switch stop the old service, and then the new one
-//! takes its lock, tells the server to take each name as soon as the old
-//! registration lets go of it, and goes on with the connections it already
-//! has.
+//! takes its lock, writes the control's record, tells the server to take
+//! each name as soon as the old registration lets go of it, and goes on with
+//! the connections it already has.
 //!
 //! A login that fails or waits for the user, or a connection lost before
 //! the switch stops the old service, leaves the old service receiving, and
 //! the new one logs out and exits. So does one the switch stops waiting
 //! for, or a switch that ends: the new service hears it as the end of its
 //! input. A new service that finds another one holding the lock once told
-//! to take over leaves it the connection, never having taken a name.
+//! to take over leaves it the connection and its record, never having taken
+//! a name.
 //!
 //! The switch and the service it starts are always the same build, as is
 //! the helper on the server: the switch installs and runs its own.
@@ -145,10 +146,9 @@ impl Successor {
         }
     }
 
-    /// Once the service it replaces has stopped: take over, as `spec` says,
-    /// which the control's record keeps from now on.
-    pub(super) fn take_over(mut self, control: &Path, spec: &ServiceSpec) -> Result<()> {
-        super::atomic_json(&suffixed(control, RECORD), spec)?;
+    /// Once the service it replaces has stopped: take over, unless another
+    /// service took the control meanwhile.
+    pub(super) fn take_over(mut self) -> Result<()> {
         let mut input = self.input.take().context("successor input")?;
         input.write_all(b"go\n")?;
         drop(input);
@@ -318,11 +318,13 @@ pub(super) fn run(domain: &Domain, control: &Path, started_from: Option<PathBuf>
         unsafe { libc::dup2(null.as_raw_fd(), fd) };
     }
     // The service it replaces has stopped. Another that started meanwhile,
-    // as for a command, keeps the connection; the server never gave this one
-    // the name.
+    // as for a command, keeps the connection, with its record; the server
+    // never gave this one the name.
     let Some(_lock) = lock_for_start(|| try_lock(control, true))? else {
         return Ok(());
     };
+    // The control's record says how it receives from now on.
+    super::atomic_json(&suffixed(control, RECORD), &spec)?;
     taken_over.store(true, Ordering::Release);
     for worker in &workers {
         worker.wake();
