@@ -278,12 +278,13 @@ impl Container {
 
 /// The authority of a copy to this machine, which it approved itself with
 /// `issued`, whose rules it derived as `rules`
-/// (`directive::receiving_rules`). It shares the restricted executor, but
+/// (`directive::receiving_rules`). The machine keeps it in memory for the
+/// copy rather than signing `issued`. It shares the restricted executor, but
 /// never reads or changes an enrollment, a record of used directives, or
 /// persistence preferences.
 pub(crate) fn receiving_authority(
     container: &Container,
-    issued: &directive::Issued,
+    issued: &Directive,
     (grant, constraints): (Grant, GrantConstraints),
 ) -> Result<std::sync::Arc<RestrictedAuthority>> {
     if constraints.extra_options.follow_dst {
@@ -306,7 +307,7 @@ pub(crate) fn receiving_authority(
         confined,
         grant,
         constraints,
-        issued.digest(),
+        directive::issued_digest(issued)?,
         key,
         Instant::now() + std::time::Duration::from_secs(FINISH_WINDOW_SECONDS as u64),
         &protected,

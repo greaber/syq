@@ -361,8 +361,8 @@ pub(crate) fn issue(
 }
 
 /// A directive for a copy to this machine, issued now, that this machine
-/// keeps for itself (`Issued`): no other clock reads it, and its copy must
-/// start within `start_within`.
+/// keeps for itself rather than signs: no other clock reads it, and its copy
+/// must start within `start_within`.
 pub(crate) fn issue_here(
     binding: Binding,
     command: Vec<Vec<u8>>,
@@ -419,41 +419,16 @@ fn made(
     Ok(directive)
 }
 
-/// The header of a directive a machine issued for a copy to itself. It
-/// differs from a signed directive's, so neither passes as the other.
-const ISSUED_MAGIC: &[u8; 8] = b"SYQDIRL1";
-
-/// The encoding of a directive a machine issued for a copy to itself
-/// (`issue_here`), which it hands the copy's coordinator. It is never
-/// signed: the machine keeps the directives it issued in memory, and the
-/// copy's control opens only by presenting one of those encodings unchanged
-/// (`destination::Receiver`).
-#[derive(Debug)]
-pub(crate) struct Issued {
-    /// The header, then the canonical body.
-    pub encoded: Vec<u8>,
-}
-
-impl Issued {
-    pub(crate) fn new(directive: &Directive) -> Result<Self> {
-        directive.validate()?;
-        let body = postcard::to_stdvec(directive).context("encode the directive")?;
-        if body.len() > MAX_BODY_BYTES {
-            bail!("the directive exceeds {MAX_BODY_BYTES} bytes");
-        }
-        Ok(Self {
-            encoded: [ISSUED_MAGIC.as_slice(), &body].concat(),
-        })
-    }
-
-    /// The digest that binds the machine's results to this directive.
-    pub(crate) fn digest(&self) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"syq-issued-directive-transcript@greaber.github\0");
-        hasher.update(&(self.encoded.len() as u64).to_be_bytes());
-        hasher.update(&self.encoded);
-        *hasher.finalize().as_bytes()
-    }
+/// The digest that binds a machine's results to a directive it issued for a
+/// copy to itself (`issue_here`). Such a directive is never signed or sent,
+/// so its size is bounded only by the request that carried its command.
+pub(crate) fn issued_digest(directive: &Directive) -> Result<[u8; 32]> {
+    let body = postcard::to_stdvec(directive).context("encode the directive")?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"syq-issued-directive-transcript@greaber.github\0");
+    hasher.update(&(body.len() as u64).to_be_bytes());
+    hasher.update(&body);
+    Ok(*hasher.finalize().as_bytes())
 }
 
 /// The rules for the destination of `directive`, on an account whose home

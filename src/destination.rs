@@ -50,10 +50,11 @@ const REGISTRATION_VERSION: u16 = 3;
 /// The size of an ordinary message, and the most a few small values
 /// carried beside messages may take.
 const MAX_MESSAGE: usize = 256 * 1024;
-/// The largest message: a copy request whose command is as long as a
-/// receiving machine accepts (`approval_command::MAX_COMMAND_BYTES`), which
-/// JSON spells with up to four characters a byte, once in the command and
-/// twice in the request derived from it.
+/// The largest message: a request whose command is as long as a receiving
+/// machine accepts (`approval_command::MAX_COMMAND_BYTES`), which JSON spells
+/// with up to four characters a byte, beside what the command read from
+/// files or, for a copy of files on that machine, the request derived from
+/// it.
 const MAX_REQUEST_MESSAGE: usize = 4 * 1024 * 1024;
 /// How many messages larger than an ordinary one this process reads at
 /// once. A message is read before its sender is authenticated, so this keeps
@@ -192,11 +193,8 @@ pub(crate) struct CopyRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Approved {
-    /// What the copy's workers name to join it.
+    /// What the copy's control, once, and then its workers name to open.
     pub token: String,
-    /// The directive this machine issued for the copy, base64url-encoded,
-    /// which the copy's control presents unchanged.
-    pub directive: String,
     pub destination: Vec<u8>,
     /// The approving machine's own deletion limit for this copy, when it has
     /// one. Both machines run the same build.
@@ -269,16 +267,9 @@ enum Message {
     /// other servers, which this machine approves with directives for their
     /// enrolled receivers.
     Forward(Box<forward::ForwardRequest>),
-    /// A worker of an approved copy, or the control of a copy of files on
-    /// this machine.
     Open {
         token: String,
         control: bool,
-    },
-    /// The control of an approved copy to this machine, presenting the
-    /// directive this machine issued for it.
-    OpenCopy {
-        directive: String,
     },
 }
 #[derive(Serialize, Deserialize)]
@@ -311,10 +302,6 @@ struct Registration {
 struct Route {
     registration: Registration,
     token: String,
-    /// For a copy to the receiving machine, the directive its control
-    /// presents.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    directive: Option<String>,
 }
 
 pub(crate) fn write_message(writer: &mut impl Write, message: &impl Serialize) -> Result<()> {
@@ -1189,6 +1176,14 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     let handoff::Selection {
         name, registration, ..
     } = selection;
+    // Refuse here, before asking, what the receiving machine would refuse
+    // in the command alone, such as an out-of-range limit or too many
+    // sources: it derives the copy's rules the same way.
+    let (_, sources) = args
+        .locations
+        .split_last()
+        .context("copy endpoints missing")?;
+    crate::directive::copy_operation(args, sources, &request_path(b".")?)?;
     let command = crate::approval_command::copy_command(args)?;
     let inputs = crate::directive::Inputs {
         ignore: args.ignore_lines.clone(),
@@ -1259,7 +1254,6 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&Route {
             registration,
             token: approved.token,
-            directive: Some(approved.directive),
         })?)
     ));
     Ok(())
@@ -1284,14 +1278,15 @@ fn switched_away(error: &anyhow::Error) -> bool {
 
 pub(crate) fn connect(grant: &str, control: bool) -> Result<UnixStream> {
     let route = decode_route(grant)?;
-    let message = match route.directive {
-        Some(directive) if control => Message::OpenCopy { directive },
-        _ => Message::Open {
+    let (stream, reply) = exchange(
+        &route.registration,
+        Message::Open {
             token: route.token,
             control,
         },
-    };
-    let (stream, reply) = exchange(&route.registration, message, START_TIMEOUT, None)?;
+        START_TIMEOUT,
+        None,
+    )?;
     if !matches!(reply, Reply::Ready) {
         bail!("named transfer channel was not opened");
     }
@@ -1302,8 +1297,7 @@ fn decode_route(grant: &str) -> Result<Route> {
     let encoded = grant
         .strip_prefix(PREFIX)
         .context("invalid named destination route")?;
-    // A copy's directive carries its command.
-    if encoded.len() > MAX_REQUEST_MESSAGE {
+    if encoded.len() > MAX_MESSAGE {
         bail!("named route too large");
     }
     Ok(serde_json::from_slice(
@@ -1366,9 +1360,6 @@ impl SessionAuthority {
 struct Session {
     tcp: Option<crate::conn::TcpInfo>,
     authority: SessionAuthority,
-    /// For a copy to this machine, the directive it issued, as the copy's
-    /// control must present it.
-    directive: Option<String>,
     issued: Instant,
     opened: bool,
     channels: Arc<crate::private_broker::ConnectionRegistry>,
@@ -1517,16 +1508,14 @@ impl Receiver {
                 cwd,
                 inputs,
             } => self.request(command, cwd, inputs, stream),
-            Message::Open { token, control } => {
-                self.open(Opening::Token { token, control }, stream)
-            }
-            Message::OpenCopy { directive } => self.open(Opening::Directive(directive), stream),
+            Message::Open { token, control } => self.open(token, control, stream),
         }
     }
 
     /// Approve a copy from the requesting server to this machine: derive
-    /// what it may do here from its command, ask, and issue the directive
-    /// that its control presents.
+    /// what it may do here from its command, ask, and keep the directive it
+    /// issued for the copy, as the authority made from it, under a token
+    /// that opens the copy's control once, within `START_TIMEOUT`.
     fn request(
         &self,
         command: Vec<Vec<u8>>,
@@ -1561,6 +1550,9 @@ impl Receiver {
             home.as_ref()
                 .map(|(named, real)| (named.as_path(), real.as_path())),
         )?;
+        if self.root.as_ref() == Some(&destination) && args.placement == crate::cli::Placement::As {
+            bail!("cannot replace the receiving root itself; use --into . or a child path");
+        }
         let caps = crate::directive::Caps {
             max_bytes: self.max_bytes,
             max_entries: self.max_entries,
@@ -1585,7 +1577,7 @@ impl Receiver {
             )?;
             let rules =
                 crate::directive::receiving_rules(&directive, destination.as_os_str().as_bytes())?;
-            Ok((crate::directive::Issued::new(&directive)?, rules))
+            Ok((directive, rules))
         };
         let (issued, rules) = issue()?;
         let request = CopyRequest {
@@ -1593,11 +1585,6 @@ impl Receiver {
             copy: rules.0.copy.clone(),
             constraints: rules.1.clone(),
         };
-        if self.root.as_ref() == Some(&destination)
-            && request.copy.policy.placement == DestinationPlacement::ExactPath
-        {
-            bail!("cannot replace the receiving root itself; use --into . or a child path");
-        }
         // The most deletions the copy may make here: this machine's own
         // --max-delete, within the copy's entry limit. A pruning copy's
         // rules enforce it, or the sender's own --max-delete if lower. The
@@ -1645,6 +1632,7 @@ impl Receiver {
         let container = crate::restricted::Container::open(&container)?;
         // Validate the complete operation before the local policy decision.
         let authority = crate::restricted::receiving_authority(&container, &issued, rules)?;
+        drop(issued);
         self.authorize_request(
             &command,
             &cwd,
@@ -1655,12 +1643,11 @@ impl Receiver {
         )?;
         // Start the directive's clocks at approval, including after a long
         // prompt.
-        let (issued, authority) = if automatic {
-            (issued, authority)
+        let authority = if automatic {
+            authority
         } else {
             let (issued, rules) = issue()?;
-            let authority = crate::restricted::receiving_authority(&container, &issued, rules)?;
-            (issued, authority)
+            crate::restricted::receiving_authority(&container, &issued, rules)?
         };
         let mut sessions = self.sessions.lock().unwrap();
         if self.stop.load(Ordering::Acquire)
@@ -1670,13 +1657,11 @@ impl Receiver {
             bail!("copy disconnected before approval could be used");
         }
         let token = random_token()?;
-        let directive = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&issued.encoded);
         sessions.insert(
             token.clone(),
             Session {
                 tcp: None,
                 authority: SessionAuthority::Receive(authority),
-                directive: Some(directive.clone()),
                 issued: Instant::now(),
                 opened: false,
                 channels: Arc::new(crate::private_broker::ConnectionRegistry::new(
@@ -1689,39 +1674,23 @@ impl Receiver {
             &mut stream,
             &Reply::Approved(Approved {
                 token,
-                directive,
                 destination: request.copy.destination,
                 max_delete: Some(max_delete),
             }),
         )
     }
 
-    /// Open a channel of an approved copy. A copy to this machine opens its
-    /// control only with the directive this machine issued for it, unused,
-    /// within `START_TIMEOUT` of its approval.
-    fn open(&self, opening: Opening, mut stream: TrackedStream) -> Result<()> {
-        let (token, control, authority, channels, _permit, _channel) = {
+    /// Open a channel of an approved copy: its control once, within
+    /// `START_TIMEOUT` of its approval, then its workers.
+    fn open(&self, token: String, control: bool, mut stream: TrackedStream) -> Result<()> {
+        let (authority, channels, _permit, _channel) = {
             let mut sessions = self.sessions.lock().unwrap();
-            let (token, control) = match &opening {
-                Opening::Token { token, control } => (token.clone(), *control),
-                Opening::Directive(directive) => (
-                    sessions
-                        .iter()
-                        .find(|(_, session)| session.directive.as_ref() == Some(directive))
-                        .map(|(token, _)| token.clone())
-                        .context("transfer authorization expired or is unknown")?,
-                    true,
-                ),
-            };
             let session = sessions
                 .get_mut(&token)
                 .context("transfer authorization expired or is unknown")?;
             if control {
                 if session.opened || session.issued.elapsed() >= START_TIMEOUT {
                     bail!("transfer authorization has already been used or expired");
-                }
-                if session.directive.is_some() && !matches!(opening, Opening::Directive(_)) {
-                    bail!("an approved copy's control presents its directive");
                 }
             } else if !session.opened {
                 bail!("transfer control channel has not opened");
@@ -1734,8 +1703,6 @@ impl Receiver {
                 session.opened = true;
             }
             (
-                token,
-                control,
                 session.authority.clone(),
                 Arc::clone(&session.channels),
                 permit,
@@ -1773,16 +1740,6 @@ impl Receiver {
         }
         result
     }
-}
-
-/// How a channel of an approved copy names it.
-enum Opening {
-    Token {
-        token: String,
-        control: bool,
-    },
-    /// The control of a copy to this machine.
-    Directive(String),
 }
 
 fn requester_closed(socket: &UnixStream) -> bool {

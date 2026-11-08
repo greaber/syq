@@ -180,7 +180,6 @@ fn apply(
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&Route {
             registration,
             token: approved.token,
-            directive: None,
         })?)
     ));
     Ok(())
@@ -395,7 +394,6 @@ impl Receiver {
                     authority,
                     descriptors: Default::default(),
                 },
-                directive: None,
                 issued: Instant::now(),
                 opened: false,
                 channels: Arc::new(crate::private_broker::ConnectionRegistry::new(

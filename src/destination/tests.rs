@@ -542,7 +542,6 @@ fn a_request_keeps_the_receiving_directory_it_opened() {
     let container_path = root.path().join("container");
     fs::create_dir(&container_path).unwrap();
     let directive = issued(&command(&root.path().join("source"), &[]), None);
-    let encoded = crate::directive::Issued::new(&directive).unwrap();
     let output = container_path.join("output");
     let rules =
         || crate::directive::receiving_rules(&directive, output.as_os_str().as_bytes()).unwrap();
@@ -550,10 +549,10 @@ fn a_request_keeps_the_receiving_directory_it_opened() {
     let opened = crate::rooted::Root::open(&container_path)
         .unwrap()
         .identity();
-    let before = crate::restricted::receiving_authority(&container, &encoded, rules()).unwrap();
+    let before = crate::restricted::receiving_authority(&container, &directive, rules()).unwrap();
     fs::rename(&container_path, root.path().join("moved")).unwrap();
     fs::create_dir(&container_path).unwrap();
-    let after = crate::restricted::receiving_authority(&container, &encoded, rules()).unwrap();
+    let after = crate::restricted::receiving_authority(&container, &directive, rules()).unwrap();
     assert_eq!(before.root_identity_for_test(), opened);
     assert_eq!(after.root_identity_for_test(), opened);
 }
@@ -724,7 +723,6 @@ fn route(registration: Registration, approved: &Approved) -> String {
             serde_json::to_vec(&Route {
                 registration,
                 token: approved.token.clone(),
-                directive: Some(approved.directive.clone()),
             })
             .unwrap()
         )
@@ -843,42 +841,16 @@ fn named_control_cannot_be_replayed_and_cannot_listen_on_tcp() {
     let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
     let (command, inputs) = requested(Path::new("source"), &["--no-compress"]);
     let approved = approve(&registration, command, inputs);
-    let open = |message: Message| {
-        exchange(
-            &registration,
-            message,
-            Duration::from_secs(2),
-            Some(Duration::from_secs(2)),
-        )
-        .map(drop)
-    };
-    // A copy's control opens only with its directive, not with the token
-    // its workers name.
-    let refused = open(Message::Open {
-        token: approved.token.clone(),
-        control: true,
-    })
-    .unwrap_err();
-    assert!(
-        format!("{refused:#}").contains("presents its directive"),
-        "{refused:#}"
-    );
-    // Nor with any other directive, or one changed by a byte.
-    let mut changed = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(&approved.directive)
-        .unwrap();
-    *changed.last_mut().unwrap() ^= 1;
-    for directive in [
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(changed),
-        String::new(),
-    ] {
-        assert!(open(Message::OpenCopy { directive }).is_err());
-    }
     let mut conn = control(registration.clone(), &approved);
-    // Once opened, its directive is used.
-    assert!(open(Message::OpenCopy {
-        directive: approved.directive.clone()
-    })
+    assert!(exchange(
+        &registration,
+        Message::Open {
+            token: approved.token.clone(),
+            control: true
+        },
+        Duration::from_secs(2),
+        Some(Duration::from_secs(2))
+    )
     .is_err());
     conn.send(Request::TcpListen {
         send_rate: None,
@@ -1087,8 +1059,9 @@ fn named_abandoned_open_releases_its_session() {
     let approved = approve(&registration, command, inputs);
     let (stream, reply) = exchange(
         &registration,
-        Message::OpenCopy {
-            directive: approved.directive,
+        Message::Open {
+            token: approved.token,
+            control: true,
         },
         Duration::from_secs(2),
         Some(Duration::from_secs(2)),
@@ -1125,8 +1098,9 @@ fn named_failed_open_reply_releases_its_session() {
             version: VERSION,
             identity: crate::identity::build().into(),
             secret: registration.secret,
-            message: Message::OpenCopy {
-                directive: approved.directive,
+            message: Message::Open {
+                token: approved.token,
+                control: true,
             },
         },
     )
@@ -1185,8 +1159,7 @@ fn named_copy_with_transport(tcp: bool) {
 }
 
 /// As many named sources as any copy takes, with names long enough that
-/// their request, the directive the approval returns, and the control's
-/// opening that presents it are each larger than an ordinary message.
+/// their request is larger than an ordinary message.
 #[test]
 fn named_copy_takes_1024_sources_with_long_names() {
     let temp = crate::test_support::tempdir().unwrap();
@@ -1227,6 +1200,89 @@ fn named_copy_takes_1024_sources_with_long_names() {
     for name in &names {
         assert!(root.join(name).is_dir(), "{name}");
     }
+}
+
+/// What the receiving machine would refuse in the command alone is refused
+/// on the server, before it asks or says that it waits.
+#[test]
+fn a_named_copy_the_receiving_machine_would_refuse_fails_before_asking() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let registration = Registration {
+        version: REGISTRATION_VERSION,
+        program: b"/nonexistent/syq".to_vec(),
+        identity: crate::identity::build().into(),
+        // Nothing listens here: asking would fail with another error.
+        socket: temp.path().join("absent.sock"),
+        secret: "test".into(),
+    };
+    let mut many = vec![b"cp".to_vec()];
+    for i in 0..crate::delegation::MAX_MUTATION_SCOPES {
+        many.push(b"--src".to_vec());
+        many.push(format!("source-{i}").into_bytes());
+    }
+    many.extend(["--to", "@laptop", "--into", "."].map(|arg| arg.as_bytes().to_vec()));
+    for (command, refusal) in [
+        (
+            command(
+                Path::new("source"),
+                &["--follow-dst", "--widen-dirs", "all"],
+            ),
+            "--widen-dirs all cannot be combined with --follow-dst",
+        ),
+        (many, "its approval can list"),
+    ] {
+        let mut args = crate::approval_command::parse(&command).unwrap();
+        args.return_selection = Some(Some(handoff::Selection::new(
+            "laptop".into(),
+            registration.clone(),
+            handoff::Kind::Copy,
+            None,
+        )));
+        let error = format!("{:#}", prepare(&mut args).unwrap_err());
+        assert!(
+            error.contains(refusal) && !error.contains("absent.sock"),
+            "{error}"
+        );
+    }
+}
+
+/// The rules a server's command read from files may be as large as the
+/// request that carries them: the receiving machine keeps the directive it
+/// issues for them rather than signing or returning it, so it imposes no
+/// smaller limit.
+#[test]
+fn a_named_copy_takes_ignore_rules_larger_than_a_signed_directive() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    fs::create_dir(&root).unwrap();
+    let source = fs::canonicalize(temp.path()).unwrap().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("kept"), b"kept").unwrap();
+    fs::write(source.join("skip.tmp"), b"skipped").unwrap();
+    let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
+    // 600 KiB of comments, more than a signed directive's 512 KiB, then one
+    // rule.
+    let mut ignore: Vec<String> = (0..1024)
+        .map(|i| format!("# {i:04} {}", "x".repeat(592)))
+        .collect();
+    ignore.push("*.tmp".into());
+    let (command, _) = requested(&source, &[]);
+    let mut args = crate::approval_command::parse(&command).unwrap();
+    args.ignore_lines = ignore.clone();
+    let approved = approve(
+        &registration,
+        command,
+        crate::directive::Inputs {
+            ignore,
+            mapping: None,
+        },
+    );
+    args.locations.last_mut().unwrap().host = Some("server".into());
+    args.locations.last_mut().unwrap().path = approved.destination.clone();
+    args.restricted_grant = Some(route(registration, &approved));
+    assert_eq!(crate::transfer::run(args).unwrap(), 0);
+    assert_eq!(fs::read(root.join("source/kept")).unwrap(), b"kept");
+    assert!(!root.join("source/skip.tmp").exists());
 }
 
 /// Before a message is authenticated, its sender decides its size. Only a
@@ -1366,7 +1422,6 @@ fn named_requests_accept_in_place_new_and_prune_within_the_machines_limit() {
     // The sender plans against the machine's limit, or its own if lower.
     let approved = Approved {
         token: String::new(),
-        directive: String::new(),
         destination: Vec::new(),
         max_delete: None,
     };
@@ -1768,8 +1823,9 @@ fn named_authorization_expires_before_control_opens() {
         .issued = Instant::now() - START_TIMEOUT;
     assert!(exchange(
         &registration,
-        Message::OpenCopy {
-            directive: approved.directive
+        Message::Open {
+            token: approved.token,
+            control: true
         },
         Duration::from_secs(2),
         Some(Duration::from_secs(2))

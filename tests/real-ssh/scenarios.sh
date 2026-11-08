@@ -652,11 +652,13 @@ def run(*args):
     return subprocess.run(args, check=True, capture_output=True, text=True, timeout=60).stdout
 
 
-for label, transport in [("tcp", []), ("ssh", ["--no-tcp"])]:
+# The TCP copy fails rather than falling back to SSH data.
+for label, environment, transport in [("tcp", ["env", "SYQ_TEST_REQUIRE_TCP=1"], []),
+                                      ("ssh", [], ["--no-tcp"])]:
     results = f"/tmp/syq-real-ssh/paced-return-{label}.ndjson"
-    command = ["syq", "cp", "--srcs-in", "/tmp/syq-real-ssh/paced-return", "--to", "@laptop",
-               "--into", f"paced-{label}", "--resource-limits", "bandwidth=2M",
-               f"--results={results}", *transport]
+    command = [*environment, "syq", "cp", "--srcs-in", "/tmp/syq-real-ssh/paced-return",
+               "--to", "@laptop", "--into", f"paced-{label}",
+               "--resource-limits", "bandwidth=2M", f"--results={results}", *transport]
     copy = subprocess.Popen(["ssh", "source", shlex.join(command)], stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True)
     try:
