@@ -95,6 +95,9 @@ pub(crate) enum Role {
     /// The source's own receiver coordinates it: it runs the command and
     /// reaches `Peer`, the destination's receiver, itself.
     CoordinatingSource(Peer),
+    /// The source of a copy that the server that started it coordinates,
+    /// to itself: the receiver serves only what the command reads.
+    Source,
 }
 
 /// The destination's receiver a coordinating source reaches, as the signing
@@ -429,6 +432,51 @@ pub(crate) fn destination_rules(
         },
         constraints,
     ))
+}
+
+/// What the source of `directive` may read, on an account whose home
+/// directory is at `home`, with any symlinks on its way resolved: the
+/// sources its command names, read from its -C or --root directory there,
+/// which is in the home unless it is absolute. A login starts in its home
+/// directory without walking the path that names it, so the command's
+/// symlink policy applies only to the paths the command gives. The receiver
+/// and the signing machine both call this, as for a destination's rules.
+pub(crate) fn source_rules(
+    directive: &Directive,
+    home: &Path,
+) -> Result<crate::destination::pull::PullRequest> {
+    ensure!(
+        directive.binding.role == Role::Source,
+        "the directive is not for a copy's source"
+    );
+    let args = crate::approval_command::parse(&directive.command)?;
+    crate::destination::pull::eligible_target(&args)?;
+    ensure!(
+        args.native_mapping.is_some() == directive.inputs.mapping.is_some(),
+        "the directive's mapping does not match its command"
+    );
+    let mut request = crate::destination::pull::source_request(&args)?;
+    if let Some(caps) = &directive.caps {
+        let limits = &mut request.limits;
+        limits.max_total_bytes = limits.max_total_bytes.min(caps.max_bytes);
+        limits.max_file_bytes = limits.max_file_bytes.min(limits.max_total_bytes);
+        limits.max_entries = limits.max_entries.min(caps.max_entries);
+    }
+    // The receiver works in its state directory, so relative paths start in
+    // the home directory, as they do for the account's own logins. A leading
+    // `~` is the home directory already, as `HOME` names it, as for a login.
+    let base = request.base.path.as_deref();
+    if !base.is_some_and(|base| base.starts_with(b"/") || base == b"~" || base.starts_with(b"~/")) {
+        let home = home.as_os_str().as_bytes();
+        request.resolved_base = Some(match base {
+            None => home.to_vec(),
+            Some(base) => crate::fsops::join(home, base),
+        });
+    }
+    // A copy approved without TCP gets no listener on the source either.
+    request.no_tcp = args.no_tcp;
+    request.validate()?;
+    Ok(request)
 }
 
 /// The source and destination of `args` when it is a copy between two

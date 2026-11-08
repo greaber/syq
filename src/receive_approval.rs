@@ -127,6 +127,18 @@ fn source_path(base: Option<&[u8]>, path: &[u8]) -> Vec<u8> {
     [base.strip_suffix(b"/").unwrap_or(base), b"/", relative].concat()
 }
 
+/// `path`, a source the command names on `server`, as it is read there,
+/// with the server: `user@host:/path`.
+fn on_server(server: &crate::cli::NativeEndpoint, base: Option<&[u8]>, path: &[u8]) -> String {
+    let label = match &server.user {
+        Some(user) => format!("{user}@{}", server.host),
+        None => server.host.clone(),
+    };
+    crate::approval_command::display_arg(
+        &[label.as_bytes(), b":", &source_path(base, path)].concat(),
+    )
+}
+
 /// What approving a copy sets up on `target` before it starts, after the
 /// copy's own `permission`.
 fn setup_text(target: &str, enrollment: crate::restricted::EnrollmentState) -> String {
@@ -355,16 +367,7 @@ impl Summary {
                     .take(count)
                     .map(|location| match &source_server {
                         None => crate::approval_command::quote_arg(&location.path),
-                        Some(server) => {
-                            let label = match &server.user {
-                                Some(user) => format!("{user}@{}", server.host),
-                                None => server.host.clone(),
-                            };
-                            crate::approval_command::display_arg(
-                                &[label.as_bytes(), b":", &source_path(base, &location.path)]
-                                    .concat(),
-                            )
-                        }
+                        Some(server) => on_server(server, base, &location.path),
                     })
                     .collect::<Vec<_>>()
             })
@@ -1350,27 +1353,67 @@ impl Queue {
         )
     }
 
+    /// A copy from `source`, another server, to the requesting one, and
+    /// what approving it sets up there: `request` is what the source's
+    /// receiver will allow it to read.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn request_source(
         &self,
         from: &Requester,
         command: &[Vec<u8>],
         cwd: &str,
-        target: &str,
+        (target, enrollment, as_root): (&str, crate::restricted::EnrollmentState, bool),
         request: &crate::destination::pull::PullRequest,
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
         let mut id = [0; 16];
         getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("approval ID: {e}"))?;
-        let scopes = request.scopes();
-        let base = request
-            .base
-            .path
-            .as_deref()
-            .map(crate::approval_command::display_arg)
-            .unwrap_or_else(|| "source login directory".into());
-        let permission = format!("May list and read the selected directory trees or exact non-directory entries. Filters narrow the copy, not this read permission. {}: {base}. Uses this machine's SSH access and installs the syq helper if needed. File data travels directly between the servers; no source mutations are allowed.", if request.base.confined { "Hard source root" } else { "Source working directory" });
+        // The files are named with their server, where they are read: from
+        // the command's -C or --root directory there.
+        let server = crate::cli::parse_native_endpoint(Some(target))
+            .ok()
+            .flatten();
+        let base = request.base.path.as_deref();
+        let shown = |path: &[u8]| match &server {
+            Some(server) => on_server(server, base, path),
+            None => crate::approval_command::quote_arg(path),
+        };
+        let scopes = request.scopes(shown);
+        let sources = request
+            .selections
+            .iter()
+            .map(|selection| shown(&selection.path))
+            .collect();
+        let root = match base {
+            Some(base) if request.base.confined => format!(
+                " Reads stay inside {}.",
+                crate::approval_command::display_arg(base)
+            ),
+            _ => String::new(),
+        };
+        let as_root = if as_root {
+            format!(" This machine logs in to {target:?} as root, so file permissions there do not limit what it can read.")
+        } else {
+            String::new()
+        };
+        let permission = format!("May list and read the selected directory trees or exact non-directory entries. Filters narrow the copy, not this read permission.{root} The files go directly to the server that asks. The copy only reads: it cannot write or remove anything on {target:?}.{as_root} {}.", setup_text(target, enrollment));
+        let mut notes = vec![
+            permission.clone(),
+            "Read authority ends when this copy closes, or after seven days.".into(),
+        ];
+
+        if let Some(port) = server.as_ref().and_then(|server| server.port) {
+            notes.push(format!("the source's SSH port is {port}"));
+        }
+        if crate::approval_command::parse(command)
+            .is_ok_and(|args| args.follows_native_source_paths())
+        {
+            notes.push(
+                "follows symlinks in the sources, so it can send files outside the paths shown"
+                    .to_owned(),
+            );
+        }
         self.wait(
             Summary {
                 id: id.iter().map(|b| format!("{b:02x}")).collect(),
@@ -1384,12 +1427,9 @@ impl Queue {
                 verb: "wants to read",
                 preposition: "from",
                 target: target.into(),
-                notes: vec![
-                    permission.clone(),
-                    "Read authority ends when this copy closes, or after seven days.".into(),
-                ],
+                notes,
                 sources_heading: "",
-                sources: scopes.clone(),
+                sources,
                 details: Details::Source {
                     kind: SourceKind::Source,
                     source: target.into(),

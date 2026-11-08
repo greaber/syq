@@ -91,9 +91,7 @@ pub(super) fn interface_option<'a>(args: &Args, native: &'a str, rsync: &'a str)
 }
 
 pub(super) fn remote_helper_mode(spec: &RemoteSpec, interface: Interface) -> &'static str {
-    if spec.forwarded.is_some() {
-        "approved return connection"
-    } else if spec.bootstrap_helper {
+    if spec.bootstrap_helper {
         if *spec.helper_install.lock().unwrap() {
             "managed; installed now"
         } else {

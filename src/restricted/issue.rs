@@ -45,9 +45,8 @@ pub(crate) struct Issue<'a> {
     /// The initiator's key for the destination's results, when another
     /// machine started the copy; otherwise this machine makes one.
     pub results_key: Option<[u8; 32]>,
-    /// For the source of a copy between two servers, which coordinates it,
-    /// the destination's receiver it reaches; `None` for a destination.
-    pub peer: Option<directive::Peer>,
+    /// Which end of the copy the account is.
+    pub role: Role,
 }
 
 /// Sign a directive for a copy to an account with the user's login key,
@@ -68,9 +67,16 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
         allow_enrollment,
         batch,
         results_key,
-        peer,
+        role,
     } = issue;
     let account = endpoint(destination_login, host, port)?.label();
+    // The receiver writes or coordinates only as an ordinary account; say so
+    // before setting anything up. An account with another name and user ID 0
+    // is refused once the enrollment session reports its user ID, or, when
+    // already enrolled, by its receiver.
+    if privilege::refuses_privileged(&role) && destination_login == "root" {
+        bail!(privilege::privileged_receiver_message(None));
+    }
     let (recipient_secret, recipient_public_key) = match results_key {
         Some(key) => (None, key),
         None => {
@@ -78,8 +84,7 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
             (Some(secret), public)
         }
     };
-    let is_destination = peer.is_none();
-    let role = peer.map_or(Role::Destination, Role::CoordinatingSource);
+    let is_destination = role == Role::Destination;
     let directive_for = |enrollment: EnrollmentId, generation: u64| {
         directive::issue(
             Binding {
@@ -96,8 +101,19 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
     };
     // A destination the receiver would refuse is refused before anything
     // is set up or refreshed on the server, from the same rules. A source
-    // runs its command as the account would.
-    let check = |home: &Path, receiving: &[PathBuf]| {
+    // reads what its command names as the account would.
+    let refuses_privileged = privilege::refuses_privileged(&role);
+    let check = |home: &Path, receiving: &[PathBuf], uid: &str| {
+        // An account with another name and user ID 0 is refused here, before
+        // anything is installed for a copy it could not serve.
+        if uid == "0" {
+            bail!(
+                "{account} logs in with user ID 0, and restricted receivers do not write or run copies as root or with root's capabilities; use an ordinary account there"
+            );
+        }
+        if !is_destination {
+            return Ok(());
+        }
         checked_destination(
             &directive_for(EnrollmentId::random(), 1)?,
             (home, receiving),
@@ -111,14 +127,19 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
             destination_login,
             (jump.as_ref(), batch),
             refresh,
-            is_destination.then_some(&check as &dyn Fn(&Path, &[PathBuf]) -> Result<()>),
+            refuses_privileged.then_some(&check as &dyn Fn(&Path, &[PathBuf], &str) -> Result<()>),
         )
     };
     let found = load_local_enrollments()?.into_iter().find(|(metadata, _)| {
         metadata.host == host && metadata.port == port && metadata.target_login == destination_login
     });
     if let Some((metadata, _)) = found.as_ref().filter(|_| is_destination) {
-        check(Path::new(&metadata.remote_home), &metadata.receiving_state)?;
+        // The enrollment records no user ID; its receiver refuses user ID 0.
+        check(
+            Path::new(&metadata.remote_home),
+            &metadata.receiving_state,
+            "",
+        )?;
     }
     let (metadata, directory, signer) = match found {
         Some((metadata, directory)) if !needs_refresh(&metadata, &directory) => {

@@ -1,14 +1,14 @@
-//! Laptop-approved source reads. Control metadata crosses the return channel;
-//! payload workers connect directly to the source and never use laptop credentials.
+//! Copies from another server to the server that asks for them (`syq cp
+//! --from hostB` on hostA), which the receiving machine approves: it signs a
+//! source directive for hostB's enrolled receiver, and hostA logs in to that
+//! receiver itself. The receiver serves only what the signed command reads.
 use super::*;
 use crate::proto::{OperatorSymlinkPolicy, SourceRootBase, SourceRootSelection};
 use crate::restricted::source::{SourceAuthority, SourcePolicy, SourceTcpPolicy};
-use std::fs::File;
-use std::os::fd::FromRawFd;
 
-const HELPER_VERSION: u16 = 1;
-const LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-
+/// What a copy's sources may be read for: derived from its command, on the
+/// server that serves them (a source directive's receiver) or on the
+/// receiving machine that sends them (`send`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PullRequest {
@@ -24,16 +24,59 @@ pub(crate) struct PullRequest {
     pub tcp_congestion: Option<String>,
     pub send_rate: Option<u64>,
     pub limits: crate::delegation::CopyLimits,
+    /// Where `base` is on the server that reads, when it reads from another
+    /// working directory than the command's (`SourcePolicy::resolved_base`).
+    /// Never sent: only the reading server sets it.
+    #[serde(skip)]
+    pub resolved_base: Option<Vec<u8>>,
+    /// Whether the command copies without TCP, so the reader starts no
+    /// listener for it. Never sent: only a source directive's rules set it.
+    #[serde(skip)]
+    pub no_tcp: bool,
 }
 
+/// A server's request to approve a copy from another server to itself,
+/// which this machine approves with a source directive for that server's
+/// enrolled receiver. The server sends what its command read from files.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct HelperRequest {
-    version: u16,
-    identity: String,
-    request: PullRequest,
+pub(super) struct ReadRequest {
+    /// The source as the command names it.
+    pub(super) target: String,
+    pub(super) command: Vec<Vec<u8>>,
+    pub(super) cwd: String,
+    pub(super) inputs: crate::directive::Inputs,
 }
 
+/// What the receiving machine returns for a server's copy from another
+/// server: the directive it signed for the source's enrolled receiver, and
+/// how to reach that receiver.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Issued {
+    /// The signed directive, base64url-encoded.
+    directive: String,
+    /// The enrollment's entry key, which only starts its receiver.
+    entry_key: forward::EntryKeyText,
+    /// The account the enrollment is for.
+    login: String,
+    /// What this machine's known_hosts files say about the source.
+    known_hosts: String,
+    /// What they leave out of its configuration, without its value, for a
+    /// notice.
+    known_hosts_left_out: Option<String>,
+}
+
+impl std::fmt::Debug for Issued {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Issued")
+            .field("login", &self.login)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The source of `args`, a copy from one SSH server to this machine that a
+/// receiving machine can approve, as the command names it.
 pub(crate) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
     use crate::cli::{CoordinateAt, Interface, PeerAuth};
     let (destination, sources) = args
@@ -42,6 +85,7 @@ pub(crate) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
         .context("copy endpoints missing")?;
     let source = sources.first().context("copy source missing")?;
     if args.interface != Interface::NativeCp
+        || args.s3.is_some()
         || destination.is_remote()
         || !source.is_remote()
         || sources.iter().any(|other| {
@@ -55,12 +99,11 @@ pub(crate) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
         || args.no_bootstrap
         || args.detach
         || args.restricted_grant.is_some()
-        || args.no_tcp
         || args.no_tcp_encryption
         || args.peer_auth != PeerAuth::Restricted
         || args.coordinate_at != CoordinateAt::Auto
     {
-        bail!("source authorization owns its SSH control connection and requires encrypted direct TCP; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --no-tcp, --no-tcp-encryption, --peer-auth, or --coordinate-at");
+        bail!("a copy from another server that a receiving machine approves reads it through that server's restricted receiver and encrypts its data; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --no-tcp-encryption, --peer-auth, or --coordinate-at");
     }
     anyhow::ensure!(args.descriptor_copy.is_none(), "source authorization requires pathname file selections; descriptor streams are not supported");
     let target = crate::remote_to_remote::endpoint_arg(source, None, None);
@@ -68,19 +111,14 @@ pub(crate) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
     Ok(target)
 }
 
-pub(crate) fn request(args: &crate::cli::Args) -> Result<PullRequest> {
-    eligible_target(args)?;
-    source_request(args)
-}
-
 /// The read permission a copy's sources need, wherever they are.
-pub(super) fn source_request(args: &crate::cli::Args) -> Result<PullRequest> {
+pub(crate) fn source_request(args: &crate::cli::Args) -> Result<PullRequest> {
     let sources =
         crate::transfer::distinct_native_sources(&args.locations[..args.locations.len() - 1]);
     let (base, selections, symlink_policy) = crate::transfer::source_registration(&sources, args);
     let max_total_bytes = args
         .receiver_max_bytes
-        .unwrap_or(8 * 1024 * 1024 * 1024 * 1024);
+        .unwrap_or(crate::directive::DEFAULT_MAX_BYTES);
     let max_file_bytes = args
         .max_size
         .as_deref()
@@ -123,7 +161,9 @@ pub(super) fn source_request(args: &crate::cli::Args) -> Result<PullRequest> {
         tcp_congestion: args.tcp_congestion.clone(),
         send_rate: (args.bwlimit_bytes != 0).then_some(args.bwlimit_bytes),
         limits: crate::delegation::CopyLimits {
-            max_entries: args.receiver_max_entries.unwrap_or(100_000_000),
+            max_entries: args
+                .receiver_max_entries
+                .unwrap_or(crate::directive::DEFAULT_MAX_ENTRIES),
             max_total_bytes,
             max_file_bytes,
             hash_block_bytes: args.block_size,
@@ -131,13 +171,15 @@ pub(super) fn source_request(args: &crate::cli::Args) -> Result<PullRequest> {
             max_connections: u16::try_from(workers + 1)?,
             max_deletions: 0,
         },
+        resolved_base: None,
+        no_tcp: false,
     };
     request.validate()?;
     Ok(request)
 }
 
 impl PullRequest {
-    pub(super) fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             self.limits.max_total_bytes > 0
                 && self.limits.max_total_bytes <= crate::delegation::MAX_COPY_BYTES
@@ -149,33 +191,36 @@ impl PullRequest {
                 && self.limits.max_deletions == 0,
             "invalid source read limits"
         );
-        SourceAuthority::new(self.policy())?;
+        SourceAuthority::new(self.policy(Instant::now()))?;
         Ok(())
     }
-    pub(super) fn policy(&self) -> SourcePolicy {
+    /// The reads this allows until `deadline`.
+    pub(crate) fn policy(&self, deadline: Instant) -> SourcePolicy {
         SourcePolicy {
             base: self.base.clone(),
             selections: self.selections.clone(),
             selection_types: self.selection_types.clone(),
+            resolved_base: self.resolved_base.clone(),
             symlink_policy: self.symlink_policy,
             hashing: self.hashing,
             preservation: self.preservation,
             sparse: self.sparse,
             compressed: self.compressed,
-            tcp: Some(SourceTcpPolicy {
+            tcp: (!self.no_tcp).then(|| SourceTcpPolicy {
                 port_lo: self.tcp_ports.0,
                 port_hi: self.tcp_ports.1,
                 congestion_control: self.tcp_congestion.clone(),
             }),
             send_rate: self.send_rate,
             limits: self.limits.clone(),
-            deadline: Instant::now() + LIFETIME,
+            deadline,
             outer_root: None,
         }
     }
-    /// Do not stat the source before approval. The native registration resolves
-    /// each selection as a directory root or exact leaf after permission arrives.
-    pub(crate) fn scopes(&self) -> Vec<String> {
+    /// Each selection, as `shown` names it, and what it may be. The source
+    /// is not looked at before approval: its reader resolves each selection
+    /// as a directory tree or an exact leaf after permission arrives.
+    pub(crate) fn scopes(&self, shown: impl Fn(&[u8]) -> String) -> Vec<String> {
         self.selections
             .iter()
             .zip(&self.selection_types)
@@ -186,27 +231,10 @@ impl PullRequest {
                     | crate::cli::SourceSelection::Contents => "directory tree",
                     _ => "directory tree or exact non-directory entry",
                 };
-                format!(
-                    "{} ({scope})",
-                    crate::approval_command::quote_arg(&selection.path)
-                )
+                format!("{} ({scope})", shown(&selection.path))
             })
             .collect()
     }
-}
-
-pub(crate) fn check(command: &[Vec<u8>], target: &str, requested: &PullRequest) -> Result<()> {
-    let args = crate::approval_command::parse(command)?;
-    anyhow::ensure!(
-        eligible_target(&args)? == target,
-        "requesting command reads from a different server"
-    );
-    let derived = request(&args)?;
-    anyhow::ensure!(
-        serde_json::to_value(requested)? == serde_json::to_value(derived)?,
-        "source request does not match the command that produced it"
-    );
-    Ok(())
 }
 
 pub(super) fn select(
@@ -250,7 +278,7 @@ pub(super) fn select(
                 args.direct_source = Some(Box::new(spec));
                 return Ok(None);
             }
-            Err(error) if crate::conn::is_ssh_authorization_fallback_error(&error) => error,
+            Err(error) if crate::conn::is_per_copy_approval_fallback_error(&error) => error,
             Err(error) => return Err(error),
         };
         let Some(found) = names.into_iter().find_map(|name| {
@@ -271,6 +299,8 @@ pub(super) fn select(
     )))
 }
 
+/// Ask the receiving machine to approve this copy, then set up this
+/// machine's connections to the source's enrolled receiver.
 pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection) -> Result<()> {
     let handoff::Selection {
         name,
@@ -279,60 +309,134 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
         ..
     } = selection;
     let target = target.context("source authorization target missing")?;
+    // Refused with advice before anything is asked when an approval cannot
+    // carry the command.
     let command = crate::approval_command::copy_command(args)?;
-    let request = request(args)?;
+    let inputs = crate::directive::Inputs {
+        ignore: args.ignore_lines.clone(),
+        mapping: crate::directive::mapping_authorization(args)?,
+    };
     super::notices::waiting(&format!("@{name}"), &format!("this copy from {target}"));
     let (stream, reply) = exchange(
         &registration,
-        Message::Pull {
-            target,
+        Message::Pull(Box::new(ReadRequest {
+            target: target.clone(),
             command,
             cwd: crate::approval_command::current_directory(),
-            request: Box::new(request),
-        },
+            inputs,
+        })),
         REQUEST_TIMEOUT + forward::SETUP_TIMEOUT + Duration::from_secs(10),
         None,
     )?;
-    let Reply::SourceApproved {
-        data_hostname: Some(data_hostname),
-    } = reply
-    else {
-        bail!("source approval did not provide its resolved data hostname");
+    // The copy needs nothing more from the receiving machine.
+    drop(stream);
+    let Reply::SourceDirective(issued) = reply else {
+        bail!("unexpected source approval response");
     };
+    let Issued {
+        directive,
+        entry_key,
+        login,
+        known_hosts,
+        known_hosts_left_out,
+    } = *issued;
+    if args.verbose > 0 {
+        crate::output::diagnostic!(
+            "syq: source copy approved; connecting to the source's restricted receiver"
+        );
+    }
+    if let Some(left_out) = known_hosts_left_out.filter(|_| !args.quiet) {
+        crate::output::diagnostic!(
+            "syq: checking the source's host key without some of what the approving machine knows about it: {}",
+            left_out
+                .chars()
+                .filter(|character| !character.is_control())
+                .collect::<String>()
+        );
+    }
+    // This machine reaches the receiver as its own SSH configuration reaches
+    // the source its command named, as the account the approving machine
+    // enrolled, and checks its host key as its own `ssh` would, also
+    // accepting what the approving machine knows.
+    let endpoint = forward::target_endpoint(&target)?;
+    let receiver = crate::remote_to_remote::ReceiverSsh::prepare(
+        &shell_words::split(&crate::remote_to_remote::receiver_rsh(endpoint.port))?,
+        (Some(&login), endpoint.port, &endpoint.host),
+        &known_hosts,
+        entry_key.as_bytes(),
+        args.quiet,
+    )?;
+    let count = args.locations.len() - 1;
+    for source in &mut args.locations[..count] {
+        source.host = Some(endpoint.host.clone());
+        source.user = Some(login.clone());
+        source.port = endpoint.port;
+    }
     args.auth_from = crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name));
-    args.return_source = Some(ReturnConnection::source(stream, data_hostname)?);
+    args.source_directive = Some(directive);
+    args.rsh = Some(shell_words::join(receiver.command));
+    args.receiver_host = Some(receiver.receiver_host);
+    args.receiver_keys = Some(Arc::new(receiver.directory));
     Ok(())
 }
 
 impl Receiver {
-    pub(super) fn pull(
-        &self,
-        target: String,
-        command: Vec<Vec<u8>>,
-        cwd: String,
-        mut request: PullRequest,
-        mut stream: TrackedStream,
-    ) -> Result<()> {
+    /// Approve a server's copy from another server to itself: show the
+    /// command and what it reads, then, over this machine's own SSH, set up
+    /// or refresh the source account's enrollment and sign its directive.
+    /// The server connects to the source's receiver itself; this machine is
+    /// not part of the copy after it replies.
+    pub(super) fn pull(&self, request: ReadRequest, mut stream: TrackedStream) -> Result<()> {
+        let ReadRequest {
+            target,
+            command,
+            cwd,
+            inputs,
+        } = request;
+        // The server waits this long for the reply, from when it asked.
+        let budget = Instant::now() + REQUEST_TIMEOUT + forward::SETUP_TIMEOUT;
         let request_lock = self.request_lock.try_lock().map_err(|_| {
             anyhow::anyhow!("another transfer is awaiting approval; retry after it is decided")
         })?;
         forward::target_endpoint(&target)?;
         crate::approval_command::check_authorizer(&command, &self.name)?;
-        check(&command, &target, &request)?;
-        request.limits.max_total_bytes = request.limits.max_total_bytes.min(self.max_bytes);
-        request.limits.max_file_bytes = request
-            .limits
-            .max_file_bytes
-            .min(request.limits.max_total_bytes);
-        request.limits.max_entries = request.limits.max_entries.min(self.max_entries);
-        request.validate()?;
+        let args = crate::approval_command::parse(&command)?;
+        anyhow::ensure!(
+            eligible_target(&args)? == target,
+            "the requesting command reads from a different server"
+        );
+        // A source deletes nothing.
+        let caps = crate::directive::Caps {
+            max_bytes: self.max_bytes,
+            max_entries: self.max_entries,
+            max_delete: 0,
+        };
+        // What the source's receiver will allow, before its home is known.
+        let preview = crate::directive::issue(
+            crate::directive::Binding {
+                enrollment: crate::enrollment::EnrollmentId::random(),
+                generation: 1,
+                account: "preview".into(),
+                role: crate::directive::Role::Source,
+            },
+            command.clone(),
+            cwd.clone(),
+            (inputs.clone(), Some(caps)),
+            // Unused: a source has no results.
+            [1; 32],
+        )?;
+        let reads = crate::directive::source_rules(
+            &preview,
+            Path::new(std::ffi::OsStr::from_bytes(REQUEST_ROOT)),
+        )?;
         let count = self.forward_count.fetch_add(1, Ordering::AcqRel);
         let _slot = forward::Slot(&self.forward_count);
         anyhow::ensure!(
             count < 8,
-            "too many active remote copies; wait for one to finish"
+            "too many copies from other servers are waiting for approval or setup here; retry after one is decided"
         );
         let (generation, _channel) = {
+            // Serialize registration with revocation, including reconnects.
             let _sessions = self.sessions.lock().unwrap();
             (
                 self.generation.load(Ordering::Acquire),
@@ -343,111 +447,62 @@ impl Receiver {
         let cancelled = || {
             self.stop.load(Ordering::Acquire)
                 || self.generation.load(Ordering::Acquire) != generation
+                || requester_closed(&socket)
         };
-        let setup_cancelled = || cancelled() || requester_closed(&socket);
+        let source = forward::Account::find(&target, &cancelled)?;
+        // A source only reads, so a root login can serve a download too:
+        // the receiver refuses root only where it would write.
+        if args.dry_run {
+            source.ready_for_dry_run()?;
+        }
+        // Automatic approval of writes to this machine does not authorize
+        // use of its SSH credentials on another host.
         self.approvals.request_source(
             &self.requester,
             &command,
             &cwd,
-            &target,
-            &request,
+            (&target, source.enrollment, source.is_root()),
+            &reads,
             self.notifications,
-            setup_cancelled,
+            cancelled,
         )?;
-        anyhow::ensure!(!setup_cancelled(), "source copy disconnected before setup");
+        anyhow::ensure!(!cancelled(), "source copy disconnected before setup");
+        // This lock only serializes decisions, not enrollment.
         drop(request_lock);
-        // Resolve on the machine that owns the SSH alias, after approval. The
-        // requester may have different config and cannot infer this address.
-        let deadline = Instant::now() + forward::SETUP_TIMEOUT;
-        let data_hostname = forward::source_data_hostname(
-            &forward::target_spec(&target)?,
-            deadline,
-            &setup_cancelled,
-        )?;
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(target.as_bytes());
-        let (mut child, reply) = forward::ForwardChild::connect(
-            &encoded,
-            &HelperRequest {
-                version: HELPER_VERSION,
-                identity: crate::identity::build().into(),
-                request,
+        let policy = source.policy(&cancelled)?;
+        let mut setup = crate::process::self_command()?;
+        setup.arg("--return-prepare");
+        let prepared = forward::prepare_in_child(
+            setup,
+            &forward::Prepare {
+                command,
+                cwd,
+                inputs,
+                caps,
+                accounts: forward::Accounts::Source(source.setup(&policy)),
+                results_key: None,
+                via: (
+                    self.server_user.clone(),
+                    self.tcp_peer.host.clone(),
+                    self.tcp_peer.port,
+                ),
+                allow_enrollment: !args.dry_run,
             },
-            "--return-source",
-            deadline,
-            &setup_cancelled,
-        )?;
-        anyhow::ensure!(
-            matches!(reply, Reply::SourceApproved { .. }),
-            "invalid source setup response"
-        );
-        let result = (|| {
-            let input = child.child.stdin.take().unwrap();
-            let output = child.child.stdout.take().unwrap();
-            socket.set_read_timeout(None)?;
-            socket.set_write_timeout(None)?;
-            write_message(
-                &mut stream,
-                &Reply::SourceApproved {
-                    data_hostname: Some(data_hostname),
-                },
-            )?;
-            forward::relay(socket.try_clone()?, input, output, cancelled, &mut child)
-        })();
-        result.with_context(|| format!("copy via this machine from {target:?}: {}", child.errors()))
+            budget,
+            &cancelled,
+        )
+        .with_context(|| format!("approve the copy from {target:?}"))?;
+        anyhow::ensure!(!cancelled(), "source copy disconnected before setup");
+        let issued = Issued {
+            directive: prepared.directive,
+            entry_key: prepared.entry_key,
+            login: policy.login_user.clone(),
+            known_hosts: policy.known_hosts_for_others()?,
+            // The configured value stays here: it can hold commands and paths.
+            known_hosts_left_out: policy.left_out_kind().map(str::to_owned),
+        };
+        write_message(&mut stream, &Reply::SourceDirective(Box::new(issued)))
     }
-}
-
-pub(super) fn receive() -> Result<i32> {
-    crate::fsops::reserve_startup_descriptors();
-    let fd = unsafe { libc::dup(libc::STDIN_FILENO) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let mut input = unsafe { File::from_raw_fd(fd) };
-    let setup = (|| {
-        let started = Instant::now();
-        let request: HelperRequest = read_message_extending(
-            &mut forward::DeadlineIo {
-                inner: &mut input,
-                deadline: started + Duration::from_secs(10),
-                cancelled: None,
-            },
-            |input| input.deadline = started + super::LARGE_MESSAGE_TIMEOUT,
-        )?;
-        anyhow::ensure!(
-            request.version == HELPER_VERSION && request.identity == crate::identity::build(),
-            "return source helper build mismatch"
-        );
-        request.request.validate()?;
-        SourceAuthority::new(request.request.policy())
-    })();
-    let authority = match setup {
-        Ok(authority) => authority,
-        Err(error) => {
-            write_message(&mut std::io::stdout(), &Reply::Error(format!("{error:#}")))?;
-            return Err(error);
-        }
-    };
-    write_message(
-        &mut std::io::stdout(),
-        &Reply::SourceApproved {
-            data_hostname: None,
-        },
-    )?;
-    let pending = Arc::new(AtomicBool::new(true));
-    crate::server::run_authorized_source(
-        forward::HandshakeInput::new(
-            input,
-            pending.clone(),
-            START_TIMEOUT,
-            Duration::from_secs(10),
-        ),
-        std::io::stdout(),
-        authority,
-        crate::descriptor_broker::DescriptorSessionSlot::default(),
-        Some(pending),
-    )?;
-    Ok(0)
 }
 
 #[cfg(test)]
@@ -464,6 +519,15 @@ mod tests {
             .collect()
     }
 
+    fn read_request(target: &str, command: Vec<Vec<u8>>) -> Message {
+        Message::Pull(Box::new(ReadRequest {
+            target: target.into(),
+            command,
+            cwd: "~/job".into(),
+            inputs: crate::directive::Inputs::default(),
+        }))
+    }
+
     #[test]
     fn source_request_is_derived_from_native_selection_and_limits_include_control() {
         let command = command(&[
@@ -476,7 +540,8 @@ mod tests {
             "bandwidth=4M",
         ]);
         let args = crate::approval_command::parse(&command).unwrap();
-        let request = request(&args).unwrap();
+        eligible_target(&args).unwrap();
+        let request = source_request(&args).unwrap();
         assert_eq!(request.base.path, Some(b"/approved".to_vec()));
         assert!(request.base.confined);
         assert_eq!(request.selections[0].path, b"selected");
@@ -484,60 +549,75 @@ mod tests {
         assert_eq!(request.symlink_policy, OperatorSymlinkPolicy::FollowAll);
         assert_eq!(request.limits.max_connections, 2);
         assert_eq!(request.send_rate, Some(4 << 20));
-        check(&command, "backup", &request).unwrap();
-        let mut changed = request.clone();
-        changed.base.path = Some(b"/outside".to_vec());
-        assert!(check(&command, "backup", &changed).is_err());
-        changed = request.clone();
-        changed.selections[0].path = b"other".to_vec();
-        assert!(check(&command, "backup", &changed).is_err());
-        assert!(check(&command, "another-host", &request).is_err());
     }
 
     #[test]
     fn source_filters_narrow_copy_but_do_not_change_read_scopes() {
-        let plain = request(&crate::approval_command::parse(&command(&[])).unwrap()).unwrap();
-        let filtered =
-            request(&crate::approval_command::parse(&command(&["--ignore", "*.private"])).unwrap())
-                .unwrap();
+        let plain =
+            source_request(&crate::approval_command::parse(&command(&[])).unwrap()).unwrap();
+        let filtered = source_request(
+            &crate::approval_command::parse(&command(&["--ignore", "*.private"])).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             serde_json::to_value(&plain).unwrap(),
             serde_json::to_value(&filtered).unwrap()
         );
-        assert_eq!(
-            plain.scopes(),
-            vec!["\"selected\" (directory tree or exact non-directory entry)"]
-        );
-        let args = crate::approval_command::parse(&command(&["--no-tcp"])).unwrap();
-        assert!(eligible_target(&args)
-            .unwrap_err()
-            .to_string()
-            .contains("requires encrypted direct TCP"));
+        // SSH data works through the source's receiver; unencrypted TCP and
+        // options that choose another route do not.
+        let eligible = |extra: &[&str]| {
+            eligible_target(&crate::approval_command::parse(&command(extra)).unwrap())
+        };
+        assert_eq!(eligible(&["--no-tcp"]).unwrap(), "backup");
+        for refused in [
+            &["--no-tcp-encryption"][..],
+            &["--rsh", "ssh"],
+            &["--detach"],
+            &["--coordinate-at", "src"],
+        ] {
+            assert!(eligible(refused).is_err(), "{refused:?}");
+        }
     }
 
     #[test]
     fn source_validation_precedes_approval_and_outbound_ssh() {
         let root = crate::test_support::tempdir().unwrap();
         let (_broker, receiver, registration, _) = broker(root.path(), Approval::Always);
-        let command = command(&[]);
-        let request = request(&crate::approval_command::parse(&command).unwrap()).unwrap();
-        for case in 0..4 {
-            let mut request = request.clone();
-            let mut target = "backup".to_owned();
-            match case {
-                0 => target = "bad$(command)".into(),
-                1 => request.selections[0].path = b"/unapproved".to_vec(),
-                2 => request.limits.max_entries = 0,
-                _ => request.symlink_policy = OperatorSymlinkPolicy::FollowAll,
-            }
+        let cases = [
+            // Not a plain SSH endpoint.
+            read_request("bad$(command)", command(&[])),
+            // The command reads from another server than the one named.
+            read_request("elsewhere", command(&[])),
+            // Options this route refuses, and limits no source allows.
+            read_request("backup", command(&["--rsh", "ssh"])),
+            read_request("backup", command(&["--receiver-max-entries", "0"])),
+            // A copy to another server, not to the requester.
+            read_request(
+                "backup",
+                [
+                    "cp", "--from", "backup", "--src", "x", "--to", "other", "--as", "y",
+                ]
+                .map(|arg| arg.as_bytes().to_vec())
+                .to_vec(),
+            ),
+            // What the server read from files must match its command.
+            Message::Pull(Box::new(ReadRequest {
+                target: "backup".into(),
+                command: command(&[]),
+                cwd: String::new(),
+                inputs: crate::directive::Inputs {
+                    ignore: Vec::new(),
+                    mapping: Some(crate::mapping::Authorization {
+                        bytes: 1,
+                        digest: [0; 32],
+                    }),
+                },
+            })),
+        ];
+        for message in cases {
             assert!(exchange(
                 &registration,
-                Message::Pull {
-                    target,
-                    command: command.clone(),
-                    cwd: String::new(),
-                    request: Box::new(request)
-                },
+                message,
                 Duration::from_secs(2),
                 Some(Duration::from_secs(2))
             )
@@ -547,22 +627,73 @@ mod tests {
         assert_eq!(receiver.forward_count.load(Ordering::Acquire), 0);
     }
 
+    /// A root login on the source only reads, so its download is asked
+    /// about like any other.
+    #[test]
+    fn a_root_source_is_asked_about() {
+        let root = crate::test_support::tempdir().unwrap();
+        let (_broker, receiver, registration, _) = broker(root.path(), Approval::Always);
+        let task = std::thread::spawn(move || {
+            let command = [
+                "cp",
+                "--from",
+                "root@backup",
+                "--src",
+                "selected",
+                "--as",
+                "output",
+            ]
+            .iter()
+            .map(|arg| arg.as_bytes().to_vec())
+            .collect();
+            exchange(
+                &registration,
+                read_request("root@backup", command),
+                Duration::from_secs(3),
+                Some(Duration::from_secs(3)),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let pending = loop {
+            if let Some(summary) = receiver.approvals.snapshots().first() {
+                break summary.clone();
+            }
+            if task.is_finished() {
+                panic!(
+                    "root source request ended: {:?}",
+                    task.join().unwrap().err()
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "root source approval did not become pending"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        use crate::receive_approval::Kind;
+        assert_eq!(pending.kind(), Kind::Source);
+        let description =
+            pending.description(&crate::persistence::Domain::default(), str::to_owned);
+        assert!(
+            description.contains("as root, so file permissions there do not limit"),
+            "{description}"
+        );
+        receiver
+            .approvals
+            .decide(&pending.id, false, Kind::Source)
+            .unwrap();
+        assert!(task.join().unwrap().is_err());
+    }
+
     #[test]
     fn source_needs_its_own_decision_even_when_copies_are_automatically_approved() {
         for revoke in [false, true] {
             let root = crate::test_support::tempdir().unwrap();
             let (_broker, receiver, registration, _) = broker(root.path(), Approval::Always);
-            let command = command(&[]);
-            let request = request(&crate::approval_command::parse(&command).unwrap()).unwrap();
             let task = std::thread::spawn(move || {
                 exchange(
                     &registration,
-                    Message::Pull {
-                        target: "backup".into(),
-                        command,
-                        cwd: "~/job".into(),
-                        request: Box::new(request),
-                    },
+                    read_request("backup", command(&[])),
                     Duration::from_secs(3),
                     Some(Duration::from_secs(3)),
                 )
@@ -571,6 +702,9 @@ mod tests {
             let pending = loop {
                 if let Some(summary) = receiver.approvals.snapshots().first() {
                     break summary.clone();
+                }
+                if task.is_finished() {
+                    panic!("source request ended: {:?}", task.join().unwrap().err());
                 }
                 assert!(
                     Instant::now() < deadline,
@@ -587,6 +721,11 @@ mod tests {
                 pending.description(&crate::persistence::Domain::default(), str::to_owned);
             assert!(description.contains("Filters narrow the copy"));
             assert!(description.contains("exact non-directory"));
+            assert!(description.contains("restricted copying on \"backup\""));
+            // Approving sets up the source, but the copy itself only reads.
+            assert!(description.contains("The copy only reads"), "{description}");
+            assert!(!description.contains("as root"), "{description}");
+            assert!(!description.contains("is changed"), "{description}");
             for old in [Kind::Copy, Kind::Command, Kind::Ssh, Kind::Storage] {
                 assert!(receiver.approvals.decide(&pending.id, true, old).is_err());
             }
@@ -599,6 +738,14 @@ mod tests {
                     .unwrap();
             }
             assert!(task.join().unwrap().is_err());
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while receiver.forward_count.load(Ordering::Acquire) != 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "source request did not release its slot"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
             assert!(receiver.approvals.snapshots().is_empty());
         }
     }

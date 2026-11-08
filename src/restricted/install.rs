@@ -418,7 +418,7 @@ pub(crate) fn remote_install() -> Result<()> {
         bail!("this syq cannot handle that enrollment request version");
     }
     request.id.validate()?;
-    refuse_privileged_receiver(None)?;
+    // A root enrollment serves downloads; its receiver refuses writes.
     let (account, home) = current_account()?;
     let response = install_for_account(&request, &account, &home)?;
     serde_json::to_writer(std::io::stdout().lock(), &response)?;

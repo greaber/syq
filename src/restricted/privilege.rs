@@ -1,19 +1,26 @@
-//! Command-restricted receivers run only as an ordinary account. A sender the
-//! receiver does not trust could otherwise use root's powers: setting any
-//! owner, creating device files, or writing privileged attributes.
+//! Command-restricted receivers write only as an ordinary account. A sender
+//! the receiver does not trust could otherwise use root's powers: setting any
+//! owner, creating device files, or writing privileged attributes. A copy's
+//! source only reads what the signed command names, so it may run as root.
 
 use super::*;
 
-/// Why a command-restricted receiver does not run for a root account, with
-/// how to remove `enrollment` when one exists for it.
+/// Why a command-restricted receiver does not write or run copies for a
+/// root account, with how to remove `enrollment` when one exists for it.
 pub(crate) fn privileged_receiver_message(enrollment: Option<&str>) -> String {
-    let mut message = "restricted receivers do not run as root or with root's capabilities; copy through this machine with --coordinate-at local, or enroll an ordinary account on the destination (--peer-auth broker would give the source host root's authority on the destination)".to_owned();
+    let mut message = "restricted receivers do not write or run copies as root or with root's capabilities; copy through this machine with --coordinate-at local, or enroll an ordinary account on the destination (--peer-auth broker would give the source host root's authority on the destination)".to_owned();
     if let Some(enrollment) = enrollment {
         message.push_str(&format!(
-            "; `syq receiver revoke {enrollment}` removes this root enrollment"
+            "; this root enrollment serves only downloads, and `syq receiver revoke {enrollment}` removes it"
         ));
     }
     message
+}
+
+/// Whether a receiver serving `role` must not run privileged: one that
+/// writes, or runs a copy, must not; one that only reads may.
+pub(crate) fn refuses_privileged(role: &crate::directive::Role) -> bool {
+    !matches!(role, crate::directive::Role::Source)
 }
 
 /// Refuse to act as a command-restricted receiver as root or, on Linux, with

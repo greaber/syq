@@ -56,110 +56,88 @@ fn native_in_place_new_replaces_an_existing_file_and_writes_a_new_one_at_its_nam
 
 #[test]
 fn background_bootstrap_installs_the_command_quietly() {
-    use base64::Engine;
-
-    for completion in [true, false] {
-        for upload in [false, true] {
-            let t = Tmp::new();
-            fs::create_dir(t.runtime()).unwrap();
-            write(&t.path("remote-home/data/name"), b"remote");
-            setup_release_bootstrap(&t);
-            if upload {
-                executable(&t.path("remote-bin/curl"), b"#!/bin/sh\nexit 22\n");
-            }
-            let ssh = fake_ssh(&t);
-            // Stop after bootstrap for the return service: its receiver protocol
-            // is unrelated to whether setup publishes an interactive command.
-            let script = fs::read_to_string(&ssh).unwrap().replace(
-                "exec /bin/sh -c",
-                "case \"$1\" in *--return-source*) exit 0 ;; esac\nexec /bin/sh -c",
-            );
-            executable(&ssh, script.as_bytes());
-            let path = t.s("remote-home/data/n");
-            let mut command = if completion {
-                completion_command(
-                    &t,
-                    &[
-                        "__complete",
-                        "bash",
-                        "4",
-                        "--",
-                        "syq",
-                        "cp",
-                        "--from",
-                        "fake.example",
-                        &path,
-                    ],
-                )
-            } else {
-                let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
-                command
-                    .arg("--return-connect-install")
-                    .arg(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("fake.example"))
-                    .arg("--return-source");
-                command
-            };
-            let output = command
-                .env("HOME", t.path("home"))
-                .env("XDG_CONFIG_HOME", t.path("config"))
-                .env("XDG_CACHE_HOME", t.path("cache"))
-                .env("XDG_RUNTIME_DIR", t.runtime())
-                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
-                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
-                .env("FAKE_RSH_LOG", t.path("rsh.log"))
-                .env("FAKE_REMOTE_RELEASE_ARCHIVE", t.path("release.gz"))
-                .env(
-                    "FAKE_REMOTE_RELEASE_MANIFEST",
-                    t.path("release-manifest.json"),
-                )
-                .env("FAKE_CURL_LOG", t.path("curl.log"))
-                .env("SYQ_COMPLETION_DEBUG", "1")
-                .env("SYQ_TEST_RELEASE_BUILD", "1")
-                .env(
-                    "SYQ_TEST_RELEASE_PUBLIC_KEY",
-                    fs::read_to_string(t.path("release-public-key"))
-                        .unwrap()
-                        .trim(),
-                )
-                .env(
-                    "SYQ_TEST_RELEASE_DOWNLOADS",
-                    "https://release.invalid/download",
-                )
-                .env("SYQ_TEST_FIXTURES", &t.0)
-                .env(
-                    "PATH",
-                    format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
-                )
-                .run()
-                .unwrap();
-            assert_output_ok(&output);
-            if completion {
-                assert_eq!(
-                    completion_values(&output.stdout),
-                    vec![(
-                        b'f',
-                        t.path("remote-home/data/name")
-                            .as_os_str()
-                            .as_encoded_bytes()
-                            .to_vec()
-                    )],
-                    "completion={completion}, upload={upload}: {output:?}"
-                );
-            }
-            assert!(
-                stored_remote_helper(&t).is_file(),
-                "completion={completion}, upload={upload}: {output:?}"
-            );
-            assert_eq!(
-                read(&t.path("remote-home/.local/bin/syq")),
-                read(&stored_remote_helper(&t))
-            );
-            assert!(t.path("remote-home/.local/bin/.syq-install.json").is_file());
-            let log = fs::read_to_string(t.path("rsh.log")).unwrap();
-            assert!(log.contains("--install-remote-command"), "{log}");
-            assert!(!String::from_utf8_lossy(&output.stderr).contains("installed syq"));
-            assert!(!String::from_utf8_lossy(&output.stderr).contains("syq-remote-install-notice:"));
+    for upload in [false, true] {
+        let t = Tmp::new();
+        fs::create_dir(t.runtime()).unwrap();
+        write(&t.path("remote-home/data/name"), b"remote");
+        setup_release_bootstrap(&t);
+        if upload {
+            executable(&t.path("remote-bin/curl"), b"#!/bin/sh\nexit 22\n");
         }
+        let ssh = fake_ssh(&t);
+        let path = t.s("remote-home/data/n");
+        let mut command = completion_command(
+            &t,
+            &[
+                "__complete",
+                "bash",
+                "4",
+                "--",
+                "syq",
+                "cp",
+                "--from",
+                "fake.example",
+                &path,
+            ],
+        );
+        let output = command
+            .env("HOME", t.path("home"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("FAKE_REMOTE_RELEASE_ARCHIVE", t.path("release.gz"))
+            .env(
+                "FAKE_REMOTE_RELEASE_MANIFEST",
+                t.path("release-manifest.json"),
+            )
+            .env("FAKE_CURL_LOG", t.path("curl.log"))
+            .env("SYQ_COMPLETION_DEBUG", "1")
+            .env("SYQ_TEST_RELEASE_BUILD", "1")
+            .env(
+                "SYQ_TEST_RELEASE_PUBLIC_KEY",
+                fs::read_to_string(t.path("release-public-key"))
+                    .unwrap()
+                    .trim(),
+            )
+            .env(
+                "SYQ_TEST_RELEASE_DOWNLOADS",
+                "https://release.invalid/download",
+            )
+            .env("SYQ_TEST_FIXTURES", &t.0)
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            )
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert_eq!(
+            completion_values(&output.stdout),
+            vec![(
+                b'f',
+                t.path("remote-home/data/name")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec()
+            )],
+            "upload={upload}: {output:?}"
+        );
+        assert!(
+            stored_remote_helper(&t).is_file(),
+            "upload={upload}: {output:?}"
+        );
+        assert_eq!(
+            read(&t.path("remote-home/.local/bin/syq")),
+            read(&stored_remote_helper(&t))
+        );
+        assert!(t.path("remote-home/.local/bin/.syq-install.json").is_file());
+        let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+        assert!(log.contains("--install-remote-command"), "{log}");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("installed syq"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("syq-remote-install-notice:"));
     }
 }
 

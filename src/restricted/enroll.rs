@@ -490,9 +490,10 @@ enum Session {
 }
 
 /// What a copy checks once a session knows the server's home directory,
-/// before anything is installed: that its destination is not a path the
-/// receiver protects.
-pub(super) type DestinationCheck<'a> = Option<&'a dyn Fn(&Path, &[PathBuf]) -> Result<()>>;
+/// receiving state and user ID, before anything is installed: that the
+/// account may serve it (a copy that writes or coordinates is refused for
+/// user ID 0) and that its destination is not a path the receiver protects.
+pub(super) type DestinationCheck<'a> = Option<&'a dyn Fn(&Path, &[PathBuf], &str) -> Result<()>>;
 
 /// The enrollment for `login@host:port`, set up when there is none, and
 /// refreshed when it runs another build or `refresh` asks to find the
@@ -508,11 +509,6 @@ pub(super) fn enroll(
     refresh: bool,
     check: DestinationCheck<'_>,
 ) -> Result<(LocalEnrollment, PathBuf, Option<LoginSigner>)> {
-    // The receiver refuses to run as root; say so before creating anything.
-    // An account with another name and user ID 0 is refused when installing.
-    if login == "root" {
-        bail!(privileged_receiver_message(None));
-    }
     let base = local_state_base()?;
     let base_lock = open_directory(&base)?;
     lock_directory(&base_lock)?;
@@ -645,12 +641,22 @@ fn run_session(
     plan: Plan,
     check: DestinationCheck<'_>,
 ) -> Result<(Session, PathBuf)> {
-    let retry_state = if plan.refresh {
-        "remains active with its previous state; the refresh can be retried"
-    } else {
-        "remains pending for a safe retry"
-    };
     let id = plan.id;
+    // What is left after a failure: a refresh keeps the active enrollment;
+    // a new one is pending only once its entry key is stored, which a check
+    // that refuses the copy never reaches.
+    let pending = plan.directory.join(PENDING_FILE);
+    let retry_state = || {
+        if plan.refresh {
+            Some(format!(
+                "enrollment {id} remains active with its previous state; the refresh can be retried"
+            ))
+        } else if pending.exists() {
+            Some(format!("enrollment {id} remains pending for a safe retry"))
+        } else {
+            None
+        }
+    };
     // The user's own login first, along the route the SSH configuration
     // gives; then through `jump` when that cannot connect.
     let configured = install_over_route(
@@ -670,12 +676,19 @@ fn run_session(
                 (&plan, batch),
                 check,
             )
-            .with_context(|| {
-                format!("enrollment {id} {retry_state}; enrolling along your SSH configuration's route also failed: {configured_error:#}")
+            .map_err(|error| {
+                let also = format!("enrolling along your SSH configuration's route also failed: {configured_error:#}");
+                match retry_state() {
+                    Some(state) => error.context(format!("{state}; {also}")),
+                    None => error.context(also),
+                }
             })?
         }
         (Err(error), _) => {
-            return Err(error).with_context(|| format!("enrollment {id} {retry_state}"))
+            return Err(match retry_state() {
+                Some(state) => error.context(state),
+                None => error,
+            })
         }
     };
     Ok((session, plan.directory))
@@ -786,10 +799,10 @@ fn install_over_route(
         }
         let mut authorized = vec![0u8; length];
         stdout.read_exact(&mut authorized)?;
-        Ok((os, arch, home, receiving, stored, authorized))
+        Ok((os, arch, home, receiving, stored, authorized, uid))
     })();
     drop(foreground);
-    let (os, arch, home, receiving, stored, authorized) = match platform {
+    let (os, arch, home, receiving, stored, authorized, uid) = match platform {
         Ok(platform) => platform,
         Err(error) => {
             drop(input);
@@ -818,9 +831,9 @@ fn install_over_route(
     // Everything before the request is checked with nothing installed: an
     // error closes the session's input, and the remote shell stops.
     let prepared = (|| -> Result<_> {
-        // A destination the receiver would refuse leaves no enrollment.
+        // A copy the receiver would refuse leaves no enrollment.
         if let Some(check) = check {
-            check(Path::new(&home), &receiving)?;
+            check(Path::new(&home), &receiving, &uid)?;
         }
         let trace =
             fs::read_to_string(&trace_path).context("read enrollment SSH authentication trace")?;

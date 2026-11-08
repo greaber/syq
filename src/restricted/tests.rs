@@ -1061,6 +1061,160 @@ fn a_coordinating_source_is_admitted_only_with_its_own_destination_directive() {
     assert!(format!("{error:#}").contains("already"), "{error:#}");
 }
 
+/// A source's directive is admitted as reads only: it derives what its
+/// command reads there, within the approving machine's limits, with paths
+/// that are not absolute read from the account's home, and is recorded once.
+/// It never passes as a destination's copy or a coordinating source's, and
+/// neither of those passes as a source's.
+#[test]
+fn a_source_directive_is_admitted_only_for_what_its_command_reads() {
+    use crate::directive::{Binding, Caps, Peer, Role};
+    use std::os::unix::ffi::OsStrExt as _;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let state = temporary.path().join("state");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(state.join("replay"))
+        .unwrap();
+    let home = temporary.path().join("home");
+    let login = generate_test_key("login").unwrap();
+    let build = crate::identity::build();
+    let config = ReceiverEnrollment {
+        version: CONFIG_VERSION,
+        id: EnrollmentId::random(),
+        target_login: "reader".into(),
+        generation: 2,
+        release: build.into(),
+        receiver_path: "/home/reader/.local/lib/syq/v0.8.0/linux-x86_64/syq".into(),
+        entry_public_key: generate_test_key("entry")
+            .unwrap()
+            .public_key()
+            .to_openssh()
+            .unwrap(),
+        signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
+    };
+    let command = |extra: &[&str]| {
+        ["cp", "--from", "host-b"]
+            .iter()
+            .chain(extra)
+            .chain(&["--srcs-in", "data", "--into", "/archive"])
+            .map(|arg| arg.as_bytes().to_vec())
+            .collect::<Vec<_>>()
+    };
+    let caps = Caps {
+        max_bytes: 4096,
+        max_entries: 10,
+        max_delete: 0,
+    };
+    let issue = |role: Role, command: Vec<Vec<u8>>| {
+        let directive = crate::directive::issue(
+            Binding {
+                enrollment: config.id,
+                generation: 2,
+                account: "reader".into(),
+                role,
+            },
+            command,
+            "~".into(),
+            (Default::default(), Some(caps)),
+            [7; 32],
+        )
+        .unwrap();
+        sign_test_directive(&directive, &login, crate::directive::NAMESPACE)
+    };
+    let recorded = || fs::read_dir(state.join("replay")).unwrap().count();
+    let receiver = (2, build);
+    let refused = [
+        // A destination's directive is not a source's, nor the reverse.
+        (
+            issue(Role::Destination, command(&[])),
+            &home,
+            "copies to this machine",
+        ),
+        (
+            issue(
+                Role::CoordinatingSource(Peer {
+                    enrollment: EnrollmentId::random(),
+                    generation: 1,
+                    account: "backup".into(),
+                    request: crate::delegation::RequestId::fresh(1).unwrap(),
+                    destination: b"/home/backup/archive".to_vec(),
+                    known_hosts: String::new(),
+                }),
+                command(&[]),
+            ),
+            &home,
+            "comes with its destination's",
+        ),
+        // A source's command must read from one server to the requester.
+        (
+            issue(
+                Role::Source,
+                [
+                    "cp",
+                    "--from",
+                    "host-b",
+                    "--srcs-in",
+                    "data",
+                    "--to",
+                    "host-c",
+                    "--into",
+                    "/x",
+                ]
+                .map(|arg| arg.as_bytes().to_vec())
+                .to_vec(),
+            ),
+            &home,
+            "from one SSH server to this machine",
+        ),
+        (
+            issue(Role::Source, command(&["--rsh", "ssh"])),
+            &home,
+            "cannot be combined",
+        ),
+    ];
+    for (directive, home, expected) in refused {
+        let Err(error) = verify_rules(&state, &config, receiver, &directive, (home, home)) else {
+            panic!("a directive was admitted: {expected}");
+        };
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+        assert_eq!(recorded(), 0);
+    }
+    let source = issue(Role::Source, command(&["-C", "projects"]));
+    // A source's directive does not pass as a destination's copy.
+    let error = verify(&state, &config, receiver, &source, &home)
+        .err()
+        .unwrap();
+    assert!(
+        format!("{error:#}").contains("not for a copy's destination"),
+        "{error:#}"
+    );
+    assert_eq!(recorded(), 0);
+    // Relative paths start where the home really is, not where its name
+    // leads through links.
+    let resolved_home = temporary.path().join("resolved-home");
+    let (Rules::Source(reads), _) =
+        verify_rules(&state, &config, receiver, &source, (&home, &resolved_home)).unwrap()
+    else {
+        panic!("a source's directive derived a destination's rules");
+    };
+    assert_eq!(reads.base.path.as_deref(), Some(&b"projects"[..]));
+    assert_eq!(
+        reads.resolved_base.as_deref(),
+        Some(resolved_home.join("projects").as_os_str().as_bytes())
+    );
+    assert_eq!(reads.selections[0].path, b"data");
+    assert_eq!(reads.limits.max_total_bytes, 4096);
+    assert_eq!(reads.limits.max_entries, 10);
+    assert_eq!(reads.limits.max_deletions, 0);
+    assert_ne!(recorded(), 0);
+    let error = verify_rules(&state, &config, receiver, &source, (&home, &home))
+        .err()
+        .unwrap();
+    assert!(format!("{error:#}").contains("already"), "{error:#}");
+}
+
 /// A receiver records a directive as used only after the build, the
 /// generation, the binding, the signature and the derivation of its rules
 /// are checked: a refused directive leaves the record of used directives as
@@ -7115,9 +7269,71 @@ fn receivers_refuse_root_and_effective_capabilities() {
     assert!(!fresh.contains("revoke"), "{fresh}");
     let existing = privilege::privileged_receiver_message(Some("0123abcd"));
     assert!(
-        existing.ends_with("`syq receiver revoke 0123abcd` removes this root enrollment"),
+        existing.ends_with("serves only downloads, and `syq receiver revoke 0123abcd` removes it"),
         "{existing}"
     );
+}
+
+/// Only a receiver that reads may run as root: a destination's and a
+/// coordinating source's are refused, as admission applies it to the rules a
+/// directive yields.
+#[test]
+fn only_reading_receivers_may_run_privileged() {
+    use crate::directive::Role;
+    assert!(!privilege::refuses_privileged(&Role::Source));
+    assert!(privilege::refuses_privileged(&Role::Destination));
+    let peer = crate::directive::Peer {
+        enrollment: EnrollmentId::random(),
+        generation: 1,
+        account: "backup".into(),
+        request: delegation::RequestId::test(1),
+        destination: b"/archive".to_vec(),
+        known_hosts: String::new(),
+    };
+    assert!(privilege::refuses_privileged(&Role::CoordinatingSource(
+        peer
+    )));
+}
+
+/// A copy that would write as root, or run a copy as root, is refused
+/// before anything is set up: no login, no enrollment, no signature.
+#[test]
+fn a_root_writer_is_refused_before_enrolling() {
+    use crate::directive::Role;
+    for role in [
+        Role::Destination,
+        Role::CoordinatingSource(crate::directive::Peer {
+            enrollment: EnrollmentId::random(),
+            generation: 1,
+            account: "backup".into(),
+            request: delegation::RequestId::test(1),
+            destination: b"/archive".to_vec(),
+            known_hosts: String::new(),
+        }),
+    ] {
+        let error = prepare_transfer(Issue {
+            command: vec![b"cp".to_vec()],
+            cwd: "/".into(),
+            inputs: Default::default(),
+            caps: None,
+            // Nothing may resolve or dial this.
+            host: "root-writer.invalid",
+            port: None,
+            login: "root",
+            jump: None,
+            agent: None,
+            allow_enrollment: true,
+            batch: true,
+            results_key: None,
+            role,
+        })
+        .err()
+        .expect("root writer refused");
+        assert!(
+            format!("{error:#}").contains("do not write or run copies as root"),
+            "{error:#}"
+        );
+    }
 }
 
 #[test]

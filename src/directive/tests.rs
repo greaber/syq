@@ -138,10 +138,18 @@ fn unknown_variants_are_refused() {
     };
     let body = |role| postcard::to_stdvec(&future(role)).unwrap();
     // The layout matches: role 0 is the destination, 1 a coordinating
-    // source, with its peer.
+    // source, with its peer, and 2 a source.
     assert_eq!(body(0), postcard::to_stdvec(&known).unwrap());
     assert!(Signed::decode(&framed(&body(0), &armored(1))).is_ok());
-    assert!(Signed::decode(&framed(&body(2), &armored(1))).is_err());
+    assert_eq!(
+        Signed::decode(&framed(&body(2), &armored(1)))
+            .unwrap()
+            .directive
+            .binding
+            .role,
+        Role::Source
+    );
+    assert!(Signed::decode(&framed(&body(3), &armored(1))).is_err());
 }
 
 const ROUTE_6: &[&str] = &[
@@ -674,4 +682,106 @@ fn the_approving_machines_limits_lower_the_commands() {
         let error = destination_rules(&directive, home).unwrap_err().to_string();
         assert!(error.contains("positive --max-delete"), "{error}");
     }
+}
+
+fn source_directive(args: &[&str]) -> Directive {
+    let mut directive = directive(args);
+    directive.binding.role = Role::Source;
+    directive
+}
+
+const ROUTE_4: &[&str] = &[
+    "cp", "--from", "host-b", "--src", "data", "--src", "~/notes", "--into", "copy",
+];
+
+/// A source's reads come from its signed command, as the command reads
+/// them: within the approving machine's limits, deleting nothing, and with
+/// relative paths in the account's home, where its own logins start. The
+/// role is part of the binding, so neither end's directive passes as the
+/// other's.
+#[test]
+fn a_sources_reads_come_from_the_signed_command() {
+    let home = Path::new(HOME);
+    let original = source_directive(ROUTE_4);
+    assert_eq!(
+        Signed::decode(&signed(&original)).unwrap().directive,
+        original
+    );
+    let mut capped = original.clone();
+    capped.caps = Some(Caps {
+        max_bytes: 1 << 20,
+        max_entries: 10,
+        max_delete: 7,
+    });
+    let reads = source_rules(&capped, home).unwrap();
+    assert_eq!(
+        reads
+            .selections
+            .iter()
+            .map(|selection| selection.path.as_slice())
+            .collect::<Vec<_>>(),
+        [&b"data"[..], b"~/notes"]
+    );
+    assert_eq!(reads.base.path, None);
+    assert_eq!(reads.resolved_base.as_deref(), Some(HOME.as_bytes()));
+    assert_eq!(reads.limits.max_total_bytes, 1 << 20);
+    assert_eq!(reads.limits.max_file_bytes, 1 << 20);
+    assert_eq!(reads.limits.max_entries, 10);
+    assert_eq!(reads.limits.max_deletions, 0);
+    // A base in the home or absolute is where the command names it; a
+    // relative one is in the home.
+    for (base, resolved) in [
+        ("work", Some("/home/backup/work")),
+        ("~/work", None),
+        ("~", None),
+        ("/srv/data", None),
+    ] {
+        let args = [&ROUTE_4[..3], &["-C", base], &ROUTE_4[3..]].concat();
+        let reads = source_rules(&source_directive(&args), home).unwrap();
+        assert_eq!(reads.base.path.as_deref(), Some(base.as_bytes()), "{base}");
+        assert_eq!(
+            reads.resolved_base.as_deref(),
+            resolved.map(str::as_bytes),
+            "{base}"
+        );
+    }
+    // Neither end's directive passes as the other's.
+    assert!(destination_rules(&original, home)
+        .unwrap_err()
+        .to_string()
+        .contains("not for a copy's destination"));
+    assert!(source_rules(&directive(ROUTE_4), home)
+        .unwrap_err()
+        .to_string()
+        .contains("not for a copy's source"));
+    // Only a copy from one server to the requester, without options that
+    // choose another route, and with the mapping its command reads.
+    for refused in [
+        ROUTE_5.to_vec(),
+        [ROUTE_4, &["--rsh", "ssh"]].concat(),
+        [ROUTE_4, &["--no-tcp-encryption"]].concat(),
+        [ROUTE_4, &["--coordinate-at", "src"]].concat(),
+        [ROUTE_4, &["--receiver-max-entries", "0"]].concat(),
+    ] {
+        assert!(
+            source_rules(&source_directive(&refused), home).is_err(),
+            "{refused:?}"
+        );
+    }
+    let mut mapped = original.clone();
+    mapped.inputs.mapping = Some(crate::mapping::Authorization {
+        bytes: 1,
+        digest: [0; 32],
+    });
+    assert!(source_rules(&mapped, home)
+        .unwrap_err()
+        .to_string()
+        .contains("mapping does not match"));
+    // SSH data is not a reason to refuse it, and then the source starts no
+    // TCP listener either.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert!(reads.policy(deadline).tcp.is_some());
+    let ssh_only =
+        source_rules(&source_directive(&[ROUTE_4, &["--no-tcp"]].concat()), home).unwrap();
+    assert!(ssh_only.policy(deadline).tcp.is_none());
 }

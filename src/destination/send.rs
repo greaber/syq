@@ -6,6 +6,9 @@ use super::*;
 use crate::proto::{SourceRootBase, SourceRootSelection};
 use crate::restricted::source::SourceAuthority;
 
+/// How long the reads a send approves last at most.
+const LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 /// What the receiving machine approved: the token that opens the copy's
 /// channels and the source base and selections its reads are confined to.
 /// They can differ from what the command named: the machine resolves them
@@ -372,7 +375,7 @@ impl Receiver {
             cancelled,
         )?;
         // Start the authority's clock at approval, after a long prompt.
-        let mut policy = request.policy();
+        let mut policy = request.policy(Instant::now() + LIFETIME);
         policy.outer_root = self
             .root
             .as_ref()

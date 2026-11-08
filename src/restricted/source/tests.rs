@@ -13,6 +13,7 @@ fn policy(path: &Path) -> SourcePolicy {
             path: path.as_os_str().as_bytes().to_vec(),
             follow_root: false,
         }],
+        resolved_base: None,
         selection_types: vec![crate::cli::SourceSelection::Named],
         symlink_policy: OperatorSymlinkPolicy::Refuse,
         hashing: Default::default(),
@@ -588,4 +589,126 @@ fn overlapping_native_descriptor_estimates_keep_the_live_worker_limit() {
     let _first = authority.acquire(&role, false).unwrap();
     let _second = authority.acquire(&role, false).unwrap();
     assert!(authority.acquire(&role, false).is_err());
+}
+
+/// A source whose reader works elsewhere than where the command's relative
+/// paths start reads them from its resolved base: the coordinator registers
+/// the base and selections as the command names them, and the registration
+/// must still match them.
+#[test]
+fn relative_selections_are_read_from_the_resolved_base() {
+    let temp = crate::test_support::tempdir().unwrap();
+    fs::create_dir(temp.path().join("projects")).unwrap();
+    fs::write(temp.path().join("projects/data"), b"approved").unwrap();
+    // Here, in this process's own directory, the relative name means
+    // something else.
+    let mut resolved = policy_with_base(b"projects");
+    resolved.resolved_base = Some(temp.path().join("projects").as_os_str().as_bytes().to_vec());
+    let mut fixture = Fixture::new(resolved);
+    let worker = fixture.worker();
+    let request = read(Some(fixture.source()), 8);
+    worker.authorize(&request).unwrap();
+    let response = fixture.ops.handle(&request);
+    assert!(matches!(response, Response::Block { data, .. } if data == b"approved"));
+    // The registration still has to be the command's.
+    let mut other = policy_with_base(b"elsewhere");
+    other.resolved_base = Some(temp.path().as_os_str().as_bytes().to_vec());
+    let authority = SourceAuthority::new(other).unwrap();
+    let control = authority.acquire(&ConnectionRole::Control, false).unwrap();
+    let changed = registration(&policy_with_base(b"projects"));
+    assert!(control.register(&mut FsOps::new(), &changed).is_err());
+    // A resolved base is absolute.
+    let mut relative = policy(Path::new("data"));
+    relative.resolved_base = Some(b"projects".to_vec());
+    assert!(SourceAuthority::new(relative).is_err());
+}
+
+fn policy_with_base(base: &[u8]) -> SourcePolicy {
+    let mut policy = policy(Path::new("data"));
+    policy.base.path = Some(base.to_vec());
+    policy
+}
+
+/// A source account whose home directory is reached through a symlink, as
+/// when `/home` links elsewhere, reads its relative sources from where the
+/// home really is, as its own login does, without `--follow-src`. A link in
+/// the paths the command gives is still refused.
+#[test]
+fn a_linked_home_reads_relative_sources_without_following_links() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let real = temp.path().join("real");
+    fs::create_dir_all(real.join("alice/projects")).unwrap();
+    fs::write(real.join("alice/data"), b"homedata").unwrap();
+    fs::write(real.join("alice/projects/data"), b"projdata").unwrap();
+    symlink(real.join("alice/projects"), real.join("alice/linked")).unwrap();
+    symlink(&real, temp.path().join("home")).unwrap();
+    let named = temp.path().join("home/alice");
+    let home = fs::canonicalize(&named).unwrap();
+    let read_through = |base: &[&str], home: &Path| -> Option<Vec<u8>> {
+        let command = ["cp", "--from", "host-b"]
+            .iter()
+            .chain(base)
+            .chain(&["--src", "data", "--as", "copy"])
+            .map(|arg| arg.as_bytes().to_vec())
+            .collect();
+        let directive = crate::directive::issue(
+            crate::directive::Binding {
+                enrollment: crate::enrollment::EnrollmentId::random(),
+                generation: 1,
+                account: "alice".into(),
+                role: crate::directive::Role::Source,
+            },
+            command,
+            "~".into(),
+            (Default::default(), None),
+            [1; 32],
+        )
+        .unwrap();
+        let reads = crate::directive::source_rules(&directive, home).unwrap();
+        // The coordinator registers what its command names.
+        let request = Request::RegisterSourceRoots {
+            base: reads.base.clone(),
+            selections: reads.selections.clone(),
+            symlink_policy: reads.symlink_policy,
+            allow_unconfined_paths: false,
+            shared_workers: 0,
+            independent_handoff_workers: 0,
+        };
+        let authority =
+            SourceAuthority::new(reads.policy(Instant::now() + Duration::from_secs(30))).unwrap();
+        let control = authority
+            .acquire(&ConnectionRole::Control, reads.compressed)
+            .unwrap();
+        let mut ops = FsOps::new();
+        let Ok(Response::SourceRootsRegistered(roots)) = control.register(&mut ops, &request)
+        else {
+            return None;
+        };
+        let worker = authority
+            .acquire(
+                &ConnectionRole::SourceWorker {
+                    roots: roots.clone(),
+                    send_budget: None,
+                },
+                reads.compressed,
+            )
+            .unwrap();
+        let request = read(Some(roots[0].selection.clone()), 8);
+        worker.authorize(&request).unwrap();
+        match ops.handle(&request) {
+            Response::Block { data, .. } => Some(data),
+            _ => None,
+        }
+    };
+    // With no base, and with a relative one.
+    assert_eq!(read_through(&[], &home).as_deref(), Some(&b"homedata"[..]));
+    assert_eq!(
+        read_through(&["-C", "projects"], &home).as_deref(),
+        Some(&b"projdata"[..])
+    );
+    // Walking the home as it is named would meet its link.
+    assert_eq!(read_through(&[], &named), None);
+    // A link in the base the command gives is refused, as for any copy
+    // that does not follow source symlinks.
+    assert_eq!(read_through(&["-C", "linked"], &home), None);
 }

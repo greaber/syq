@@ -14,10 +14,8 @@ sudo ufw allow from <trusted-client-address> to any port 47600:47699 proto tcp
 ```
 
 Allow the range in any cloud firewall too. When TCP is blocked, copies fall
-back to SSH and say so; `syq cp -vv` shows which one a copy used.
-[Downloads your laptop approves per copy](receive.md#authorize-copies-between-servers)
-can't fall back: they need TCP. On Linux, syq also uses IP over InfiniBand
-(IPoIB) addresses.
+back to SSH and say so; `syq cp -vv` shows which one a copy used. On Linux,
+syq also uses IP over InfiniBand (IPoIB) addresses.
 
 ### Tailscale
 

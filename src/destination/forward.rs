@@ -144,7 +144,7 @@ pub(super) fn select(
                 args.direct_destination = Some(Box::new(spec));
                 return Ok(None);
             }
-            Err(error) if crate::conn::is_ssh_authorization_fallback_error(&error) => error,
+            Err(error) if crate::conn::is_per_copy_approval_fallback_error(&error) => error,
             Err(error) => return Err(error),
         };
         let Some(found) = names.into_iter().find_map(|name| {
@@ -217,11 +217,15 @@ pub(super) struct Coordinated {
 /// An entry key in OpenSSH form, wiped when dropped.
 #[derive(Serialize, Deserialize)]
 #[serde(transparent)]
-struct EntryKeyText(String);
+pub(super) struct EntryKeyText(String);
 
 impl EntryKeyText {
     fn of(key: &ssh_key::PrivateKey) -> Result<Self> {
         Ok(Self(key.to_openssh(ssh_key::LineEnding::LF)?.to_string()))
+    }
+
+    pub(super) fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
     }
 }
 
@@ -486,21 +490,27 @@ pub(super) struct ForwardRequest {
 
 /// An account this machine reaches with its own SSH, and what its records
 /// say about the account's enrollment.
-struct Account {
+pub(super) struct Account {
     endpoint: crate::cli::NativeEndpoint,
     target: String,
     login: String,
-    enrollment: crate::restricted::EnrollmentState,
+    pub(super) enrollment: crate::restricted::EnrollmentState,
 }
 
 impl Account {
-    fn label(&self) -> String {
+    /// Whether this machine's SSH configuration logs in to the account as
+    /// root.
+    pub(super) fn is_root(&self) -> bool {
+        self.login == "root"
+    }
+
+    pub(super) fn label(&self) -> String {
         format!("{}@{}", self.login, self.endpoint.host)
     }
 
     /// The login this machine's SSH configuration gives `target`, and its
     /// enrollment. Reading the configuration contacts no server.
-    fn find(target: &str, cancelled: &dyn Fn() -> bool) -> Result<Self> {
+    pub(super) fn find(target: &str, cancelled: &dyn Fn() -> bool) -> Result<Self> {
         let endpoint = target_endpoint(target)?;
         let login = ssh_login(target, Instant::now() + SETUP_TIMEOUT, cancelled)?;
         let enrollment =
@@ -513,8 +523,23 @@ impl Account {
         })
     }
 
+    /// Restricted receivers do not write or run copies as root: refuse a
+    /// copy `direction` ("to" or "from") such an account that would need
+    /// one, before anything is asked or set up, with `advice` for what to do
+    /// instead. An account with another name and user ID 0 is refused when
+    /// enrolling, or by its receiver when already enrolled.
+    pub(super) fn refuse_root(&self, direction: &str, advice: &str) -> Result<()> {
+        if self.is_root() {
+            bail!(
+                "syq's restricted receiver does not write or run copies as root, so a copy {direction} {} cannot be approved for one copy; {advice}",
+                self.label()
+            );
+        }
+        Ok(())
+    }
+
     /// A dry run never sets up or updates restricted copying.
-    fn ready_for_dry_run(&self) -> Result<()> {
+    pub(super) fn ready_for_dry_run(&self) -> Result<()> {
         let account = self.label();
         match self.enrollment {
             crate::restricted::EnrollmentState::Ready => Ok(()),
@@ -530,7 +555,10 @@ impl Account {
     /// The login enrollment uses and what this machine knows about the
     /// account's host key, which the server dialing it adds to what it
     /// knows.
-    fn policy(&self, cancelled: &dyn Fn() -> bool) -> Result<crate::agent_broker::HostPolicy> {
+    pub(super) fn policy(
+        &self,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<crate::agent_broker::HostPolicy> {
         let policy = crate::agent_broker::resolve_known_policy_at_bounded(
             "ssh",
             self.endpoint.user.as_deref(),
@@ -547,7 +575,7 @@ impl Account {
         Ok(policy)
     }
 
-    fn setup(&self, policy: &crate::agent_broker::HostPolicy) -> SetupAccount {
+    pub(super) fn setup(&self, policy: &crate::agent_broker::HostPolicy) -> SetupAccount {
         SetupAccount {
             host: self.endpoint.host.clone(),
             port: self.endpoint.port,
@@ -656,6 +684,21 @@ impl Receiver {
             .as_deref()
             .map(|source| Account::find(source, &cancelled))
             .transpose()?;
+        match &source {
+            None => destination.refuse_root(
+                "to",
+                &format!(
+                    "copy to an ordinary account on {host}, or use the requesting server's own SSH access, or account access approved with `syq persist connect {account} --auth-from @NAME`",
+                    host = destination.endpoint.host,
+                    account = destination.label()
+                ),
+            )?,
+            Some(source) => {
+                let advice = "use an ordinary account there, or copy through the requesting server with `--coordinate-at local`, which needs account access to both servers";
+                source.refuse_root("from", advice)?;
+                destination.refuse_root("to", advice)?;
+            }
+        }
         if args.dry_run {
             for account in source.iter().chain([&destination]) {
                 account.ready_for_dry_run()?;
@@ -698,13 +741,14 @@ impl Receiver {
                 cwd,
                 inputs,
                 caps,
-                destination: destination.setup(&destination_policy),
-                source: source
-                    .as_ref()
-                    .zip(source_policy.as_ref())
-                    .map(|(source, policy)| {
-                        (source.setup(policy), destination_known_hosts.clone())
-                    }),
+                accounts: match source.as_ref().zip(source_policy.as_ref()) {
+                    None => Accounts::Destination(destination.setup(&destination_policy)),
+                    Some((source, policy)) => Accounts::BetweenServers {
+                        source: source.setup(policy),
+                        destination: destination.setup(&destination_policy),
+                        known_hosts: destination_known_hosts.clone(),
+                    },
+                },
                 results_key,
                 via: (
                     self.server_user.clone(),
@@ -728,10 +772,10 @@ impl Receiver {
                 login: policy.login_user.clone(),
                 known_hosts: policy.known_hosts_for_others()?,
                 known_hosts_left_out: policy.left_out_kind().map(str::to_owned),
-                results_public_key: prepared.results.public_key,
-                enrollment: prepared.results.enrollment,
-                request: prepared.results.request,
-                digest: prepared.results.digest,
+                results_public_key: signed.results.public_key,
+                enrollment: signed.results.enrollment,
+                request: signed.results.request,
+                digest: signed.results.digest,
             }),
             (None, None) => None,
             _ => bail!("the copy's setup did not sign its source's directive"),
@@ -755,29 +799,56 @@ impl Receiver {
 /// accounts' enrollments and sign an approved copy's directives.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Prepare {
-    command: Vec<Vec<u8>>,
-    cwd: String,
-    inputs: crate::directive::Inputs,
-    caps: crate::directive::Caps,
-    destination: SetupAccount,
-    /// For a copy between two other servers, the source, which coordinates
-    /// it, and what this machine's known_hosts files say about the
-    /// destination, which its directive carries.
-    source: Option<(SetupAccount, String)>,
+pub(super) struct Prepare {
+    pub(super) command: Vec<Vec<u8>>,
+    pub(super) cwd: String,
+    pub(super) inputs: crate::directive::Inputs,
+    pub(super) caps: crate::directive::Caps,
+    pub(super) accounts: Accounts,
     /// The requester's key for the destination's results, when it checks
     /// them.
-    results_key: Option<[u8; 32]>,
+    pub(super) results_key: Option<[u8; 32]>,
     /// The server that asked, as this machine's receiving connection logs
     /// in to it: its user, if named, host and port.
-    via: (Option<String>, String, Option<u16>),
-    allow_enrollment: bool,
+    pub(super) via: (Option<String>, String, Option<u16>),
+    pub(super) allow_enrollment: bool,
+}
+
+/// The accounts an approved copy has directives for.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) enum Accounts {
+    /// The destination of a copy from the server that asked.
+    Destination(SetupAccount),
+    /// A copy between two other servers: the source, which coordinates it,
+    /// the destination, and what this machine's known_hosts files say about
+    /// the destination, which the source's directive carries.
+    BetweenServers {
+        source: SetupAccount,
+        destination: SetupAccount,
+        known_hosts: String,
+    },
+    /// The source of a copy to the server that asked.
+    Source(SetupAccount),
+}
+
+impl Accounts {
+    fn all(&self) -> Vec<&SetupAccount> {
+        match self {
+            Self::Destination(account) | Self::Source(account) => vec![account],
+            Self::BetweenServers {
+                source,
+                destination,
+                ..
+            } => vec![source, destination],
+        }
+    }
 }
 
 /// An account the setup child enrolls and signs a directive for.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SetupAccount {
+pub(super) struct SetupAccount {
     host: String,
     port: Option<u16>,
     login: String,
@@ -794,7 +865,7 @@ impl Prepare {
     fn issue<'a>(
         &'a self,
         account: &'a SetupAccount,
-        peer: Option<crate::directive::Peer>,
+        role: crate::directive::Role,
     ) -> Result<crate::restricted::Issue<'a>> {
         let (user, host, port) = &self.via;
         Ok(crate::restricted::Issue {
@@ -809,10 +880,10 @@ impl Prepare {
             // machine cannot reach the account along its own SSH
             // configuration's route, as a copy started on this machine goes
             // through its source. An upload needs that server to reach the
-            // destination's SSH port anyway, and a copy between two other
-            // servers needs it to reach the source's; for the destination of
-            // such a copy, the hop works only if it reaches that too, as the
-            // docs say.
+            // destination's SSH port anyway, and a download, or a copy
+            // between two other servers, needs it to reach the source's; for
+            // the destination of such a copy, the hop works only if it
+            // reaches that too, as the docs say.
             jump: Some(crate::enrollment::SshEndpoint::from_host(
                 user.as_deref(),
                 host,
@@ -825,44 +896,65 @@ impl Prepare {
             // time, as `accept-new` does.
             batch: true,
             results_key: self.results_key,
-            peer,
+            role,
         })
     }
 
-    /// Set up or refresh the enrollments and sign the directives: the
-    /// destination's first, which the source's names.
+    /// Set up or refresh the enrollments and sign the directives: for a
+    /// copy between two other servers, the destination's first, which the
+    /// source's names.
     fn sign(&self) -> Result<Signed> {
+        use crate::directive::Role;
+        let (account, known_hosts) = match &self.accounts {
+            Accounts::Source(account) => {
+                let source =
+                    crate::restricted::prepare_transfer(self.issue(account, Role::Source)?)?;
+                return Ok(Signed {
+                    directive: source.directive,
+                    entry_key: EntryKeyText::of(&source.entry_key)?,
+                    destination: Vec::new(),
+                    source: None,
+                });
+            }
+            Accounts::Destination(account) => (account, None),
+            Accounts::BetweenServers {
+                destination,
+                known_hosts,
+                ..
+            } => (destination, Some(known_hosts)),
+        };
         let destination =
-            crate::restricted::prepare_transfer(self.issue(&self.destination, None)?)?;
-        let source = self
-            .source
-            .as_ref()
-            .map(|(account, known_hosts)| {
+            crate::restricted::prepare_transfer(self.issue(account, Role::Destination)?)?;
+        let source = match (&self.accounts, known_hosts) {
+            (Accounts::BetweenServers { source, .. }, Some(known_hosts)) => {
                 let peer = crate::directive::Peer {
                     enrollment: destination.enrollment_id,
                     generation: destination.generation,
-                    account: self.destination.login.clone(),
+                    account: account.login.clone(),
                     request: destination.request_id,
                     destination: destination.destination.clone(),
                     known_hosts: known_hosts.clone(),
                 };
-                let source = crate::restricted::prepare_transfer(self.issue(account, Some(peer))?)?;
-                Ok::<_, anyhow::Error>(SignedSource {
-                    directive: source.directive,
-                    entry_key: EntryKeyText::of(&source.entry_key)?,
+                let signed = crate::restricted::prepare_transfer(
+                    self.issue(source, Role::CoordinatingSource(peer))?,
+                )?;
+                Some(SignedSource {
+                    directive: signed.directive,
+                    entry_key: EntryKeyText::of(&signed.entry_key)?,
+                    results: Results {
+                        public_key: destination.results_public_key.clone(),
+                        enrollment: destination.enrollment_id,
+                        request: destination.request_id,
+                        digest: destination.digest,
+                    },
                 })
-            })
-            .transpose()?;
+            }
+            _ => None,
+        };
         Ok(Signed {
             directive: destination.directive,
             entry_key: EntryKeyText::of(&destination.entry_key)?,
             destination: destination.destination,
-            results: Results {
-                public_key: destination.results_public_key,
-                enrollment: destination.enrollment_id,
-                request: destination.request_id,
-                digest: destination.digest,
-            },
             source,
         })
     }
@@ -878,12 +970,12 @@ enum Prepared {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Signed {
-    directive: String,
-    entry_key: EntryKeyText,
+pub(super) struct Signed {
+    pub(super) directive: String,
+    pub(super) entry_key: EntryKeyText,
+    /// Where the destination's rules write, for a destination's directive.
     destination: Vec<u8>,
-    /// What the destination's results are checked with.
-    results: Results,
+    /// For a copy between two other servers, the source's directive.
     source: Option<SignedSource>,
 }
 
@@ -901,13 +993,15 @@ struct Results {
 struct SignedSource {
     directive: String,
     entry_key: EntryKeyText,
+    /// What the requester checks the destination's results with.
+    results: Results,
 }
 
 /// Set up the enrollments and sign the directives in the setup child
 /// `command`, until `deadline` or until `cancelled`. Then the child ends
 /// with everything in its process group, its SSH logins included, which
 /// releases the enrollment lock and any wait for the SSH agent with it.
-fn prepare_in_child(
+pub(super) fn prepare_in_child(
     command: Command,
     request: &Prepare,
     deadline: Instant,
@@ -945,10 +1039,9 @@ fn prepare_in_child(
         Ok(Prepared::Refused(error)) => Err(anyhow::anyhow!("{error}{output}")),
         Err(error) if Instant::now() >= deadline => {
             let accounts = request
-                .source
-                .iter()
-                .map(|(source, _)| source)
-                .chain([&request.destination])
+                .accounts
+                .all()
+                .into_iter()
                 .map(|account| format!("`syq receiver enroll {}`", account.label()))
                 .collect::<Vec<_>>()
                 .join(" and ");
@@ -988,93 +1081,6 @@ pub(super) struct ForwardChild {
     closed: bool,
 }
 impl ForwardChild {
-    pub(super) fn connect<T: Serialize>(
-        target: &str,
-        request: &T,
-        operation: &str,
-        deadline: Instant,
-        cancelled: &impl Fn() -> bool,
-    ) -> Result<(Self, Reply)> {
-        for install in [false, true] {
-            let mut command = crate::process::self_command()?;
-            command.args([
-                if install {
-                    "--return-connect-install"
-                } else {
-                    "--return-connect"
-                },
-                target,
-                operation,
-            ]);
-            let mut child = Self::spawn_command(command)?;
-            let reply = (|| {
-                write_message(
-                    &mut DeadlineIo {
-                        inner: child.child.stdin.as_mut().unwrap(),
-                        deadline,
-                        cancelled: Some(cancelled),
-                    },
-                    request,
-                )?;
-                read_message::<Reply>(&mut DeadlineIo {
-                    inner: child.child.stdout.as_mut().unwrap(),
-                    deadline,
-                    cancelled: Some(cancelled),
-                })
-            })();
-            match reply {
-                Ok(reply @ (Reply::Approved(_) | Reply::SourceApproved { .. })) => {
-                    return Ok((child, reply))
-                }
-                Ok(Reply::Error(error)) => bail!("destination refused the copy: {error}"),
-                Ok(Reply::RetryableError(error)) => {
-                    return Err(super::ssh_auth::RetryableSetupError(error).into());
-                }
-                Ok(
-                    Reply::Ready
-                    | Reply::Waiting
-                    | Reply::Identity(_)
-                    | Reply::TcpProbed(_)
-                    | Reply::TcpCongestionRejected(_)
-                    | Reply::Directive(_)
-                    | Reply::SendApproved(_),
-                ) => {
-                    bail!("invalid destination setup response")
-                }
-                Err(error) => {
-                    // Match ordinary bootstrap: a missing helper or an exec
-                    // failure may retry setup once, before a copy is approved.
-                    let closed = error.downcast_ref::<std::io::Error>().is_some_and(|e| {
-                        matches!(
-                            e.kind(),
-                            std::io::ErrorKind::UnexpectedEof
-                                | std::io::ErrorKind::BrokenPipe
-                                | std::io::ErrorKind::ConnectionReset
-                        )
-                    });
-                    let status = if closed {
-                        child.wait_for_exit(deadline, cancelled)
-                    } else {
-                        child.close().map_err(Into::into)
-                    };
-                    if !install
-                        && status
-                            .as_ref()
-                            .is_ok_and(|s| crate::remote_helper::needs_install(s.code()))
-                    {
-                        continue;
-                    }
-                    return Err(error).with_context(|| {
-                        format!(
-                            "return helper setup failed ({status:?}): {}",
-                            child.errors()
-                        )
-                    });
-                }
-            }
-        }
-        unreachable!("the second helper attempt returns its result")
-    }
     pub(super) fn wait_for_exit(
         &mut self,
         deadline: Instant,
@@ -1174,58 +1180,6 @@ impl Drop for ForwardChild {
     }
 }
 
-// Control frames must reach the other side immediately. Avoid kernel copy
-// offload, which can wait for more pipe data across this request/reply boundary.
-fn pump(reader: &mut impl Read, writer: &mut impl Write) -> std::io::Result<u64> {
-    let mut buffer = [0; 16 * 1024];
-    let mut total = 0;
-    loop {
-        let count = match reader.read(&mut buffer) {
-            Ok(0) => return Ok(total),
-            Ok(count) => count,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
-        };
-        writer.write_all(&buffer[..count])?;
-        writer.flush()?;
-        total += count as u64;
-    }
-}
-
-pub(super) fn relay(
-    mut socket: UnixStream,
-    mut input: std::process::ChildStdin,
-    mut output: std::process::ChildStdout,
-    cancelled: impl Fn() -> bool,
-    child: &mut ForwardChild,
-) -> Result<()> {
-    let mut writer = socket.try_clone()?;
-    let shutdown = socket.try_clone()?;
-    let (done, completions) = mpsc::channel();
-    let sent = done.clone();
-    let upload = std::thread::spawn(move || {
-        let _ = sent.send(pump(&mut socket, &mut input));
-    });
-    let download = std::thread::spawn(move || {
-        let _ = done.send(pump(&mut output, &mut writer));
-    });
-    let result = loop {
-        if cancelled() {
-            break Err(anyhow::anyhow!("return connection stopped during copy"));
-        }
-        match completions.recv_timeout(Duration::from_millis(100)) {
-            Ok(result) => break result.map(drop).map_err(Into::into),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(error) => break Err(error.into()),
-        }
-    };
-    let _ = shutdown.shutdown(std::net::Shutdown::Both);
-    let _ = child.close();
-    let _ = upload.join();
-    let _ = download.join();
-    result
-}
-
 pub(crate) struct DeadlineIo<'a, T> {
     pub(crate) inner: &'a mut T,
     pub(crate) deadline: Instant,
@@ -1300,17 +1254,8 @@ impl<R: Read + AsRawFd> Read for HandshakeInput<R> {
     }
 }
 
-fn connect(target: &str, install: bool, operation: &str) -> Result<i32> {
-    crate::fsops::reserve_startup_descriptors();
-    let target =
-        String::from_utf8(base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(target)?)?;
-    let spec = target_spec(&target)?;
-    if install {
-        spec.install_helper()?;
-    }
-    Err(spec.helper_command(&[operation.into()]).exec().into())
-}
-/// Build the same SSH route for helper setup and laptop-side address lookup.
+/// The SSH route this machine's configuration gives `target`, for reading
+/// that configuration without contacting the server.
 pub(super) fn target_spec(target: &str) -> Result<crate::conn::RemoteSpec> {
     let endpoint = target_endpoint(target)?;
     Ok(crate::conn::RemoteSpec {
@@ -1341,34 +1286,9 @@ pub(super) fn target_spec(target: &str) -> Result<crate::conn::RemoteSpec> {
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),
-        forwarded: None,
         receiver_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     })
-}
-
-pub(super) fn source_data_hostname(
-    spec: &crate::conn::RemoteSpec,
-    deadline: Instant,
-    cancelled: &impl Fn() -> bool,
-) -> Result<String> {
-    read_source_hostname(spec.ssh_hostname_command(), deadline, cancelled)
-}
-
-fn read_source_hostname(
-    command: Command,
-    deadline: Instant,
-    cancelled: &impl Fn() -> bool,
-) -> Result<String> {
-    let text = read_ssh_configuration(command, deadline, cancelled)?;
-    let hostname = text
-        .lines()
-        .find_map(|line| line.strip_prefix("hostname "))
-        .context("source SSH configuration did not report its hostname")?
-        .trim()
-        .to_owned();
-    validate_data_hostname(&hostname)?;
-    Ok(hostname)
 }
 
 /// What `ssh -G` prints for a target, within the setup's deadline.
@@ -1406,22 +1326,6 @@ pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
     match argv.get(1).and_then(|v| v.to_str())? {
         "--return-source-probe" | "--return-send-probe" if argv.len() == 2 => Some(Ok(0)),
         "--return-prepare" if argv.len() == 2 => Some(prepare_setup()),
-        "--return-source" if argv.len() == 2 => Some(super::pull::receive()),
-        "--return-connect" | "--return-connect-install" if argv.len() == 4 => Some(
-            argv[2]
-                .to_str()
-                .context("invalid return target")
-                .and_then(|target| {
-                    connect(
-                        target,
-                        argv[1] == "--return-connect-install",
-                        match argv.get(3).and_then(|arg| arg.to_str()) {
-                            Some("--return-source") => "--return-source",
-                            _ => bail!("invalid return helper operation"),
-                        },
-                    )
-                }),
-        ),
         _ => None,
     }
 }
@@ -1441,13 +1345,12 @@ mod tests {
                 max_entries: 1,
                 max_delete: 0,
             },
-            destination: SetupAccount {
+            accounts: Accounts::Destination(SetupAccount {
                 host: "backup".into(),
                 port: None,
                 login: "alice".into(),
                 agent: None,
-            },
-            source: None,
+            }),
             results_key: None,
             via: (None, "server".into(), None),
             allow_enrollment: true,
@@ -1555,42 +1458,23 @@ mod tests {
     #[test]
     fn the_setup_child_enrolls_without_prompts_and_through_the_server_that_asked() {
         let request = prepare_request();
-        let issue = request.issue(&request.destination, None).unwrap();
+        let account = &request.accounts.all()[0];
+        let issue = request
+            .issue(account, crate::directive::Role::Destination)
+            .unwrap();
         assert!(issue.batch);
         assert_eq!(issue.caps, Some(request.caps));
         assert_eq!(issue.jump.unwrap().label(), "server");
         let mut named = prepare_request();
         named.via = (Some("alice".into()), "server".into(), Some(2222));
-        assert_eq!(
-            named
-                .issue(&named.destination, None)
-                .unwrap()
-                .jump
-                .unwrap()
-                .label(),
-            "alice@server:2222"
-        );
+        let issue = |request: &Prepare| {
+            request
+                .issue(request.accounts.all()[0], crate::directive::Role::Source)
+                .map(|issue| issue.jump.unwrap().label())
+        };
+        assert_eq!(issue(&named).unwrap(), "alice@server:2222");
         named.via = (None, "-oProxyCommand=evil".into(), None);
-        assert!(named.issue(&named.destination, None).is_err());
-    }
-
-    #[test]
-    fn source_hostname_lookup_obeys_setup_deadline_and_cancellation() {
-        for cancelled in [false, true] {
-            let mut command = Command::new("sh");
-            command.args(["-c", "sleep 30; printf 'hostname example.test\n'"]);
-            let start = Instant::now();
-            let result =
-                read_source_hostname(command, start + Duration::from_millis(20), &|| cancelled);
-            assert!(result.is_err());
-            assert!(start.elapsed() < Duration::from_secs(2));
-        }
-        let mut command = Command::new("sh");
-        command.args(["-c", "printf 'hostname example.test\n'; exit 1"]);
-        assert!(
-            read_source_hostname(command, Instant::now() + Duration::from_secs(2), &|| false)
-                .is_err()
-        );
+        assert!(issue(&named).is_err());
     }
 
     #[test]
@@ -1674,47 +1558,6 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(2));
             assert!(child.child.try_wait().unwrap().is_some());
         }
-    }
-
-    #[test]
-    fn duplex_control_relay_delivers_small_messages_without_waiting_for_eof() {
-        let (mut client, server) = UnixStream::pair().unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        let mut command = Command::new("cat");
-        command.arg("-");
-        let mut child = ForwardChild::spawn_command(command).unwrap();
-        let input = child.child.stdin.take().unwrap();
-        let output = child.child.stdout.take().unwrap();
-        let thread = std::thread::spawn(move || relay(server, input, output, || false, &mut child));
-        client.write_all(b"hello").unwrap();
-        let mut response = [0; 5];
-        let result = client.read_exact(&mut response);
-        client.shutdown(std::net::Shutdown::Both).unwrap();
-        let _ = thread.join().unwrap();
-        result.unwrap();
-        assert_eq!(&response, b"hello");
-    }
-    #[test]
-    fn relay_cancellation_wakes_both_blocked_pumps() {
-        let (_client, server) = UnixStream::pair().unwrap();
-        let mut command = Command::new("cat");
-        command.arg("-");
-        let mut child = ForwardChild::spawn_command(command).unwrap();
-        let input = child.child.stdin.take().unwrap();
-        let output = child.child.stdout.take().unwrap();
-        let started = Instant::now();
-        assert!(relay(
-            server,
-            input,
-            output,
-            || started.elapsed() >= Duration::from_millis(20),
-            &mut child
-        )
-        .is_err());
-        assert!(started.elapsed() < Duration::from_secs(2));
-        assert!(child.child.try_wait().unwrap().is_some());
     }
 
     #[test]
@@ -1842,6 +1685,48 @@ mod tests {
             assert!(receiver.approvals.snapshots().is_empty());
         }
         assert_eq!(receiver.forward_count.load(Ordering::Acquire), 0);
+    }
+
+    /// A root login on the destination is refused before anything is asked
+    /// or set up, with advice that fits an upload.
+    #[test]
+    fn a_root_destination_is_refused_before_the_prompt() {
+        let root = crate::test_support::tempdir().unwrap();
+        let (_broker, receiver, registration, _) = broker(root.path(), Approval::Always);
+        let source = root.path().as_os_str().as_bytes().to_vec();
+        let command = [b"cp".to_vec(), b"--src".to_vec(), source]
+            .into_iter()
+            .chain(
+                ["--to", "root@backup", "--into", "output"]
+                    .iter()
+                    .map(|arg| arg.as_bytes().to_vec()),
+            )
+            .collect();
+        let error = exchange(
+            &registration,
+            Message::Forward(Box::new(ForwardRequest {
+                source: None,
+                target: "root@backup".into(),
+                command,
+                cwd: String::new(),
+                inputs: crate::directive::Inputs::default(),
+                results_key: None,
+            })),
+            Duration::from_secs(2),
+            Some(Duration::from_secs(2)),
+        )
+        .err()
+        .unwrap();
+        let message = format!("{error:#}");
+        for expected in [
+            "does not write or run copies as root",
+            "a copy to root@backup",
+            "copy to an ordinary account on backup",
+        ] {
+            assert!(message.contains(expected), "{expected}: {message}");
+        }
+        assert!(!message.contains("--coordinate-at"), "{message}");
+        assert!(receiver.approvals.snapshots().is_empty());
     }
 
     #[test]

@@ -199,7 +199,10 @@ The protection has four parts:
 1. **A restricted entry point on hostB.** The first copy uses your normal SSH
    login to install syq's receiver and add one `authorized_keys` line, whose
    entry key can only start the receiver, with SSH forwarding disabled. The
-   receiver refuses to run as root.
+   receiver refuses to write or run a copy as root. A root account can serve
+   downloads, which can then read any file on the machine the copy names, and
+   its receiver runs as root whenever a server that holds the entry key
+   connects, before it has checked a signature.
 2. **Only the entry key for hostA.** With each copy, hostA receives the entry
    key and uses it to reach the receiver, checking hostB's host key as described
    [below](#how-hosta-checks-hostbs-key). The entry key authorizes nothing by
@@ -486,14 +489,29 @@ the hostB account, so a command that names syq's own files there, or a source
 symlink that leads to them, sends those to hostC like any other file. The copy
 stops when hostX's command ends, and continues if your laptop disconnects.
 
-A server can also ask your laptop to approve a download from another server. Syq
-on the source then reads only the approved files and directory trees, applies
-the selected symlink behavior, accepts no writes or removals, and limits the
-file data, entries, and connections it returns. The server can also ask for
-hashes of approved files; these do not count toward the data limit, so that
-limit does not bound what the server can learn from them. File data uses
-authenticated, encrypted TCP directly between the servers, and the copy fails
-without it. Closing the approval connection stops further reads.
+A server can also ask your laptop to approve a download from another server,
+hostB, to itself. Your laptop shows the command and each source as hostB will
+read it, sets up or updates hostB's enrollment when needed, and signs the
+command for hostB's receiver as the copy's source. The server logs in to that
+receiver with hostB's entry key, checking hostB's host key as
+[hostA checks hostB's](#how-hosta-checks-hostbs-key), and keeps the entry key
+afterwards. The receiver checks the signature as for a destination, and then
+reads only the files and directory trees the command names, with the symlink
+behavior the command chose, accepts no writes or removals, and limits the file
+data, entries, and connections it returns to the command's and your laptop's
+limits. A signed download cannot be used as a copy to hostB, and a copy signed
+for hostB as a destination cannot be used to read from it.
+
+Reads are not limited further within the account: a command that names
+hostB's `~/.ssh` or syq's own files there, or a symlink it follows to them,
+sends those files like any other, as a login to the account could. The prompt
+shows the paths, and says when the command follows symlinks and when your
+laptop logs in as root, so file permissions don't limit the reads. The server can
+also ask for hashes of approved files; these do not count toward the data
+limit, so that limit does not bound what the server can learn from them. Once
+approved, the copy goes on without your laptop until it finishes, someone
+interrupts it on the server, its signature's seven days run out, or you revoke
+the enrollment.
 
 <a id="approved-commands-on-receiving-machines"></a>
 

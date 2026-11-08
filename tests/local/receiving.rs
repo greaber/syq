@@ -1828,7 +1828,7 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     });
     let responder = std::thread::spawn(move || {
         let mut messages = Vec::new();
-        for _ in 0..12 {
+        for _ in 0..8 {
             // The client first tries SSH, and later exercises commands that
             // must not contact this listener at all. Their process startup
             // time is not part of the authorization-ordering assertion.
@@ -1948,28 +1948,35 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
         .collect();
     assert_eq!(records.last().unwrap()["status"], "failed");
 
-    for (diagnostic, reason) in [
-        (
-            "Host key verification failed.",
-            "host key verification failed on the source machine",
-        ),
-        (
-            "ssh: Could not resolve hostname backup: Name or service not known",
-            "destination hostname could not be resolved",
-        ),
-        (
-            "ssh: connect to host backup port 22: Connection refused",
-            "connection was refused",
-        ),
+    let host_key = command(&["cp", "source", "--to", "backup"])
+        .env("SYQ_TEST_SSH_FAILURE", "Host key verification failed.")
+        .capture_output()
+        .unwrap();
+    let stderr = stderr_of(&host_key);
+    assert!(!host_key.status.success());
+    assert!(stderr.contains("copy denied by fixture"), "{stderr}");
+    assert!(
+        stderr.contains("host key verification failed on the source machine"),
+        "{stderr}"
+    );
+    assert_eq!(fs::read_to_string(t.path("ssh-used")).unwrap(), "connect\n");
+    fs::remove_file(t.path("ssh-used")).unwrap();
+    // The approved copy would dial the same name from this machine, so a
+    // name that does not resolve here, or a refused connection, asks no
+    // receiving machine: syq reports SSH's error.
+    for diagnostic in [
+        "ssh: Could not resolve hostname backup: Name or service not known",
+        "ssh: connect to host backup port 22: Connection refused",
     ] {
-        let refused = command(&["cp", "source", "--to", "backup"])
+        let failed = command(&["cp", "source", "--to", "backup"])
             .env("SYQ_TEST_SSH_FAILURE", diagnostic)
             .capture_output()
             .unwrap();
-        let stderr = stderr_of(&refused);
-        assert!(!refused.status.success());
-        assert!(stderr.contains("copy denied by fixture"), "{stderr}");
-        assert!(stderr.contains(reason), "{stderr}");
+        let stderr = stderr_of(&failed);
+        assert!(!failed.status.success());
+        assert!(stderr.contains(diagnostic), "{stderr}");
+        assert!(!stderr.contains("copy denied by fixture"), "{stderr}");
+        assert!(!stderr.contains("waiting up to"), "{stderr}");
         assert_eq!(fs::read_to_string(t.path("ssh-used")).unwrap(), "connect\n");
         fs::remove_file(t.path("ssh-used")).unwrap();
     }
@@ -2033,12 +2040,12 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     assert_eq!(forward["command"][0], serde_json::json!(b"cp"));
     assert_eq!(forward["inputs"]["ignore"], serde_json::json!([]));
     assert!(forward.get("request").is_none(), "{forward}");
-    for pair in messages[2..8].chunks_exact(2) {
+    for pair in messages[2..4].chunks_exact(2) {
         assert_eq!(pair[0]["secret"], "laptop");
         assert_eq!(pair[0]["message"], "Ping");
         assert!(pair[1]["message"].get("Forward").is_some());
     }
-    for (pair, name) in messages[8..12].chunks_exact(2).zip(["z-other", "ssh"]) {
+    for (pair, name) in messages[4..8].chunks_exact(2).zip(["z-other", "ssh"]) {
         assert_eq!(pair[0]["secret"], name);
         assert_eq!(pair[1]["secret"], name);
         assert_eq!(

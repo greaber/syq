@@ -604,7 +604,6 @@ fn connect_receiving(
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),
-        forwarded: None,
         receiver_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
