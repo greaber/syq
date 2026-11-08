@@ -21,7 +21,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy -v \
 | Key | Default | Accepted values |
 |---|---|---|
 | `workers` | Automatic | 1 through 65536 filesystem workers, fewer when there is less work |
-| `comparison-block-size` | 4 MiB; 64 KiB for replaced files up to 64 MiB | 64 KiB through 64 MiB; filesystem copies only. Comparison can use up to 64 MiB of memory per worker |
+| `comparison-block-size` | 64 KiB for replaced files up to 64 MiB; automatic from 64 KiB through 4 MiB for larger ones | 64 KiB through 64 MiB; filesystem copies only. Comparison can use up to 64 MiB of memory per worker |
 | `request-size` | Automatic, normally up to 4 MiB; at most 2 MiB for streaming | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
 | `copy-path` | `auto` | `auto`, `ranges`, `streaming`, `auto-streaming`; see below |
@@ -141,8 +141,11 @@ supports reflinks.
 
 ### Scattered edits in existing files
 
-Smaller comparison blocks can reduce the data sent for scattered edits, at the
-cost of more hashes and requests:
+For a replaced file over 64 MiB, syq chooses the comparison block size as the
+copy runs. Smaller blocks send less around scattered edits, and larger ones
+need fewer requests, so syq uses smaller blocks on slower links and larger ones
+where whole regions changed or the link is fast. To compare with one fixed
+size instead, for example to see what block size costs on your link:
 
 ```sh
 syq cp --srcs-in source --to host --into destination \

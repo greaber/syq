@@ -76,6 +76,15 @@ impl Default for ComparisonSizing {
 }
 
 impl ComparisonSizing {
+    #[cfg(test)]
+    pub(super) fn starting(block: u64, ahead: u64) -> Self {
+        Self {
+            block,
+            ahead,
+            ..Self::default()
+        }
+    }
+
     /// The block of the next window, no larger than `ceiling`.
     pub(super) fn block(&self, ceiling: u64) -> u64 {
         self.block.min(ceiling).max(MIN_BLOCK.min(ceiling))
@@ -156,6 +165,9 @@ struct Sizes {
     /// Whether the destination is asked for hashes before it has answered
     /// everything sent to it.
     prefetch: bool,
+    /// The source answers each request as it is sent, as one in this
+    /// process does.
+    source_answers_at_once: bool,
 }
 
 struct Window {
@@ -215,8 +227,7 @@ struct Flow {
     matched: u64,
     /// The last block the source answered for differed.
     differing: bool,
-    /// When each connection's last reply arrived.
-    last_source_reply: Option<Instant>,
+    /// When the destination's last reply arrived.
     last_destination_reply: Option<Instant>,
     /// A window has been asked about: waits for hashes after that mean the
     /// look-ahead is too short.
@@ -244,6 +255,7 @@ impl Worker {
                 source_requests: if src_pipelines { depth } else { 1 },
                 destination_requests: if dst_pipelines { depth + 1 } else { 1 },
                 prefetch: dst_pipelines,
+                source_answers_at_once: !src_pipelines,
             };
         }
         let block = self.comparison.block(configured);
@@ -259,6 +271,7 @@ impl Worker {
             source_requests: if src_pipelines { queue(&*self.src) } else { 1 },
             destination_requests: if dst_pipelines { queue(&*self.dst) } else { 1 },
             prefetch: dst_pipelines,
+            source_answers_at_once: !src_pipelines,
         }
     }
 
@@ -332,9 +345,12 @@ impl Worker {
         credited: &mut u64,
     ) -> Result<()> {
         loop {
-            if !(self.sched.is_aborted() || self.sched.is_failed(idx)) {
-                self.issue_comparisons(job, handle, sizes, flow)?;
+            // Nothing further is written for a copy that ended or a file that
+            // failed: the caller drains what is outstanding.
+            if self.sched.is_aborted() || self.sched.is_failed(idx) {
+                return Ok(());
             }
+            self.issue_comparisons(job, handle, sizes, flow)?;
             let from_source = match (flow.reads.front(), flow.awaited.front()) {
                 (None, None) => return Ok(()),
                 (Some(_), None) => true,
@@ -344,7 +360,9 @@ impl Worker {
                 // one whose request went out first.
                 (Some(read), Some(awaited)) => {
                     flow.awaited.len() < sizes.destination_requests
-                        && (self.src.reply_ready() || read.sent <= awaited.sent())
+                        && (sizes.source_answers_at_once
+                            || self.src.reply_ready()
+                            || read.sent <= awaited.sent())
                 }
             };
             if from_source {
@@ -472,12 +490,15 @@ impl Worker {
     ) -> Result<()> {
         let read = flow.reads.pop_front().expect("pending read");
         flow.reading -= read.len;
-        let response = ok(self.src.recv()?, "compare source block")?;
+        // A reply that has not yet arrived when it is waited for crosses the
+        // link from its first byte to its last; one already queued says
+        // nothing about the link.
+        let (waited, (response, started)) = match self.src.try_recv_with_arrival() {
+            Some(queued) => (false, queued?),
+            None => (!sizes.source_answers_at_once, self.src.recv_with_arrival()?),
+        };
         let arrived = Instant::now();
-        let since = flow
-            .last_source_reply
-            .map_or(read.sent, |last| last.max(read.sent));
-        flow.last_source_reply = Some(arrived);
+        let response = ok(response, "compare source block")?;
         let differs = match response {
             Response::RangeMatched { off, len } => {
                 validate_range_reply(read.off, read.len, off, len as usize)?;
@@ -509,10 +530,10 @@ impl Worker {
             }
             Response::Block { off, hash, data } => {
                 validate_range_reply(read.off, read.len, off, data.len())?;
-                if sizes.adaptive && self.opts.src_remote {
+                if sizes.adaptive && self.opts.src_remote && waited {
                     // The block crossed the link in this reply.
                     self.comparison
-                        .sent(read.len, arrived.saturating_duration_since(since));
+                        .sent(read.len, arrived.saturating_duration_since(started));
                 }
                 self.benchmark.range_requests += 1;
                 self.limit(read.len);
