@@ -626,7 +626,7 @@ class PreflightTests(Scratch):
             'version = 4\n\n[[package]]\nname = "syq"\nversion = "9.9.9"\n')
         (repo / ".github/workflows/release.yml").write_text(
             "steps:\n  - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n"
-            "  - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18\n")
+            "  - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9\n")
         (repo / ".github/release-notes/v9.9.9.md").write_text("Release fixture notes\n")
         self.init_repo(repo)
         self.git(repo, "add", ".")
@@ -660,7 +660,7 @@ class PreflightTests(Scratch):
             SYQ_TEST_SELECTED_ACTIONS_JSON=json.dumps({
                 "github_owned_allowed": True, "verified_allowed": False,
                 "patterns_allowed": [
-                    "rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18"]}),
+                    "rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9"]}),
             SYQ_TEST_SIGNING_KEY=self.signing_key,
             SYQ_TEST_FORMULA_B64=base64.b64encode(formula.encode()).decode(),
             PATH=str(bin_dir) + os.pathsep + os.environ["PATH"])
