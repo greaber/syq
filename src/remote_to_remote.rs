@@ -2152,9 +2152,17 @@ fn run_remote_once(
                 })
             })
             .transpose()
-            .context(
-                "prepare restricted destination enrollment; use --peer-auth broker to explicitly request authentication-only confinement",
-            )?;
+            .map_err(|error| {
+                // A refused copy that is not run again says why, and to run
+                // it again; the other modes are no answer to that.
+                if refresh {
+                    error
+                } else {
+                    error.context(
+                        "prepare restricted destination enrollment; use --peer-auth broker to explicitly request authentication-only confinement",
+                    )
+                }
+            })?;
         if let Some(prepared) = prepared {
             // The coordinator gets the entry key on its input and uses it
             // for every SSH connection to the receiver, so the copy needs

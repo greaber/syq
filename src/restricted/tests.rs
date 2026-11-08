@@ -810,10 +810,22 @@ pub(super) fn test_directive(
 #[test]
 fn a_refused_copy_is_signed_again_as_the_same_copy() {
     let enrollment = EnrollmentId::random();
-    let first = test_directive(enrollment, 3, "backup");
+    // Signed a while before the refusal, and still in its start window.
+    let mut first = test_directive(enrollment, 3, "backup");
+    for time in [
+        &mut first.issued_at,
+        &mut first.not_before,
+        &mut first.start_by,
+        &mut first.finish_by,
+    ] {
+        *time -= 600;
+    }
     let retry = Retry::of(&first);
     let mut again = test_directive(enrollment, 4, "backup");
     assert_ne!(again.request_id, first.request_id);
+    assert_ne!(again.issued_at, first.issued_at);
+    assert_ne!(again.start_by, first.start_by);
+    assert_ne!(again.finish_by, first.finish_by);
     retry.apply(&mut again).unwrap();
     assert_eq!(
         (
