@@ -14,7 +14,8 @@
 //! replay nonce; durable redeeming gives at-most-once redemption, not
 //! exactly-once execution across a receiver crash. The ID is a separate type
 //! and size from the stable copy IDs in `proto`. Redeemed IDs are refused from
-//! the pinned redeem store before the signature is checked.
+//! the pinned redeem store once the signature has verified and the body has
+//! been decoded: nothing the body says is read before then.
 //!
 //!
 //! "Durable" here means that redeem contents and directory-entry changes are

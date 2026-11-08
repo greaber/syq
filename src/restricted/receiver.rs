@@ -519,9 +519,9 @@ impl OtherBuild {
             );
         Self(format!(
             "this receiver runs syq {}, and the syq connecting to it is {theirs}; \
-             a restricted copy needs the same syq build on both machines: update syq \
-             on the connecting machine, or run `syq receiver enroll` on your machine \
-             to update this receiver to your machine's build",
+             a restricted copy needs the same syq build on the machine that connects \
+             and on the machine that approves the copy, whose build this receiver \
+             follows: update syq on whichever of them is older",
             crate::identity::build()
         ))
     }

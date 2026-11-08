@@ -212,16 +212,16 @@ The protection has four parts:
    itself: anyone who holds it, such as a server that was compromised during an
    earlier copy and kept it, still needs a copy you newly signed, and the
    receiver checks that signature before it looks at anything else the
-   connection sends. Such a server can, however, keep some of the receiver's
-   connections waiting. At most 32 can wait to be checked at once, and at
-   most 16 of them from one address; for IPv6, from one /64 network. So a
-   server with one address slows new copies started from other addresses but
-   does not stop them. Machines that share an address, such as those behind
-   one NAT or on one IPv6 /64, share its 16, and a server that connects from
-   two addresses, such as over both IPv4 and IPv6, can make new copies fail
-   until you revoke the enrollment and enroll again. Don't add the entry key to
-   any other `authorized_keys` file: hostA holds it, so it would gain that
-   access too. Your laptop stores it unencrypted.
+   connection sends, apart from which syq build sent it. Such a server can,
+   however, keep some of the receiver's connections waiting. At most 32 can
+   wait to be checked at once, and at most 16 of them from one address; for
+   IPv6, from one /64 network. So a server with one address slows new copies
+   started from other addresses but does not stop them. Machines that share an
+   address, such as those behind one NAT or on one IPv6 /64, share its 16, and
+   a server that connects from two addresses, such as over both IPv4 and IPv6,
+   can make new copies fail until you revoke the enrollment and enroll again.
+   Don't add the entry key to any other `authorized_keys` file: hostA holds it,
+   so it would gain that access too. Your laptop stores it unencrypted.
 3. **A signature on each copy.** Your laptop signs the copy's command, exactly
    as you ran it, with an expiry time, using the key you log in to hostB with.
    The receiver checks the signature, requiring the touch and PIN your login
