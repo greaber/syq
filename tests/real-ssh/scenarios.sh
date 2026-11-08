@@ -818,7 +818,9 @@ ssh source 'syq persist destinations wait laptop --timeout 5'
 printf 'case: interrupted named copy fails, laptop reconnects, and retry resumes\n'
 ssh source 'dd if=/dev/urandom of=/tmp/syq-real-ssh/return-source/resume.bin bs=1M count=16 status=none'
 source_prefix=$(ssh source 'dd if=/tmp/syq-real-ssh/return-source/resume.bin bs=1M count=4 status=none | sha256sum')
-timeout 45 ssh source 'SYQ_TEST_REQUIRE_TCP=1 syq cp --resource-limits bandwidth=512 /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted' &
+# One worker writes the file from its start, so its first 4 MiB arrive
+# after 8 seconds at this rate; several would each fill a part of it.
+timeout 45 ssh source 'SYQ_TEST_REQUIRE_TCP=1 syq cp --resource-limits bandwidth=512,workers=1 /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted' &
 return_copy_pid=$!
 deadline=$(($(date +%s) + 25))
 next_progress=$(($(date +%s) + 5))
