@@ -1981,3 +1981,62 @@ fn whole_file_comparisons_of_files_beyond_one_hash_response_use_windows() {
         assert!(partial_files(&t.0).is_empty());
     }
 }
+
+/// An explicit comparison block over half of what a receiver holds of a
+/// file it compares hashes one window at a time, with no window ahead, and
+/// the copy completes. The receiver here cannot clone, so it holds every
+/// block it hashed until the block is used.
+#[cfg(debug_assertions)]
+#[test]
+fn explicit_blocks_above_half_the_receivers_hold_still_compare() {
+    for block in ["32M", "64M"] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        for (name, first) in [("src", b'a'), ("dst", b'b')] {
+            let file = fs::File::create(t.path(name)).unwrap();
+            file.set_len(160 << 20).unwrap();
+            std::os::unix::fs::FileExt::write_all_at(&file, &[first], 0).unwrap();
+        }
+        set_mtime(&t.path("dst"), 1);
+        let tuning = format!("--performance-tuning=copy-path=ranges,comparison-block-size={block}");
+        let destination = format!("fake:{}", t.s("dst"));
+        let out = remote_syq_command(
+            &t,
+            &rsh,
+            &[
+                "-a",
+                "--stats",
+                "--rsync-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--syq-no-bootstrap",
+                &tuning,
+                &t.s("src"),
+                &destination,
+            ],
+        )
+        .env("SYQ_TEST_BASIS_CLONE_UNSUPPORTED", "1")
+        .run()
+        .unwrap();
+        assert_output_ok(&out);
+        let block_bytes = if block == "32M" { 32 << 20 } else { 64 << 20 };
+        assert_eq!(
+            stats_bytes(&out, "bytes transferred"),
+            block_bytes,
+            "{block}"
+        );
+        let (mut source, mut copied) = (
+            fs::File::open(t.path("src")).unwrap(),
+            fs::File::open(t.path("dst")).unwrap(),
+        );
+        let (mut a, mut b) = (vec![0; 1 << 20], vec![0; 1 << 20]);
+        loop {
+            let n = source.read(&mut a).unwrap();
+            copied.read_exact(&mut b[..n]).unwrap();
+            assert!(a[..n] == b[..n], "{block}: contents differ");
+            if n == 0 {
+                break;
+            }
+        }
+        assert_eq!(copied.read(&mut b).unwrap(), 0, "{block}");
+    }
+}

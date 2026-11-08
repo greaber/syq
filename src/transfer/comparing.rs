@@ -89,6 +89,12 @@ impl ComparisonSizing {
         }
     }
 
+    /// Runs of differing blocks measured, as they now count.
+    #[cfg(test)]
+    pub(super) fn runs(&self) -> f64 {
+        self.runs
+    }
+
     /// The block of the next window, no larger than `ceiling`.
     pub(super) fn block(&self, ceiling: u64) -> u64 {
         self.block.min(ceiling).max(MIN_BLOCK.min(ceiling))
@@ -205,13 +211,11 @@ impl Awaited {
     }
 }
 
-/// A source reply still to come: the block asked about, when, and whether
-/// it is the first of its window.
+/// A source reply still to come: the block asked about, and when.
 struct Read {
     off: u64,
     len: u64,
     sent: Instant,
-    first: bool,
 }
 
 /// What a comparing range has outstanding and has learned.
@@ -229,8 +233,9 @@ struct Flow {
     reading: u64,
     claimed_all: bool,
     matched: u64,
-    /// The last block the source answered for differed.
-    differing: bool,
+    /// Where the last block the source answered for ended, if it differed:
+    /// a differing block there continues its run.
+    differing_end: Option<u64>,
     /// When the destination's last reply arrived.
     last_destination_reply: Option<Instant>,
     /// A window has been asked about: waits for hashes after that mean the
@@ -245,7 +250,8 @@ impl Worker {
         let dst_pipelines = self.dst.supports_request_pipelining();
         if !self.opts.adaptive_ranges() {
             // Fixed sizes, as configured: windows of `pipeline-depth` blocks,
-            // one hashed ahead while the last is read.
+            // one hashed ahead while the last is read, if the receiver can
+            // hold both: a window over half its limit is hashed alone.
             let depth = self.opts.tuning.pipeline_depth();
             let window = configured
                 .saturating_mul(depth as u64)
@@ -255,7 +261,7 @@ impl Worker {
                 adaptive: false,
                 block: configured,
                 window,
-                ahead: window * 2,
+                ahead: (window * 2).min(crate::proto::MAX_READ_BYTES).max(window),
                 source_requests: if src_pipelines { depth } else { 1 },
                 destination_requests: if dst_pipelines { depth + 1 } else { 1 },
                 prefetch: dst_pipelines,
@@ -350,8 +356,12 @@ impl Worker {
     ) -> Result<()> {
         loop {
             // Nothing further is written for a copy that ended or a file that
-            // failed: the caller drains what is outstanding.
-            if self.sched.is_aborted() || self.sched.is_failed(idx) {
+            // failed: the caller drains what is outstanding. One scheduler
+            // visit answers both.
+            if matches!(
+                self.sched.range_work(idx, None),
+                crate::sched::RangeWork::Cancelled
+            ) {
                 return Ok(());
             }
             self.issue_comparisons(job, handle, sizes, flow)?;
@@ -360,8 +370,10 @@ impl Worker {
                 (Some(_), None) => true,
                 (None, Some(_)) => false,
                 // A source reply leads to a destination request, which needs
-                // room. Otherwise take a reply that has arrived, or else the
-                // one whose request went out first.
+                // room. Otherwise take an in-process source's reply, which is
+                // there as soon as it is asked for, or one a connection says
+                // has arrived (only an in-process one can), or else the reply
+                // whose request went out first.
                 (Some(read), Some(awaited)) => {
                     flow.awaited.len() < sizes.destination_requests
                         && (sizes.source_answers_at_once
@@ -371,19 +383,26 @@ impl Worker {
             };
             if from_source {
                 self.receive_compared_block(job, sizes, flow, credited)?;
-            } else {
-                // Waiting for hashes with no block to ask about: the windows
-                // hashed ahead were used up before the next arrived.
-                if sizes.adaptive
-                    && flow.started
-                    && flow.reads.is_empty()
-                    && matches!(flow.awaited.front(), Some(Awaited::Hashes(_)))
-                {
-                    self.comparison.starved();
-                    sizes.ahead = self.comparison.ahead();
-                }
-                self.receive_compared_destination(job, sizes, flow, credited)?;
+                continue;
             }
+            let reply = match self.dst.try_recv_with_arrival() {
+                Some(arrived) => arrived?,
+                None => {
+                    // Waiting for hashes that have not arrived, with no block
+                    // to ask about: the windows hashed ahead were used up.
+                    if sizes.adaptive
+                        && sizes.prefetch
+                        && flow.started
+                        && flow.reads.is_empty()
+                        && matches!(flow.awaited.front(), Some(Awaited::Hashes(_)))
+                    {
+                        self.comparison.starved();
+                        sizes.ahead = self.comparison.ahead();
+                    }
+                    self.dst.recv_with_arrival()?
+                }
+            };
+            self.receive_compared_destination(job, sizes, flow, credited, reply)?;
         }
     }
 
@@ -445,7 +464,6 @@ impl Worker {
             let Some(hashes) = &window.hashes else {
                 break;
             };
-            let first = window.next == 0;
             let off = window.start + window.next as u64 * window.block;
             let len = (window.end - off).min(window.block);
             // Differing blocks come back as data: keep what may be on its way
@@ -476,7 +494,6 @@ impl Worker {
                 off,
                 len,
                 sent: Instant::now(),
-                first,
             });
             self.benchmark.max_request_bytes = self.benchmark.max_request_bytes.max(len);
         }
@@ -566,15 +583,13 @@ impl Worker {
         };
         // Either request ends the receiver's hold on the block's bytes.
         flow.retained = flow.retained.saturating_sub(read.len);
-        if read.first {
-            flow.differing = false;
-        }
         if sizes.adaptive {
+            // Windows of a range adjoin, so a run continues across them.
             let ceiling = self.opts.block.min(self.transfer_block());
-            let run = u64::from(differs && !flow.differing);
+            let run = u64::from(differs && flow.differing_end != Some(read.off));
             self.comparison.compared(read.len, run, ceiling);
         }
-        flow.differing = differs;
+        flow.differing_end = differs.then_some(read.off + read.len);
         Ok(())
     }
 
@@ -586,9 +601,9 @@ impl Worker {
         sizes: &Sizes,
         flow: &mut Flow,
         credited: &mut u64,
+        (response, arrived): (Response, Instant),
     ) -> Result<()> {
         let awaited = flow.awaited.pop_front().expect("awaited reply");
-        let (response, arrived) = self.dst.recv_with_arrival()?;
         let since = flow
             .last_destination_reply
             .map_or(awaited.sent(), |last| last.max(awaited.sent()));

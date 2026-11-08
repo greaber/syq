@@ -6532,3 +6532,97 @@ fn a_failed_comparison_write_drains_both_connections_in_order() {
         }
     }
 }
+
+#[test]
+fn fixed_comparisons_never_ask_the_receiver_to_hold_more_than_it_may() {
+    // Explicit blocks over half the receiver's limit hash one window at a
+    // time; smaller ones still hash one ahead.
+    for block in [16u64 << 20, 32 << 20, 48 << 20, 64 << 20] {
+        let size = block * 3;
+        let (mut worker, handle, job, _, dst) = adaptive_comparison(
+            size,
+            true,
+            false,
+            std::time::Duration::ZERO,
+            |_| true,
+            Default::default(),
+        );
+        let opts = Arc::get_mut(&mut worker.opts).unwrap();
+        opts.block = block;
+        opts.block_explicit = true;
+        opts.tuning.pipeline_depth = Some(4);
+        let mut credited = 0;
+        worker.transfer_range(&handle, &mut credited).unwrap();
+        assert_eq!(job.done.load(Relaxed), size, "{block}");
+        let (mut held, mut most) = (0u64, 0u64);
+        for request in &dst.lock().unwrap().requests {
+            match request {
+                Request::HashWindow { len, .. } => {
+                    held += u64::from(*len);
+                    most = most.max(held);
+                }
+                Request::ReuseComparedRange { len, .. } => held -= u64::from(*len),
+                other => panic!("{block}: unexpected {other:?}"),
+            }
+        }
+        assert!(most <= crate::proto::MAX_READ_BYTES, "{block}: {most}");
+        if block <= 32 << 20 {
+            assert!(most > block, "{block}: still hashes ahead");
+        }
+    }
+}
+
+#[test]
+fn hashes_already_arrived_are_not_a_reason_to_look_further_ahead() {
+    let ahead = 4 << 10;
+    let (mut worker, handle, _, _, dst) = adaptive_comparison(
+        64 << 10,
+        true,
+        false,
+        std::time::Duration::ZERO,
+        |_| true,
+        super::comparing::ComparisonSizing::starting(512, ahead),
+    );
+    dst.lock().unwrap().early_range_acks = true;
+    let mut credited = 0;
+    worker.transfer_range(&handle, &mut credited).unwrap();
+    assert_eq!(worker.comparison.ahead(), ahead);
+}
+
+#[test]
+fn a_run_of_differing_blocks_continues_across_windows() {
+    for remote_source in [false, true] {
+        // Every block differs: one run, whatever the windows.
+        let (mut worker, handle, _, _, dst) = adaptive_comparison(
+            64 << 10,
+            true,
+            remote_source,
+            std::time::Duration::ZERO,
+            |_| false,
+            super::comparing::ComparisonSizing::starting(512, 4 << 10),
+        );
+        let mut credited = 0;
+        worker.transfer_range(&handle, &mut credited).unwrap();
+        let windows = dst
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|r| matches!(r, Request::HashWindow { .. }))
+            .count();
+        assert!(windows > 2);
+        assert_eq!(worker.comparison.runs(), 1.0, "remote={remote_source}");
+    }
+    // Two separate changes are two runs, even within one window.
+    let (mut worker, handle, _, _, _) = adaptive_comparison(
+        64 << 10,
+        true,
+        false,
+        std::time::Duration::ZERO,
+        |off| !(off == 0 || off == 1024 || off == 8192),
+        super::comparing::ComparisonSizing::starting(512, 4 << 10),
+    );
+    let mut credited = 0;
+    worker.transfer_range(&handle, &mut credited).unwrap();
+    assert_eq!(worker.comparison.runs(), 3.0);
+}
