@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -102,6 +103,29 @@ for tcp in [True, False]:
         == "clusters: []\n"
     assert run("ssh", "source", "readlink " + shlex.quote(server + "/" + label + "/.kube/link")) \
         .strip() == "config"
+
+print("case: the laptop paces a capped copy on the bytes it sends", flush=True)
+paced = receive_root / "send-paced"
+paced.mkdir()
+# 8 MiB that compresses to a few kilobytes, and 1 MiB that does not.
+(paced / "compressible").write_bytes(b"syq pacing test\n" * (1 << 19))
+incompressible = os.urandom(1 << 20)
+(paced / "random").write_bytes(incompressible)
+for tcp in [True, False]:
+    label = "paced-" + ("tcp" if tcp else "ssh")
+    results = server + "/" + label + ".ndjson"
+    copy(["send-paced"], label, tcp=tcp,
+         extra=["--resource-limits", "bandwidth=2M", "--results=" + results])
+    terminal = json.loads(run("ssh", "source", "tail -n 1 " + shlex.quote(results)))
+    # The megabyte that does not compress takes half a second at 2 MiB/s.
+    # Pacing file data rather than the bytes sent would take four seconds
+    # more for the rest.
+    transfer_ms = terminal["timings"]["transfer_ms"]
+    assert 400 <= transfer_ms < 3000, (label, terminal)
+    assert server_digest(label + "/send-paced/random") == hashlib.sha256(incompressible).hexdigest()
+    print(json.dumps({"route": "from the laptop", "transport": label,
+                      "transfer_ms": transfer_ms}), flush=True)
+shutil.rmtree(paced)
 
 print("case: another server build hands the copy to the laptop's helper", flush=True)
 copy(["send-fixture/.kube/config"], "other-build", binary="syq-other-build")
