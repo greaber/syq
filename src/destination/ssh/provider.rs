@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
@@ -512,6 +512,10 @@ pub(crate) fn hold_use(domain: &Domain, provider: &Provider) -> Result<Use> {
 enum Requests {
     /// One holds it.
     Using,
+    /// Its keeper is starting: the record requests will lock is the ready
+    /// one it replaces this one with, so a lock on this one would not keep
+    /// them off. Look again once it is ready.
+    Starting,
     /// None does, and none can take it until this is dropped: a stop
     /// published meanwhile is one that a request sees before it sends.
     Held(Option<File>),
@@ -532,9 +536,21 @@ fn requests(domain: &Domain, provider: &Provider) -> Requests {
         return Requests::Held(None);
     };
     match try_lock(&file) {
-        Ok(true) => Requests::Held(Some(file)),
-        Ok(false) | Err(_) => Requests::Using,
+        Ok(true) => {}
+        Ok(false) | Err(_) => return Requests::Using,
     }
+    // Read from the file locked: the record at its path may be newer.
+    let starting = {
+        let mut bytes = Vec::new();
+        (&file).take(16 * 1024).read_to_end(&mut bytes).is_ok()
+            && serde_json::from_slice::<serde_json::Value>(&bytes)
+                .is_ok_and(|record| record.get("ticket").is_some_and(|ticket| ticket.is_null()))
+    };
+    let held = Requests::Held(Some(file));
+    if starting {
+        return Requests::Starting;
+    }
+    held
 }
 
 /// What became of a keeper this build cannot use.
@@ -618,11 +634,16 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
         if other != OtherKeeper::Stopping && Instant::now() >= next_look {
             next_look = Instant::now() + Duration::from_secs(5);
             // Kept from requests until a stop is published (`Requests`).
-            let requests = requests(domain, provider);
-            other = stop_other_build_keeper(domain, provider, || {
-                matches!(requests, Requests::Using) || persistent::uses_provider(domain, provider)
-            })?;
-            drop(requests);
+            match requests(domain, provider) {
+                Requests::Starting => next_look = Instant::now() + Duration::from_millis(200),
+                requests => {
+                    other = stop_other_build_keeper(domain, provider, || {
+                        matches!(requests, Requests::Using)
+                            || persistent::uses_provider(domain, provider)
+                    })?;
+                    drop(requests);
+                }
+            }
             if let OtherKeeper::InUse { build } = &other {
                 // Those nothing uses end, and are opened again on their
                 // next use. Keepers that can tell answer within a second.
@@ -1356,6 +1377,20 @@ mod tests {
         assert!(!active(&domain, &record));
     }
 
+    /// What a keeper publishes once ready, replacing the record it started
+    /// with.
+    fn ready(record: &mut Record) {
+        record.ticket = Some(Ticket {
+            session: "0".repeat(64),
+            profile: "laptop".into(),
+            identity: crate::receive_approval::provider_accounts::ProviderIdentity::new(
+                "user".into(),
+                ssh_key::Fingerprint::Sha256([1; 32]).to_string(),
+            )
+            .unwrap(),
+        });
+    }
+
     /// A copy's request waiting for the provider's decision through a keeper
     /// another build left keeps it from being stopped, as an account
     /// connection does; once the request ends, it is stopped.
@@ -1366,6 +1401,7 @@ mod tests {
             .unwrap()
             .with_extension("stop");
         record.build = "v0.0.1+other-build".into();
+        ready(&mut record);
         write_record(&domain, &record).unwrap();
         let using = hold_use(&domain, &record.provider).unwrap();
         // Another request may hold it at the same time.
@@ -1392,12 +1428,25 @@ mod tests {
 
     /// A request that takes the connection while another build decides to
     /// stop it waits until that stop is published, and so sees it before
-    /// it sends anything.
+    /// it sends anything. A keeper still starting is not decided on: the
+    /// record requests lock is the ready one that replaces its first.
     #[test]
     fn a_request_that_races_a_stop_sees_it_before_sending() {
         let (_root, domain, mut record) = cleanup_fixture();
         record.build = "v0.0.1+other-build".into();
         write_record(&domain, &record).unwrap();
+        let starting = requests(&domain, &record.provider);
+        assert!(matches!(starting, Requests::Starting));
+        // Ready meanwhile: what was looked at is not what requests lock.
+        ready(&mut record);
+        write_record(&domain, &record).unwrap();
+        let using = hold_use(&domain, &record.provider).unwrap();
+        drop(starting);
+        assert!(matches!(
+            requests(&domain, &record.provider),
+            Requests::Using
+        ));
+        drop(using);
         let requests = requests(&domain, &record.provider);
         assert!(matches!(requests, Requests::Held(Some(_))));
         let (taken, waiting) = std::sync::mpsc::channel();
