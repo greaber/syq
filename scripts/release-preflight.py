@@ -22,7 +22,7 @@ CANONICAL_REPOSITORY = "greaber/syq"
 HOMEBREW_REPOSITORY = "greaber/homebrew-tap"
 RELEASE_ENVIRONMENT = "release"
 REQUIRED_CHECKS = "rust,sdks,macos,linux-arm64,conformance"
-CRATES_AUTH_ACTION = "rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18"
+CRATES_AUTH_ACTION = "rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9"
 
 
 def succeeds(*args):

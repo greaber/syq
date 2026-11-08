@@ -27,7 +27,7 @@ The Python SDK shares the version of the syq release it pins and uses
    the latter explicitly through GitHub's tag verification API.
    The repository's selected-actions policy permits GitHub-owned actions and
    the exact full-SHA
-   `rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18`
+   `rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9`
    reference used by `release.yml`, while continuing to require full-SHA pins
    and deny verified actions generally. This narrow exception lets the release
    exchange GitHub OIDC identity for a crates.io credential without broadening
