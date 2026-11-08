@@ -472,14 +472,21 @@ const CLOSE_ANSWER: Duration = Duration::from_secs(3);
 /// connection carries, such as a copy's approval. Until it is dropped,
 /// another build does not stop the connection's keeper to replace it
 /// (`requests`).
-pub(crate) struct Use(#[allow(dead_code)] File);
+pub(crate) struct Use(File);
+impl Drop for Use {
+    fn drop(&mut self) {
+        // As for `Requests`: a concurrent fork can share the lock.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
 
 /// The record of `provider`'s keeper, opened to lock: the file this build's
 /// keeper published once, which no syq removes while the keeper runs.
 fn record_lock(domain: &Domain, provider: &Provider) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        // Not held up by anything but a regular file, which is checked next.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(record_path(domain, provider)?)?;
     let metadata = file.metadata()?;
     anyhow::ensure!(
