@@ -1160,6 +1160,8 @@ fn start(domain: &Domain, request: SessionRequest, plan: resolution::Plan) -> Re
         });
     }
     drop(process);
+    // A reader with messages nobody receives must not block on the channel.
+    drop(receiver);
     let _ = reader.join();
     result?.map_err(anyhow::Error::msg)?;
     Ok(())

@@ -841,13 +841,23 @@ fn install_over_route(
         // same user ID, such as `toor` for root, cannot enroll.
         if name != login {
             let given = endpoint(login, host, port)?.label();
-            if name.is_empty() {
-                bail!("{given} logs in with user ID {uid}, which has no account name on that server; restricted copying needs one");
+            let mut message = match endpoint(&name, host, port) {
+                _ if name.is_empty() => format!("{given} logs in with user ID {uid}, which has no account name on that server; restricted copying needs one"),
+                Ok(named) => format!("{given} logs in as user ID {uid}, which that server calls {name}; restricted copying works only under that name, so use {} instead", named.label()),
+                Err(_) => format!("{given} logs in as user ID {uid}, which that server calls {name}; restricted copying works only under that name"),
+            };
+            // Earlier builds stored the entry key before the server refused
+            // this name, which it does before changing anything, and `syq
+            // receiver revoke` refuses it the same way: nothing on the
+            // server uses that pending enrollment, so it goes.
+            if plan.entry_key.is_some() && !plan.refresh {
+                remove_local_enrollment(&plan.directory)?;
+                message.push_str(&format!(
+                    "; removed enrollment {}, which an earlier attempt left pending",
+                    plan.id
+                ));
             }
-            bail!(
-                "{given} logs in as user ID {uid}, which that server calls {name}; restricted copying works only under that name, so use {} instead",
-                endpoint(&name, host, port)?.label()
-            );
+            bail!(message);
         }
         let trace =
             fs::read_to_string(&trace_path).context("read enrollment SSH authentication trace")?;

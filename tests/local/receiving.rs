@@ -2499,7 +2499,15 @@ fn a_signal_ends_a_wait_for_the_laptops_approval() {
         ),
     ] {
         for signal in [libc::SIGTERM, libc::SIGINT] {
-            let (mut child, lines, reader) = HeldLaptop::start(&mut laptop.command(args));
+            let mut command = laptop.command(args);
+            // A test run started in the background inherits SIGINT ignored.
+            unsafe {
+                command.pre_exec(|| {
+                    libc::signal(libc::SIGINT, libc::SIG_DFL);
+                    Ok(())
+                });
+            }
+            let (mut child, lines, reader) = HeldLaptop::start(&mut command);
             let request = laptop
                 .requests
                 .recv_timeout(Duration::from_secs(30))
