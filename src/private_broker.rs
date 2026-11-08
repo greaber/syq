@@ -516,7 +516,9 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(SIGNAL_CHILD, signal.to_string())
-                .env(SIGNAL_MARKER, &marker);
+                .env(SIGNAL_MARKER, &marker)
+                // A directory a failed run leaves stays in this fixture.
+                .env("TMPDIR", temporary.path());
             let output = crate::process::capture_output_bounded(
                 &mut command,
                 std::time::Instant::now() + Duration::from_secs(20),
