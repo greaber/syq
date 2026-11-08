@@ -1,8 +1,8 @@
 """Downloads from another server that the runner approves per copy: the
 requesting server reads through the source's enrolled receiver, which serves
 only what the signed command reads. The source's root account, which only this
-lab endpoint lets log in, serves downloads too, but no copy writes to it or to
-toor, another name for user ID 0. All paths are disposable."""
+lab endpoint lets log in, serves downloads too, but no copy writes to it, and
+toor, another name for user ID 0, cannot enroll. All paths are disposable."""
 import contextlib
 import json
 import os
@@ -435,6 +435,23 @@ def main():
         # Nothing was left pending, so the error does not say so.
         assert "remains pending" not in text, text
         # Nothing reached toor's home: no key line, no stored syq, no state.
+        assert alias_home() == alias_before
+        remote(alias, "test ! -e ~/.local/lib/syq && test ! -e ~/.local/share/syq"
+               " && ! grep -s -q syq-enrollment: ~/.ssh/authorized_keys")
+        assert pending() == []
+        assert [line for line in run("syq", "receiver", "list").splitlines()
+                if "\ttoor@destination" in line] == []
+
+        print("case: a download through another name for user ID 0 is refused before setup", flush=True)
+        # Root may serve downloads, but only under the name the server gives
+        # user ID 0; nothing is installed or left pending for toor.
+        with running(command("toor-secret", path=secret, account=alias)) as (process, output):
+            decide(setup='Also sets up restricted copying on "toor@destination"', source=alias)
+            text = finish(process, output, success=False)
+        assert ("toor@destination logs in as user ID 0, which that server calls root; restricted"
+                " copying works only under that name, so use root@destination instead") in text, text
+        assert "remains pending" not in text, text
+        absent("toor-secret")
         assert alias_home() == alias_before
         remote(alias, "test ! -e ~/.local/lib/syq && test ! -e ~/.local/share/syq"
                " && ! grep -s -q syq-enrollment: ~/.ssh/authorized_keys")

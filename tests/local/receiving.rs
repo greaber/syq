@@ -2483,6 +2483,53 @@ fn account_access_says_when_it_waits_for_the_laptop() {
 }
 
 #[test]
+fn a_signal_ends_a_wait_for_the_laptops_approval() {
+    use std::time::{Duration, Instant};
+    let laptop = HeldLaptop::new();
+    for (args, kind) in [
+        (
+            &["cp", "source", "--to", "backup", "--auth-from", "@laptop"][..],
+            "LocalSsh",
+        ),
+        (&["cp", "source", "--to", "backup"][..], "Forward"),
+        (&["cp", "source", "--to", "@laptop"][..], "Request"),
+        (
+            &["cp", "--from", "@laptop", "source", "--into", "copy"][..],
+            "Send",
+        ),
+    ] {
+        for signal in [libc::SIGTERM, libc::SIGINT] {
+            let (mut child, lines, reader) = HeldLaptop::start(&mut laptop.command(args));
+            let request = laptop
+                .requests
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap();
+            assert!(request["message"].get(kind).is_some(), "{request}");
+            let mut seen = Vec::new();
+            HeldLaptop::expect_line(&lines, &mut seen, "waiting up to 5 minutes for @laptop");
+            assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    seen.extend(lines.try_iter());
+                    panic!("{args:?} ignored signal {signal} while waiting: {seen:?}");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert!(!status.success(), "{args:?}");
+            // Nothing the command started keeps its stderr open.
+            reader.join().unwrap();
+            laptop.release.send(()).unwrap();
+        }
+    }
+}
+
+#[test]
 fn receiving_profiles_preserve_independent_settings_and_select_names() {
     let t = Tmp::new();
     fs::create_dir(t.runtime()).unwrap();

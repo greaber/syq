@@ -2221,26 +2221,32 @@ fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
     };
     let session = |input: &[u8]| session_in("/bin/sh", home, input);
     let run = |input: &[u8]| lines(session(input));
-    // Lines 0 to 6 are the platform and state locations; line 7 lists the
-    // platforms the store has this build for, and line 8 starts
-    // authorized_keys. The session then reads the request and an offered
-    // stored build's platform and hash, answers on line 9 whether it starts
-    // that build or needs the syq that follows, and line 10 is what runs.
+    // Lines 0 to 7 are the platform, the account's user ID and name, and
+    // state locations; line 8 lists the platforms the store has this build
+    // for, and line 9 starts authorized_keys. The session then reads the
+    // request and an offered stored build's platform and hash, answers on
+    // line 10 whether it starts that build or needs the syq that follows,
+    // and line 11 is what runs.
     let sent = b"#!/bin/sh\nprintf 'sent %s ' \"$*\"; cat\n";
     let mut upload = b"{\"request\":1}\n\n\n".to_vec();
     upload.extend_from_slice(sent);
     let greeting = run(&upload);
-    assert_eq!(greeting[7].trim(), "");
-    assert_eq!(greeting[8], "0");
-    assert_eq!(greeting[9], "upload");
-    assert_eq!(greeting[10], r#"sent --restricted-install {"request":1}"#);
+    assert_eq!(greeting[3], unsafe { libc::geteuid() }.to_string());
+    assert_eq!(
+        Some(greeting[4].as_str()),
+        crate::restricted::current_account_name().as_deref()
+    );
+    assert_eq!(greeting[8].trim(), "");
+    assert_eq!(greeting[9], "0");
+    assert_eq!(greeting[10], "upload");
+    assert_eq!(greeting[11], r#"sent --restricted-install {"request":1}"#);
     // A login shell that stops at a glob matching nothing, as zsh does,
     // runs the session through `sh` all the same.
     if Path::new("/bin/zsh").exists() {
         let empty = crate::test_support::tempdir().unwrap();
         let greeting = lines(session_in("/bin/zsh", empty.path(), &upload));
-        assert_eq!(greeting[7].trim(), "");
-        assert_eq!(greeting[10], r#"sent --restricted-install {"request":1}"#);
+        assert_eq!(greeting[8].trim(), "");
+        assert_eq!(greeting[11], r#"sent --restricted-install {"request":1}"#);
     }
 
     let store = home.join(crate::user_dirs::BINARY_STORE_IN_HOME);
@@ -2277,17 +2283,17 @@ fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
         private(&directory);
     }
     let greeting = run(format!("{{\"request\":2}}\nlinux-x86_64\n{stored_hash}\n").as_bytes());
-    assert_eq!(greeting[7].trim(), "linux-x86_64");
-    assert_eq!(greeting[9], "stored");
-    assert_eq!(greeting[10], r#"stored --restricted-install {"request":2}"#);
+    assert_eq!(greeting[8].trim(), "linux-x86_64");
+    assert_eq!(greeting[10], "stored");
+    assert_eq!(greeting[11], r#"stored --restricted-install {"request":2}"#);
     // Anything else offered is not started: the session asks for this
     // machine's build and runs that.
     let refused = |target: &str, hash: &str| {
         let mut input = format!("{{\"request\":3}}\n{target}\n{hash}\n").into_bytes();
         input.extend_from_slice(sent);
         let greeting = run(&input);
-        assert_eq!(greeting[9], "upload", "{target}");
-        assert_eq!(greeting[10], r#"sent --restricted-install {"request":3}"#);
+        assert_eq!(greeting[10], "upload", "{target}");
+        assert_eq!(greeting[11], r#"sent --restricted-install {"request":3}"#);
         assert!(!started.exists(), "{target} was started");
     };
     for target in ["linux-aarch64", "macos-x86_64"] {
@@ -2304,10 +2310,10 @@ fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
     fs::rename(&store, &moved).unwrap();
     symlink(&moved, &store).unwrap();
     let greeting = run(format!("{{\"request\":4}}\nlinux-x86_64\n{stored_hash}\n").as_bytes());
-    assert!(greeting[7]
+    assert!(greeting[8]
         .split_whitespace()
         .any(|target| target == "linux-x86_64"));
-    assert_eq!(greeting[10], r#"stored --restricted-install {"request":4}"#);
+    assert_eq!(greeting[11], r#"stored --restricted-install {"request":4}"#);
     assert!(fs::read_dir(&moved).unwrap().all(|entry| !entry
         .unwrap()
         .file_name()
