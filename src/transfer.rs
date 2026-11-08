@@ -1688,7 +1688,13 @@ fn attempt_small_copy(
     };
     let elapsed = progress.display_elapsed().as_secs_f64();
     if !args.quiet && !args.suppress_summary {
-        print_transfer_summary(&terminal, Some(progress.bytes_reused()), elapsed, "");
+        print_transfer_summary(
+            &terminal,
+            Some(progress.bytes_reused()),
+            elapsed,
+            "",
+            &received_at(args, dst, args.placement == Placement::Into),
+        );
     }
     print_timings(args, progress);
     if let Some(benchmark) = &opts.benchmark {
@@ -1826,11 +1832,17 @@ pub(crate) fn in_place_refusal_summary(
 /// also counts data reused inside transferred files; that part is shown with
 /// them, so "unchanged" covers only files left alone. `reused` is None when
 /// only the results are known; with no unchanged files, all of it was reused.
-fn transfer_summary_counts(terminal: &crate::results::ResultRecord, reused: Option<u64>) -> String {
+/// `destination`, when not empty, follows what was transferred, as
+/// [`received_at`] says it.
+fn transfer_summary_counts(
+    terminal: &crate::results::ResultRecord,
+    reused: Option<u64>,
+    destination: &str,
+) -> String {
     let reused = reused.or((terminal.files_unchanged == 0).then_some(terminal.bytes_unchanged));
     let Some(reused) = reused.map(|reused| reused.min(terminal.bytes_unchanged)) else {
         return format!(
-            "transferred {} files ({}), {} unchanged or reused ({} files unchanged)",
+            "transferred {} files ({}){destination}, {} unchanged or reused ({} files unchanged)",
             commas(terminal.files_transferred),
             human(terminal.bytes_transferred),
             human(terminal.bytes_unchanged),
@@ -1843,7 +1855,7 @@ fn transfer_summary_counts(terminal: &crate::results::ResultRecord, reused: Opti
         String::new()
     };
     format!(
-        "transferred {} files ({}{reused_note}), {} unchanged ({} files)",
+        "transferred {} files ({}{reused_note}){destination}, {} unchanged ({} files)",
         commas(terminal.files_transferred),
         human(terminal.bytes_transferred),
         human(terminal.bytes_unchanged - reused),
@@ -1853,16 +1865,18 @@ fn transfer_summary_counts(terminal: &crate::results::ResultRecord, reused: Opti
 
 /// The one summary line a completed copy prints, rendered from the same
 /// record the results stream settles with, and the data reused inside
-/// transferred files when this process counted it.
+/// transferred files when this process counted it. `destination` is empty or
+/// where a copy to a receiving machine put its files ([`received_at`]).
 pub(crate) fn print_transfer_summary(
     terminal: &crate::results::ResultRecord,
     reused: Option<u64>,
     elapsed: f64,
     deletions: &str,
+    destination: &str,
 ) {
     crate::output::human_stdout!(
         "syq: {}, {} dirs created{}{}{}",
-        transfer_summary_counts(terminal, reused),
+        transfer_summary_counts(terminal, reused, destination),
         commas(terminal.directories_created),
         deletions,
         format_args!(
@@ -1883,6 +1897,29 @@ pub(crate) fn print_transfer_summary(
     {
         crate::output::human_stdout!("syq: {summary}");
     }
+}
+
+/// Where a copy to a receiving machine (`--to @NAME`) put its files, for its
+/// summary line: " into @laptop:/home/alice/Downloads", or " to" an exact
+/// path given with `--as`. The machine resolves the destination in its
+/// receiving profile's directory and its approval returns the full path, so
+/// the summary says where the files are rather than leaving the user to
+/// work out the profile's directory. Other copies name their destination in
+/// the command and leave it out.
+fn received_at(args: &Args, dst: &Location, into: bool) -> String {
+    if !crate::destination::is_named(&args.restricted_grant)
+        || !dst
+            .host
+            .as_deref()
+            .is_some_and(|host| host.starts_with('@'))
+    {
+        return String::new();
+    }
+    format!(
+        " {} {}",
+        if into { "into" } else { "to" },
+        display_location(dst, &clean_root(&dst.path))
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -5349,6 +5386,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     opts.max_delete,
                     opts.max_delete_from_approver,
                 ),
+                &received_at(&args, dst, dst_is_dir),
             );
         }
     }

@@ -715,8 +715,17 @@ remote_manifest source /tmp/syq-real-ssh/return-source /tmp/syq-return-source.ma
     } | LC_ALL=C sort
 ) > /tmp/syq-return-local.manifest
 diff -u /tmp/syq-return-source.manifest /tmp/syq-return-local.manifest
-ssh source 'syq cp --no-tcp /tmp/syq-real-ssh/return-source/subdir/chunks.bin --to @laptop --as ssh-copy'
+ssh_copy_summary=$(ssh source 'syq cp --no-tcp /tmp/syq-real-ssh/return-source/subdir/chunks.bin --to @laptop --as ssh-copy')
 cmp "$receive_root/first/subdir/chunks.bin" "$receive_root/ssh-copy"
+# The server's summary says where on the laptop the files went: the profile's
+# directory, which the server's command does not name.
+case "$ssh_copy_summary" in
+    *" to @laptop:$receive_root/ssh-copy, "*) ;;
+    *)
+        printf 'the summary does not say where the copy went on the laptop:\n%s\n' "$ssh_copy_summary" >&2
+        exit 1
+        ;;
+esac
 ssh source 'syq cp --dry-run --hash --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first --results-fd 3 3>&1 1>/dev/null' > /tmp/syq-return-preview.ndjson
 assert_preview_counts /tmp/syq-return-preview.ndjson 0 3
 ssh source 'syq cp --if-exists=keep /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as first/message.txt'
