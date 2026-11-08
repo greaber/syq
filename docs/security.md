@@ -206,8 +206,8 @@ The protection has four parts:
 2. **Only the entry key for hostA.** With each copy, hostA receives the entry
    key and uses it to reach the receiver, checking hostB's host key as described
    [below](#how-hosta-checks-hostbs-key). Syq on hostA deletes the key when the
-   copy ends, also when you interrupt it; only a copy killed before it can clean
-   up, for example with `kill -9`, leaves it behind, in a private temporary
+   copy ends, also when you interrupt it or its terminal closes; only a copy
+   killed outright, as with `kill -9`, leaves it behind, in a private temporary
    directory named `syq-receiver-hosts-…`. The entry key authorizes nothing by
    itself: anyone who holds it, such as a server that was compromised during an
    earlier copy and kept it, still needs a copy you newly signed, and the
