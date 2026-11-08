@@ -20,7 +20,10 @@
 //!   Around each run of differing blocks, a copy sends up to a block of bytes
 //!   that did not change; more, smaller blocks cost a request each instead.
 //!   The worker balances the two from what it has measured: the rate at which
-//!   differing data crossed the link and how far apart the runs were.
+//!   differing data crossed the link and how far apart the runs were. A push
+//!   times the destination's acknowledgments of differing blocks. A pull can
+//!   only time replies that may have waited in this machine's buffers, so its
+//!   blocks start at 256 KiB and only shrink (`adaptive_ceiling`).
 
 use super::*;
 use std::collections::VecDeque;
@@ -564,8 +567,10 @@ impl Worker {
             }
             Response::Block { off, hash, data } => {
                 validate_range_reply(read.off, read.len, off, data.len())?;
-                if sizes.adaptive && self.opts.src_remote && waited {
-                    // The block crossed the link in this reply.
+                // The block crossed the link in this reply. Where it also
+                // crosses to a remote destination, that destination's
+                // acknowledgments time it instead.
+                if sizes.adaptive && self.opts.src_remote && !self.opts.dst_remote && waited {
                     self.comparison
                         .sent(read.len, arrived.saturating_duration_since(started));
                 }
