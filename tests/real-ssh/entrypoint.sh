@@ -32,8 +32,18 @@ endpoint() {
     if [ "${SYQ_REAL_SSH_ROOT_LOGIN:-0}" = 1 ]; then
         # A root download needs a real root enrollment, so this endpoint alone
         # lets root log in with the lab key. sshd keeps the first
-        # PermitRootLogin it reads, and AllowUsers lines add to each other.
-        printf 'PermitRootLogin prohibit-password\nAllowUsers root\n' > /etc/ssh/sshd_config.d/00-root.conf
+        # PermitRootLogin it reads, which applies to any user ID 0, and
+        # AllowUsers lines add to each other.
+        printf 'PermitRootLogin prohibit-password\nAllowUsers root toor\n' > /etc/ssh/sshd_config.d/00-root.conf
+        # toor is another name for user ID 0, listed after root, so user ID
+        # 0 is still called root. Its key login comes from the lab's shared
+        # authorized keys.
+        if ! getent passwd toor >/dev/null; then
+            useradd --non-unique --uid 0 --gid 0 --no-create-home --home-dir /home/toor --shell /bin/sh toor
+            passwd --delete toor >/dev/null
+        fi
+        install -d -m 0700 -o root -g root /home/toor
+        test "$(getent passwd 0 | cut -d: -f1)" = root
     fi
     /usr/sbin/sshd -t -f /etc/ssh/sshd_config
     if [ -n "${SYQ_REAL_SSH_EXPECT_MAX_SESSIONS:-}" ]; then

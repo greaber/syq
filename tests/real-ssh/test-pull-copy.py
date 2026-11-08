@@ -1,8 +1,8 @@
 """Downloads from another server that the runner approves per copy: the
 requesting server reads through the source's enrolled receiver, which serves
 only what the signed command reads. The source's root account, which only this
-lab endpoint lets log in, serves downloads too, but no copy writes to it. All
-paths are disposable."""
+lab endpoint lets log in, serves downloads too, but no copy writes to it or to
+toor, another name for user ID 0. All paths are disposable."""
 import contextlib
 import json
 import os
@@ -410,10 +410,43 @@ def main():
         print("case: revoking the root enrollment removes its key from root's account", flush=True)
         run("syq", "receiver", "revoke", root_enrollment[0])
         assert enrollments(as_root) == [] and "syq-enrollment:" not in authorized_keys(as_root)
+
+        print("case: an upload to another name for user ID 0 is refused by its enrollment session", flush=True)
+        # toor shares root's user ID and is listed after it. The laptop's
+        # check of the name passes; the user ID the session reports does not.
+        alias = "toor@destination"
+        assert remote(alias, "id -u; id -un; printf '%s\\n' \"$HOME\"").split() == ["0", "root", "/home/toor"]
+
+        def alias_home():
+            return remote(as_root, "find /home/toor -printf '%p %y %m\\n' | LC_ALL=C sort")
+
+        alias_before = alias_home()
+        upload = ["syq", "cp", into + "/approved", "--to", alias, "--as", "/home/toor/upload",
+                  "--auth-from", "auto", "--no-progress"]
+        with running("exec timeout 120 " + shlex.join(upload)) as (process, output):
+            requests = json.loads(run("syq", "persist", "receive", "pending", "--json",
+                                      "--wait", "--timeout", "20"))
+            assert len(requests) == 1, requests
+            assert 'on "toor@destination"' in requests[0]["destination"], requests
+            assert 'Also sets up restricted copying on "toor@destination"' in requests[0]["permission"], requests
+            run("syq", "persist", "receive", "approve", requests[0]["id"])
+            text = finish(process, output, success=False)
+        assert "restricted receivers do not write or run copies as root" in text, text
+        # Nothing reached toor's home: no key line, no stored syq, no state.
+        assert alias_home() == alias_before
+        remote(alias, "test ! -e ~/.local/lib/syq && test ! -e ~/.local/share/syq"
+               " && ! grep -s -q syq-enrollment: ~/.ssh/authorized_keys")
+        assert pending() == []
+        assert [line for line in run("syq", "receiver", "list").splitlines()
+                if "\ttoor@destination" in line] == []
         print("Source downloads passed", flush=True)
     finally:
         for enrollment in enrollments("root@destination"):
             run("syq", "receiver", "revoke", enrollment)
+        for line in run("syq", "receiver", "list").splitlines():
+            if "\ttoor@destination" in line:
+                subprocess.run(["syq", "receiver", "revoke", line.split("\t")[0]],
+                               capture_output=True, timeout=60)
         if "home" in roots:
             remote("destination", "rm -rf -- ~/" + shlex.quote(roots.pop("home")))
         for host, root in roots.items():
