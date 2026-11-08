@@ -4183,9 +4183,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
 
-    // Settle restricted transport setup before destination creation. Return
-    // authorization still requires direct TCP; enrolled receivers can instead
-    // attach SSH workers to the already-authorized copy on the same route.
+    // Settle restricted transport setup before destination creation: where
+    // TCP fails, an enrolled receiver attaches SSH workers to the copy it
+    // already authorized, on the same route.
     if pending_tcp_setups
         .iter()
         .any(|(spec, _)| spec.restricted_grant.is_some())

@@ -590,3 +590,41 @@ fn overlapping_native_descriptor_estimates_keep_the_live_worker_limit() {
     let _second = authority.acquire(&role, false).unwrap();
     assert!(authority.acquire(&role, false).is_err());
 }
+
+/// A source whose reader works elsewhere than where the command's relative
+/// paths start reads them from its resolved base: the coordinator registers
+/// the base and selections as the command names them, and the registration
+/// must still match them.
+#[test]
+fn relative_selections_are_read_from_the_resolved_base() {
+    let temp = crate::test_support::tempdir().unwrap();
+    fs::create_dir(temp.path().join("projects")).unwrap();
+    fs::write(temp.path().join("projects/data"), b"approved").unwrap();
+    // Here, in this process's own directory, the relative name means
+    // something else.
+    let mut resolved = policy_with_base(b"projects");
+    resolved.resolved_base = Some(temp.path().join("projects").as_os_str().as_bytes().to_vec());
+    let mut fixture = Fixture::new(resolved);
+    let worker = fixture.worker();
+    let request = read(Some(fixture.source()), 8);
+    worker.authorize(&request).unwrap();
+    let response = fixture.ops.handle(&request);
+    assert!(matches!(response, Response::Block { data, .. } if data == b"approved"));
+    // The registration still has to be the command's.
+    let mut other = policy_with_base(b"elsewhere");
+    other.resolved_base = Some(temp.path().as_os_str().as_bytes().to_vec());
+    let authority = SourceAuthority::new(other).unwrap();
+    let control = authority.acquire(&ConnectionRole::Control, false).unwrap();
+    let changed = registration(&policy_with_base(b"projects"));
+    assert!(control.register(&mut FsOps::new(), &changed).is_err());
+    // A resolved base is absolute.
+    let mut relative = policy(Path::new("data"));
+    relative.resolved_base = Some(b"projects".to_vec());
+    assert!(SourceAuthority::new(relative).is_err());
+}
+
+fn policy_with_base(base: &[u8]) -> SourcePolicy {
+    let mut policy = policy(Path::new("data"));
+    policy.base.path = Some(base.to_vec());
+    policy
+}
