@@ -60,7 +60,7 @@ import hashlib
 from pathlib import Path
 root = Path(v["root"])
 matches = list(root.glob("." + v["name"] + ".syq-tmp.*"))
-print(json.dumps(any(hashlib.sha256(p.open("rb").read(1 << 20)).hexdigest() == v["digest"] for p in matches)))
+print(json.dumps(any(hashlib.sha256(p.open("rb").read(4 << 20)).hexdigest() == v["digest"] for p in matches)))
 ''',
 }
 
@@ -188,8 +188,9 @@ def main():
         remote("destination", "dd if=/dev/urandom of=" + shlex.quote(files + "/large")
                + " bs=1M count=32 status=none")
         expected, large = digest("destination", files + "/data"), digest("destination", files + "/large")
+        # One whole comparison block, which a later copy can reuse.
         prefix = remote("destination", "dd if=" + shlex.quote(files + "/large")
-                        + " bs=1M count=1 status=none | sha256sum").split()[0]
+                        + " bs=1M count=4 status=none | sha256sum").split()[0]
         attempts = {}
 
         def command(name, extra=(), source="data", binary="syq", tcp=False):
@@ -320,7 +321,7 @@ def main():
             decide(setup='Also sets up restricted copying on "destination"')
             finish(process, output)
         terminal = copied("revoked", large)
-        assert terminal["bytes_unchanged"] >= 1 << 20, terminal
+        assert terminal["bytes_unchanged"] >= 4 << 20, terminal
         print("Source downloads passed", flush=True)
     finally:
         for host, root in roots.items():
