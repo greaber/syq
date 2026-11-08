@@ -498,7 +498,7 @@ pub(super) struct Account {
 }
 
 impl Account {
-    fn label(&self) -> String {
+    pub(super) fn label(&self) -> String {
         format!("{}@{}", self.login, self.endpoint.host)
     }
 
@@ -681,8 +681,9 @@ impl Receiver {
             None => destination.refuse_root(
                 "to",
                 &format!(
-                    "copy to an ordinary account on {host}, or use the requesting server's own SSH access, or account access approved with `--auth-from @NAME` (`syq persist connect {host}`)",
-                    host = destination.endpoint.host
+                    "copy to an ordinary account on {host}, or use the requesting server's own SSH access, or account access approved with `syq persist connect {account} --auth-from @NAME`",
+                    host = destination.endpoint.host,
+                    account = destination.label()
                 ),
             )?,
             Some(source) => {

@@ -453,8 +453,9 @@ impl Receiver {
         source.refuse_root(
             "from",
             &format!(
-                "download from an ordinary account on {host}, or use the requesting server's own SSH access, or account access approved with `--auth-from @NAME` (`syq persist connect {host}`)",
-                host = forward::target_endpoint(&target)?.host
+                "download from an ordinary account on {host}, or use the requesting server's own SSH access, or account access approved with `syq persist connect {account} --auth-from @NAME`",
+                host = forward::target_endpoint(&target)?.host,
+                account = source.label()
             ),
         )?;
         if args.dry_run {
