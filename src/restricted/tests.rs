@@ -2974,12 +2974,28 @@ fn unverified_sessions_beyond_the_slots_are_refused_at_once() {
         error.to_string().contains("3 other connections are"),
         "{error:#}"
     );
-    // A slot frees when its session is verified or ends, and the source a
-    // freed slot named no longer counts.
+    // A slot frees when its session is verified or ends, and a source's
+    // slot file goes with it.
+    let source_files = || {
+        fs::read_dir(&state)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("session-source-")
+            })
+            .count()
+    };
+    assert_eq!(source_files(), 3);
     drop(first);
+    assert_eq!(source_files(), 2);
     let third = take("192.0.2.7").unwrap();
     assert!(take("192.0.2.7").is_err());
     drop((second, third, other));
+    assert_eq!(source_files(), 0);
     for _ in 0..2 {
         drop(take(UNKNOWN_SOURCE).unwrap());
     }
@@ -2990,14 +3006,89 @@ fn unverified_sessions_beyond_the_slots_are_refused_at_once() {
         "{error:#}"
     );
     drop(unknown);
-    // A slot, or their lock, that is not a private regular file is refused.
-    for name in ["session-slot-0", "session-slots-lock"] {
-        let path = state.join(name);
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(take("192.0.2.7").is_err());
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    }
+    // A source's file that a session left behind when it was killed is
+    // free, and taken again.
+    let stale = state.join(format!(
+        "session-source-{}-0",
+        "192.0.2.7"
+            .bytes()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ));
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&stale)
+        .unwrap();
+    let reused = take("192.0.2.7").unwrap();
+    assert_eq!(source_files(), 1);
+    drop(reused);
+    assert!(!stale.exists());
+    // A slot file that is not private, or has another name, is refused.
+    let path = state.join("session-slot-0");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(take("192.0.2.7").is_err());
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::hard_link(&path, state.join("linked")).unwrap();
+    assert!(take("192.0.2.7").is_err());
+    fs::remove_file(state.join("linked")).unwrap();
     drop(take("192.0.2.7").unwrap());
+    assert_eq!(source_files(), 0);
+}
+
+/// Sessions from one source taking and releasing slots at once never hold
+/// more than its share, though a released slot's file is removed and made
+/// again while others are taking it.
+#[test]
+fn a_sources_share_holds_while_its_slots_change_hands() {
+    use std::sync::atomic::AtomicUsize;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let state = temporary.path().join("state");
+    fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+    let held = AtomicUsize::new(0);
+    let most = AtomicUsize::new(0);
+    let taken = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                for _ in 0..300 {
+                    let Ok(slot) = UnverifiedSlot::take(&state, (32, 3), "192.0.2.7") else {
+                        continue;
+                    };
+                    let now = held.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(now, Ordering::SeqCst);
+                    taken.fetch_add(1, Ordering::SeqCst);
+                    std::thread::yield_now();
+                    held.fetch_sub(1, Ordering::SeqCst);
+                    drop(slot);
+                }
+            });
+        }
+    });
+    assert!(most.load(Ordering::SeqCst) <= 3, "{most:?}");
+    assert!(taken.load(Ordering::SeqCst) >= 300, "{taken:?}");
+
+    // A session that opened a slot's file just before its holder released
+    // it, and so locks the removed file, does not hold the slot: the next
+    // session makes the file again and takes it.
+    let path = state.join("session-source-00-0");
+    let holder = UnverifiedSlot::take(&state, (32, 1), "\0").unwrap();
+    let (late, metadata) = open_slot_file(&path).unwrap();
+    drop(holder);
+    assert!(!path.exists());
+    assert!(matches!(
+        lock_source_file(&path, late, &metadata).unwrap(),
+        SourceLock::Moved
+    ));
+    let next = UnverifiedSlot::take(&state, (32, 1), "\0").unwrap();
+    assert!(path.exists());
+    let (other, metadata) = open_slot_file(&path).unwrap();
+    assert!(matches!(
+        lock_source_file(&path, other, &metadata).unwrap(),
+        SourceLock::Held
+    ));
+    drop(next);
 }
 
 #[test]

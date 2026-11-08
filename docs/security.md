@@ -214,12 +214,14 @@ The protection has four parts:
    receiver checks that signature before it looks at anything else the
    connection sends. Such a server can, however, keep some of the receiver's
    connections waiting. At most 32 can wait to be checked at once, and at
-   most 16 of them from one address (for IPv6, one /64 network), so one such
-   server slows new copies from other machines but does not stop them. Several
-   on different addresses can make new copies fail until you revoke the
-   enrollment and enroll again. Don't add the entry key to any other
-   `authorized_keys` file: hostA holds it, so it would gain that access too.
-   Your laptop stores it unencrypted.
+   most 16 of them from one address; for IPv6, from one /64 network. So a
+   server with one address slows new copies started from other addresses but
+   does not stop them. Machines that share an address, such as those behind
+   one NAT or on one IPv6 /64, share its 16, and a server that connects from
+   two addresses, such as over both IPv4 and IPv6, can make new copies fail
+   until you revoke the enrollment and enroll again. Don't add the entry key to
+   any other `authorized_keys` file: hostA holds it, so it would gain that
+   access too. Your laptop stores it unencrypted.
 3. **A signature on each copy.** Your laptop signs the copy's command, exactly
    as you ran it, with an expiry time, using the key you log in to hostB with.
    The receiver checks the signature, requiring the touch and PIN your login
@@ -493,10 +495,12 @@ used as a copy to hostB, and hostC's cannot be used to read from hostC.
 HostX receives the copy's progress and hostC's reports, which it checks as
 your laptop would, but no file data. It receives both entry keys and hostC's
 signed copy, so it could write content of its choosing to hostC within that
-approval, as a server uploading to hostC can. HostB's receiver reads within
-the hostB account, so a command that names syq's own files there, or a source
-symlink that leads to them, sends those to hostC like any other file. The copy
-stops when hostX's command ends, and continues if your laptop disconnects.
+approval, as a server uploading to hostC can. HostB's receiver also receives
+hostC's entry key, and holds it while the copy runs, as hostA does. HostB's
+receiver reads within the hostB account, so a command that names syq's own
+files there, or a source symlink that leads to them, sends those to hostC like
+any other file. The copy stops when hostX's command ends, and continues if your
+laptop disconnects.
 
 A server can also ask your laptop to approve a download from another server,
 hostB, to itself. Your laptop shows the command and each source as hostB will
@@ -504,12 +508,13 @@ read it, sets up or updates hostB's enrollment when needed, and signs the
 command for hostB's receiver as the copy's source. The server logs in to that
 receiver with hostB's entry key, checking hostB's host key as
 [hostA checks hostB's](#how-hosta-checks-hostbs-key), and holds the entry key
-while the copy runs, as hostA does. The receiver checks the signature as for a destination, and then
-reads only the files and directory trees the command names, with the symlink
-behavior the command chose, accepts no writes or removals, and limits the file
-data, entries, and connections it returns to the command's and your laptop's
-limits. A signed download cannot be used as a copy to hostB, and a copy signed
-for hostB as a destination cannot be used to read from it.
+while the copy runs, as hostA does. The receiver checks the signature as for a
+destination, and then reads only the files and directory trees the command
+names, with the symlink behavior the command chose, accepts no writes or
+removals, and limits the file data, entries, and connections it returns to the
+command's and your laptop's limits. A signed download cannot be used as a copy
+to hostB, and a copy signed for hostB as a destination cannot be used to read
+from it.
 
 Reads are not limited further within the account: a command that names
 hostB's `~/.ssh` or syq's own files there, or a symlink it follows to them,

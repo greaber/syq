@@ -339,8 +339,8 @@ impl<'a> Framed<'a> {
 }
 
 impl Signed {
-    /// Decode `bytes` without checking its signature, which a receiver
-    /// checks first (`delegation::verify_and_redeem`).
+    /// Decode `bytes` without checking its signature. A receiver that
+    /// checks a directive's signature does so first, through [`Framed`].
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         Framed::split(bytes)?.decode()
     }

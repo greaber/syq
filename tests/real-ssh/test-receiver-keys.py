@@ -8,10 +8,9 @@ sign are refused before anything is installed. A new login key replaces only
 the trusted signer, a connection started before a refresh cannot start a new
 copy, and a copy running through a refresh finishes. Connections that have
 not shown a signed copy yet are refused once 32 are starting, or 16 from one
-machine, which one copy never reaches: a machine holding its 16 leaves copies
-from another working. A copy's workers refused that way start again without
-the wait of a failed worker, and revoking works while refused connections
-keep arriving.
+address: a machine holding its 16 leaves copies from another working. A
+copy's workers refused that way start again without the wait of a failed
+worker, and revoking works while refused connections keep arriving.
 """
 import json
 import os
@@ -510,9 +509,9 @@ def entry_ssh(directory):
 
 
 def session_slots(parent):
-    # One copy starts at most 32 connections at once, and each holds its slot
-    # only until it shows its ticket, so none of a copy's workers is refused,
-    # though one machine may hold only 16 slots.
+    # One copy starts at most 32 connections at once, more than the 16 one
+    # machine may hold, but each holds its slot only until it shows its
+    # ticket. A worker refused meanwhile is retried, so the copy completes.
     files = '/tmp/syq-real-ssh-slots'
     run('ssh', 'source', f'rm -rf {files} && mkdir {files} && cd {files} && '
         'for i in $(seq 2000); do echo $i > $i; done')
@@ -520,9 +519,10 @@ def session_slots(parent):
                    '--as', f'{parent}/slots-many', '--no-tcp', '--no-progress',
                    '--performance-tuning', 'workers=64')
     log = (many.stdout + many.stderr).decode(errors='replace')
-    assert many.returncode == 0 and REFUSED.decode() not in log, log
+    assert many.returncode == 0, log
     assert remote_text(f'ls {parent}/slots-many | wc -l').strip() == '2000'
-    print('a copy with 64 workers had none refused', flush=True)
+    print(f'a copy with 64 workers completed; {log.count(REFUSED.decode())} '
+          'worker connections were refused and retried', flush=True)
 
     directory, record = enrollment()
     receivers = 'python3 -c ' + shlex.quote(RECEIVER_SESSIONS + 'print(len(sessions))')

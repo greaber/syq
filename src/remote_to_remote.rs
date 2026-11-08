@@ -1306,7 +1306,9 @@ impl ReceiverSsh {
             connection.omission_cause()
         );
         }
-        // An interrupted copy removes the entry key too; only SIGKILL leaves it.
+        // An interrupted copy (SIGINT or SIGTERM) removes the entry key too;
+        // a copy killed by a signal syq does not catch, such as SIGKILL or
+        // SIGHUP, leaves it.
         let directory = crate::private_broker::SignalCleanedDir::new("syq-receiver-hosts-")?;
         let path = directory.path().join(APPROVING_KNOWN_HOSTS);
         if union {

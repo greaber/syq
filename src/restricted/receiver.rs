@@ -1,6 +1,5 @@
 use super::*;
 use std::os::fd::AsFd;
-use std::os::unix::fs::FileExt as _;
 use std::time::Duration;
 
 /// The enrollment's state directory and its configuration, for the account
@@ -261,72 +260,129 @@ pub(super) fn session_source(connection: Option<&str>) -> String {
 pub(super) const UNKNOWN_SOURCE: &str = "unknown";
 
 /// One of the enrollment's slots for sessions that have not been verified
-/// yet: a lock on one of the files `session-slot-N` in its state directory,
-/// which names the session's source. Dropping it closes the file, which
-/// releases the lock, as exiting does.
-pub(super) struct UnverifiedSlot(#[allow(dead_code)] File);
+/// yet, held until the session is: a lock on one of the files
+/// `session-slot-N` in its state directory, and on one of its source's files
+/// `session-source-SOURCE-N`. Dropping it removes the source's file and
+/// closes both, which releases the locks, as exiting does.
+pub(super) struct UnverifiedSlot {
+    _total: File,
+    _source: SourceSlot,
+}
 
 impl UnverifiedSlot {
-    /// Take a free slot of the `slots` for a session from `source`, or
-    /// refuse the session at once when there is none or `source` already
-    /// holds `per_source` of them. No session waits for a slot, so no more
-    /// than `slots` unverified sessions run, and no more than `per_source`
-    /// from one source.
+    /// Take one of the `slots`, and one of `per_source` slots for `source`,
+    /// or refuse the session at once when either is full. Each lock is tried
+    /// once, without waiting, so a session either holds its slots or exits:
+    /// no more than `slots` unverified sessions run, and no more than
+    /// `per_source` from one source.
     pub(super) fn take(
         state: &Path,
         (slots, per_source): (usize, usize),
         source: &str,
     ) -> Result<Self> {
-        // Slots are taken, and their sources read, only under this lock, so
-        // two sessions from one source cannot both miss each other. It is
-        // held only for this, never while reading from a session.
-        let guard = open_slot_file(&state.join("session-slots-lock"))?;
-        lock_slot_file(&guard, false)?;
-        let mut free = None;
-        let mut from_source = 0;
-        for slot in 0..slots {
-            let file = open_slot_file(&state.join(format!("session-slot-{slot}")))?;
-            if lock_slot_file(&file, true)? {
-                // The first free slot stays locked; other free ones unlock
-                // as they close.
-                free.get_or_insert(file);
-                continue;
-            }
-            // A slot is locked only while its session runs, and names its
-            // source from before this lock was released.
-            let mut held = [0u8; 64];
-            let length = file.read_at(&mut held, 0).context("read a session slot")?;
-            from_source += usize::from(&held[..length] == source.as_bytes());
-        }
-        let label = if source == UNKNOWN_SOURCE {
-            "an unknown address"
-        } else {
-            source
-        };
         let retry = "try again shortly, or replace its entry key with `syq receiver revoke` and enroll again if this persists";
-        if from_source >= per_source {
-            return Err(SessionsFull(format!(
-                "{from_source} other connections from {label} are starting copies on this enrollment; {retry}"
-            ))
-            .into());
+        let name: String = source.bytes().map(|byte| format!("{byte:02x}")).collect();
+        let mut taken = None;
+        for slot in 0..per_source {
+            taken = SourceSlot::take(state.join(format!("session-source-{name}-{slot}")))?;
+            if taken.is_some() {
+                break;
+            }
         }
-        let Some(file) = free else {
+        let Some(source_slot) = taken else {
+            let label = if source == UNKNOWN_SOURCE {
+                "an unknown address"
+            } else {
+                source
+            };
             return Err(SessionsFull(format!(
-                "{slots} other connections are starting copies on this enrollment; {retry}"
+                "{per_source} other connections from {label} are starting copies on this enrollment; {retry}"
             ))
             .into());
         };
-        file.set_len(0).context("name a session slot's source")?;
-        file.write_all_at(source.as_bytes(), 0)
-            .context("name a session slot's source")?;
-        drop(guard);
-        Ok(Self(file))
+        for slot in 0..slots {
+            let file = open_slot_file(&state.join(format!("session-slot-{slot}")))?.0;
+            if lock_slot_file(&file)? {
+                return Ok(Self {
+                    _total: file,
+                    _source: source_slot,
+                });
+            }
+        }
+        Err(SessionsFull(format!(
+            "{slots} other connections are starting copies on this enrollment; {retry}"
+        ))
+        .into())
+    }
+}
+
+/// A source's slot: a lock on a file that exists while some session holds
+/// it, and is removed when it is released.
+struct SourceSlot {
+    _file: File,
+    path: PathBuf,
+}
+
+/// What locking a source's slot file found.
+pub(super) enum SourceLock {
+    /// Another session holds it.
+    Held,
+    /// This session does.
+    Taken(File),
+    /// Its holder released it, and removed it, after it was opened: the
+    /// name now names another file, or none.
+    Moved,
+}
+
+impl SourceSlot {
+    /// Lock the file at `path`, creating it if needed, unless another
+    /// session holds it.
+    fn take(path: PathBuf) -> Result<Option<Self>> {
+        // A few tries settle a slot that changes hands meanwhile; one that
+        // keeps changing hands counts as held.
+        for _ in 0..8 {
+            let (file, metadata) = open_slot_file(&path)?;
+            match lock_source_file(&path, file, &metadata)? {
+                SourceLock::Held => return Ok(None),
+                SourceLock::Taken(file) => return Ok(Some(Self { _file: file, path })),
+                SourceLock::Moved => {}
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Lock `file`, opened at `path` with `metadata`, as a source's slot.
+pub(super) fn lock_source_file(
+    path: &Path,
+    file: File,
+    metadata: &fs::Metadata,
+) -> Result<SourceLock> {
+    if !lock_slot_file(&file)? {
+        return Ok(SourceLock::Held);
+    }
+    match fs::symlink_metadata(path) {
+        Ok(named) if (named.dev(), named.ino()) == (metadata.dev(), metadata.ino()) => {
+            Ok(SourceLock::Taken(file))
+        }
+        Ok(_) => Ok(SourceLock::Moved),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(SourceLock::Moved),
+        Err(error) => Err(error).context("inspect a session slot"),
+    }
+}
+
+impl Drop for SourceSlot {
+    fn drop(&mut self) {
+        // Removed while still locked: the next session from this source
+        // creates the file again.
+        let _ = fs::remove_file(&self.path);
     }
 }
 
 /// Open one of the enrollment's private slot files, creating it on first
-/// use.
-fn open_slot_file(path: &Path) -> Result<File> {
+/// use. A source's slot file can have just been removed by the session
+/// releasing it, and so have no name.
+pub(super) fn open_slot_file(path: &Path) -> Result<(File, fs::Metadata)> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -338,28 +394,26 @@ fn open_slot_file(path: &Path) -> Result<File> {
         .context("open the enrollment's session slots")?;
     let metadata = file.metadata()?;
     if !metadata.is_file()
-        || metadata.nlink() != 1
+        || metadata.nlink() > 1
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.mode() & 0o7777 != 0o600
     {
         bail!("the enrollment's session slots must be private, singly linked regular files");
     }
-    Ok(file)
+    Ok((file, metadata))
 }
 
-/// Lock `file` exclusively: at once when `nonblocking`, returning whether
-/// it was free, or else waiting for it.
-fn lock_slot_file(file: &File, nonblocking: bool) -> Result<bool> {
-    let operation = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+/// Lock `file` exclusively if no other session holds it, without waiting.
+fn lock_slot_file(file: &File) -> Result<bool> {
     loop {
         // SAFETY: the descriptor stays open for the call.
-        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(true);
         }
         let error = std::io::Error::last_os_error();
         match error.kind() {
             std::io::ErrorKind::Interrupted => {}
-            std::io::ErrorKind::WouldBlock if nonblocking => return Ok(false),
+            std::io::ErrorKind::WouldBlock => return Ok(false),
             _ => return Err(error).context("lock a session slot"),
         }
     }
