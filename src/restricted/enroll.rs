@@ -482,6 +482,8 @@ pub(super) struct Plan {
     pub(super) entry_key: Option<PrivateKey>,
     pub(super) refresh: bool,
     pub(super) replaces: Option<ReplacedEnrollment>,
+    /// The server must keep the record of used directives (`InstallRequest`).
+    pub(super) keep_used: bool,
 }
 
 enum Session {
@@ -495,18 +497,31 @@ enum Session {
 /// user ID 0) and that its destination is not a path the receiver protects.
 pub(super) type DestinationCheck<'a> = Option<&'a dyn Fn(&Path, &[PathBuf], &str) -> Result<()>>;
 
+/// When [`enroll`] refreshes an enrollment this machine has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Refresh {
+    /// When it runs another build, or a refresh did not finish.
+    IfOutdated,
+    /// Always, as to find the login key again.
+    Always,
+    /// Always, for a copy its receiver refused for running another build,
+    /// which is then signed again as the same copy: only this enrollment,
+    /// and only keeping the server's record of the directives that ran.
+    /// Nothing is set up anew or replaced.
+    SameRecord(EnrollmentId),
+}
+
 /// The enrollment for `login@host:port`, set up when there is none, and
-/// refreshed when it runs another build or `refresh` asks to find the
-/// login key again. Returns the login key's signer when this logged in to
-/// the server. With `batch`, SSH never prompts; where the SSH configuration
-/// would ask about a host key nobody knows, it accepts it the first time, as
-/// `accept-new` does.
+/// refreshed as `refresh` says. Returns the login key's signer when this
+/// logged in to the server. With `batch`, SSH never prompts; where the SSH
+/// configuration would ask about a host key nobody knows, it accepts it the
+/// first time, as `accept-new` does.
 pub(super) fn enroll(
     host: &str,
     port: Option<u16>,
     login: &str,
     (jump, batch): (Option<&SshEndpoint>, bool),
-    refresh: bool,
+    refresh: Refresh,
     check: DestinationCheck<'_>,
 ) -> Result<(LocalEnrollment, PathBuf, Option<LoginSigner>)> {
     let base = local_state_base()?;
@@ -518,19 +533,31 @@ pub(super) fn enroll(
     let active = load_local_enrollments()?
         .into_iter()
         .find(|(metadata, _)| account(&metadata.host, metadata.port, &metadata.target_login));
+    let target = endpoint(login, host, port)?;
+    if let Refresh::SameRecord(id) = refresh {
+        if !active
+            .as_ref()
+            .is_some_and(|(metadata, _)| metadata.id == id)
+        {
+            bail!(
+                "restricted copying on {} is no longer enrollment {id}, which this copy was signed for; run the copy again",
+                target.label()
+            );
+        }
+    }
     if let Some((metadata, directory)) = &active {
-        if !refresh && !needs_refresh(metadata, directory) {
+        if refresh == Refresh::IfOutdated && !needs_refresh(metadata, directory) {
             return Ok((metadata.clone(), directory.clone(), None));
         }
     }
-    let target = endpoint(login, host, port)?;
-    let plan = match active {
+    let mut plan = match active {
         Some((metadata, directory)) => Plan {
             id: metadata.id,
             entry_key: Some(load_entry_key(&directory)?),
             directory,
             refresh: true,
             replaces: None,
+            keep_used: false,
         },
         None => match load_pending_enrollments()?
             .into_iter()
@@ -542,61 +569,73 @@ pub(super) fn enroll(
                 directory,
                 refresh: false,
                 replaces: None,
+                keep_used: false,
             },
             None => new_plan(&base, None),
         },
     };
+    plan.keep_used = matches!(refresh, Refresh::SameRecord(_));
     if plan.refresh {
         // Until the server's reply arrives, the server may hold a newer
         // signer and generation than this machine's record.
         atomic_write(&plan.directory, REFRESH_FILE, b"", 0o600)?;
     }
     let lost = (plan.refresh, plan.id, plan.directory.clone());
-    let (metadata, directory, signer) =
-        match run_session(&target, (jump, batch), (host, port, login), plan, check)? {
-            (Session::Installed(installed), directory) => {
-                let (metadata, signer) = *installed;
-                (metadata, directory, signer)
+    let (metadata, directory, signer) = match run_session(
+        &target,
+        (jump, batch),
+        (host, port, login),
+        plan,
+        check,
+    )? {
+        (Session::Installed(installed), directory) => {
+            let (metadata, signer) = *installed;
+            (metadata, directory, signer)
+        }
+        (Session::StateMissing, _) => {
+            // The server lost this enrollment's state. Enroll under a new ID
+            // instead of re-creating the old one, so no grant can be replayed
+            // against an empty record, and remove the old line. Not for a
+            // refused copy signed again: its record is gone with the state.
+            let (_, old_id, old_directory) = lost;
+            if refresh == Refresh::SameRecord(old_id) {
+                bail!(
+                        "{} has lost the state of enrollment {old_id}, so the copy it refused is not run again; run the copy again",
+                        target.label()
+                    );
             }
-            (Session::StateMissing, _) => {
-                // The server lost this enrollment's state. Enroll under a new ID
-                // instead of re-creating the old one, so no grant can be replayed
-                // against an empty record, and remove the old line.
-                let (_, old_id, old_directory) = lost;
-                let old_key = load_entry_key(&old_directory)?;
-                crate::output::diagnostic!(
-                    "syq: {} has lost the state of enrollment {old_id}; enrolling again",
-                    target.label()
-                );
-                let replaced = ReplacedEnrollment {
-                    id: old_id,
-                    entry_public_key: old_key.public_key().to_openssh()?,
-                };
-                let pending = load_pending_enrollments()?
-                    .into_iter()
-                    .find(|(pending, _)| {
-                        account(&pending.host, pending.port, &pending.target_login)
-                    });
-                match run_session(
-                    &target,
-                    (jump, batch),
-                    (host, port, login),
-                    replacement_plan(&base, pending, replaced)?,
-                    check,
-                )? {
-                    (Session::Installed(installed), directory) => {
-                        // Keep the old record until its replacement is installed,
-                        // so a failure here can still name the line to remove.
-                        remove_local_enrollment(&old_directory)?;
-                        let (metadata, signer) = *installed;
-                        (metadata, directory, signer)
-                    }
-                    (Session::StateMissing, _) => {
-                        bail!("the server reported missing state for a new enrollment")
-                    }
+            let old_key = load_entry_key(&old_directory)?;
+            crate::output::diagnostic!(
+                "syq: {} has lost the state of enrollment {old_id}; enrolling again",
+                target.label()
+            );
+            let replaced = ReplacedEnrollment {
+                id: old_id,
+                entry_public_key: old_key.public_key().to_openssh()?,
+            };
+            let pending = load_pending_enrollments()?
+                .into_iter()
+                .find(|(pending, _)| account(&pending.host, pending.port, &pending.target_login));
+            match run_session(
+                &target,
+                (jump, batch),
+                (host, port, login),
+                replacement_plan(&base, pending, replaced)?,
+                check,
+            )? {
+                (Session::Installed(installed), directory) => {
+                    // Keep the old record until its replacement is installed,
+                    // so a failure here can still name the line to remove.
+                    remove_local_enrollment(&old_directory)?;
+                    let (metadata, signer) = *installed;
+                    (metadata, directory, signer)
+                }
+                (Session::StateMissing, _) => {
+                    bail!("the server reported missing state for a new enrollment")
                 }
             }
-        };
+        }
+    };
     Ok((metadata, directory, Some(signer)))
 }
 
@@ -616,6 +655,7 @@ pub(super) fn replacement_plan(
             directory,
             refresh: false,
             replaces: Some(replaced),
+            keep_used: false,
         },
         None => new_plan(base, Some(replaced)),
     })
@@ -629,6 +669,7 @@ fn new_plan(base: &Path, replaces: Option<ReplacedEnrollment>) -> Plan {
         entry_key: None,
         refresh: false,
         replaces,
+        keep_used: false,
     }
 }
 
@@ -916,6 +957,7 @@ fn install_over_route(
             signer: login_key.trusted.clone(),
             refresh: plan.refresh,
             replaces: plan.replaces.clone(),
+            keep_used: plan.keep_used,
         };
         Ok((login_key, (offer, build), request))
     })();

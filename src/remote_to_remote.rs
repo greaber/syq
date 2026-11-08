@@ -1979,11 +1979,11 @@ pub(crate) const REPORT_OTHER_BUILD: &str = "SYQ_INTERNAL_NATIVE_REPORT_OTHER_BU
 /// The destination's receiver refused a copy started here for running
 /// another build than this one, which coordinated the copy and signed it:
 /// this machine's record of the enrollment is out of date, so refreshing it
-/// installs this build there. The copy's directive had `request_id`.
+/// installs this build there. `retry` is the copy as it was signed.
 #[derive(Debug)]
 struct ReceiverRunsOtherBuild {
     receiver: String,
-    request_id: crate::delegation::RequestId,
+    retry: crate::restricted::Retry,
 }
 
 impl std::fmt::Display for ReceiverRunsOtherBuild {
@@ -2026,7 +2026,7 @@ fn run_remote(
                         "syq: {refused}; updating it to this build and trying once more"
                     );
                 }
-                attempt(Some(refused.request_id))
+                attempt(Some(refused.retry))
             }
             Err(error) => Err(error),
         },
@@ -2035,14 +2035,14 @@ fn run_remote(
 }
 
 /// One attempt at a copy between two servers that started at `started`.
-/// `retry_of` is the request ID of an earlier attempt's directive that the
+/// `retry_of` is the copy as an earlier attempt signed it, which the
 /// destination's receiver refused for running another build.
 fn run_remote_once(
     args: &Args,
     (srcs, dst, coordinator_at_dst): (&[Location], &Location, bool),
     results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
     started: std::time::Instant,
-    retry_of: Option<crate::delegation::RequestId>,
+    retry_of: Option<crate::restricted::Retry>,
 ) -> Result<i32> {
     let refresh = retry_of.is_some();
     crate::fsops::ensure_source_count(srcs.len())?;
@@ -2081,8 +2081,8 @@ fn run_remote_once(
     let mut constrained_rsh = None;
     let mut restricted_destination_path = None;
     let mut restricted_grant = None;
-    // The restricted destination's directive's request ID.
-    let mut signed_request = None;
+    // The restricted destination's copy as it was signed.
+    let mut signed_copy = None;
     // The restricted destination's results: who signs them and which copy.
     let mut destination_results = None;
     let default_ssh_agent_policy = if args.rsh.is_some() {
@@ -2168,7 +2168,7 @@ fn run_remote_once(
             constrained_rsh = Some(receiver_rsh(Some(peer_policy.port())));
             restricted_destination_path = Some(prepared.destination);
             restricted_grant = Some(prepared.directive);
-            signed_request = Some(prepared.request_id);
+            signed_copy = Some(prepared.retry);
             // A detached copy has no one to relay the destination's results
             // to: its log on the coordinator is its record.
             destination_results = (!args.detach)
@@ -2347,14 +2347,11 @@ fn run_remote_once(
             return None;
         }
         let receiver = endpoint_display(peer);
-        Some(match (refresh, signed_request) {
+        Some(match (refresh, signed_copy) {
             (false, Some(_)) if args.dry_run => anyhow::anyhow!(
                 "the restricted receiver on {receiver} runs another syq build; a dry run does not update it, but the next copy does"
             ),
-            (false, Some(request_id)) => ReceiverRunsOtherBuild {
-                receiver,
-                request_id,
-            }
+            (false, Some(retry)) => ReceiverRunsOtherBuild { receiver, retry }
             .into(),
             _ => anyhow::anyhow!(
                 "the restricted receiver on {receiver} still runs another syq build after syq updated it; see its message above"

@@ -468,6 +468,16 @@ pub(super) fn install_for_account(
             id: request.id,
         });
     }
+    // A copy signed again under the request a refused copy had is
+    // refused as used only while the record of used directives stays.
+    if request.keep_used
+        && delegation::validate_private_directory_path(&state.join("replay")).is_err()
+    {
+        bail!(
+            "the record of the copies enrollment {} ran is unusable, so the copy it refused is not run again; run the copy again",
+            request.id
+        );
+    }
     if let Some(existing) = &existing {
         if existing.id != request.id || existing.target_login != request.target_login {
             bail!("the enrollment's state does not match the request");

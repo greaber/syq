@@ -274,6 +274,7 @@ fn released_enrollment_state_is_never_read_or_touched() {
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
         refresh: false,
         replaces: None,
+        keep_used: false,
     };
     let InstallResponse::Installed { generation, .. } =
         install_for_account(&request, &account, home).unwrap()
@@ -367,6 +368,7 @@ fn install_request(
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
         refresh,
         replaces: None,
+        keep_used: false,
     }
 }
 
@@ -511,6 +513,20 @@ fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
     );
     let replay = enrollment_state(home, id).join("replay");
     fs::remove_dir(&replay).unwrap();
+    // A refresh for a refused copy that is signed again under the same
+    // request keeps the record or fails, changing nothing.
+    let mut keeping = install_request(&account, id, &entry, &login, true);
+    keeping.keep_used = true;
+    let error = install_for_account(&keeping, &account, home).unwrap_err();
+    assert!(format!("{error:#}").contains("is unusable"), "{error:#}");
+    assert!(!replay.exists());
+    let generation = |home: &Path| {
+        read_receiver_config(&enrollment_state(home, id))
+            .unwrap()
+            .unwrap()
+            .generation
+    };
+    assert_eq!(generation(home), 1);
     let refresh = install_request(&account, id, &entry, &login, true);
     assert_eq!(
         installed(install_for_account(&refresh, &account, home).unwrap()),
@@ -523,6 +539,10 @@ fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
     // With the record in place, a refresh changes nothing.
     assert_eq!(
         installed(install_for_account(&refresh, &account, home).unwrap()),
+        (2, false)
+    );
+    assert_eq!(
+        installed(install_for_account(&keeping, &account, home).unwrap()),
         (2, false)
     );
     // A record the receiver refuses, as after a restore from a backup with
@@ -781,6 +801,47 @@ pub(super) fn test_directive(
         [7; 32],
     )
     .unwrap()
+}
+
+/// A copy its receiver refused for running another build is signed again
+/// as the same copy: for its own enrollment, under its request ID, and with
+/// its start and finish times, so the receiver's record of used directives
+/// runs it at most once, and no later than the first could have run.
+#[test]
+fn a_refused_copy_is_signed_again_as_the_same_copy() {
+    let enrollment = EnrollmentId::random();
+    let first = test_directive(enrollment, 3, "backup");
+    let retry = Retry::of(&first);
+    let mut again = test_directive(enrollment, 4, "backup");
+    assert_ne!(again.request_id, first.request_id);
+    retry.apply(&mut again).unwrap();
+    assert_eq!(
+        (
+            again.request_id,
+            again.issued_at,
+            again.not_before,
+            again.start_by,
+            again.finish_by
+        ),
+        (
+            first.request_id,
+            first.issued_at,
+            first.not_before,
+            first.start_by,
+            first.finish_by
+        )
+    );
+    assert_eq!(again.binding.generation, 4);
+    // Not for another enrollment, as one set up again after a revoke.
+    let mut other = test_directive(EnrollmentId::random(), 1, "backup");
+    assert!(retry.apply(&mut other).is_err());
+    // Not once it may no longer start.
+    let mut expired = first.clone();
+    expired.start_by = crate::directive::now().unwrap() - 1;
+    let error = Retry::of(&expired)
+        .apply(&mut test_directive(enrollment, 4, "backup"))
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("expired"), "{error:#}");
 }
 
 pub(super) fn sign_test_directive(

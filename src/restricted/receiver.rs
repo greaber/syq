@@ -1010,7 +1010,14 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
                 .expect("account required");
             let (login, host) = enrollment_account(account)?;
             let via = via()?;
-            let (metadata, _, _) = enroll(&host, None, &login, (via.as_ref(), false), true, None)?;
+            let (metadata, _, _) = enroll(
+                &host,
+                None,
+                &login,
+                (via.as_ref(), false),
+                Refresh::Always,
+                None,
+            )?;
             crate::output::command_println!(
                 "enrolled {} for {}",
                 metadata.id,

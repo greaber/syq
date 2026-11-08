@@ -79,10 +79,13 @@ whichever of the two machines is older.
 A copy between two servers that you start on your laptop can also find the
 receiver running another build than your laptop recorded, for example after
 another syq on your laptop updated it. Then syq updates the receiver to its
-own build and runs the copy once more, signed as the same copy, so the
-receiver runs at most one of the two. It does this only when the server
-running the copy runs your laptop's build, as it does unless you pass
-`--syq-path` or `--no-bootstrap`, and never for a dry run.
+own build and runs the copy once more, signed as the same copy with the same
+time limits, so the receiver runs at most one of the two. It does this only
+when the server running the copy runs your laptop's build, as it does unless
+you pass `--syq-path` or `--no-bootstrap`, and never for a dry run. It doesn't
+when the enrollment was revoked or set up again meanwhile, when hostB's record
+of the copies it ran is damaged, or when the copy may no longer start; syq
+then reports the refusal, and running the copy again starts afresh.
 
 Only `syq receiver revoke ID`, or deleting syq's line from `authorized_keys`,
 ends an enrollment. Removing or revoking your login key, certificate, or
