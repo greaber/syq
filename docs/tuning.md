@@ -23,7 +23,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy -v \
 | `workers` | Automatic | 1 through 65536 filesystem workers, fewer when there is less work |
 | `comparison-block-size` | 64 KiB for replaced files up to 64 MiB; automatic from 64 KiB through 4 MiB for larger ones | 64 KiB through 64 MiB; filesystem copies only. Comparison can use up to 64 MiB of memory per worker |
 | `request-size` | Automatic, normally up to 4 MiB; at most 2 MiB for streaming | 512 bytes through 64 MiB |
-| `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
+| `pipeline-depth` | 4; automatic when comparing replaced files over 64 MiB | 1 through 64 outstanding range requests per endpoint per worker |
 | `copy-path` | `auto` | `auto`, `ranges`, `streaming`, `auto-streaming`; see below |
 | `batch-files` | Up to 2048 | 1 through 4096 files per worker batch |
 | `batch-bytes` | 16 MiB | 512 bytes through 64 MiB per worker batch |
