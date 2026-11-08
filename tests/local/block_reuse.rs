@@ -312,6 +312,7 @@ fn remote_defaults_reuse_blocks_for_push_and_pull() {
             &rsh,
             &[
                 "-a",
+                "--stats",
                 "--rsync-path",
                 env!("CARGO_BIN_EXE_syq"),
                 "--syq-no-bootstrap",
@@ -325,7 +326,11 @@ fn remote_defaults_reuse_blocks_for_push_and_pull() {
         .unwrap();
         assert_output_ok(&out);
         assert_eq!(read(&t.path("dst")), source);
-        assert_eq!(tuning_observed(&out)["range_requests"], 1);
+        // Only the changed half is sent, in whatever blocks the comparison
+        // chose, and the rest reused.
+        assert!(tuning_observed(&out)["range_requests"].as_u64().unwrap() > 0);
+        assert_eq!(stats_bytes(&out, "bytes transferred"), 4 << 20);
+        assert_eq!(stats_bytes(&out, "bytes unchanged or reused"), 4 << 20);
         assert!(stderr_of(&out).contains("transfer-strategy=locality (block reuse on)"));
     }
 }

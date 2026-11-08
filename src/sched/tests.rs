@@ -420,8 +420,8 @@ fn short_range_claim_leaves_a_share_for_a_waiting_worker() {
         let mut inner = sched.inner.lock().unwrap();
         // Publish without notifying yet: the owner can claim an extra,
         // but must leave another share for the sleeping peer.
-        inner.ranges.push((0, 1024, 1536));
-        inner.ranges.push((0, 2048, 2560));
+        inner.ranges.push((0, 1024, 1536), None);
+        inner.ranges.push((0, 2048, 2560), None);
         *inner.outstanding.get_mut(&0).unwrap() += 2;
     }
     let extra = sched.take_short_range(0, 512).unwrap();
@@ -451,24 +451,24 @@ fn range_queue_updates_file_maxima_and_preserves_equal_length_order() {
     // empty batches must not create an empty per-file index.
     queue.extend(0, &[(4096, 6144)]);
     queue.extend(3, &[]);
-    queue.push((1, 0, 2048));
-    queue.push((2, 0, 512));
+    queue.push((1, 0, 2048), None);
+    queue.push((2, 0, 512), None);
     assert_eq!(queue.len(), 5);
     assert_eq!(queue.bytes, 7168);
     assert_eq!(queue.largest.len(), 3);
     assert_eq!(queue.iter().count(), 5);
-    assert_eq!(queue.pop(), Some((1, 0, 2048)));
-    assert_eq!(queue.take_short(0, 512), Some((0, 0, 512)));
-    assert_eq!(queue.take_short(2, 512), Some((2, 0, 512)));
+    assert_eq!(queue.pop(), Some((1, 0, 2048, None)));
+    assert_eq!(queue.take_short(0, 512), Some((0, 0, 512, None)));
+    assert_eq!(queue.take_short(2, 512), Some((2, 0, 512, None)));
     assert_eq!(queue.largest.len(), 1);
     assert_eq!(queue.bytes, 4096);
     assert_eq!(queue.take_short(0, 512), None);
-    queue.push((0, 8192, 12288));
-    queue.push((1, 8192, 10240));
-    assert_eq!(queue.pop(), Some((0, 8192, 12288)));
-    assert_eq!(queue.pop(), Some((1, 8192, 10240)));
-    assert_eq!(queue.pop(), Some((0, 4096, 6144)));
-    assert_eq!(queue.pop(), Some((0, 1024, 3072)));
+    queue.push((0, 8192, 12288), None);
+    queue.push((1, 8192, 10240), None);
+    assert_eq!(queue.pop(), Some((0, 8192, 12288, None)));
+    assert_eq!(queue.pop(), Some((1, 8192, 10240, None)));
+    assert_eq!(queue.pop(), Some((0, 4096, 6144, None)));
+    assert_eq!(queue.pop(), Some((0, 1024, 3072, None)));
     assert!(queue.is_empty());
     assert!(queue.by_file.is_empty());
     assert!(queue.largest.is_empty());
@@ -492,7 +492,7 @@ fn range_queue_indexes_agree_after_interleaved_claims() {
     assert_eq!(queue.largest.len(), 200);
     for idx in (0..200).rev() {
         for _ in 0..125 {
-            let (_, off, end) = queue.take_short(idx, 512).unwrap();
+            let (_, off, end, _) = queue.take_short(idx, 512).unwrap();
             assert_eq!(end - off, 512);
         }
         assert!(queue.take_short(idx, 512).is_none());
@@ -500,7 +500,7 @@ fn range_queue_indexes_agree_after_interleaved_claims() {
     let mut remaining: u64 = queue.iter().map(|(_, o, e)| e - o).sum();
     assert_eq!(queue.bytes, remaining);
     let mut previous = u64::MAX;
-    while let Some((_, off, end)) = queue.pop() {
+    while let Some((_, off, end, _)) = queue.pop() {
         remaining -= end - off;
         assert_eq!(queue.bytes, remaining);
         assert!(end - off <= previous);
@@ -1454,4 +1454,53 @@ fn only_a_jobs_first_preparation_is_first() {
     assert!(jobs.first_preparation(1));
     // One bit per job up to the highest prepared.
     assert_eq!(jobs.prepared.len(), 1000 / 64 + 1);
+}
+
+#[test]
+fn queued_ranges_keep_the_split_hint_they_had_in_flight() {
+    let split = RangeSplit {
+        block: 512,
+        minimum: 64 << 10,
+    };
+    for how in ["release", "return", "retry", "none"] {
+        let sched = Sched::new(4 << 20, 32 << 20);
+        sched.inner.lock().unwrap().probing = 1;
+        let first = sched.ranges_ready(0, vec![(0, 8 << 20)]).unwrap();
+        sched.scan_done();
+        if how != "none" {
+            sched.update_range_split(&first, split);
+        }
+        first.lock().unwrap().pos = 1 << 20;
+        match how {
+            "release" | "none" => {
+                sched.release_rest(&first);
+                assert!(!sched.range_done(&first));
+            }
+            "return" => sched.return_unstarted(Item::Range(first)),
+            "retry" => sched.retry_range(&first, 1 << 20),
+            _ => unreachable!(),
+        }
+        let Item::Range(next) = sched.next() else {
+            panic!("{how}: expected the queued remainder")
+        };
+        let range = next.lock().unwrap();
+        assert_eq!((range.pos, range.end), (1 << 20, 8 << 20), "{how}");
+        assert_eq!(
+            range.split,
+            (how != "none").then_some(split),
+            "{how}: the claimed range starts from the hint it was queued with"
+        );
+        drop(range);
+        // Stealing from the claimed range follows its hint: 7 MiB splits
+        // under the 64 KiB minimum, not under the 32 MiB floor.
+        let stolen = sched.steal(&mut sched.inner.lock().unwrap());
+        assert_eq!(stolen.is_some(), how != "none", "{how}");
+        if let Some(stolen) = stolen {
+            assert_eq!(stolen.lock().unwrap().split, Some(split));
+        }
+        assert!(
+            sched.inner.lock().unwrap().ranges.splits.is_empty(),
+            "{how}"
+        );
+    }
 }

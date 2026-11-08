@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::sync::Mutex;
 
+mod comparing;
 mod diagnostics;
 mod dry_run;
 mod hardlinks;
@@ -3254,6 +3255,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         fast_batch_files,
                         batch_budget: WorkBudget::default(),
                         range_budget: None,
+                        comparison: Default::default(),
                         setup_elapsed: t0.elapsed(),
                     };
                     #[cfg(debug_assertions)]

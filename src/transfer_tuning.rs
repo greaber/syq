@@ -8,6 +8,9 @@ pub(crate) const DEFAULT_PIPELINE_DEPTH: usize = 4;
 /// Groups a worker keeps in flight while comparing replaced files in groups
 /// (`transfer::small_compare`), each with one request outstanding.
 pub(crate) const COMPARE_WINDOW: usize = 16;
+/// Block requests a comparison keeps awaiting replies on each connection,
+/// enough for small blocks to fill a long link (`transfer::comparing`).
+pub(crate) const COMPARE_REQUESTS: usize = 256;
 const MAX_PIPELINE_DEPTH: usize = 64;
 const MAX_REQUEST_BYTES: u64 = 64 << 20;
 pub(crate) const DEFAULT_BATCH_BYTES: u64 = 16 << 20;

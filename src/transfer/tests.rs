@@ -486,6 +486,7 @@ fn pipeline_worker(
         fast_batch_files: 1,
         batch_budget: WorkBudget::default(),
         range_budget: None,
+        comparison: Default::default(),
         setup_elapsed: std::time::Duration::ZERO,
     }
 }

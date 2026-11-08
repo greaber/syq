@@ -763,13 +763,15 @@ fn spawn_reader(
 /// still sending requests (including large path batches). A worker's queue
 /// also holds the replies of every group a grouped comparison keeps in
 /// flight: a source's carry differing blocks, and a read stream's blocks
-/// queue as deep.
+/// queue as deep. It also holds the replies to the block requests a
+/// comparison keeps in flight (`COMPARE_REQUESTS`), mostly short
+/// acknowledgments.
 fn reply_queue(read_ahead: usize, role: &ConnectionRole) -> usize {
     let replies = read_ahead.max(crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH);
     match role {
-        ConnectionRole::SourceWorker { .. } | ConnectionRole::DestinationWorker { .. } => {
-            replies.max(crate::transfer_tuning::COMPARE_WINDOW)
-        }
+        ConnectionRole::SourceWorker { .. } | ConnectionRole::DestinationWorker { .. } => replies
+            .max(crate::transfer_tuning::COMPARE_WINDOW)
+            .max(crate::transfer_tuning::COMPARE_REQUESTS),
         _ => replies,
     }
 }
