@@ -582,6 +582,7 @@ fn print_summary(terminal: &serde_json::Value) {
         None,
         elapsed_ms as f64 / 1000.0,
         &deletions,
+        "",
     );
 }
 

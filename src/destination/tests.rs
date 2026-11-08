@@ -1090,6 +1090,9 @@ fn named_copy_with_transport(tcp: bool) {
     let (command, request, _) = requested(&source, &[]);
     let mut args = crate::approval_command::parse(&command).unwrap();
     let approved = approve(&registration, command, request);
+    // The approval says in full where on this machine the copy goes, here
+    // the profile's directory for `--into .`; the server's summary shows it.
+    assert_eq!(approved.destination, root.as_os_str().as_bytes());
     // The route below replaces discovery of the named receiver.
     args.locations.last_mut().unwrap().host = Some("server".into());
     args.locations.last_mut().unwrap().path = approved.destination.clone();

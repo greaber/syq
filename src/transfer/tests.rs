@@ -6212,31 +6212,78 @@ fn the_summary_shows_reused_data_with_transferred_files_not_as_unchanged() {
     // A retry that reused 120 MiB inside the files it finished.
     let retried = summary_record(4, 136 * MIB, 0, 120 * MIB);
     assert_eq!(
-        transfer_summary_counts(&retried, Some(120 * MIB)),
+        transfer_summary_counts(&retried, Some(120 * MIB), ""),
         "transferred 4 files (136 MiB, plus 120 MiB reused), 0 B unchanged (0 files)"
     );
     // From the results alone: with no unchanged files, all of it was reused.
     assert_eq!(
-        transfer_summary_counts(&retried, None),
-        transfer_summary_counts(&retried, Some(120 * MIB))
+        transfer_summary_counts(&retried, None, ""),
+        transfer_summary_counts(&retried, Some(120 * MIB), "")
     );
     // Without reuse the line is as before.
     let plain = summary_record(3, 4096, 2, 10 * MIB);
     assert_eq!(
-        transfer_summary_counts(&plain, Some(0)),
+        transfer_summary_counts(&plain, Some(0), ""),
         "transferred 3 files (4.00 KiB), 10.0 MiB unchanged (2 files)"
     );
     // Both kinds.
     let both = summary_record(1, MIB, 2, 10 * MIB);
     assert_eq!(
-        transfer_summary_counts(&both, Some(2 * MIB)),
+        transfer_summary_counts(&both, Some(2 * MIB), ""),
         "transferred 1 files (1.00 MiB, plus 2.00 MiB reused), 8.00 MiB unchanged (2 files)"
     );
     // The results alone cannot split them.
     assert_eq!(
-        transfer_summary_counts(&both, None),
+        transfer_summary_counts(&both, None, ""),
         "transferred 1 files (1.00 MiB), 10.0 MiB unchanged or reused (2 files unchanged)"
     );
+}
+
+/// A copy to a receiving machine says where the machine put its files: it
+/// resolves the destination in its profile's directory, so the command's
+/// `--into` or `--as` alone does not say.
+#[test]
+fn a_copy_to_a_receiving_machine_says_where_its_files_are() {
+    let command: Vec<Vec<u8>> = ["cp", "results", "--to", "@laptop", "--as", "x"]
+        .iter()
+        .map(|arg| arg.as_bytes().to_vec())
+        .collect();
+    let mut args = crate::approval_command::parse(&command).unwrap();
+    let mut dst = args.locations.last().unwrap().clone();
+    // Before the approval, nothing says where the copy goes.
+    assert_eq!(received_at(&args, &dst, false), "");
+    // As `destination::prepare` leaves them with the machine's approval.
+    dst.host = Some("@laptop".into());
+    dst.path = b"/home/alice/Downloads/server/x".to_vec();
+    args.restricted_grant = Some("named-v2:route".into());
+    assert_eq!(
+        received_at(&args, &dst, false),
+        " to @laptop:/home/alice/Downloads/server/x"
+    );
+    assert_eq!(
+        transfer_summary_counts(
+            &summary_record(3, 4096, 0, 0),
+            Some(0),
+            &received_at(&args, &dst, false)
+        ),
+        "transferred 3 files (4.00 KiB) to @laptop:/home/alice/Downloads/server/x, 0 B unchanged (0 files)"
+    );
+    dst.path = b"/home/alice/Downloads/server".to_vec();
+    assert_eq!(
+        received_at(&args, &dst, true),
+        " into @laptop:/home/alice/Downloads/server"
+    );
+    // A path the machine approved is shown as any destination path is, with
+    // control characters escaped.
+    dst.path = b"/home/alice/new\nline\x1b[2J".to_vec();
+    assert_eq!(
+        received_at(&args, &dst, true),
+        " into @laptop:/home/alice/new\\nline\\u{1b}[2J"
+    );
+    // A copy from a receiving machine comes here; its command names where.
+    let mut here = dst.clone();
+    here.host = None;
+    assert_eq!(received_at(&args, &here, true), "");
 }
 
 #[test]

@@ -68,7 +68,8 @@ syq cp report.pdf --to @laptop --as reports/latest.pdf
 Write the `@`: without it, `--to laptop` names an SSH server. Files go to the
 profile's starting directory (your home directory unless you set `--cwd`,
 `--root` or `--auto-approve-root`), or to a path you give with `--into` or
-`--as`, relative to that directory or absolute.
+`--as`, relative to that directory or absolute. The summary on the server says
+where they went on your laptop, such as `into @laptop:/home/alice`.
 
 Each copy waits for approval **on your laptop**. The prompt shows the server,
 what is copied where, and a warning for each option that lets the server do
