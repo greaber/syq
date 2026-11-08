@@ -1362,7 +1362,7 @@ impl Queue {
         from: &Requester,
         command: &[Vec<u8>],
         cwd: &str,
-        (target, enrollment): (&str, crate::restricted::EnrollmentState),
+        (target, enrollment, as_root): (&str, crate::restricted::EnrollmentState, bool),
         request: &crate::destination::pull::PullRequest,
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
@@ -1392,11 +1392,17 @@ impl Queue {
             ),
             _ => String::new(),
         };
-        let permission = format!("May list and read the selected directory trees or exact non-directory entries. Filters narrow the copy, not this read permission.{root} The files go directly to the server that asks. The copy only reads: it cannot write or remove anything on {target:?}. {}.", setup_text(target, enrollment));
+        let as_root = if as_root {
+            format!(" This machine logs in to {target:?} as root, so file permissions there do not limit what it can read.")
+        } else {
+            String::new()
+        };
+        let permission = format!("May list and read the selected directory trees or exact non-directory entries. Filters narrow the copy, not this read permission.{root} The files go directly to the server that asks. The copy only reads: it cannot write or remove anything on {target:?}.{as_root} {}.", setup_text(target, enrollment));
         let mut notes = vec![
             permission.clone(),
             "Read authority ends when this copy closes, or after seven days.".into(),
         ];
+
         if let Some(port) = server.as_ref().and_then(|server| server.port) {
             notes.push(format!("the source's SSH port is {port}"));
         }

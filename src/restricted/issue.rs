@@ -72,7 +72,8 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
     let account = endpoint(destination_login, host, port)?.label();
     // The receiver writes or coordinates only as an ordinary account; say so
     // before setting anything up. An account with another name and user ID 0
-    // is refused by its receiver.
+    // is refused once the enrollment session reports its user ID, or, when
+    // already enrolled, by its receiver.
     if privilege::refuses_privileged(&role) && destination_login == "root" {
         bail!(privilege::privileged_receiver_message(None));
     }
@@ -101,7 +102,16 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
     // A destination the receiver would refuse is refused before anything
     // is set up or refreshed on the server, from the same rules. A source
     // reads what its command names as the account would.
-    let check = |home: &Path, receiving: &[PathBuf]| {
+    let refuses_privileged = privilege::refuses_privileged(&role);
+    let check = |home: &Path, receiving: &[PathBuf], uid: &str| {
+        // An account with another name and user ID 0 is refused here, before
+        // anything is installed for a copy it could not serve.
+        if uid == "0" {
+            bail!(privilege::privileged_receiver_message(None));
+        }
+        if !is_destination {
+            return Ok(());
+        }
         checked_destination(
             &directive_for(EnrollmentId::random(), 1)?,
             (home, receiving),
@@ -115,14 +125,19 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
             destination_login,
             (jump.as_ref(), batch),
             refresh,
-            is_destination.then_some(&check as &dyn Fn(&Path, &[PathBuf]) -> Result<()>),
+            refuses_privileged.then_some(&check as &dyn Fn(&Path, &[PathBuf], &str) -> Result<()>),
         )
     };
     let found = load_local_enrollments()?.into_iter().find(|(metadata, _)| {
         metadata.host == host && metadata.port == port && metadata.target_login == destination_login
     });
     if let Some((metadata, _)) = found.as_ref().filter(|_| is_destination) {
-        check(Path::new(&metadata.remote_home), &metadata.receiving_state)?;
+        // The enrollment records no user ID; its receiver refuses user ID 0.
+        check(
+            Path::new(&metadata.remote_home),
+            &metadata.receiving_state,
+            "",
+        )?;
     }
     let (metadata, directory, signer) = match found {
         Some((metadata, directory)) if !needs_refresh(&metadata, &directory) => {

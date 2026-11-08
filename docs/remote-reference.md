@@ -22,7 +22,8 @@ first copy to a server account sets this up there, once for each of your
 machines; this is called enrollment. To do it ahead of time, run
 `syq receiver enroll HOST`. Enrollment needs an SSH key or certificate login.
 A root account can be enrolled, but its receiver serves only downloads: it
-refuses uploads and copies to another server.
+refuses copies that write to the account, and copies between servers that it
+would run.
 
 Enrollment adds one line to the server's `~/.ssh/authorized_keys`. Its key,
 the entry key, can only start syq's receiver, and its comment,

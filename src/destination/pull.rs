@@ -461,7 +461,7 @@ impl Receiver {
             &self.requester,
             &command,
             &cwd,
-            (&target, source.enrollment),
+            (&target, source.enrollment, source.is_root()),
             &reads,
             self.notifications,
             cancelled,
@@ -672,6 +672,12 @@ mod tests {
         };
         use crate::receive_approval::Kind;
         assert_eq!(pending.kind(), Kind::Source);
+        let description =
+            pending.description(&crate::persistence::Domain::default(), str::to_owned);
+        assert!(
+            description.contains("as root, so file permissions there do not limit"),
+            "{description}"
+        );
         receiver
             .approvals
             .decide(&pending.id, false, Kind::Source)
@@ -718,6 +724,7 @@ mod tests {
             assert!(description.contains("restricted copying on \"backup\""));
             // Approving sets up the source, but the copy itself only reads.
             assert!(description.contains("The copy only reads"), "{description}");
+            assert!(!description.contains("as root"), "{description}");
             assert!(!description.contains("is changed"), "{description}");
             for old in [Kind::Copy, Kind::Command, Kind::Ssh, Kind::Storage] {
                 assert!(receiver.approvals.decide(&pending.id, true, old).is_err());

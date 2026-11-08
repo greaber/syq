@@ -498,6 +498,12 @@ pub(super) struct Account {
 }
 
 impl Account {
+    /// Whether this machine's SSH configuration logs in to the account as
+    /// root.
+    pub(super) fn is_root(&self) -> bool {
+        self.login == "root"
+    }
+
     pub(super) fn label(&self) -> String {
         format!("{}@{}", self.login, self.endpoint.host)
     }
@@ -517,14 +523,15 @@ impl Account {
         })
     }
 
-    /// Restricted receivers do not run as root: refuse a copy `direction`
-    /// ("to" or "from") such an account before anything is asked or set up,
-    /// with `advice` for what to do instead. An account with another name
-    /// and user ID 0 is refused when enrolling.
+    /// Restricted receivers do not write or run copies as root: refuse a
+    /// copy `direction` ("to" or "from") such an account that would need
+    /// one, before anything is asked or set up, with `advice` for what to do
+    /// instead. An account with another name and user ID 0 is refused when
+    /// enrolling, or by its receiver when already enrolled.
     pub(super) fn refuse_root(&self, direction: &str, advice: &str) -> Result<()> {
-        if self.login == "root" {
+        if self.is_root() {
             bail!(
-                "syq's restricted receiver does not run as root, so a copy {direction} {} cannot be approved for one copy; {advice}",
+                "syq's restricted receiver does not write or run copies as root, so a copy {direction} {} cannot be approved for one copy; {advice}",
                 self.label()
             );
         }
@@ -1712,7 +1719,7 @@ mod tests {
         .unwrap();
         let message = format!("{error:#}");
         for expected in [
-            "does not run as root",
+            "does not write or run copies as root",
             "a copy to root@backup",
             "copy to an ordinary account on backup",
         ] {

@@ -490,9 +490,10 @@ enum Session {
 }
 
 /// What a copy checks once a session knows the server's home directory,
-/// before anything is installed: that its destination is not a path the
-/// receiver protects.
-pub(super) type DestinationCheck<'a> = Option<&'a dyn Fn(&Path, &[PathBuf]) -> Result<()>>;
+/// receiving state and user ID, before anything is installed: that the
+/// account may serve it (a copy that writes or coordinates is refused for
+/// user ID 0) and that its destination is not a path the receiver protects.
+pub(super) type DestinationCheck<'a> = Option<&'a dyn Fn(&Path, &[PathBuf], &str) -> Result<()>>;
 
 /// The enrollment for `login@host:port`, set up when there is none, and
 /// refreshed when it runs another build or `refresh` asks to find the
@@ -781,10 +782,10 @@ fn install_over_route(
         }
         let mut authorized = vec![0u8; length];
         stdout.read_exact(&mut authorized)?;
-        Ok((os, arch, home, receiving, stored, authorized))
+        Ok((os, arch, home, receiving, stored, authorized, uid))
     })();
     drop(foreground);
-    let (os, arch, home, receiving, stored, authorized) = match platform {
+    let (os, arch, home, receiving, stored, authorized, uid) = match platform {
         Ok(platform) => platform,
         Err(error) => {
             drop(input);
@@ -813,9 +814,9 @@ fn install_over_route(
     // Everything before the request is checked with nothing installed: an
     // error closes the session's input, and the remote shell stops.
     let prepared = (|| -> Result<_> {
-        // A destination the receiver would refuse leaves no enrollment.
+        // A copy the receiver would refuse leaves no enrollment.
         if let Some(check) = check {
-            check(Path::new(&home), &receiving)?;
+            check(Path::new(&home), &receiving, &uid)?;
         }
         let trace =
             fs::read_to_string(&trace_path).context("read enrollment SSH authentication trace")?;

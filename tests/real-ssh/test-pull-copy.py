@@ -345,7 +345,7 @@ def main():
         roots[as_root] = remote(as_root, "mktemp -d /tmp/syq-pull-root.XXXXXX").strip()
         secret = roots[as_root] + "/secret"
         remote(as_root, "dd if=/dev/urandom of=" + shlex.quote(secret)
-               + " bs=1M count=4 status=none && chmod 600 " + shlex.quote(secret))
+               + " bs=1M count=8 status=none && chmod 600 " + shlex.quote(secret))
         assert remote(as_root, "stat -c '%U %a' " + shlex.quote(secret)).split() == ["root", "600"]
         remote("destination", "cat " + shlex.quote(secret), success=False)
         secret_digest, account_keys = digest(as_root, secret), authorized_keys()
@@ -398,7 +398,7 @@ def main():
         refused("source", ["syq", "cp", into + "/approved", "--to", as_root,
                            "--as", roots[as_root] + "/upload", "--auth-from", "auto",
                            "--no-progress"],
-                "does not run as root, so a copy to root@destination cannot be approved", before)
+                "does not write or run copies as root, so a copy to root@destination cannot be approved", before)
 
         print("case: a copy this machine starts between servers to root is refused before setup", flush=True)
         text = refused(None, ["syq", "cp", "--from", "source", into + "/approved", "--to", as_root,
