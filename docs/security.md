@@ -614,3 +614,17 @@ a source server. **Allow** lasts for the current provider connection;
 **Remember** covers later logins to that provider account through the same
 profile and domain. Stopping receiving prevents further syq authorizations but
 does not revoke SSH access to the provider.
+
+A provider can also approve each
+[copy between two other servers](remote-reference.md#copies-between-two-other-servers)
+separately, as your laptop does for hostX above, and never approves one by
+itself. Its prompt says that it can't confirm which server is asking.
+What you approve goes back only over the provider login that sent that
+request, and it allows only the copy the prompt shows, once, as the copy's
+signed command states. So if two servers send similar requests and you approve
+the wrong one, the server that sent it gets that copy and nothing more: it
+can't use another request's approval, change the accounts or paths, or reuse
+it. It does keep both entry keys and hostC's signed copy, as hostX does. A
+server that can log in to the provider account could already do more than
+that without asking, so the prompt guards against mistakes, not against those
+servers.

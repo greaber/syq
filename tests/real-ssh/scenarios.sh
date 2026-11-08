@@ -754,6 +754,9 @@ python3 /usr/local/libexec/syq-test-account-switch.py
 printf 'case: copies between two other servers run on the enrolled source\n'
 python3 /usr/local/libexec/syq-test-between-servers.py
 
+printf 'case: an SSH provider approves copies between two other servers\n'
+python3 /usr/local/libexec/syq-test-provider-between-servers.py
+
 printf 'case: storage authorization through the return connection\n'
 python3 /usr/local/libexec/syq-test-storage-authorization.py
 

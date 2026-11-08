@@ -139,6 +139,11 @@ that a dry run sets nothing up and a denial changes nothing, that the source's
 enrolled receiver runs the copy and sends TCP and SSH data directly to the
 destination's, that the requester checks the destination's results, that the
 copy outlives the laptop, and that killing the requester stops it on the source.
+A second three-server case has an ordinary SSH provider approve such copies: its
+prompt says it can't confirm which server asks, the first approval enrolls the
+source, a dry run or denial changes nothing, a saved choice selects it, each of
+two provider logins gets only its own decision, and an upload that selects the
+provider asks for account access instead.
 The download case also enrolls the destination's root account: its receiver
 reads a file only root can read, while an upload to root and a copy between
 servers to root started on the runner are refused before anything is asked or

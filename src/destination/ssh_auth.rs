@@ -1436,6 +1436,7 @@ mod tests {
         let requester = crate::receive_approval::Requester {
             server: "test-server".into(),
             profile: "laptop".into(),
+            provider_account: None,
         };
         let reason = r#"KnownHostsCommand is configured as "/private/source-helper %h""#;
         let source = Mutex::new(Err(reason.to_owned()));

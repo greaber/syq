@@ -229,16 +229,21 @@ for a directory named `~`.
 ## Copies between two other servers
 
 To copy from hostB to hostC while working on a third server, select a
-receiving machine with `--auth-from @NAME`, or save one for either server
-(`auto` and `ssh` never ask). The receiving machine asks you once, applies its
-copy limits, and sets up or updates the [enrollment](#enrollment) on each
-account when needed, over its own SSH logins without prompts, as for an upload
-(see [Authorization selection](#authorization-selection)); a dry run never
-sets them up. If it can't reach hostB or hostC along its own SSH
-configuration's route, it logs in through the server you run the command on,
-whose SSH server must then allow TCP forwarding and which must reach that
-server's SSH port. Account approvals are not used, and an SSH authorization
-provider cannot approve these copies.
+receiving machine with `--auth-from @NAME` or an
+[SSH authorization provider](persistence-reference.md#ssh-authorization-providers)
+with `--auth-from [USER@]HOST[:PORT]`, or save either for one of the servers
+(`auto` and `ssh` never ask). The receiving machine or provider asks you once,
+applies its copy limits, and sets up or updates the [enrollment](#enrollment)
+on each account when needed, over its own SSH logins without prompts, as for an
+upload (see [Authorization selection](#authorization-selection)); a dry run
+never sets them up. If a receiving machine can't reach hostB or hostC along
+its own SSH configuration's route, it logs in through the server you run the
+command on, whose SSH server must then allow TCP forwarding and which must
+reach that server's SSH port. A provider can't tell which server is asking, so
+it reaches both only along its own route, and its prompt names the provider
+account instead of your server; see
+[provider trust](security.md#ordinary-ssh-authorization-providers). Account
+approvals are not used for these copies.
 
 The server you run the command on logs in to hostB's restricted receiver,
 which runs the copy and sends file data directly to hostC's receiver. Your

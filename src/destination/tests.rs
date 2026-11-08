@@ -636,6 +636,7 @@ fn broker_confined(
         requester: crate::receive_approval::Requester {
             server: "test-server".into(),
             profile: "test".into(),
+            provider_account: None,
         },
         auto_approve_root: Some(root.into()),
         notifications: crate::receive_approval::Notifications::Off,

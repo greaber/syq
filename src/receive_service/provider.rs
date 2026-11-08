@@ -55,6 +55,10 @@ enum Access {
 pub(crate) enum SessionRequest {
     ResolveLocal(ssh_auth::LocalTarget),
     LocalAccount(ssh_auth::LocalRequest),
+    /// A copy between two other servers that the login asks this provider
+    /// to approve, as a receiving machine approves one
+    /// (`destination::forward::approve`).
+    Forward(Box<crate::destination::forward::ForwardRequest>),
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -466,6 +470,9 @@ struct Session {
     request_lock: Mutex<()>,
     active_count: AtomicU64,
     grants: Mutex<HashMap<String, u64>>,
+    /// Copies between two servers this login asked for, waiting for
+    /// approval or setup.
+    forward_count: AtomicUsize,
 }
 impl Session {
     fn close(&self) {
@@ -875,6 +882,30 @@ impl Service {
                                 context, request, tracked, 0, &cancelled,
                             )
                         }
+                        SessionRequest::Forward(request) => {
+                            // Ending the session shuts this request down.
+                            let _tracked = tracked;
+                            let settings = &session.profile.settings;
+                            let requester = crate::receive_approval::Requester::provider_login(
+                                &session.identity.user,
+                                &settings.name,
+                            );
+                            crate::destination::forward::Approver {
+                                origin: crate::destination::forward::Origin::Provider,
+                                requester: &requester,
+                                approvals: &session.profile.approvals,
+                                notifications: settings.notifications,
+                                caps: crate::directive::Caps {
+                                    max_bytes: settings.max_bytes,
+                                    max_entries: settings.max_entries,
+                                    max_delete: settings.max_delete,
+                                },
+                                request_lock: &session.request_lock,
+                                forward_count: &session.forward_count,
+                                cancelled: &cancelled,
+                            }
+                            .approve(*request, &mut stream)
+                        }
                     }
                 })();
                 if let Err(error) = result {
@@ -954,6 +985,7 @@ impl Service {
             request_lock: Mutex::new(()),
             active_count: AtomicU64::new(0),
             grants: Mutex::new(HashMap::new()),
+            forward_count: AtomicUsize::new(0),
         });
         inner
             .sessions
@@ -2043,6 +2075,117 @@ mod tests {
         assert!(state.decision_error.is_none());
         handler.join().unwrap().unwrap();
         assert_eq!(request.join().unwrap().unwrap(), AccountDecision::Session);
+        service.close();
+    }
+
+    /// Each login's request for a copy between two other servers waits for
+    /// its own decision, and the answer goes only to the login that asked:
+    /// denying one leaves the other pending, and ending the other login's
+    /// attachment ends its request unanswered.
+    #[test]
+    fn a_copy_decision_reaches_only_the_login_that_asked() {
+        let (_directory, domain, _) = fixture();
+        let service = Arc::new(Service::new(domain, None).unwrap());
+        let ask = |output: &str| {
+            let (ticket, session) = service.open_identified(None, identity).unwrap();
+            let (mut client, server) = pair(&service);
+            client
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let handler_service = service.clone();
+            let handler = std::thread::spawn(move || handler_service.handle(server));
+            crate::destination::write_message(
+                &mut client,
+                &Hello {
+                    version: PROTOCOL,
+                    build: crate::identity::build().into(),
+                    control: false,
+                },
+            )
+            .unwrap();
+            let _: HelloReply = crate::destination::read_message(&mut client).unwrap();
+            let command = [
+                "cp",
+                "--from",
+                "reader@source-host",
+                "--srcs-in",
+                "data",
+                "--to",
+                "backup",
+                "--into",
+                output,
+            ]
+            .map(|arg| arg.as_bytes().to_vec())
+            .to_vec();
+            crate::destination::write_message(
+                &mut client,
+                &Access::Request {
+                    session: ticket.session,
+                    operation: Box::new(SessionRequest::Forward(Box::new(
+                        crate::destination::forward::ForwardRequest {
+                            source: Some("reader@source-host".into()),
+                            target: "backup".into(),
+                            command,
+                            cwd: "~".into(),
+                            inputs: crate::directive::Inputs::default(),
+                            results_key: Some([5; 32]),
+                        },
+                    ))),
+                },
+            )
+            .unwrap();
+            (session, client, handler)
+        };
+        let (first_session, mut first, first_handler) = ask("first-output");
+        let (second_session, mut second, second_handler) = ask("second-output");
+        let pending = || {
+            service
+                .snapshot(None)
+                .profiles
+                .iter()
+                .flat_map(|profile| profile.pending.clone())
+                .collect::<Vec<_>>()
+        };
+        wait_until(|| pending().len() == 2);
+        let describe = |summary: &crate::receive_approval::Summary| {
+            summary.description(&Domain::default(), str::to_owned)
+        };
+        let requests = pending();
+        let first_request = requests
+            .iter()
+            .find(|summary| describe(summary).contains("first-output"))
+            .unwrap();
+        for summary in &requests {
+            assert!(describe(summary).contains("syq can't confirm which server is asking"));
+        }
+        first_session
+            .profile
+            .approvals
+            .decide(
+                &first_request.id,
+                false,
+                crate::receive_approval::Kind::Copy,
+            )
+            .unwrap();
+        let reply: serde_json::Value = crate::destination::read_message(&mut first).unwrap();
+        assert!(reply.get("Error").is_some(), "{reply}");
+        first_handler.join().unwrap().unwrap();
+        // The other login's request is untouched.
+        let left = pending();
+        assert_eq!(left.len(), 1);
+        assert!(describe(&left[0]).contains("second-output"));
+        second_session.close();
+        let reply = crate::destination::read_message::<serde_json::Value>(&mut second);
+        assert!(
+            reply
+                .as_ref()
+                .map_or(true, |reply| reply.get("Directive").is_none()),
+            "{reply:?}"
+        );
+        // Closing the session shut its socket, so no reply may reach it.
+        let _ = second_handler.join().unwrap();
+        wait_until(|| pending().is_empty());
+        assert_eq!(service.requests.load(Ordering::SeqCst), 0);
         service.close();
     }
 

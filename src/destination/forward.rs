@@ -91,7 +91,12 @@ pub(super) fn select(
         crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Ssh { .. })
             if between_servers(args) =>
         {
-            bail!("a copy between two servers cannot use account access from an SSH provider; use --auth-from @NAME for a copy a receiving machine approves, or --coordinate-at local to copy through this machine with the provider's access");
+            // The provider approves this copy once the command has read its
+            // inputs (`prepare_through_provider`). Refuse here, before that,
+            // what it would refuse in the command alone.
+            eligible_peer(args)?;
+            handoff::refuse_unsupported_preservation(args)?;
+            return Ok(None);
         }
         crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Ssh { .. }) => {
             bail!("this copy cannot use account authorization from an SSH provider; use a supported direct SSH copy or --auth-from @NAME for per-copy authorization");
@@ -272,14 +277,110 @@ fn left_out_notices(
         .collect()
 }
 
-/// Ask the receiving machine to approve a copy between two servers, then
-/// set up this machine's connection to the source's receiver, which runs
-/// the copy.
-fn prepare_coordinated(
-    args: &mut crate::cli::Args,
-    name: String,
-    registration: Registration,
-) -> Result<()> {
+/// What approves a copy between two servers that this machine starts.
+enum Approving {
+    /// A receiving machine, by the name it registered here.
+    Return {
+        name: String,
+        registration: Registration,
+    },
+    /// An SSH authorization provider, over this machine's own login to it.
+    Provider(crate::auth_from::Provider),
+}
+
+impl Approving {
+    fn label(&self) -> String {
+        match self {
+            Self::Return { name, .. } => format!("@{name}"),
+            Self::Provider(provider) => provider.label(),
+        }
+    }
+
+    /// Send `request` and read the reply, within what the approver may
+    /// take to decide and set the accounts up.
+    fn ask(&self, args: &crate::cli::Args, request: ForwardRequest) -> Result<Reply> {
+        let timeout = REQUEST_TIMEOUT + SETUP_TIMEOUT + Duration::from_secs(10);
+        match self {
+            Self::Return { registration, .. } => {
+                let (stream, reply) = exchange(
+                    registration,
+                    Message::Forward(Box::new(request)),
+                    timeout,
+                    None,
+                )?;
+                // The copy needs nothing more from the receiving machine.
+                drop(stream);
+                Ok(reply)
+            }
+            Self::Provider(provider) => crate::auth_from::selected_context(
+                ask_provider(args, provider, request, Instant::now() + timeout),
+                &args.auth_from,
+                args.auth_from_explicit,
+            ),
+        }
+    }
+}
+
+/// Ask `provider`, over this machine's login to it, to approve a copy
+/// between two servers.
+fn ask_provider(
+    args: &crate::cli::Args,
+    provider: &crate::auth_from::Provider,
+    request: ForwardRequest,
+    deadline: Instant,
+) -> Result<Reply> {
+    let domain = crate::persistence::Domain::select(args.pscope.as_deref())?;
+    let binding = super::ssh::provider::resolve_connection(&domain, provider)?;
+    let mut stream = super::ssh::provider::open(
+        &domain,
+        provider,
+        &binding,
+        crate::receive_service::provider::SessionRequest::Forward(Box::new(request)),
+    )?;
+    let reply = read_message(&mut super::DeadlineSocket {
+        socket: &mut stream,
+        deadline,
+    })?;
+    // The copy needs nothing more from the provider.
+    drop(stream);
+    match reply {
+        Reply::Error(error) | Reply::RetryableError(error) => {
+            bail!("SSH authorization provider {}: {error}", provider.label())
+        }
+        reply => Ok(reply),
+    }
+}
+
+/// The SSH authorization provider that approves this copy between two
+/// servers, if one does: the command selected it, explicitly or by a saved
+/// choice, for a copy that runs on the source.
+fn approving_provider(args: &crate::cli::Args) -> Option<crate::auth_from::Provider> {
+    match &args.auth_from {
+        crate::cli::AuthFrom::Provider(provider @ crate::auth_from::Provider::Ssh { .. })
+            if args.interface == crate::cli::Interface::NativeCp
+                && args.coordinate_at != crate::cli::CoordinateAt::Local
+                && between_servers(args) =>
+        {
+            Some(provider.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Ask the SSH authorization provider the command selected to approve its
+/// copy between two servers, if it selected one (`select` checked the
+/// command), and set the copy up as `prepare_coordinated` does.
+pub(super) fn prepare_through_provider(args: &mut crate::cli::Args) -> Result<()> {
+    match approving_provider(args) {
+        Some(provider) => prepare_coordinated(args, Approving::Provider(provider)),
+        None => Ok(()),
+    }
+}
+
+/// Ask the receiving machine or SSH authorization provider to approve a
+/// copy between two servers, then set up this machine's connection to the
+/// source's receiver, which runs the copy.
+fn prepare_coordinated(args: &mut crate::cli::Args, approving: Approving) -> Result<()> {
     let (source, target) = eligible_peer(args)?;
     // Refused here as a local copy refuses it, before the receiving machine
     // is asked.
@@ -300,24 +401,20 @@ fn prepare_coordinated(
     // for a copy between two servers it started with its own access.
     let (secret, results_key) = crate::destination_results::generate_recipient()?;
     super::notices::waiting(
-        &format!("@{name}"),
+        &approving.label(),
         &format!("this copy from {source} to {target}"),
     );
-    let (stream, reply) = exchange(
-        &registration,
-        Message::Forward(Box::new(ForwardRequest {
+    let reply = approving.ask(
+        args,
+        ForwardRequest {
             source: Some(source.clone()),
             target: target.clone(),
             command,
             cwd: crate::approval_command::current_directory(),
             inputs,
             results_key: Some(results_key),
-        })),
-        REQUEST_TIMEOUT + SETUP_TIMEOUT + Duration::from_secs(10),
-        None,
+        },
     )?;
-    // The copy needs nothing more from the receiving machine.
-    drop(stream);
     let Reply::Directive(issued) = reply else {
         bail!("unexpected remote copy approval response");
     };
@@ -377,7 +474,9 @@ fn prepare_coordinated(
             records: args.native_results.is_some() || args.native_results_fd.is_some(),
         })),
     }));
-    args.auth_from = crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name));
+    if let Approving::Return { name, .. } = approving {
+        args.auth_from = crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name));
+    }
     Ok(())
 }
 
@@ -389,7 +488,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
         ..
     } = selection;
     if between_servers(args) {
-        return prepare_coordinated(args, name, registration);
+        return prepare_coordinated(args, Approving::Return { name, registration });
     }
     let target = target.context("remote authorization target missing")?;
     // Refused with advice before anything is asked when an approval cannot
@@ -483,18 +582,18 @@ impl Drop for Slot<'_> {
 /// The server sends what its command read from files.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ForwardRequest {
+pub(crate) struct ForwardRequest {
     /// For a copy between two other servers, the source as the command
     /// names it; otherwise the files are on the server that asks.
-    pub(super) source: Option<String>,
+    pub(crate) source: Option<String>,
     /// The destination as the command names it.
-    pub(super) target: String,
-    pub(super) command: Vec<Vec<u8>>,
-    pub(super) cwd: String,
-    pub(super) inputs: crate::directive::Inputs,
+    pub(crate) target: String,
+    pub(crate) command: Vec<Vec<u8>>,
+    pub(crate) cwd: String,
+    pub(crate) inputs: crate::directive::Inputs,
     /// For a copy between two other servers, the requester's key for the
     /// destination's results, which it checks.
-    pub(super) results_key: Option<[u8; 32]>,
+    pub(crate) results_key: Option<[u8; 32]>,
 }
 
 /// An account this machine reaches with its own SSH, and what its records
@@ -594,13 +693,93 @@ impl Account {
     }
 }
 
+/// Where a request to approve a copy to another server arrives, which
+/// decides what its command may select and how this machine reaches the
+/// accounts.
+pub(crate) enum Origin<'a> {
+    /// A receiving connection to the server that asked, which its command
+    /// selects by `name`. Enrolling can go through that server, `via` the
+    /// login, host and port this machine's receiving connection uses.
+    Receiving {
+        name: &'a str,
+        via: (Option<String>, String, Option<u16>),
+    },
+    /// A login to this SSH authorization provider, which cannot tell which
+    /// server made it. It approves only copies between two other servers:
+    /// an upload that selects a provider uses its account access instead.
+    Provider,
+}
+
+/// Who approves a server's copy to another server here, and what it applies
+/// to the copy: a receiving connection's profile, or an SSH authorization
+/// provider's.
+pub(crate) struct Approver<'a> {
+    pub(crate) origin: Origin<'a>,
+    /// Who asks, as the prompt names them.
+    pub(crate) requester: &'a crate::receive_approval::Requester,
+    pub(crate) approvals: &'a crate::receive_approval::Queue,
+    pub(crate) notifications: crate::receive_approval::Notifications,
+    pub(crate) caps: crate::directive::Caps,
+    /// Held while a decision is pending, so that one is pending at a time.
+    pub(crate) request_lock: &'a Mutex<()>,
+    /// Copies to other servers waiting here for approval or setup.
+    pub(crate) forward_count: &'a AtomicUsize,
+    /// Whether the request ended: the server that asked went, or approving
+    /// stopped.
+    pub(crate) cancelled: &'a dyn Fn() -> bool,
+}
+
 impl Receiver {
     /// Approve a server's copy to another server, or between two other
-    /// servers: show the command, then, over this machine's own SSH, set up
-    /// or refresh the accounts' enrollments and sign their directives. The
-    /// server connects to the receiver itself; this machine is not part of
-    /// the copy after it replies.
+    /// servers, as `approve` does, for as long as this receiving connection
+    /// and its server last.
     pub(super) fn forward(&self, request: ForwardRequest, mut stream: TrackedStream) -> Result<()> {
+        let (generation, _channel) = {
+            // Serialize registration with revocation, including reconnects.
+            let _sessions = self.sessions.lock().unwrap();
+            (
+                self.generation.load(Ordering::Acquire),
+                self.active_streams.track(stream.try_clone()?)?,
+            )
+        };
+        let socket = stream.try_clone()?;
+        let cancelled = || {
+            self.stop.load(Ordering::Acquire)
+                || self.generation.load(Ordering::Acquire) != generation
+                || requester_closed(&socket)
+        };
+        Approver {
+            origin: Origin::Receiving {
+                name: &self.name,
+                via: (
+                    self.server_user.clone(),
+                    self.tcp_peer.host.clone(),
+                    self.tcp_peer.port,
+                ),
+            },
+            requester: &self.requester,
+            approvals: &self.approvals,
+            notifications: self.notifications,
+            caps: crate::directive::Caps {
+                max_bytes: self.max_bytes,
+                max_entries: self.max_entries,
+                max_delete: self.max_delete,
+            },
+            request_lock: &self.request_lock,
+            forward_count: &self.forward_count,
+            cancelled: &cancelled,
+        }
+        .approve(request, &mut stream)
+    }
+}
+
+impl Approver<'_> {
+    /// Approve a server's copy to another server, or between two other
+    /// servers: show the command, then, over this machine's own SSH, set up
+    /// or refresh the accounts' enrollments and sign their directives, and
+    /// reply on `stream`. The server connects to the receivers itself; this
+    /// machine is not part of the copy after it replies.
+    pub(crate) fn approve(&self, request: ForwardRequest, stream: &mut impl Write) -> Result<()> {
         let ForwardRequest {
             source,
             target,
@@ -616,7 +795,20 @@ impl Receiver {
         let request_lock = self.request_lock.try_lock().map_err(|_| {
             anyhow::anyhow!("another transfer is awaiting approval; retry after it is decided")
         })?;
-        crate::approval_command::check_authorizer(&command, &self.name)?;
+        let via = match &self.origin {
+            Origin::Receiving { name, via } => {
+                crate::approval_command::check_authorizer(&command, name)?;
+                Some(via.clone())
+            }
+            Origin::Provider => {
+                anyhow::ensure!(
+                    source.is_some(),
+                    "an SSH authorization provider approves only copies between two other servers; this copy uses the provider's account access"
+                );
+                crate::approval_command::check_provider_authorizer(&command)?;
+                None
+            }
+        };
         let args = crate::approval_command::parse(&command)?;
         match &source {
             None => anyhow::ensure!(
@@ -634,11 +826,7 @@ impl Receiver {
             results_key.is_some() == source.is_some(),
             "invalid request to approve a copy to another server"
         );
-        let caps = crate::directive::Caps {
-            max_bytes: self.max_bytes,
-            max_entries: self.max_entries,
-            max_delete: self.max_delete,
-        };
+        let caps = self.caps;
         // The rules the receiver will derive, before the server's home is
         // known: the prompt names the destination as the command does.
         let preview = crate::directive::issue(
@@ -670,24 +858,11 @@ impl Receiver {
             constraints,
         };
         let count = self.forward_count.fetch_add(1, Ordering::AcqRel);
-        let _slot = Slot(&self.forward_count);
+        let _slot = Slot(self.forward_count);
         if count >= 8 {
             bail!("too many copies to other servers are waiting for approval or setup here; retry after one is decided");
         }
-        let (generation, _channel) = {
-            // Serialize registration with revocation, including reconnects.
-            let _sessions = self.sessions.lock().unwrap();
-            (
-                self.generation.load(Ordering::Acquire),
-                self.active_streams.track(stream.try_clone()?)?,
-            )
-        };
-        let socket = stream.try_clone()?;
-        let cancelled = || {
-            self.stop.load(Ordering::Acquire)
-                || self.generation.load(Ordering::Acquire) != generation
-                || requester_closed(&socket)
-        };
+        let cancelled = self.cancelled;
         let destination = Account::find(&target, &cancelled)?;
         let source = source
             .as_deref()
@@ -716,7 +891,7 @@ impl Receiver {
         // Automatic approval of writes to this machine does not authorize
         // use of its SSH credentials on another host.
         self.approvals.request_remote(
-            &self.requester,
+            self.requester,
             &command,
             &cwd,
             crate::receive_approval::Remote {
@@ -759,11 +934,7 @@ impl Receiver {
                     },
                 },
                 results_key,
-                via: (
-                    self.server_user.clone(),
-                    self.tcp_peer.host.clone(),
-                    self.tcp_peer.port,
-                ),
+                via,
                 allow_enrollment: !args.dry_run,
             },
             // Setting restricted copying up can upload syq, which takes a
@@ -800,7 +971,7 @@ impl Receiver {
             max_delete,
             coordinated,
         };
-        write_message(&mut stream, &Reply::Directive(Box::new(issued)))
+        write_message(stream, &Reply::Directive(Box::new(issued)))
     }
 }
 
@@ -818,8 +989,9 @@ pub(super) struct Prepare {
     /// them.
     pub(super) results_key: Option<[u8; 32]>,
     /// The server that asked, as this machine's receiving connection logs
-    /// in to it: its user, if named, host and port.
-    pub(super) via: (Option<String>, String, Option<u16>),
+    /// in to it: its user, if named, host and port. None for an SSH
+    /// authorization provider, which cannot tell which server asked.
+    pub(super) via: Option<(Option<String>, String, Option<u16>)>,
     pub(super) allow_enrollment: bool,
 }
 
@@ -876,7 +1048,6 @@ impl Prepare {
         account: &'a SetupAccount,
         role: crate::directive::Role,
     ) -> Result<crate::restricted::Issue<'a>> {
-        let (user, host, port) = &self.via;
         Ok(crate::restricted::Issue {
             command: self.command.clone(),
             cwd: self.cwd.clone(),
@@ -892,12 +1063,15 @@ impl Prepare {
             // destination's SSH port anyway, and a download, or a copy
             // between two other servers, needs it to reach the source's; for
             // the destination of such a copy, the hop works only if it
-            // reaches that too, as the docs say.
-            jump: Some(crate::enrollment::SshEndpoint::from_host(
-                user.as_deref(),
-                host,
-                *port,
-            )?),
+            // reaches that too, as the docs say. A provider cannot tell which
+            // server asked, so it enrolls only along its own route.
+            jump: self
+                .via
+                .as_ref()
+                .map(|(user, host, port)| {
+                    crate::enrollment::SshEndpoint::from_host(user.as_deref(), host, *port)
+                })
+                .transpose()?,
             agent: account.agent.as_deref(),
             allow_enrollment: self.allow_enrollment,
             // This server's own syq connects to the receiver: a refusal for
@@ -1364,7 +1538,7 @@ mod tests {
                 agent: None,
             }),
             results_key: None,
-            via: (None, "server".into(), None),
+            via: Some((None, "server".into(), None)),
             allow_enrollment: true,
         }
     }
@@ -1478,14 +1652,14 @@ mod tests {
         assert_eq!(issue.caps, Some(request.caps));
         assert_eq!(issue.jump.unwrap().label(), "server");
         let mut named = prepare_request();
-        named.via = (Some("alice".into()), "server".into(), Some(2222));
+        named.via = Some((Some("alice".into()), "server".into(), Some(2222)));
         let issue = |request: &Prepare| {
             request
                 .issue(request.accounts.all()[0], crate::directive::Role::Source)
                 .map(|issue| issue.jump.unwrap().label())
         };
         assert_eq!(issue(&named).unwrap(), "alice@server:2222");
-        named.via = (None, "-oProxyCommand=evil".into(), None);
+        named.via = Some((None, "-oProxyCommand=evil".into(), None));
         assert!(issue(&named).is_err());
     }
 
@@ -1882,6 +2056,13 @@ mod tests {
                 between_servers_command(&["--coordinate-at", "dst"]),
                 key,
             ),
+            // A command that selects an SSH authorization provider.
+            request(
+                Some("reader@source-host"),
+                "backup",
+                between_servers_command(&["--auth-from", "alice@provider"]),
+                key,
+            ),
             // A mapping would choose which source files are read, unseen.
             Message::Forward(Box::new(ForwardRequest {
                 source: Some("reader@source-host".into()),
@@ -1995,6 +2176,191 @@ mod tests {
             .unwrap();
         assert!(task.join().unwrap().is_err());
         assert!(receiver.approvals.snapshots().is_empty());
+    }
+
+    /// Ask `approve` as an SSH authorization provider does, with prompts in
+    /// `approvals`, for login `alice` on profile `laptop`. The returned
+    /// socket is the requesting login's end.
+    fn ask_provider_directly(
+        approvals: Arc<crate::receive_approval::Queue>,
+        count: Arc<AtomicUsize>,
+        request: ForwardRequest,
+    ) -> (std::thread::JoinHandle<Result<()>>, UnixStream) {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let task = std::thread::spawn(move || {
+            let requester = crate::receive_approval::Requester::provider_login("alice", "laptop");
+            let lock = Mutex::new(());
+            let socket = server.try_clone().unwrap();
+            let cancelled = || requester_closed(&socket);
+            Approver {
+                origin: Origin::Provider,
+                requester: &requester,
+                approvals: &approvals,
+                notifications: crate::receive_approval::Notifications::Off,
+                caps: crate::directive::Caps {
+                    max_bytes: 1 << 30,
+                    max_entries: 1000,
+                    max_delete: 10,
+                },
+                request_lock: &lock,
+                forward_count: &count,
+                cancelled: &cancelled,
+            }
+            .approve(request, &mut server)
+        });
+        (task, client)
+    }
+
+    fn between_servers_request(command: Vec<Vec<u8>>) -> ForwardRequest {
+        ForwardRequest {
+            source: Some("reader@source-host".into()),
+            target: "backup".into(),
+            command,
+            cwd: "~/work".into(),
+            inputs: crate::directive::Inputs::default(),
+            results_key: Some([5; 32]),
+        }
+    }
+
+    /// A provider approves only copies between two other servers whose
+    /// command selected it, by its address or by a saved choice, and
+    /// refuses the rest before anything is asked: an upload, a command that
+    /// selects a receiving machine or the server's own SSH, and a request
+    /// that does not match its command.
+    #[test]
+    fn a_provider_refuses_uploads_and_other_authorizers_before_asking() {
+        let root = crate::test_support::tempdir().unwrap();
+        let approvals = Arc::new(crate::receive_approval::Queue::default());
+        let count = Arc::new(AtomicUsize::new(0));
+        let upload = ForwardRequest {
+            source: None,
+            target: "backup".into(),
+            command: forward_command(root.path()),
+            cwd: String::new(),
+            inputs: crate::directive::Inputs::default(),
+            results_key: None,
+        };
+        let mismatched = ForwardRequest {
+            source: Some("elsewhere".into()),
+            ..between_servers_request(between_servers_command(&["--auth-from", "alice@provider"]))
+        };
+        let cases = [
+            (upload, "approves only copies between two other servers"),
+            (
+                between_servers_request(between_servers_command(&["--auth-from", "@laptop"])),
+                "authorizes from a different machine",
+            ),
+            (
+                between_servers_request(between_servers_command(&["--auth-from", "ssh"])),
+                "authorizes from a different machine",
+            ),
+            (mismatched, "copies between different servers"),
+        ];
+        for (request, expected) in cases {
+            let (task, _client) = ask_provider_directly(approvals.clone(), count.clone(), request);
+            let error = task.join().unwrap().err().unwrap();
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{expected}: {error:#}"
+            );
+            assert!(approvals.snapshots().is_empty());
+            assert_eq!(count.load(Ordering::Acquire), 0);
+        }
+    }
+
+    /// A provider's prompt for a copy between two other servers says that it
+    /// cannot confirm which server asks, names the provider account the login
+    /// used, and never approves by itself; ending the request ends it.
+    #[test]
+    fn a_provider_prompt_says_it_cannot_confirm_the_server() {
+        for command in [
+            between_servers_command(&["--auth-from", "alice@provider:2222"]),
+            // Selected by a saved choice, the command names no authorizer.
+            between_servers_command(&[]),
+        ] {
+            let approvals = Arc::new(crate::receive_approval::Queue::default());
+            let count = Arc::new(AtomicUsize::new(0));
+            let (task, client) = ask_provider_directly(
+                approvals.clone(),
+                count.clone(),
+                between_servers_request(command),
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let pending = loop {
+                if let Some(summary) = approvals.snapshots().first() {
+                    break summary.clone();
+                }
+                if task.is_finished() {
+                    panic!("request ended: {:?}", task.join().unwrap().err());
+                }
+                assert!(Instant::now() < deadline, "request did not become pending");
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(pending.kind(), crate::receive_approval::Kind::Copy);
+            assert!(!pending.can_remember());
+            let description =
+                pending.description(&crate::persistence::Domain::default(), str::to_owned);
+            for expected in [
+                "From: \"a server logged in to provider account alice (receiving profile @laptop)\"",
+                "syq can't confirm which server is asking: any machine that can log in to provider account alice over SSH can send this request",
+                "\"reader@source-host\" runs the copy",
+                "\"~/output\" on \"backup\"",
+            ] {
+                assert!(description.contains(expected), "{expected}: {description}");
+            }
+            // What `persist receive pending` gets from a provider is the
+            // stored form, without the prompt's notes; it still says so.
+            let stored: crate::receive_approval::Summary =
+                serde_json::from_value(serde_json::to_value(&pending).unwrap()).unwrap();
+            assert!(stored
+                .description(&crate::persistence::Domain::default(), str::to_owned)
+                .contains("syq can't confirm which server is asking"));
+            // The requesting login goes: its request ends unanswered.
+            drop(client);
+            let error = task.join().unwrap().err().unwrap();
+            assert!(!format!("{error:#}").contains("approved"), "{error:#}");
+            assert!(approvals.snapshots().is_empty());
+            assert_eq!(count.load(Ordering::Acquire), 0);
+        }
+    }
+
+    /// The server that starts a copy between two others asks the SSH
+    /// authorization provider its command selected only for a copy that
+    /// runs on the source; `select` checks the command first and leaves the
+    /// asking to `prepare`.
+    #[test]
+    fn a_copy_between_servers_selects_the_provider_its_command_names() {
+        let parsed = |extra: &[&str]| {
+            crate::approval_command::parse(&between_servers_command(extra)).unwrap()
+        };
+        let mut args = parsed(&["--auth-from", "alice@provider"]);
+        assert_eq!(
+            approving_provider(&args).map(|provider| provider.label()),
+            Some("alice@provider".to_owned())
+        );
+        assert!(select(&mut args, None).unwrap().is_none());
+        // Through this machine, the provider's account access runs it.
+        let args = parsed(&["--auth-from", "alice@provider", "--coordinate-at", "local"]);
+        assert!(approving_provider(&args).is_none());
+        // A receiving machine, or none, is not a provider.
+        assert!(approving_provider(&parsed(&["--auth-from", "@laptop"])).is_none());
+        assert!(approving_provider(&parsed(&[])).is_none());
+        // What the provider would refuse is refused before it is asked.
+        for extra in [
+            &["--rsh", "ssh"][..],
+            &["--copy-metadata", "hardlinks"],
+            &["--detach"],
+        ] {
+            let mut args = parsed(&[&["--auth-from", "alice@provider"], extra].concat());
+            assert!(select(&mut args, None).is_err(), "{extra:?}");
+        }
+        // An upload that selects a provider uses its account access, not
+        // this route.
+        let root = crate::test_support::tempdir().unwrap();
+        let mut upload = forward_command(root.path());
+        upload.extend([b"--auth-from".to_vec(), b"alice@provider".to_vec()]);
+        let args = crate::approval_command::parse(&upload).unwrap();
+        assert!(approving_provider(&args).is_none());
     }
 
     #[test]

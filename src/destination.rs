@@ -30,7 +30,7 @@ use crate::private_broker::{PrivateBroker, PrivateBrokerConfig, TrackedStream};
 
 pub(crate) mod account_copy;
 pub(crate) mod exec;
-mod forward;
+pub(crate) mod forward;
 pub(crate) mod notices;
 pub(crate) use forward::{DeadlineIo, HandshakeInput};
 pub(crate) mod handoff;
@@ -1165,7 +1165,10 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         None => select_copy(args, None)?,
     };
     let Some(selection) = selection else {
-        return Ok(());
+        // An SSH authorization provider approves a copy between two
+        // servers that the command selected it for; other copies without a
+        // receiving machine use SSH access, their own or approved.
+        return forward::prepare_through_provider(args);
     };
     handoff::check_selection(&selection)?;
     if selection.kind == handoff::Kind::Pull {
@@ -2112,6 +2115,7 @@ pub(crate) fn serve_background(
         requester: crate::receive_approval::Requester {
             server: spec.endpoint.label(),
             profile: config.name.clone(),
+            provider_account: None,
         },
         auto_approve_root: config.auto_approve_root.clone(),
         notifications: config.notifications,
