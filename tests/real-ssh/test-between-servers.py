@@ -373,6 +373,32 @@ def main():
         assert "syq-copy-worker" not in authorized_keys("destination")
         wait_for("the source's entry key cleanup after completed copies", no_key_dirs)
 
+        print("case: one approval copies 1,024 long-named sources between two other servers", flush=True)
+        # Twice what one command line holds: the source's receiver gives
+        # them to its coordinator as separate arguments. The requester's
+        # shell lists them, as a command this long cannot reach it either.
+        stem = "n" * 140
+        remote("source", "mkdir " + shlex.quote(b + "/many") + " && cd " + shlex.quote(b + "/many")
+               + " && seq -f " + shlex.quote(stem + "_%04g") + " 1 1024 | xargs touch")
+        remote("destination", "mkdir " + shlex.quote(c + "/many"))
+        attempts["many"] = 1
+        argv = ["--to", "destination", "--into", c + "/many", "--auth-from", "@laptop",
+                "--performance-tuning", "workers=2", "--no-progress",
+                "--results", f"{a}/many.1.ndjson"]
+        script = ("test -z \"${SSH_AUTH_SOCK:-}\" && set -- $(seq -f "
+                  + shlex.quote(b + "/many/" + stem + "_%04g") + " 1 1024) && exec env "
+                  + "PATH=/usr/bin:/bin:/usr/local/bin syq cp --from source \"$@\" "
+                  + shlex.join(argv))
+        with running(shlex.join(["timeout", "120", "sh", "-c", script])) as (process, output):
+            decide()
+            finish(process, output)
+        terminal = results("many")[-1]
+        assert terminal["type"] == "result" and terminal["status"] == "success", terminal
+        assert terminal["files_transferred"] == 1024 and terminal["errors"] == 0, terminal
+        assert remote("destination", "find " + shlex.quote(c + "/many")
+                      + " -type f | wc -l").strip() == "1024"
+        assert pending() == []
+
         print("case: a saved choice approves a copy between servers, and blocked TCP falls back to SSH", flush=True)
         remote("requester", "syq persist auth-from @laptop --for source")
         blocked = os.environ["SYQ_REAL_SSH_BLOCKED_TCP_PORT"]

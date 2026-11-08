@@ -2516,27 +2516,96 @@ fn live_group_members(group: u32) -> Vec<String> {
         .collect()
 }
 
+/// 1,024 sources whose paths take about 140 bytes each on the coordinator's
+/// command line, more than its 128 KiB in all.
+fn long_named_sources(t: &Tmp) -> Vec<String> {
+    (0..1024)
+        .map(|i| t.s(&format!("src/{}{i:04}", "x".repeat(94))))
+        .collect()
+}
+
 #[test]
-fn remote_to_remote_refuses_more_sources_than_its_coordinator_command_holds() {
+fn remote_to_remote_sends_sources_its_coordinator_command_cannot_hold_on_its_input() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    // On the coordinator's command line each 100-byte path takes about 140.
-    let sources: Vec<String> = (0..1024)
-        .map(|i| format!("/{}/{i:04}", "x".repeat(94)))
-        .collect();
+    pin_remote_helper(&t);
+    let sources = long_named_sources(&t);
+    for (i, source) in sources.iter().enumerate() {
+        write(Path::new(source), format!("file {i}").as_bytes());
+    }
+    let out = remote_to_remote_copy(&t, &rsh, &sources).run().unwrap();
+    assert_output_ok(&out);
+    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 1024);
+    for i in [0, 511, 1023] {
+        let name = Path::new(&sources[i]).file_name().unwrap();
+        assert_eq!(
+            read(&t.path("dst").join(name)),
+            format!("file {i}").as_bytes()
+        );
+    }
+    // The coordinator's command names where its sources are instead.
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(log.contains("--delegated-sources-on-input="), "{log}");
+    let operand = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&sources[0]);
+    assert!(!log.contains(&operand), "{log}");
+}
+
+#[test]
+fn remote_to_remote_keeps_sources_on_the_command_line_of_another_build_or_a_detached_copy() {
+    for option in ["--syq-path", "--no-bootstrap", "--detach"] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        let mut arguments = match option {
+            "--syq-path" => vec![format!("--syq-path={}", env!("CARGO_BIN_EXE_syq"))],
+            _ => vec![option.to_owned()],
+        };
+        arguments.extend(long_named_sources(&t));
+        let out = if option == "--detach" {
+            // A detached copy is between two different servers.
+            Command::new(env!("CARGO_BIN_EXE_syq"))
+                .args(["cp", "--rsh"])
+                .arg(&rsh)
+                .args(["--no-progress", "--from", "fake"])
+                .args(&arguments)
+                .args(["--to", "other", "--into", &t.s("dst")])
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                .run()
+                .unwrap()
+        } else {
+            remote_to_remote_copy(&t, &rsh, &arguments).run().unwrap()
+        };
+        assert_eq!(out.status.code(), Some(1), "{option}: {out:?}");
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains("this copy between two servers names 1024 sources"),
+            "{option}: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "more than the 128 KiB a server accepts (without {option}, syq sends them over its connection instead)"
+            )),
+            "{option}: {stderr}"
+        );
+        assert!(stderr.contains("--srcs-in"), "{option}: {stderr}");
+        // Refused before anything ran on either server.
+        assert!(!t.path("rsh.log").exists(), "{option}: {stderr}");
+    }
+}
+
+#[test]
+fn remote_to_remote_refuses_more_sources_than_one_copy_accepts_before_starting() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let sources: Vec<String> = (0..1025).map(|i| format!("/s/{i:04}")).collect();
     let out = remote_to_remote_copy(&t, &rsh, &sources).run().unwrap();
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     let stderr = stderr_of(&out);
     assert!(
-        stderr.contains("this copy between two servers names 1024 sources"),
+        stderr.contains("this copy names 1025 sources, more than the 1024 one copy accepts; select their parent directory with --srcs-in"),
         "{stderr}"
     );
-    assert!(
-        stderr.contains("more than the 128 KiB a server accepts"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("--srcs-in"), "{stderr}");
-    // Refused before anything ran on either server.
     assert!(!t.path("rsh.log").exists(), "{stderr}");
 }
 

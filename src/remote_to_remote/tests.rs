@@ -1611,13 +1611,235 @@ fn the_coordinator_reads_the_entry_key_and_directive_from_its_input() {
 
 #[test]
 fn a_coordinator_command_fits_in_one_linux_argument() {
-    assert!(ensure_coordinator_command_fits(128 * 1024 - 1, 1).is_ok());
-    let error = ensure_coordinator_command_fits(128 * 1024, 900).unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("names 900 sources, which make its coordinator's command line 128 KiB"),
+        ensure_coordinator_command_fits(128 * 1024 - 1, CommandSources::Listed(1, None)).is_ok()
+    );
+    let error =
+        ensure_coordinator_command_fits(128 * 1024, CommandSources::Listed(900, None)).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "this copy between two servers names 900 sources, which make its coordinator's command line 128 KiB, more than the 128 KiB a server accepts; select their parent directory with --srcs-in and narrow it with --ignore or --where, or split the copy"
+    );
+    // An option that keeps them on the command line is named.
+    let error =
+        ensure_coordinator_command_fits(200 * 1024, CommandSources::Listed(1024, Some("--detach")))
+            .unwrap_err();
+    assert!(
+        error.to_string().contains(
+            "200 KiB, more than the 128 KiB a server accepts (without --detach, syq sends them over its connection instead); select"
+        ),
         "{error:#}"
+    );
+    // Without its sources, nothing about them is suggested.
+    let error = ensure_coordinator_command_fits(130 * 1024, CommandSources::OnInput).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "this copy between two servers makes its coordinator's command line 130 KiB even without its sources, more than the 128 KiB a server accepts"
+    );
+}
+
+#[test]
+fn only_detached_and_other_build_coordinators_keep_their_sources_on_the_command_line() {
+    use clap::Parser;
+    let parse = || Args::parse_from(["syq", "src", "dst"]);
+    assert_eq!(sources_kept_on_command_line(&parse()), None);
+    let mut args = parse();
+    args.detach = true;
+    assert_eq!(sources_kept_on_command_line(&args), Some("--detach"));
+    let mut args = parse();
+    args.syq_path = Some("/opt/syq".into());
+    assert_eq!(sources_kept_on_command_line(&args), Some("--syq-path"));
+    let mut args = parse();
+    args.no_bootstrap = true;
+    assert_eq!(sources_kept_on_command_line(&args), Some("--no-bootstrap"));
+}
+
+#[test]
+fn named_sources_on_the_coordinators_input_are_its_source_words() {
+    let sources = [
+        Location::parse("host:/data/a\nb").unwrap(),
+        Location {
+            selection: SourceSelection::Contents,
+            ..Location::parse("host:/srv/tree").unwrap()
+        },
+        Location {
+            selection: SourceSelection::File,
+            ..Location::parse("host:-file").unwrap()
+        },
+        Location {
+            selection: SourceSelection::Directory,
+            ..Location::parse("host:dir").unwrap()
+        },
+    ];
+    let input = input_sources(&sources).unwrap();
+    let words: Vec<String> = sources.iter().flat_map(source_words).collect();
+    assert_eq!(
+        parse_input_sources(&input).unwrap(),
+        words.iter().map(OsString::from).collect::<Vec<_>>()
+    );
+    // The input can only add sources: anything else is refused.
+    for invalid in [
+        &b""[..],
+        b"--src\0",
+        b"--src\0YQ",
+        b"--src\0\0",
+        b"--src\0YQ\0--src\0",
+        b"--into\0YQ\0",
+        b"--src\0-YQ\0",
+        b"--src\0Y Q\0",
+        b"--src=YQ\0YQ\0",
+    ] {
+        assert!(parse_input_sources(invalid).is_err(), "{invalid:?}");
+    }
+    let too_many = b"--src\0YQ\0".repeat(crate::descriptor_broker::MAX_SOURCE_ROOTS + 1);
+    assert!(parse_input_sources(&too_many).is_err());
+}
+
+#[test]
+fn a_coordinator_without_its_sources_names_their_input_in_their_place() {
+    let command: Vec<Vec<u8>> = [
+        "cp",
+        "--from",
+        "a",
+        "x",
+        "--srcs-in",
+        "y",
+        "--to",
+        "b",
+        "--into",
+        "z",
+    ]
+    .iter()
+    .map(|arg| arg.as_bytes().to_vec())
+    .collect();
+    let args = crate::approval_command::parse(&command).unwrap();
+    let (dst, srcs) = args.locations.split_last().unwrap();
+    let command = CoordinatorCommand {
+        relay_results: false,
+        destination_results: false,
+        remote_shell: None,
+        peer_login_user: None,
+        peer_connection_host: None,
+        destination_path: None,
+        mapping: false,
+        sources_on_input: None,
+    };
+    let listed =
+        coordinator_arguments(&args, (srcs, dst, dst), (false, false), command.clone()).unwrap();
+    let on_input = coordinator_arguments(
+        &args,
+        (srcs, dst, dst),
+        (false, false),
+        CoordinatorCommand {
+            sources_on_input: Some(42),
+            ..command
+        },
+    )
+    .unwrap();
+    let words: Vec<String> = srcs.iter().flat_map(source_words).collect();
+    let start = listed
+        .windows(words.len())
+        .position(|window| window == words.as_slice())
+        .unwrap();
+    // The same command, with one word where the sources were.
+    let mut expected = listed.clone();
+    expected.splice(
+        start..start + words.len(),
+        [format!("{SOURCES_ON_INPUT}=42")],
+    );
+    assert_eq!(on_input, expected);
+}
+
+/// The word that stands for the sources is not an option any build parses:
+/// a coordinator that predates it, which never reads its input for them,
+/// refuses the command rather than copying something else.
+#[test]
+fn a_build_that_does_not_read_sources_from_its_input_refuses_their_word() {
+    let argv: Vec<OsString> = [
+        "cp",
+        "--delegated-operands-b64",
+        &format!("{SOURCES_ON_INPUT}=9"),
+        "--to",
+        "host",
+        "--into",
+        "ZHN0",
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    let error = Args::parse_args(&argv).unwrap_err();
+    assert!(format!("{error:#}").contains(SOURCES_ON_INPUT), "{error:#}");
+}
+
+/// The coordinator puts the sources from its input where their word was,
+/// before anything parses its arguments, and leaves the rest of its input,
+/// such as an entry key, for what reads it next.
+#[test]
+fn the_coordinator_reads_its_named_sources_from_its_input() {
+    const CHILD: &str = "SYQ_TEST_SOURCES_FROM_INPUT";
+    let sources = [
+        Location::parse("host:/data/a").unwrap(),
+        Location::parse("host:/data/b c").unwrap(),
+    ];
+    let input = input_sources(&sources).unwrap();
+    let words: Vec<String> = sources.iter().flat_map(source_words).collect();
+    if std::env::var_os(CHILD).is_some() {
+        let mut argv: Vec<OsString> = [
+            "syq".to_owned(),
+            "cp".into(),
+            "--delegated-operands-b64".into(),
+            "--no-tcp".into(),
+            format!("{SOURCES_ON_INPUT}={}", input.len()),
+            "--into".into(),
+            "ZHN0".into(),
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        take_sources_from_input(&mut argv).unwrap();
+        let expected: Vec<OsString> = ["syq", "cp", "--delegated-operands-b64", "--no-tcp"]
+            .into_iter()
+            .map(String::from)
+            .chain(words)
+            .chain(["--into".to_owned(), "ZHN0".to_owned()])
+            .map(OsString::from)
+            .collect();
+        assert_eq!(argv, expected);
+        let mut rest = Vec::new();
+        std::io::stdin().read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"entry key");
+        // Anything other than a delegated copy is left alone.
+        let mut other: Vec<OsString> = ["syq", "cp", &format!("{SOURCES_ON_INPUT}=1")]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let before = other.clone();
+        take_sources_from_input(&mut other).unwrap();
+        assert_eq!(other, before);
+        return;
+    }
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "remote_to_remote::tests::the_coordinator_reads_its_named_sources_from_its_input",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn_guarded()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(&input).unwrap();
+    stdin.write_all(b"entry key").unwrap();
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

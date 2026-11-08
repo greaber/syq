@@ -282,6 +282,16 @@ fn prepare_coordinated(
     registration: Registration,
 ) -> Result<()> {
     let (source, target) = eligible_peer(args)?;
+    // Refused here as a local copy refuses it, before the receiving machine
+    // is asked.
+    crate::fsops::ensure_source_count(
+        crate::transfer::distinct_native_sources(
+            args.locations
+                .split_last()
+                .map_or(&[], |(_, sources)| sources),
+        )
+        .len(),
+    )?;
     let command = crate::approval_command::copy_command(args)?;
     let inputs = crate::directive::Inputs {
         ignore: args.ignore_lines.clone(),

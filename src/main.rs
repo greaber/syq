@@ -333,6 +333,11 @@ fn run() {
         }
         return;
     }
+    // A coordinator that another syq started may get its named sources at
+    // the start of its input, which nothing else has read yet.
+    if let Err(error) = remote_to_remote::take_sources_from_input(&mut argv) {
+        crate::output::exit_on_error(&error, 1, "syq");
+    }
     // Internal entry points above never see environment options. Insert them
     // here, before `exec` and the copy commands, and record the result for
     // the return-helper handoff, which both of those may perform.
