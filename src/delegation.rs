@@ -609,11 +609,11 @@ impl ReceiverContext<'_> {
         }
         let binding = &directive.binding;
         if directive.build != self.build {
-            bail!(
+            return Err(crate::restricted::OtherBuild(format!(
                 "the copy was approved for a receiver of syq {}, and this receiver runs {}",
-                directive.build,
-                self.build
-            );
+                directive.build, self.build
+            ))
+            .into());
         }
         if binding.enrollment != self.enrollment_id {
             bail!("the directive is for a different enrollment");

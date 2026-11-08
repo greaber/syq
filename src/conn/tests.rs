@@ -2152,6 +2152,39 @@ fn a_receiver_with_full_session_slots_is_retried_on_the_fast_path() {
     );
 }
 
+/// A receiver of another syq build refuses with its own status, which the
+/// client reports as that build refusal and does not retry.
+#[test]
+fn a_receiver_of_another_build_is_reported_as_that_and_not_retried() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let script = temporary.path().join("ssh");
+    let log = temporary.path().join("attempts");
+    crate::test_support::write_executable(
+        &script,
+        format!(
+            "#!/bin/sh\necho attempt >> {log}\nexit {other}\n",
+            log = shell_words::quote(log.to_str().unwrap()),
+            other = crate::restricted::OTHER_BUILD_EXIT,
+        ),
+        0o700,
+    );
+    let mut spec = RemoteSpec::local_receiver(true);
+    spec.local_process = false;
+    spec.rsh = vec![script.to_string_lossy().into_owned()];
+    let worker = || ConnectionRole::SourceWorker {
+        roots: Vec::new(),
+        send_budget: None,
+    };
+    let error = spec
+        .connect_retried(false, true, worker(), false, false, None)
+        .err()
+        .unwrap();
+    assert!(crate::restricted::is_other_build(&error), "{error:#}");
+    assert!(is_non_retryable_connect_error(&error), "{error:#}");
+    assert!(!helper_needs_install(&error), "{error:#}");
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "attempt\n");
+}
+
 #[test]
 fn a_pool_appearing_after_priming_is_not_queried_during_connect() {
     use std::os::unix::net::UnixListener;

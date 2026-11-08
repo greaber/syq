@@ -2610,6 +2610,12 @@ fn run_coordinated(
         Some(crate::restricted::REFUSED_EXIT) => {
             bail!("the restricted receiver on {source} refused the copy")
         }
+        Some(crate::restricted::OTHER_BUILD_EXIT) => {
+            return Err(crate::restricted::OtherBuild(format!(
+                "the restricted receiver on {source} runs another syq build"
+            ))
+            .into())
+        }
         Some(255) => {
             bail!("could not reach the restricted receiver on {source}; see the SSH error above")
         }

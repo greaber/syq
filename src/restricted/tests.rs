@@ -2855,16 +2855,29 @@ fn a_session_reads_exactly_one_bounded_first_frame() {
             .to_string()
     };
     let long = std::time::Duration::from_secs(5);
-    // Lengths outside the bounds are refused before anything else is read.
-    assert!(refused(&[0, 0, 0, 0], long).contains("unsupported length"));
-    assert!(refused(&u32::MAX.to_be_bytes(), long).contains("unsupported length"));
-    let largest = (MAX_ADMISSION_BYTES as u32 + 1).to_be_bytes();
-    assert!(refused(&largest, long).contains("unsupported length"));
+    // The start of a frame from this build, with `rest` after it.
+    let build = crate::identity::build().as_bytes();
+    let framed = |length: u32, rest: &[u8]| {
+        [
+            &length.to_be_bytes()[..],
+            FRAME_MAGIC,
+            &[build.len() as u8],
+            build,
+            rest,
+        ]
+        .concat()
+    };
+    let prefix = (FRAME_MAGIC.len() + 1 + build.len()) as u32;
+    // Lengths beyond the bounds are refused once the build is known.
+    assert!(refused(&framed(u32::MAX, &[]), long).contains("unsupported length"));
+    let largest = MAX_ADMISSION_BYTES as u32 + 1;
+    assert!(refused(&framed(largest, &[]), long).contains("unsupported length"));
     // An unknown kind; a field longer than the frame or than its kind
     // allows; a field that is not text where text belongs; and trailing
     // bytes inside the frame.
-    assert!(refused(&[0, 0, 0, 1, 9], long).contains("malformed"));
-    assert!(refused(&[0, 0, 0, 6, 1, 0, 0, 0, 2, 0], long).contains("malformed"));
+    assert!(refused(&framed(prefix + 1, &[9]), long).contains("malformed"));
+    let short_field = framed(prefix + 6, &[COPY_FRAME, 0, 0, 0, 2, 0]);
+    assert!(refused(&short_field, long).contains("malformed"));
     let ticket = Admission::Worker("w".repeat(MAX_TICKET_BYTES + 1));
     assert!(refused(&ticket.frame().unwrap(), long).contains("malformed"));
     let mut width = coordinate(None).frame().unwrap();
@@ -2890,11 +2903,15 @@ fn a_session_reads_exactly_one_bounded_first_frame() {
         results_token: "0".repeat(MAX_TOKEN_BYTES),
         progress_width: Some(80),
     }));
-    assert_eq!(largest.frame().unwrap().len(), 4 + MAX_ADMISSION_BYTES);
+    assert_eq!(
+        largest.frame().unwrap().len() + MAX_FRAME_BUILD_BYTES - build.len(),
+        4 + MAX_ADMISSION_BYTES
+    );
     // A field longer than its kind allows is refused from its length, before
     // its bytes are read.
     let long_copy = Admission::Copy(vec![0; signed + 1]).frame().unwrap();
-    assert!(refused(&long_copy[..9], long).contains("malformed"));
+    let header = 4 + prefix as usize + 1 + 4;
+    assert!(refused(&long_copy[..header], long).contains("malformed"));
     // A session that sends nothing, or only part of its frame, is dropped at
     // the deadline.
     let short = std::time::Duration::from_millis(200);
@@ -2902,6 +2919,64 @@ fn a_session_reads_exactly_one_bounded_first_frame() {
     refused(&[], short);
     refused(&[0, 0, 0, 9, COPY_FRAME, 0, 0], short);
     assert!(started.elapsed() < std::time::Duration::from_secs(3));
+}
+
+/// A session from another syq build is refused for that before anything
+/// else in its frame is read: frames from builds before this frame format,
+/// kept as those builds wrote them, and frames in this format from another
+/// build, whatever their length.
+#[test]
+fn a_session_from_another_build_is_refused_for_that_first() {
+    use std::io::Write as _;
+    let refused = |bytes: &[u8]| {
+        let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        writer.write_all(bytes).unwrap();
+        drop(writer);
+        Admission::read(
+            &mut reader,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap_err()
+    };
+    let ours = crate::identity::build();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    for name in ["copy", "worker", "coordinate"] {
+        let frame =
+            fs::read(fixtures.join(format!("admission-frame-before-0.9-{name}.bin"))).unwrap();
+        let error = refused(&frame);
+        assert!(is_other_build(&error), "{name}: {error:#}");
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("this receiver runs syq {ours}")),
+            "{message}"
+        );
+        assert!(message.contains("is another build"), "{message}");
+    }
+    // A frame too short to hold the magic is no frame of this build.
+    assert!(is_other_build(&refused(&[0, 0, 0, 0])));
+    assert!(is_other_build(&refused(&[0, 0, 0, 2, 1, 0])));
+    let copy = Admission::Copy(b"directive".to_vec());
+    let error = refused(&copy.frame_from("v0.0.0-other").unwrap());
+    assert!(is_other_build(&error), "{error:#}");
+    assert!(error.to_string().contains("is v0.0.0-other;"), "{error:#}");
+    // A build that cannot be shown as it is is named as another build.
+    let error = refused(&copy.frame_from("v0.0.0\nother").unwrap());
+    assert!(error.to_string().contains("is another build"), "{error:#}");
+    // Another build's frame may be longer than this build's limit.
+    let mut long = copy.frame_from("v0.0.0-other").unwrap();
+    long[..4].copy_from_slice(&u32::MAX.to_be_bytes());
+    assert!(is_other_build(&refused(&long)));
+    // This build's own frame passes.
+    let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    writer.write_all(&copy.frame().unwrap()).unwrap();
+    assert_eq!(
+        Admission::read(
+            &mut reader,
+            Instant::now() + std::time::Duration::from_secs(5)
+        )
+        .unwrap(),
+        copy
+    );
 }
 
 #[test]

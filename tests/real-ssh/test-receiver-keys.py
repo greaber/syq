@@ -6,11 +6,12 @@ key files, encrypted keys in the agent, agent-only keys, FIDO keys through
 the agent with the lab's provider, and a certificate login. Keys that cannot
 sign are refused before anything is installed. A new login key replaces only
 the trusted signer, a connection started before a refresh cannot start a new
-copy, and a copy running through a refresh finishes. Connections that have
-not shown a signed copy yet are refused once 32 are starting, or 16 from one
-address: a machine holding its 16 leaves copies from another working. A
-copy's workers refused that way start again without the wait of a failed
-worker, and revoking works while refused connections keep arriving.
+copy, a session from another syq build is refused as that, and a copy running
+through a refresh finishes. Connections that have not shown a signed copy yet
+are refused once 32 are starting, or 16 from one address: a machine holding
+its 16 leaves copies from another working. A copy's workers refused that way
+start again without the wait of a failed worker, and revoking works while
+refused connections keep arriving.
 """
 import json
 import os
@@ -26,6 +27,7 @@ PROVIDER = '/usr/local/lib/syq-test-sk.so'
 SOURCE_FILE = '/tmp/syq-real-ssh-key-source'
 STATE = Path.home() / '.local/state/syq/enrollments'
 REFUSED = b'are starting copies on this enrollment'
+OTHER_BUILD_EXIT = 79
 # The entry key on the source, for sessions held from there.
 SOURCE_ENTRY_KEY = '/tmp/syq-real-ssh-held-entry-key'
 SESSIONS_FULL_EXIT = 73
@@ -45,6 +47,15 @@ for pid in filter(str.isdigit, os.listdir('/proc')):
     if command.split(b'\\0')[1:2] == [b'--restricted-receiver']:
         sessions.append((started, int(status.split('PPid:')[1].split()[0])))
 '''
+
+
+def admission_frame(build, directive):
+    """The first frame of a session that starts a copy, as syq of `build`
+    sends it: a 4-byte length; the magic; the build after its length in one
+    byte; the kind, 1; then the copy's directive after its 4-byte length."""
+    body = (b'SYQA' + bytes([len(build)]) + build + b'\x01'
+            + len(directive).to_bytes(4, 'big') + directive)
+    return len(body).to_bytes(4, 'big') + body
 
 
 def run(*args, **kwargs):
@@ -422,11 +433,7 @@ def rotation_and_generations(lab, parent):
         run('syq', 'receiver', 'enroll', 'destination')
         _, refreshed = enrollment()
         assert refreshed['generation'] == 3, refreshed
-        # The first frame of a session that starts a copy: a 4-byte
-        # length; the kind, 1; then the copy's directive with its 4-byte
-        # length, here not a valid one.
-        body = b'\x01' + (4).to_bytes(4, 'big') + b'AAAA'
-        frame = len(body).to_bytes(4, 'big') + body
+        frame = admission_frame(refreshed['release'].encode(), b'AAAA')
         old = attempt(*entry_ssh, '-o', f'ControlPath={control}', '-o', 'ControlMaster=no',
                       'syq@destination', 'syq --server', input=frame)
         assert old.returncode and b'outdated receiver' in old.stderr, old.stderr
@@ -435,6 +442,19 @@ def rotation_and_generations(lab, parent):
         assert new.returncode and b'outdated receiver' not in new.stderr, new.stderr
         assert b'not a syq directive' in new.stderr, new.stderr
         print('a connection from before a refresh cannot start a new copy', flush=True)
+
+        # Another build's session is refused as that, with its own status,
+        # before anything else it sent is read: in the first-frame format of
+        # builds before 0.9 (a postcard copy), and in this one.
+        for frame, theirs in [
+            ((6).to_bytes(4, 'big') + b'\x00\x04AAAA', b'is another build'),
+            (admission_frame(b'v0.0.0-other', b'AAAA'), b'is v0.0.0-other'),
+        ]:
+            other = attempt(*entry_ssh, '-o', 'ControlPath=none', 'syq@destination',
+                            'syq --server', input=frame)
+            assert other.returncode == OTHER_BUILD_EXIT, other
+            assert theirs in other.stderr and refreshed['release'].encode() in other.stderr, other
+        print('a session from another syq build was refused as that', flush=True)
     finally:
         subprocess.run([*entry_ssh, '-o', f'ControlPath={control}', '-O', 'exit', 'syq@destination'],
                        timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

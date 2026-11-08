@@ -402,6 +402,11 @@ fn a_directive_for_another_receiver_is_refused_without_redeeming() {
     let mut rebuilt = context(TARGET, NOW, 0);
     rebuilt.build = "other-build";
     refused(rebuilt, "this receiver runs other-build");
+    // That refusal is the receiver's build refusal, which the client knows.
+    let mut rebuilt = context(TARGET, NOW, 0);
+    rebuilt.build = "other-build";
+    let error = verify(&encoded, &rebuilt, &fixture.policy(), &replay).unwrap_err();
+    assert!(crate::restricted::is_other_build(&error), "{error:#}");
     let wrong_namespace = signed_directive(&directive, &fixture.key, "other-protocol@example.test");
     let error = verify(
         &wrong_namespace,

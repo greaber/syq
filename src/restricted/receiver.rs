@@ -39,10 +39,20 @@ const ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 /// (`destination_results::relay::valid_token`) a frame may carry.
 pub(super) const MAX_TICKET_BYTES: usize = 128;
 pub(super) const MAX_TOKEN_BYTES: usize = 64;
+/// Every first frame starts with this, then the sending syq's build
+/// identity, in every frame format to come. A receiver refuses a session
+/// from another build for that ([`OtherBuild`]) before it reads anything
+/// else. Frames from builds before this start with a byte of 0 to 2.
+pub(super) const FRAME_MAGIC: &[u8; 4] = b"SYQA";
+/// The longest build identity a frame may carry.
+pub(super) const MAX_FRAME_BUILD_BYTES: usize = 255;
 /// The largest first frame a session may send: a coordinating source's two
 /// signed directives, the destination's entry key, its token and width, and
-/// the frame's kind and field lengths.
-pub(super) const MAX_ADMISSION_BYTES: usize = 1
+/// the frame's magic, build, kind and field lengths.
+pub(super) const MAX_ADMISSION_BYTES: usize = FRAME_MAGIC.len()
+    + 1
+    + MAX_FRAME_BUILD_BYTES
+    + 1
     + 5 * 4
     + 2 * crate::directive::MAX_SIGNED_BYTES
     + crate::remote_to_remote::MAX_ENTRY_KEY_BYTES
@@ -99,11 +109,17 @@ impl fmt::Debug for Coordinate {
 }
 
 impl Admission {
-    /// The frame: a 4-byte big-endian length of the rest; the kind, one
+    /// The frame: a 4-byte big-endian length of the rest; [`FRAME_MAGIC`];
+    /// this build's identity, after its length in one byte; the kind, one
     /// byte; then each field as a 4-byte big-endian length and its bytes. A
     /// coordinating source's frame carries an entry key, so it is built in
     /// one allocation, which the caller wipes.
     pub(crate) fn frame(&self) -> Result<Vec<u8>> {
+        self.frame_from(crate::identity::build())
+    }
+
+    /// The frame as the syq of build `build` sends it.
+    pub(super) fn frame_from(&self, build: &str) -> Result<Vec<u8>> {
         let width;
         let (kind, fields): (u8, Vec<&[u8]>) = match self {
             Self::Copy(directive) => (COPY_FRAME, vec![directive]),
@@ -122,12 +138,22 @@ impl Admission {
                 )
             }
         };
-        let length = 1 + fields.iter().map(|field| 4 + field.len()).sum::<usize>();
+        if build.len() > MAX_FRAME_BUILD_BYTES {
+            bail!("this build's identity is too long for the admission frame");
+        }
+        let length = FRAME_MAGIC.len()
+            + 1
+            + build.len()
+            + 1
+            + fields.iter().map(|field| 4 + field.len()).sum::<usize>();
         if length > MAX_ADMISSION_BYTES {
             bail!("the admission frame exceeds its size limit");
         }
         let mut out = Vec::with_capacity(4 + length);
         out.extend_from_slice(&(length as u32).to_be_bytes());
+        out.extend_from_slice(FRAME_MAGIC);
+        out.push(build.len() as u8);
+        out.extend_from_slice(build.as_bytes());
         out.push(kind);
         for field in fields {
             out.extend_from_slice(&(field.len() as u32).to_be_bytes());
@@ -137,10 +163,12 @@ impl Admission {
     }
 
     /// Read exactly one frame from `input` by `deadline`, and nothing after
-    /// it: what follows belongs to the session. Nothing in the frame is
-    /// interpreted here: each field is read into a buffer of its own,
-    /// bounded by its kind and by the frame's length, so a session holds at
-    /// most one frame's bytes until its directive's signature is checked.
+    /// it: what follows belongs to the session. A frame from another build,
+    /// in this format or an earlier one, is refused as [`OtherBuild`] first.
+    /// Nothing else in the frame is interpreted here: each field is read
+    /// into a buffer of its own, bounded by its kind and by the frame's
+    /// length, so a session holds at most one frame's bytes until its
+    /// directive's signature is checked.
     pub(super) fn read(
         input: &mut (impl Read + std::os::fd::AsRawFd),
         deadline: Instant,
@@ -155,13 +183,31 @@ impl Admission {
             .read_exact(&mut length)
             .context("read the session's first frame")?;
         let length = u32::from_be_bytes(length) as usize;
-        if length == 0 || length > MAX_ADMISSION_BYTES {
-            bail!("the session's first frame has an unsupported length");
+        // Another build's frame is refused as that, whatever its length.
+        let mut magic = [0u8; FRAME_MAGIC.len()];
+        if length < magic.len() {
+            return Err(OtherBuild::refuse(None).into());
+        }
+        input
+            .read_exact(&mut magic)
+            .context("read the session's first frame")?;
+        if &magic != FRAME_MAGIC {
+            return Err(OtherBuild::refuse(None).into());
         }
         let mut frame = FrameFields {
             input: &mut input,
-            remaining: length,
+            remaining: length - magic.len(),
         };
+        let mut build = [0u8];
+        frame.read(&mut build)?;
+        let mut build = vec![0; usize::from(build[0])];
+        frame.read(&mut build)?;
+        if build != crate::identity::build().as_bytes() {
+            return Err(OtherBuild::refuse(Some(&build)).into());
+        }
+        if length > MAX_ADMISSION_BYTES {
+            bail!("the session's first frame has an unsupported length");
+        }
         let mut kind = [0u8];
         frame.read(&mut kind)?;
         let signed = crate::directive::MAX_SIGNED_BYTES;
@@ -452,6 +498,49 @@ impl std::error::Error for Refused {}
 
 /// The exit status of a copy the receiver [`Refused`].
 pub(crate) const REFUSED_EXIT: i32 = 74;
+
+/// A session from another syq build than the receiver's, refused before
+/// anything it sent was read but its build, or a copy approved for another
+/// build. Nothing is recorded. The receiver prints why and exits with
+/// [`OTHER_BUILD_EXIT`]; a client that sees that status reports this error,
+/// which no retry on its own can fix: one of the two builds must change.
+#[derive(Debug)]
+pub(crate) struct OtherBuild(pub(crate) String);
+
+impl OtherBuild {
+    /// The refusal of a session whose frame names `build`, when it names
+    /// one this receiver can show.
+    fn refuse(build: Option<&[u8]>) -> Self {
+        let theirs = build
+            .filter(|build| !build.is_empty() && build.iter().all(u8::is_ascii_graphic))
+            .map_or_else(
+                || "another build".to_owned(),
+                |build| String::from_utf8_lossy(build).into_owned(),
+            );
+        Self(format!(
+            "this receiver runs syq {}, and the syq connecting to it is {theirs}; \
+             a restricted copy needs the same syq build on both machines: update syq \
+             on the connecting machine, or run `syq receiver enroll` on your machine \
+             to update this receiver to your machine's build",
+            crate::identity::build()
+        ))
+    }
+}
+
+impl fmt::Display for OtherBuild {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for OtherBuild {}
+
+/// The exit status of a session refused for [`OtherBuild`].
+pub(crate) const OTHER_BUILD_EXIT: i32 = 79;
+
+pub(crate) fn is_other_build(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<OtherBuild>())
+}
 
 /// What the coordinator reports when the receiver exited with
 /// [`REFUSED_EXIT`]: the receiver's own message, already shown, says why.
