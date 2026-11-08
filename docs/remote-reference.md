@@ -23,7 +23,9 @@ machines; this is called enrollment. To do it ahead of time, run
 `syq receiver enroll HOST`. Enrollment needs an SSH key or certificate login.
 A root account can be enrolled, but its receiver serves only downloads: it
 refuses copies that write to the account, and copies between servers that it
-would run.
+would run. Enroll an account under the name the server gives its user ID:
+another name for the same user, such as `toor` for root, is refused before
+anything is set up.
 
 Enrollment adds one line to the server's `~/.ssh/authorized_keys`. Its key,
 the entry key, can only start syq's receiver, and its comment,
