@@ -37,6 +37,10 @@ const START_AHEAD: u64 = 8 << 20;
 /// Most bytes, and blocks, one hash window covers.
 const MAX_WINDOW: u64 = 16 << 20;
 const MAX_WINDOW_BLOCKS: u64 = 1024;
+// The receiver holds at most `MAX_READ_BYTES` of hashed windows for one
+// connection, and a window of the smallest blocks still fills `MAX_WINDOW`.
+const _: () = assert!(MAX_AHEAD <= crate::proto::MAX_READ_BYTES);
+const _: () = assert!(MAX_WINDOW_BLOCKS * MIN_BLOCK >= MAX_WINDOW);
 /// What one more block costs, mostly the receiver's handling of its request.
 /// Measured as 25-35 us of receiver CPU per reused block on Linux.
 const BLOCK_COST: Duration = Duration::from_micros(25);
@@ -704,7 +708,5 @@ mod tests {
         assert_eq!(sizing.window(MIN_BLOCK), MAX_WINDOW);
         assert_eq!(sizing.window(64 << 20), 64 << 20);
         assert_eq!(sizing.window(3 << 20), 15 << 20);
-        assert!(MAX_AHEAD <= crate::proto::MAX_READ_BYTES);
-        assert!(MAX_WINDOW_BLOCKS * MIN_BLOCK >= MAX_WINDOW);
     }
 }
