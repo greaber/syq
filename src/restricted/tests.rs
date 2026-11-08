@@ -2924,7 +2924,7 @@ fn a_session_reads_exactly_one_bounded_first_frame() {
 /// A session from another syq build is refused for that before anything
 /// else in its frame is read: frames from builds before this frame format,
 /// kept as those builds wrote them, and frames in this format from another
-/// build, whatever their length.
+/// build, whatever their length, except a worker joining a running copy.
 #[test]
 fn a_session_from_another_build_is_refused_for_that_first() {
     use std::io::Write as _;
@@ -2966,17 +2966,24 @@ fn a_session_from_another_build_is_refused_for_that_first() {
     let mut long = copy.frame_from("v0.0.0-other").unwrap();
     long[..4].copy_from_slice(&u32::MAX.to_be_bytes());
     assert!(is_other_build(&refused(&long)));
-    // This build's own frame passes.
-    let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
-    writer.write_all(&copy.frame().unwrap()).unwrap();
-    assert_eq!(
-        Admission::read(
-            &mut reader,
-            Instant::now() + std::time::Duration::from_secs(5)
-        )
-        .unwrap(),
-        copy
-    );
+    // This build's own frame passes, and so does a worker joining a running
+    // copy from another build: that copy's own receiver serves it.
+    let worker = Admission::Worker("w-0123456789abcdef:ticket".into());
+    for (frame, expected) in [
+        (copy.frame().unwrap(), &copy),
+        (worker.frame_from("v0.0.0-other").unwrap(), &worker),
+    ] {
+        let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        writer.write_all(&frame).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        assert_eq!(&Admission::read(&mut reader, deadline).unwrap(), expected);
+    }
+    // Another build's frame that ends at its build has no kind to pass.
+    let mut bare = copy.frame_from("v0.0.0-other").unwrap();
+    let ends = 4 + FRAME_MAGIC.len() + 1 + "v0.0.0-other".len();
+    bare.truncate(ends);
+    bare[..4].copy_from_slice(&((ends - 4) as u32).to_be_bytes());
+    assert!(is_other_build(&refused(&bare)));
 }
 
 #[test]

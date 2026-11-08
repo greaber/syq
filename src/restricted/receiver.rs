@@ -40,9 +40,11 @@ const ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 pub(super) const MAX_TICKET_BYTES: usize = 128;
 pub(super) const MAX_TOKEN_BYTES: usize = 64;
 /// Every first frame starts with this, then the sending syq's build
-/// identity, in every frame format to come. A receiver refuses a session
-/// from another build for that ([`OtherBuild`]) before it reads anything
-/// else. Frames from builds before this start with a byte of 0 to 2.
+/// identity, then its kind, in every frame format to come. A receiver
+/// refuses a session from another build for that ([`OtherBuild`]) before it
+/// reads anything else, unless it is a worker joining a running copy, whose
+/// frame keeps its layout across builds. Frames from builds before this
+/// start with a byte of 0 to 2.
 pub(super) const FRAME_MAGIC: &[u8; 4] = b"SYQA";
 /// The longest build identity a frame may carry.
 pub(super) const MAX_FRAME_BUILD_BYTES: usize = 255;
@@ -202,14 +204,26 @@ impl Admission {
         frame.read(&mut build)?;
         let mut build = vec![0; usize::from(build[0])];
         frame.read(&mut build)?;
-        if build != crate::identity::build().as_bytes() {
-            return Err(OtherBuild::refuse(Some(&build)).into());
+        // A worker joins a copy that is already running, whose own receiver
+        // serves it whatever build this one is, as after an update; only a
+        // new copy needs this build. So the worker frame keeps its layout.
+        let ours = build == crate::identity::build().as_bytes();
+        let mut kind = [0u8];
+        if !ours {
+            if frame.remaining == 0 {
+                return Err(OtherBuild::refuse(Some(&build)).into());
+            }
+            frame.read(&mut kind)?;
+            if kind[0] != WORKER_FRAME {
+                return Err(OtherBuild::refuse(Some(&build)).into());
+            }
         }
         if length > MAX_ADMISSION_BYTES {
             bail!("the session's first frame has an unsupported length");
         }
-        let mut kind = [0u8];
-        frame.read(&mut kind)?;
+        if ours {
+            frame.read(&mut kind)?;
+        }
         let signed = crate::directive::MAX_SIGNED_BYTES;
         let admission = match kind[0] {
             COPY_FRAME => Self::Copy(frame.field(signed)?),
@@ -614,7 +628,8 @@ pub(crate) fn admit_session(enrollment: &str, generation: &str) -> Result<Sessio
     match Admission::read(&mut input, deadline)? {
         Admission::Worker(ticket) => {
             // A worker joins a copy that is already running, which continues
-            // whatever has changed since it started.
+            // whatever has changed since it started, this receiver's build
+            // included.
             ssh::enter_state_directory(&state)?;
             let socket = ssh::join(&ticket)?;
             drop(slot);

@@ -7,11 +7,11 @@ the agent with the lab's provider, and a certificate login. Keys that cannot
 sign are refused before anything is installed. A new login key replaces only
 the trusted signer, a connection started before a refresh cannot start a new
 copy, a session from another syq build is refused as that, and a copy running
-through a refresh finishes. Connections that have not shown a signed copy yet
-are refused once 32 are starting, or 16 from one address: a machine holding
-its 16 leaves copies from another working. A copy's workers refused that way
-start again without the wait of a failed worker, and revoking works while
-refused connections keep arriving.
+through a refresh to another build finishes. Connections that have not shown
+a signed copy yet are refused once 32 are starting, or 16 from one address: a
+machine holding its 16 leaves copies from another working. A copy's workers
+refused that way start again without the wait of a failed worker, and
+revoking works while refused connections keep arriving.
 """
 import json
 import os
@@ -478,12 +478,17 @@ print(any(p.stat().st_size > 0 for p in Path({parent!r}).glob('.rotation-large.s
             lab.add(socket, '-d', str(third.with_suffix('.pub')))
             lab.add(socket, str(second))
             lab.use(second, socket)
-            run('syq', 'receiver', 'enroll', 'destination')
+            # The refresh comes from another syq build, as right after an
+            # update, so the line now starts a receiver of that build.
+            other = run('syq-other-build', '--build-identity', stdout=subprocess.PIPE)
+            run('syq-other-build', 'receiver', 'enroll', 'destination')
             _, again = enrollment()
             assert again['generation'] == 4, again
+            assert again['release'] == other.stdout.decode().strip(), again
             # Drop the copy's worker connections: the workers that replace
-            # them start from the refreshed line, at the new generation, and
-            # join the running copy. Every session runs the receiver; the
+            # them start from the refreshed line, at the new generation and
+            # of the other build, and join the running copy, whose own
+            # receiver serves them. Every session runs the receiver; the
             # copy's control started first, and the others are its workers.
             dropped = remote_text('python3 -c ' + shlex.quote(RECEIVER_SESSIONS + '''
 import signal
@@ -504,7 +509,7 @@ print(len(sessions) - 1)
             raise
     size = remote_text('stat -c %s ' + shlex.quote(destination)).strip()
     assert size == str(32 << 20), size
-    print('a worker joined a copy running through a refresh', flush=True)
+    print('a worker joined a copy running through a refresh to another build', flush=True)
 
 
 def remount(parent):
