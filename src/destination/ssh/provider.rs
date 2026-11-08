@@ -662,7 +662,12 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
             next_look = Instant::now() + Duration::from_secs(5);
             // Kept from requests until a stop is published (`Requests`).
             match requests(domain, provider) {
-                Requests::Starting => next_look = Instant::now() + Duration::from_millis(200),
+                Requests::Starting => {
+                    // A new keeper: what an earlier look found does not
+                    // apply to it, so its first look once ready decides.
+                    other = OtherKeeper::None;
+                    next_look = Instant::now() + Duration::from_millis(200);
+                }
                 requests => {
                     other = stop_other_build_keeper(domain, provider, || {
                         // Last, so that the stop follows at once: one for
