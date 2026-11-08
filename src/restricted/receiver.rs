@@ -382,6 +382,17 @@ pub(super) enum Rules {
     Source(crate::destination::pull::PullRequest),
 }
 
+impl Rules {
+    /// The end of the copy these rules serve, as the directive's role names
+    /// it.
+    pub(super) fn role(&self) -> crate::directive::Role {
+        match self {
+            Rules::Destination(_) => crate::directive::Role::Destination,
+            Rules::Source(_) => crate::directive::Role::Source,
+        }
+    }
+}
+
 /// Admit a new copy's directive and set up its authority: refused by a
 /// receiver of another generation or build, then checked against the
 /// trusted login key and its policy, its rules derived from its command for
@@ -408,14 +419,14 @@ fn admit(
         (&home, &canonical_home),
     )?;
     drop(slot);
+    // Writing as root could set any owner, create device files or write
+    // privileged attributes; reading as root reads only what the signed
+    // command names.
+    if privilege::refuses_privileged(&rules.role()) {
+        refuse_privileged_receiver(Some(enrollment))?;
+    }
     let (grant, constraints) = match rules {
-        // Writing as root could set any owner, create device files or write
-        // privileged attributes; reading as root reads only what the signed
-        // command names.
-        Rules::Destination(rules) => {
-            refuse_privileged_receiver(Some(enrollment))?;
-            *rules
-        }
+        Rules::Destination(rules) => *rules,
         Rules::Source(reads) => {
             // Reads follow the signed command, as the account's own would:
             // the approving machine's prompt showed what it names.

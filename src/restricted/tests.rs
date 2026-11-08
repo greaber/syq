@@ -7269,9 +7269,71 @@ fn receivers_refuse_root_and_effective_capabilities() {
     assert!(!fresh.contains("revoke"), "{fresh}");
     let existing = privilege::privileged_receiver_message(Some("0123abcd"));
     assert!(
-        existing.ends_with("`syq receiver revoke 0123abcd` removes this root enrollment"),
+        existing.ends_with("serves only downloads, and `syq receiver revoke 0123abcd` removes it"),
         "{existing}"
     );
+}
+
+/// Only a receiver that reads may run as root: a destination's and a
+/// coordinating source's are refused, as admission applies it to the rules a
+/// directive yields.
+#[test]
+fn only_reading_receivers_may_run_privileged() {
+    use crate::directive::Role;
+    assert!(!privilege::refuses_privileged(&Role::Source));
+    assert!(privilege::refuses_privileged(&Role::Destination));
+    let peer = crate::directive::Peer {
+        enrollment: EnrollmentId::random(),
+        generation: 1,
+        account: "backup".into(),
+        request: delegation::RequestId::test(1),
+        destination: b"/archive".to_vec(),
+        known_hosts: String::new(),
+    };
+    assert!(privilege::refuses_privileged(&Role::CoordinatingSource(
+        peer
+    )));
+}
+
+/// A copy that would write as root, or run a copy as root, is refused
+/// before anything is set up: no login, no enrollment, no signature.
+#[test]
+fn a_root_writer_is_refused_before_enrolling() {
+    use crate::directive::Role;
+    for role in [
+        Role::Destination,
+        Role::CoordinatingSource(crate::directive::Peer {
+            enrollment: EnrollmentId::random(),
+            generation: 1,
+            account: "backup".into(),
+            request: delegation::RequestId::test(1),
+            destination: b"/archive".to_vec(),
+            known_hosts: String::new(),
+        }),
+    ] {
+        let error = prepare_transfer(Issue {
+            command: vec![b"cp".to_vec()],
+            cwd: "/".into(),
+            inputs: Default::default(),
+            caps: None,
+            // Nothing may resolve or dial this.
+            host: "root-writer.invalid",
+            port: None,
+            login: "root",
+            jump: None,
+            agent: None,
+            allow_enrollment: true,
+            batch: true,
+            results_key: None,
+            role,
+        })
+        .err()
+        .expect("root writer refused");
+        assert!(
+            format!("{error:#}").contains("do not write or run copies as root"),
+            "{error:#}"
+        );
+    }
 }
 
 #[test]

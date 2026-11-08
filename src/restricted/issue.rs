@@ -70,6 +70,12 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
         role,
     } = issue;
     let account = endpoint(destination_login, host, port)?.label();
+    // The receiver writes or coordinates only as an ordinary account; say so
+    // before setting anything up. An account with another name and user ID 0
+    // is refused by its receiver.
+    if privilege::refuses_privileged(&role) && destination_login == "root" {
+        bail!(privilege::privileged_receiver_message(None));
+    }
     let (recipient_secret, recipient_public_key) = match results_key {
         Some(key) => (None, key),
         None => {

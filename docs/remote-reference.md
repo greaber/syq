@@ -20,8 +20,9 @@ In syq's default mode, restricted copying, hostB accepts only copies you
 signed; see [Copies between servers](security.md#copies-between-servers). The
 first copy to a server account sets this up there, once for each of your
 machines; this is called enrollment. To do it ahead of time, run
-`syq receiver enroll HOST`. Enrollment needs an SSH key login to an account
-other than root.
+`syq receiver enroll HOST`. Enrollment needs an SSH key or certificate login.
+A root account can be enrolled, but its receiver serves only downloads: it
+refuses uploads and copies to another server.
 
 Enrollment adds one line to the server's `~/.ssh/authorized_keys`. Its key,
 the entry key, can only start syq's receiver, and its comment,
@@ -146,8 +147,8 @@ other SSH error, such as a name that does not resolve, a refused connection or
 a timeout, or with no receiving machine available, syq reports the SSH error.
 A refusal or failure on the receiving machine ends the copy.
 
-Per-copy approval does not work for an upload to a root login, or a copy
-between two servers from one, nor with `--detach`, `--rsh`, `--syq-path`, `--no-bootstrap`, other `--peer-auth` or
+Per-copy approval does not work for an upload to a root login, nor with
+`--detach`, `--rsh`, `--syq-path`, `--no-bootstrap`, other `--peer-auth` or
 `--coordinate-at` values, or `--no-tcp-encryption`, and an approved upload
 cannot preserve hard links, ACLs, extended attributes, or access or birth
 times, or use `--open-noatime` or `--sparse`. Such copies need this machine's
