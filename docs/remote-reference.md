@@ -87,6 +87,13 @@ changes hostB makes: files written, directories, links and special files
 created, metadata changes, and deletions. The copy must start within 24 hours
 of authorization and finish within seven days of it.
 
+A copy between two servers can name up to 1,024 sources, like any copy. Long
+paths lower that number in two cases. A restricted copy's signed command can
+be at most 256 KiB, so 1,024 sources fit when their paths average up to about
+250 characters. With `--detach`, `--syq-path` or `--no-bootstrap`, the server
+that runs the copy gets the sources on its command line, which holds 128 KiB,
+so 1,024 sources fit only when their paths average up to about 90 characters.
+
 Restricted copies cannot use `--no-tcp-encryption`, `--detach`, or
 `--performance-tuning workers=N` above 128, and `syq rm` cannot go through the
 receiver; use a normal SSH login for those.

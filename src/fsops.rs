@@ -146,6 +146,15 @@ fn too_many_sources(count: usize) -> String {
     )
 }
 
+/// Refuse a copy of `count` named sources that no endpoint session would
+/// accept, before it sets anything up, as a local copy refuses it.
+pub(crate) fn ensure_source_count(count: usize) -> Result<()> {
+    if count > MAX_SOURCE_ROOTS {
+        bail!(too_many_sources(count));
+    }
+    Ok(())
+}
+
 pub const PARTIAL_MARKER: &str = ".syq-tmp.";
 pub(crate) const FD_CACHE_MAX: usize = 16;
 const PARTIAL_DIRECTORY_CACHE_MAX: usize = 64;

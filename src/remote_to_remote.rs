@@ -6,7 +6,9 @@ use crate::cli::{parse_rsh, Args, Existence, Interface, Location, Placement, Sou
 use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
+use std::ffi::OsString;
 use std::io::{BufRead, IsTerminal, Read, Write};
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::process::{Command, Stdio};
 
 /// What the destination's own results say, for the outcome rule.
@@ -1050,9 +1052,9 @@ impl ReceiverConnection {
 }
 
 pub(crate) const RECEIVER_KNOWN_HOSTS: &str = "SYQ_INTERNAL_NATIVE_RECEIVER_KNOWN_HOSTS";
-/// Set when a remote coordinator's input starts with this many bytes of the
-/// enrollment's entry key. The key never appears in arguments or the
-/// environment.
+/// Set when a remote coordinator's input holds this many bytes of the
+/// enrollment's entry key, after any named sources. The key never appears
+/// in arguments or the environment.
 pub(crate) const ENTRY_KEY_STDIN: &str = "SYQ_INTERNAL_NATIVE_ENTRY_KEY";
 /// Set with the entry key: this many bytes of the copy's signed directive
 /// follow it on the coordinator's input.
@@ -1133,8 +1135,8 @@ pub(crate) fn prepare_receiver_ssh(
 }
 
 /// Read `length` bytes of what the requesting syq sends first on this
-/// coordinator's input, before any manifest: the entry key, then the
-/// directive.
+/// coordinator's input, before any manifest: any named sources, then the
+/// entry key, then the directive.
 fn read_input(label: &str, length: usize, maximum: usize) -> Result<zeroize::Zeroizing<Vec<u8>>> {
     use std::os::fd::AsFd;
     anyhow::ensure!((1..=maximum).contains(&length), "invalid {label} length");
@@ -1147,9 +1149,11 @@ fn read_input(label: &str, length: usize, maximum: usize) -> Result<zeroize::Zer
             .context("take the requesting syq's input")?,
     );
     let mut bytes = zeroize::Zeroizing::new(vec![0; length]);
-    input
-        .read_exact(&mut bytes)
-        .with_context(|| format!("the requesting syq ended before sending the {label}"))?;
+    input.read_exact(&mut bytes).map_err(|error| {
+        anyhow::anyhow!(
+            "the requesting syq ended before sending the {label} ({error}); the SSH connection must pass this coordinator its input, which `ssh -n` and `StdinNull yes` close"
+        )
+    })?;
     Ok(bytes)
 }
 
@@ -1413,17 +1417,147 @@ fn source_words(source: &Location) -> [String; 2] {
 /// 128 KiB in one argument, with its terminating NUL.
 const MAX_COORDINATOR_COMMAND: usize = 128 * 1024 - 1;
 
+/// Where a coordinator's named sources are, for its command line's limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandSources {
+    /// On the command line: this many, kept there by this option, if one.
+    Listed(usize, Option<&'static str>),
+    /// On the coordinator's input.
+    OnInput,
+}
+
 /// Refuse a coordinator command of `length` bytes that a server cannot run,
 /// before anything starts there, rather than let it fail with "Argument list
 /// too long".
-fn ensure_coordinator_command_fits(length: usize, sources: usize) -> Result<()> {
-    if length > MAX_COORDINATOR_COMMAND {
+fn ensure_coordinator_command_fits(length: usize, sources: CommandSources) -> Result<()> {
+    if length <= MAX_COORDINATOR_COMMAND {
+        return Ok(());
+    }
+    let size = length.div_ceil(1024);
+    match sources {
+        CommandSources::Listed(count, kept_by) => {
+            let instead = kept_by.map_or(String::new(), |option| {
+                format!(" (without {option}, syq sends them over its connection instead)")
+            });
+            bail!(
+                "this copy between two servers names {count} sources, which make its coordinator's command line {size} KiB, more than the 128 KiB a server accepts{instead}; {}",
+                crate::fsops::FEWER_SOURCES
+            )
+        }
+        CommandSources::OnInput => bail!(
+            "this copy between two servers makes its coordinator's command line {size} KiB even without its sources, more than the 128 KiB a server accepts"
+        ),
+    }
+}
+
+/// The option that keeps a copy's named sources on its coordinator's
+/// command line: a detached coordinator's input is closed, and only this
+/// build reads them from its input, which a coordinator chosen by
+/// `--syq-path` or `--no-bootstrap` may not be.
+fn sources_kept_on_command_line(args: &Args) -> Option<&'static str> {
+    if args.detach {
+        Some("--detach")
+    } else if args.syq_path.is_some() {
+        Some("--syq-path")
+    } else if args.no_bootstrap {
+        Some("--no-bootstrap")
+    } else {
+        None
+    }
+}
+
+/// The word that stands for a coordinator's named sources on its command
+/// line when they are too many for it, followed by `=` and their length on
+/// its input, which they start. A build that predates it refuses the word as
+/// an unknown option before reading any input.
+pub(crate) const SOURCES_ON_INPUT: &str = "--delegated-sources-on-input";
+/// The longest list of named sources a coordinator reads from its input.
+const MAX_SOURCES_INPUT: usize = 16 * 1024 * 1024;
+
+/// The named sources of a copy between two servers as its coordinator reads
+/// them from its input: each of their command-line words, ended by a NUL.
+fn input_sources(srcs: &[Location]) -> Result<Vec<u8>> {
+    let mut input = Vec::new();
+    for word in srcs.iter().flat_map(source_words) {
+        input.extend_from_slice(word.as_bytes());
+        input.push(0);
+    }
+    if input.len() > MAX_SOURCES_INPUT {
         bail!(
-            "this copy between two servers names {sources} sources, which make its coordinator's command line {} KiB, more than the 128 KiB a server accepts; {}",
-            length.div_ceil(1024),
+            "this copy between two servers names {} sources, which take {} KiB, more than the {} KiB its coordinator reads; {}",
+            srcs.len(),
+            input.len().div_ceil(1024),
+            MAX_SOURCES_INPUT / 1024,
             crate::fsops::FEWER_SOURCES
         );
     }
+    Ok(input)
+}
+
+/// The command-line words that `input`, from [`input_sources`], holds. Only
+/// source options and their encoded paths are accepted, so the input adds
+/// sources and nothing else.
+fn parse_input_sources(input: &[u8]) -> Result<Vec<OsString>> {
+    let words: Vec<&[u8]> = input
+        .strip_suffix(b"\0")
+        .context("the named sources on the coordinator's input are incomplete")?
+        .split(|byte| *byte == 0)
+        .collect();
+    anyhow::ensure!(
+        words.len().is_multiple_of(2)
+            && words.len() / 2 <= crate::descriptor_broker::MAX_SOURCE_ROOTS,
+        "the coordinator's input holds an invalid list of named sources"
+    );
+    for pair in words.chunks(2) {
+        anyhow::ensure!(
+            matches!(
+                pair[0],
+                b"--src" | b"--srcs-in" | b"--src-non-dir" | b"--src-dir"
+            ) && !pair[1].is_empty()
+                && pair[1]
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/')),
+            "the coordinator's input holds an invalid list of named sources"
+        );
+    }
+    Ok(words
+        .into_iter()
+        .map(|word| OsString::from_vec(word.to_vec()))
+        .collect())
+}
+
+/// Put a delegated coordinator's named sources, which another syq sent on
+/// its input because its command line could not hold them, in place of the
+/// word that stands for them in `argv`, before anything parses it or reads
+/// its input.
+pub(crate) fn take_sources_from_input(argv: &mut Vec<OsString>) -> Result<()> {
+    let delegated = argv.get(1).is_some_and(|arg| arg == "cp")
+        && argv
+            .get(2)
+            .is_some_and(|arg| arg == "--delegated-operands-b64");
+    if !delegated {
+        return Ok(());
+    }
+    let prefix = format!("{SOURCES_ON_INPUT}=");
+    let mut marked = argv.iter().enumerate().filter_map(|(position, word)| {
+        word.as_bytes()
+            .strip_prefix(prefix.as_bytes())
+            .map(|length| (position, length))
+    });
+    let Some((position, length)) = marked.next() else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        marked.next().is_none(),
+        "the coordinator's command names its sources' input more than once"
+    );
+    let length = std::str::from_utf8(length)
+        .ok()
+        .and_then(|length| length.parse().ok())
+        .context("invalid length of the named sources on the coordinator's input")?;
+    let input = read_input("named sources", length, MAX_SOURCES_INPUT)?;
+    let words = parse_input_sources(&input)?;
+    argv.splice(position..=position, words);
     Ok(())
 }
 
@@ -1478,6 +1612,7 @@ fn detached_launcher_command(
 }
 
 /// What a coordinator's command depends on besides the copy's own options.
+#[derive(Clone)]
 pub(crate) struct CoordinatorCommand<'a> {
     /// The coordinator writes its results for the syq that started it to
     /// relay.
@@ -1493,6 +1628,9 @@ pub(crate) struct CoordinatorCommand<'a> {
     pub destination_path: Option<&'a [u8]>,
     /// The mapping arrives on the coordinator's input.
     pub mapping: bool,
+    /// The named sources start the coordinator's input, in this many bytes
+    /// of [`input_sources`], rather than being on its command line.
+    pub sources_on_input: Option<usize>,
 }
 
 /// The arguments of the delegated `syq cp` that coordinates a copy between
@@ -1693,6 +1831,8 @@ pub(crate) fn coordinator_arguments(
     }
     if command.mapping {
         remote.push("--mapping=-".into());
+    } else if let Some(length) = command.sources_on_input {
+        remote.push(format!("{SOURCES_ON_INPUT}={length}"));
     } else {
         for source in srcs {
             remote.extend(source_words(source));
@@ -1750,24 +1890,27 @@ fn run_remote(
     results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
 ) -> Result<i32> {
     let started = std::time::Instant::now();
-    // The coordinator gets the named sources on its command line. Refuse
-    // more than it can take before asking for any approval or signature.
-    if args.mapping_contents.is_none() {
-        ensure_coordinator_command_fits(
-            srcs.iter()
-                .flat_map(source_words)
-                .map(|word| word.len() + 1)
-                .sum(),
-            srcs.len(),
-        )?;
-    }
-    // A copy a receiving machine approved runs on the source's receiver.
+    crate::fsops::ensure_source_count(srcs.len())?;
+    // A copy a receiving machine approved runs on the source's receiver,
+    // which gives its coordinator the sources as separate arguments.
     if let Some(copy) = &args.coordinated_copy {
         anyhow::ensure!(
             !coordinator_at_dst,
             "a copy between two servers approved by another machine runs on its source"
         );
         return run_coordinated(args, dst, results, copy);
+    }
+    // Sources too many for the coordinator's command line go on its input,
+    // unless an option keeps them on the command line. Refuse those that
+    // cannot fit there before asking for any approval or signature.
+    if let (None, Some(option)) = (&args.mapping_contents, sources_kept_on_command_line(args)) {
+        ensure_coordinator_command_fits(
+            srcs.iter()
+                .flat_map(source_words)
+                .map(|word| word.len() + 1)
+                .sum(),
+            CommandSources::Listed(srcs.len(), Some(option)),
+        )?;
     }
     let coordinator = if coordinator_at_dst { dst } else { &srcs[0] };
     let peer = if coordinator_at_dst { &srcs[0] } else { dst };
@@ -1819,14 +1962,19 @@ fn run_remote(
         )?;
         peer_login_user = Some(peer_policy.login_user.clone());
         peer_connection_host = Some(peer_policy.connection_host().to_owned());
+        // A command too long to sign is refused as such, before anything
+        // is set up, rather than as an enrollment that failed.
+        let command = (!coordinator_at_dst && args.peer_auth != PeerAuth::Broker)
+            .then(|| crate::approval_command::copy_command(args))
+            .transpose()?;
         // Native new/existing placement forms travel in the signed grant as the
         // root-existence precondition, so they use the receiver like any other
         // form instead of silently keeping only the constrained broker.
-        let prepared = (!coordinator_at_dst && args.peer_auth != PeerAuth::Broker)
-            .then(|| {
+        let prepared = command
+            .map(|command| {
                 crate::directive::validate_restricted_args(args)?;
                 crate::restricted::prepare_transfer(crate::restricted::Issue {
-                    command: crate::approval_command::copy_command(args)?,
+                    command,
                     cwd: crate::approval_command::current_directory(),
                     inputs: crate::directive::Inputs {
                         ignore: args.ignore_lines.clone(),
@@ -1975,27 +2123,16 @@ fn run_remote(
             constrained_rsh.as_deref(),
         )
     };
-    let mut remote = coordinator_arguments(
-        args,
-        (srcs, dst, peer),
-        (coordinator_at_dst, same_host),
-        CoordinatorCommand {
-            relay_results: results.is_some(),
-            destination_results: destination_results.is_some(),
-            remote_shell,
-            peer_login_user: peer_login_user.as_deref(),
-            peer_connection_host: peer_connection_host.as_deref(),
-            destination_path: restricted_destination_path.as_deref(),
-            mapping: args.mapping_contents.is_some(),
-        },
-    )?;
-
-    if args.detach {
-        // Detached: keep a text log without a live progress display.
-        remote.retain(|a| a != "--progress" && a != "--no-progress" && !a.starts_with("--width="));
-        remote.insert(1, "--no-progress".into());
-        remote.insert(1, "-v".into());
-    }
+    let command = CoordinatorCommand {
+        relay_results: results.is_some(),
+        destination_results: destination_results.is_some(),
+        remote_shell,
+        peer_login_user: peer_login_user.as_deref(),
+        peer_connection_host: peer_connection_host.as_deref(),
+        destination_path: restricted_destination_path.as_deref(),
+        mapping: args.mapping_contents.is_some(),
+        sources_on_input: None,
+    };
     // A detached launcher returns before the background syq execs, so a
     // missing helper could otherwise look like a successful start.  Validate
     // and, in automatic mode, install it before detaching.
@@ -2059,12 +2196,30 @@ fn run_remote(
         .collect::<Vec<_>>()
         .join(" ");
     let separator = if environment.is_empty() { "" } else { " " };
-    let remote_cmd = format!(
-        "{dbg}{environment}{separator}{}",
-        spec.program_command(&remote)
-    );
-
-    let remote_cmd = if args.detach {
+    // The coordinator's command for `command`: its environment and
+    // arguments, started in the background when it is detached.
+    let coordinator_command = |command: CoordinatorCommand<'_>| -> Result<String> {
+        let mut remote = coordinator_arguments(
+            args,
+            (srcs, dst, peer),
+            (coordinator_at_dst, same_host),
+            command,
+        )?;
+        if args.detach {
+            // Detached: keep a text log without a live progress display.
+            remote.retain(|a| {
+                a != "--progress" && a != "--no-progress" && !a.starts_with("--width=")
+            });
+            remote.insert(1, "--no-progress".into());
+            remote.insert(1, "-v".into());
+        }
+        let remote_cmd = format!(
+            "{dbg}{environment}{separator}{}",
+            spec.program_command(&remote)
+        );
+        if !args.detach {
+            return Ok(remote_cmd);
+        }
         // Survive the loss of this ssh session: new session, no controlling
         // terminal, everything to a log file. A forwarded agent disappears
         // when the launcher session ends, so hostA needs its own credentials
@@ -2093,11 +2248,32 @@ fn run_remote(
         } else {
             name
         };
-        detached_launcher_command(&remote_cmd, &name, 30, 5)
-    } else {
-        remote_cmd
+        Ok(detached_launcher_command(&remote_cmd, &name, 30, 5))
     };
-    ensure_coordinator_command_fits(remote_cmd.len(), srcs.len())?;
+    let mut remote_cmd = coordinator_command(command.clone())?;
+    let mut command_sources = if args.mapping_contents.is_some() {
+        CommandSources::OnInput
+    } else {
+        CommandSources::Listed(srcs.len(), sources_kept_on_command_line(args))
+    };
+    // Named sources that the command line cannot hold start the
+    // coordinator's input instead, when it is this build and stays attached
+    // to read them. A command that fits stays as it was, so a copy whose
+    // SSH connection closes the coordinator's input still runs.
+    let mut sources_input = None;
+    if remote_cmd.len() > MAX_COORDINATOR_COMMAND
+        && command_sources == CommandSources::Listed(srcs.len(), None)
+        && spec.runs_this_build()
+    {
+        let input = input_sources(srcs)?;
+        remote_cmd = coordinator_command(CoordinatorCommand {
+            sources_on_input: Some(input.len()),
+            ..command
+        })?;
+        sources_input = Some(input);
+        command_sources = CommandSources::OnInput;
+    }
+    ensure_coordinator_command_fits(remote_cmd.len(), command_sources)?;
 
     let make_command = || {
         if spec.ssh_multiplexer.is_some() {
@@ -2162,7 +2338,11 @@ fn run_remote(
     let run = |relay: Option<Relay>| {
         let mut cmd = make_command();
         cmd.stdin(
-            if follow_requester || args.mapping_contents.is_some() || entry_key.is_some() {
+            if follow_requester
+                || args.mapping_contents.is_some()
+                || entry_key.is_some()
+                || sources_input.is_some()
+            {
                 Stdio::piped()
             } else {
                 Stdio::null()
@@ -2183,10 +2363,15 @@ fn run_remote(
             let mapping = args.mapping_contents.clone();
             let entry_key = entry_key.clone();
             let directive = directive.clone();
+            let sources = sources_input.clone();
             std::thread::spawn(move || {
-                // The entry key and the directive come first; the
-                // coordinator reads exactly their lengths before anything
+                // Named sources first, which the coordinator reads before it
+                // parses its arguments, then the entry key and the
+                // directive; it reads exactly their lengths before anything
                 // else reads its input.
+                if let Some(sources) = sources {
+                    stdin.write_all(&sources)?;
+                }
                 if let (Some(key), Some(directive)) = (entry_key, directive) {
                     stdin.write_all(&key)?;
                     stdin.write_all(&directive)?;
@@ -2219,7 +2404,7 @@ fn run_remote(
             })
             .transpose();
         if status.success() {
-            written.context("send mapping to remote coordinator")?;
+            written.context("send the remote coordinator its input")?;
         }
         Ok::<_, anyhow::Error>((status, relayed?))
     };
@@ -2482,6 +2667,9 @@ pub(crate) fn coordination_command(
             peer_connection_host: None,
             destination_path: Some(&peer.destination),
             mapping: false,
+            // The receiver starts the coordinator itself, with each source
+            // a separate argument.
+            sources_on_input: None,
         },
     )?;
     let mut environment = vec![

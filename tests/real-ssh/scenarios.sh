@@ -1197,6 +1197,64 @@ for small_case in new unchanged updated; do
     test "$small_expected" = "$small_actual"
 done
 
+printf 'case: a copy between two servers started here takes 1,024 named sources\n'
+# Short paths fit the source's command line; 1,024 of about 175 bytes need
+# twice its 128 KiB, so they go to the source over the connection instead.
+many=/tmp/syq-real-ssh/many-sources
+long_stem=$(printf 'n%.0s' $(seq 1 140))
+# shellcheck disable=SC2029
+ssh source "rm -rf $many && mkdir -p $many/short $many/long && cd $many/short && seq -f 'f%04g' 1 1025 | xargs touch && cd $many/long && seq -f '${long_stem}_%04g' 1 1024 | xargs touch"
+for many_case in short long; do
+    # shellcheck disable=SC2029
+    ssh destination "rm -rf $many-$many_case && install -d $many-$many_case"
+    many_results="/tmp/syq-real-ssh-many-$many_case.ndjson"
+    if [ "$many_case" = short ]; then
+        # shellcheck disable=SC2046
+        set -- $(seq -f "$many/short/f%04g" 1 1024)
+    else
+        # shellcheck disable=SC2046
+        set -- $(seq -f "$many/long/${long_stem}_%04g" 1 1024)
+    fi
+    if ! many_output=$(syq cp --no-progress --results "$many_results" --from source "$@" \
+        --to destination --into "$many-$many_case" 2>&1); then
+        printf '%s\n' "$many_output" >&2
+        exit 1
+    fi
+    python3 - "$many_results" <<'PYTHON'
+import json, sys
+result = [json.loads(line) for line in open(sys.argv[1])][-1]
+assert result["type"] == "result" and result["status"] == "success", result
+assert result["files_transferred"] == 1024 and result["errors"] == 0, result
+PYTHON
+    # shellcheck disable=SC2029
+    test "$(ssh destination "find $many-$many_case -type f | wc -l")" -eq 1024
+done
+# More than one copy accepts are refused before anything is set up.
+# shellcheck disable=SC2046
+set -- $(seq -f "$many/short/f%04g" 1 1025)
+if many_output=$(syq cp --no-progress --from source "$@" --to destination --into "$many-short" 2>&1); then
+    echo 'a copy between two servers with 1,025 sources unexpectedly started' >&2
+    exit 1
+fi
+case "$many_output" in
+    'syq: this copy names 1025 sources, more than the 1024 one copy accepts;'*) ;;
+    *) printf '%s\n' "$many_output" >&2; exit 1 ;;
+esac
+# So is a command longer than its signature covers: 1,024 paths of about
+# 290 bytes.
+# shellcheck disable=SC2046
+set -- $(seq -f "$many/huge/$(printf 'n%.0s' $(seq 1 250))_%04g" 1 1024)
+if many_output=$(syq cp --no-progress --from source "$@" --to destination --into "$many-short" 2>&1); then
+    echo 'a copy between two servers with a 290 KiB command unexpectedly started' >&2
+    exit 1
+fi
+case "$many_output" in
+    *'--peer-auth broker'*) printf '%s\n' "$many_output" >&2; exit 1 ;;
+    'syq: this copy names 1024 sources, which make its command '*' KiB, more than the 256 KiB its approval can carry;'*) ;;
+    *) printf '%s\n' "$many_output" >&2; exit 1 ;;
+esac
+set --
+
 printf 'case: --follow-dst copies into the directory a restricted destination link leads to\n'
 # The receiver resolves the link inside the directory the destination is in
 # and writes into the directory it leads to; the link stays a link.
