@@ -110,7 +110,9 @@ helpers.
 
 The source sshd permits remote Unix socket forwarding for named return transfers
 (OpenSSH 7.8 and later also require remote TCP forwarding permission). The destination
-keeps forwarding disabled. The core runner also hosts a loopback sshd for an
+keeps forwarding disabled. Only the destination lets root log in with the lab's
+key, so a download from root runs on a real root enrollment; other cases log in
+as ordinary accounts. The core runner also hosts a loopback sshd for an
 isolated requester account without the laptop's keys. The ordinary-provider case
 uses a separate disposable SSH listener that permits local Unix forwarding;
 it does not change the other scenarios' forwarding restrictions. Return scenarios cover
@@ -136,6 +138,10 @@ that a dry run sets nothing up and a denial changes nothing, that the source's
 enrolled receiver runs the copy and sends TCP and SSH data directly to the
 destination's, that the requester checks the destination's results, that the
 copy outlives the laptop, and that killing the requester stops it on the source.
+The download case also enrolls the destination's root account: its receiver
+reads a file only root can read, while an upload to root and a copy between
+servers to root started on the runner are refused before anything is asked or
+written to root's account.
 
 Source-shell remote copies also cover cached helper reuse, bootstrap after a
 missing or unexecutable helper, a delayed approval relay before Hello, and

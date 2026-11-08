@@ -1,6 +1,8 @@
 """Downloads from another server that the runner approves per copy: the
 requesting server reads through the source's enrolled receiver, which serves
-only what the signed command reads. All paths are disposable."""
+only what the signed command reads. The source's root account, which only this
+lab endpoint lets log in, serves downloads too, but no copy writes to it. All
+paths are disposable."""
 import contextlib
 import json
 import os
@@ -141,13 +143,13 @@ def pending():
     return json.loads(run("syq", "persist", "receive", "pending", "--json"))
 
 
-def decide(allow=True, setup=None):
+def decide(allow=True, setup=None, source="destination"):
     requests = json.loads(run("syq", "persist", "receive", "pending", "--json",
                               "--wait", "--timeout", "20"))
     assert len(requests) == 1, requests
     request = requests[0]
     assert request["kind"] == "source", request
-    assert request["source"] == "destination", request
+    assert request["source"] == source, request
     assert "destination" not in request, request
     assert "syq's receiver" in request["permission"], request
     if setup is not None:
@@ -157,17 +159,17 @@ def decide(allow=True, setup=None):
     return request
 
 
-def enrollments():
+def enrollments(account="syq@destination"):
     return [line.split("\t")[0] for line in run("syq", "receiver", "list").splitlines()
-            if "\tactive\tsyq@destination" in line]
+            if "\tactive\t" + account in line]
 
 
 def digest(host, path):
     return remote(host, "sha256sum " + shlex.quote(path)).split()[0]
 
 
-def authorized_keys():
-    return remote("destination", "cat ~/.ssh/authorized_keys 2>/dev/null || true")
+def authorized_keys(account="destination"):
+    return remote(account, "cat ~/.ssh/authorized_keys 2>/dev/null || true")
 
 
 def main():
@@ -193,9 +195,10 @@ def main():
                         + " bs=1M count=4 status=none | sha256sum").split()[0]
         attempts = {}
 
-        def command(name, extra=(), source="data", binary="syq", tcp=False, path=None):
+        def command(name, extra=(), source="data", binary="syq", tcp=False, path=None,
+                    account="destination"):
             attempts[name] = attempts.get(name, 0) + 1
-            argv = [binary, "cp", "--from", "destination", path or files + "/" + source,
+            argv = [binary, "cp", "--from", account, path or files + "/" + source,
                     "--as", into + "/" + name, "--auth-from", "auto", "--no-progress",
                     "--performance-tuning", "workers=2",
                     "--results", f"{into}/{name}.{attempts[name]}.ndjson", *extra]
@@ -336,8 +339,81 @@ def main():
             finish(process, output)
         terminal = copied("revoked", large)
         assert terminal["bytes_unchanged"] >= 4 << 20, terminal
+
+        print("case: a root login serves an approved download of a root-only file", flush=True)
+        as_root = "root@destination"
+        roots[as_root] = remote(as_root, "mktemp -d /tmp/syq-pull-root.XXXXXX").strip()
+        secret = roots[as_root] + "/secret"
+        remote(as_root, "dd if=/dev/urandom of=" + shlex.quote(secret)
+               + " bs=1M count=4 status=none && chmod 600 " + shlex.quote(secret))
+        assert remote(as_root, "stat -c '%U %a' " + shlex.quote(secret)).split() == ["root", "600"]
+        remote("destination", "cat " + shlex.quote(secret), success=False)
+        secret_digest, account_keys = digest(as_root, secret), authorized_keys()
+        assert enrollments(as_root) == [] and "syq-enrollment:" not in authorized_keys(as_root)
+        with running(command("root-secret", ("--resource-limits", "bandwidth=2M"), path=secret,
+                             account=as_root)) as (process, output):
+            decide(setup='Also sets up restricted copying on "root@destination"', source=as_root)
+            receivers = wait_for("root's restricted receiver", lambda: probe(as_root, "receivers"))
+            finish(process, output)
+        copied("root-secret", secret_digest)
+        root_enrollment = enrollments(as_root)
+        assert len(root_enrollment) == 1
+        root_keys = authorized_keys(as_root)
+        assert root_keys.count("syq-enrollment:") == 1 and "syq-copy-worker" not in root_keys, root_keys
+        # The ordinary account's keys did not change.
+        assert authorized_keys() == account_keys
+        wait_for("root's receiver after the copy",
+                 lambda: probe(as_root, "exited", processes=receivers))
+
+        def root_state():
+            # Everything in root's home and the directory a copy would write
+            # to, so a refusal can be seen to change nothing there.
+            return remote(as_root, "find ~ " + shlex.quote(roots[as_root])
+                          + " -printf '%p %y %s %m %T@\\n' | LC_ALL=C sort")
+
+        def refused(host, argv, expected, before):
+            # A bounded wait: a copy waiting for an approval would time out.
+            command = "exec timeout --kill-after=5 30 " + shlex.join(argv)
+            with tempfile.TemporaryFile() as output:
+                process = subprocess.Popen(["sh", "-c", command] if host is None else ["ssh", host, command],
+                                           stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                                           start_new_session=True)
+                try:
+                    status = process.wait(timeout=45)
+                except subprocess.TimeoutExpired:
+                    status = None
+                    print("Still running; pending:", pending(), flush=True)
+                    stop(process)
+                text = os.pread(output.fileno(), 1024 * 1024, 0).decode(errors="replace")
+            print(text, end="", flush=True)
+            assert status not in (None, 0, 124, 137), (status, text)
+            assert expected in text, text
+            assert pending() == []
+            assert root_state() == before
+            assert enrollments(as_root) == root_enrollment
+            return text
+
+        print("case: on that root enrollment, an upload to root is refused before any prompt", flush=True)
+        before = root_state()
+        refused("source", ["syq", "cp", into + "/approved", "--to", as_root,
+                           "--as", roots[as_root] + "/upload", "--auth-from", "auto",
+                           "--no-progress"],
+                "does not run as root, so a copy to root@destination cannot be approved", before)
+
+        print("case: a copy this machine starts between servers to root is refused before setup", flush=True)
+        text = refused(None, ["syq", "cp", "--from", "source", into + "/approved", "--to", as_root,
+                              "--as", roots[as_root] + "/between", "--no-progress"],
+                       "restricted receivers do not write or run copies as root", before)
+        # Refused here, not by root's receiver, which would name its enrollment.
+        assert "serves only downloads" not in text, text
+
+        print("case: revoking the root enrollment removes its key from root's account", flush=True)
+        run("syq", "receiver", "revoke", root_enrollment[0])
+        assert enrollments(as_root) == [] and "syq-enrollment:" not in authorized_keys(as_root)
         print("Source downloads passed", flush=True)
     finally:
+        for enrollment in enrollments("root@destination"):
+            run("syq", "receiver", "revoke", enrollment)
         if "home" in roots:
             remote("destination", "rm -rf -- ~/" + shlex.quote(roots.pop("home")))
         for host, root in roots.items():

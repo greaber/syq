@@ -33,6 +33,7 @@ services:
       - NET_ADMIN
     environment:
       SYQ_REAL_SSH_BLOCKED_TCP_PORT: "47800"
+      SYQ_REAL_SSH_ROOT_LOGIN: "1"
     volumes:
       - type: bind
         source: ${SYQ_REAL_SSH_STATE:?set SYQ_REAL_SSH_STATE}/id_ed25519.pub

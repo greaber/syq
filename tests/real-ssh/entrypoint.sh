@@ -29,6 +29,12 @@ endpoint() {
         # Only the source needs return forwarding; the destination keeps it disabled.
         printf 'AllowTcpForwarding remote\nAllowStreamLocalForwarding remote\n' > /etc/ssh/sshd_config.d/00-return.conf
     fi
+    if [ "${SYQ_REAL_SSH_ROOT_LOGIN:-0}" = 1 ]; then
+        # A root download needs a real root enrollment, so this endpoint alone
+        # lets root log in with the lab key. sshd keeps the first
+        # PermitRootLogin it reads, and AllowUsers lines add to each other.
+        printf 'PermitRootLogin prohibit-password\nAllowUsers root\n' > /etc/ssh/sshd_config.d/00-root.conf
+    fi
     /usr/sbin/sshd -t -f /etc/ssh/sshd_config
     if [ -n "${SYQ_REAL_SSH_EXPECT_MAX_SESSIONS:-}" ]; then
         effective_max_sessions=$(
