@@ -107,7 +107,9 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
         // An account with another name and user ID 0 is refused here, before
         // anything is installed for a copy it could not serve.
         if uid == "0" {
-            bail!(privilege::privileged_receiver_message(None));
+            bail!(
+                "{account} logs in with user ID 0, and restricted receivers do not write or run copies as root or with root's capabilities; use an ordinary account there"
+            );
         }
         if !is_destination {
             return Ok(());

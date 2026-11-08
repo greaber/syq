@@ -40,7 +40,9 @@ endpoint() {
         # authorized keys.
         if ! getent passwd toor >/dev/null; then
             useradd --non-unique --uid 0 --gid 0 --no-create-home --home-dir /home/toor --shell /bin/sh toor
-            passwd --delete toor >/dev/null
+            # Locked to passwords (as root is) but not to keys: `*` keeps su
+            # from accepting an empty password.
+            usermod -p '*' toor
         fi
         install -d -m 0700 -o root -g root /home/toor
         test "$(getent passwd 0 | cut -d: -f1)" = root

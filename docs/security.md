@@ -505,7 +505,8 @@ for hostB as a destination cannot be used to read from it.
 Reads are not limited further within the account: a command that names
 hostB's `~/.ssh` or syq's own files there, or a symlink it follows to them,
 sends those files like any other, as a login to the account could. The prompt
-shows the paths, and says when the command follows symlinks. The server can
+shows the paths, and says when the command follows symlinks and when your
+laptop logs in as root, so file permissions don't limit the reads. The server can
 also ask for hashes of approved files; these do not count toward the data
 limit, so that limit does not bound what the server can learn from them. Once
 approved, the copy goes on without your laptop until it finishes, someone
