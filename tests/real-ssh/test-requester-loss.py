@@ -8,6 +8,10 @@ its SSH client running. The source coordinator, its processes, and the
 destination receiver must exit within seconds without publishing either file.
 The receiver then sees an interrupted copy: it removes the partial shorter
 than 1 MiB and keeps the longer one, and a rerun completes.
+
+With the argument `detached`, it checks the opposite: a `--detach` copy runs
+on after the command that started it returns, keeps the destination's entry
+key on the source only until it finishes, and leaves its log there.
 """
 import hashlib
 import json
@@ -15,6 +19,7 @@ import os
 import shlex
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -81,6 +86,12 @@ print(json.dumps(found))
     "published": r'''
 root = Path(v["root"])
 print(json.dumps(sorted(name for name in v["names"] if root.joinpath(name).exists())))
+''',
+    # The private directories holding entry keys for copies coordinated here.
+    "key_directories": r'''
+import os, tempfile
+print(json.dumps(sorted(str(p) for p in Path(tempfile.gettempdir()).glob("syq-receiver-hosts-*")
+                        if p.stat().st_uid == os.getuid())))
 ''',
     "digests": r'''
 import hashlib
@@ -163,10 +174,45 @@ def interrupt_copy(name, end_requester):
     assert probe("destination", "digests", root=destination, names=list(FILES)) == expected
 
 
+def detached_copy():
+    destination = "/tmp/syq-real-ssh/requester-loss-detached"
+    subprocess.run(["ssh", "destination", "rm -rf " + shlex.quote(destination)],
+                   check=True, timeout=30)
+    keys_before = set(probe("source", "key_directories"))
+    # At 1 MiB/s the copy needs about seven seconds after it starts, so it
+    # is still running when the command that started it returns.
+    started = subprocess.run(copy(destination, "--detach", "--resource-limits", "bandwidth=1M"),
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                             timeout=60)
+    assert started.returncode == 0, started
+    handoff = started.stdout.strip()
+    assert handoff.startswith("syq: started on ") and ", log " in handoff, started
+    log = handoff.rsplit(", log ", 1)[1]
+    coordinator = probe("source", "coordinator", destination=destination)
+    assert coordinator, "the detached copy ended with the command that started it"
+    keys = set(probe("source", "key_directories")) - keys_before
+    assert len(keys) == 1, f"the detached copy holds no entry key of its own: {keys}"
+    wait_for("the detached copy to finish", lambda: (
+        not (alive := probe("source", "alive", processes=coordinator)), alive), timeout=90)
+    expected = probe("source", "digests", root=SOURCE, names=list(FILES))
+    assert probe("destination", "digests", root=destination, names=list(FILES)) == expected
+    left = keys & set(probe("source", "key_directories"))
+    assert not left, f"the entry key outlived the detached copy: {left}"
+    text = subprocess.run(["ssh", "source", "cat " + shlex.quote(log)], capture_output=True,
+                          text=True, timeout=30, check=True).stdout
+    # The log is the copy's only record; -v leaves its summary there.
+    assert text.strip(), f"the detached copy's log {log} is empty"
+    print(f"a detached copy finished after its command returned; its log: {log}", flush=True)
+
+
 def main():
     subprocess.run(["ssh", "source", "mkdir -p " + shlex.quote(SOURCE) + " && " + " && ".join(
         f"head -c {size} /dev/urandom > {shlex.quote(SOURCE + '/' + name)}"
         for name, size in FILES.items())], check=True, timeout=30)
+    if sys.argv[1:] == ["detached"]:
+        detached_copy()
+        return
+    assert not sys.argv[1:], sys.argv
     # Ctrl-C reaches the requester and its SSH client together.
     interrupt_copy("interrupted", lambda pid: os.killpg(pid, signal.SIGINT))
     # Only the requester ends; its SSH client sees the end of its input.

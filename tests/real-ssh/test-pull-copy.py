@@ -269,10 +269,20 @@ def main():
 
         print("case: an SSH-only download reads through the source's entry key", flush=True)
         with running(command("ssh-only", ("--no-tcp",))) as (process, output):
-            decide()
+            request = decide()
+            assert "without encryption" not in request["permission"], request
             finish(process, output)
         copied("ssh-only")
         assert "syq-copy-worker" not in authorized_keys()
+
+        print("case: an approved download sends unencrypted TCP only when its command asks", flush=True)
+        # The source's receiver starts a listener without encryption only
+        # because the signed command asks for it, and the prompt warns.
+        with running(command("plain", ("--no-tcp-encryption",), tcp=True)) as (process, output):
+            request = decide()
+            assert "over TCP without encryption" in request["permission"], request
+            finish(process, output)
+        copied("plain")
 
         print("case: relative and ~/ sources are read from the source account's home", flush=True)
         # The receiver works in its state directory, yet reads these where

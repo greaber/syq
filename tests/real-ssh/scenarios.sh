@@ -1313,8 +1313,8 @@ esac
 set --
 
 printf 'case: --follow-dst copies into the directory a restricted destination link leads to\n'
-# The receiver resolves the link inside the directory the destination is in
-# and writes into the directory it leads to; the link stays a link.
+# The receiver resolves the link, wherever it leads as the account would
+# follow it, and writes into the directory it leads to; the link stays a link.
 make_tree source /tmp/syq-real-ssh/follow-source follow
 ssh destination 'rm -rf /tmp/syq-real-ssh/follow-real /tmp/syq-real-ssh/follow-link &&
     install -d /tmp/syq-real-ssh/follow-real &&
@@ -1335,6 +1335,49 @@ case "$follow_output" in
     *'--widen-dirs all cannot be combined with --follow-dst'*) ;;
     *) printf '%s\n' "$follow_output" >&2; exit 1 ;;
 esac
+# A link that leads outside the destination's directory is followed too, but
+# not into the account's SSH configuration, however the link names it.
+ssh destination 'rm -rf /tmp/syq-real-ssh-follow-outside /tmp/syq-real-ssh/follow-away \
+        /tmp/syq-real-ssh/follow-ssh &&
+    install -d /tmp/syq-real-ssh-follow-outside &&
+    ln -s ../syq-real-ssh-follow-outside /tmp/syq-real-ssh/follow-away &&
+    ln -s "$HOME/.ssh" /tmp/syq-real-ssh/follow-ssh'
+syq cp --no-progress --copy-metadata=permissions --follow-dst \
+    --from source --srcs-in /tmp/syq-real-ssh/follow-source \
+    --to destination --into /tmp/syq-real-ssh/follow-away
+assert_same_tree source /tmp/syq-real-ssh/follow-source \
+    destination /tmp/syq-real-ssh-follow-outside follow-away
+ssh_before=$(ssh destination 'ls -a ~/.ssh')
+if follow_output=$(syq cp --no-progress --follow-dst \
+    --from source --srcs-in /tmp/syq-real-ssh/follow-source \
+    --to destination --into /tmp/syq-real-ssh/follow-ssh 2>&1); then
+    echo '--follow-dst into ~/.ssh through a link unexpectedly succeeded' >&2
+    exit 1
+fi
+case "$follow_output" in
+    *"receiver's protected SSH configuration"*) ;;
+    *) printf '%s\n' "$follow_output" >&2; exit 1 ;;
+esac
+test "$(ssh destination 'ls -a ~/.ssh')" = "$ssh_before"
+
+printf 'case: a restricted copy sends unencrypted TCP data only when its command asks\n'
+# The coordinator on source asks the destination's receiver for a listener
+# without encryption, which the receiver allows because the signed command
+# passes --no-tcp-encryption.
+make_tree source /tmp/syq-real-ssh/plain-source plain
+ssh destination 'rm -rf /tmp/syq-real-ssh/plain-destination'
+plain_output=$(syq cp -vv --no-progress --copy-metadata=permissions --no-tcp-encryption \
+    --from source --srcs-in /tmp/syq-real-ssh/plain-source \
+    --to destination --into /tmp/syq-real-ssh/plain-destination 2>&1) || {
+    printf '%s\n' "$plain_output" >&2
+    exit 1
+}
+case "$plain_output" in
+    *'transport: unencrypted TCP planned'*) ;;
+    *) printf '%s\n' "$plain_output" >&2; exit 1 ;;
+esac
+assert_same_tree source /tmp/syq-real-ssh/plain-source \
+    destination /tmp/syq-real-ssh/plain-destination plain
 
 printf 'case: a symlink named as a source needs --follow-src or --src-non-dir\n'
 # The coordinator runs on the source server here, so its refusal must reach
@@ -1416,6 +1459,9 @@ python3 /usr/local/libexec/syq-test-receiver-revoke.py
 
 printf 'case: ending the requesting syq stops its server-to-server copy\n'
 python3 /usr/local/libexec/syq-test-requester-loss.py
+
+printf 'case: a detached restricted copy outlives the command that started it\n'
+python3 /usr/local/libexec/syq-test-requester-loss.py detached
 
 printf 'case: source coordinator with constrained agent and restricted destination\n'
 make_tree source /tmp/syq-real-ssh/direct-source direct
