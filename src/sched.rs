@@ -395,19 +395,28 @@ pub enum RangeWork {
     Ready(Option<RangeHandle>),
 }
 
+/// A queued range: its file, offsets, and the split policy it had when it
+/// was in flight, so that the worker claiming it starts from it.
+type QueuedRange = (usize, u64, u64, Option<RangeSplit>);
+
 /// Keep one global maximum per file. The file index supports both largest-first
 /// scheduling and short same-file claims without storing every range twice.
 #[derive(Default)]
 struct RangeQueue {
     largest: BTreeSet<(u64, usize, u64)>,
     by_file: HashMap<usize, BTreeSet<(u64, u64)>>,
+    /// Split policies of queued ranges that had one, by file and offset.
+    splits: HashMap<(usize, u64), RangeSplit>,
     len: usize,
     bytes: u64,
 }
 
 impl RangeQueue {
-    fn push(&mut self, (idx, off, end): (usize, u64, u64)) {
+    fn push(&mut self, (idx, off, end): (usize, u64, u64), split: Option<RangeSplit>) {
         self.extend(idx, &[(off, end)]);
+        if let Some(split) = split {
+            self.splits.insert((idx, off), split);
+        }
     }
 
     /// Publish a file's newly compared ranges with one global maximum update.
@@ -433,7 +442,7 @@ impl RangeQueue {
         self.len += ranges.len();
     }
 
-    fn remove(&mut self, len: u64, idx: usize, off: u64) -> (usize, u64, u64) {
+    fn remove(&mut self, len: u64, idx: usize, off: u64) -> QueuedRange {
         let file = self.by_file.get_mut(&idx).expect("queued file");
         let was_maximum = file.last() == Some(&(len, off));
         assert!(file.remove(&(len, off)));
@@ -448,15 +457,15 @@ impl RangeQueue {
         }
         self.len -= 1;
         self.bytes -= len;
-        (idx, off, off + len)
+        (idx, off, off + len, self.splits.remove(&(idx, off)))
     }
 
-    fn pop(&mut self) -> Option<(usize, u64, u64)> {
+    fn pop(&mut self) -> Option<QueuedRange> {
         let &(len, idx, off) = self.largest.last()?;
         Some(self.remove(len, idx, off))
     }
 
-    fn take_short(&mut self, idx: usize, max_size: u64) -> Option<(usize, u64, u64)> {
+    fn take_short(&mut self, idx: usize, max_size: u64) -> Option<QueuedRange> {
         let &(len, off) = self.by_file.get(&idx)?.first()?;
         (len <= max_size).then(|| self.remove(len, idx, off))
     }
@@ -614,12 +623,18 @@ struct Inner {
 }
 
 impl Inner {
-    fn claim_range(&mut self, idx: usize, off: u64, end: u64) -> RangeHandle {
+    fn claim_range(
+        &mut self,
+        idx: usize,
+        off: u64,
+        end: u64,
+        split: Option<RangeSplit>,
+    ) -> RangeHandle {
         let handle = Arc::new(Mutex::new(RangeState {
             idx,
             pos: off,
             end,
-            split: None,
+            split,
         }));
         self.inflight.push(handle.clone());
         handle
@@ -1120,11 +1135,11 @@ impl Sched {
         if r.end <= r.pos {
             return;
         }
-        let (idx, pos, end) = (r.idx, r.pos, r.end);
+        let (idx, pos, end, split) = (r.idx, r.pos, r.end, r.split);
         r.end = pos;
         drop(r);
         *g.outstanding.entry(idx).or_insert(0) += 1;
-        g.ranges.push((idx, pos, end));
+        g.ranges.push((idx, pos, end), split);
         self.cv.notify_all();
     }
 
@@ -1144,7 +1159,8 @@ impl Sched {
                 g.inflight.retain(|h| !Arc::ptr_eq(h, &handle));
                 let range = handle.lock().unwrap();
                 // The queued range keeps the assignment's outstanding share.
-                g.ranges.push((range.idx, range.pos, range.end));
+                g.ranges
+                    .push((range.idx, range.pos, range.end), range.split);
             }
             Item::Finish { idx, matched } => {
                 let mut g = self.inner.lock().unwrap();
@@ -1163,8 +1179,8 @@ impl Sched {
                 return Item::Exit;
             }
             if g.scan_done || g.work_released {
-                if let Some((idx, off, end)) = g.ranges.pop() {
-                    return Item::Range(g.claim_range(idx, off, end));
+                if let Some((idx, off, end, split)) = g.ranges.pop() {
+                    return Item::Range(g.claim_range(idx, off, end, split));
                 }
                 if let Some((idx, matched)) = g.finishes.pop() {
                     g.finishing += 1;
@@ -1216,9 +1232,7 @@ impl Sched {
         r.end = split;
         drop(r);
         *g.outstanding.entry(idx).or_insert(0) += 1;
-        let handle = g.claim_range(idx, split, old_end);
-        handle.lock().unwrap().split = policy;
-        Some(handle)
+        Some(g.claim_range(idx, split, old_end, policy))
     }
 
     /// Pop further queued files no larger than `max_size` (largest-first order
@@ -1321,8 +1335,8 @@ impl Sched {
             if g.ranges.len() <= g.waiting_workers {
                 return None;
             }
-            let (idx, off, end) = g.ranges.take_short(idx, size)?;
-            Some(g.claim_range(idx, off, end))
+            let (idx, off, end, split) = g.ranges.take_short(idx, size)?;
+            Some(g.claim_range(idx, off, end, split))
         });
         RangeWork::Ready(next)
     }
@@ -1362,7 +1376,9 @@ impl Sched {
             g.outstanding.insert(idx, ranges.len() as u32);
         }
         let mut it = ranges.into_iter();
-        let first = it.next().map(|(off, end)| g.claim_range(idx, off, end));
+        let first = it
+            .next()
+            .map(|(off, end)| g.claim_range(idx, off, end, None));
         g.ranges.extend(idx, it.as_slice());
         self.cv.notify_all();
         first
@@ -1391,7 +1407,7 @@ impl Sched {
         g.inflight.retain(|candidate| !Arc::ptr_eq(candidate, h));
         let range = h.lock().unwrap();
         if start < range.end {
-            g.ranges.push((range.idx, start, range.end));
+            g.ranges.push((range.idx, start, range.end), range.split);
         } else {
             let n = g.outstanding.get_mut(&range.idx).expect("outstanding");
             *n -= 1;

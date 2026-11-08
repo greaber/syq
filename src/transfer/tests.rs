@@ -94,6 +94,12 @@ struct PipelineState {
     tuning_check: Option<(Arc<Sched>, Arc<Gate>, usize)>,
     tuning_snapshots: Vec<(crate::sched::TuningWork, bool)>,
     auto_ranges: bool,
+    /// Offsets of blocks an automatic source finds unchanged.
+    auto_matching: std::collections::HashSet<u64>,
+    /// Offset of a block whose automatic write or reuse fails.
+    auto_fail_write: Option<u64>,
+    /// Replies the connection queues (`Conn::reply_queue`).
+    reply_queue: Option<usize>,
     arrival_delay: Option<std::time::Duration>,
     arrival_delays: std::collections::VecDeque<std::time::Duration>,
     early_range_acks: bool,
@@ -138,6 +144,9 @@ impl Conn for PipelineConn {
     }
     fn tcp_rtt_us(&self) -> Option<u64> {
         self.0.lock().unwrap().rtt_us
+    }
+    fn reply_queue(&self) -> Option<usize> {
+        self.0.lock().unwrap().reply_queue
     }
     fn is_dead(&self) -> bool {
         self.0.lock().unwrap().dead
@@ -212,6 +221,22 @@ impl Conn for PipelineConn {
                     );
                     state.replies.push_back(Response::Ok);
                 }
+                Request::ReadComparedRange { off, len, .. }
+                    if state.auto_matching.contains(off) =>
+                {
+                    state.replies.push_back(Response::RangeMatched {
+                        off: *off,
+                        len: *len,
+                    });
+                }
+                Request::WriteRange { off, .. } | Request::ReuseComparedRange { off, .. }
+                    if state.auto_fail_write == Some(*off) =>
+                {
+                    state
+                        .replies
+                        .push_back(Response::Err("injected write failure".into()));
+                }
+                Request::ReuseComparedRange { .. } => state.replies.push_back(Response::Ok),
                 Request::ReadRange { off, len, .. }
                 | Request::ReadComparedRange { off, len, .. } => {
                     let data = vec![42; *len as usize];
@@ -486,6 +511,7 @@ fn pipeline_worker(
         fast_batch_files: 1,
         batch_budget: WorkBudget::default(),
         range_budget: None,
+        comparison: Default::default(),
         setup_elapsed: std::time::Duration::ZERO,
     }
 }
@@ -6304,4 +6330,394 @@ fn the_tcp_fallback_notice_says_why_and_how_to_skip_trying() {
     let label = format!("fallback-notice-test-{}", std::process::id());
     assert!(first_tcp_fallback_notice(&label));
     assert!(!first_tcp_fallback_notice(&label));
+}
+
+/// A worker comparing `size` bytes with automatic sizes, starting from
+/// `block` and `ahead`, against endpoints that answer by themselves: the
+/// destination after `latency`, a pipelined or in-process source, and the
+/// blocks at `matching` unchanged.
+fn adaptive_comparison(
+    size: u64,
+    final_basis: bool,
+    remote_source: bool,
+    latency: std::time::Duration,
+    matching: impl Fn(u64) -> bool,
+    sizing: super::comparing::ComparisonSizing,
+) -> (
+    Worker,
+    RangeHandle,
+    FileJob,
+    Arc<Mutex<PipelineState>>,
+    Arc<Mutex<PipelineState>>,
+) {
+    let (sched, handle, job) = pipeline_ranges(&[(0, size)]);
+    {
+        let mut jobs = sched.jobs.lock().unwrap();
+        jobs[0].compare_ranges = true;
+        jobs[0].compare_final = final_basis;
+    }
+    let matching: std::collections::HashSet<u64> = (0..size)
+        .step_by(512)
+        .filter(|off| matching(*off))
+        .collect();
+    let src = Arc::new(Mutex::new(PipelineState {
+        auto_ranges: true,
+        auto_matching: matching,
+        synchronous: !remote_source,
+        reply_queue: Some(crate::transfer_tuning::COMPARE_REQUESTS),
+        ..Default::default()
+    }));
+    let dst = Arc::new(Mutex::new(PipelineState {
+        auto_ranges: true,
+        latency: Some(latency),
+        reply_queue: Some(crate::transfer_tuning::COMPARE_REQUESTS),
+        ..Default::default()
+    }));
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    let opts = Arc::get_mut(&mut worker.opts).unwrap();
+    opts.tuning.pipeline_depth = None;
+    opts.src_remote = remote_source;
+    worker.comparison = sizing;
+    (worker, handle, job, src, dst)
+}
+
+#[test]
+fn adaptive_comparisons_flow_across_windows_within_the_look_ahead() {
+    let size = 64 << 10;
+    for final_basis in [true, false] {
+        for remote_source in [false, true] {
+            let ahead = 4 << 10;
+            let (mut worker, handle, job, src, dst) = adaptive_comparison(
+                size,
+                final_basis,
+                remote_source,
+                std::time::Duration::from_millis(1),
+                |off| off % 4096 != 0,
+                super::comparing::ComparisonSizing::starting(512, ahead),
+            );
+            let mut credited = 0;
+            worker.transfer_range(&handle, &mut credited).unwrap();
+            let case = format!("final={final_basis} remote={remote_source}");
+            // Every block is in place, the matching ones counted as reused.
+            assert_eq!(job.done.load(Relaxed), size, "{case}");
+            assert_eq!(credited, size / 8, "{case}");
+            assert_eq!(
+                worker.progress.bytes_unchanged.load(Relaxed),
+                size - size / 8,
+                "{case}"
+            );
+            let dst = dst.lock().unwrap();
+            assert_eq!(dst.received, dst.requests.len(), "{case}: drained");
+            assert!(dst.replies.is_empty(), "{case}");
+            // The windows hashed cover the range once, in order, and the
+            // receiver never holds more than the look-ahead, which may have
+            // grown while the worker waited for hashes.
+            let mut next = 0;
+            let mut held = 0u64;
+            let mut most = 0u64;
+            let mut windows = 0;
+            for request in &dst.requests {
+                match request {
+                    Request::HashWindow {
+                        off, len, block, ..
+                    } => {
+                        assert_eq!((*off, *block), (next, 512), "{case}");
+                        next += u64::from(*len);
+                        held += u64::from(*len);
+                        most = most.max(held);
+                        windows += 1;
+                    }
+                    Request::ReuseComparedRange { len, .. } => {
+                        held = held.saturating_sub(u64::from(*len))
+                    }
+                    Request::WriteRange { data, .. } => {
+                        held = held.saturating_sub(data.len() as u64)
+                    }
+                    other => panic!("{case}: unexpected {other:?}"),
+                }
+            }
+            assert_eq!(next, size, "{case}");
+            if final_basis {
+                // A pull may hold up to 32 MiB from the start; a push only its
+                // look-ahead, which may have grown while it waited for hashes.
+                let bound = if remote_source {
+                    32 << 20
+                } else {
+                    worker.comparison.ahead()
+                };
+                assert!(most <= bound, "{case}: {most}");
+            }
+            assert!(windows > 2, "{case}");
+            // Requests continue past window boundaries: reuses to the
+            // destination, or questions to a remote source.
+            let per_window = (ahead / 2 / 512) as usize;
+            if final_basis {
+                assert!(
+                    dst.max_pending > per_window,
+                    "{case}: {} pending",
+                    dst.max_pending
+                );
+            } else if remote_source {
+                let pending = src.lock().unwrap().max_pending;
+                assert!(pending > per_window, "{case}: {pending} pending");
+            }
+            let reuses = dst
+                .requests
+                .iter()
+                .filter(|r| matches!(r, Request::ReuseComparedRange { .. }))
+                .count() as u64;
+            assert_eq!(
+                reuses,
+                if final_basis {
+                    (size - size / 8) / 512
+                } else {
+                    0
+                },
+                "{case}"
+            );
+            let src = src.lock().unwrap();
+            assert_eq!(src.received, src.requests.len(), "{case}");
+            if remote_source {
+                assert!(src.max_pending > 1, "{case}: source requests pipeline");
+            }
+        }
+    }
+}
+
+#[test]
+fn adaptive_comparisons_look_further_ahead_after_waiting_for_hashes() {
+    let sizing = super::comparing::ComparisonSizing::starting(512, 4 << 10);
+    let (mut worker, handle, _, _, _) = adaptive_comparison(
+        64 << 10,
+        true,
+        false,
+        std::time::Duration::from_millis(5),
+        |_| true,
+        sizing,
+    );
+    let mut credited = 0;
+    worker.transfer_range(&handle, &mut credited).unwrap();
+    assert!(worker.comparison.ahead() > 4 << 10);
+}
+
+#[test]
+fn a_failed_comparison_write_drains_both_connections_in_order() {
+    for final_basis in [true, false] {
+        for failing in [0, 4096, 8192 + 512] {
+            let (mut worker, handle, job, src, dst) = adaptive_comparison(
+                32 << 10,
+                final_basis,
+                true,
+                std::time::Duration::ZERO,
+                |off| off % 1024 == 0,
+                super::comparing::ComparisonSizing::starting(512, 4 << 10),
+            );
+            dst.lock().unwrap().auto_fail_write = Some(failing);
+            dst.lock().unwrap().peer = Some(src.clone());
+            let mut credited = 0;
+            let result = worker.transfer_range(&handle, &mut credited);
+            let case = format!("final={final_basis} failing={failing}");
+            if !final_basis && failing % 1024 == 0 {
+                // A matching block over a cloned stage needs no request.
+                assert!(result.is_ok(), "{case}");
+                continue;
+            }
+            let error = result.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("injected write failure"),
+                "{case}: {error:#}"
+            );
+            assert!(!error.is::<RangeReplyMismatch>(), "{case}");
+            for endpoint in [&src, &dst] {
+                let state = endpoint.lock().unwrap();
+                assert_eq!(state.received, state.requests.len(), "{case}");
+                assert!(state.replies.is_empty(), "{case}");
+            }
+            assert!(job.done.load(Relaxed) < 32 << 10, "{case}");
+            // Nothing is sent to either endpoint once the failure is seen.
+            let dst = dst.lock().unwrap();
+            let failed = dst
+                .requests
+                .iter()
+                .position(|r| {
+                    matches!(r, Request::WriteRange { off, .. }
+                        | Request::ReuseComparedRange { off, .. } if *off == failing)
+                })
+                .unwrap();
+            assert_eq!(dst.sent_at_receive[failed], dst.requests.len(), "{case}");
+            assert_eq!(
+                dst.peer_sent_at_receive[failed],
+                src.lock().unwrap().requests.len(),
+                "{case}"
+            );
+        }
+    }
+}
+
+#[test]
+fn fixed_comparisons_never_ask_the_receiver_to_hold_more_than_it_may() {
+    // Explicit blocks over half the receiver's limit hash one window at a
+    // time; smaller ones still hash one ahead.
+    for block in [16u64 << 20, 32 << 20, 48 << 20, 64 << 20] {
+        let size = block * 3;
+        let (mut worker, handle, job, _, dst) = adaptive_comparison(
+            size,
+            true,
+            false,
+            std::time::Duration::ZERO,
+            |_| true,
+            Default::default(),
+        );
+        let opts = Arc::get_mut(&mut worker.opts).unwrap();
+        opts.block = block;
+        opts.block_explicit = true;
+        opts.tuning.pipeline_depth = Some(4);
+        let mut credited = 0;
+        worker.transfer_range(&handle, &mut credited).unwrap();
+        assert_eq!(job.done.load(Relaxed), size, "{block}");
+        let (mut held, mut most) = (0u64, 0u64);
+        for request in &dst.lock().unwrap().requests {
+            match request {
+                Request::HashWindow { len, .. } => {
+                    held += u64::from(*len);
+                    most = most.max(held);
+                }
+                Request::ReuseComparedRange { len, .. } => held -= u64::from(*len),
+                other => panic!("{block}: unexpected {other:?}"),
+            }
+        }
+        assert!(most <= crate::proto::MAX_READ_BYTES, "{block}: {most}");
+        if block <= 32 << 20 {
+            assert!(most > block, "{block}: still hashes ahead");
+        }
+    }
+}
+
+#[test]
+fn hashes_already_arrived_are_not_a_reason_to_look_further_ahead() {
+    let ahead = 4 << 10;
+    let (mut worker, handle, _, _, dst) = adaptive_comparison(
+        64 << 10,
+        true,
+        false,
+        std::time::Duration::ZERO,
+        |_| true,
+        super::comparing::ComparisonSizing::starting(512, ahead),
+    );
+    dst.lock().unwrap().early_range_acks = true;
+    let mut credited = 0;
+    worker.transfer_range(&handle, &mut credited).unwrap();
+    assert_eq!(worker.comparison.ahead(), ahead);
+}
+
+#[test]
+fn a_run_of_differing_blocks_continues_across_windows() {
+    for remote_source in [false, true] {
+        // Every block differs: one run, whatever the windows.
+        let (mut worker, handle, _, _, dst) = adaptive_comparison(
+            64 << 10,
+            true,
+            remote_source,
+            std::time::Duration::ZERO,
+            |_| false,
+            super::comparing::ComparisonSizing::starting(512, 4 << 10),
+        );
+        let mut credited = 0;
+        worker.transfer_range(&handle, &mut credited).unwrap();
+        let windows = dst
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|r| matches!(r, Request::HashWindow { .. }))
+            .count();
+        assert!(windows > 2);
+        assert_eq!(worker.comparison.runs(), 1.0, "remote={remote_source}");
+    }
+    // Two separate changes are two runs, even within one window.
+    let (mut worker, handle, _, _, _) = adaptive_comparison(
+        64 << 10,
+        true,
+        false,
+        std::time::Duration::ZERO,
+        |off| !(off == 0 || off == 1024 || off == 8192),
+        super::comparing::ComparisonSizing::starting(512, 4 << 10),
+    );
+    let mut credited = 0;
+    worker.transfer_range(&handle, &mut credited).unwrap();
+    assert_eq!(worker.comparison.runs(), 3.0);
+}
+
+#[test]
+fn pulls_only_make_comparison_blocks_smaller_than_where_they_start() {
+    for (remote_source, largest) in [(true, 256u64 << 10), (false, 4 << 20)] {
+        // Measurements that would choose the whole configured block.
+        let (mut worker, handle, _, _, dst) = adaptive_comparison(
+            32 << 20,
+            true,
+            remote_source,
+            std::time::Duration::ZERO,
+            |_| true,
+            super::comparing::ComparisonSizing::starting(4 << 20, 8 << 20),
+        );
+        let opts = Arc::get_mut(&mut worker.opts).unwrap();
+        opts.block = 4 << 20;
+        opts.dst_remote = !remote_source;
+        let mut credited = 0;
+        worker.transfer_range(&handle, &mut credited).unwrap();
+        let blocks: Vec<u64> = dst
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter_map(|r| match r {
+                Request::HashWindow { block, .. } => Some(*block),
+                _ => None,
+            })
+            .collect();
+        assert!(!blocks.is_empty());
+        assert!(
+            blocks.iter().all(|block| *block == largest),
+            "remote={remote_source}: {blocks:?}"
+        );
+    }
+}
+
+#[test]
+fn only_pushes_start_with_a_short_look_ahead() {
+    for remote_source in [true, false] {
+        let ahead = 4 << 10;
+        let (mut worker, handle, _, src, dst) = adaptive_comparison(
+            64 << 10,
+            true,
+            remote_source,
+            std::time::Duration::ZERO,
+            |_| true,
+            super::comparing::ComparisonSizing::starting(512, ahead),
+        );
+        // Every reply is there as soon as it is asked for.
+        src.lock().unwrap().early_range_acks = true;
+        dst.lock().unwrap().early_range_acks = true;
+        let mut credited = 0;
+        worker.transfer_range(&handle, &mut credited).unwrap();
+        let (mut held, mut most) = (0u64, 0u64);
+        for request in &dst.lock().unwrap().requests {
+            match request {
+                Request::HashWindow { len, .. } => {
+                    held += u64::from(*len);
+                    most = most.max(held);
+                }
+                Request::ReuseComparedRange { len, .. } => held -= u64::from(*len),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // A pull hashes the whole 64 KiB ahead at once; a push no more than
+        // it starts with, since it never waited for hashes.
+        if remote_source {
+            assert_eq!(most, 64 << 10);
+        } else {
+            assert!(most <= ahead, "{most}");
+            assert_eq!(worker.comparison.ahead(), ahead);
+        }
+    }
 }
