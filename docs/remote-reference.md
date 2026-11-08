@@ -98,14 +98,19 @@ be at most 256 KiB, so 1,024 sources fit when their paths average up to about
 that runs the copy gets the sources on its command line, which holds 128 KiB,
 so 1,024 sources fit only when their paths average up to about 90 characters.
 
-Restricted copies cannot use `--no-tcp-encryption`, `--detach`, or
-`--performance-tuning workers=N` above 128, and `syq rm` cannot go through the
-receiver; use a normal SSH login for those.
+Restricted copies cannot use `--performance-tuning workers=N` above 128, and
+`syq rm` cannot go through the receiver; use a normal SSH login for those.
+With `--no-tcp-encryption`, the receiver accepts unencrypted TCP data only
+because the signed command asks for it, and an approval prompt for such a copy
+warns that anyone on the network between the servers can read or change the
+files.
 
 As in any copy, a symlink in the destination path you give stops the copy
-unless you pass `--follow-dst`. Even then, with `--into`, a symlink at the
-destination itself is followed only to a directory inside the destination's
-parent directory. `--widen-dirs all` widens nothing above that parent.
+unless you pass `--follow-dst`. With it, hostB follows the links, including
+one at the destination itself, wherever they lead, as the account would,
+except into its SSH configuration or syq's own programs and state.
+`--widen-dirs all` widens nothing above the destination's parent directory,
+and can't be combined with `--follow-dst`.
 
 <a id="signed-results"></a>
 
@@ -121,8 +126,7 @@ preview. The reports cannot prove that hostA sent the right files; see
 ## Other authentication modes
 
 When restricted copying does not fit, for example because hostB should pull
-from hostA or the copy must keep running after you disconnect, choose another
-mode. Each gives the server running the copy (hostA unless you set
+from hostA, choose another mode. Each gives the server running the copy (hostA unless you set
 `--coordinate-at`) more authority:
 
 | Option | Authority available to the server running the copy |
@@ -144,11 +148,16 @@ syq cp --coordinate-at dst --peer-auth own-credentials --from hostA data --to ho
 
 ## Detached copies
 
-`--detach` keeps the copy running after your command exits. It needs
-`--peer-auth own-credentials` or `--rsh`, and cannot use `--results`. Save the
-remote log location it prints; if printing fails, the job may still be
-running. The server running the copy needs `/bin/kill` and either `setsid` or
-`perl`.
+`--detach` keeps the copy running after your command exits, and cannot use
+`--results`. Save the remote log location it prints; if printing fails, the
+job may still be running. The server running the copy needs `/bin/kill` and
+either `setsid` or `perl`.
+
+A detached restricted copy runs until it finishes, until the seven days it
+has to finish run out, or until you revoke hostB's enrollment. HostA deletes
+the entry key when the copy ends. Your laptop doesn't see hostB's reports of
+a detached copy, so the log on hostA is the copy's only record, and it is only
+as trustworthy as hostA.
 
 ## Authorization selection
 
@@ -162,8 +171,8 @@ a timeout, or with no receiving machine available, syq reports the SSH error.
 A refusal or failure on the receiving machine ends the copy.
 
 Per-copy approval does not work for an upload to a root login, nor with
-`--detach`, `--rsh`, `--syq-path`, `--no-bootstrap`, other `--peer-auth` or
-`--coordinate-at` values, or `--no-tcp-encryption`, and an approved upload
+`--detach`, `--rsh`, `--syq-path`, `--no-bootstrap`, or other `--peer-auth` or
+`--coordinate-at` values, and an approved upload
 cannot preserve hard links, ACLs, extended attributes, or access or birth
 times, or use `--open-noatime` or `--sparse`. Such copies need this machine's
 own SSH access. The receiving machine's copy limits apply, including its
@@ -186,8 +195,9 @@ that server's name and reach its SSH port directly, without a `ProxyJump`. It
 checks the host key as
 [hostA checks hostB's](security.md#how-hosta-checks-hostbs-key). From then
 on, the copy doesn't need the receiving machine, and stops when the command
-that started it ends. File data goes over direct encrypted TCP, or over SSH
-with `--no-tcp` or when TCP cannot connect.
+that started it ends. File data goes over direct TCP, encrypted unless the
+command passes `--no-tcp-encryption`, or over SSH with `--no-tcp` or when TCP
+cannot connect.
 
 For a download, the source's receiver serves only the files and directory
 trees the command names, which the approval prompt shows as the source reads
@@ -227,12 +237,12 @@ command. Your server checks hostB's host key, and hostB checks hostC's, as
 trusting what your laptop's known_hosts lists. The copy stops when the command
 that started it ends.
 
-The copy supports `--no-tcp` and `--results`, and your server checks
-[results from the destination](#results-from-the-destination). It does not
-support `--mapping`, whose contents your laptop never sees, `--coordinate-at
-dst`, `--detach`, `--rsh`, `--syq-path`, `--no-bootstrap`, other `--peer-auth`
-values, or `--no-tcp-encryption`, and neither login may be root. As for an
-upload, a saved choice does not apply to a copy with one of these options:
+The copy supports `--no-tcp`, `--no-tcp-encryption` and `--results`, and your
+server checks [results from the destination](#results-from-the-destination).
+It does not support `--mapping`, whose contents your laptop never sees,
+`--coordinate-at dst`, `--detach`, `--rsh`, `--syq-path`, `--no-bootstrap`, or
+other `--peer-auth` values, and neither login may be root. As for an upload, a
+saved choice does not apply to a copy with one of these options:
 your server's own SSH access runs it. An explicit `--auth-from @NAME` with one
 of them is refused. [Restricted-copy limits](#limits-and-unsupported-options)
 apply. With `--coordinate-at local`, file data goes through your server

@@ -2647,6 +2647,7 @@ fn test_authority_with_options(
         grant,
         GrantConstraints {
             tcp_congestion: None,
+            unencrypted_tcp: false,
             mapping: None,
             hashing: None,
             filters,
@@ -6830,6 +6831,40 @@ fn ordinary_helper_selection_does_not_change_the_restricted_grant() {
     args.syq_path = None;
     args.no_bootstrap = true;
     validate_restricted_args(&args).unwrap();
+}
+
+/// The receiver accepts an unencrypted listener only when the signed
+/// command asks for one.
+#[test]
+fn authority_accepts_an_unencrypted_listener_only_when_signed() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let listener = || Request::TcpListen {
+        send_rate: None,
+        key: None,
+        token: vec![8; 16],
+        port_lo: 47_600,
+        port_hi: 47_699,
+        congestion_control: None,
+    };
+    let encrypted = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    let error = encrypted.authorize(&mut listener(), true).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("unless the signed command passes --no-tcp-encryption"),
+        "{error:#}"
+    );
+    let mut plain = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    plain.unencrypted_tcp = true;
+    plain.authorize(&mut listener(), true).unwrap();
+    // An encrypted listener is still fine, and the token is still checked.
+    let mut plain = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    plain.unencrypted_tcp = true;
+    let mut short_token = listener();
+    if let Request::TcpListen { token, .. } = &mut short_token {
+        token.pop();
+    }
+    assert!(plain.authorize(&mut short_token, true).is_err());
 }
 
 #[test]
@@ -12139,10 +12174,10 @@ fn follow_dst_compares_absolute_link_targets_with_the_real_directory() {
 }
 
 /// With `--follow-dst`, a destination reached through symlinks is the
-/// directory they lead to inside the confinement root: the receiver works
-/// beneath it, under the signed destination's name. A link that leads
-/// outside the root, into the receiver's control plane, to nothing, or
-/// round in a loop is refused when the grant is redeemed.
+/// directory they lead to, wherever that is: the receiver works beneath it,
+/// under the signed destination's name. A link that leads into or above the
+/// receiver's control plane, to nothing, or round in a loop is refused when
+/// the grant is redeemed.
 #[test]
 fn follow_dst_copies_into_the_directory_a_destination_link_leads_to() {
     let temporary = crate::test_support::tempdir().unwrap();
@@ -12176,10 +12211,22 @@ fn follow_dst_copies_into_the_directory_a_destination_link_leads_to() {
             (options, &protected),
         )
     };
-    for target in [
-        b"data/real".to_vec(),
-        b"./data/../data/real/".to_vec(),
-        path_bytes(&real),
+    let outside = temporary.path().join("outside");
+    for (target, lands) in [
+        (b"data/real".to_vec(), &real),
+        (b"./data/../data/real/".to_vec(), &real),
+        (path_bytes(&real), &real),
+        // Outside the directory the destination is in.
+        (b"../outside".to_vec(), &outside),
+        (path_bytes(&outside), &outside),
+        (
+            b"../../../../../../../.."
+                .iter()
+                .chain(&path_bytes(&outside))
+                .copied()
+                .collect(),
+            &outside,
+        ),
     ] {
         let authority = authority(&target, options).unwrap();
         let mut put = small_put(&root.join("target/file"));
@@ -12187,11 +12234,11 @@ fn follow_dst_copies_into_the_directory_a_destination_link_leads_to() {
         let response = authority.test_ops().handle(&put);
         authority.settle(settlement, &response);
         assert_eq!(
-            fs::read(real.join("file")).unwrap(),
+            fs::read(lands.join("file")).unwrap(),
             b"new",
             "{target:?}: {response:?}"
         );
-        fs::remove_file(real.join("file")).unwrap();
+        fs::remove_file(lands.join("file")).unwrap();
         assert!(fs::symlink_metadata(root.join("target"))
             .unwrap()
             .file_type()
@@ -12213,21 +12260,20 @@ fn follow_dst_copies_into_the_directory_a_destination_link_leads_to() {
     symlink("loop-b", root.join("loop-a")).unwrap();
     symlink("loop-a", root.join("loop-b")).unwrap();
     for (target, refusal) in [
-        (
-            b"../outside".to_vec(),
-            "outside the directory the destination is in",
-        ),
-        (
-            path_bytes(&temporary.path().join("outside")),
-            "outside the directory the destination is in",
-        ),
         (b".ssh".to_vec(), "protected SSH configuration"),
+        (
+            path_bytes(&root.join(".ssh")),
+            "protected SSH configuration",
+        ),
+        // Directories that hold a protected one.
+        (b".".to_vec(), "holds the receiver's protected"),
+        (b"..".to_vec(), "holds the receiver's protected"),
         (
             b"missing".to_vec(),
             "leads to missing, which does not exist",
         ),
         (b"loop-a".to_vec(), "too many symlinks"),
-        (b".".to_vec(), "the directory it is in"),
+        (b"/".to_vec(), "resolves to /"),
     ] {
         let error = format!("{:#}", authority(&target, options).err().unwrap());
         assert!(error.contains(refusal), "{target:?}: {error}");

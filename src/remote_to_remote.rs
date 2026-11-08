@@ -1602,14 +1602,27 @@ fn native_placement_arg(args: &Args) -> Result<&'static str> {
     })
 }
 
+/// The command that starts `remote_command` in the background on a server,
+/// detached from the SSH session, with its output in a log under
+/// `~/.syq/NAME-…`. It prints the log's path once the coordinator says it is
+/// ready, or the log and the coordinator's status if it exits first. With
+/// `input`, the coordinator reads the session's input, which it takes before
+/// it is ready; otherwise its input is empty.
 fn detached_launcher_command(
     remote_command: &str,
     name: &str,
-    readiness_attempts: u32,
-    termination_attempts: u32,
+    input: bool,
+    (readiness_attempts, termination_attempts): (u32, u32),
 ) -> String {
+    // A background command's input is empty unless redirected explicitly,
+    // so the session's input goes to it through descriptor 3.
+    let (keep, stdin) = if input {
+        ("exec 3<&0; ", "<&3 3<&-")
+    } else {
+        ("", "< /dev/null")
+    };
     format!(
-        "mkdir -p \"$HOME/.syq\" && [ -x /bin/kill ] || {{ echo 'syq: detached launch requires /bin/kill for process-group cleanup' >&2; exit 1; }}; if command -v setsid >/dev/null 2>&1; then new_session() {{ exec setsid \"$@\"; }}; elif command -v perl >/dev/null 2>&1; then new_session() {{ exec perl -MPOSIX -e 'POSIX::setsid() or die \"setsid: $!\\n\"; exec {{ $ARGV[0] }} @ARGV or die \"exec: $!\\n\"' -- \"$@\"; }}; else echo 'syq: detached launch requires setsid or perl to start a new session' >&2; exit 1; fi; log=\"$HOME/.syq/{name}-$(date +%Y%m%d-%H%M%S)-$$.log\" && ready=\"$log.ready\" && rm -f -- \"$ready\" && {{ terminate_group() {{ /bin/kill -TERM -- \"-$pid\" 2>/dev/null || :; j=0; while /bin/kill -0 -- \"-$pid\" 2>/dev/null && [ \"$j\" -lt {termination_attempts} ]; do j=$((j + 1)); sleep 1; done; if /bin/kill -0 -- \"-$pid\" 2>/dev/null; then /bin/kill -KILL -- \"-$pid\" 2>/dev/null || :; fi; wait \"$pid\" 2>/dev/null || :; j=0; while /bin/kill -0 -- \"-$pid\" 2>/dev/null && [ \"$j\" -lt {termination_attempts} ]; do j=$((j + 1)); sleep 1; done; ! /bin/kill -0 -- \"-$pid\" 2>/dev/null; }}; SYQ_INTERNAL_DETACH_READY=\"$ready\" new_session nohup sh -c {} > \"$log\" 2>&1 < /dev/null & pid=$!; i=0; while [ \"$i\" -lt {readiness_attempts} ]; do if [ -f \"$ready\" ]; then rm -f -- \"$ready\"; echo \"$log\"; exit 0; fi; if ! kill -0 \"$pid\" 2>/dev/null; then wait \"$pid\"; status=$?; cat -- \"$log\" >&2; exit \"$status\"; fi; i=$((i + 1)); sleep 1; done; if ! terminate_group; then rm -f -- \"$ready\"; cat -- \"$log\" >&2; echo 'syq: could not terminate timed-out detached coordinator process group' >&2; exit 1; fi; rm -f -- \"$ready\"; cat -- \"$log\" >&2; echo 'syq: detached coordinator did not become ready within {readiness_attempts} seconds' >&2; exit 1; }}",
+        "{keep}mkdir -p \"$HOME/.syq\" && [ -x /bin/kill ] || {{ echo 'syq: detached launch requires /bin/kill for process-group cleanup' >&2; exit 1; }}; if command -v setsid >/dev/null 2>&1; then new_session() {{ exec setsid \"$@\"; }}; elif command -v perl >/dev/null 2>&1; then new_session() {{ exec perl -MPOSIX -e 'POSIX::setsid() or die \"setsid: $!\\n\"; exec {{ $ARGV[0] }} @ARGV or die \"exec: $!\\n\"' -- \"$@\"; }}; else echo 'syq: detached launch requires setsid or perl to start a new session' >&2; exit 1; fi; log=\"$HOME/.syq/{name}-$(date +%Y%m%d-%H%M%S)-$$.log\" && ready=\"$log.ready\" && rm -f -- \"$ready\" && {{ terminate_group() {{ /bin/kill -TERM -- \"-$pid\" 2>/dev/null || :; j=0; while /bin/kill -0 -- \"-$pid\" 2>/dev/null && [ \"$j\" -lt {termination_attempts} ]; do j=$((j + 1)); sleep 1; done; if /bin/kill -0 -- \"-$pid\" 2>/dev/null; then /bin/kill -KILL -- \"-$pid\" 2>/dev/null || :; fi; wait \"$pid\" 2>/dev/null || :; j=0; while /bin/kill -0 -- \"-$pid\" 2>/dev/null && [ \"$j\" -lt {termination_attempts} ]; do j=$((j + 1)); sleep 1; done; ! /bin/kill -0 -- \"-$pid\" 2>/dev/null; }}; SYQ_INTERNAL_DETACH_READY=\"$ready\" new_session nohup sh -c {} > \"$log\" 2>&1 {stdin} & pid=$!; i=0; while [ \"$i\" -lt {readiness_attempts} ]; do if [ -f \"$ready\" ]; then rm -f -- \"$ready\"; echo \"$log\"; exit 0; fi; if ! kill -0 \"$pid\" 2>/dev/null; then wait \"$pid\"; status=$?; cat -- \"$log\" >&2; exit \"$status\"; fi; i=$((i + 1)); sleep 1; done; if ! terminate_group; then rm -f -- \"$ready\"; cat -- \"$log\" >&2; echo 'syq: could not terminate timed-out detached coordinator process group' >&2; exit 1; fi; rm -f -- \"$ready\"; cat -- \"$log\" >&2; echo 'syq: detached coordinator did not become ready within {readiness_attempts} seconds' >&2; exit 1; }}",
         shell_words::quote(remote_command)
     )
 }
@@ -1920,12 +1933,6 @@ fn run_remote(
     let rsh = parse_rsh(&args.rsh)?;
     let coordinator_host = coordinator.host.clone().unwrap();
     let same_host = srcs[0].same_host(dst);
-    if args.detach && args.rsh.is_none() && !same_host && args.peer_auth != PeerAuth::OwnCredentials
-    {
-        bail!(
-            "--detach needs --peer-auth own-credentials with credentials on {coordinator_host}, or an explicit --rsh policy: a restricted copy and the authentication broker both need this syq to stay attached"
-        );
-    }
 
     let mut broker_guard = None;
     let mut entry_key = None;
@@ -2019,18 +2026,24 @@ fn run_remote(
             constrained_rsh = Some(receiver_rsh(Some(peer_policy.port())));
             restricted_destination_path = Some(prepared.destination);
             restricted_grant = Some(prepared.directive);
-            destination_results = Some(crate::destination_results::Expectation {
-                public_key: prepared.results_public_key.clone(),
-                binding: crate::destination_results::Binding {
-                    enrollment_id: prepared.enrollment_id,
-                    request_id: prepared.request_id,
-                    grant_digest: prepared.digest,
-                },
-                secret: prepared
-                    .recipient_secret
-                    .context("the results recipient key is unavailable")?,
-                records: results.is_some(),
-            });
+            // A detached copy has no one to relay the destination's results
+            // to: its log on the coordinator is its record.
+            destination_results = (!args.detach)
+                .then(|| {
+                    anyhow::Ok(crate::destination_results::Expectation {
+                        public_key: prepared.results_public_key.clone(),
+                        binding: crate::destination_results::Binding {
+                            enrollment_id: prepared.enrollment_id,
+                            request_id: prepared.request_id,
+                            grant_digest: prepared.digest,
+                        },
+                        secret: prepared
+                            .recipient_secret
+                            .context("the results recipient key is unavailable")?,
+                        records: results.is_some(),
+                    })
+                })
+                .transpose()?;
             if !args.quiet {
                 crate::output::diagnostic!(
                     "syq: using restricted destination enrollment {}",
@@ -2046,6 +2059,12 @@ fn run_remote(
             ));
             Some(AgentForwarding::Disabled)
         } else {
+            // The broker runs in this process, so it serves only an attached
+            // copy.
+            anyhow::ensure!(
+                !args.detach,
+                "--detach cannot use the authentication broker, which exists only while syq stays attached"
+            );
             coordinator_policy.require_exact_host_keys()?;
             peer_policy.require_exact_host_keys()?;
             constrained_rsh = Some(constrained_destination_rsh(
@@ -2251,7 +2270,12 @@ fn run_remote(
         } else {
             name
         };
-        Ok(detached_launcher_command(&remote_cmd, &name, 30, 5))
+        Ok(detached_launcher_command(
+            &remote_cmd,
+            &name,
+            entry_key.is_some(),
+            (30, 5),
+        ))
     };
     let mut remote_cmd = coordinator_command(command.clone())?;
     let mut command_sources = if args.mapping_contents.is_some() {
@@ -2297,14 +2321,42 @@ fn run_remote(
         );
     }
     if args.detach {
+        // A restricted copy's coordinator reads the entry key and the
+        // directive from its input before it says it is ready, as an
+        // attached one does; the launcher passes the input on to it.
+        let input = entry_key.as_ref().zip(directive.as_ref());
         let run = || {
             let mut cmd = make_command();
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit());
-            cmd.spawn_guarded()
-                .and_then(|child| child.wait_with_output())
-                .with_context(|| format!("spawn {:?}", rsh[0]))
+            cmd.stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+            let mut child = cmd
+                .spawn_guarded()
+                .with_context(|| format!("spawn {:?}", rsh[0]))?;
+            let writer = child
+                .stdin
+                .take()
+                .zip(input)
+                .map(|(mut stdin, (key, directive))| {
+                    let (key, directive) = (key.clone(), directive.clone());
+                    std::thread::spawn(move || {
+                        stdin.write_all(&key)?;
+                        stdin.write_all(&directive)
+                    })
+                });
+            let output = child
+                .wait_with_output()
+                .with_context(|| format!("wait for {:?}", rsh[0]))?;
+            // A coordinator that did not take its input reports why in its
+            // log, which the launcher prints.
+            if let Some(writer) = writer {
+                let _ = writer.join();
+            }
+            anyhow::Ok(output)
         };
         let mut out = run()?;
         if helper_missing(out.status.code(), spec.bootstrap_helper) {

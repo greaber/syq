@@ -1019,11 +1019,15 @@ pub(crate) fn is_named(grant: &Option<String>) -> bool {
 
 /// Whether this coordinator relays the destination's own results to the
 /// syq that started it: one another syq started for a copy between two
-/// servers, which that syq does not see the destination's replies to. A copy
-/// to a receiving machine, or one a server started itself, is coordinated by
-/// the syq that reads every reply.
+/// servers, which that syq does not see the destination's replies to, and
+/// gave a token to relay them with. A detached coordinator has none: nobody
+/// reads its output but its log. A copy to a receiving machine, or one a
+/// server started itself, is coordinated by the syq that reads every reply.
 pub(crate) fn reports_results(args: &crate::cli::Args) -> bool {
-    args.delegated && args.restricted_grant.is_some() && !is_named(&args.restricted_grant)
+    args.delegated
+        && args.results_token.is_some()
+        && args.restricted_grant.is_some()
+        && !is_named(&args.restricted_grant)
 }
 
 fn select_copy(

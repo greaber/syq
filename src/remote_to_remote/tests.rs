@@ -29,7 +29,7 @@ fn detached_timeout_terminates_the_complete_process_group() {
             shell_words::quote(survived.to_str().unwrap()),
             shell_words::quote(pids.to_str().unwrap()),
         );
-    let launcher = detached_launcher_command(&remote_command, "timeout-test", 1, 1);
+    let launcher = detached_launcher_command(&remote_command, "timeout-test", false, (1, 1));
     let output = Command::new("sh")
         .args(["-c", &launcher])
         .env("HOME", directory.path())
@@ -59,6 +59,46 @@ fn detached_timeout_terminates_the_complete_process_group() {
     }
     assert!(alive.is_empty(), "detached processes survived: {alive:?}");
     assert!(!survived.exists());
+}
+
+/// A restricted copy's detached coordinator reads its entry key and
+/// directive from the session's input: the launcher passes that input on to
+/// the background command, and otherwise gives it none.
+#[test]
+fn detached_launcher_passes_its_input_on_only_when_asked() {
+    let directory = crate::test_support::tempdir().unwrap();
+    let received = directory.path().join("received");
+    let remote_command = format!(
+        "cat > {} && printf ready > \"$SYQ_INTERNAL_DETACH_READY\"",
+        shell_words::quote(received.to_str().unwrap()),
+    );
+    for (input, expected) in [(true, &b"entry key, directive"[..]), (false, &b""[..])] {
+        let launcher = detached_launcher_command(&remote_command, "input-test", input, (10, 1));
+        let mut child = Command::new("sh")
+            .args(["-c", &launcher])
+            .env("HOME", directory.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The launcher that passes nothing on may already have exited.
+        let _ = child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"entry key, directive");
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = String::from_utf8(output.stdout).unwrap();
+        let logs = directory.path().join(".syq/input-test-");
+        assert!(log.starts_with(logs.to_str().unwrap()), "{log}");
+        assert_eq!(std::fs::read(&received).unwrap(), expected, "input {input}");
+    }
 }
 
 #[test]

@@ -52,6 +52,8 @@ pub(crate) struct SourceTcpPolicy {
     pub port_lo: u16,
     pub port_hi: u16,
     pub congestion_control: Option<String>,
+    /// The approved command asks for TCP data without encryption.
+    pub unencrypted: bool,
 }
 
 struct State {
@@ -508,11 +510,14 @@ impl SourceConnection {
                     .tcp
                     .as_ref()
                     .context("source TCP listener was not approved")?;
+                // Unencrypted only when the approved command asks for it.
+                let key_valid = match key {
+                    Some(key) => key.len() == crate::tcp_records::KEY_LEN,
+                    None => tcp.unencrypted,
+                };
                 ensure!(
-                    key.as_ref()
-                        .is_some_and(|key| key.len() == crate::tcp_records::KEY_LEN)
-                        && token.len() == 16,
-                    "approved source requires encrypted authenticated TCP"
+                    key_valid && token.len() == 16,
+                    "approved source requires encrypted authenticated TCP unless its command passes --no-tcp-encryption"
                 );
                 ensure!(
                     (*port_lo, *port_hi) == (tcp.port_lo, tcp.port_hi)

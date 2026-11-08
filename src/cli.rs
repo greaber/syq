@@ -1557,7 +1557,7 @@ struct NativeRemoteArgs {
         conflicts_with = "no_tcp"
     )]
     tcp_congestion: Option<String>,
-    /// Return as soon as the copy starts on the server that runs it; requires --peer-auth own-credentials or --rsh
+    /// Return as soon as the copy starts on the server that runs it
     #[arg(long, help_heading = REMOTE_TO_REMOTE_HEADING)]
     detach: bool,
     /// How the server running the copy logs in to the other server; --rsh takes over this choice

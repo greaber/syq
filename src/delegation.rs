@@ -904,6 +904,11 @@ pub(crate) struct GrantConstraints {
     pub root_existence: RootExistence,
     pub receipt_policy: crate::destination_results::ReceiptPolicy,
     pub tcp_congestion: Option<String>,
+    /// The command asks for TCP data without encryption
+    /// (`--no-tcp-encryption`), so the receiver accepts an unencrypted
+    /// listener.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unencrypted_tcp: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mapping: Option<crate::mapping::Authorization>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -920,6 +925,7 @@ impl Default for GrantConstraints {
             root_existence: RootExistence::Any,
             receipt_policy: test_receipt_policy(),
             tcp_congestion: None,
+            unencrypted_tcp: false,
             mapping: None,
             hashing: None,
             extra_options: ExtraCopyOptions::default(),

@@ -486,6 +486,12 @@ pub(crate) fn receiving_rules(
     destination: &[u8],
 ) -> Result<(Grant, GrantConstraints)> {
     let args = destination_command(directive)?;
+    // Its data comes over this machine's own connection, or TCP it dials
+    // itself, which is always encrypted.
+    ensure!(
+        !args.no_tcp_encryption,
+        "copies to a receiving machine always encrypt their data; leave out --no-tcp-encryption"
+    );
     rules_at(directive, &args, destination, false)
 }
 
@@ -549,6 +555,8 @@ fn rules_at(
     // sender paces network bytes, as for an ordinary copy.
     let mut constraints = GrantConstraints {
         tcp_congestion: args.tcp_congestion.clone(),
+        // Without TCP, nothing is sent over it.
+        unencrypted_tcp: args.no_tcp_encryption && !args.no_tcp,
         mapping: directive.inputs.mapping.clone(),
         hashing: Some(crate::hashing::CopyHashing::from_args(args)),
         filters: FilterPolicy {
@@ -615,8 +623,10 @@ pub(crate) fn source_rules(
             Some(base) => crate::fsops::join(home, base),
         });
     }
-    // A copy approved without TCP gets no listener on the source either.
+    // A copy approved without TCP gets no listener on the source either,
+    // and one approved without its encryption gets an unencrypted one.
     request.no_tcp = args.no_tcp;
+    request.unencrypted_tcp = args.no_tcp_encryption;
     request.validate()?;
     Ok(request)
 }
@@ -762,9 +772,6 @@ pub(crate) fn extra_copy_options(args: &Args) -> delegation::ExtraCopyOptions {
 pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
     if let Some(input) = &args.mapping_contents {
         input.validate_restricted_bounds()?;
-    }
-    if args.no_tcp_encryption {
-        bail!("restricted transfers require encrypted data connections");
     }
     if args.follows_native_destination_paths()
         && args.placement == Placement::Into

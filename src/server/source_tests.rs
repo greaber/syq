@@ -409,6 +409,40 @@ fn approved_source_scan_entry_limit_is_enforced_before_emitting_the_batch() {
     server.control.shutdown();
 }
 
+/// An approved source starts an unencrypted listener only when its command
+/// asks for one.
+#[test]
+fn approved_source_tcp_is_unencrypted_only_when_approved_so() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let file = temporary.path().join("file");
+    fs::write(&file, b"approved").unwrap();
+    for unencrypted in [false, true] {
+        let mut policy = source_policy(&file);
+        policy.tcp = Some(crate::restricted::source::SourceTcpPolicy {
+            port_lo: 0,
+            port_hi: 0,
+            congestion_control: None,
+            unencrypted,
+        });
+        let register = registration(&policy);
+        let mut server = SourceServer::new(policy);
+        server.register(register);
+        let response = server.control.request(Request::TcpListen {
+            key: None,
+            token: vec![23; 16],
+            port_lo: 0,
+            port_hi: 0,
+            congestion_control: None,
+            send_rate: None,
+        });
+        assert_eq!(
+            matches!(response, Response::TcpListening { .. }),
+            unencrypted,
+            "{response:?}"
+        );
+    }
+}
+
 #[test]
 fn approved_source_tcp_requires_encryption_and_keeps_workers_read_only() {
     let temporary = crate::test_support::tempdir().unwrap();
@@ -419,6 +453,7 @@ fn approved_source_tcp_requires_encryption_and_keeps_workers_read_only() {
         port_lo: 0,
         port_hi: 0,
         congestion_control: None,
+        unencrypted: false,
     });
     policy.send_rate = Some(1 << 30);
     let register = registration(&policy);
@@ -598,6 +633,7 @@ fn approved_source_control_disconnect_revokes_tcp_while_control_response_is_busy
         port_lo: 0,
         port_hi: 0,
         congestion_control: None,
+        unencrypted: false,
     });
     let register = registration(&policy);
     let armed = Arc::new(AtomicBool::new(false));
