@@ -109,6 +109,11 @@ struct InstallRequest {
     /// Its line goes when its state is still missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replaces: Option<ReplacedEnrollment>,
+    /// The refresh is for a copy its receiver refused for running another
+    /// build, which is then signed again as the same copy: it must keep the
+    /// record of the directives that ran, never recreate it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    keep_used: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -203,6 +208,8 @@ pub(crate) struct PreparedTransfer {
     /// directive, when this machine made it.
     pub(crate) recipient_secret: Option<crate::destination_results::RecipientSecret>,
     pub(crate) digest: [u8; 32],
+    /// What signing this copy again after a refusal for another build needs.
+    pub(crate) retry: Retry,
 }
 
 #[cfg(test)]

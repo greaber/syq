@@ -159,7 +159,9 @@ pub(super) struct ResolvedDestination {
 /// `root` (named `root_path`), inside the root: `None` when no component is
 /// a symlink. Components of the destination itself that do not exist yet
 /// are left for the copy to create; a symlink that leads outside the root,
-/// or to a name that does not exist, is refused.
+/// or to a name that does not exist, is refused. With a root of `/`, as a
+/// receiver resolves a destination, nothing is outside it: `/..` is `/`,
+/// as for the kernel.
 pub(super) fn resolve_destination_links(
     root: &Root,
     root_path: &[u8],
@@ -190,7 +192,7 @@ pub(super) fn resolve_destination_links(
         match component.as_slice() {
             b"." => continue,
             b".." => {
-                if resolved.pop().is_none() {
+                if resolved.pop().is_none() && root_path != b"/" {
                     bail!(
                         "a destination symlink leads outside the directory the destination is in"
                     );
@@ -671,6 +673,8 @@ pub(crate) struct RestrictedAuthority {
     /// Signalled whenever an in-flight request settles.
     pub(super) settled: std::sync::Condvar,
     pub(super) tcp_congestion: Option<String>,
+    /// Whether the signed command asks for TCP data without encryption.
+    pub(super) unencrypted_tcp: bool,
     pub(super) mapping: Option<Mutex<crate::mapping::Admission>>,
     pub(super) hashing: Option<crate::hashing::CopyHashing>,
     pub(super) extra_options: crate::delegation::ExtraCopyOptions,
@@ -763,6 +767,7 @@ impl RestrictedAuthority {
             root_existence,
             receipt_policy,
             tcp_congestion,
+            unencrypted_tcp,
             mapping,
             hashing,
             extra_options,
@@ -801,44 +806,66 @@ impl RestrictedAuthority {
         let mut root = std::sync::Arc::new(confined.root);
         let identities = ProtectedIdentities::find(protected);
         // `--follow-dst`: a destination reached through symlinks is the
-        // directory they resolve to inside the confinement root. That
-        // directory, or the deepest existing one the copy creates the rest
-        // of the destination inside, is the root every connection works
-        // beneath, named in requests by the matching part of the signed
-        // destination, so nothing reaches past it.
+        // directory they resolve to, wherever the account itself would find
+        // it: the protected paths, checked below by name and by identity,
+        // are the only limit. That directory, or the deepest existing one
+        // the copy creates the rest of the destination inside, is the root
+        // every connection works beneath, named in requests by the matching
+        // part of the signed destination, so nothing reaches past it.
         let followed = if extra_options.follow_dst
             && copy.policy.placement != DestinationPlacement::ExactPath
         {
-            // An absolute link target names where the directory really
-            // is, whatever name the grant uses for it.
-            resolve_destination_links(&root, &real_root, relative)?
+            // Resolved from `/`, where an absolute link target names where
+            // the directory really is, whatever name the grant uses for it.
+            let slash = Root::open(Path::new("/"))?;
+            let path = crate::fsops::join(&real_root, relative);
+            resolve_destination_links(&slash, b"/", &path[1..])?.map(|found| (slash, found))
         } else {
             None
         };
-        if let Some(found) = followed {
+        if let Some((slash, found)) = followed {
             let signed: Vec<&[u8]> = relative
                 .split(|byte| *byte == b'/')
                 .filter(|component| !component.is_empty())
                 .collect();
-            let whole = found.signed_components == signed.len();
-            if whole && found.existing.is_empty() {
-                bail!("signed destination resolves to the directory it is in");
+            // The signed destination's components that lead to where it
+            // resolves, past those of the directory it is in, which has no
+            // links.
+            let above = real_root
+                .split(|byte| *byte == b'/')
+                .filter(|component| !component.is_empty())
+                .count();
+            let consumed = found
+                .signed_components
+                .checked_sub(above)
+                .filter(|consumed| *consumed > 0)
+                .with_context(|| {
+                    format!(
+                        "the directory {} changed as the copy started",
+                        String::from_utf8_lossy(&real_root)
+                    )
+                })?;
+            let whole = consumed == signed.len();
+            if found.existing.is_empty() {
+                bail!("signed destination resolves to /");
             }
+            let existing = crate::fsops::join(b"/", &found.existing.join(&b'/'));
             // The path the links resolve to, with the directories the copy
             // creates, by its names as well as by identity: a control
             // directory that does not exist yet has no identity.
-            let resolved = signed[found.signed_components..].iter().fold(
-                crate::fsops::join(&real_root, &found.existing.join(&b'/')),
-                |path, component| crate::fsops::join(&path, component),
-            );
+            let resolved = signed[consumed..]
+                .iter()
+                .fold(existing.clone(), |path, component| {
+                    crate::fsops::join(&path, component)
+                });
             reject_control_plane_scope(&resolved, descendants, protected)?;
             reject_control_plane_directory(
-                &root,
+                &slash,
                 &found.existing,
                 whole && descendants,
                 &identities,
             )?;
-            let directory = root
+            let directory = slash
                 .open_directory(&crate::rooted::RelativePath::new(
                     &found.existing.join(&b'/'),
                 )?)
@@ -846,13 +873,12 @@ impl RestrictedAuthority {
                     format!(
                         "signed destination {} resolves to {}, which is not a directory",
                         destination.display(),
-                        String::from_utf8_lossy(&found.existing.join(&b'/'))
+                        String::from_utf8_lossy(&existing)
                     )
                 })?;
             root = std::sync::Arc::new(Root::from_directory(directory)?);
-            held_path =
-                crate::fsops::join(&held_path, &signed[..found.signed_components].join(&b'/'));
-            held_real = crate::fsops::join(&real_root, &found.existing.join(&b'/'));
+            held_path = crate::fsops::join(&held_path, &signed[..consumed].join(&b'/'));
+            held_real = existing;
         } else if let Ok(found) = existing_directory_components(&root, relative) {
             // The destination's directory as it stands, judged by identity
             // too: a name the strings above miss cannot reach the control
@@ -912,6 +938,7 @@ impl RestrictedAuthority {
             owned: Default::default(),
             stage_scope: crate::fsops::new_stage_scope(),
             tcp_congestion,
+            unencrypted_tcp,
             mapping: mapping.map(|authorization| {
                 Mutex::new(crate::mapping::Admission::new(
                     authorization,
@@ -3602,12 +3629,13 @@ impl RestrictedAuthority {
                 if !over_ssh {
                     bail!("TCP listener request is allowed only on the signed control connection");
                 }
-                if key
-                    .as_ref()
-                    .is_none_or(|key| key.len() != crate::tcp_records::KEY_LEN)
-                    || token.len() != 16
-                {
-                    bail!("signed transfers require encrypted TCP data connections");
+                // Unencrypted only when the signed command asks for it.
+                let key_valid = match key {
+                    Some(key) => key.len() == crate::tcp_records::KEY_LEN,
+                    None => self.unencrypted_tcp,
+                };
+                if !key_valid || token.len() != 16 {
+                    bail!("signed transfers require encrypted TCP data connections unless the signed command passes --no-tcp-encryption");
                 }
                 if (*port_lo, *port_hi)
                     != (self.copy.options.tcp_port_lo, self.copy.options.tcp_port_hi)

@@ -316,8 +316,13 @@ fn a_coordinating_source_needs_a_copy_between_two_servers() {
             "{option:?}: {message}"
         );
     }
-    assert!(refused(&[ROUTE_6, &["--no-tcp-encryption"]].concat())
-        .contains("encrypted data connections"));
+    // Unencrypted TCP is the command's own choice, which both ends see.
+    let (destination, source) = pair(&[ROUTE_6, &["--no-tcp-encryption"]].concat());
+    assert!(
+        coordination(&source, &destination)
+            .unwrap()
+            .no_tcp_encryption
+    );
     // A mapping the command names must be the one approved with it.
     let mapped = &[
         "cp",
@@ -546,21 +551,6 @@ fn commands_a_receiver_cannot_enforce_yield_no_rules() {
                 "--to",
                 "host-b",
                 "--into",
-                "b",
-                "--no-tcp-encryption",
-            ],
-            "encrypted",
-        ),
-        (
-            &[
-                "cp",
-                "--from",
-                "host-a",
-                "--src",
-                "data",
-                "--to",
-                "host-b",
-                "--into",
                 "../escape",
             ],
             "..",
@@ -760,7 +750,6 @@ fn a_sources_reads_come_from_the_signed_command() {
     for refused in [
         ROUTE_5.to_vec(),
         [ROUTE_4, &["--rsh", "ssh"]].concat(),
-        [ROUTE_4, &["--no-tcp-encryption"]].concat(),
         [ROUTE_4, &["--coordinate-at", "src"]].concat(),
         [ROUTE_4, &["--receiver-max-entries", "0"]].concat(),
     ] {
@@ -785,4 +774,32 @@ fn a_sources_reads_come_from_the_signed_command() {
     let ssh_only =
         source_rules(&source_directive(&[ROUTE_4, &["--no-tcp"]].concat()), home).unwrap();
     assert!(ssh_only.policy(deadline).tcp.is_none());
+    // Its TCP is unencrypted only when the command asks for that.
+    assert!(!reads.policy(deadline).tcp.unwrap().unencrypted);
+    let plain = source_rules(
+        &source_directive(&[ROUTE_4, &["--no-tcp-encryption"]].concat()),
+        home,
+    )
+    .unwrap();
+    assert!(plain.policy(deadline).tcp.unwrap().unencrypted);
+}
+
+/// A destination's TCP is unencrypted only when its signed command asks
+/// for that, and a copy to a receiving machine never is.
+#[test]
+fn unencrypted_tcp_comes_only_from_the_command() {
+    let home = Path::new(HOME);
+    let (_, encrypted) = destination_rules(&directive(ROUTE_5), home).unwrap();
+    assert!(!encrypted.unencrypted_tcp);
+    let (_, plain) = destination_rules(
+        &directive(&[ROUTE_5, &["--no-tcp-encryption"]].concat()),
+        home,
+    )
+    .unwrap();
+    assert!(plain.unencrypted_tcp);
+    let to_laptop = directive(&[ROUTE_5, &["--no-tcp-encryption"]].concat());
+    let error = receiving_rules(&to_laptop, b"/home/me/backup")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("always encrypt"), "{error}");
 }

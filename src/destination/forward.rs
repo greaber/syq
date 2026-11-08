@@ -49,11 +49,10 @@ pub(super) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
         || args.no_bootstrap
         || args.detach
         || args.restricted_grant.is_some()
-        || args.no_tcp_encryption
         || args.peer_auth != PeerAuth::Restricted
         || args.coordinate_at != CoordinateAt::Auto
     {
-        bail!("return authorization owns its SSH connection and requires encrypted direct data transport; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --no-tcp-encryption, --peer-auth, or --coordinate-at");
+        bail!("return authorization owns its SSH connection; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --peer-auth, or --coordinate-at");
     }
     crate::directive::validate_restricted_args(args)?;
     let target = crate::remote_to_remote::endpoint_arg(destination, None, None);
@@ -901,6 +900,9 @@ impl Prepare {
             )?),
             agent: account.agent.as_deref(),
             allow_enrollment: self.allow_enrollment,
+            // This server's own syq connects to the receiver: a refusal for
+            // its build is that server's, which no refresh here changes.
+            retry_of: None,
             // No terminal: never prompt. Where the SSH configuration
             // would ask about a host key nobody knows, accept it the first
             // time, as `accept-new` does.

@@ -373,6 +373,18 @@ impl Summary {
             })
             .unwrap_or_default();
         let mut notes = copy_notes(request, remote.is_some());
+        // On another server, the receiver follows links in the destination
+        // path wherever they lead in the account, as the account would.
+        if remote.is_some()
+            && parsed
+                .as_ref()
+                .is_some_and(|args| args.follows_native_destination_paths())
+        {
+            notes.push(
+                "follows symlinks in the destination path, so it can write where they lead rather than to the path shown"
+                    .to_owned(),
+            );
+        }
         if let Some(server) = &source_server {
             if let Some(port) = server.port {
                 notes.push(format!("the source's SSH port is {port}"));
@@ -772,6 +784,9 @@ fn copy_notes(request: &crate::destination::CopyRequest, remote: bool) -> Vec<St
 const PERMISSIONS_WARNING: &str =
     "can make files readable or writable by others or create programs that run as you";
 
+/// The warning for `--no-tcp-encryption`, which the copy's command chose.
+const UNENCRYPTED_TCP_WARNING: &str = "sends the files over TCP without encryption, so anyone on the network between the servers can read or change them";
+
 /// The warning for `--in-place=update`, shown first.
 const UPDATE_IN_PLACE_WARNING: &str = "can write new contents into your existing files in place, where anyone who already has one open can read them, and an interruption leaves a file partly updated";
 
@@ -812,6 +827,10 @@ fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
             .publication
             .updates_existing_files_in_place()
             .then(|| UPDATE_IN_PLACE_WARNING.to_owned()),
+        request
+            .constraints
+            .unencrypted_tcp
+            .then(|| UNENCRYPTED_TCP_WARNING.to_owned()),
         (deletions > 0).then(|| {
             format!("can delete up to {deletions} files or folders anywhere in the destination")
         }),
@@ -1397,7 +1416,16 @@ impl Queue {
         } else {
             String::new()
         };
-        let permission = format!("May list and read the selected directory trees or exact non-directory entries. Filters narrow the copy, not this read permission.{root} The files go directly to the server that asks. The copy only reads: it cannot write or remove anything on {target:?}.{as_root} {}.", setup_text(target, enrollment));
+        // The command's own choice, which the source's receiver allows only
+        // because the command asks for it.
+        let unencrypted = if crate::approval_command::parse(command)
+            .is_ok_and(|args| args.no_tcp_encryption && !args.no_tcp && !args.dry_run)
+        {
+            " The files go over TCP without encryption, so anyone on the network between the servers can read or change them."
+        } else {
+            ""
+        };
+        let permission = format!("May list and read the selected directory trees or exact non-directory entries. Filters narrow the copy, not this read permission.{root} The files go directly to the server that asks.{unencrypted} The copy only reads: it cannot write or remove anything on {target:?}.{as_root} {}.", setup_text(target, enrollment));
         let mut notes = vec![
             permission.clone(),
             "Read authority ends when this copy closes, or after seven days.".into(),
@@ -2210,6 +2238,22 @@ mod tests {
         warnings
     }
 
+    /// A copy whose command sends its data unencrypted says so, unless it
+    /// only previews.
+    #[test]
+    fn copy_approvals_warn_of_unencrypted_tcp() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap().join("data");
+        let mut request = copy_request(&path);
+        request.constraints.unencrypted_tcp = true;
+        let warnings = |request: &crate::destination::CopyRequest| {
+            shown_warnings(&Summary::new(&requester(), &[], "~", request, TIMEOUT, None).unwrap())
+        };
+        assert_eq!(warnings(&request), [UNENCRYPTED_TCP_WARNING]);
+        request.copy.options.dry_run = true;
+        assert!(warnings(&request).is_empty());
+    }
+
     const MAPPING_WARNING: &str = "can use its mapping file to make the files it lists readable or writable by others, create programs that run as you, or give them to any group you belong to";
 
     /// A server's mapping file can set the permissions, set-ID bits
@@ -2656,6 +2700,29 @@ mod tests {
             "{desktop}"
         );
         assert!(!desktop.contains("SSH port"), "{desktop}");
+        assert!(!desktop.contains("destination path"), "{desktop}");
+        let desktop = rooted(
+            "reader@source",
+            &[
+                "cp",
+                "--from",
+                "reader@source",
+                "--src",
+                "data",
+                "--to",
+                "backup",
+                "--into",
+                "out",
+                "--follow-dst",
+            ],
+        );
+        assert!(
+            desktop.contains(
+                "follows symlinks in the destination path, so it can write where they lead"
+            ),
+            "{desktop}"
+        );
+        assert!(!desktop.contains("in the sources"), "{desktop}");
 
         let details = between.details_description(str::to_owned);
         assert!(

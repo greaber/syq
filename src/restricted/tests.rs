@@ -274,6 +274,7 @@ fn released_enrollment_state_is_never_read_or_touched() {
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
         refresh: false,
         replaces: None,
+        keep_used: false,
     };
     let InstallResponse::Installed { generation, .. } =
         install_for_account(&request, &account, home).unwrap()
@@ -367,6 +368,7 @@ fn install_request(
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
         refresh,
         replaces: None,
+        keep_used: false,
     }
 }
 
@@ -511,6 +513,20 @@ fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
     );
     let replay = enrollment_state(home, id).join("replay");
     fs::remove_dir(&replay).unwrap();
+    // A refresh for a refused copy that is signed again under the same
+    // request keeps the record or fails, changing nothing.
+    let mut keeping = install_request(&account, id, &entry, &login, true);
+    keeping.keep_used = true;
+    let error = install_for_account(&keeping, &account, home).unwrap_err();
+    assert!(format!("{error:#}").contains("is unusable"), "{error:#}");
+    assert!(!replay.exists());
+    let generation = |home: &Path| {
+        read_receiver_config(&enrollment_state(home, id))
+            .unwrap()
+            .unwrap()
+            .generation
+    };
+    assert_eq!(generation(home), 1);
     let refresh = install_request(&account, id, &entry, &login, true);
     assert_eq!(
         installed(install_for_account(&refresh, &account, home).unwrap()),
@@ -523,6 +539,10 @@ fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
     // With the record in place, a refresh changes nothing.
     assert_eq!(
         installed(install_for_account(&refresh, &account, home).unwrap()),
+        (2, false)
+    );
+    assert_eq!(
+        installed(install_for_account(&keeping, &account, home).unwrap()),
         (2, false)
     );
     // A record the receiver refuses, as after a restore from a backup with
@@ -781,6 +801,59 @@ pub(super) fn test_directive(
         [7; 32],
     )
     .unwrap()
+}
+
+/// A copy its receiver refused for running another build is signed again
+/// as the same copy: for its own enrollment, under its request ID, and with
+/// its start and finish times, so the receiver's record of used directives
+/// runs it at most once, and no later than the first could have run.
+#[test]
+fn a_refused_copy_is_signed_again_as_the_same_copy() {
+    let enrollment = EnrollmentId::random();
+    // Signed a while before the refusal, and still in its start window.
+    let mut first = test_directive(enrollment, 3, "backup");
+    for time in [
+        &mut first.issued_at,
+        &mut first.not_before,
+        &mut first.start_by,
+        &mut first.finish_by,
+    ] {
+        *time -= 600;
+    }
+    let retry = Retry::of(&first);
+    let mut again = test_directive(enrollment, 4, "backup");
+    assert_ne!(again.request_id, first.request_id);
+    assert_ne!(again.issued_at, first.issued_at);
+    assert_ne!(again.start_by, first.start_by);
+    assert_ne!(again.finish_by, first.finish_by);
+    retry.apply(&mut again).unwrap();
+    assert_eq!(
+        (
+            again.request_id,
+            again.issued_at,
+            again.not_before,
+            again.start_by,
+            again.finish_by
+        ),
+        (
+            first.request_id,
+            first.issued_at,
+            first.not_before,
+            first.start_by,
+            first.finish_by
+        )
+    );
+    assert_eq!(again.binding.generation, 4);
+    // Not for another enrollment, as one set up again after a revoke.
+    let mut other = test_directive(EnrollmentId::random(), 1, "backup");
+    assert!(retry.apply(&mut other).is_err());
+    // Not once it may no longer start.
+    let mut expired = first.clone();
+    expired.start_by = crate::directive::now().unwrap() - 1;
+    let error = Retry::of(&expired)
+        .apply(&mut test_directive(enrollment, 4, "backup"))
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("expired"), "{error:#}");
 }
 
 pub(super) fn sign_test_directive(
@@ -2647,6 +2720,7 @@ fn test_authority_with_options(
         grant,
         GrantConstraints {
             tcp_congestion: None,
+            unencrypted_tcp: false,
             mapping: None,
             hashing: None,
             filters,
@@ -6832,6 +6906,40 @@ fn ordinary_helper_selection_does_not_change_the_restricted_grant() {
     validate_restricted_args(&args).unwrap();
 }
 
+/// The receiver accepts an unencrypted listener only when the signed
+/// command asks for one.
+#[test]
+fn authority_accepts_an_unencrypted_listener_only_when_signed() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let listener = || Request::TcpListen {
+        send_rate: None,
+        key: None,
+        token: vec![8; 16],
+        port_lo: 47_600,
+        port_hi: 47_699,
+        congestion_control: None,
+    };
+    let encrypted = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    let error = encrypted.authorize(&mut listener(), true).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("unless the signed command passes --no-tcp-encryption"),
+        "{error:#}"
+    );
+    let mut plain = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    plain.unencrypted_tcp = true;
+    plain.authorize(&mut listener(), true).unwrap();
+    // An encrypted listener is still fine, and the token is still checked.
+    let mut plain = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    plain.unencrypted_tcp = true;
+    let mut short_token = listener();
+    if let Request::TcpListen { token, .. } = &mut short_token {
+        token.pop();
+    }
+    assert!(plain.authorize(&mut short_token, true).is_err());
+}
+
 #[test]
 fn authority_binds_one_encrypted_listener_and_known_metadata_flags() {
     let temporary = crate::test_support::tempdir().unwrap();
@@ -7517,6 +7625,7 @@ fn a_root_writer_is_refused_before_enrolling() {
             jump: None,
             agent: None,
             allow_enrollment: true,
+            retry_of: None,
             batch: true,
             results_key: None,
             role,
@@ -12139,10 +12248,10 @@ fn follow_dst_compares_absolute_link_targets_with_the_real_directory() {
 }
 
 /// With `--follow-dst`, a destination reached through symlinks is the
-/// directory they lead to inside the confinement root: the receiver works
-/// beneath it, under the signed destination's name. A link that leads
-/// outside the root, into the receiver's control plane, to nothing, or
-/// round in a loop is refused when the grant is redeemed.
+/// directory they lead to, wherever that is: the receiver works beneath it,
+/// under the signed destination's name. A link that leads into or above the
+/// receiver's control plane, to nothing, or round in a loop is refused when
+/// the grant is redeemed.
 #[test]
 fn follow_dst_copies_into_the_directory_a_destination_link_leads_to() {
     let temporary = crate::test_support::tempdir().unwrap();
@@ -12176,10 +12285,22 @@ fn follow_dst_copies_into_the_directory_a_destination_link_leads_to() {
             (options, &protected),
         )
     };
-    for target in [
-        b"data/real".to_vec(),
-        b"./data/../data/real/".to_vec(),
-        path_bytes(&real),
+    let outside = temporary.path().join("outside");
+    for (target, lands) in [
+        (b"data/real".to_vec(), &real),
+        (b"./data/../data/real/".to_vec(), &real),
+        (path_bytes(&real), &real),
+        // Outside the directory the destination is in.
+        (b"../outside".to_vec(), &outside),
+        (path_bytes(&outside), &outside),
+        (
+            b"../../../../../../../.."
+                .iter()
+                .chain(&path_bytes(&outside))
+                .copied()
+                .collect(),
+            &outside,
+        ),
     ] {
         let authority = authority(&target, options).unwrap();
         let mut put = small_put(&root.join("target/file"));
@@ -12187,11 +12308,11 @@ fn follow_dst_copies_into_the_directory_a_destination_link_leads_to() {
         let response = authority.test_ops().handle(&put);
         authority.settle(settlement, &response);
         assert_eq!(
-            fs::read(real.join("file")).unwrap(),
+            fs::read(lands.join("file")).unwrap(),
             b"new",
             "{target:?}: {response:?}"
         );
-        fs::remove_file(real.join("file")).unwrap();
+        fs::remove_file(lands.join("file")).unwrap();
         assert!(fs::symlink_metadata(root.join("target"))
             .unwrap()
             .file_type()
@@ -12213,21 +12334,20 @@ fn follow_dst_copies_into_the_directory_a_destination_link_leads_to() {
     symlink("loop-b", root.join("loop-a")).unwrap();
     symlink("loop-a", root.join("loop-b")).unwrap();
     for (target, refusal) in [
-        (
-            b"../outside".to_vec(),
-            "outside the directory the destination is in",
-        ),
-        (
-            path_bytes(&temporary.path().join("outside")),
-            "outside the directory the destination is in",
-        ),
         (b".ssh".to_vec(), "protected SSH configuration"),
+        (
+            path_bytes(&root.join(".ssh")),
+            "protected SSH configuration",
+        ),
+        // Directories that hold a protected one.
+        (b".".to_vec(), "holds the receiver's protected"),
+        (b"..".to_vec(), "holds the receiver's protected"),
         (
             b"missing".to_vec(),
             "leads to missing, which does not exist",
         ),
         (b"loop-a".to_vec(), "too many symlinks"),
-        (b".".to_vec(), "the directory it is in"),
+        (b"/".to_vec(), "resolves to /"),
     ] {
         let error = format!("{:#}", authority(&target, options).err().unwrap());
         assert!(error.contains(refusal), "{target:?}: {error}");

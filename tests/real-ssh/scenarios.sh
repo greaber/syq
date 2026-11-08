@@ -1313,8 +1313,8 @@ esac
 set --
 
 printf 'case: --follow-dst copies into the directory a restricted destination link leads to\n'
-# The receiver resolves the link inside the directory the destination is in
-# and writes into the directory it leads to; the link stays a link.
+# The receiver resolves the link, wherever it leads as the account would
+# follow it, and writes into the directory it leads to; the link stays a link.
 make_tree source /tmp/syq-real-ssh/follow-source follow
 ssh destination 'rm -rf /tmp/syq-real-ssh/follow-real /tmp/syq-real-ssh/follow-link &&
     install -d /tmp/syq-real-ssh/follow-real &&
@@ -1335,6 +1335,49 @@ case "$follow_output" in
     *'--widen-dirs all cannot be combined with --follow-dst'*) ;;
     *) printf '%s\n' "$follow_output" >&2; exit 1 ;;
 esac
+# A link that leads outside the destination's directory is followed too, but
+# not into the account's SSH configuration, however the link names it.
+ssh destination 'rm -rf /tmp/syq-real-ssh-follow-outside /tmp/syq-real-ssh/follow-away \
+        /tmp/syq-real-ssh/follow-ssh &&
+    install -d /tmp/syq-real-ssh-follow-outside &&
+    ln -s ../syq-real-ssh-follow-outside /tmp/syq-real-ssh/follow-away &&
+    ln -s "$HOME/.ssh" /tmp/syq-real-ssh/follow-ssh'
+syq cp --no-progress --copy-metadata=permissions --follow-dst \
+    --from source --srcs-in /tmp/syq-real-ssh/follow-source \
+    --to destination --into /tmp/syq-real-ssh/follow-away
+assert_same_tree source /tmp/syq-real-ssh/follow-source \
+    destination /tmp/syq-real-ssh-follow-outside follow-away
+ssh_before=$(ssh destination 'ls -a ~/.ssh')
+if follow_output=$(syq cp --no-progress --follow-dst \
+    --from source --srcs-in /tmp/syq-real-ssh/follow-source \
+    --to destination --into /tmp/syq-real-ssh/follow-ssh 2>&1); then
+    echo '--follow-dst into ~/.ssh through a link unexpectedly succeeded' >&2
+    exit 1
+fi
+case "$follow_output" in
+    *"receiver's protected SSH configuration"*) ;;
+    *) printf '%s\n' "$follow_output" >&2; exit 1 ;;
+esac
+test "$(ssh destination 'ls -a ~/.ssh')" = "$ssh_before"
+
+printf 'case: a restricted copy sends unencrypted TCP data only when its command asks\n'
+# The coordinator on source asks the destination's receiver for a listener
+# without encryption, which the receiver allows because the signed command
+# passes --no-tcp-encryption.
+make_tree source /tmp/syq-real-ssh/plain-source plain
+ssh destination 'rm -rf /tmp/syq-real-ssh/plain-destination'
+plain_output=$(syq cp -vv --no-progress --copy-metadata=permissions --no-tcp-encryption \
+    --from source --srcs-in /tmp/syq-real-ssh/plain-source \
+    --to destination --into /tmp/syq-real-ssh/plain-destination 2>&1) || {
+    printf '%s\n' "$plain_output" >&2
+    exit 1
+}
+case "$plain_output" in
+    *'transport: unencrypted TCP planned'*) ;;
+    *) printf '%s\n' "$plain_output" >&2; exit 1 ;;
+esac
+assert_same_tree source /tmp/syq-real-ssh/plain-source \
+    destination /tmp/syq-real-ssh/plain-destination plain
 
 printf 'case: a symlink named as a source needs --follow-src or --src-non-dir\n'
 # The coordinator runs on the source server here, so its refusal must reach
@@ -1411,11 +1454,103 @@ assert_same_tree source /tmp/syq-real-ssh/pscope-source \
 printf 'case: login keys sign restricted copies\n'
 python3 /usr/local/libexec/syq-test-receiver-keys.py
 
+printf 'case: a copy started here updates a receiver of another build and runs once more\n'
+# The laptop's record says the destination's receiver runs this build, as
+# after restoring the laptop's state from a backup, but the lab's second
+# build has updated the receiver since. The receiver refuses the copy for
+# its build; syq updates it to this build and runs the copy once more,
+# leaving nothing of the refused attempt in the results.
+make_tree source /tmp/syq-real-ssh/rebuild-source rebuild
+syq cp --no-progress --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
+    --to destination --into /tmp/syq-real-ssh/rebuild-first
+rebuild_record=$(python3 - <<'PYTHON'
+import json
+from pathlib import Path
+found = [path.parent for path in Path.home().glob(".local/state/syq/enrollments/*/enrollment.json")
+         if (lambda record: (record["host"], record.get("port"), record["target_login"])
+             == ("destination", None, "syq"))(json.loads(path.read_text()))]
+assert len(found) == 1, found
+print(found[0])
+PYTHON
+)
+# Let the second build update the receiver behind this build's record.
+stale_receiver() {
+    cp "$rebuild_record/enrollment.json" /tmp/syq-real-ssh-rebuild-enrollment.json
+    syq-other-build receiver enroll destination >/dev/null
+    test "$(syq-other-build receiver list | awk -F '\t' '$3 == "syq@destination" { print $4 }')" = \
+        "$(syq-other-build --build-identity)"
+    cp /tmp/syq-real-ssh-rebuild-enrollment.json "$rebuild_record/enrollment.json"
+}
+stale_receiver
+ssh destination 'rm -rf /tmp/syq-real-ssh/rebuild-destination'
+# A dry run says so and updates nothing.
+if rebuild_output=$(syq cp --no-progress --dry-run \
+    --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
+    --to destination --into /tmp/syq-real-ssh/rebuild-destination 2>&1); then
+    printf '%s\n' "$rebuild_output" >&2
+    echo 'a dry run against a receiver of another build unexpectedly succeeded' >&2
+    exit 1
+fi
+case "$rebuild_output" in
+    *'a dry run does not update it, but the next copy does'*) ;;
+    *) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
+esac
+rm -f /tmp/syq-real-ssh-rebuild.ndjson
+rebuild_output=$(syq cp --no-progress --results /tmp/syq-real-ssh-rebuild.ndjson \
+    --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
+    --to destination --into /tmp/syq-real-ssh/rebuild-destination 2>&1) || {
+    printf '%s\n' "$rebuild_output" >&2
+    exit 1
+}
+case "$rebuild_output" in
+    *'runs another syq build than this one; updating it to this build and trying once more'*) ;;
+    *) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
+esac
+assert_same_tree source /tmp/syq-real-ssh/rebuild-source \
+    destination /tmp/syq-real-ssh/rebuild-destination rebuild
+test "$(syq receiver list | awk -F '\t' '$3 == "syq@destination" { print $4 }')" = \
+    "$(syq --build-identity)"
+python3 - /tmp/syq-real-ssh-rebuild.ndjson <<'PYTHON'
+import json, sys
+records = [json.loads(line) for line in open(sys.argv[1])]
+kinds = [record["type"] for record in records]
+assert kinds.count("run") == 1 and "error" not in kinds, records
+assert records[-1]["type"] == "result" and records[-1]["status"] == "success", records[-1]
+PYTHON
+# A detached copy is run once more the same way, before it detaches.
+stale_receiver
+ssh destination 'rm -rf /tmp/syq-real-ssh/rebuild-detached'
+rebuild_output=$(syq cp --no-progress --detach \
+    --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
+    --to destination --into /tmp/syq-real-ssh/rebuild-detached 2>&1) || {
+    printf '%s\n' "$rebuild_output" >&2
+    exit 1
+}
+case "$rebuild_output" in
+    *'updating it to this build and trying once more'*'syq: started on '*) ;;
+    *) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
+esac
+rebuild_deadline=$(($(date +%s) + 60))
+until assert_same_tree source /tmp/syq-real-ssh/rebuild-source \
+    destination /tmp/syq-real-ssh/rebuild-detached rebuild-detached >/dev/null 2>&1; do
+    if [ "$(date +%s)" -ge "$rebuild_deadline" ]; then
+        assert_same_tree source /tmp/syq-real-ssh/rebuild-source \
+            destination /tmp/syq-real-ssh/rebuild-detached rebuild-detached
+        echo 'the detached copy did not finish within 60 seconds' >&2
+        exit 1
+    fi
+    echo 'waiting for the detached copy after its receiver was updated'
+    sleep 2
+done
+
 printf 'case: enrollment revocation stops active restricted receivers\n'
 python3 /usr/local/libexec/syq-test-receiver-revoke.py
 
 printf 'case: ending the requesting syq stops its server-to-server copy\n'
 python3 /usr/local/libexec/syq-test-requester-loss.py
+
+printf 'case: a detached restricted copy outlives the command that started it\n'
+python3 /usr/local/libexec/syq-test-requester-loss.py detached
 
 printf 'case: source coordinator with constrained agent and restricted destination\n'
 make_tree source /tmp/syq-real-ssh/direct-source direct

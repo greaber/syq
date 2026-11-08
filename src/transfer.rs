@@ -2490,12 +2490,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             "--detach and --peer-auth apply only to a direct copy between two different remote endpoints"
         );
     }
-    if args.restricted_grant.is_some()
-        && (args.no_tcp_encryption || original_srcs[0].is_remote() || !dst.is_remote())
-    {
-        bail!(
-            "a signed receiver grant is valid only for a local-to-remote coordinator using encrypted data connections"
-        );
+    if args.restricted_grant.is_some() && (original_srcs[0].is_remote() || !dst.is_remote()) {
+        bail!("a signed receiver grant is valid only for a local-to-remote coordinator");
     }
     for source in original_srcs {
         if !source.same_host(&original_srcs[0]) {
@@ -2871,10 +2867,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // to the syq that started this coordinator, from before any change.
     let destination_results = crate::destination::reports_results(&args);
     if destination_results {
-        anyhow::ensure!(
-            args.results_token.is_some(),
-            "the destination's results need a relay from the syq that started this copy"
-        );
         ok(
             dst_ctl.call(Request::DestinationResults {
                 records: args.relay_results,

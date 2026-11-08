@@ -29,7 +29,7 @@ fn detached_timeout_terminates_the_complete_process_group() {
             shell_words::quote(survived.to_str().unwrap()),
             shell_words::quote(pids.to_str().unwrap()),
         );
-    let launcher = detached_launcher_command(&remote_command, "timeout-test", 1, 1);
+    let launcher = detached_launcher_command(&remote_command, "timeout-test", false, (1, 1));
     let output = Command::new("sh")
         .args(["-c", &launcher])
         .env("HOME", directory.path())
@@ -59,6 +59,46 @@ fn detached_timeout_terminates_the_complete_process_group() {
     }
     assert!(alive.is_empty(), "detached processes survived: {alive:?}");
     assert!(!survived.exists());
+}
+
+/// A restricted copy's detached coordinator reads its entry key and
+/// directive from the session's input: the launcher passes that input on to
+/// the background command, and otherwise gives it none.
+#[test]
+fn detached_launcher_passes_its_input_on_only_when_asked() {
+    let directory = crate::test_support::tempdir().unwrap();
+    let received = directory.path().join("received");
+    let remote_command = format!(
+        "cat > {} && printf ready > \"$SYQ_INTERNAL_DETACH_READY\"",
+        shell_words::quote(received.to_str().unwrap()),
+    );
+    for (input, expected) in [(true, &b"entry key, directive"[..]), (false, &b""[..])] {
+        let launcher = detached_launcher_command(&remote_command, "input-test", input, (10, 1));
+        let mut child = Command::new("sh")
+            .args(["-c", &launcher])
+            .env("HOME", directory.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The launcher that passes nothing on may already have exited.
+        let _ = child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"entry key, directive");
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = String::from_utf8(output.stdout).unwrap();
+        let logs = directory.path().join(".syq/input-test-");
+        assert!(log.starts_with(logs.to_str().unwrap()), "{log}");
+        assert_eq!(std::fs::read(&received).unwrap(), expected, "input {input}");
+    }
 }
 
 #[test]
@@ -502,6 +542,60 @@ fn destination_results_supply_its_changes_whatever_the_human_output_does() {
         assert_eq!(terminal["errors"], 1);
         assert!(terminal.get("provenance").is_none());
     }
+}
+
+/// Before a restricted destination's results start, the coordinator's
+/// records are held back: an attempt that is run again because the
+/// receiver runs another build leaves nothing in the results. Otherwise
+/// they are written, in order, once the destination's results start or the
+/// relay ends.
+#[test]
+fn coordinator_records_wait_for_the_destination_results_to_start() {
+    let setup = serde_json::json!({"type": "error", "message": "syq: setting up"});
+    let relayed = |input: &[u8]| {
+        let (stream, expectation) = destination(true);
+        let (file, writer) = results_file();
+        let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
+        relay.hold_until_destination_starts();
+        relay_output(input, &mut Vec::new(), &mut None, &mut relay).unwrap();
+        (stream, file, relay)
+    };
+    let messages = |file| -> Vec<String> {
+        read_records(file)
+            .iter()
+            .filter_map(|record| record["message"].as_str().map(str::to_owned))
+            .collect()
+    };
+    // Run again: nothing of it reaches the results.
+    let (_, file, mut relay) = relayed(&coordinator_line(setup.clone(), 0));
+    assert!(relay.discard_held());
+    drop(relay);
+    assert!(read_records(file).is_empty());
+    // Not run again: written when the relay ends, as before.
+    let (_, file, relay) = relayed(&coordinator_line(setup.clone(), 0));
+    drop(relay);
+    assert_eq!(messages(file), ["syq: setting up"]);
+    // Started: written ahead of the destination's records, and the copy
+    // can no longer be run again.
+    let (mut stream, expectation) = destination(true);
+    let (file, writer) = results_file();
+    let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
+    relay.hold_until_destination_starts();
+    let mut input = coordinator_line(setup, 0);
+    input.extend(destination_lines(&mut stream, 0));
+    relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+    assert!(!relay.discard_held());
+    let records = read_records(file);
+    assert_eq!(records[0]["message"], "syq: setting up", "{records:?}");
+    assert!(records.len() > 1, "{records:?}");
+    // More than a refused attempt sends is written at once, and the copy
+    // can no longer be run again.
+    let long = serde_json::json!({"type": "error", "message": "x".repeat(600 * 1024)});
+    let mut input = coordinator_line(long.clone(), 0);
+    input.extend(coordinator_line(long, 1));
+    let (_, file, mut relay) = relayed(&input);
+    assert_eq!(read_records(file.try_clone().unwrap()).len(), 2);
+    assert!(!relay.discard_held());
 }
 
 #[test]

@@ -33,6 +33,10 @@ pub(crate) struct PullRequest {
     /// listener for it. Never sent: only a source directive's rules set it.
     #[serde(skip)]
     pub no_tcp: bool,
+    /// Whether the command sends TCP data without encryption, so the reader
+    /// accepts an unencrypted listener. Never sent, as `no_tcp`.
+    #[serde(skip)]
+    pub unencrypted_tcp: bool,
 }
 
 /// A server's request to approve a copy from another server to itself,
@@ -99,11 +103,10 @@ pub(crate) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
         || args.no_bootstrap
         || args.detach
         || args.restricted_grant.is_some()
-        || args.no_tcp_encryption
         || args.peer_auth != PeerAuth::Restricted
         || args.coordinate_at != CoordinateAt::Auto
     {
-        bail!("a copy from another server that a receiving machine approves reads it through that server's restricted receiver and encrypts its data; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --no-tcp-encryption, --peer-auth, or --coordinate-at");
+        bail!("a copy from another server that a receiving machine approves reads it through that server's restricted receiver; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --peer-auth, or --coordinate-at");
     }
     anyhow::ensure!(args.descriptor_copy.is_none(), "source authorization requires pathname file selections; descriptor streams are not supported");
     let target = crate::remote_to_remote::endpoint_arg(source, None, None);
@@ -173,6 +176,7 @@ pub(crate) fn source_request(args: &crate::cli::Args) -> Result<PullRequest> {
         },
         resolved_base: None,
         no_tcp: false,
+        unencrypted_tcp: false,
     };
     request.validate()?;
     Ok(request)
@@ -210,6 +214,7 @@ impl PullRequest {
                 port_lo: self.tcp_ports.0,
                 port_hi: self.tcp_ports.1,
                 congestion_control: self.tcp_congestion.clone(),
+                unencrypted: self.unencrypted_tcp,
             }),
             send_rate: self.send_rate,
             limits: self.limits.clone(),
@@ -563,15 +568,15 @@ mod tests {
             serde_json::to_value(&plain).unwrap(),
             serde_json::to_value(&filtered).unwrap()
         );
-        // SSH data works through the source's receiver; unencrypted TCP and
+        // SSH data and unencrypted TCP work through the source's receiver;
         // options that choose another route do not.
         let eligible = |extra: &[&str]| {
             eligible_target(&crate::approval_command::parse(&command(extra)).unwrap())
         };
         assert_eq!(eligible(&["--no-tcp"]).unwrap(), "backup");
+        assert_eq!(eligible(&["--no-tcp-encryption"]).unwrap(), "backup");
         for refused in [
-            &["--no-tcp-encryption"][..],
-            &["--rsh", "ssh"],
+            &["--rsh", "ssh"][..],
             &["--detach"],
             &["--coordinate-at", "src"],
         ] {
@@ -683,6 +688,48 @@ mod tests {
             .decide(&pending.id, false, Kind::Source)
             .unwrap();
         assert!(task.join().unwrap().is_err());
+    }
+
+    /// A read whose command sends the files unencrypted warns of it.
+    #[test]
+    fn source_approval_warns_of_unencrypted_tcp() {
+        for (extra, warns) in [
+            (&[][..], false),
+            (&["--no-tcp-encryption"], true),
+            (&["--no-tcp-encryption", "--no-tcp"], false),
+        ] {
+            let root = crate::test_support::tempdir().unwrap();
+            let (_broker, receiver, registration, _) = broker(root.path(), Approval::Always);
+            let task = std::thread::spawn(move || {
+                exchange(
+                    &registration,
+                    read_request("backup", command(extra)),
+                    Duration::from_secs(3),
+                    Some(Duration::from_secs(3)),
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let pending = loop {
+                if let Some(summary) = receiver.approvals.snapshots().first() {
+                    break summary.clone();
+                }
+                assert!(!task.is_finished(), "{extra:?}: source request ended");
+                assert!(Instant::now() < deadline, "{extra:?}: not pending");
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            let description =
+                pending.description(&crate::persistence::Domain::default(), str::to_owned);
+            assert_eq!(
+                description.contains("The files go over TCP without encryption"),
+                warns,
+                "{extra:?}: {description}"
+            );
+            receiver
+                .approvals
+                .decide(&pending.id, false, crate::receive_approval::Kind::Source)
+                .unwrap();
+            assert!(task.join().unwrap().is_err());
+        }
     }
 
     #[test]

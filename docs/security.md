@@ -131,7 +131,11 @@ producers in directories untrusted users cannot modify.
 Remote copies encrypt and authenticate file data, over SSH and over syq's
 direct TCP connections. `--no-tcp-encryption` turns this off for TCP, so
 anyone on the network can read or alter the traffic, including its
-authentication token. Use it only on a network you trust.
+authentication token. Use it only on a network you trust. A restricted
+receiver accepts unencrypted TCP only when the signed command asks for it;
+someone on the network can then change what the copy writes, within what the
+signed command allows. Copies to and from your laptop through a receiving
+connection always encrypt their data.
 
 For TCP, a server lists addresses to connect to, and syq also tries the
 server's SSH address. Syq doesn't look up names a server lists, and doesn't
@@ -233,15 +237,17 @@ The protection has four parts:
 4. **Reports from hostB.** The receiver reports each change it makes, protected
    by a key hostB created during setup. Your laptop checks that the reports
    hostA passes on are hostB's, and that hostA left none out, added none, and
-   did not cut them short.
+   did not cut them short. A [detached](remote-reference.md#detached-copies)
+   copy has no reports: its log on hostA is only as trustworthy as hostA.
 
 An enrollment covers the whole account. Each signed command names its own
 destination, which can be anywhere the account can write except its SSH
 configuration and syq's own programs and state (see
 [Enrollment](remote-reference.md#enrollment)). As in any copy, a symlink in
-the destination path stops the copy unless the command passes `--follow-dst`;
-links in the account's home directory's own path are fine. The receiver does
-not follow symlinks below the destination. Because a copy can write a file that
+the destination path stops the copy unless the command passes `--follow-dst`,
+which follows it wherever it leads, except into those paths; links in the
+account's home directory's own path are fine. The receiver does not follow
+symlinks below the destination. Because a copy can write a file that
 runs code as the account, such as a shell startup file, a signed copy is as
 strong as a login. That is acceptable because only your login key can sign one,
 and you choose each destination.

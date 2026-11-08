@@ -1019,11 +1019,15 @@ pub(crate) fn is_named(grant: &Option<String>) -> bool {
 
 /// Whether this coordinator relays the destination's own results to the
 /// syq that started it: one another syq started for a copy between two
-/// servers, which that syq does not see the destination's replies to. A copy
-/// to a receiving machine, or one a server started itself, is coordinated by
-/// the syq that reads every reply.
+/// servers, which that syq does not see the destination's replies to, and
+/// gave a token to relay them with. A detached coordinator has none: nobody
+/// reads its output but its log. A copy to a receiving machine, or one a
+/// server started itself, is coordinated by the syq that reads every reply.
 pub(crate) fn reports_results(args: &crate::cli::Args) -> bool {
-    args.delegated && args.restricted_grant.is_some() && !is_named(&args.restricted_grant)
+    args.delegated
+        && args.results_token.is_some()
+        && args.restricted_grant.is_some()
+        && !is_named(&args.restricted_grant)
 }
 
 fn select_copy(
@@ -1603,12 +1607,14 @@ impl Receiver {
         let generation = self.generation.load(Ordering::Acquire);
         // ACLs, extended attributes and hard links reach beyond the
         // files being written, so they always ask, as does widening
-        // the directory the copy goes into.
+        // the directory the copy goes into, and unencrypted TCP, which
+        // `receiving_rules` refuses here before it gets this far.
         let extra = &request.constraints.extra_options;
         let automatic = !(extra.acls
             || extra.xattrs
             || extra.hardlinks
-            || extra.widen_dirs == crate::delegation::DirectoryWidening::All)
+            || extra.widen_dirs == crate::delegation::DirectoryWidening::All
+            || request.constraints.unencrypted_tcp)
             && self.auto_approve_root.as_ref().is_some_and(|root| {
                 destination.starts_with(root)
                     && !(destination == *root

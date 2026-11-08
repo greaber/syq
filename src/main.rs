@@ -488,6 +488,11 @@ fn run() {
             receive_service::refresh_outdated(&domain, quiet);
         }
     }
+    // A coordinator for a copy between two servers that this syq's build
+    // started reports a destination's receiver of another build by its
+    // status, so that the syq that started it can update the receiver.
+    let reports_other_build = args.delegated
+        && std::env::var_os(remote_to_remote::REPORT_OTHER_BUILD).is_some_and(|value| value == "1");
     let result = if args.stream_mapping_fd.is_some() {
         stream_mapping::run(args)
     } else if args.descriptor_copy.is_some() {
@@ -509,7 +514,12 @@ fn run() {
             crate::output::exit(code)
         }
         Err(e) => {
-            crate::output::exit_on_error(&e, 1, "syq");
+            let code = if reports_other_build && crate::restricted::is_other_build(&e) {
+                crate::restricted::OTHER_BUILD_EXIT
+            } else {
+                1
+            };
+            crate::output::exit_on_error(&e, code, "syq");
         }
     }
 }

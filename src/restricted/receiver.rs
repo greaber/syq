@@ -737,7 +737,7 @@ pub(super) fn verify_coordination(
 /// What a verified directive for one end of a copy allows.
 pub(super) enum Rules {
     Destination(Box<(Grant, GrantConstraints)>),
-    Source(crate::destination::pull::PullRequest),
+    Source(Box<crate::destination::pull::PullRequest>),
 }
 
 impl Rules {
@@ -849,10 +849,9 @@ pub(super) fn verify_rules(
             crate::directive::Role::Destination => Ok(Rules::Destination(Box::new(
                 crate::directive::destination_rules(directive, home)?,
             ))),
-            crate::directive::Role::Source => Ok(Rules::Source(crate::directive::source_rules(
-                directive,
-                canonical_home,
-            )?)),
+            crate::directive::Role::Source => Ok(Rules::Source(Box::new(
+                crate::directive::source_rules(directive, canonical_home)?,
+            ))),
             crate::directive::Role::CoordinatingSource(_) => {
                 bail!("a coordinating source's directive comes with its destination's")
             }
@@ -1011,7 +1010,14 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
                 .expect("account required");
             let (login, host) = enrollment_account(account)?;
             let via = via()?;
-            let (metadata, _, _) = enroll(&host, None, &login, (via.as_ref(), false), true, None)?;
+            let (metadata, _, _) = enroll(
+                &host,
+                None,
+                &login,
+                (via.as_ref(), false),
+                Refresh::Always,
+                None,
+            )?;
             crate::output::command_println!(
                 "enrolled {} for {}",
                 metadata.id,
