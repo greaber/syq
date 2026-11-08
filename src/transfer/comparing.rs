@@ -249,6 +249,18 @@ struct Flow {
     started: bool,
 }
 
+/// Whether waiting for the destination's next reply, which has not arrived,
+/// shows a push's look-ahead is too short: it waits for hashes with no block
+/// left to ask about. A pull's look-ahead is already the most it may be.
+fn hashes_ran_out(sizes: &Sizes, flow: &Flow) -> bool {
+    sizes.adaptive
+        && sizes.source_answers_at_once
+        && sizes.prefetch
+        && flow.started
+        && flow.reads.is_empty()
+        && matches!(flow.awaited.front(), Some(Awaited::Hashes(_)))
+}
+
 impl Worker {
     /// The largest block an automatic comparison uses: the configured one,
     /// but in a pull no more than the starting block. A pull's replies can
@@ -413,14 +425,7 @@ impl Worker {
             let reply = match self.dst.try_recv_with_arrival() {
                 Some(arrived) => arrived?,
                 None => {
-                    // Waiting for hashes that have not arrived, with no block
-                    // to ask about: the windows hashed ahead were used up.
-                    if sizes.adaptive
-                        && sizes.prefetch
-                        && flow.started
-                        && flow.reads.is_empty()
-                        && matches!(flow.awaited.front(), Some(Awaited::Hashes(_)))
-                    {
+                    if hashes_ran_out(sizes, flow) {
                         self.comparison.starved();
                         sizes.ahead = self.comparison.ahead();
                     }
@@ -733,6 +738,51 @@ mod tests {
             sizing.compared(1 << 30, 1, ceiling);
         }
         assert!(sizing.block(ceiling) >= 2 << 20);
+    }
+
+    #[test]
+    fn only_a_push_that_waits_for_hashes_with_nothing_to_ask_has_run_out() {
+        let sizes = |push: bool| Sizes {
+            adaptive: true,
+            block: 256 << 10,
+            window: 4 << 20,
+            ahead: if push { START_AHEAD } else { MAX_AHEAD },
+            source_requests: if push { 1 } else { 256 },
+            destination_requests: 256,
+            prefetch: true,
+            source_answers_at_once: push,
+        };
+        let waiting = || Flow {
+            started: true,
+            awaited: VecDeque::from([Awaited::Hashes(Instant::now())]),
+            ..Flow::default()
+        };
+        assert!(hashes_ran_out(&sizes(true), &waiting()));
+        assert!(!hashes_ran_out(&sizes(false), &waiting()), "a pull");
+        let mut asking = waiting();
+        asking.reads.push_back(Read {
+            off: 0,
+            len: 512,
+            sent: Instant::now(),
+        });
+        assert!(!hashes_ran_out(&sizes(true), &asking), "blocks to ask");
+        let mut first = waiting();
+        first.started = false;
+        assert!(!hashes_ran_out(&sizes(true), &first), "the first window");
+        let mut acknowledging = waiting();
+        acknowledging.awaited = VecDeque::from([Awaited::Write {
+            len: 512,
+            reused: true,
+            sent: Instant::now(),
+            data: false,
+        }]);
+        assert!(
+            !hashes_ran_out(&sizes(true), &acknowledging),
+            "an acknowledgment"
+        );
+        let mut fixed = sizes(true);
+        fixed.adaptive = false;
+        assert!(!hashes_ran_out(&fixed, &waiting()), "fixed sizes");
     }
 
     #[test]
