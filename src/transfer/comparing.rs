@@ -13,9 +13,12 @@
 //! Unless the copy fixes comparison settings, each worker sizes its own
 //! requests as it goes (`ComparisonSizing`):
 //!
-//! - How far ahead it has windows hashed: further after it waited for hashes
-//!   with nothing else to do, up to the 32 MiB the receiver retained for one
-//!   worker before comparisons adapted. A short link never needs that much.
+//! - How far ahead it has windows hashed: in a push, further after it waited
+//!   for hashes with nothing else to do, up to the 32 MiB the receiver
+//!   retained for one worker before comparisons adapted. A short link never
+//!   needs that much. A pull or relay waits on a remote source in the
+//!   ordinary course of its pipeline, which says nothing about whether more
+//!   would help, so it hashes the 32 MiB ahead from the start.
 //! - The comparison block of each window, from 64 KiB to the configured block.
 //!   Around each run of differing blocks, a copy sends up to a block of bytes
 //!   that did not change; more, smaller blocks cost a request each instead.
@@ -244,8 +247,6 @@ struct Flow {
     /// A window has been asked about: waits for hashes after that mean the
     /// look-ahead is too short.
     started: bool,
-    /// The look-ahead stopped the last attempt to hash another window.
-    held_back: bool,
 }
 
 impl Worker {
@@ -295,7 +296,13 @@ impl Worker {
             adaptive: true,
             block,
             window: self.comparison.window(block),
-            ahead: self.comparison.ahead(),
+            // A remote source's replies are waited on as a matter of course;
+            // only a push learns how far ahead it needs to hash.
+            ahead: if src_pipelines {
+                MAX_AHEAD
+            } else {
+                self.comparison.ahead()
+            },
             source_requests: if src_pipelines { queue(&*self.src) } else { 1 },
             destination_requests: if dst_pipelines { queue(&*self.dst) } else { 1 },
             prefetch: dst_pipelines,
@@ -434,7 +441,6 @@ impl Worker {
         flow: &mut Flow,
     ) -> Result<()> {
         let ceiling = self.adaptive_ceiling();
-        flow.held_back = false;
         while !flow.claimed_all && flow.awaited.len() < sizes.destination_requests {
             // Without pipelining, the destination answers each request before
             // the next: hash a window only once the last has been used.
@@ -457,7 +463,6 @@ impl Worker {
                 flow.ahead
             };
             if held > 0 && held + window > sizes.ahead {
-                flow.held_back = true;
                 break;
             }
             let Some((start, end)) = self.claim_comparison_window(handle, window) else {
@@ -525,7 +530,7 @@ impl Worker {
     fn receive_compared_block(
         &mut self,
         job: &WorkerJob,
-        sizes: &mut Sizes,
+        sizes: &Sizes,
         flow: &mut Flow,
         credited: &mut u64,
     ) -> Result<()> {
@@ -536,20 +541,7 @@ impl Worker {
         // nothing about the link.
         let (waited, (response, started)) = match self.src.try_recv_with_arrival() {
             Some(queued) => (false, queued?),
-            None => {
-                // Waiting on a remote source with every hashed block asked
-                // about, while the look-ahead keeps the next window unhashed:
-                // it is too short for this link.
-                if sizes.adaptive
-                    && !sizes.source_answers_at_once
-                    && flow.held_back
-                    && flow.windows.front().is_none_or(|w| w.hashes.is_none())
-                {
-                    self.comparison.starved();
-                    sizes.ahead = self.comparison.ahead();
-                }
-                (!sizes.source_answers_at_once, self.src.recv_with_arrival()?)
-            }
+            None => (!sizes.source_answers_at_once, self.src.recv_with_arrival()?),
         };
         let arrived = Instant::now();
         let response = ok(response, "compare source block")?;

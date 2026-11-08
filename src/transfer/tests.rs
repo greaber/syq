@@ -6438,7 +6438,14 @@ fn adaptive_comparisons_flow_across_windows_within_the_look_ahead() {
             }
             assert_eq!(next, size, "{case}");
             if final_basis {
-                assert!(most <= worker.comparison.ahead(), "{case}: {most}");
+                // A pull may hold up to 32 MiB from the start; a push only its
+                // look-ahead, which may have grown while it waited for hashes.
+                let bound = if remote_source {
+                    32 << 20
+                } else {
+                    worker.comparison.ahead()
+                };
+                assert!(most <= bound, "{case}: {most}");
             }
             assert!(windows > 2, "{case}");
             // Requests continue past window boundaries: reuses to the
@@ -6677,32 +6684,40 @@ fn pulls_only_make_comparison_blocks_smaller_than_where_they_start() {
 }
 
 #[test]
-fn waiting_on_a_slow_source_with_the_look_ahead_used_up_looks_further_ahead() {
-    for (latency, ready, grows) in [(5, false, true), (0, true, false)] {
+fn only_pushes_start_with_a_short_look_ahead() {
+    for remote_source in [true, false] {
         let ahead = 4 << 10;
         let (mut worker, handle, _, src, dst) = adaptive_comparison(
             64 << 10,
             true,
-            true,
+            remote_source,
             std::time::Duration::ZERO,
             |_| true,
             super::comparing::ComparisonSizing::starting(512, ahead),
         );
-        {
-            let mut src = src.lock().unwrap();
-            src.latency = Some(std::time::Duration::from_millis(latency));
-            src.early_range_acks = ready;
-        }
-        // The destination's hashes and acknowledgments are always there.
+        // Every reply is there as soon as it is asked for.
+        src.lock().unwrap().early_range_acks = true;
         dst.lock().unwrap().early_range_acks = true;
-        let opts = Arc::get_mut(&mut worker.opts).unwrap();
-        opts.dst_remote = false;
         let mut credited = 0;
         worker.transfer_range(&handle, &mut credited).unwrap();
-        assert_eq!(
-            worker.comparison.ahead() > ahead,
-            grows,
-            "latency={latency} ready={ready}"
-        );
+        let (mut held, mut most) = (0u64, 0u64);
+        for request in &dst.lock().unwrap().requests {
+            match request {
+                Request::HashWindow { len, .. } => {
+                    held += u64::from(*len);
+                    most = most.max(held);
+                }
+                Request::ReuseComparedRange { len, .. } => held -= u64::from(*len),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // A pull hashes the whole 64 KiB ahead at once; a push no more than
+        // it starts with, since it never waited for hashes.
+        if remote_source {
+            assert_eq!(most, 64 << 10);
+        } else {
+            assert!(most <= ahead, "{most}");
+            assert_eq!(worker.comparison.ahead(), ahead);
+        }
     }
 }

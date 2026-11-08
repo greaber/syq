@@ -156,8 +156,8 @@ syq cp --srcs-in source --to host --into destination \
 Set `request-size` too, since it otherwise follows the comparison block size.
 In `syq rsync`, `-B` / `--block-size` sets the comparison block size. Setting
 any of `comparison-block-size`, `-B`, `request-size`, `pipeline-depth` or
-`split-min-size` fixes the comparison at the configured block, 4 MiB unless
-you set another.
+`split-min-size` fixes the comparison block: the configured one (4 MiB unless
+you set another), or `request-size` if that is smaller.
 
 ### Batch size and splitting
 
