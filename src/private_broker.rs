@@ -517,6 +517,9 @@ mod tests {
                 ])
                 .env(SIGNAL_CHILD, signal.to_string())
                 .env(SIGNAL_MARKER, &marker)
+                // A busy runner must not let the cleanup's cap end the
+                // child before the cleanup has run.
+                .env("SYQ_TEST_TERMINATION_CAP_MS", "10000")
                 // A directory a failed run leaves stays in this fixture.
                 .env("TMPDIR", temporary.path());
             let output = crate::process::capture_output_bounded(
