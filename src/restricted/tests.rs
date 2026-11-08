@@ -3223,7 +3223,10 @@ fn a_sources_share_holds_while_its_slots_change_hands() {
         }
     });
     assert!(most.load(Ordering::SeqCst) <= 3, "{most:?}");
-    assert!(taken.load(Ordering::SeqCst) >= 300, "{taken:?}");
+    // Each session tries every lock once and gives up, so how many attempts
+    // win depends on scheduling; a busy runner saw 244 of 2,400. The share is
+    // what this checks, so only require that sessions got slots at all.
+    assert!(taken.load(Ordering::SeqCst) > 0, "{taken:?}");
 
     // A session that opened a slot's file just before its holder released
     // it, and so locks the removed file, does not hold the slot: the next
