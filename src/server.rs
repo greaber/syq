@@ -232,7 +232,7 @@ impl Drop for SweepOnLoss {
 }
 
 /// Remove this process's unpublished sidecars, partials too short to resume
-/// included, before SIGINT or SIGTERM ends it. A local receiver shares the
+/// included, before SIGINT, SIGTERM or SIGHUP ends it. A local receiver shares the
 /// terminal's process group, so Ctrl-C reaches it directly; a remote one
 /// learns of an interrupted copy when its connection closes. This is best
 /// effort: a receiver that cannot listen for signals still copies.

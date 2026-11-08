@@ -1,4 +1,7 @@
-//! Work a process finishes before SIGINT or SIGTERM ends it.
+//! Work a process finishes before SIGINT, SIGTERM or SIGHUP ends it. A
+//! hang-up, as when the terminal or the SSH session with a terminal that
+//! started the process closes, ends it just as SIGTERM does, so it cleans up
+//! the same way.
 //!
 //! The first such signal runs every registered cleanup on a thread of its
 //! own: first those added with `add_first`, then the rest, each group in
@@ -157,7 +160,7 @@ pub(crate) fn wait_if_terminating() {
 fn listen() -> io::Result<()> {
     let result = LISTENING.get_or_init(|| {
         let mut signals = Vec::new();
-        for signal in [libc::SIGINT, libc::SIGTERM] {
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
             if !super::signals::inherited_is_ignored(signal)? {
                 signals.push(signal);
             }
@@ -233,7 +236,7 @@ fn terminate(signal: i32) -> ! {
         let _ = finished.recv_timeout(cap.saturating_sub(started.elapsed()));
     }
     let _ = signal_hook::low_level::emulate_default_handler(signal);
-    // Not reached: both signals end a process by default.
+    // Not reached: each of these signals ends a process by default.
     unsafe { libc::_exit(128 + signal) }
 }
 
@@ -278,7 +281,9 @@ mod tests {
         };
         let mut cleanups = Vec::new();
         match mode.as_str() {
-            "cleanup" | "inherited-ignore" => cleanups.push(add(mark("cleaned")).unwrap()),
+            "cleanup" | "hangup" | "inherited-ignore" | "inherited-ignore-hangup" => {
+                cleanups.push(add(mark("cleaned")).unwrap())
+            }
             "removed" => {
                 drop(add(mark("cleaned")).unwrap());
                 cleanups.push(add(|_| {}).unwrap());
@@ -323,6 +328,14 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(200));
                 raise(libc::SIGTERM);
             }
+            // A hang-up the process inherited as ignored, as under nohup,
+            // stays ignored.
+            "inherited-ignore-hangup" => {
+                raise(libc::SIGHUP);
+                std::thread::sleep(Duration::from_millis(200));
+                raise(libc::SIGTERM);
+            }
+            "hangup" => raise(libc::SIGHUP),
             "repeated" => {
                 // A second interrupt does not cut the cleanup short.
                 raise(libc::SIGINT);
@@ -352,6 +365,15 @@ mod tests {
                 false,
             ),
             ("removed", Signal(libc::SIGTERM), None, None, false),
+            // A hang-up cleans up as SIGTERM does.
+            ("hangup", Signal(libc::SIGHUP), Some("cleaned"), None, false),
+            (
+                "inherited-ignore-hangup",
+                Signal(libc::SIGTERM),
+                Some("cleaned"),
+                None,
+                false,
+            ),
             (
                 "inherited-ignore",
                 Signal(libc::SIGTERM),
@@ -417,11 +439,16 @@ mod tests {
             if refused {
                 command.env("SYQ_TEST_REFUSE_TERMINATION_THREADS", "1");
             }
-            if mode == "inherited-ignore" {
+            let ignored = match mode {
+                "inherited-ignore" => Some(libc::SIGINT),
+                "inherited-ignore-hangup" => Some(libc::SIGHUP),
+                _ => None,
+            };
+            if let Some(signal) = ignored {
                 use std::os::unix::process::CommandExt;
                 unsafe {
-                    command.pre_exec(|| {
-                        if libc::signal(libc::SIGINT, libc::SIG_IGN) == libc::SIG_ERR {
+                    command.pre_exec(move || {
+                        if libc::signal(signal, libc::SIG_IGN) == libc::SIG_ERR {
                             return Err(io::Error::last_os_error());
                         }
                         Ok(())

@@ -109,7 +109,7 @@ impl Source {
                     anyhow::ensure!(leaf.metadata().is_fifo(), "pipe source is not a FIFO");
                     let (parent, name, expected, _object) = leaf.into_parts();
                     // This owned open waits for a writer. It runs outside the async
-                    // executor so SIGINT/SIGTERM can still cancel a quiet FIFO.
+                    // executor so a termination signal can still cancel a quiet FIFO.
                     let number = unsafe {
                         libc::openat(
                             parent.as_raw_fd(),

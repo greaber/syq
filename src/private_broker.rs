@@ -479,6 +479,69 @@ impl Write for TrackedStream {
 mod tests {
     use super::*;
 
+    const SIGNAL_CHILD: &str = "SYQ_TEST_SIGNAL_CLEANED_DIR";
+    const SIGNAL_MARKER: &str = "SYQ_TEST_SIGNAL_CLEANED_DIR_MARKER";
+
+    /// The child of `a_signal_cleaned_dir_goes_when_a_termination_signal_ends_the_process`:
+    /// it makes a directory as a coordinator does for its entry key, names
+    /// it in the marker, and raises the signal it was given.
+    #[test]
+    fn signal_cleaned_dir_subprocess() {
+        let Ok(signal) = std::env::var(SIGNAL_CHILD) else {
+            return;
+        };
+        let directory = SignalCleanedDir::new("syq-signal-cleanup-test-").unwrap();
+        std::fs::write(directory.path().join("entry-key"), b"key").unwrap();
+        let marker = std::env::var_os(SIGNAL_MARKER).unwrap();
+        std::fs::write(&marker, directory.path().as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::raise(signal.parse().unwrap()) }, 0);
+        std::thread::sleep(Duration::from_secs(30));
+        panic!("the signal did not end the process");
+    }
+
+    /// A coordinator's private directory, which holds the entry key, goes
+    /// when SIGTERM, SIGINT or a hang-up ends the process, which still ends
+    /// by that signal.
+    #[test]
+    fn a_signal_cleaned_dir_goes_when_a_termination_signal_ends_the_process() {
+        use std::os::unix::process::ExitStatusExt;
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            let temporary = crate::test_support::tempdir().unwrap();
+            let marker = temporary.path().join("directory");
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "private_broker::tests::signal_cleaned_dir_subprocess",
+                    "--nocapture",
+                ])
+                .env(SIGNAL_CHILD, signal.to_string())
+                .env(SIGNAL_MARKER, &marker)
+                // A directory a failed run leaves stays in this fixture.
+                .env("TMPDIR", temporary.path());
+            let output = crate::process::capture_output_bounded(
+                &mut command,
+                std::time::Instant::now() + Duration::from_secs(20),
+                &|| false,
+                64 * 1024,
+            )
+            .unwrap();
+            let context = format!(
+                "signal {signal}: status={:?}, stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.status.signal(), Some(signal), "{context}");
+            let directory = PathBuf::from(std::fs::read_to_string(&marker).unwrap());
+            assert!(directory.is_absolute(), "{context}");
+            assert!(
+                !directory.exists(),
+                "{context}: {} remains",
+                directory.display()
+            );
+        }
+    }
+
     #[test]
     fn private_temp_dir_is_created_owner_only() {
         let directory = private_temp_dir("syq-test-").unwrap();
