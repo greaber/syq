@@ -486,11 +486,11 @@ impl Receiver {
                 caps,
                 accounts: forward::Accounts::Source(source.setup(&policy)),
                 results_key: None,
-                via: (
+                via: Some((
                     self.server_user.clone(),
                     self.tcp_peer.host.clone(),
                     self.tcp_peer.port,
-                ),
+                )),
                 allow_enrollment: !args.dry_run,
             },
             budget,

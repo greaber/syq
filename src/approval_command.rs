@@ -113,6 +113,25 @@ pub(crate) fn check_authorizer(command: &[Vec<u8>], receiver: &str) -> Result<()
     Ok(())
 }
 
+/// Validate the authorizer chosen on the requesting host when an SSH
+/// authorization provider approves its copy. The command names the provider
+/// by an address that only the requester's SSH configuration resolves, so
+/// the provider cannot check it is the one named; an omitted or `auto` flag
+/// can select it by a saved choice. It must not name a receiving machine or
+/// the requester's own SSH access.
+pub(crate) fn check_provider_authorizer(command: &[Vec<u8>]) -> Result<()> {
+    let args = parse(command)?;
+    anyhow::ensure!(
+        matches!(
+            args.auth_from,
+            crate::cli::AuthFrom::Auto
+                | crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Ssh { .. })
+        ),
+        "the requesting command authorizes from a different machine"
+    );
+    Ok(())
+}
+
 /// Storage authorization. The server may take the endpoint from its
 /// environment when the command does not name one. A pathname source is a
 /// stream upload when it is a pipe on the server, so either reading matches.

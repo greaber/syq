@@ -332,16 +332,8 @@ pub(crate) fn copy(
     }
     let selection = select_copy(args, Some(progress))?;
     if let Some(selection) = &selection {
-        if !matches!(selection.kind, Kind::Pull | Kind::Send)
-            && (args.hardlinks
-                || args.acls
-                || args.xattrs
-                || args.atimes > 0
-                || args.crtimes
-                || args.open_noatime
-                || args.sparse)
-        {
-            bail!("hardlink, ACL, xattr, access-time and birth-time preservation, no-atime reads and sparse allocation are not supported by named or receiving destinations");
+        if !matches!(selection.kind, Kind::Pull | Kind::Send) {
+            refuse_unsupported_preservation(args)?;
         }
         maybe_exec(selection, args.quiet)?;
     } else if ACCEPTED
@@ -354,6 +346,22 @@ pub(crate) fn copy(
     // a different authorizer after output files or stdin have been consumed.
     args.return_selection = Some(selection);
     finish_account_preflight();
+    Ok(())
+}
+
+/// Refuse what a copy a receiving machine or provider approves cannot
+/// preserve or do, except a download or a copy of the approver's own files.
+pub(super) fn refuse_unsupported_preservation(args: &crate::cli::Args) -> Result<()> {
+    if args.hardlinks
+        || args.acls
+        || args.xattrs
+        || args.atimes > 0
+        || args.crtimes
+        || args.open_noatime
+        || args.sparse
+    {
+        bail!("hardlink, ACL, xattr, access-time and birth-time preservation, no-atime reads and sparse allocation are not supported by named or receiving destinations");
+    }
     Ok(())
 }
 

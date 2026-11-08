@@ -98,7 +98,9 @@ Your laptop asks once. The first copy sets up restricted copying on both
 servers, as a copy started on your laptop does. HostB then runs the copy and
 sends file data directly to hostC; the server you started it on gets no other
 access to either account. The copy stops if you interrupt the command, and it
-needs nothing more from your laptop once it starts. See
+needs nothing more from your laptop once it starts. An
+[SSH authorization provider](receive.md#use-an-ssh-authorization-provider)
+can approve it instead, with `--auth-from` and the provider's SSH address. See
 [Copies between two other servers](remote-reference.md#copies-between-two-other-servers)
 for requirements.
 

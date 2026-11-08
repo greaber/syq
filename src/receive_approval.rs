@@ -89,11 +89,39 @@ impl Kind {
 pub(crate) struct Requester {
     pub server: String,
     pub profile: String,
+    /// For a login to this SSH authorization provider, the provider's own
+    /// account. The provider cannot tell which server made the login, so
+    /// `server` names only the account.
+    pub provider_account: Option<String>,
+}
+impl Requester {
+    /// A login to this SSH authorization provider's account `user`, on
+    /// receiving profile `profile`.
+    pub(crate) fn provider_login(user: &str, profile: &str) -> Self {
+        Self {
+            server: format!("a server logged in to provider account {user}"),
+            profile: profile.into(),
+            provider_account: Some(user.into()),
+        }
+    }
 }
 impl std::fmt::Display for Requester {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} (receiving profile @{})", self.server, self.profile)
+        // As a provider's account-access prompts name it.
+        let kind = match self.provider_account {
+            Some(_) => "provider",
+            None => "receiving",
+        };
+        write!(f, "{} ({kind} profile @{})", self.server, self.profile)
     }
+}
+
+/// What a prompt for a request through an SSH authorization provider says
+/// about who asks: the provider knows only that a login to `account` sent it.
+fn unconfirmed_requester(account: &str) -> String {
+    format!(
+        "syq can't confirm which server is asking: any machine that can log in to provider account {account} over SSH can send this request. Only the login that sent it receives what approving it signs"
+    )
 }
 
 /// The other server a copy approved here goes to, and what approving it
@@ -385,6 +413,14 @@ impl Summary {
                     .to_owned(),
             );
         }
+        // Who asks comes first, in the prompt and in the permission that
+        // `persist receive pending` shows, which has no notes.
+        let unconfirmed = from.provider_account.as_deref().map(unconfirmed_requester);
+        let permission = match &unconfirmed {
+            Some(unconfirmed) => format!("{unconfirmed}. {permission}"),
+            None => permission,
+        };
+        notes.splice(0..0, unconfirmed);
         if let Some(server) = &source_server {
             if let Some(port) = server.port {
                 notes.push(format!("the source's SSH port is {port}"));
@@ -2023,6 +2059,7 @@ mod tests {
         Requester {
             server: "server".into(),
             profile: "laptop".into(),
+            provider_account: None,
         }
     }
     fn copy_request(path: &std::path::Path) -> crate::destination::CopyRequest {

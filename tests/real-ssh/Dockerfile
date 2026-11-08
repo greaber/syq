@@ -110,6 +110,7 @@ COPY tests/real-ssh/test-return-ssh.py /usr/local/libexec/syq-test-return-ssh.py
 COPY tests/real-ssh/test-ssh-tools.py /usr/local/libexec/syq-test-ssh-tools.py
 COPY tests/real-ssh/test-provider-ssh.py /usr/local/libexec/syq-test-provider-ssh.py
 COPY tests/real-ssh/test-between-servers.py /usr/local/libexec/syq-test-between-servers.py
+COPY tests/real-ssh/test-provider-between-servers.py /usr/local/libexec/syq-test-provider-between-servers.py
 COPY tests/real-ssh/test-account-switch.py /usr/local/libexec/syq-test-account-switch.py
 
 COPY tests/real-ssh/test-receive-profiles.py /usr/local/libexec/syq-test-receive-profiles.py
