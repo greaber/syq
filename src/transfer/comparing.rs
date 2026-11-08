@@ -244,6 +244,19 @@ struct Flow {
 }
 
 impl Worker {
+    /// The largest block an automatic comparison uses: the configured one,
+    /// but in a pull no more than the starting block. A pull's replies can
+    /// wait in this machine's buffers before they are read, so the rate it
+    /// measures may only make blocks smaller.
+    fn adaptive_ceiling(&self) -> u64 {
+        let configured = self.opts.block.min(self.transfer_block());
+        if self.opts.src_remote && !self.opts.dst_remote {
+            configured.min(START_BLOCK)
+        } else {
+            configured
+        }
+    }
+
     fn comparison_sizes(&self) -> Sizes {
         let configured = self.opts.block.min(self.transfer_block());
         let src_pipelines = self.src.supports_request_pipelining();
@@ -268,7 +281,7 @@ impl Worker {
                 source_answers_at_once: !src_pipelines,
             };
         }
-        let block = self.comparison.block(configured);
+        let block = self.comparison.block(self.adaptive_ceiling());
         let queue = |conn: &dyn Conn| {
             conn.reply_queue()
                 .unwrap_or(crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH)
@@ -415,7 +428,7 @@ impl Worker {
         sizes: &Sizes,
         flow: &mut Flow,
     ) -> Result<()> {
-        let ceiling = self.opts.block.min(self.transfer_block());
+        let ceiling = self.adaptive_ceiling();
         while !flow.claimed_all && flow.awaited.len() < sizes.destination_requests {
             // Without pipelining, the destination answers each request before
             // the next: hash a window only once the last has been used.
@@ -585,7 +598,7 @@ impl Worker {
         flow.retained = flow.retained.saturating_sub(read.len);
         if sizes.adaptive {
             // Windows of a range adjoin, so a run continues across them.
-            let ceiling = self.opts.block.min(self.transfer_block());
+            let ceiling = self.adaptive_ceiling();
             let run = u64::from(differs && flow.differing_end != Some(read.off));
             self.comparison.compared(read.len, run, ceiling);
         }

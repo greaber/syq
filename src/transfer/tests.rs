@@ -6626,3 +6626,38 @@ fn a_run_of_differing_blocks_continues_across_windows() {
     worker.transfer_range(&handle, &mut credited).unwrap();
     assert_eq!(worker.comparison.runs(), 3.0);
 }
+
+#[test]
+fn pulls_only_make_comparison_blocks_smaller_than_where_they_start() {
+    for (remote_source, largest) in [(true, 256u64 << 10), (false, 4 << 20)] {
+        // Measurements that would choose the whole configured block.
+        let (mut worker, handle, _, _, dst) = adaptive_comparison(
+            32 << 20,
+            true,
+            remote_source,
+            std::time::Duration::ZERO,
+            |_| true,
+            super::comparing::ComparisonSizing::starting(4 << 20, 8 << 20),
+        );
+        let opts = Arc::get_mut(&mut worker.opts).unwrap();
+        opts.block = 4 << 20;
+        opts.dst_remote = !remote_source;
+        let mut credited = 0;
+        worker.transfer_range(&handle, &mut credited).unwrap();
+        let blocks: Vec<u64> = dst
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter_map(|r| match r {
+                Request::HashWindow { block, .. } => Some(*block),
+                _ => None,
+            })
+            .collect();
+        assert!(!blocks.is_empty());
+        assert!(
+            blocks.iter().all(|block| *block == largest),
+            "remote={remote_source}: {blocks:?}"
+        );
+    }
+}
