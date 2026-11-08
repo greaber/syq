@@ -1091,16 +1091,20 @@ fn start(domain: &Domain, request: SessionRequest, plan: resolution::Plan) -> Re
     };
     let signals = foreground::Signals::new()?;
     let (mut parent, child) = crate::process::with_inheritance_guard(UnixStream::pair)?;
-    let mut process = crate::process::self_command()?;
+    let mut command = crate::process::self_command()?;
     use std::os::unix::process::CommandExt as _;
-    process
+    command
         .arg(INTERNAL)
         .process_group(0)
         .stdin(Stdio::from(File::from(OwnedFd::from(child.try_clone()?))))
         .stdout(Stdio::from(File::from(OwnedFd::from(child))))
         .stderr(Stdio::null());
-    protect_keeper_inheritance(&mut process)?;
-    let mut process = Starting(Some(process.spawn_guarded()?));
+    protect_keeper_inheritance(&mut command)?;
+    let mut process = Starting(Some(command.spawn_guarded()?));
+    // The command holds this process's copy of the keeper's end. Close it so
+    // the reader below sees the keeper's end close when the keeper is
+    // stopped; otherwise an interrupted wait never returns.
+    drop(command);
     super::super::write_message(&mut parent, &startup)?;
     let (sender, receiver) = std::sync::mpsc::sync_channel(2);
     let reader = std::thread::spawn(move || loop {
@@ -1156,6 +1160,8 @@ fn start(domain: &Domain, request: SessionRequest, plan: resolution::Plan) -> Re
         });
     }
     drop(process);
+    // A reader with messages nobody receives must not block on the channel.
+    drop(receiver);
     let _ = reader.join();
     result?.map_err(anyhow::Error::msg)?;
     Ok(())

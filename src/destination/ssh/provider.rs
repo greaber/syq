@@ -722,6 +722,9 @@ fn launch_keeper(
         });
     }
     let mut process = Starting(Some(command.spawn_guarded()?));
+    // Close this process's copy of the keeper's end, so a keeper that ends
+    // without replying ends the read below at once.
+    drop(command);
     write_message(
         &mut parent,
         &Startup {

@@ -781,6 +781,7 @@ fn install_over_route(
         let arch = read_enrollment_line(&mut stdout)?;
         let home = read_enrollment_line(&mut stdout)?;
         let uid = read_enrollment_line(&mut stdout)?;
+        let name = read_enrollment_line(&mut stdout)?;
         let config_home = read_enrollment_line(&mut stdout)?;
         let runtime_dir = read_enrollment_line(&mut stdout)?;
         let tmpdir = read_enrollment_line(&mut stdout)?;
@@ -799,10 +800,10 @@ fn install_over_route(
         }
         let mut authorized = vec![0u8; length];
         stdout.read_exact(&mut authorized)?;
-        Ok((os, arch, home, receiving, stored, authorized, uid))
+        Ok((os, arch, home, receiving, stored, authorized, (uid, name)))
     })();
     drop(foreground);
-    let (os, arch, home, receiving, stored, authorized, uid) = match platform {
+    let (os, arch, home, receiving, stored, authorized, (uid, name)) = match platform {
         Ok(platform) => platform,
         Err(error) => {
             drop(input);
@@ -834,6 +835,35 @@ fn install_over_route(
         // A copy the receiver would refuse leaves no enrollment.
         if let Some(check) = check {
             check(Path::new(&home), &receiving, &uid)?;
+        }
+        // The server knows the account by the name it gives the user ID,
+        // which its receiver and every directive name. Another name for the
+        // same user ID, such as `toor` for root, cannot enroll.
+        if name != login {
+            let given = endpoint(login, host, port)?.label();
+            let mut message = match endpoint(&name, host, port) {
+                _ if name.is_empty() => format!("{given} logs in with user ID {uid}, which has no account name on that server; restricted copying needs one"),
+                Ok(named) => format!("{given} logs in as user ID {uid}, which that server calls {name}; restricted copying works only under that name, so use {} instead", named.label()),
+                Err(_) => format!("{given} logs in as user ID {uid}, which that server calls {name}; restricted copying works only under that name"),
+            };
+            // Earlier builds stored the entry key before the server refused
+            // this name, which it does before changing anything, and `syq
+            // receiver revoke` refuses it the same way: nothing on the
+            // server uses that pending enrollment, so it goes. Without a
+            // name, as while the server's account lookup fails, an earlier
+            // attempt may have installed it, so it stays.
+            if !name.is_empty()
+                && plan.entry_key.is_some()
+                && !plan.refresh
+                && plan.replaces.is_none()
+            {
+                remove_local_enrollment(&plan.directory)?;
+                message.push_str(&format!(
+                    "; removed enrollment {}, which an earlier attempt left pending",
+                    plan.id
+                ));
+            }
+            bail!(message);
         }
         let trace =
             fs::read_to_string(&trace_path).context("read enrollment SSH authentication trace")?;
@@ -984,7 +1014,7 @@ fn install_over_route(
 }
 
 /// The enrollment session's commands, for `sh`. The greeting reports the
-/// platform, where the account keeps syq's state, the platforms the store
+/// platform, the account's user ID and name, where it keeps syq's state, the platforms the store
 /// has this build for, and `authorized_keys`. The session then reads the
 /// request and, when the enrolling machine offers a stored build, its
 /// platform and the SHA-256 of the build that machine would install. It
@@ -1007,7 +1037,7 @@ pub(super) fn install_remote_command(stage: &str) -> String {
         "set -eu".to_owned(),
         "uname -s".to_owned(),
         "uname -m".to_owned(),
-        "printf '%s\\n' \"$HOME\" \"$(id -u)\" \"${XDG_CONFIG_HOME-}\" \"${XDG_RUNTIME_DIR-}\" \"${TMPDIR-}\"".to_owned(),
+        "printf '%s\\n' \"$HOME\" \"$(id -u)\" \"$(id -un)\" \"${XDG_CONFIG_HOME-}\" \"${XDG_RUNTIME_DIR-}\" \"${TMPDIR-}\"".to_owned(),
         format!(
             "r=\"$HOME/{store}\"; s=\"$r/\"{build}",
             store = crate::user_dirs::BINARY_STORE_IN_HOME,
