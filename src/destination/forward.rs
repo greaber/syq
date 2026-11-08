@@ -313,7 +313,7 @@ impl Approving {
                 Ok(reply)
             }
             Self::Provider(provider) => crate::auth_from::selected_context(
-                ask_provider(args, provider, request, Instant::now() + timeout),
+                ask_provider(args, provider, request, timeout),
                 &args.auth_from,
                 args.auth_from_explicit,
             ),
@@ -322,12 +322,13 @@ impl Approving {
 }
 
 /// Ask `provider`, over this machine's login to it, to approve a copy
-/// between two servers.
+/// between two servers, and wait `timeout` for its reply once it has the
+/// request: logging in to the provider first does not shorten its wait.
 fn ask_provider(
     args: &crate::cli::Args,
     provider: &crate::auth_from::Provider,
     request: ForwardRequest,
-    deadline: Instant,
+    timeout: Duration,
 ) -> Result<Reply> {
     let domain = crate::persistence::Domain::select(args.pscope.as_deref())?;
     let binding = super::ssh::provider::resolve_connection(&domain, provider)?;
@@ -339,7 +340,7 @@ fn ask_provider(
     )?;
     let reply = read_message(&mut super::DeadlineSocket {
         socket: &mut stream,
-        deadline,
+        deadline: Instant::now() + timeout,
     })?;
     // The copy needs nothing more from the provider.
     drop(stream);
