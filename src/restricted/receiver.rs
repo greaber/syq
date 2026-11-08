@@ -1,5 +1,6 @@
 use super::*;
 use std::os::fd::AsFd;
+use std::os::unix::fs::FileExt as _;
 use std::time::Duration;
 
 /// The enrollment's state directory and its configuration, for the account
@@ -18,23 +19,46 @@ fn receiver_state(id: EnrollmentId) -> Result<(PathBuf, ReceiverEnrollment)> {
 
 /// How many sessions an entry key may have open on one enrollment before
 /// they have shown a verified directive or a running copy's worker ticket.
-/// Former coordinators keep the entry key, so this bounds what they can start
-/// without a fresh directive. A coordinator sets up at most this many
-/// workers at once, so one copy's workers never take more slots than there
-/// are; a worker refused when several copies start at once is retried by its
-/// coordinator.
+/// A server that ran an earlier copy may still hold the entry key, so this
+/// bounds what it can start without a fresh directive: each such session
+/// holds at most one first frame ([`MAX_ADMISSION_BYTES`]) for at most
+/// [`ADMISSION_TIMEOUT`] before its signature is checked. A coordinator
+/// sets up at most this many workers at once; a worker refused for a slot is
+/// retried by its coordinator.
 const UNVERIFIED_SESSIONS: usize = crate::conn::MAX_CONCURRENT_CONNECTS;
+/// How many of those sessions may come from one source (see
+/// [`session_source`]) at once, so that one lingering holder of the entry
+/// key cannot take them all: half. While one source holds its share, any
+/// other source can still start as many sessions as that holder has, and a
+/// smaller share would leave a coordinator, itself one source, fewer than
+/// the rest. A coordinator whose own workers are refused retries them, and
+/// its first refusal halves how many it starts at once, to this share.
+const UNVERIFIED_SESSIONS_PER_SOURCE: usize = UNVERIFIED_SESSIONS / 2;
 /// How long a session has to send its first frame.
 const ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
+/// The longest worker ticket (`ssh::ticket_parts`) and results token
+/// (`destination_results::relay::valid_token`) a frame may carry.
+pub(super) const MAX_TICKET_BYTES: usize = 128;
+pub(super) const MAX_TOKEN_BYTES: usize = 64;
 /// The largest first frame a session may send: a coordinating source's two
-/// directives and the destination's entry key.
-const MAX_ADMISSION_BYTES: usize =
-    2 * crate::directive::MAX_SIGNED_BYTES + crate::remote_to_remote::MAX_ENTRY_KEY_BYTES + 1024;
+/// signed directives, the destination's entry key, its token and width, and
+/// the frame's kind and field lengths.
+pub(super) const MAX_ADMISSION_BYTES: usize = 1
+    + 5 * 4
+    + 2 * crate::directive::MAX_SIGNED_BYTES
+    + crate::remote_to_remote::MAX_ENTRY_KEY_BYTES
+    + MAX_TOKEN_BYTES
+    + 2;
+
+/// The kinds of first frame.
+pub(super) const COPY_FRAME: u8 = 1;
+const WORKER_FRAME: u8 = 2;
+const COORDINATE_FRAME: u8 = 3;
 
 /// The first frame of every session an entry key starts, before any other
 /// byte. The command a client asks sshd for is only data: the line's forced
 /// command runs whatever it asked.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Admission {
     /// Start a copy with this signed directive.
     Copy(Vec<u8>),
@@ -48,7 +72,7 @@ pub(crate) enum Admission {
 /// A copy between two servers that this account's receiver coordinates.
 /// After the frame, the session's input carries the requester's marker, and
 /// then nothing more until the requester ends.
-#[derive(PartialEq, Eq, Serialize, Deserialize)]
+#[derive(PartialEq, Eq)]
 pub(crate) struct Coordinate {
     /// This enrollment's signed directive.
     pub source: Vec<u8>,
@@ -76,21 +100,48 @@ impl fmt::Debug for Coordinate {
 }
 
 impl Admission {
-    /// The frame: a 4-byte big-endian length, then the postcard encoding.
-    /// A coordinating source's frame carries an entry key; the caller wipes
-    /// the frame, and the encoding is wiped here.
+    /// The frame: a 4-byte big-endian length of the rest; the kind, one
+    /// byte; then each field as a 4-byte big-endian length and its bytes. A
+    /// coordinating source's frame carries an entry key, so it is built in
+    /// one allocation, which the caller wipes.
     pub(crate) fn frame(&self) -> Result<Vec<u8>> {
-        let body = zeroize::Zeroizing::new(
-            postcard::to_stdvec(self).context("encode the admission frame")?,
-        );
-        if body.len() > MAX_ADMISSION_BYTES {
+        let width;
+        let (kind, fields): (u8, Vec<&[u8]>) = match self {
+            Self::Copy(directive) => (COPY_FRAME, vec![directive]),
+            Self::Worker(ticket) => (WORKER_FRAME, vec![ticket.as_bytes()]),
+            Self::Coordinate(frame) => {
+                width = frame.progress_width.map(u16::to_be_bytes);
+                (
+                    COORDINATE_FRAME,
+                    vec![
+                        &frame.source,
+                        &frame.destination,
+                        &frame.entry_key,
+                        frame.results_token.as_bytes(),
+                        width.as_ref().map_or(&[][..], |width| width.as_slice()),
+                    ],
+                )
+            }
+        };
+        let length = 1 + fields.iter().map(|field| 4 + field.len()).sum::<usize>();
+        if length > MAX_ADMISSION_BYTES {
             bail!("the admission frame exceeds its size limit");
         }
-        Ok([(body.len() as u32).to_be_bytes().as_slice(), &body].concat())
+        let mut out = Vec::with_capacity(4 + length);
+        out.extend_from_slice(&(length as u32).to_be_bytes());
+        out.push(kind);
+        for field in fields {
+            out.extend_from_slice(&(field.len() as u32).to_be_bytes());
+            out.extend_from_slice(field);
+        }
+        Ok(out)
     }
 
     /// Read exactly one frame from `input` by `deadline`, and nothing after
-    /// it: what follows belongs to the session.
+    /// it: what follows belongs to the session. Nothing in the frame is
+    /// interpreted here: each field is read into a buffer of its own,
+    /// bounded by its kind and by the frame's length, so a session holds at
+    /// most one frame's bytes until its directive's signature is checked.
     pub(super) fn read(
         input: &mut (impl Read + std::os::fd::AsRawFd),
         deadline: Instant,
@@ -108,67 +159,209 @@ impl Admission {
         if length == 0 || length > MAX_ADMISSION_BYTES {
             bail!("the session's first frame has an unsupported length");
         }
-        // It can carry an entry key, wiped once decoded.
-        let mut body = zeroize::Zeroizing::new(vec![0; length]);
-        input
-            .read_exact(&mut body)
-            .context("read the session's first frame")?;
-        let (admission, rest): (Self, &[u8]) =
-            postcard::take_from_bytes(&body).context("decode the session's first frame")?;
-        if !rest.is_empty() {
+        let mut frame = FrameFields {
+            input: &mut input,
+            remaining: length,
+        };
+        let mut kind = [0u8];
+        frame.read(&mut kind)?;
+        let signed = crate::directive::MAX_SIGNED_BYTES;
+        let admission = match kind[0] {
+            COPY_FRAME => Self::Copy(frame.field(signed)?),
+            WORKER_FRAME => Self::Worker(text(frame.field(MAX_TICKET_BYTES)?)?),
+            COORDINATE_FRAME => {
+                let source = frame.field(signed)?;
+                let destination = frame.field(signed)?;
+                // Wiped if the rest of the frame is refused.
+                let mut entry_key = zeroize::Zeroizing::new(
+                    frame.field(crate::remote_to_remote::MAX_ENTRY_KEY_BYTES)?,
+                );
+                let results_token = text(frame.field(MAX_TOKEN_BYTES)?)?;
+                let progress_width = match frame.field(2)?.as_slice() {
+                    [] => None,
+                    [high, low] => Some(u16::from_be_bytes([*high, *low])),
+                    _ => bail!("the session's first frame is malformed"),
+                };
+                Self::Coordinate(Box::new(Coordinate {
+                    source,
+                    destination,
+                    entry_key: std::mem::take(&mut *entry_key),
+                    results_token,
+                    progress_width,
+                }))
+            }
+            _ => bail!("the session's first frame is malformed"),
+        };
+        if frame.remaining != 0 {
             bail!("the session's first frame has trailing bytes");
         }
         Ok(admission)
     }
 }
 
+/// The rest of a first frame, `remaining` bytes of `input`.
+struct FrameFields<'a, R> {
+    input: &'a mut R,
+    remaining: usize,
+}
+
+impl<R: Read> FrameFields<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> Result<()> {
+        if buffer.len() > self.remaining {
+            bail!("the session's first frame is malformed");
+        }
+        self.input
+            .read_exact(buffer)
+            .context("read the session's first frame")?;
+        self.remaining -= buffer.len();
+        Ok(())
+    }
+
+    /// One field of at most `maximum` bytes. A field cut short is wiped: it
+    /// may be part of an entry key.
+    fn field(&mut self, maximum: usize) -> Result<Vec<u8>> {
+        let mut length = [0u8; 4];
+        self.read(&mut length)?;
+        let length = u32::from_be_bytes(length) as usize;
+        if length > maximum || length > self.remaining {
+            bail!("the session's first frame is malformed");
+        }
+        let mut field = zeroize::Zeroizing::new(vec![0; length]);
+        self.read(&mut field)?;
+        Ok(std::mem::take(&mut *field))
+    }
+}
+
+fn text(field: Vec<u8>) -> Result<String> {
+    String::from_utf8(field).map_err(|_| anyhow!("the session's first frame is malformed"))
+}
+
+/// Where a session comes from, for its share of the unverified-session
+/// slots, from `SSH_CONNECTION`, which sshd sets after anything the client
+/// sends: an IPv4 address, or an IPv6 address's /64 network, since one host
+/// can usually use any address in its /64. A session with no address syq
+/// can read counts as one unknown source.
+pub(super) fn session_source(connection: Option<&str>) -> String {
+    use std::net::{IpAddr, Ipv6Addr};
+    let address = connection
+        .and_then(|connection| connection.split_whitespace().next())
+        // A link-local address names its interface after a `%`.
+        .and_then(|address| address.split('%').next())
+        .and_then(|address| address.parse::<IpAddr>().ok());
+    match address.map(|address| address.to_canonical()) {
+        Some(IpAddr::V4(address)) => address.to_string(),
+        Some(IpAddr::V6(address)) => {
+            let [a, b, c, d, ..] = address.segments();
+            format!("{}/64", Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
+        }
+        None => UNKNOWN_SOURCE.to_owned(),
+    }
+}
+
+pub(super) const UNKNOWN_SOURCE: &str = "unknown";
+
 /// One of the enrollment's slots for sessions that have not been verified
-/// yet: a lock on one of the files `session-slot-N` in its state directory.
-/// Dropping it closes the file, which releases the lock, as exiting does.
+/// yet: a lock on one of the files `session-slot-N` in its state directory,
+/// which names the session's source. Dropping it closes the file, which
+/// releases the lock, as exiting does.
 pub(super) struct UnverifiedSlot(#[allow(dead_code)] File);
 
 impl UnverifiedSlot {
-    /// Take a free slot of the `slots`, or refuse the session at once when
-    /// there is none. No session waits for a slot, so no more than `slots`
-    /// unverified sessions run.
-    pub(super) fn take(state: &Path, slots: usize) -> Result<Self> {
+    /// Take a free slot of the `slots` for a session from `source`, or
+    /// refuse the session at once when there is none or `source` already
+    /// holds `per_source` of them. No session waits for a slot, so no more
+    /// than `slots` unverified sessions run, and no more than `per_source`
+    /// from one source.
+    pub(super) fn take(
+        state: &Path,
+        (slots, per_source): (usize, usize),
+        source: &str,
+    ) -> Result<Self> {
+        // Slots are taken, and their sources read, only under this lock, so
+        // two sessions from one source cannot both miss each other. It is
+        // held only for this, never while reading from a session.
+        let guard = open_slot_file(&state.join("session-slots-lock"))?;
+        lock_slot_file(&guard, false)?;
+        let mut free = None;
+        let mut from_source = 0;
         for slot in 0..slots {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(state.join(format!("session-slot-{slot}")))
-                .context("open the enrollment's session slots")?;
-            let metadata = file.metadata()?;
-            if !metadata.is_file()
-                || metadata.nlink() != 1
-                || metadata.uid() != unsafe { libc::geteuid() }
-                || metadata.mode() & 0o7777 != 0o600
-            {
-                bail!(
-                    "the enrollment's session slots must be private, singly linked regular files"
-                );
+            let file = open_slot_file(&state.join(format!("session-slot-{slot}")))?;
+            if lock_slot_file(&file, true)? {
+                // The first free slot stays locked; other free ones unlock
+                // as they close.
+                free.get_or_insert(file);
+                continue;
             }
-            loop {
-                // SAFETY: the descriptor stays open for the call.
-                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                    return Ok(Self(file));
-                }
-                let error = std::io::Error::last_os_error();
-                match error.kind() {
-                    std::io::ErrorKind::Interrupted => {}
-                    std::io::ErrorKind::WouldBlock => break,
-                    _ => return Err(error).context("lock a session slot"),
-                }
-            }
+            // A slot is locked only while its session runs, and names its
+            // source from before this lock was released.
+            let mut held = [0u8; 64];
+            let length = file.read_at(&mut held, 0).context("read a session slot")?;
+            from_source += usize::from(&held[..length] == source.as_bytes());
         }
-        Err(SessionsFull(format!(
-            "{slots} other connections are starting copies on this enrollment; try again shortly, or replace its entry key with `syq receiver revoke` and enroll again if this persists"
-        ))
-        .into())
+        let label = if source == UNKNOWN_SOURCE {
+            "an unknown address"
+        } else {
+            source
+        };
+        let retry = "try again shortly, or replace its entry key with `syq receiver revoke` and enroll again if this persists";
+        if from_source >= per_source {
+            return Err(SessionsFull(format!(
+                "{from_source} other connections from {label} are starting copies on this enrollment; {retry}"
+            ))
+            .into());
+        }
+        let Some(file) = free else {
+            return Err(SessionsFull(format!(
+                "{slots} other connections are starting copies on this enrollment; {retry}"
+            ))
+            .into());
+        };
+        file.set_len(0).context("name a session slot's source")?;
+        file.write_all_at(source.as_bytes(), 0)
+            .context("name a session slot's source")?;
+        drop(guard);
+        Ok(Self(file))
+    }
+}
+
+/// Open one of the enrollment's private slot files, creating it on first
+/// use.
+fn open_slot_file(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .context("open the enrollment's session slots")?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o7777 != 0o600
+    {
+        bail!("the enrollment's session slots must be private, singly linked regular files");
+    }
+    Ok(file)
+}
+
+/// Lock `file` exclusively: at once when `nonblocking`, returning whether
+/// it was free, or else waiting for it.
+fn lock_slot_file(file: &File, nonblocking: bool) -> Result<bool> {
+    let operation = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+    loop {
+        // SAFETY: the descriptor stays open for the call.
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        match error.kind() {
+            std::io::ErrorKind::Interrupted => {}
+            std::io::ErrorKind::WouldBlock if nonblocking => return Ok(false),
+            _ => return Err(error).context("lock a session slot"),
+        }
     }
 }
 
@@ -262,7 +455,11 @@ pub(crate) fn admit_session(enrollment: &str, generation: &str) -> Result<Sessio
     let (state, config) = receiver_state(enrollment)?;
     // A revoked enrollment starts nothing, even while its revocation runs.
     active::require_not_revoked(&state)?;
-    let slot = UnverifiedSlot::take(&state, UNVERIFIED_SESSIONS)?;
+    let slot = UnverifiedSlot::take(
+        &state,
+        (UNVERIFIED_SESSIONS, UNVERIFIED_SESSIONS_PER_SOURCE),
+        &session_source(std::env::var("SSH_CONNECTION").ok().as_deref()),
+    )?;
     // Read exactly the frame from the session's input, unbuffered, so the
     // copy's own protocol after it stays where the server reads it.
     let mut input = File::from(
@@ -347,24 +544,25 @@ pub(super) type Coordination = (
 
 /// Verify a coordinating source's `frame`: its own directive as [`verify`]
 /// verifies a destination's, recorded as used only when the destination's
-/// directive is the one approved with it.
+/// directive is the one approved with it. The rest of the frame is read only
+/// once the source's directive is known to be signed.
 pub(super) fn verify_coordination(
     state: &Path,
     config: &ReceiverEnrollment,
     receiver: (u64, &str),
     frame: &Coordinate,
 ) -> Result<(Coordination, delegation::VerifiedDirective)> {
-    if !crate::destination_results::relay::valid_token(&frame.results_token) {
-        bail!("invalid results token");
-    }
-    if frame.entry_key.len() > crate::remote_to_remote::MAX_ENTRY_KEY_BYTES {
-        bail!("the destination's entry key is too long");
-    }
-    crate::restricted::parse_entry_key(&frame.entry_key)?;
-    let destination = crate::directive::Signed::decode(&frame.destination)
-        .context("decode the destination's directive")?
-        .directive;
     verify_with(state, config, receiver, &frame.source, |source| {
+        if !crate::destination_results::relay::valid_token(&frame.results_token) {
+            bail!("invalid results token");
+        }
+        if frame.entry_key.len() > crate::remote_to_remote::MAX_ENTRY_KEY_BYTES {
+            bail!("the destination's entry key is too long");
+        }
+        crate::restricted::parse_entry_key(&frame.entry_key)?;
+        let destination = crate::directive::Signed::decode(&frame.destination)
+            .context("decode the destination's directive")?
+            .directive;
         let mut args = crate::directive::coordination(source, &destination)?;
         // The ignore rules the command read from files, which this machine
         // cannot read.

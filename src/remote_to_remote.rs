@@ -789,8 +789,11 @@ fn constrained_destination_rsh(
     for option in [
         format!("IdentityAgent={agent}"),
         format!("IdentitiesOnly={only}"),
+        // No `CertificateFile`: ssh reads `none` as a file of that name, and
+        // no value removes the configuration's. The broker's command reads
+        // no configuration, and the entry key's allows only the entry key's
+        // own algorithm, so no configured certificate is offered.
         ENTRY_KEY_PLACEHOLDER.to_owned(),
-        "CertificateFile=none".to_owned(),
         "PKCS11Provider=none".to_owned(),
         format!("PubkeyAuthentication={publickey}"),
         "PreferredAuthentications=publickey".to_owned(),

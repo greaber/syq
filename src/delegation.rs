@@ -938,6 +938,10 @@ pub(crate) struct VerifiedDirective {
 /// Verify `encoded` against `context` and `signer`, derive what it allows
 /// with `derive`, and only then record it as used. Nothing is recorded for
 /// a directive that any check, or the derivation, refuses.
+///
+/// Whoever holds the enrollment's entry key can send anything here, so the
+/// signature is checked before the body is decoded: until then only the
+/// fixed header's lengths and the signature's armor are read.
 pub(crate) fn verify_and_redeem<T>(
     encoded: &[u8],
     context: &ReceiverContext<'_>,
@@ -945,23 +949,23 @@ pub(crate) fn verify_and_redeem<T>(
     replay: &ReplayStore,
     derive: impl FnOnce(&Directive) -> Result<T>,
 ) -> Result<(T, VerifiedDirective)> {
-    let signed = crate::directive::Signed::decode(encoded)?;
-    let directive = &signed.directive;
+    let framed = crate::directive::Framed::split(encoded)?;
     let observed_at = Instant::now();
-    context.validate_at(directive, observed_at)?;
-    let replay_digest: [u8; 32] = Sha256::digest(&signed.payload).into();
-    replay.reject_if_redeemed(directive.request_id, replay_digest)?;
     // A certificate's expiry is judged with the clock skew in the signer's
     // favour, like the directive's own start-by time.
     let (_, latest_now) = context.wall_time_bounds_at(observed_at)?;
     signer.verify(
         crate::directive::NAMESPACE,
-        &signed.payload,
-        &signed.signature,
+        &framed.payload,
+        framed.signature,
         latest_now.saturating_sub(context.clock_skew_seconds),
     )?;
-    // Only a signed command reaches the parser, and a directive whose rules
-    // cannot be derived stays unused.
+    let signed = framed.decode()?;
+    let directive = &signed.directive;
+    context.validate_at(directive, observed_at)?;
+    let replay_digest: [u8; 32] = Sha256::digest(&signed.payload).into();
+    replay.reject_if_redeemed(directive.request_id, replay_digest)?;
+    // A directive whose rules cannot be derived stays unused.
     let derived = derive(directive)?;
     replay.redeem_after_lock(directive.request_id, replay_digest, || {
         context.validate_at(directive, Instant::now())
