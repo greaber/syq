@@ -181,25 +181,24 @@ for a directory named `~`.
 
 To copy from hostB to hostC while working on a third server, select a
 receiving machine with `--auth-from @NAME`, or save one for either server
-(`auto` and `ssh` never ask). The receiving machine shows the command once,
-within its copy limits, and sets up or updates the [enrollment](#enrollment)
-on each account when needed, over its own SSH logins without prompts, as for
-an upload (see [Authorization selection](#authorization-selection)); a dry
-run never sets them up. If it cannot reach hostB or hostC along its own SSH
-configuration's route, it logs in through the server you run the command
-on, whose SSH server must then allow TCP forwarding and which must then reach
-that server's SSH port. Account approvals are not used, and an SSH
-authorization provider cannot approve these copies.
+(`auto` and `ssh` never ask). The receiving machine asks you once, applies its
+copy limits, and sets up or updates the [enrollment](#enrollment) on each
+account when needed, over its own SSH logins without prompts, as for an upload
+(see [Authorization selection](#authorization-selection)); a dry run never
+sets them up. If it can't reach hostB or hostC along its own SSH
+configuration's route, it logs in through the server you run the command on,
+whose SSH server must then allow TCP forwarding and which must reach that
+server's SSH port. Account approvals are not used, and an SSH authorization
+provider cannot approve these copies.
 
 The server you run the command on logs in to hostB's restricted receiver,
-which runs the copy as the command states and reaches hostC's restricted
-receiver itself, so file data goes directly from hostB to hostC. Your server
-must reach hostB's SSH port, and hostB must reach hostC's, each with its own
-SSH configuration: hostB looks hostC up under the name in your command. Each
-checks the other's host key as
+which runs the copy and sends file data directly to hostC's receiver. Your
+server must reach hostB's SSH port, and hostB must reach hostC's, each with
+its own SSH configuration; hostB looks hostC up under the name in your
+command. Your server checks hostB's host key, and hostB checks hostC's, as
 [hostA checks hostB's](security.md#how-hosta-checks-hostbs-key), also
-trusting what your laptop's known_hosts lists. The copy stops when the
-command that started it ends.
+trusting what your laptop's known_hosts lists. The copy stops when the command
+that started it ends.
 
 The copy supports `--no-tcp` and `--results`, and your server checks
 [results from the destination](#results-from-the-destination). It does not
