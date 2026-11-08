@@ -30,8 +30,46 @@ pub(super) fn enter_state_directory(state: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The standalone receiver keeps its protected enrollment directory as cwd.
+/// Serve a copy's SSH workers with `authority`, the copy's destination
+/// rules. The standalone receiver keeps its protected enrollment directory
+/// as cwd.
 pub(crate) fn start(authority: Arc<RestrictedAuthority>) -> Result<(PrivateBroker, String)> {
+    start_with(move |input, output, stream, handshake| {
+        crate::server::serve_handed_restricted(input, output, stream, authority.clone(), handshake)
+    })
+}
+
+/// Serve a copy's SSH workers with `authority`, the reads its source
+/// allows, in the descriptor session its control registers the sources in.
+pub(crate) fn start_source(
+    authority: Arc<crate::restricted::source::SourceAuthority>,
+    session: crate::descriptor_broker::DescriptorSessionSlot,
+) -> Result<(PrivateBroker, String)> {
+    start_with(move |input, output, stream, handshake| {
+        crate::server::serve_handed_source(
+            input,
+            output,
+            stream,
+            (authority.clone(), session.clone()),
+            handshake,
+        )
+    })
+}
+
+/// Admit SSH workers that present the ticket's secret, and `serve` each
+/// with the input and output its session process hands over and what is
+/// left of its handshake time.
+fn start_with(
+    serve: impl Fn(
+            std::fs::File,
+            std::fs::File,
+            crate::private_broker::TrackedStream,
+            Duration,
+        ) -> Result<()>
+        + Send
+        + Sync
+        + 'static,
+) -> Result<(PrivateBroker, String)> {
     let mut secret = [0u8; 32];
     getrandom::fill(&mut secret).context("generate SSH worker admission")?;
     let broker = PrivateBroker::start_in_current_dir(
@@ -70,13 +108,7 @@ pub(crate) fn start(authority: Arc<RestrictedAuthority>) -> Result<(PrivateBroke
                 let handshake = deadline
                     .checked_duration_since(Instant::now())
                     .context("SSH worker admission timed out")?;
-                crate::server::serve_handed_restricted(
-                    input,
-                    output,
-                    stream,
-                    authority.clone(),
-                    handshake,
-                )
+                serve(input, output, stream, handshake)
             })();
             // The SSH client observes a closed stream on refused admission.
             // Do not let unauthenticated clients block on diagnostic output.

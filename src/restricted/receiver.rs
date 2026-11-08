@@ -227,6 +227,9 @@ pub(crate) fn is_sessions_full(error: &anyhow::Error) -> bool {
 pub(crate) enum Session {
     /// Serve a copy a verified directive allows.
     Copy(std::sync::Arc<RestrictedAuthority>),
+    /// Serve the reads a verified directive for this account as a copy's
+    /// source allows, to the server that started the copy.
+    Source(std::sync::Arc<super::source::SourceAuthority>),
     /// This session's input and output were handed to the running copy its
     /// worker ticket names, which has served them.
     Worker,
@@ -279,13 +282,13 @@ pub(crate) fn admit_session(enrollment: &str, generation: &str) -> Result<Sessio
                 .context("hand the restricted SSH worker to the receiver")?;
             Ok(Session::Worker)
         }
-        Admission::Copy(directive) => Ok(Session::Copy(admit(
+        Admission::Copy(directive) => admit(
             &state,
             &config,
             (generation, crate::identity::build()),
             &directive,
             slot,
-        )?)),
+        ),
         Admission::Coordinate(frame) => Ok(Session::Coordinate(admit_coordinator(
             &state,
             &config,
@@ -367,26 +370,48 @@ pub(super) fn verify_coordination(
     })
 }
 
+/// What a verified directive for one end of a copy allows.
+pub(super) enum Rules {
+    Destination(Box<(Grant, GrantConstraints)>),
+    Source(crate::destination::pull::PullRequest),
+}
+
 /// Admit a new copy's directive and set up its authority: refused by a
 /// receiver of another generation or build, then checked against the
-/// trusted login key and its policy, its rules derived from its command, and
-/// only then recorded as used. The session's `slot` is released once the
-/// directive is verified.
+/// trusted login key and its policy, its rules derived from its command for
+/// the end of the copy it is signed for, and only then recorded as used. The
+/// session's `slot` is released once the directive is verified.
 fn admit(
     state: &Path,
     config: &ReceiverEnrollment,
     (generation, build): (u64, &str),
     directive: &[u8],
     slot: UnverifiedSlot,
-) -> Result<std::sync::Arc<RestrictedAuthority>> {
+) -> Result<Session> {
     let observed_state = fs::symlink_metadata(state).context("inspect receiver enrollment")?;
     let (_, home) = current_account()?;
     let canonical_home = fs::canonicalize(&home)
         .with_context(|| format!("resolve receiver home {}", home.display()))?;
     let protected = receiver_control_paths(&canonical_home, None, ControlPaths::Here)?;
-    let ((grant, constraints), verified) =
-        verify(state, config, (generation, build), directive, &home)?;
+    let (rules, verified) = verify_rules(state, config, (generation, build), directive, &home)?;
     drop(slot);
+    let (grant, constraints) = match rules {
+        Rules::Destination(rules) => *rules,
+        Rules::Source(reads) => {
+            // Reads follow the signed command, as the account's own would:
+            // the approving machine's prompt showed what it names.
+            let authority =
+                super::source::SourceAuthority::new(reads.policy(verified.execution_deadline))?;
+            ssh::enter_state_directory(state)?;
+            active::watch(
+                &home,
+                state,
+                (observed_state.dev(), observed_state.ino()),
+                verified.execution_deadline,
+            )?;
+            return Ok(Session::Source(authority));
+        }
+    };
     let results_key = load_results_key(state)?;
     let root = ConfinedRoot::resolve(
         &grant.copy.destination,
@@ -412,11 +437,41 @@ fn admit(
         (observed_state.dev(), observed_state.ino()),
         verified.execution_deadline,
     )?;
-    Ok(authority)
+    Ok(Session::Copy(authority))
 }
 
-/// Verify a directive and derive its rules, recording it as used only when
-/// everything passes.
+/// Verify a new copy's directive and derive its rules for the end of the
+/// copy it is signed for, recording it as used only when everything passes.
+/// A coordinating source's directive comes only with its destination's.
+pub(super) fn verify_rules(
+    state: &Path,
+    config: &ReceiverEnrollment,
+    receiver: (u64, &str),
+    directive: &[u8],
+    home: &Path,
+) -> Result<(Rules, delegation::VerifiedDirective)> {
+    verify_with(
+        state,
+        config,
+        receiver,
+        directive,
+        |directive| match &directive.binding.role {
+            crate::directive::Role::Destination => Ok(Rules::Destination(Box::new(
+                crate::directive::destination_rules(directive, home)?,
+            ))),
+            crate::directive::Role::Source => Ok(Rules::Source(crate::directive::source_rules(
+                directive, home,
+            )?)),
+            crate::directive::Role::CoordinatingSource(_) => {
+                bail!("a coordinating source's directive comes with its destination's")
+            }
+        },
+    )
+}
+
+/// Verify a destination's directive and derive its rules, recording it as
+/// used only when everything passes.
+#[cfg(test)]
 pub(super) fn verify(
     state: &Path,
     config: &ReceiverEnrollment,
@@ -429,7 +484,7 @@ pub(super) fn verify(
     })
 }
 
-/// Verify a directive as [`verify`] does, deriving with `derive`.
+/// Verify a directive as [`verify_rules`] does, deriving with `derive`.
 fn verify_with<T>(
     state: &Path,
     config: &ReceiverEnrollment,

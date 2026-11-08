@@ -42,54 +42,6 @@ fn bootstrap_stderr_preserves_invalid_utf8_in_both_channels() {
 }
 
 #[test]
-fn tcp_only_source_worker_failure_is_terminal_without_ssh_fallback() {
-    // Reserve an address without listening, so connection refusal cannot race
-    // another test reusing a released ephemeral port.
-    let refused = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
-    refused
-        .bind(
-            &"127.0.0.1:0"
-                .parse::<std::net::SocketAddr>()
-                .unwrap()
-                .into(),
-        )
-        .unwrap();
-    let port = refused.local_addr().unwrap().as_socket().unwrap().port();
-    let (control, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
-    let approved =
-        crate::destination::ReturnConnection::source(control, "127.0.0.1".into()).unwrap();
-    let mut spec = super::RemoteSpec::local_receiver(false);
-    spec.forwarded = Some(approved);
-    *spec.tcp.lock().unwrap() = Some(super::TcpInfo {
-        pacing: None,
-        reverse: None,
-        addrs: vec!["127.0.0.1".into()],
-        port,
-        key: None,
-        token: Vec::new(),
-        congestion_control: None,
-        failed: false,
-        failure: None,
-        next: Default::default(),
-    });
-    let endpoint = super::Endpoint::Remote(spec.clone());
-    let error = endpoint
-        .connect_with_sources(false, Vec::new(), false, None)
-        .err()
-        .unwrap();
-    assert!(super::is_non_retryable_connect_error(&error), "{error:#}");
-    assert!(
-        error.is::<crate::destination::SshWorkersUnavailable>(),
-        "{error:#}"
-    );
-    assert!(format!("{error:#}").contains("requires direct TCP"));
-    assert!(
-        !spec.tcp.lock().unwrap().as_ref().unwrap().failed,
-        "TCP-only failure must not activate the SSH fallback state"
-    );
-}
-
-#[test]
 fn advertised_tcp_port_must_match_requested_range() {
     for port in [47_600, 47_650, 47_699] {
         super::validate_advertised_tcp_port(port, (47_600, 47_699)).unwrap();
@@ -1054,7 +1006,6 @@ fn connecting_socket_congestion_rejection_is_attributed_to_coordinator() {
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),
-        forwarded: None,
         receiver_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
@@ -1966,7 +1917,6 @@ fn ssh_inherits_host_key_policy() {
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),
-        forwarded: None,
         receiver_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
@@ -2032,7 +1982,6 @@ fn worker_tcp_fallback_survives_broken_stderr() {
         }))),
         diagnostics: Default::default(),
         primed_control: Default::default(),
-        forwarded: None,
         receiver_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
@@ -2072,7 +2021,6 @@ fn ssh_workers_reuse_the_private_control_socket_only_when_enabled() {
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),
-        forwarded: None,
         receiver_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
@@ -2266,7 +2214,6 @@ fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),
-        forwarded: None,
         receiver_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
@@ -2397,7 +2344,6 @@ fn persistent_control_path_is_one_byte_exact_openssh_argument() {
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),
-        forwarded: None,
         receiver_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
@@ -2831,7 +2777,6 @@ fn only_sessions_within_a_run_use_the_handshake_platform() {
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),
-        forwarded: None,
         receiver_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };

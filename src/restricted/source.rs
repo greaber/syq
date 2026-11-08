@@ -31,6 +31,10 @@ pub(crate) struct SourcePolicy {
     pub base: SourceRootBase,
     pub selections: Vec<SourceRootSelection>,
     pub selection_types: Vec<crate::cli::SourceSelection>,
+    /// Where `base` is on this machine, when this process works elsewhere
+    /// than where its relative paths start: the coordinator registers the
+    /// base as its command names it, and this executor reads from here.
+    pub resolved_base: Option<Vec<u8>>,
     pub symlink_policy: OperatorSymlinkPolicy,
     pub hashing: crate::hashing::HashPolicy,
     pub preservation: crate::inode_metadata::Selection,
@@ -101,6 +105,13 @@ impl SourceAuthority {
         );
         ensure!(policy.limits.max_entries > 0, "source entry limit is zero");
         ensure!(policy.send_rate != Some(0), "source sender rate is zero");
+        ensure!(
+            policy
+                .resolved_base
+                .as_ref()
+                .is_none_or(|base| base.starts_with(b"/") && !base.contains(&0)),
+            "a source's resolved base must be an absolute path"
+        );
         if let Some(tcp) = &policy.tcp {
             ensure!(
                 tcp.port_lo <= tcp.port_hi,
@@ -398,7 +409,18 @@ impl SourceConnection {
                 && *independent_handoff_workers < usize::from(policy.limits.max_connections),
             "source registration exceeds the connection limit"
         );
-        let response = ops.handle_in_place(&mut request.clone());
+        let mut executed = request.clone();
+        if let (
+            Some(resolved),
+            Request::RegisterSourceRoots {
+                base: SourceRootBase { path, .. },
+                ..
+            },
+        ) = (&policy.resolved_base, &mut executed)
+        {
+            *path = Some(resolved.clone());
+        }
+        let response = ops.handle_in_place(&mut executed);
         if let Response::SourceRootsRegistered(roots) = &response {
             for (root, kind) in roots.iter().zip(&policy.selection_types) {
                 root.validate()?;

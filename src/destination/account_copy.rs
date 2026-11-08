@@ -136,7 +136,7 @@ pub(crate) fn approved_operation(
     if args.s3.is_some()
         || args.delegated
         || args.restricted_grant.is_some()
-        || args.return_source.is_some()
+        || args.source_directive.is_some()
     {
         return Ok(None);
     }
@@ -333,7 +333,6 @@ mod tests {
         )
         .unwrap();
         assert!(spec.ssh_multiplexer.is_none());
-        assert!(spec.forwarded.is_none());
         assert!(spec.restricted_grant.is_none());
         assert_eq!(spec.host, "resolved");
         assert_eq!(spec.user.as_deref(), Some("approved"));

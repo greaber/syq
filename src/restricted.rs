@@ -55,7 +55,7 @@ pub(crate) use privilege::{
     privileged_receiver_message, refuse_privileged_approved_receiver, refuse_privileged_receiver,
 };
 pub(crate) use receiver::*;
-pub(crate) use ssh::start as start_ssh_workers;
+pub(crate) use ssh::{start as start_ssh_workers, start_source as start_source_ssh_workers};
 use statefs::*;
 
 /// The effective account's login name, for messages; `None` if unknown.

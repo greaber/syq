@@ -552,9 +552,15 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
     Ok(match &loc.host {
         None => Endpoint::local(),
         Some(h) => {
-            let forwarded = args.return_source.clone();
             // A receiving machine's files come over the route it approved.
             let named_source = args.named_source.clone().filter(|_| h.starts_with('@'));
+            // So do the sources of a copy a receiving machine approved for
+            // their server's enrolled receiver: this copy's destination is
+            // local, so every remote endpoint is the source.
+            let restricted_grant = named_source
+                .clone()
+                .or_else(|| args.restricted_grant.clone())
+                .or_else(|| args.source_directive.clone());
             let rsh = parse_rsh(&args.rsh)?;
             if loc.port.is_some() && args.rsh.is_some() && !rsh[0].ends_with("ssh") {
                 bail!(
@@ -568,7 +574,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
             // server.
             let sharing: Option<(Option<crate::persistence::SshOptions>, bool)> = match &args.rsh {
                 None => Some((None, true)),
-                Some(_) if args.delegated || args.restricted_grant.is_some() => None,
+                Some(_) if args.delegated || restricted_grant.is_some() => None,
                 Some(_) => crate::conn::shareable_ssh_options(&rsh).map(|sharing| {
                     if sharing.options.is_empty() {
                         return (None, sharing.persist);
@@ -584,14 +590,10 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                     }
                 }),
             };
-            let ssh_multiplexer = match sharing
-                .filter(|_| forwarded.is_none() && named_source.is_none())
-            {
+            let ssh_multiplexer = match sharing.filter(|_| named_source.is_none()) {
                 None => None,
                 // A restricted grant keeps a private connection for this run.
-                Some(_) if args.restricted_grant.is_some() => {
-                    Some(Arc::new(SshMultiplexer::new()?))
-                }
+                Some(_) if restricted_grant.is_some() => Some(Arc::new(SshMultiplexer::new()?)),
                 Some((ssh, persist)) => {
                     // Connection sharing and persistence only save logins. When
                     // their local state cannot be used, connect without them. An
@@ -646,12 +648,10 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 port: loc.port,
                 rsh,
                 syq_path: args.syq_path.clone(),
-                bootstrap_helper: forwarded.is_none()
-                    && named_source.is_none()
-                    && args.restricted_grant.is_none()
+                bootstrap_helper: restricted_grant.is_none()
                     && args.syq_path.is_none()
                     && !args.no_bootstrap,
-                restricted_grant: named_source.or_else(|| args.restricted_grant.clone()),
+                restricted_grant,
                 helper_install: Default::default(),
                 ssh_multiplexer,
                 quiet: args.quiet,
@@ -659,7 +659,6 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 tcp: Default::default(),
                 diagnostics: Default::default(),
                 primed_control: Default::default(),
-                forwarded,
                 receiver_host: args
                     .receiver_host
                     .as_ref()
@@ -1152,7 +1151,7 @@ fn small_copy_eligible(
         && args.ignore_lines.is_empty()
         && (args.bwlimit_bytes == 0
             || matches!(dst_ep, Endpoint::Remote(spec)
-            if spec.restricted_grant.is_none() && spec.forwarded.is_none()))
+            if spec.restricted_grant.is_none()))
         && args.max_size.is_none()
         && args.min_size.is_none()
         && !args.follows_native_destination_paths()
@@ -1924,13 +1923,6 @@ fn handle_tcp_setup_error(
                 args.tcp_congestion.as_deref().unwrap_or_default()
             )
         });
-    }
-    if args.return_source.is_some() {
-        sched.abort();
-        progress.stop();
-        return Err(error).context(
-            "approved source requires direct TCP; SSH source authorization is unavailable",
-        );
     }
     if !args.quiet || debug() {
         let congestion_note =
@@ -3418,11 +3410,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             .is_none_or(crate::restricted::enrolled_grant)
     };
     let ordinary = [&src_ep, &dst_ep].iter().all(|ep| match ep {
-        Endpoint::Remote(spec) => {
-            spec.local_process
-                || (ordinary_grant(&spec.restricted_grant)
-                    && (spec.forwarded.is_none() || args.return_source.is_some()))
-        }
+        Endpoint::Remote(spec) => spec.local_process || ordinary_grant(&spec.restricted_grant),
         _ => true,
     });
     let transport_budget = (args.bwlimit_bytes > 0

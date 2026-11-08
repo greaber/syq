@@ -339,9 +339,7 @@ fn automatic_workers_still_respect_restricted_receiver_authority() {
 #[test]
 fn automatic_workers_respect_source_scope_but_not_full_account_ssh() {
     let mut args = native_engine_defaults();
-    let (control, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
-    args.return_source =
-        Some(crate::destination::ReturnConnection::source(control, "source".into()).unwrap());
+    args.source_directive = Some("signed source directive".into());
     assert_eq!(args.automatic_worker_limit(), 128);
     args.resource_limits = Some(crate::advanced::ResourceLimits {
         workers: Some(3),
@@ -351,8 +349,8 @@ fn automatic_workers_respect_source_scope_but_not_full_account_ssh() {
     args.resource_limits.as_mut().unwrap().workers = Some(1000);
     assert_eq!(args.automatic_worker_limit(), 128);
     // Account-authorized copies use a primed ordinary RemoteSpec instead of
-    // the per-copy source-authority control channel.
-    args.return_source = None;
+    // the source's enrolled receiver.
+    args.source_directive = None;
     args.auth_from =
         crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return("laptop".into()));
     args.direct_source = Some(Box::new(crate::conn::RemoteSpec::local_receiver(true)));

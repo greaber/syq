@@ -518,7 +518,6 @@ fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     is_worker_initialization_error(error)
         || error.is::<crate::restricted::CopyRefused>()
-        || error.is::<crate::destination::SshWorkersUnavailable>()
         || error.chain().any(|cause| cause.is::<OpenSshVersionError>())
         || error
             .chain()
@@ -1965,7 +1964,6 @@ pub struct RemoteSpec {
     /// still filling its pipeline. Readers also reserve the default depth
     /// for pipelined control lookups.
     pub(crate) read_ahead: usize,
-    pub(crate) forwarded: Option<std::sync::Arc<crate::destination::ReturnConnection>>,
     /// An enrolled receiver's connection, as preparing its host-key
     /// checking found it.
     pub(crate) receiver_host: Option<std::sync::Arc<ReceiverHost>>,
@@ -2010,7 +2008,6 @@ impl RemoteSpec {
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
-            forwarded: None,
             receiver_host: None,
             read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         }
@@ -2204,7 +2201,6 @@ impl RemoteSpec {
         if !multiplexer.persistent
             || !multiplexer.session_pool
             || self.local_process
-            || self.forwarded.is_some()
             || self.restricted_grant.is_some()
             || !self
                 .rsh
@@ -2603,11 +2599,7 @@ impl RemoteSpec {
         // The receiver child is on this machine, not across the network.
         // Recompressing forwarded blocks here adds CPU work to downloads.
         let compress = compress && !self.local_process;
-        let return_stream = if let Some(approved) = &self.forwarded {
-            matches!(role, ConnectionRole::Control)
-                .then(|| approved.take_control())
-                .transpose()?
-        } else if crate::destination::is_named(&self.restricted_grant) {
+        let return_stream = if crate::destination::is_named(&self.restricted_grant) {
             let control = matches!(role, ConnectionRole::Control);
             let started = std::time::Instant::now();
             let stream =
@@ -2649,11 +2641,7 @@ impl RemoteSpec {
         // An enrolled receiver reads its admission frame before anything
         // else: the control's directive, or a worker's ticket. Neither goes
         // on a command line.
-        let admission = match self
-            .restricted_grant
-            .as_ref()
-            .filter(|_| self.forwarded.is_none())
-        {
+        let admission = match self.restricted_grant.as_ref() {
             Some(directive) if matches!(role, ConnectionRole::Control) => {
                 use base64::Engine as _;
                 crate::restricted::Admission::Copy(
@@ -2694,8 +2682,6 @@ impl RemoteSpec {
             command.arg(self.session_command(&server_args));
             std::os::unix::process::CommandExt::process_group(&mut command, 0);
             command
-        } else if self.forwarded.is_some() {
-            return Err(crate::destination::SshWorkersUnavailable.into());
         } else if self.local_process {
             let mut command = crate::process::self_command()?;
             // The same executable receives, so this internal flag is always
@@ -3097,19 +3083,12 @@ impl RemoteSpec {
         })
     }
 
-    /// How long this endpoint's route probes wait for an answer. A source
-    /// reached through an approved return connection without SSH has no
-    /// fallback when TCP fails, so giving up early would fail the copy: it
-    /// waits the ceiling.
+    /// How long this endpoint's route probes wait for an answer.
     pub(crate) fn route_probe_wait(
         &self,
         round_trip: Option<std::time::Duration>,
     ) -> std::time::Duration {
-        if self.forwarded.is_some() {
-            TCP_PROBE_CEILING
-        } else {
-            tcp_probe_wait(round_trip)
-        }
+        tcp_probe_wait(round_trip)
     }
 
     pub(crate) fn probe_tcp_addresses(
@@ -3227,27 +3206,9 @@ impl RemoteSpec {
         Ok(())
     }
 
-    /// The real host name behind an ssh config alias.
-    #[cfg(test)]
-    pub(crate) fn resolved_hostname(&self) -> Option<String> {
-        self.ssh_destination()
-            .map(|destination| destination.hostname)
-    }
-
     /// Where SSH reaches the host: its real name behind an ssh config alias,
     /// and whether this machine connects to that name itself.
     fn ssh_destination(&self) -> Option<SshDestination> {
-        if let Some(host) = self
-            .forwarded
-            .as_ref()
-            .and_then(|connection| connection.data_hostname())
-        {
-            // The approving machine resolved this name for its own SSH.
-            return Some(SshDestination {
-                hostname: host.to_owned(),
-                direct: false,
-            });
-        }
         if let Some(receiver) = &self.receiver_host {
             return Some(SshDestination {
                 hostname: receiver.hostname.clone(),
@@ -4069,9 +4030,6 @@ impl Endpoint {
                             #[cfg(debug_assertions)]
                             if std::env::var_os("SYQ_TEST_REQUIRE_TCP").is_some() {
                                 return Err(e).context("TCP data transport required by test");
-                            }
-                            if spec.forwarded.is_some() {
-                                return Err(e).context(crate::destination::SshWorkersUnavailable);
                             }
                             let mut g = spec.tcp.lock().unwrap();
                             let mut warning = None;

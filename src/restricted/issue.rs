@@ -45,9 +45,8 @@ pub(crate) struct Issue<'a> {
     /// The initiator's key for the destination's results, when another
     /// machine started the copy; otherwise this machine makes one.
     pub results_key: Option<[u8; 32]>,
-    /// For the source of a copy between two servers, which coordinates it,
-    /// the destination's receiver it reaches; `None` for a destination.
-    pub peer: Option<directive::Peer>,
+    /// Which end of the copy the account is.
+    pub role: Role,
 }
 
 /// Sign a directive for a copy to an account with the user's login key,
@@ -68,7 +67,7 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
         allow_enrollment,
         batch,
         results_key,
-        peer,
+        role,
     } = issue;
     let account = endpoint(destination_login, host, port)?.label();
     let (recipient_secret, recipient_public_key) = match results_key {
@@ -78,8 +77,7 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
             (Some(secret), public)
         }
     };
-    let is_destination = peer.is_none();
-    let role = peer.map_or(Role::Destination, Role::CoordinatingSource);
+    let is_destination = role == Role::Destination;
     let directive_for = |enrollment: EnrollmentId, generation: u64| {
         directive::issue(
             Binding {
@@ -96,7 +94,7 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
     };
     // A destination the receiver would refuse is refused before anything
     // is set up or refreshed on the server, from the same rules. A source
-    // runs its command as the account would.
+    // reads what its command names as the account would.
     let check = |home: &Path, receiving: &[PathBuf]| {
         checked_destination(
             &directive_for(EnrollmentId::random(), 1)?,

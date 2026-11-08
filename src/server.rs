@@ -552,6 +552,52 @@ pub(crate) fn serve_handed_restricted(
     result
 }
 
+/// Serve a restricted source's SSH worker, whose input and output its
+/// process handed over `control` after the receiver admitted it, in the
+/// descriptor session the copy's control registered its sources in, and
+/// tell that process how it ended.
+pub(crate) fn serve_handed_source(
+    input: std::fs::File,
+    output: std::fs::File,
+    mut control: crate::private_broker::TrackedStream,
+    (authority, descriptor_session): (
+        Arc<crate::restricted::source::SourceAuthority>,
+        DescriptorSessionSlot,
+    ),
+    handshake: Duration,
+) -> Result<()> {
+    use crate::descriptor_broker::HandedConnection;
+    HandedConnection::accept(&mut control)?;
+    let pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let reader = PipeHandshakeReader {
+        input,
+        pending: pending.clone(),
+        deadline: std::time::Instant::now() + handshake,
+    };
+    let result = serve(
+        reader,
+        output,
+        false,
+        None,
+        None,
+        None,
+        ServeSession {
+            owns_process: false,
+            handshake_pending: Some(pending),
+            ssh_worker_ticket: None,
+            allow_tcp: false,
+            metadata_control: false,
+            loopback_only: false,
+            named_socket: None,
+            authority: None,
+            source_authority: Some(authority),
+            descriptor_session,
+        },
+    );
+    HandedConnection::report_end(control, &result);
+    result
+}
+
 /// Bound every read of a handed-over SSH session by the Hello deadline until
 /// `serve` clears `pending`, as `TcpHandshakeReader` bounds a socket's.
 struct PipeHandshakeReader {
@@ -701,6 +747,9 @@ pub(crate) fn run_checker(enrollment: &str, generation: &str) -> Result<i32> {
     match session {
         crate::restricted::Session::Worker => Ok(0),
         crate::restricted::Session::Copy(authority) => run_restricted(authority).map(|()| 0),
+        crate::restricted::Session::Source(authority) => {
+            run_restricted_source(authority).map(|()| 0)
+        }
         crate::restricted::Session::Coordinate(coordinating) => {
             crate::remote_to_remote::coordinate(*coordinating)
         }
@@ -762,6 +811,49 @@ fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Res
     descriptor_session.close();
     authority.close_control();
     crate::process::termination::wait_if_terminating();
+    client_gone_result(result, client_gone.load(Relaxed))
+}
+
+/// Serve the reads a verified source directive allows to the server that
+/// started the copy: over this session, over the TCP workers it sets up,
+/// and over SSH workers that join with this session's ticket. Closing this
+/// session ends them all.
+fn run_restricted_source(authority: Arc<crate::restricted::source::SourceAuthority>) -> Result<()> {
+    let descriptor_session = DescriptorSessionSlot::default();
+    let (_workers, ticket) = match crate::restricted::start_source_ssh_workers(
+        authority.clone(),
+        descriptor_session.clone(),
+    ) {
+        Ok((workers, ticket)) => (Some(workers), Ok(ticket)),
+        Err(error) => (
+            None,
+            Err(format!("start restricted SSH workers: {error:#}")),
+        ),
+    };
+    let pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    // Unbuffered: the deadline waits on the descriptor, which must not hide
+    // bytes another buffer already read.
+    let input = std::fs::File::from(
+        std::os::fd::AsFd::as_fd(&io::stdin())
+            .try_clone_to_owned()
+            .context("take the copy's input")?,
+    );
+    let client_gone = std::sync::atomic::AtomicBool::new(false);
+    let result = run_authorized_source(
+        crate::destination::HandshakeInput::new(
+            input,
+            pending.clone(),
+            RESTRICTED_START_TIMEOUT,
+            RESTRICTED_HELLO_TIMEOUT,
+        ),
+        ClientOutput {
+            inner: io::stdout().lock(),
+            gone: &client_gone,
+        },
+        authority,
+        descriptor_session,
+        (Some(pending), Some(ticket)),
+    );
     client_gone_result(result, client_gone.load(Relaxed))
 }
 
@@ -970,12 +1062,16 @@ pub(crate) fn run_named_source_tcp(
 /// One approved source control stream. The caller creates a fresh descriptor
 /// session and shares it with its private worker broker; this control owns the
 /// session lifetime. Dropping that broker after this returns wakes idle workers.
-pub(crate) fn run_authorized_source<R: Read + Send + 'static, W: Write>(
+/// `ssh_worker_ticket` is what SSH workers join with, when they can.
+fn run_authorized_source<R: Read + Send + 'static, W: Write>(
     input: R,
     output: W,
     authority: Arc<crate::restricted::source::SourceAuthority>,
     descriptor_session: DescriptorSessionSlot,
-    pending: Option<Arc<std::sync::atomic::AtomicBool>>,
+    (pending, ssh_worker_ticket): (
+        Option<Arc<std::sync::atomic::AtomicBool>>,
+        Option<std::result::Result<String, String>>,
+    ),
 ) -> Result<()> {
     let result = serve(
         input,
@@ -987,7 +1083,7 @@ pub(crate) fn run_authorized_source<R: Read + Send + 'static, W: Write>(
         ServeSession {
             owns_process: false,
             handshake_pending: pending,
-            ssh_worker_ticket: None,
+            ssh_worker_ticket,
             allow_tcp: true,
             metadata_control: false,
             loopback_only: false,

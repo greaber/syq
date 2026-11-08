@@ -215,8 +215,10 @@ pub struct Args {
     /// Source SSH connection opened while choosing automatic authorization.
     #[arg(skip)]
     pub(crate) direct_source: Option<Box<crate::conn::RemoteSpec>>,
+    /// The signed directive for the enrolled receiver of this copy's
+    /// sources, which a receiving machine approved this copy for.
     #[arg(skip)]
-    pub(crate) return_source: Option<std::sync::Arc<crate::destination::ReturnConnection>>,
+    pub(crate) source_directive: Option<String>,
     /// The route to a receiving machine that approved sending this copy's
     /// sources (`destination::send`).
     #[arg(skip)]
@@ -1039,7 +1041,7 @@ impl Args {
         // receiver or approved source authority. Each endpoint still enforces
         // its particular grant; cached full-account SSH has no such ceiling.
         if self.restricted_grant.is_some()
-            || self.return_source.is_some()
+            || self.source_directive.is_some()
             || self.named_source.is_some()
         {
             requested.min(usize::from(crate::delegation::MAX_CONNECTIONS))

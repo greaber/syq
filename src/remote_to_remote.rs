@@ -1847,7 +1847,7 @@ fn run_remote(
                     allow_enrollment: !args.dry_run,
                     batch: false,
                     results_key: None,
-                    peer: None,
+                    role: crate::directive::Role::Destination,
                 })
             })
             .transpose()
@@ -1957,7 +1957,6 @@ fn run_remote(
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
-            forwarded: None,
             receiver_host: None,
             read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         }

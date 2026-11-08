@@ -486,14 +486,27 @@ the hostB account, so a command that names syq's own files there, or a source
 symlink that leads to them, sends those to hostC like any other file. The copy
 stops when hostX's command ends, and continues if your laptop disconnects.
 
-A server can also ask your laptop to approve a download from another server. Syq
-on the source then reads only the approved files and directory trees, applies
-the selected symlink behavior, accepts no writes or removals, and limits the
-file data, entries, and connections it returns. The server can also ask for
-hashes of approved files; these do not count toward the data limit, so that
-limit does not bound what the server can learn from them. File data uses
-authenticated, encrypted TCP directly between the servers, and the copy fails
-without it. Closing the approval connection stops further reads.
+A server can also ask your laptop to approve a download from another server,
+hostB, to itself. Your laptop shows the command and each source as hostB will
+read it, sets up or updates hostB's enrollment when needed, and signs the
+command for hostB's receiver as the copy's source. The server logs in to that
+receiver with hostB's entry key, checking hostB's host key as hostA checks
+hostB's. The receiver checks the signature as for a destination, and then
+reads only the files and directory trees the command names, with the symlink
+behavior the command chose, accepts no writes or removals, and limits the file
+data, entries, and connections it returns to the command's and your laptop's
+limits. A signed download cannot be used as a copy to hostB, and a copy signed
+for hostB as a destination cannot be used to read from it.
+
+Reads are not limited further within the account: a command that names
+hostB's `~/.ssh` or syq's own files there, or a symlink it follows to them,
+sends those files like any other, as a login to the account could. The prompt
+shows the paths, and says when the command follows symlinks. The server can
+also ask for hashes of approved files; these do not count toward the data
+limit, so that limit does not bound what the server can learn from them. Once
+approved, the copy goes on without your laptop until it finishes, someone
+interrupts it on the server, its signature's seven days run out, or you revoke
+the enrollment.
 
 <a id="approved-commands-on-receiving-machines"></a>
 

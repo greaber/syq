@@ -127,25 +127,32 @@ fn receiving_pins_preserve_native_identity_and_certificate_alias_tokens() {
     }
 }
 
+/// A copy from another server that a receiving machine approved reads it
+/// through the source's enrolled receiver: the signed directive goes to the
+/// source's control, with the SSH command the approval prepared, no shared
+/// or persistent connection and no helper installation.
 #[test]
-fn approved_source_uses_its_control_channel_without_a_native_ssh_pool() {
+fn an_approved_source_presents_its_directive_on_a_private_connection() {
     let directory = crate::test_support::tempdir().unwrap();
     let mut args = args(directory.path(), "target");
     args.locations[0].host = Some("source".into());
     args.locations.last_mut().unwrap().host = None;
-    let (control, _peer) = UnixStream::pair().unwrap();
-    let approved = ReturnConnection::source(control, "source".into()).unwrap();
-    args.return_source = Some(approved.clone());
+    args.source_directive = Some("signed".into());
+    args.rsh = Some(crate::remote_to_remote::receiver_rsh(None));
     let crate::conn::Endpoint::Remote(source) =
         crate::transfer::endpoint(&args.locations[0], &args).unwrap()
     else {
         panic!("source must remain remote");
     };
-    assert!(Arc::ptr_eq(source.forwarded.as_ref().unwrap(), &approved));
+    assert_eq!(source.restricted_grant.as_deref(), Some("signed"));
     assert!(source.ssh_multiplexer.is_none());
     assert!(!source.bootstrap_helper);
-    assert!(approved.take_control().is_ok());
-    assert!(approved.take_control().is_err());
+    assert!(source.rsh.iter().any(|option| option == "ControlPath=none"));
+    // It does not make this copy's local destination restricted.
+    assert!(
+        crate::transfer::endpoint(args.locations.last().unwrap(), &args)
+            .is_ok_and(|endpoint| !endpoint.is_remote())
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -2178,33 +2185,7 @@ fn named_tcp_idle_and_partial_arrivals_do_not_block_worker() {
 }
 
 #[test]
-fn source_data_hostname_preserves_laptop_alias_and_never_uses_requester_config() {
-    let directory = crate::test_support::tempdir().unwrap();
-    let laptop_config = directory.path().join("laptop-config");
-    fs::write(&laptop_config, "Match originalhost copy-alias user approved\n    HostName 203.0.113.42\nHost *\n    HostName fallback.invalid\n").unwrap();
-    let mut laptop = forward::target_spec("approved@copy-alias").unwrap();
-    laptop
-        .rsh
-        .extend(["-F".into(), laptop_config.to_str().unwrap().into()]);
-    let hostname =
-        forward::source_data_hostname(&laptop, Instant::now() + Duration::from_secs(2), &|| false)
-            .unwrap();
-    assert_eq!(hostname, "203.0.113.42");
-    let (control, _peer) = UnixStream::pair().unwrap();
-    let approved = ReturnConnection::source(control, hostname).unwrap();
-    let mut requester = forward::target_spec("copy-alias").unwrap();
-    requester.forwarded = Some(approved);
-    // A pinned laptop result must not run this requesting machine's command.
-    requester.rsh = vec!["/no/such/requester-ssh".into()];
-    assert_eq!(
-        requester.resolved_hostname().as_deref(),
-        Some("203.0.113.42")
-    );
-    assert_eq!(requester.host, "copy-alias");
-}
-
-#[test]
-fn source_data_hostname_rejects_options_paths_and_config_syntax() {
+fn data_hostnames_reject_options_paths_and_config_syntax() {
     for hostname in ["example.test", "192.0.2.4", "2001:db8::4", "my_ssh_alias"] {
         validate_data_hostname(hostname).unwrap();
     }
@@ -2258,33 +2239,6 @@ fn a_rejected_login_waits_longer_each_time_up_to_ten_minutes() {
             wait(151_000)
         ],
         ["0 s", "1 s", "30 s", "119 s", "2 min", "3 min"]
-    );
-}
-
-/// An approved source reached without SSH has no fallback when TCP fails,
-/// so its route probes wait the most rather than a few round trips.
-#[test]
-fn an_approved_source_without_ssh_waits_the_full_probe_time() {
-    let directory = crate::test_support::tempdir().unwrap();
-    let mut args = args(directory.path(), "target");
-    args.locations[0].host = Some("source".into());
-    args.locations.last_mut().unwrap().host = None;
-    let (control, _peer) = UnixStream::pair().unwrap();
-    args.return_source = Some(ReturnConnection::source(control, "source".into()).unwrap());
-    let crate::conn::Endpoint::Remote(source) =
-        crate::transfer::endpoint(&args.locations[0], &args).unwrap()
-    else {
-        panic!("source must remain remote");
-    };
-    let fast = Some(Duration::from_millis(1));
-    assert_eq!(
-        source.route_probe_wait(fast),
-        crate::conn::TCP_PROBE_CEILING
-    );
-    let ordinary = crate::conn::RemoteSpec::local_receiver(true);
-    assert_eq!(
-        ordinary.route_probe_wait(fast),
-        crate::conn::TCP_PROBE_FLOOR
     );
 }
 

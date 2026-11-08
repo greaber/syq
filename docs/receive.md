@@ -161,12 +161,11 @@ syq cp --from hostB /archive/results --into .
 If hostA can't log in to hostB itself, syq asks your laptop to approve just
 this copy, within your laptop's copy limits. File data goes directly between
 the servers, so hostA must reach hostB directly, without a `ProxyJump`; see
-[What you need](remote-to-remote.md#what-you-need). Once approved, an upload
-finishes even if your laptop disconnects. A download needs the laptop
-connection throughout, and a direct encrypted TCP connection between the
-servers. See [Authorization selection](remote-reference.md#authorization-selection)
-for the options this supports, and add `--auth-from ssh` to use only hostA's
-own SSH access.
+[What you need](remote-to-remote.md#what-you-need). Once approved, the copy
+finishes even if your laptop disconnects. See
+[Authorization selection](remote-reference.md#authorization-selection) for
+the options this supports, and add `--auth-from ssh` to use only hostA's own
+SSH access.
 
 ## Open a shell on another server
 

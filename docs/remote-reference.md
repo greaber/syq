@@ -36,7 +36,8 @@ as `~/.local/lib/syq`, `~/.local/libexec`, `~/.config/syq`, and enrollment and
 receiving state. A copy that puts a directory's contents into, prunes, or
 replaces a directory holding one of these, such as your home directory, is
 refused; copy into a subdirectory instead, or copy named files or directories
-into it.
+into it. A copy from the account reads whatever its command names, these
+included, as a login to the account could.
 
 ### Which key signs
 
@@ -144,7 +145,7 @@ name, to approve just this copy. After a timeout, a temporary DNS failure, or
 any other SSH error, or with no receiving machine available, syq reports the
 SSH error. A refusal or failure on the receiving machine ends the copy.
 
-Per-copy approval does not work with a root login on the destination,
+Per-copy approval does not work with a root login on the other server,
 `--detach`, `--rsh`, `--syq-path`, `--no-bootstrap`, other `--peer-auth` or
 `--coordinate-at` values, or `--no-tcp-encryption`, and an approved upload
 cannot preserve hard links, ACLs, extended attributes, or access or birth
@@ -152,24 +153,32 @@ times, or use `--open-noatime` or `--sparse`. Such copies need this machine's
 own SSH access. The receiving machine's copy limits apply, including its
 `--max-delete` and `--max-entries`.
 
-For an upload, the receiving machine sets up the destination's
-[enrollment](#enrollment) on the first approved copy, and again after you
-upgrade syq, over its own SSH login without prompts. Its key must therefore
-sign without a terminal: in its agent, or an unencrypted key file. Unless its
-SSH configuration sets `StrictHostKeyChecking yes`, that login accepts a
-destination host key it has not seen before; see
+The receiving machine sets up the other server's
+[enrollment](#enrollment), the destination of an upload or the source of a
+download, on the first approved copy, and again after you upgrade syq, over
+its own SSH login without prompts; a dry run never sets it up. Its key must
+therefore sign without a terminal: in its agent, or an unencrypted key file.
+Unless its SSH configuration sets `StrictHostKeyChecking yes`, that login
+accepts a host key it has not seen before; see
 [how hostA checks hostB's key](security.md#how-hosta-checks-hostbs-key). If it
-cannot reach the destination, it goes through the source, whose SSH server
-must then allow TCP forwarding.
+cannot reach the other server, it goes through the server you run the command
+on, whose SSH server must then allow TCP forwarding.
 
-For a download, approval grants read access only to the source files and
-directory trees shown. A source given with `--src-non-dir` grants only that
-entry; any other source grants the whole tree if it is a directory. Filters
-narrow the copy but not the grant. File data needs direct encrypted TCP between
-the servers, so `--no-tcp` and descriptor streams do not work. To download over
-SSH, use an
-[approved account connection](persistence-reference.md#approved-account-connections)
-(`--auth-from @NAME`).
+The server you run the command on then logs in to the other server's
+restricted receiver itself, with its own SSH configuration, and checks its
+host key as [hostA checks hostB's](security.md#how-hosta-checks-hostbs-key).
+The copy no longer needs the receiving machine, and stops when the command
+that started it ends. File data goes over direct encrypted TCP, or over SSH
+with `--no-tcp` or when TCP cannot connect.
+
+For a download, the source's receiver serves only the files and directory
+trees the command names, which the approval prompt shows as the source reads
+them: relative paths start in the `-C` or `--root` directory you give, or else
+in the source account's home directory. A source given with `--src-non-dir`
+allows only that entry; any other source allows the whole tree if it is a
+directory. Filters narrow the copy but not what may be read, and with
+`--follow-src` symlinks are followed wherever they lead. Descriptor streams do
+not work.
 
 For uploads, quoted `~` and `~/archive` mean the destination account's home
 directory, and `~//archive` means `/archive`, as with SSH. Use `./~/archive`

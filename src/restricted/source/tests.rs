@@ -13,6 +13,7 @@ fn policy(path: &Path) -> SourcePolicy {
             path: path.as_os_str().as_bytes().to_vec(),
             follow_root: false,
         }],
+        resolved_base: None,
         selection_types: vec![crate::cli::SourceSelection::Named],
         symlink_policy: OperatorSymlinkPolicy::Refuse,
         hashing: Default::default(),

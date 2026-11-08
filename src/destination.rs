@@ -203,47 +203,6 @@ pub(crate) struct Approved {
     pub max_delete: Option<u64>,
 }
 
-/// One approved control channel for a source the receiving machine
-/// approved. File data needs direct TCP to the source.
-#[derive(Debug)]
-pub(crate) struct ReturnConnection {
-    data_hostname: Option<String>,
-    control: Mutex<Option<UnixStream>>,
-}
-
-impl ReturnConnection {
-    pub(super) fn source(stream: UnixStream, data_hostname: String) -> Result<Arc<Self>> {
-        validate_data_hostname(&data_hostname)?;
-        Ok(Arc::new(Self {
-            data_hostname: Some(data_hostname),
-            control: Mutex::new(Some(stream)),
-        }))
-    }
-
-    pub(crate) fn data_hostname(&self) -> Option<&str> {
-        self.data_hostname.as_deref()
-    }
-
-    pub(crate) fn take_control(&self) -> Result<UnixStream> {
-        self.control
-            .lock()
-            .unwrap()
-            .take()
-            .context("approved return control connection was already consumed")
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct SshWorkersUnavailable;
-impl std::fmt::Display for SshWorkersUnavailable {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(
-            "approved source requires direct TCP; SSH source authorization is unavailable",
-        )
-    }
-}
-impl std::error::Error for SshWorkersUnavailable {}
-
 /// This value is a TCP address candidate only, never SSH or shell syntax.
 fn validate_data_hostname(host: &str) -> Result<()> {
     anyhow::ensure!(
@@ -295,12 +254,9 @@ enum Message {
         cwd: String,
         request: Box<CopyRequest>,
     },
-    Pull {
-        target: String,
-        command: Vec<Vec<u8>>,
-        cwd: String,
-        request: Box<pull::PullRequest>,
-    },
+    /// A copy from another server to the requesting server, which this
+    /// machine approves with a directive for the source's enrolled receiver.
+    Pull(Box<pull::ReadRequest>),
     /// A copy of files on this machine to the requesting server.
     Send {
         command: Vec<Vec<u8>>,
@@ -319,8 +275,8 @@ enum Message {
 #[derive(Serialize, Deserialize)]
 enum Reply {
     RetryableError(String),
-    SourceApproved { data_hostname: Option<String> },
     Directive(Box<forward::Issued>),
+    SourceDirective(Box<pull::Issued>),
     TcpProbed(Vec<crate::conn::TcpCandidate>),
     TcpCongestionRejected(String),
     Ready,
@@ -1584,12 +1540,7 @@ impl Receiver {
                 let proof = identity::prove(&self.identity_key, &name, &challenge, &self.secret)?;
                 write_message(&mut stream, &Reply::Identity(proof))
             }
-            Message::Pull {
-                target,
-                command,
-                cwd,
-                request,
-            } => self.pull(target, command, cwd, *request, stream),
+            Message::Pull(request) => self.pull(*request, stream),
             Message::Send {
                 command,
                 cwd,
