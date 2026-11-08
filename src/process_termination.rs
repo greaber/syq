@@ -353,6 +353,13 @@ mod tests {
         Code(i32),
     }
 
+    /// The cap of a mode whose cleanup must finish: far beyond what the
+    /// cleanup needs, because a busy runner can wake its threads hundreds of
+    /// milliseconds late, and the real cap would then end the process first,
+    /// as it should. A process ends as soon as its cleanup has, so this costs
+    /// no time. The modes that set a short cap test the cap itself.
+    const FINISHES_MS: u64 = 10_000;
+
     #[test]
     fn termination_runs_cleanup_and_ends_by_the_signal() {
         use Ending::*;
@@ -361,38 +368,45 @@ mod tests {
                 "cleanup",
                 Signal(libc::SIGTERM),
                 Some("cleaned"),
-                None,
+                Some(FINISHES_MS),
                 false,
             ),
             ("removed", Signal(libc::SIGTERM), None, None, false),
             // A hang-up cleans up as SIGTERM does.
-            ("hangup", Signal(libc::SIGHUP), Some("cleaned"), None, false),
+            (
+                "hangup",
+                Signal(libc::SIGHUP),
+                Some("cleaned"),
+                Some(FINISHES_MS),
+                false,
+            ),
             (
                 "inherited-ignore-hangup",
                 Signal(libc::SIGTERM),
                 Some("cleaned"),
-                None,
+                Some(FINISHES_MS),
                 false,
             ),
             (
                 "inherited-ignore",
                 Signal(libc::SIGTERM),
                 Some("cleaned"),
-                None,
+                Some(FINISHES_MS),
                 false,
             ),
             (
                 "first",
                 Signal(libc::SIGTERM),
                 Some("first,later"),
-                None,
+                Some(FINISHES_MS),
                 false,
             ),
+            // The second interrupt arrives while the 300 ms cleanup runs.
             (
                 "repeated",
                 Signal(libc::SIGINT),
                 Some("cleaned"),
-                None,
+                Some(FINISHES_MS),
                 false,
             ),
             ("cap", Signal(libc::SIGTERM), None, Some(200), false),
@@ -419,7 +433,13 @@ mod tests {
                 Some(200),
                 false,
             ),
-            ("watchdog-finished", Code(7), Some("cleaned"), None, false),
+            (
+                "watchdog-finished",
+                Code(7),
+                Some("cleaned"),
+                Some(FINISHES_MS),
+                false,
+            ),
             ("watchdog-refused", Code(7), None, None, true),
         ] {
             let directory = crate::test_support::tempdir().unwrap();
