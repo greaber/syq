@@ -2551,6 +2551,35 @@ fn remote_to_remote_sends_sources_its_coordinator_command_cannot_hold_on_its_inp
 }
 
 #[test]
+fn remote_to_remote_says_when_its_sources_could_not_reach_the_coordinator() {
+    // Like `ssh -n` or `StdinNull yes`: the sources sent on the
+    // coordinator's input never arrive, and it says why.
+    let t = Tmp::new();
+    let fake = fake_rsh(&t);
+    let rsh = t.path("null-input-rsh");
+    executable(
+        &rsh,
+        format!(
+            "#!/bin/sh\nexec {} \"$@\" </dev/null\n",
+            shell_words::quote(fake.to_str().unwrap())
+        )
+        .as_bytes(),
+    );
+    pin_remote_helper(&t);
+    let out = remote_to_remote_copy(&t, &rsh, &long_named_sources(&t))
+        .run()
+        .unwrap();
+    assert_ne!(out.status.code(), Some(0), "{out:?}");
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("the requesting syq ended before sending the named sources")
+            && stderr.contains("`ssh -n` and `StdinNull yes` close"),
+        "{stderr}"
+    );
+    assert!(!t.path("dst").exists(), "{stderr}");
+}
+
+#[test]
 fn remote_to_remote_keeps_sources_on_the_command_line_of_another_build_or_a_detached_copy() {
     for option in ["--syq-path", "--no-bootstrap", "--detach"] {
         let t = Tmp::new();

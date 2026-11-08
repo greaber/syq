@@ -1052,9 +1052,9 @@ impl ReceiverConnection {
 }
 
 pub(crate) const RECEIVER_KNOWN_HOSTS: &str = "SYQ_INTERNAL_NATIVE_RECEIVER_KNOWN_HOSTS";
-/// Set when a remote coordinator's input starts with this many bytes of the
-/// enrollment's entry key. The key never appears in arguments or the
-/// environment.
+/// Set when a remote coordinator's input holds this many bytes of the
+/// enrollment's entry key, after any named sources. The key never appears
+/// in arguments or the environment.
 pub(crate) const ENTRY_KEY_STDIN: &str = "SYQ_INTERNAL_NATIVE_ENTRY_KEY";
 /// Set with the entry key: this many bytes of the copy's signed directive
 /// follow it on the coordinator's input.
@@ -1135,8 +1135,8 @@ pub(crate) fn prepare_receiver_ssh(
 }
 
 /// Read `length` bytes of what the requesting syq sends first on this
-/// coordinator's input, before any manifest: the entry key, then the
-/// directive.
+/// coordinator's input, before any manifest: any named sources, then the
+/// entry key, then the directive.
 fn read_input(label: &str, length: usize, maximum: usize) -> Result<zeroize::Zeroizing<Vec<u8>>> {
     use std::os::fd::AsFd;
     anyhow::ensure!((1..=maximum).contains(&length), "invalid {label} length");
@@ -1552,8 +1552,14 @@ pub(crate) fn take_sources_from_input(argv: &mut Vec<OsString>) -> Result<()> {
     let length = std::str::from_utf8(length)
         .ok()
         .and_then(|length| length.parse().ok())
+        .filter(|length| (1..=MAX_SOURCES_INPUT).contains(length))
         .context("invalid length of the named sources on the coordinator's input")?;
-    let input = read_input("named sources", length, MAX_SOURCES_INPUT)?;
+    // Only an input that ends early fails here.
+    let input = read_input("named sources", length, MAX_SOURCES_INPUT).map_err(|error| {
+        anyhow::anyhow!(
+            "{error:#}; the SSH connection must pass this coordinator its input, which `ssh -n` and `StdinNull yes` close"
+        )
+    })?;
     let words = parse_input_sources(&input)?;
     argv.splice(position..=position, words);
     Ok(())
@@ -1963,11 +1969,16 @@ fn run_remote(
         // Native new/existing placement forms travel in the signed grant as the
         // root-existence precondition, so they use the receiver like any other
         // form instead of silently keeping only the constrained broker.
-        let prepared = (!coordinator_at_dst && args.peer_auth != PeerAuth::Broker)
-            .then(|| {
+        // A command too long to sign is refused as such, before anything
+        // is set up, rather than as an enrollment that failed.
+        let command = (!coordinator_at_dst && args.peer_auth != PeerAuth::Broker)
+            .then(|| crate::approval_command::copy_command(args))
+            .transpose()?;
+        let prepared = command
+            .map(|command| {
                 crate::directive::validate_restricted_args(args)?;
                 crate::restricted::prepare_transfer(crate::restricted::Issue {
-                    command: crate::approval_command::copy_command(args)?,
+                    command,
                     cwd: crate::approval_command::current_directory(),
                     inputs: crate::directive::Inputs {
                         ignore: args.ignore_lines.clone(),

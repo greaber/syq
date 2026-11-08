@@ -1240,6 +1240,19 @@ case "$many_output" in
     'syq: this copy names 1025 sources, more than the 1024 one copy accepts;'*) ;;
     *) printf '%s\n' "$many_output" >&2; exit 1 ;;
 esac
+# So is a command longer than its signature covers: 1,024 paths of about
+# 290 bytes.
+# shellcheck disable=SC2046
+set -- $(seq -f "$many/huge/$(printf 'n%.0s' $(seq 1 250))_%04g" 1 1024)
+if many_output=$(syq cp --no-progress --from source "$@" --to destination --into "$many-short" 2>&1); then
+    echo 'a copy between two servers with a 290 KiB command unexpectedly started' >&2
+    exit 1
+fi
+case "$many_output" in
+    *'--peer-auth broker'*) printf '%s\n' "$many_output" >&2; exit 1 ;;
+    'syq: this copy names 1024 sources, which make its command '*' KiB, more than the 256 KiB its approval can carry;'*) ;;
+    *) printf '%s\n' "$many_output" >&2; exit 1 ;;
+esac
 set --
 
 printf 'case: --follow-dst copies into the directory a restricted destination link leads to\n'

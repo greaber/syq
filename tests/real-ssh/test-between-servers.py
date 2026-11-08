@@ -385,11 +385,14 @@ def main():
         argv = ["--to", "destination", "--into", c + "/many", "--auth-from", "@laptop",
                 "--performance-tuning", "workers=2", "--no-progress",
                 "--results", f"{a}/many.1.ndjson"]
-        script = ("test -z \"${SSH_AUTH_SOCK:-}\" && set -- $(seq -f "
-                  + shlex.quote(b + "/many/" + stem + "_%04g") + " 1 1024) && exec env "
-                  + "PATH=/usr/bin:/bin:/usr/local/bin syq cp --from source \"$@\" "
-                  + shlex.join(argv))
-        with running(shlex.join(["timeout", "120", "sh", "-c", script])) as (process, output):
+        def many(count):
+            script = ("test -z \"${SSH_AUTH_SOCK:-}\" && set -- $(seq -f "
+                      + shlex.quote(b + "/many/" + stem + "_%04g") + f" 1 {count}) && exec env "
+                      + "PATH=/usr/bin:/bin:/usr/local/bin syq cp --from source \"$@\" "
+                      + shlex.join(argv))
+            return shlex.join(["timeout", "120", "sh", "-c", script])
+
+        with running(many(1024)) as (process, output):
             decide()
             finish(process, output)
         terminal = results("many")[-1]
@@ -397,6 +400,11 @@ def main():
         assert terminal["files_transferred"] == 1024 and terminal["errors"] == 0, terminal
         assert remote("destination", "find " + shlex.quote(c + "/many")
                       + " -type f | wc -l").strip() == "1024"
+        assert pending() == []
+        # More than one copy accepts are refused before the laptop is asked.
+        with running(many(1025)) as (process, output):
+            text = finish(process, output, success=False)
+        assert "this copy names 1025 sources, more than the 1024 one copy accepts" in text, text
         assert pending() == []
 
         print("case: a saved choice approves a copy between servers, and blocked TCP falls back to SSH", flush=True)
