@@ -37,6 +37,9 @@ pub(crate) struct Issue<'a> {
     /// Whether this may set up or refresh the enrollment: never for a dry
     /// run.
     pub allow_enrollment: bool,
+    /// Refresh the enrollment even when this machine's record says it runs
+    /// this build: its receiver refused a copy for running another one.
+    pub refresh: bool,
     /// Enroll without prompting, for the receiving service, which has no
     /// terminal. Where the SSH configuration would ask about a host key
     /// nobody knows, the login accepts it the first time, as `accept-new`
@@ -65,6 +68,7 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
         jump,
         agent: destination_agent,
         allow_enrollment,
+        refresh,
         batch,
         results_key,
         role,
@@ -142,13 +146,13 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
         )?;
     }
     let (metadata, directory, signer) = match found {
-        Some((metadata, directory)) if !needs_refresh(&metadata, &directory) => {
+        Some((metadata, directory)) if !refresh && !needs_refresh(&metadata, &directory) => {
             (metadata, directory, None)
         }
         _ if !allow_enrollment => bail!(
             "a dry run does not set up restricted copying on {account} for this syq build; the next copy does, or run `syq receiver enroll {account}`"
         ),
-        _ => enroll_now(false)?,
+        _ => enroll_now(refresh)?,
     };
     let signer = match signer {
         Some(signer) => Some(signer),

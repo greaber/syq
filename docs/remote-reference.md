@@ -76,6 +76,13 @@ build as the machine that approves the copy, whose build the receiver follows.
 Otherwise the receiver refuses it and says which builds it saw; update syq on
 whichever of the two machines is older.
 
+A copy between two servers that you start on your laptop can also find the
+receiver running another build than your laptop recorded, for example after
+another syq on your laptop updated it. Then syq updates the receiver to its
+own build and runs the copy once more. It does this only when the server
+running the copy runs your laptop's build, as it does unless you pass
+`--syq-path` or `--no-bootstrap`, and never for a dry run.
+
 Only `syq receiver revoke ID`, or deleting syq's line from `authorized_keys`,
 ends an enrollment. Removing or revoking your login key, certificate, or
 certificate authority on the server does not stop copies your key signs, and

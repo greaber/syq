@@ -544,6 +544,50 @@ fn destination_results_supply_its_changes_whatever_the_human_output_does() {
     }
 }
 
+/// Before a restricted destination's results start, the coordinator's
+/// records are held back: an attempt that is run again because the
+/// receiver runs another build leaves nothing in the results. Otherwise
+/// they are written, in order, once the destination's results start or the
+/// relay ends.
+#[test]
+fn coordinator_records_wait_for_the_destination_results_to_start() {
+    let setup = serde_json::json!({"type": "error", "message": "syq: setting up"});
+    let relayed = |input: &[u8]| {
+        let (stream, expectation) = destination(true);
+        let (file, writer) = results_file();
+        let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
+        relay_output(input, &mut Vec::new(), &mut None, &mut relay).unwrap();
+        (stream, file, relay)
+    };
+    let messages = |file| -> Vec<String> {
+        read_records(file)
+            .iter()
+            .filter_map(|record| record["message"].as_str().map(str::to_owned))
+            .collect()
+    };
+    // Run again: nothing of it reaches the results.
+    let (_, file, mut relay) = relayed(&coordinator_line(setup.clone(), 0));
+    assert!(relay.discard_held());
+    drop(relay);
+    assert!(read_records(file).is_empty());
+    // Not run again: written when the relay ends, as before.
+    let (_, file, relay) = relayed(&coordinator_line(setup.clone(), 0));
+    drop(relay);
+    assert_eq!(messages(file), ["syq: setting up"]);
+    // Started: written ahead of the destination's records, and the copy
+    // can no longer be run again.
+    let (mut stream, expectation) = destination(true);
+    let (file, writer) = results_file();
+    let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
+    let mut input = coordinator_line(setup, 0);
+    input.extend(destination_lines(&mut stream, 0));
+    relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+    assert!(!relay.discard_held());
+    let records = read_records(file);
+    assert_eq!(records[0]["message"], "syq: setting up", "{records:?}");
+    assert!(records.len() > 1, "{records:?}");
+}
+
 #[test]
 fn destination_refusals_and_failures_decide_the_outcome() {
     // A refusal makes the copy refused even if the coordinator reported
@@ -700,32 +744,34 @@ fn a_source_failure_explains_a_file_the_receiver_left_unfinished_at_once() {
     let (mut stream, expectation) = destination(true);
     let (file, writer) = results_file();
     let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
-    // A file's destination was prepared, then reading its source failed:
-    // the coordinator's error explains the failure as it happens, and the
-    // receiver, which cannot know why, lists the file unfinished at the end.
-    let input = coordinator_line(
-        serde_json::json!({
-            "type": "error", "class": "io", "os_kind": "permission_denied",
-            "message": "syq: a: read: Permission denied (os error 13)",
-            "diagnostic_for": tagged_path("a"),
-        }),
-        0,
-    );
-    relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
-    // Written already, before the receiver's stream ends.
-    let early = read_records(file.try_clone().unwrap());
-    assert_eq!(early.len(), 1, "{early:?}");
-    assert_eq!(early[0]["os_kind"], "permission_denied");
-    let mut input = Vec::new();
-    let mut take = |stream: &mut crate::destination_results::Stream| {
+    let frames = |stream: &mut crate::destination_results::Stream| {
+        let mut input = Vec::new();
         for frame in stream
             .take_frames(std::time::Instant::now() + std::time::Duration::from_secs(1))
             .unwrap()
         {
             input.extend(destination_line(&frame));
         }
+        input
     };
-    take(&mut stream);
+    // The receiver's results start with the copy. A file's destination was
+    // prepared, then reading its source failed: the coordinator's error
+    // explains the failure as it happens, and the receiver, which cannot
+    // know why, lists the file unfinished at the end.
+    let mut input = frames(&mut stream);
+    input.extend(coordinator_line(
+        serde_json::json!({
+            "type": "error", "class": "io", "os_kind": "permission_denied",
+            "message": "syq: a: read: Permission denied (os error 13)",
+            "diagnostic_for": tagged_path("a"),
+        }),
+        0,
+    ));
+    relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+    // Written already, before the receiver's stream ends.
+    let early = read_records(file.try_clone().unwrap());
+    assert_eq!(early.len(), 1, "{early:?}");
+    assert_eq!(early[0]["os_kind"], "permission_denied");
     stream.record(
         crate::destination_results::Change::PublishFile { size: 4096 },
         Some(b"a"),
@@ -734,7 +780,7 @@ fn a_source_failure_explains_a_file_the_receiver_left_unfinished_at_once() {
         )),
     );
     stream.finish(0).unwrap();
-    take(&mut stream);
+    let mut input = frames(&mut stream);
     input.extend(coordinator_line(coordinator_terminal(), 1));
     relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
     assert_eq!(settle(relay, settlement(23)).unwrap(), 23);

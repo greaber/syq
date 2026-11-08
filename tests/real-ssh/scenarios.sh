@@ -1454,6 +1454,54 @@ assert_same_tree source /tmp/syq-real-ssh/pscope-source \
 printf 'case: login keys sign restricted copies\n'
 python3 /usr/local/libexec/syq-test-receiver-keys.py
 
+printf 'case: a copy started here updates a receiver of another build and runs once more\n'
+# The laptop's record says the destination's receiver runs this build, as
+# after restoring the laptop's state from a backup, but the lab's second
+# build has updated the receiver since. The receiver refuses the copy for
+# its build; syq updates it to this build and runs the copy once more,
+# leaving nothing of the refused attempt in the results.
+make_tree source /tmp/syq-real-ssh/rebuild-source rebuild
+syq cp --no-progress --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
+    --to destination --into /tmp/syq-real-ssh/rebuild-first
+rebuild_record=$(python3 - <<'PYTHON'
+import json
+from pathlib import Path
+found = [path.parent for path in Path.home().glob(".local/state/syq/enrollments/*/enrollment.json")
+         if (lambda record: (record["host"], record.get("port"), record["target_login"])
+             == ("destination", None, "syq"))(json.loads(path.read_text()))]
+assert len(found) == 1, found
+print(found[0])
+PYTHON
+)
+cp "$rebuild_record/enrollment.json" /tmp/syq-real-ssh-rebuild-enrollment.json
+syq-other-build receiver enroll destination >/dev/null
+test "$(syq-other-build receiver list | awk -F '\t' '$3 == "syq@destination" { print $4 }')" = \
+    "$(syq-other-build --build-identity)"
+cp /tmp/syq-real-ssh-rebuild-enrollment.json "$rebuild_record/enrollment.json"
+ssh destination 'rm -rf /tmp/syq-real-ssh/rebuild-destination'
+rm -f /tmp/syq-real-ssh-rebuild.ndjson
+rebuild_output=$(syq cp --no-progress --results /tmp/syq-real-ssh-rebuild.ndjson \
+    --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
+    --to destination --into /tmp/syq-real-ssh/rebuild-destination 2>&1) || {
+    printf '%s\n' "$rebuild_output" >&2
+    exit 1
+}
+case "$rebuild_output" in
+    *'runs another syq build than this one; updating it to this build and trying once more'*) ;;
+    *) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
+esac
+assert_same_tree source /tmp/syq-real-ssh/rebuild-source \
+    destination /tmp/syq-real-ssh/rebuild-destination rebuild
+test "$(syq receiver list | awk -F '\t' '$3 == "syq@destination" { print $4 }')" = \
+    "$(syq --build-identity)"
+python3 - /tmp/syq-real-ssh-rebuild.ndjson <<'PYTHON'
+import json, sys
+records = [json.loads(line) for line in open(sys.argv[1])]
+kinds = [record["type"] for record in records]
+assert kinds.count("run") == 1 and "error" not in kinds, records
+assert records[-1]["type"] == "result" and records[-1]["status"] == "success", records[-1]
+PYTHON
+
 printf 'case: enrollment revocation stops active restricted receivers\n'
 python3 /usr/local/libexec/syq-test-receiver-revoke.py
 
