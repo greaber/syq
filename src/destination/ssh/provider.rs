@@ -485,6 +485,9 @@ impl Drop for Use {
 fn record_lock(domain: &Domain, provider: &Provider) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
+        // Never written through, but NFS grants an exclusive lock only to a
+        // file open for writing.
+        .write(true)
         // Not held up by anything but a regular file, which is checked next.
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(record_path(domain, provider)?)?;
@@ -526,6 +529,23 @@ enum Requests {
     /// None does, and none can take it until this is dropped: a stop
     /// published meanwhile is one that a request sees before it sends.
     Held(Option<File>),
+}
+impl Requests {
+    /// Whether the keeper record is still the one this looked at: the file
+    /// it holds, or none. Another keeper may have replaced the one looked at
+    /// meanwhile, and a request may hold that one's record.
+    fn current(&self, domain: &Domain, provider: &Provider) -> bool {
+        let Ok(path) = record_path(domain, provider) else {
+            return false;
+        };
+        match (self, fs::symlink_metadata(path)) {
+            (Self::Held(Some(file)), Ok(now)) => file
+                .metadata()
+                .is_ok_and(|held| (held.dev(), held.ino()) == (now.dev(), now.ino())),
+            (Self::Held(None), Err(error)) => error.kind() == std::io::ErrorKind::NotFound,
+            _ => false,
+        }
+    }
 }
 impl Drop for Requests {
     fn drop(&mut self) {
@@ -645,8 +665,12 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
                 Requests::Starting => next_look = Instant::now() + Duration::from_millis(200),
                 requests => {
                     other = stop_other_build_keeper(domain, provider, || {
+                        // Last, so that the stop follows at once: one for
+                        // another keeper than the one looked at waits for
+                        // the next look.
                         matches!(requests, Requests::Using)
                             || persistent::uses_provider(domain, provider)
+                            || !requests.current(domain, provider)
                     })?;
                     drop(requests);
                 }
@@ -1483,6 +1507,46 @@ mod tests {
             Requests::Held(None)
         ));
         assert!(hold_use(&domain, &record.provider).is_err());
+    }
+
+    /// A keeper that another took over from while this build looked is not
+    /// the one looked at: the stop waits for the next look, which sees what
+    /// the new keeper's requests hold.
+    #[test]
+    fn a_stop_decided_for_one_keeper_does_not_stop_its_successor() {
+        let (_root, domain, mut record) = cleanup_fixture();
+        let stop = record_path(&domain, &record.provider)
+            .unwrap()
+            .with_extension("stop");
+        record.build = "v0.0.1+other-build".into();
+        ready(&mut record);
+        write_record(&domain, &record).unwrap();
+        let decide = |requests: &Requests| {
+            stop_other_build_keeper(&domain, &record.provider, || {
+                matches!(requests, Requests::Using) || !requests.current(&domain, &record.provider)
+            })
+            .unwrap()
+        };
+        let looked = requests(&domain, &record.provider);
+        assert!(looked.current(&domain, &record.provider));
+        // Its successor publishes its own ready record.
+        write_record(&domain, &record).unwrap();
+        assert!(!looked.current(&domain, &record.provider));
+        assert!(matches!(decide(&looked), OtherKeeper::InUse { .. }));
+        assert!(!stop.exists());
+        drop(looked);
+        // With no record looked at, a record that appears is a successor.
+        fs::remove_file(record_path(&domain, &record.provider).unwrap()).unwrap();
+        let looked = requests(&domain, &record.provider);
+        assert!(matches!(looked, Requests::Held(None)));
+        assert!(looked.current(&domain, &record.provider));
+        write_record(&domain, &record).unwrap();
+        assert!(!looked.current(&domain, &record.provider));
+        drop(looked);
+        // The next look decides on the record there now.
+        let looked = requests(&domain, &record.provider);
+        assert_eq!(decide(&looked), OtherKeeper::Stopping);
+        assert!(stop.exists());
     }
 
     #[cfg(target_os = "linux")]
